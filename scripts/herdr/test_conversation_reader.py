@@ -15,6 +15,7 @@ from unittest.mock import call, patch
 from scripts.herdr import herdr
 from scripts.agents import codex_mesh
 from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline
 from scripts.message import codex_daemon, sessions
 from scripts.production import fake_unit_host
@@ -40,7 +41,7 @@ class ConversationReaderTests(StaffTestCase):
         self.launched = fixture_runtime_id("reader-launch")
         self.runs = self.root / "runs"
         self.runs.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.proc)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.proc), "XDG_CONFIG_HOME": str(self.root / "config")})))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="1"))
         _ = self.enterContext(patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()))
@@ -66,15 +67,24 @@ class ConversationReaderTests(StaffTestCase):
 
         _ = self.enterContext(patch.object(herdr.Herdr, "result", side_effect=pane_result))
 
+        fake_unit_host.process(os.environ, 998060, 1, ["herdr", "server"], {})
+        fake_unit_host.process(os.environ, 998061, 998060, ["zsh"], {}, session=998061)
+        write_text_atomic(self.proc / "net/unix",
+            f"0: 2 0 00010000 0001 01 600 {self.root}/config/herdr/sessions/agents/herdr.sock\n")
+        descriptors = self.proc / "998060/fd"
+        descriptors.mkdir()
+        (descriptors / "3").symlink_to("socket:[600]")
+
     def codex(self, *, pane: bool = True, arguments: list[str] | None = None,
               environment: dict[str, str] | None = None, pid: int = 998071) -> None:
         argv = arguments or (["codex", "--no-daemon"] if pane else ["codex", "resume", self.launched])
-        fake_unit_host.process(os.environ, pid, 1, argv,
-                               environment or {"CODEX_THREAD_ID": self.launched}, cwd=self.root)
+        fake_unit_host.process(os.environ, pid, 998061, argv,
+                               environment or {"CODEX_THREAD_ID": self.launched}, session=998061, cwd=self.root)
+        write_text_atomic(self.proc / str(pid) / "stat",
+            f"{pid} (codex) S 998061 {pid} 998061 1 {pid} " + "0 " * 13 + "1")
         if pane and "app-server" not in argv:
             self.places[pid] = herdr.HerdrPlace("fixture", f"pane-{pid}")
             self.reports[f"pane-{pid}"] = self.identity
-
 
     def unreadable_process(self, pid: int) -> None:
         self.codex(pane=False, pid=pid)

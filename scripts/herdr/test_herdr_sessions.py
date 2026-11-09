@@ -21,7 +21,9 @@ from unittest.mock import patch
 
 from scripts.herdr import herdr
 from scripts.herdr import herdr_sessions
-from scripts.message import sessions
+from scripts.message import sessions, codex_daemon
+from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
@@ -97,6 +99,76 @@ class HerdrSessionsTests(unittest.TestCase):
         _ = self.enterContext(patch.object(showrunners, "_session_name", side_effect=self.registered_name))
         _ = self.enterContext(patch.object(showrunners, "user_zone_name", return_value="UTC"))
         self.respond([])
+
+    def test_unknown_codex_requires_a_pane_foreground_group_and_keeps_failed_stat_reads(self) -> None:
+        self.server(99, "agents")
+        self.process(100, 99, ["zsh"], {})
+        for pid in range(101, 109):
+            self.process(pid, 100, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+            write_text_atomic(self.proc / str(pid) / "stat",
+                f"{pid} (fixture) S 100 {pid} 100 1 {pid} " + "0 " * 14)
+        write_text_atomic(self.proc / "101/stat", "101 (fixture) S 100 101 100 0 -1 " + "0 " * 14)
+        write_text_atomic(self.proc / "102/stat", "102 (fixture) S 100 102 102 1 102 " + "0 " * 14)
+        (self.proc / "104/stat").unlink()
+        write_text_atomic(self.proc / "105/stat", "105 (fixture) S 100 105 100 1 103 " + "0 " * 14)
+        write_text_atomic(self.proc / "106/stat", "106 (fixture) S 100 106 100 0 -1 " + "0 " * 14)
+        write_text_atomic(self.proc / "108/stat", "108 (fixture) S 100 108 100 0 -1 " + "0 " * 14)
+        root = self.root / "runs"
+        run = root / "TEST-run"
+        run.mkdir(parents=True)
+        write_text_atomic(run / unit_runs.SERVER_FILE, "{}")
+        daemon = codex_daemon.CodexDaemon(self.root / "account", self.root / "socket")
+        arguments = herdr._process_arguments  # pyright: ignore[reportPrivateUsage]
+
+        def read_arguments(path: Path) -> list[str]:
+            if path.name in ("106", "107"):
+                raise PermissionError("fixture argv")
+            return arguments(path)
+
+        def native(pid: int, _kind: str) -> herdr.NativeAgentProcess:
+            if pid == 108:
+                return herdr.NativeAgentProcess(herdr.LaunchArgument("TEST-old-thread"), "1", {})
+            raise herdr.HerdrFailure("fixture unknown")
+
+        def display(pid: int) -> str:
+            return f"TEST-pane-{pid}"
+
+        with (patch.object(codex_daemon, "read_daemons", return_value=[
+                  codex_daemon.DaemonRead(daemon, codex_daemon.DaemonUnreadable("fixture"))]),
+              patch.object(unit_runs, "run_roots", return_value=(root,)),
+              patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra"),
+              patch.object(herdr, "_process_arguments", side_effect=read_arguments),
+              patch.object(herdr, "native_process", side_effect=native),
+              patch.object(herdr, "_process_display_name", side_effect=display),
+              patch.object(herdr.Herdr, "result", side_effect=AssertionError("no server call")),
+              patch("scripts.agents.codex_mesh.loaded_threads", side_effect=OSError("fixture"))):
+            observed = herdr.codex_conversations()
+        self.assertCountEqual(observed.unknown, [
+            "TEST-pane-103 (Codex thread unknown)", "TEST-pane-104 (Codex thread unknown)",
+            "TEST-pane-107 (process argv unknown)",
+            f"{daemon.home} (Codex daemon unknown: fixture)",
+            "TEST-run (Codex hosted threads unknown: fixture)"])
+
+    def test_darwin_unknown_codex_requires_a_foreground_group_and_keeps_failed_reads(self) -> None:
+        processes = [herdr._UserProcess(pid, 1, "codex", herdr.UnreadableProcessArguments("fixture"))  # pyright: ignore[reportPrivateUsage]
+                     for pid in (101, 102, 103)]
+
+        def read(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[1:4], ["-o", "pgid=,tpgid=", "-p"])
+            self.assertGreater(timeout, 0)
+            if argv[-1] == "103":
+                raise OSError("fixture stat")
+            return subprocess.CompletedProcess(argv, 0, "101 -1" if argv[-1] == "101" else "102 102", "")
+
+        with (patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(herdr, "_darwin_processes", return_value=processes),
+              patch.object(herdr, "run_program", side_effect=read),
+              patch.object(codex_daemon, "read_daemons", return_value=[]),
+              patch.object(unit_runs, "run_roots", return_value=()),
+              patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra"),
+              patch.object(herdr, "_process_display_name", side_effect=str)):
+            observed = herdr.codex_conversations()
+        self.assertEqual(observed.unknown, ("102 (Codex argv unknown)", "103 (Codex argv unknown)"))
 
     def record_is_live(self, record: SessionRecord) -> bool:
         return (self.proc / str(record["pid"]) / "alive").exists()

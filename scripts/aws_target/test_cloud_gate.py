@@ -39,6 +39,7 @@ class FakeGateAws:
         self.has_result: bool = True
         self.has_log: bool = True
         self.state: str = 'running'
+        self.has_instance: bool = True
         self.terminated: bool = False
         self.confirm_termination: bool = True
         self.upload_error: str = ''
@@ -82,7 +83,7 @@ class FakeGateAws:
         elif operation == 'describe-instances':
             state = 'terminated' if self.terminated and self.confirm_termination else self.state
             reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-fixture', 'State': {'Name': state},
-                                                      'LaunchTime': '2026-01-15T00:00:00+00:00'}]}]}
+                                                      'LaunchTime': '2026-01-15T00:00:00+00:00'}]}] if self.has_instance else []}
         else:
             raise AssertionError((service, operation))
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
@@ -344,6 +345,54 @@ class CloudGateTests(CostFixture):
         before = self.book.estimate(read_settings(self.settings), int(self.now)).monthly.usd
         self.advance(60)
         self.assertGreater(self.book.estimate(read_settings(self.settings), int(self.now)).monthly.usd, before)
+
+    def worker_with_pending_gate(self) -> cloud_gate.GateWorker:
+        reservation = ledger.GateReservation('orphan', int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal(0))
+        self.assertIsInstance(self.book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+        return cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+
+    def test_expired_pending_gate_without_instance_stops_charging(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.fake.has_instance = False
+        self.advance(8 * 3600)
+        self.assertGreater(self.book.estimate(read_settings(self.settings), int(self.now)).monthly.usd, Decimal(0))
+        worker.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent(int(self.now)))
+        self.assertEqual(self.book.estimate(read_settings(self.settings), int(self.now)).monthly.usd, Decimal(0))
+        self.advance(3600)
+        self.assertEqual(self.book.estimate(read_settings(self.settings), int(self.now)).monthly.usd, Decimal(0))
+        query, = self.fake.commands
+        self.assertEqual(query[query.index('--filters') + 1], 'Name=tag:GateAttempt,Values=orphan')
+
+    def test_expired_pending_gate_with_terminated_instance_stops_charging(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.fake.state = 'terminated'
+        self.advance(1200)
+        worker.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-fixture'))
+        charged = self.book.estimate(read_settings(self.settings), int(self.now)).monthly.usd
+        self.advance(3600)
+        self.assertEqual(self.book.estimate(read_settings(self.settings), int(self.now)).monthly.usd, charged)
+
+    def test_expired_pending_gate_with_live_instance_is_observed_next_time(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.advance(1200)
+        worker.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateRunning('i-fixture'))
+        self.fake.state = 'terminated'
+        worker.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-fixture'))
+        self.assertIn('--instance-ids', self.fake.commands[-1])
+
+    def test_pending_gate_before_expiry_is_unchanged(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.advance(1199)
+        worker.reconcile()
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        self.assertEqual(self.fake.commands, [])
 
     def test_combined_rust_cost_refuses_gate_before_launch(self) -> None:
         self.book.observe(ledger.InstanceObservation(int(self.now), 'running', 'fixture'))

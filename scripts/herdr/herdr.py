@@ -2487,13 +2487,22 @@ class Herdr:
         _ = self.run(*arguments)
 
     def quit_agent(self, pane: str, terminal: str, target: str, timeout: float) -> None:
-        """Quit the selected conversation and wait for its shell."""
+        """Quit the selected conversation and wait for its shell or pane closure."""
         deadline = time.monotonic() + timeout
         row = self.pane_row(pane)
         if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
             raise HerdrFailure(f"{pane}: terminal changed before quit")
         self.prompt(pane, "/quit", target=target)
-        while not isinstance(self.pane_activity(pane), PaneAtShell):
+        while True:
+            if isinstance(self.pane_row(pane), NoPane):
+                return
+            try:
+                if isinstance(self.pane_activity(pane), PaneAtShell):
+                    return
+            except HerdrFailure as error:
+                if error.code == "pane_not_found":
+                    return
+                raise
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HerdrFailure(f"{pane}: agent did not return to its shell")
@@ -3589,15 +3598,45 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
     loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
     candidates: list[tuple[int, list[str]]] = []
     unknown: list[tuple[int, str] | str] = []
+    process_root = _proc_root()
+    process_paths: list[Path] = []
+
+    @cache
+    def pane_servers() -> dict[int, str]:
+        return _live_server_processes(process_paths)
+
+    def add_unknown(pid: int, reason: str) -> None:
+        """Count terminal foreground groups; failed process reads retain uncertainty."""
+        try:
+            if _platform() == "darwin":
+                result = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "pgid=,tpgid=", "-p", str(pid)],
+                                     timeout=PROGRAM_TIMEOUT_SECONDS)
+                require_success(result, "Codex terminal process group")
+                group, foreground = map(int, result.stdout.split())
+                if foreground <= 0 or group != foreground:
+                    return
+            else:
+                stat = (process_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+                group, foreground = int(stat[2]), int(stat[5])
+                if foreground <= 0 or group != foreground:
+                    return
+                leader = (process_root / stat[3] / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(leader[1]) not in pane_servers():
+                    return
+        except (OSError, ValueError, IndexError, HerdrFailure, subprocess.SubprocessError):
+            pass
+        unknown.append((pid, reason))
+
     try:
         if _platform() == "darwin":
             for process in _darwin_processes(complete=True):
                 if isinstance(process.arguments, UnreadableProcessArguments):
-                    unknown.append((process.pid, "Codex argv unknown"))
+                    add_unknown(process.pid, "Codex argv unknown")
                 else:
                     candidates.append((process.pid, list(process.arguments.argv)))
         else:
-            for path in _proc_root().iterdir():
+            process_paths = list(process_root.iterdir())
+            for path in process_paths:
                 if not path.name.isdecimal():
                     continue
                 try:
@@ -3605,9 +3644,9 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
                         candidates.append((int(path.name), _process_arguments(path)))
                 except FileNotFoundError:
                     if path.exists():
-                        unknown.append((int(path.name), "process argv unknown"))
+                        add_unknown(int(path.name), "process argv unknown")
                 except OSError:
-                    unknown.append((int(path.name), "process argv unknown"))
+                    add_unknown(int(path.name), "process argv unknown")
     except (HerdrFailure, OSError, ValueError) as error:
         unknown.append(f"Codex process list unknown: {error}")
     live: dict[str, tuple[int, ...]] = {}
@@ -3639,7 +3678,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
                 runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
-                unknown.append((pid, "Codex thread unknown"))
+                add_unknown(pid, "Codex thread unknown")
             else:
                 identity = observed.current_identity
                 live[identity] = (*live.get(identity, ()), pid)
@@ -3649,14 +3688,14 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
             if environment is not None:
                 if "app-server" in arguments:
                     if environment.get("UNIT_RUN_DIR") or pid in server_pids:
-                        # The run read below resolves a server with no open rollout.
+                        # The run read below resolves the threads of a server in a run.
                         continue
                 elif "--no-daemon" not in arguments:
                     home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
                     if home in daemon_reads:
                         # A failed daemon read already has one note for its account.
                         continue
-            unknown.append((pid, "Codex thread unknown"))
+            add_unknown(pid, "Codex thread unknown")
     deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
         try:
@@ -4844,6 +4883,11 @@ class PreparedAgentEnvironment:
 
 
 @dataclass(frozen=True)
+class WorkerPaneEnvironment(PreparedAgentEnvironment):
+    """A worker shell ends when its agent command returns."""
+
+
+@dataclass(frozen=True)
 class NewTab:
     space: str
     title: str
@@ -4997,6 +5041,12 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
+        if isinstance(prepared, WorkerPaneEnvironment):
+            script += ("\nprecmd_functions=(${precmd_functions:#herdr_worker_exit}); "
+                       "preexec_functions=(${preexec_functions:#herdr_worker_start}); "
+                       "herdr_worker_exit() { exit $?; }; "
+                       "herdr_worker_start() { precmd_functions=(herdr_worker_exit $precmd_functions); }; "
+                       "preexec_functions+=(herdr_worker_start)")
         client.run_in_pane(pane, ["eval", script],
                            terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
         server_name = agent_name if isinstance(agent_name, str) else agent

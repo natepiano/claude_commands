@@ -7233,7 +7233,10 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
         row = fixture_worker(name, self.owner.id, backend=staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / ".codex1"))
-        self.world.add(row, "w1:p" + str(len(self.world.locations)), family=family, live=live)
+        pane = "w1:p" + str(len(self.world.locations))
+        self.world.add(row, pane, family=family, live=live)
+        if live:
+            self.world.exiting_panes.add(pane)
         return row
 
     def dispatch(self, row: staff.StaffRow, role: str = "impl", status: str = "active") -> None:
@@ -7250,7 +7253,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
             atomic_file.write_text_atomic(worker_admission.transcript_source(row, backend), json.dumps({
                 "type": "assistant", "message": {"content": [{"type": "text", "text": "DONE dispatch-" + row.name}]}}) + "\n")
 
-    def test_busy_move_keeps_one_conversation_and_pane_and_rerun_changes_nothing(self) -> None:
+    def test_busy_move_opens_a_new_pane_on_the_same_conversation_and_rerun_changes_nothing(self) -> None:
         row = self.worker()
         _ = self.fixture.worker_run("a-first", "unit", self.owner.current_session, transport="herdr", director_run=True,
             passes=({"worker_name": row.name, "kind": "review", "status": "active", "started_at": 0,
@@ -7260,13 +7263,13 @@ class PaneWorkerMoveTests(unittest.TestCase):
         before = self.fixture.staff_state()
         result = self.move("claude2", why="quota")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "director-implementer")])
         self.assertIn(row.current_session, self.world.requests[0][1])
         prompt = next(command for command in self.world.commands if command[:2] == ("agent", "prompt"))
         self.assertIn("Continue pass dispatch-implementer", prompt[-1])
         self.assertIn("moved from claude1 to claude2", prompt[-1])
         self.assertEqual(self.target_check.call_args.args[0], row.current_session)
-        self.assertEqual(cast(herdr.HerdrPlace, self.target_check.call_args.kwargs["place"]).pane, "w1:p1")
+        self.assertEqual(cast(herdr.HerdrPlace, self.target_check.call_args.kwargs["place"]).pane, "w1:p2")
         journal = moves.store_file().read_bytes()
         with patch.object(moves, "append_move", wraps=moves.append_move) as append:
             rerun = self.move("claude2")
@@ -7275,7 +7278,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(moves.store_file().read_bytes(), journal)
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.fixture.staff_state(), before)
-        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
         self.assertIn("w1:p0", self.world.foreground)
         self.assertEqual([item["kind"] for item in moves.read_moves()], ["requested", "confirmed"])
         self.assertEqual(moves.read_moves()[0].get("terminal"), "terminal-w1:p1")
@@ -7316,7 +7319,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         outcome = result.outcomes[0]
         assert isinstance(outcome, stop_results.ClaudeUp)
         self.assertEqual(outcome.elapsed_seconds, 2.5)
-        self.assertIn("Claude is up on claude2 in w1:p1 (2.5 s)", result.stdout)
+        self.assertIn("Claude is up on claude2 in w1:p2 (2.5 s)", result.stdout)
 
     def test_codex_move_reads_the_process_account_and_resumes_the_same_thread(self) -> None:
         row = self.worker(family="codex")
@@ -7334,13 +7337,15 @@ class PaneWorkerMoveTests(unittest.TestCase):
         member = accounts.LiveGroupMember(str(row.current_session), row.name, "units", self.root / ".codex2")
         self.assertTrue(accounts.session_on_account(member, "codex2"))
 
-    def test_stopped_worker_resumes_in_its_saved_terminal(self) -> None:
+    def test_stopped_worker_closes_its_old_shell_and_resumes_in_a_new_pane(self) -> None:
         row = self.worker(live=False)
         self.dispatch(row)
         result = self.move("claude2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.stop.assert_not_called()
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "director-implementer")])
+
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
 
     def test_stopped_idle_worker_move_closes_the_pane_and_keeps_the_conversation(self) -> None:
         row = self.worker(live=False)
@@ -7459,12 +7464,12 @@ class PaneWorkerMoveTests(unittest.TestCase):
                 self.assertEqual(self.world.launches, [])
                 self.stop.assert_not_called()
 
-    def test_stop_requires_fresh_stopped_evidence_in_the_same_terminal(self) -> None:
+    def test_stop_requires_fresh_stopped_evidence_before_resuming(self) -> None:
         row = self.worker()
         self.dispatch(row)
         with patch.object(self.world, "stop", return_value=True):
             result = self.move("claude2")
-        self.assertIn("stop did not prove the same worker terminal", result.stderr)
+        self.assertIn("stop did not prove the worker stopped", result.stderr)
         self.assertEqual(self.world.launches, [])
 
     def test_a_held_worker_lock_keeps_only_that_worker(self) -> None:
