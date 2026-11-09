@@ -97,6 +97,14 @@ def _committed(doc: Path) -> None:
         raise Refusal(f"{doc} is not committed; the unit commits it first")
 
 
+def check_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude,
+                   worktree: Path, document: Path) -> None:
+    """Require an idle director, a clean worktree, and a committed document."""
+    _quiet(name, marked, claude)
+    _settled(name, claude, worktree)
+    _committed(document)
+
+
 def checked(name: str, child_name: str, doc: Path, *,
             record: staff.StaffSnapshot | None = None) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
@@ -140,9 +148,7 @@ def checked(name: str, child_name: str, doc: Path, *,
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
         raise Refusal(f"{name} has no live session under {parent.name}")
     claude = marked.claude
-    _quiet(name, marked, claude)
-    _settled(name, claude, worktree)
-    _committed(child.doc)
+    check_director(name, marked, claude, worktree, child.doc)
     # Only the unit's herdr tab will end before the same-named destination starts.
     directory = showrunner_account_directory()
     ending = add_showrunner.EndingUnitTab(marked.place.pane)
@@ -151,9 +157,14 @@ def checked(name: str, child_name: str, doc: Path, *,
 
 
 def promotion_record(parent: Production, unit: str) -> Path:
-    path = _git(parent.checkout, "rev-parse", "--git-path", f"promotions/{unit}.json")
+    return director_record(parent, unit, "promotions")
+
+
+def director_record(parent: Production, name: str, operation: str) -> Path:
+    """Locate a director transition record in the parent's Git directory."""
+    path = _git(parent.checkout, "rev-parse", "--git-path", f"{operation}/{name}.json")
     if path.returncode:
-        raise Refusal(f"cannot find the promotion record: {path.stderr.strip()}")
+        raise Refusal(f"cannot find the director record: {path.stderr.strip()}")
     record = Path(path.stdout.strip())
     return record if record.is_absolute() else parent.checkout / record
 
@@ -196,13 +207,18 @@ def finish_child(promotion: Promotion, target: Path, pending: Path, pid: int) ->
 
 def stop(promotion: Promotion) -> bool:
     """Stop the director and retain its workers for the promoted holder."""
+    return stop_director(promotion.unit, promotion.marked, promotion.claude)
+
+
+def stop_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> bool:
+    """Stop the director and retain its workers for the next role."""
     record = staff.snapshot()
-    row = record.by_member_reference(promotion.claude.session_id)
+    row = record.by_member_reference(claude.session_id)
     unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None else []
-    result = stop_resume.stop(promotion.claude.session_id, deadline=worker_lifecycle.effective_deadline())
+    result = stop_resume.stop(claude.session_id, deadline=worker_lifecycle.effective_deadline())
     stopped = isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning))
     if stopped and not unresolved:
-        place = promotion.marked.place
+        place = marked.place
         client = herdr.Herdr(place.session)
         try:
             panes = client.panes()
@@ -210,7 +226,7 @@ def stop(promotion: Promotion) -> bool:
             workers: set[str] = {worker.name for worker in record.find(kind="worker", parent=row.id)} if row is not None else set()
             shells = [pane for pane in panes if pane.get("tab_id", "") in tabs and pane.get("label") in workers]
         except (OSError, ValueError, herdr.HerdrFailure) as error:
-            print(f"anomaly: {promotion.unit}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+            print(f"anomaly: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
             shells = []
         for pane in shells:
             try:
@@ -220,10 +236,10 @@ def stop(promotion: Promotion) -> bool:
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"anomaly: {pane.get('label')}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         try:
-            if not client.close_tab_confirmed(place.pane, target=promotion.claude.session_id):
-                print(f"anomaly: {promotion.unit}: old director tab close failed", file=sys.stderr)
+            if not client.close_tab_confirmed(place.pane, target=claude.session_id):
+                print(f"anomaly: {name}: old director tab close failed", file=sys.stderr)
         except (OSError, ValueError, herdr.HerdrFailure) as error:
-            print(f"anomaly: {promotion.unit}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+            print(f"anomaly: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
     return stopped
 
 

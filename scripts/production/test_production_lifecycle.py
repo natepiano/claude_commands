@@ -13,7 +13,9 @@ from dataclasses import replace
 import io
 import json
 import os
+import shutil
 import socket
+import tempfile
 import unittest
 from pathlib import Path
 from typing import final, override
@@ -823,6 +825,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("commit", "-m", "unmerged", cwd=self.alpha)
         _ = self.git("push", "origin", "alpha-branch", cwd=self.alpha)
         self.park_fixture_unit("alpha", self.alpha, "alpha-branch")
+        row = unit_membership("example", "alpha")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.alpha), expected=row.worktree)
         _ = self.git("worktree", "remove", str(self.alpha))
         _ = self.git("branch", "-D", "alpha-branch")
         result = self.run_lifecycle("wrap", "--no-ci")
@@ -837,6 +841,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         self.park_fixture_unit("alpha", self.alpha, "alpha-branch")
+        row = unit_membership("example", "alpha")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.alpha), expected=row.worktree)
         _ = self.git("worktree", "remove", str(self.alpha))
         _ = self.git("branch", "-d", "alpha-branch")
         _ = self.git("push", "origin", "--delete", "alpha-branch")
@@ -955,25 +961,51 @@ class LifecycleTests(LifecycleFixture):
         self.assertTrue(self.alpha.exists())
 
     def test_wrap_without_ci_retires_units_removes_notifier_and_reports(self) -> None:
-        self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
-        _ = self.git("push", "origin", "production")
-        result = self.run_lifecycle("wrap", "--no-ci")
-        self.assert_step(result, "ok")
-        self.assert_no_ci_skips(result.stdout)
-        self.assertFalse(self.alpha.exists())
-        self.assertFalse(self.beta.exists())
-        self.assertIn("wrapped", self.doc.read_text())
-        for area in ("Units", "Merge branch", "CI", "Close-out", "Main", "Next"):
-            self.assertIn(f"| {area} |", result.stdout)
-        calls = (self.state / "calls").read_text()
-        self.assertIn("notifier.sh remove", calls)
-        self.assertNotIn("showrunners.py", calls)
-        self.assertNotIn("gh ", calls)
-        self.assertNotIn("ssh ", calls)
-        self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
-        self.assertEqual(self.sent(), [])
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "snapshot"
+            _ = shutil.copytree(self.root, snapshot)
+            staff_bytes = self.staff.staff_file.read_bytes()
+            for landed in ("ancestor", "equal-patch", "separate-promotion"):
+                with self.subTest(landed=landed):
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root)
+                    _ = self.staff.staff_file.write_bytes(staff_bytes)
+                    self.running()
+                    if landed != "equal-patch":
+                        alpha, _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+                    else:
+                        self.write(self.alpha / "alpha-1.txt", "alpha work\n")
+                        _ = self.git("add", "alpha-1.txt", cwd=self.alpha)
+                        _ = self.git("commit", "-m", "alpha work", cwd=self.alpha)
+                        alpha = self.git("rev-parse", "HEAD", cwd=self.alpha)
+                        _ = self.git("push", "origin", "alpha-branch", cwd=self.alpha)
+                        _ = self.git("cherry-pick", "--no-commit", alpha)
+                        _ = self.git("commit", "-m", "Copy alpha patch")
+                    _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
+                    if landed == "separate-promotion":
+                        destination = self.promotion_checkout("installed")
+                        self.production_doc("running", promote=f"`{destination}`")
+                        _ = self.git("add", str(self.doc))
+                        _ = self.git("commit", "-m", "Declare promotion")
+                    _ = self.git("push", "origin", "production")
+                    result = self.run_lifecycle("wrap", "--no-ci")
+                    self.assert_step(result, "ok")
+                    self.assert_no_ci_skips(result.stdout)
+                    self.assertFalse(self.alpha.exists())
+                    self.assertFalse(self.beta.exists())
+                    self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch"), "")
+                    self.assertIn("wrapped", self.doc.read_text())
+                    if landed == "equal-patch":
+                        self.assertEqual(self.git("cherry", "origin/main", alpha).split()[0], "-")
+                    for area in ("Units", "Merge branch", "CI", "Close-out", "Main", "Next"):
+                        self.assertIn(f"| {area} |", result.stdout)
+                    calls = (self.state / "calls").read_text()
+                    self.assertIn("notifier.sh remove", calls)
+                    self.assertNotIn("showrunners.py", calls)
+                    self.assertNotIn("gh ", calls)
+                    self.assertNotIn("ssh ", calls)
+                    self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
+                    self.assertEqual(self.sent(), [])
 
     def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
         self.running()

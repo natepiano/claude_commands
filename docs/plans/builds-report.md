@@ -921,3 +921,47 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Gotchas:**
 - Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
+
+### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
+
+#### As-built
+
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
+
+### Phase 45 — Copy watch test processes end by themselves · status: done
+**Depends on:** none.
+
+From the builds showrunner (not the user), 2026-11-09: four leftover processes from 2026-11-05 are a writer bug. Find the fixture that starts them without an end and fix it.
+
+All four came from `scripts/mac_test/test_copy_watch.py`. A suite that received SIGTERM ended without `tearDown`. The stubs run in their own session and wait for a file or a signal, so they ran for four days.
+
+#### Work Order
+
+**Goal:** Every process that the copy watch tests start ends by itself within the test hang guard, also when the test run is killed.
+
+**Spec:**
+- `STEP_STUB`, `RUNNER_STUB` and the inline parent wrapper in `assert_parent_loss_stops_watcher` each arm `signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))` as their first action.
+- The fixture sets `TEST_HANG_GUARD_SECS` from `test_hang_guard.TEST_HANG_GUARD_SECS` in the environment of each of these processes. `start_step` passes that environment.
+- Any other process that this file starts and that waits with no limit gets the same alarm.
+- The watcher is real code and does not change. It ends when its parent is gone.
+- No new test: the fixture is test code. A one-time trial proves the limit.
+
+**Files:**
+- `scripts/mac_test/test_copy_watch.py`
+
+**Workers:** `1 writer`
+- writer — the file; runs the tests and the trial.
+
+**State:** none.
+
+**Acceptance gate:**
+- A trial with `TEST_HANG_GUARD_SECS=1` shows `STEP_STUB` and `RUNNER_STUB` in hold mode each end with SIGALRM within 5 seconds.
+- `test_copy_watch` passes and `basedpyright` reports 0 errors, 0 warnings on the file.

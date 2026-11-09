@@ -2180,3 +2180,37 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Ruled out:**
 - A guard for a test that runs a second in-process `unittest` runner: no test does this, and module cleanups are process-wide in `unittest`.
+
+### Phase 110 — The nightly type check is a footnote under the slowest modules list  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the user, 2026-11-09: "when showing ~/.claude repo tests we should not include it in the top 20 - it can be a footnote to the output that just shows its current time and that it runs nightly so is not considerd as part of our top tests to improve list". `types/basedpyright` runs only in the 03:00 nightly gate, but `show.py top` ranks it first by median CPU.
+
+**Goal:** `show.py top` in the `~/.claude` repository ranks test modules only, and one footnote line gives the nightly type check's latest time.
+
+**Spec:**
+1. In `top()` in `scripts/test_times/show.py`, keep `TYPE_CHECK_JOB` out of the ranked rows. The rank numbers, the `--limit` count and the `sum of median CPU` line cover test modules only, so the default list shows 20 test modules.
+2. Read the type check's latest passed run with the same filters as a module history (host, checkout, age limit, no restart, status 0, not aborted). When a run exists, print one footnote line after the `sum of median CPU` line and before any `unmeasured` line: `types/basedpyright runs nightly, so it is not ranked: last run <cpu> CPU s, <wall> s`. Use the existing `seconds()` format. When no run exists, print no footnote.
+3. Remove the table branch for `TYPE_CHECK_JOB`; no ranked row is the type check now.
+4. Change nothing else: `show.py module types/basedpyright`, the `suites` view and the nextest `top` view stay as they are. The gate still records the type check.
+5. Update the `top` description in `commands/test_times.md` in the same commit.
+6. Add no check and no new test. Change the assertions of the existing tests `test_top_ranks_live_local_modules_by_the_first_completed_attempt_and_recent_median`, `test_top_names_unmeasured_live_modules_without_counting_the_display_limit` and `test_missing_times_and_type_jobs_do_not_show_test_measurements` (its two cell assertions read the table row that this phase removes) in `scripts/test_times/test_show.py` (user rules 1 and 2, 2026-11-07). Assert that no ranked row is the type check, that the sum leaves it out, and that the footnote has its values. Keep the existing test of the limit true for test modules.
+
+**Files:**
+- `scripts/test_times/show.py` — the ranked rows and the footnote
+- `scripts/test_times/test_show.py` — changed assertions in the existing tests
+- `commands/test_times.md` — the `top` description
+
+**Workers:** 1 writer; the files are one change
+- `impl` — all three files
+
+**Constraints from prior phases:**
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `scripts/test_times/test_show.py` passes.
+- `show.py top` on the live index ranks 20 test modules, has no `types/basedpyright` row, and prints the footnote.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed Python files prints `0 errors, 0 warnings, 0 notes`
