@@ -1193,7 +1193,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The hold-events cause is a race found by reading the code; no process that outlives the test was found.
 - Above the bound, a choice-limited interpreter program is refused even when it makes no tree; the phase "A command that makes no tree passes at the copy guard's branch limit" removes that refusal.
 
-### Phase 41v — A command that makes no tree passes at the copy guard's branch limit  · status: todo
+### Phase 41v — A command that makes no tree passes at the copy guard's branch limit  · status: done
 
 **Depends on:** 41t.
 

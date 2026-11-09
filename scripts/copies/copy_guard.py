@@ -97,6 +97,7 @@ class UnresolvedChoices:
     """The branch combinations exceed the configured inspection limit."""
     description: str
     text: str = syntax.UNKNOWN_VALUE
+    choice_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,21 @@ class ArgumentChoices:
 Argument = KnownArgument | UnknownArgument | UnresolvedChoices | UnknownArguments | ForwardedArguments | ArgumentChoices
 
 
+def _retained_choice_texts(words: tuple[Argument, ...]) -> tuple[str, ...]:
+    """Keep value fragments without constructing combinations across words."""
+    texts: dict[str, None] = {}
+    pending = deque(words)
+    while pending:
+        word = pending.popleft()
+        if isinstance(word, ArgumentChoices):
+            pending.extend(argument for choice in word.choices for argument in choice)
+        elif isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
+            texts[word.text] = None
+            if isinstance(word, UnresolvedChoices):
+                texts.update(dict.fromkeys(word.choice_texts))
+    return tuple(texts)
+
+
 @cache
 def _choice_limit() -> int:
     from scripts.copies.copies import guard_choice_limit
@@ -130,7 +146,8 @@ def _choice_options(choices: tuple[tuple[Argument, ...], ...], description: str)
         for vector in _choice_vectors(choice):
             options[vector] = None
             if len(options) > _choice_limit():
-                return ((UnresolvedChoices(description),),)
+                texts = _retained_choice_texts(tuple(argument for choice in choices for argument in choice))
+                return ((UnresolvedChoices(description, choice_texts=texts),),)
     return tuple(options)
 
 
@@ -140,7 +157,7 @@ def _choice_vectors(words: tuple[Argument, ...]) -> tuple[tuple[Argument, ...], 
     for word in words:
         options = _choice_options(word.choices, "branch choices") if isinstance(word, ArgumentChoices) else ((word,),)
         if len(vectors) * len(options) > _choice_limit():
-            options = ((UnresolvedChoices("branch choices"),),)
+            options = ((UnresolvedChoices("branch choices", choice_texts=_retained_choice_texts((word,))),),)
         if len(options) == 1:
             for vector in vectors:
                 vector.extend(options[0])
@@ -165,9 +182,10 @@ class ExpandedProgramInput:
 
 
 @dataclass(frozen=True)
-class ChoiceLimitedProgramInput:
-    """Known program text remains, but some branch values exceed the inspection limit."""
+class ProgramWithChoiceTexts:
+    """The program retains known text and value fragments above the inspection limit."""
     text: str
+    choice_texts: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -175,7 +193,7 @@ class UnknownProgramInput:
     reason: str
 
 
-ProgramInput = LiteralProgramInput | ExpandedProgramInput | ChoiceLimitedProgramInput | UnknownProgramInput
+ProgramInput = LiteralProgramInput | ExpandedProgramInput | ProgramWithChoiceTexts | UnknownProgramInput
 UNAVAILABLE_STDIN = UnknownProgramInput("cannot resolve interpreter stdin")
 
 
@@ -214,7 +232,7 @@ def _program_input(argument: Argument) -> ProgramInput:
     if isinstance(argument, UnknownArgument):
         return ExpandedProgramInput(argument.text)
     if isinstance(argument, UnresolvedChoices):
-        return ChoiceLimitedProgramInput(argument.text)
+        return ProgramWithChoiceTexts(argument.text, argument.choice_texts)
     return UnknownProgramInput("cannot resolve interpreter program")
 
 
@@ -226,7 +244,8 @@ def decode_invocation(words: list[Argument]) -> Invocation:
     if executable == "eval":
         text = " ".join(word.text if isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)) else syntax.UNKNOWN_VALUE
                         for word in words[1:])
-        source = (ChoiceLimitedProgramInput(text) if any(isinstance(word, UnresolvedChoices) for word in words[1:])
+        source = (ProgramWithChoiceTexts(text, _retained_choice_texts(tuple(words[1:])))
+                  if any(isinstance(word, UnresolvedChoices) for word in words[1:])
                   else LiteralProgramInput(text) if all(isinstance(word, KnownArgument) for word in words[1:])
                   else ExpandedProgramInput(text))
         return CommandProgram("shell", source)
@@ -241,7 +260,7 @@ def _python_invocation(rest: list[Argument]) -> Invocation:
     index = 0
     while index < len(rest):
         word = rest[index]
-        if not isinstance(word, (KnownArgument, UnknownArgument)):
+        if not isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
             return ScriptProgram()
         text = word.text
         if text == "--":
@@ -262,7 +281,8 @@ def _python_invocation(rest: list[Argument]) -> Invocation:
             if flag in "?hV":
                 return NoProgramInvocation()
             if flag == "c":
-                source = ((ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
+                source = ((ProgramWithChoiceTexts(flags[offset + 1:], word.choice_texts) if isinstance(word, UnresolvedChoices)
+                           else ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
                            else LiteralProgramInput(flags[offset + 1:])) if offset + 1 < len(flags)
                           else _program_input(rest[index + 1]) if index + 1 < len(rest)
                           else UnknownProgramInput("missing interpreter command"))
@@ -288,7 +308,7 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
     long_options = True
     while index < len(rest):
         word = rest[index]
-        if not isinstance(word, (KnownArgument, UnknownArgument)):
+        if not isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
             return ScriptProgram()
         text = word.text
         if text == "--" or text == "-":
@@ -310,7 +330,8 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
             if flags.startswith(syntax.UNKNOWN_VALUE, offset):
                 return ScriptProgram()
             if flag == "c" and text.startswith("-"):
-                source = (ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
+                source = (ProgramWithChoiceTexts(flags[offset + 1:], word.choice_texts) if isinstance(word, UnresolvedChoices)
+                          else ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
                           else _program_input(rest[index + 1]) if index + 1 < len(rest)
                           else UnknownProgramInput("missing interpreter command"))
                 return CommandProgram("shell", source)
@@ -322,6 +343,11 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
                 break
         index += 1
     return StdinProgram("shell") if stdin or index == len(rest) else ScriptProgram()
+
+
+def _tree_making_text(text: str) -> bool:
+    return (TREE_COMMAND.search(text.replace("\n", " ")) is not None
+            or re.search(r"\b(?:copytree|clone_from|worktree)\b|\bRepo\s*\.\s*clone\b", text) is not None)
 
 
 def inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
@@ -343,26 +369,26 @@ def inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
     if isinstance(source, UnknownProgramInput):
         # Static abstract shell helpers are checked at concrete call sites.
         return operation if static else _prefer(operation, UnresolvedOperation(source.reason))
+    choices: PolicyOutcome = NoForbiddenOperation()
+    if isinstance(source, ProgramWithChoiceTexts) and any(
+            _tree_making_text(text) for text in (source.text, *source.choice_texts)):
+        choices = UnresolvedOperation("cannot resolve interpreter program choices")
     if invocation.language == "shell":
         parsed = inspect_shell(source.text, cwd, static=static)
     else:
         try:
             tree = ast.parse(source.text)
         except SyntaxError:
-            if isinstance(source, ChoiceLimitedProgramInput) or isinstance(source, ExpandedProgramInput) and (
-                    TREE_COMMAND.search(source.text.replace("\n", " "))
-                    or re.search(r"\b(?:copytree|clone_from|worktree)\b|\bRepo\s*\.\s*clone\b", source.text)):
+            if isinstance(source, (ExpandedProgramInput, ProgramWithChoiceTexts)) and _tree_making_text(source.text):
                 return _prefer(operation, UnresolvedOperation("cannot parse Python program"))
-            return operation
+            return _prefer(operation, choices)
         parsed: PolicyOutcome = NoForbiddenOperation()
         for finding in PythonPolicy(cwd / "<python-command>", static=static).scan(tree):
             result: PolicyOutcome = (UnresolvedOperation(finding.operation.removeprefix("unresolved relevant operation: "))
                                      if finding.operation.startswith("unresolved relevant operation: ")
                                      else ForbiddenOperation(finding.operation))
             parsed = _prefer(parsed, result)
-    if isinstance(source, ChoiceLimitedProgramInput):
-        parsed = _prefer(parsed, UnresolvedOperation("cannot resolve interpreter program choices"))
-    return _prefer(operation, parsed)
+    return _prefer(operation, _prefer(parsed, choices))
 
 
 def _prefer(left: PolicyOutcome, right: PolicyOutcome) -> PolicyOutcome:
@@ -555,7 +581,7 @@ class ShellPolicy:
             if word.segments and isinstance(word.segments[0], syntax.Literal) and not word.segments[0].quoted:
                 text = os.path.expanduser(text)
             if any(isinstance(part, UnresolvedChoices) for part in vector):
-                joined.append((UnresolvedChoices("word choices", text),))
+                joined.append((UnresolvedChoices("word choices", text, _retained_choice_texts(vector)),))
             elif all(isinstance(part, KnownArgument) for part in vector):
                 joined.append((KnownArgument(text, glob),))
             else:

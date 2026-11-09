@@ -371,6 +371,39 @@ class CopyGuardTests(unittest.TestCase):
                             self.assertEqual(reason, "")
                         self.assertLessEqual(inspected.call_count, 4 * count + copies.guard_choice_limit() + 1)
 
+        values = "".join(f"${{value{index}}}" for index in range(6))
+
+        def branches(left: str, right: str) -> list[str]:
+            return [f"if test condition; then value{index}={left}; else value{index}={right}; fi"
+                    for index in range(6)]
+
+        case_programs = ("case 0 in\n" + "\n".join(
+            f"{index}) program='git clone . /tmp/out-{index}';;" for index in range(33)) + "\nesac")
+        rows = (
+            ("shell-printf-above-choice-limit", branches("left", "right"), 'bash -c "printf %s ' + values + '"', ""),
+            ("shell-clone-above-choice-limit", branches("left", "right"), 'bash -c "git clone ' + values + ' dest"', "git clone:"),
+            ("shell-runner-above-choice-limit", branches("git", "''"),
+             'runner="' + values + '"; bash -c "$runner clone source destination"',
+             "unresolved relevant operation: cannot resolve executable name"),
+            ("copytree-above-choice-limit", branches("./", "././"),
+             'python3 -c "import shutil;shutil.copytree(\'' + values + '.\',\'/tmp/out\')"',
+             "unresolved relevant operation: cannot resolve interpreter program choices"),
+            ("git-options-above-choice-limit", branches("/", "//"),
+             'bash -c "/tmp/git-bin' + values + 'git -C . clone . /tmp/out"',
+             "unresolved relevant operation: cannot resolve interpreter program choices"),
+            ("eval-above-choice-limit", [case_programs], 'eval "$program"',
+             "unresolved relevant operation: cannot resolve interpreter program choices"),
+        )
+        for name, assignments, program, expected in rows:
+            with self.subTest(case=name):
+                reason = copy_guard.refusal("; ".join([*assignments, program]), self.repo)
+                if expected:
+                    self.assertTrue(reason.startswith(expected), reason)
+                    if expected == "git clone:":
+                        self.assertIn("copies.py", reason)
+                else:
+                    self.assertEqual(reason, "")
+
     def test_unparseable_shell_is_refused_instead_of_silently_allowed(self) -> None:
         self.assertIn("copies.py run", copy_guard.refusal('git clone "unterminated', self.root))
         for command, unreadable in (('"$(cat command-file)" source destination', "executable"),
