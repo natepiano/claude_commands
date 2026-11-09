@@ -22,6 +22,7 @@ from typing import cast
 from scripts.production import showrunners  # noqa: E402
 from scripts.production.production_doc import ProductionDocument  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
+from scripts.herdr import pane_launch  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
@@ -50,12 +51,12 @@ def ensure_staff_showrunner(child: ProductionDocument, caller: str = "", *, runt
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
             raise staff.StaffRefused(f"{child.name}: native session conflicts with retained staff identity")
         if found.row.doc == location:
-            return found.row
-        return staff.ensure("showrunner", name=found.row.name, parent=found.row.parent, doc=location)
+            return pane_launch.staff_admitted(found.row)
+        return pane_launch.staff_admitted(staff.ensure("showrunner", name=found.row.name, parent=found.row.parent, doc=location))
     if caller:
         _ = showrunners.owner_for(caller, record)
     # Admission records the document. Parent attachment records the edge and notices later.
-    return staff.ensure("showrunner", name=child.name, doc=location, runtime_id=runtime_id)
+    return pane_launch.staff_admitted(staff.ensure("showrunner", name=child.name, doc=location, runtime_id=runtime_id))
 
 
 def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:

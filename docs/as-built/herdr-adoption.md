@@ -168,6 +168,16 @@ Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
 The saved launcher reads the transcript and waits for `DONE <dispatch id>` without submitting the dispatch again.
 
+Pane starts record the account folder in the staff row's `home` through `staff.set_home`.
+Account moves and restarts use the same pane publication call.
+A pane launch retains `config_dir` only when the session has no staff row.
+`pane_launch.config_home` reads a staffed session's `home` or the unstaffed launch's `config_dir`.
+`stop_resume.py` uses this reader for retained accounts.
+The launch environment carries the selected target account until the start hook publishes its home.
+`add_unit.ensure_staff_unit` calls `pane_launch.staff_admitted` after unit admission.
+Worker pane admission and `staff_sources.ensure_staff_showrunner` use the same completion call.
+These calls complete a pane publication that preceded its staff row.
+
 ### Matching a running session to its staff row
 
 `unit_lookup.py` reads process evidence through herdr.
@@ -247,7 +257,7 @@ The command waits for the showrunner's registration before it attaches the child
   - A legacy tmux host restarts into `SharedHerdrTab`, with no window step.
   - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
 - **`_herdr_launch` steps.**
-  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
+  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account uses the home from `pane_launch.config_home`.
   2. Write Claude folder trust in the target account before starting Claude. A failed write prints one anomaly and prevents the start.
   3. Call `restore_server(name, 90_000, session_kind=...)`.
   4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.

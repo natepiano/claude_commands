@@ -144,7 +144,7 @@ class FakeClient(herdr.Herdr):
                 owner = staff.initial_snapshot().by_current_session(self.native_ids[pane])
                 reference = owner.id if owner is not None else self.native_ids[pane]
                 original = next(entry for entry in entries.values() if entry["session_id"] == reference)
-                environment = {**original["environment"], "CLAUDE_CONFIG_DIR": original["config_dir"]}
+                environment = {**original["environment"], "CLAUDE_CONFIG_DIR": pane_launch.config_home(original)}
                 replacement = pane_record.launch(pane, self.native_ids[pane], original["cwd"],
                     environment, ["claude", *agent_arguments])
                 pane_record.write(self.session, replacement)
@@ -201,6 +201,8 @@ class PaneRestoreTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.config = self.root / ".claude3"
+        self.row = replace(type(self).row, home=staff.SessionHome(self.config))
+        _ = self.enterContext(mock.patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((self.row,))))
         def codex_home(label: str) -> agent_accounts.CodexHomeHoldingLogin:
             return agent_accounts.CodexHomeHoldingLogin(label, self.root / f".{label}", "private@example.test")
         _ = self.enterContext(mock.patch.object(agent_accounts, "codex_account_home", side_effect=codex_home))
@@ -215,7 +217,14 @@ class PaneRestoreTests(unittest.TestCase):
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             write_text_atomic(configuration / source.name, source.read_text())
 
-        _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((self.row,))))
+        record_home = staff.set_home
+        def set_home(_identity: staff.StaffId, home: staff.SessionHome) -> staff.StaffRow:
+            if _identity != self.row.id:
+                return record_home(_identity, home)
+            self.row = replace(self.row, home=home)
+            return self.row
+        _ = self.enterContext(mock.patch.object(staff, "set_home", side_effect=set_home))
+        _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", side_effect=lambda: staff.StaffSnapshot((self.row,))))
         _ = self.enterContext(mock.patch("scripts.shutdown.remote.local_machine", return_value="natedev"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("demo", "alpha")))
@@ -254,13 +263,14 @@ class PaneRestoreTests(unittest.TestCase):
         return "w1:p3"
 
     def entry(self, **changes: object) -> None:
-        if changes.get("kind") == "codex":
+        kind = cast(Literal["claude", "codex"], changes.get("kind", "claude"))
+        if kind == "codex":
             changes = {"config_dir": str(self.root / ".codex2"),
                        "environment": {"CODEX_HOME": str(self.root / ".codex2")}, **changes}
-        launch = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha",
-                                    {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT": "demo",
-                                     "CLAUDE_CODE_OAUTH_TOKEN": "secret"},
-                                    ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "opus"])
+        environment = cast(dict[str, str], changes.get("environment", {
+            "CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT": "demo", "CLAUDE_CODE_OAUTH_TOKEN": "secret"}))
+        launch = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", environment,
+                                    ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "opus"], kind=kind)
         pane_record.write("agents", cast(pane_record.PaneLaunch, cast(object, {**launch, **changes})))
 
     def run_restore(self, client: FakeClient) -> tuple[int, str]:
@@ -429,7 +439,7 @@ class PaneRestoreTests(unittest.TestCase):
             worker_name=row.name, worker_id=row.id, launcher_command=["bash", "assign.sh", "impl", str(prompt)],
             prompt=prompt, kind="impl", lens="")
         pane_record.write("agents", pane_record.launch("w1:p1", str(row.current_session), str(fixture.root),
-            {"CODEX_HOME": str(fixture.root / "codex")}, ["codex", "resume", str(row.current_session)]))
+            {"CODEX_HOME": str(fixture.root / "codex")}, ["codex", "resume", str(row.current_session)], kind="codex"))
         before = fixture.world.panes()
         with (mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
               mock.patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
@@ -440,7 +450,8 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual([(pane["pane_id"], pane.get("terminal_id")) for pane in before],
                          [(pane["pane_id"], pane.get("terminal_id")) for pane in fixture.world.panes()])
         self.assertIsInstance(fixture.observation(row), worker_panes.OpenWorker)
-        self.assertEqual(staff.snapshot().by_id(row.id), row)
+        self.assertEqual(staff.snapshot().by_id(row.id), replace(row, role=staff.KnownWorkerRole("impl"),
+            home=staff.SessionHome(fixture.root / "codex")))
 
 
     def test_seed_writes_the_entry_of_each_running_claude(self) -> None:
@@ -458,7 +469,7 @@ class PaneRestoreTests(unittest.TestCase):
               redirect_stdout(io.StringIO())):
             self.assertEqual(pane_record.seed("agents"), 0)
         entry = pane_record.read("agents")["w1:p2"]
-        self.assertEqual((entry["session_id"], entry["config_dir"], entry["name"], entry["model"], entry["cwd"]),
+        self.assertEqual((entry["session_id"], pane_launch.config_home(entry), entry["name"], entry["model"], entry["cwd"]),
                          (str(self.row.id), str(self.config), "alpha", "opus", "/work/alpha"))
         self.assertEqual(entry["environment"], {})
 
@@ -711,7 +722,7 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)
-        self.assertEqual(len(self.ssh_commands()), 8)
+        self.assertEqual(len(self.ssh_commands()), 10)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 2)
         self.assertEqual(started, ["renamed", "models"])
@@ -992,7 +1003,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
                   _account: str, _message: str) -> runtime_sessions.LiveSessionProcess:
             replacement = pane_record.launch(tab.pane_id, self.owner.current_session, entry["cwd"],
-                {"CLAUDE_CONFIG_DIR": entry["config_dir"]}, ["claude", "--resume", self.owner.current_session])
+                {"CLAUDE_CONFIG_DIR": pane_launch.config_home(entry)}, ["claude", "--resume", self.owner.current_session])
             pane_record.write("agents", replacement)
             return runtime_sessions.LiveSessionProcess(backend.pid)
 

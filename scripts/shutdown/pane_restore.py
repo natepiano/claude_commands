@@ -36,8 +36,8 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr.HerdrFailure("the pane runs a program")
     kind = pane_launch.agent_kind(entry)
-    account = ({"CODEX_HOME": entry["config_dir"]} if kind == "codex"
-               else named_account_environment(Path(entry["config_dir"])))
+    account = ({"CODEX_HOME": pane_launch.config_home(entry)} if kind == "codex"
+               else named_account_environment(Path(pane_launch.config_home(entry))))
     title = entry["name"] or pane.label
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], {**entry["environment"], **account},
         kind, trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
@@ -82,12 +82,12 @@ def restore(session: str, *, dry_run: bool) -> int:
         holder = parent if parent is not None and restart.pane_workers(parent) else row
         selected[holder.id] = holder
         if saved is not None and holder.id == row.id:
-            home = Path(saved["config_dir"])
+            home = Path(pane_launch.config_home(saved))
             target_accounts[holder.id] = (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(home), home)
                 if pane_launch.agent_kind(saved) == "codex" else accounts.NamedAccount(accounts.claude_config_label(home), home))
         if dry_run:
             entry = names.resume(saved) if saved is not None else None
-            account = entry["config_dir"] if entry is not None else "retained account"
+            account = pane_launch.config_home(entry) if entry is not None else "retained account"
             print(f"{pane.pane_id} {row.name}: resume {row.current_session} on {account}")
     for holder in (() if dry_run else selected.values()):
         try:
@@ -115,7 +115,7 @@ def restore(session: str, *, dry_run: bool) -> int:
                 print(f"{pane.pane_id} {label}: left as it is: it already runs")
                 continue
             if dry_run:
-                print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {entry['config_dir']}")
+                print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {pane_launch.config_home(entry)}")
                 continue
             with staff.row_operation(entry["session_id"]):
                 current = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))

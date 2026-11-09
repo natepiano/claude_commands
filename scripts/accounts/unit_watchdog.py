@@ -32,6 +32,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.shutdown.remote import local_machine
 
+from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.production import live_units, unit_lookup
 from scripts.shutdown import pane_record
@@ -162,7 +163,7 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
         if entry is None or entry.get("ended", False):
             sources[(production, member.name)] = NoRecovery(member.current_session)
             continue
-        label = accounts.claude_config_label(Path(entry["config_dir"]))
+        label = accounts.claude_config_label(Path(pane_launch.config_home(entry)))
         owner = RecoverableUnit(session_id=member.current_session, name=member.name,
             cwd=str(member.worktree.path), unit=member.name, production=production)
         sources[(production, member.name)] = RecoverySource(owner, label, member.id)

@@ -25,10 +25,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.lib import conf, nix_env
+from scripts.lib import atomic_file, conf, nix_env
+from scripts.herdr import pane_launch
+from scripts.production import staff
 from scripts.message import send_result, sessions
 from scripts.message import send_budget
 if TYPE_CHECKING:
@@ -97,7 +99,7 @@ class PendingRestart(TypedDict):
     login: str
     name: str
     cwd: str
-    config_dir: str
+    config_dir: NotRequired[str]
     pid: int
     proc_start: str
     stop_request_sent: bool
@@ -251,13 +253,16 @@ def read_pending(value: object) -> NoPendingRestart | PendingRestart:
     stop_request_sent = fields.get("stop_request_sent", True)
     if (kind not in ("stopping", "launching") or not isinstance(login, str) or not login
             or not isinstance(name, str) or not isinstance(cwd, str) or not Path(cwd).is_absolute()
-            or not isinstance(config_dir, str) or not Path(config_dir).is_absolute()
+            or ("config_dir" in fields and (not isinstance(config_dir, str) or not Path(config_dir).is_absolute()))
             or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
             or not isinstance(proc_start, str) or not proc_start
             or not isinstance(stop_request_sent, bool)):
         raise ValueError("invalid nix-heal pending restart; refusing an unproven relaunch")
-    return PendingRestart(kind="launching" if kind == "launching" else "stopping", login=login, name=name, cwd=cwd,
-                          config_dir=config_dir, pid=pid, proc_start=proc_start, stop_request_sent=stop_request_sent)
+    pending = PendingRestart(kind="launching" if kind == "launching" else "stopping", login=login, name=name, cwd=cwd,
+                             pid=pid, proc_start=proc_start, stop_request_sent=stop_request_sent)
+    if isinstance(config_dir, str):
+        pending["config_dir"] = config_dir
+    return pending
 
 
 def read_history(directory: Path) -> dict[str, HealHistory]:
@@ -288,12 +293,7 @@ def read_history(directory: Path) -> dict[str, HealHistory]:
 
 
 def save_history(directory: Path, histories: dict[str, HealHistory]) -> None:
-    temporary = directory / f"state.{os.getpid()}.tmp"
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(histories, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
-    _ = temporary.replace(directory / "state.json")
+    atomic_file.write_text_atomic(directory / "state.json", json.dumps(histories))
 
 
 def log(directory: Path, session: HealSession, history: HealHistory, action: str, reason: str) -> None:
@@ -497,8 +497,10 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     history["restart_proc_start"] = session.proc_start
     history["healthy_since_restart"] = False
     pending = PendingRestart(kind="stopping", login=selected.login, name=session.name, cwd=str(session.cwd),
-                             config_dir=str(session.config_dir), pid=session.pid, proc_start=session.proc_start,
+                             pid=session.pid, proc_start=session.proc_start,
                              stop_request_sent=False)
+    if staff.initial_snapshot().by_member_reference(session.session_id) is None:
+        pending["config_dir"] = str(session.config_dir)
     history["pending"] = pending
     save_history(directory, histories)
     if not request_stop(directory, limits, session, pending, history, histories):
@@ -537,7 +539,7 @@ def sweep(only: str = "", check: bool = False) -> int:
                     continue
                 pending_ids.add(session_id)
                 session = HealSession(session_id, pending["pid"], pending["proc_start"], pending["name"],
-                                      Path(pending["cwd"]), "idle", Path(pending["config_dir"]))
+                                      Path(pending["cwd"]), "idle", Path(pane_launch.config_home({**pending, "session_id": session_id})))
                 try:
                     resume_pending(directory, limits, session, pending, history, histories)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

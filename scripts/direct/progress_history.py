@@ -1954,6 +1954,14 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             _start_pass(args)
+            try:
+                row = staff.initial_snapshot().by_id(worker_id)
+                if row is None:
+                    print(f"anomaly: {worker_id}: worker role has no staff row", file=sys.stderr)
+                elif row.role != staff.KnownWorkerRole(role):
+                    _ = staff.set_worker_role(worker_id, staff.KnownWorkerRole(role))
+            except (staff.StaffUnreadable, staff.StaffNotFound) as error:
+                print(f"anomaly: {worker_id}: {error}", file=sys.stderr)
             return _string(_pass_slots(_read_state(session_dir))[slot]["instance_id"])
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

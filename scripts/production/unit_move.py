@@ -28,6 +28,7 @@ from typing import NamedTuple, cast
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import tidy_wrapped  # noqa: E402
 from scripts.production import unit_lookup  # noqa: E402
+from scripts.herdr import pane_launch
 from scripts.herdr import herdr  # noqa: E402
 from scripts.shutdown import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
@@ -293,14 +294,16 @@ def unit_conversation(found: unit_lookup.LabeledSession | None, *, session_id: s
         return NoUnitConversation()
     if found is not None:
         entry = pane_record.read(found.place.session).get(found.place.pane)
-        if entry is not None and entry["session_id"] == session_id and entry["config_dir"]:
-            return UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
+        if entry is not None and entry["session_id"] == session_id:
+            home = pane_launch.config_home(entry)
+            if home:
+                return UnitConversation(session_id, accounts.claude_config_label(Path(home)))
     try:
         entry = pane_record.launch_for_session(session_id)
     except ValueError as error:
         raise RenameRefused(str(error)) from error
-    return (UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
-            if entry is not None and entry["config_dir"] else NoUnitConversation())
+    home = pane_launch.config_home(entry) if entry is not None else ""
+    return UnitConversation(session_id, accounts.claude_config_label(Path(home))) if home else NoUnitConversation()
 
 
 

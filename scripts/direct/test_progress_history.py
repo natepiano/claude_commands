@@ -8,7 +8,7 @@ from scripts.shutdown import remote
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import models_registry
+from scripts.lib import atomic_file, models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -3858,6 +3858,23 @@ with patch.object(fcntl, "flock", admission):
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertEqual(len(self.pass_events("invalid-launcher", "pass_started")), 1)
         self.assertEqual(self.pass_events("invalid-launcher", "pass_finished"), [])
+
+    def test_dispatch_replaces_the_worker_role(self) -> None:
+        session = self.start_run("TEST-staff-role", 41_000)
+        self.start_phase(session, 41_010)
+        parent = fixture_member("showrunner", name="TEST-role-parent")
+        member = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-role-worker")), "TEST-worker", parent.id)
+        prompt = self.root / "TEST-role-prompt.txt"
+        atomic_file.write_text_atomic(prompt, "Read the requested files.\n")
+        for index, role in enumerate(("review", "test")):
+            with patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(41020 + index * 20)}):
+                _ = progress_history.begin_dispatch(session, slot="TEST-worker", phase="3", role=role,
+                    worker_name=member.name, worker_id=member.id, launcher_command=["assign.sh"],
+                    prompt=prompt, kind="broad", lens="contract")
+            current = staff.by_id(member.id)
+            assert current is not None
+            self.assertEqual(current.to_json().get("role"), role)
+            self.finish_slot_pass(session, "TEST-worker", "completed", 41_030 + index * 20)
 
     def test_dispatch_api_reuses_active_and_completed_passes_after_launcher_loss(self) -> None:
         session = self.start_run("dispatch-api", 41_000)

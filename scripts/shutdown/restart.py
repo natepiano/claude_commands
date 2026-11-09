@@ -167,9 +167,9 @@ def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str) -> tu
     arguments = pane_record.resume_arguments(projected)
     kind = pane_launch.agent_kind(entry)
     if kind == "codex":
-        home = entry["environment"].get("CODEX_HOME", entry["config_dir"])
+        home = pane_launch.config_home(entry)
         return kind, {"CODEX_HOME": home}, arguments
-    return kind, named_account_environment(Path(entry["config_dir"])), arguments
+    return kind, named_account_environment(Path(pane_launch.config_home(entry))), arguments
 
 
 def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:

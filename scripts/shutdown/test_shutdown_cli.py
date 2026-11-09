@@ -1119,9 +1119,10 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(launched_ids, [unit.id])
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
-        self.assertEqual(staff.by_id(unit.id), unit)
+        expected = replace(unit, home=staff.SessionHome(Path.home() / ".claude"))
+        self.assertEqual(staff.by_id(unit.id), expected)
         assert isinstance(unit.parent, staff.ReportsTo)
-        self.assertEqual(staff.find(kind="unit", parent=unit.parent.id), [unit])
+        self.assertEqual(staff.find(kind="unit", parent=unit.parent.id), [expected])
         self.assertEqual(git(retirement.worktree, "rev-parse", "HEAD"), tip)
         before = (retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
                   git(retirement.checkout, "for-each-ref"))

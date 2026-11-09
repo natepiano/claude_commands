@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
+from typing import override
 from unittest.mock import patch
 
 
 from scripts.herdr import pane_launch
 from scripts.production import session_labels, staff
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib import legacy_identity
 from scripts.message import sessions
 from scripts.shutdown import pane_record
@@ -14,6 +18,11 @@ from scripts.herdr import herdr
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        _ = self.enterContext(isolated_staff_file(Path(directory) / "staff.json", {}))
+
     def test_launch_does_not_retain_staff_environment(self) -> None:
         entry = pane_launch.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
         self.assertEqual(entry["environment"], {})
@@ -21,6 +30,29 @@ class LaunchEnvironmentTests(unittest.TestCase):
     def test_shutdown_launch_removes_retired_identity_before_the_locked_launch(self) -> None:
         entry = pane_record.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
         self.assertEqual(entry["environment"], {})
+
+    def test_readout_keeps_a_staffed_pane_with_an_unknown_home(self) -> None:
+        row = staff.StaffRow(staff.StaffId("TEST-unknown-home"), "agent", "TEST-unknown-home", staff.STAFF_ROOT,
+                             current_session=staff.StaffId("TEST-unknown-home"))
+        entry = pane_launch.launch("TEST-pane", row.id, "/work", {}, ["claude"])
+        _ = entry.pop("config_dir", None)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "TEST-panes.json"
+            entries: dict[str, pane_launch.PaneLaunch] = {}
+            for index in range(3):
+                current = entry.copy()
+                current["pane_id"] = "TEST-pane-" + str(index)
+                entries[current["pane_id"]] = current
+            pane_launch.save(path, entries)
+            with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))) as snapshot:
+                self.assertEqual(pane_launch.config_home(entry), "")
+                snapshot.reset_mock()
+                self.assertEqual(pane_launch.read_valid_entries(path), entries)
+                snapshot.assert_called_once_with()
+                snapshot.reset_mock()
+                self.assertEqual(pane_launch.read_valid_entries(path, record=staff.StaffSnapshot((row,))), entries)
+                snapshot.assert_not_called()
+            self.assertEqual(pane_launch.read_strict(path), entries)
 
     def test_environment_boundaries_use_the_shared_identity_filter(self) -> None:
         environment = {"STAFF_ID": "old", "SHOWRUNNER_UNIT": "old", "CODEX_THREAD_ID": "native", "PATH": "/bin"}

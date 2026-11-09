@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ class PaneLaunch(TypedDict):
     kind: NotRequired[Literal["claude", "codex"]]
     pane_id: str
     session_id: str
-    config_dir: str
+    config_dir: NotRequired[str]
     cwd: str
     name: str
     model: str
@@ -45,6 +46,56 @@ class PaneLaunch(TypedDict):
     written_at: str
     pid: NotRequired[int]
     proc_start: NotRequired[str]
+
+
+def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | None = None) -> str:
+    """Read a staffed session's home, or an unstaffed launch's config folder."""
+    if record is None:
+        try:
+            record = staff.local_snapshot()
+        except staff.StaffAbsent:
+            record = staff.StaffSnapshot(())
+        except staff.StaffUnreadable as error:
+            print(f"anomaly: session home is unavailable: {error}", file=sys.stderr)
+            return ""
+    reference = entry.get("session_id", "")
+    row = record.by_member_reference(reference) if isinstance(reference, str) else None
+    if row is not None:
+        return str(row.home.path) if isinstance(row.home, staff.SessionHome) else ""
+    directory = entry.get("config_dir", "")
+    return directory if isinstance(directory, str) else ""
+
+
+def _record_home(entry: PaneLaunch) -> PaneLaunch:
+    """Publish the pane's home through the staff writer when membership exists."""
+    try:
+        row = staff.initial_snapshot().by_member_reference(entry["session_id"])
+        if row is None:
+            return entry
+        current = entry.copy()
+        directory = current.pop("config_dir", "")
+        if directory:
+            home = staff.SessionHome(Path(directory).absolute())
+            if row.home != home:
+                _ = staff.set_home(row.id, home)
+        return current
+    except (staff.StaffUnreadable, staff.StaffNotFound) as error:
+        print(f"anomaly: {entry['session_id']}: pane home is unavailable: {error}", file=sys.stderr)
+        return entry
+
+
+def staff_admitted(row: staff.StaffRow) -> staff.StaffRow:
+    """Complete pane publication after the first native identity admission."""
+    from scripts.shutdown import pane_record
+
+    try:
+        publication = pane_record.publication_for_session(row.current_session, record=staff.StaffSnapshot(()))
+        if publication is not None and "config_dir" in publication.entry:
+            write(publication.path, _record_home(publication.entry))
+            return staff.by_id(row.id) or row
+    except (OSError, ValueError, staff.StaffNotFound) as error:
+        print(f"anomaly: {row.id}: pane publication is unavailable: {error}", file=sys.stderr)
+    return row
 
 
 def record_directory() -> Path:
@@ -115,13 +166,20 @@ def read_strict(path: Path) -> dict[str, PaneLaunch]:
             for pane, value in read_entries(path).items()}
 
 
-def read_valid_entries(path: Path) -> dict[str, PaneLaunch]:
+def read_valid_entries(path: Path, *, record: staff.StaffSnapshot | None = None) -> dict[str, PaneLaunch]:
     """Keep usable evidence for a readout without losing a damaged entry's siblings."""
     valid: dict[str, PaneLaunch] = {}
-    required_strings = frozenset({"session_id", "written_at", "config_dir"})
+    required_strings = frozenset({"session_id", "written_at"})
+    if record is None:
+        try:
+            record = staff.local_snapshot()
+        except staff.StaffUnreadable:
+            record = staff.StaffSnapshot(())
     for pane, value in read_entries(path).items():
         try:
-            valid[pane] = _validated_launch(path, pane, value, required_strings=required_strings)
+            entry = _validated_launch(path, pane, value, required_strings=required_strings)
+            if "config_dir" in entry or record.by_member_reference(entry["session_id"]) is not None:
+                valid[pane] = entry
         except ValueError:
             continue
     return valid
@@ -189,12 +247,13 @@ def save(path: Path, entries: dict[str, PaneLaunch]) -> None:
 def write(path: Path, launch: PaneLaunch) -> None:
     """Persist pane observations with the fixed staff reference."""
     try:
-        owner = staff.initial_snapshot().by_current_session(launch["session_id"])
+        owner = staff.initial_snapshot().by_member_reference(launch["session_id"])
     except (staff.StaffUnreadable, OSError, ValueError):
         owner = None
-    if owner is not None and owner.id != launch["session_id"]:
+    if owner is not None:
         launch = launch.copy()
         launch["session_id"] = owner.id
+        _ = launch.pop("config_dir", None)
     with locked(path):
         entries = read(path)
         if entries.get(launch["pane_id"]) == launch:
@@ -256,12 +315,12 @@ def resume_attempt(path: Path, pane_id: str) -> ResumeAttempt:
 
 def _usable_replacement(path: Path, attempt: ResumeAttempt, entry: PaneLaunch,
                         proof: VerifiedResume, *, same_pane: bool) -> None:
-    required = frozenset({"pane_id", "session_id", "config_dir", "cwd", "name", "model", "written_at"})
+    required = frozenset({"pane_id", "session_id", "cwd", "name", "model", "written_at"})
     _ = _validated_launch(path, attempt.pane_id, entry, required_strings=required)
     expected = proof.expected
     if (entry["pane_id"] != attempt.pane_id or entry["session_id"] not in proof.references
             or agent_kind(entry) != agent_kind(expected)
-            or Path(entry["config_dir"]).resolve() != Path(expected["config_dir"]).resolve()
+            or Path(config_home(entry)).resolve() != Path(config_home(expected)).resolve()
             or Path(entry["cwd"]).resolve() != Path(expected["cwd"]).resolve()
             or not entry.get("flags_read", False)
             or (not same_pane and entry.get("ended", False))):
@@ -312,8 +371,9 @@ def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
             if entries.get(original["pane_id"]) != original or attempt.publication != original:
                 raise ValueError(f"{original['pane_id']}: retained launch changed before the account move")
             prepared = original.copy()
-            prepared["config_dir"] = str(outcome.config_dir)
-            prepared["environment"] = {**original["environment"], **outcome.account_environment}
+            if "config_dir" in original:
+                prepared["config_dir"] = str(outcome.config_dir)
+                prepared["environment"] = {**original["environment"], **outcome.account_environment}
             if prepared != original:
                 entries[original["pane_id"]] = prepared
                 save(path, entries)
@@ -396,7 +456,7 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
     config_dir = (environment.get("CODEX_HOME") or str(Path.home() / ".codex") if kind == "codex"
                   else environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"))
     parsed = parse_claude_arguments(arguments)
-    return {
+    return _record_home({
         "kind": kind,
         "pane_id": pane_id,
         "session_id": session_id,
@@ -410,4 +470,4 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
         "flags_read": bool(arguments),
         "ended": False,
         "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
+    })

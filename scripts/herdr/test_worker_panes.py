@@ -11,6 +11,7 @@ import sys
 import time
 import subprocess
 from copy import deepcopy
+from dataclasses import replace
 from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -22,7 +23,7 @@ from unittest.mock import patch
 from weakref import finalize
 
 from scripts.production import staff, worker_admission
-from scripts.shutdown import restart
+from scripts.shutdown import pane_record, restart
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import models_registry, process_start, unit_runs
@@ -474,6 +475,54 @@ class WorkerPaneTests(StaffTestCase):
     def start(self, name: str = "impl2", role: staff.WorkerRole | worker_panes.WorkerRoleUnavailable = "impl",
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount | accounts.AccountSelection = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
+
+    def test_new_worker_admission_completes_the_started_pane_home(self) -> None:
+        homes: list[str] = []
+
+        def started(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                    prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                    reported_unknown: str = "",
+                    agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+            result = self.world.launch(session, destination, prepared, kind, arguments, opening, timeout_ms,
+                                       agent=agent, reported_unknown=reported_unknown, agent_name=agent_name)
+            process = self.world.processes[self.world.foreground[result.pane][0]]
+            identity = process.identity.id
+            self.assertIsNone(staff.snapshot().by_current_session(identity))
+            entry = pane_launch.launch(result.pane, identity, str(prepared.directory), prepared.env,
+                                       [kind, *arguments], kind=cast(Literal["claude", "codex"], kind))
+            homes.append(pane_launch.config_home(entry, record=staff.StaffSnapshot(())))
+            pane_record.write("TEST-admission", entry)
+            self.assertIn("config_dir", entry)
+            return result
+
+        with patch.object(herdr, "launch_prepared_agent", side_effect=started):
+            result = self.start("TEST-admission")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.row.home, staff.SessionHome(Path(homes[0])))
+        self.assertEqual(staff.by_id(result.row.id), result.row)
+        saved = pane_record.read_strict("TEST-admission")[result.pane]
+        self.assertNotIn("config_dir", saved)
+        self.assertEqual(saved["session_id"], result.row.id)
+
+    def test_recovered_worker_admission_completes_the_started_pane_home(self) -> None:
+        identity = staff.native_id(fixture_runtime_id("TEST-recovered-worker"))
+        row = staff.StaffRow(identity, "worker", "TEST-recovered", staff.ReportsTo(self.parent.id), current_session=identity)
+        home = self.root / "codex"
+        fixture_session(identity, staff.CodexBackend(home))
+        self.world.add(row, "w1:p1", family="codex", label=worker_panes.agent_name(self.parent, row.name))
+        entry = pane_launch.launch("w1:p1", identity, str(self.root), {"CODEX_HOME": str(home)}, ["codex"], kind="codex")
+        pane_record.write("TEST-recovery", entry)
+        self.assertIsNone(staff.snapshot().by_current_session(identity))
+        result = self.start(row.name)
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.row.home, staff.SessionHome(home))
+        self.assertEqual(staff.by_id(result.row.id), result.row)
+        saved = pane_record.read_strict("TEST-recovery")["w1:p1"]
+        self.assertNotIn("config_dir", saved)
+        self.assertEqual(self.world.launches, [])
 
     def test_a_worker_name_with_its_owner_prefix_keeps_one_prefix_on_the_pane(self) -> None:
         name = self.parent.name + "-astra-reviewer"
@@ -1131,6 +1180,7 @@ class WorkerPaneTests(StaffTestCase):
         first = self.start()
         assert isinstance(first, worker_panes.OpenWorker)
         _ = self.recorded_dispatch(first.row, "completed", at=10)
+        first = replace(first, row=replace(first.row, role=staff.KnownWorkerRole("impl")))
         self.record_command("finish-phase", "--status", "completed", at=12)
         self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=13)
         self.world.unreadable_environment.add(self.world.foreground[first.pane][0])
@@ -1156,6 +1206,7 @@ class WorkerPaneTests(StaffTestCase):
         run_a = Path(os.environ["UNIT_RUN_DIR"])
         self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(run_a))
         _ = self.recorded_dispatch(row, "completed", at=10)
+        first = replace(first, row=replace(first.row, role=staff.KnownWorkerRole("impl")))
         run_b = self.root / "next-run"
         with patch.dict(os.environ, {"UNIT_RUN_DIR": str(run_b)}):
             _ = self.run_state()

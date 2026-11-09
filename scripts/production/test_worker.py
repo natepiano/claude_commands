@@ -338,7 +338,7 @@ class WorkerCommandTests(unittest.TestCase):
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
-        resume.assert_called_once_with(busy.row,
+        resume.assert_called_once_with(replace(busy.row, role=staff.KnownWorkerRole("impl")),
             progress_history.ActiveDispatch(dispatch_id, ("assign.sh", "--to", "impl")))
         self.assertEqual(self.fixture.staff_state(), before[0])
         self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
@@ -362,7 +362,7 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
-        resume.assert_called_once_with(opened.row, active)
+        resume.assert_called_once_with(replace(opened.row, role=staff.KnownWorkerRole("impl")), active)
         self.assertEqual(len(self.fixture.world.launches), launches)
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
@@ -572,7 +572,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(published, [str(row.current_session)])
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertIn(self.agent.final, self.reply.read_text())
-        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(staff.by_id(row.id), replace(row, role=staff.KnownWorkerRole("impl")))
 
     def test_unknown_evidence_during_dispatch_prints_one_scan_diagnostic(self) -> None:
         opened = self.opened()
@@ -1524,6 +1524,8 @@ class WorkerCommandTests(unittest.TestCase):
         }))
         atomic_file.write_text_atomic(self.run_dir / "board.log",
             "2026-11-06T00:00:00Z [team-impl] status: repairing the reader\n")
+        _ = staff.set_worker_role(running.id, staff.KnownWorkerRole("fix"))
+        _ = staff.set_worker_role(done.id, staff.KnownWorkerRole("review"))
         return running, done
 
     def test_mesh_pinned_list_reads_roster_states_and_staff_identity_without_herdr(self) -> None:
@@ -1538,7 +1540,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         rows = cast(list[dict[str, object]], json.loads(output))
         self.assertEqual(rows[0], {"name": running.name, "role": "fix", "state": "running",
-            "activity": "repairing the reader", "id": running.id, "current_session": running.current_session})
+            "activity": "repairing the reader", "id": running.id, "current_session": running.current_session,
+            "account": {"state": "AccountUnavailable", "reason": "worker home is unavailable"}})
         self.assertEqual(rows[1]["current_session"], done.current_session)
         self.assertNotIn("id", rows[2])
         self.assertNotIn("current_session", rows[2])
@@ -1605,6 +1608,7 @@ class WorkerCommandTests(unittest.TestCase):
         for name, role in (("impl", "impl"), ("review", "review"), ("test", "test")):
             opened = self.opened(name, role=cast(staff.WorkerRole, role))
             self.fixture.dispatch(opened.row, cast(staff.WorkerRole, role), completed=True)
+            _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole(cast(staff.WorkerRole, role)))
             # Preserve each finished pass in its own private run.
             saved = self.fixture.root / ("history-" + name)
             saved.mkdir()
@@ -1675,9 +1679,36 @@ class WorkerCommandTests(unittest.TestCase):
                            "activity": "Check the saved work.", "started_at": 10, "called_agent": {"family": family}}}}))
             atomic_file.write_text_atomic(run / "worker_transport", transport + "\n")
             paths.append(path)
+            _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("review"))
+            _ = staff.set_home(row.id, staff.SessionHome(Path.home() / (".codex2" if family == "codex" else ".claude2")))
         atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "claude2"}))
         atomic_file.write_text_atomic(accounts.accounts_config_file(), json.dumps({"workers": "codex2"}))
         return first, second, paths
+
+    def test_list_all_uses_staff_role_and_home_without_account_sources(self) -> None:
+        first, second, paths = self.recorded_list_fixture()
+        for member, role, folder in ((first, "fix", ".codex3"), (second, "test", ".claude4")):
+            _ = staff.set_worker_role(member.id, staff.KnownWorkerRole(cast(staff.WorkerRole, role)))
+            _ = staff.set_home(member.id, staff.SessionHome(self.fixture.root / folder))
+        for path in paths:
+            path.unlink()
+        history = self.run_dir / "history.jsonl"
+        atomic_file.write_text_atomic(history, "Unreadable history.\n")
+        original_open = cast(Callable[..., object], Path.open)
+        def unreadable(path: Path, *args: object, **kwargs: object) -> object:
+            if path == history:
+                raise PermissionError("TEST history is unreadable")
+            return original_open(path, *args, **kwargs)
+        with (patch.object(accounts, "read_role_map", side_effect=AssertionError("no role map")),
+              patch.object(accounts, "roles_history_file", side_effect=AssertionError("no account history")),
+              patch.object(Path, "open", autospec=True, side_effect=unreadable)):
+            code, output, errors = self.command("list", "--json", "--all")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        for member, role, label in ((first, "fix", "codex3"), (second, "test", "claude4")):
+            self.assertEqual(rows[member.id]["role"], role)
+            self.assertEqual(rows[member.id]["home"], str(self.fixture.root / ("." + label)))
+            self.assertEqual(rows[member.id]["account"], label)
 
     def test_list_all_groups_pane_workers_by_manager_from_records(self) -> None:
         first, second, _paths = self.recorded_list_fixture()
@@ -1723,7 +1754,7 @@ class WorkerCommandTests(unittest.TestCase):
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
         self.assertEqual(rows[second.id]["account"], "claude2")
         self.assertEqual(rows[second.id]["home"], str(Path.home() / ".claude2"))
-        resolved.assert_called_once()
+        resolved.assert_not_called()
 
     def test_list_all_keeps_valid_history_events_beside_an_incomplete_line(self) -> None:
         first, second, paths = self.recorded_list_fixture()
@@ -1752,7 +1783,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(sum(cast(tuple[object, ...], call.args)[0] == history for call in opened.call_args_list), 1)
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
         self.assertEqual([rows[row.id]["state"] for row in (first, second)], ["completed", "completed"])
-        self.assertEqual([rows[row.id]["role"] for row in (first, second)], ["fix", "review"])
+        self.assertEqual([rows[row.id]["role"] for row in (first, second)], ["review", "review"])
         self.assertEqual([rows[row.id]["activity"] for row in (first, second)],
                          ["First saved activity.", "Second saved activity."])
 
@@ -1774,7 +1805,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
         self.assertEqual((rows[first.id]["state"], rows[first.id]["role"], rows[first.id]["activity"]),
-                         ("completed", "fix", "Repair the saved work."))
+                         ("completed", "review", "Repair the saved work."))
 
     def test_list_all_reads_only_the_needed_default_account_history_once(self) -> None:
         _first, second, _paths = self.recorded_list_fixture()
@@ -1794,8 +1825,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
         self.assertEqual(rows[second.id]["account"], "claude2")
-        self.assertEqual(reads.count(history), 1)
-        self.assertEqual([call.args[0] for call in resolve.call_args_list], ["claude2"])
+        self.assertEqual(reads.count(history), 0)
+        resolve.assert_not_called()
 
     def test_list_all_bounds_history_without_a_uuid_creation_time(self) -> None:
         first, _second, paths = self.recorded_list_fixture()
@@ -1840,7 +1871,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertLessEqual(sum(lengths), 64 * 1024 + 1)
         self.assertEqual(sum(isinstance(cast(object, call.args[0]), bytes) for call in decoded.call_args_list), 2)
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
-        self.assertEqual((rows[first.id]["role"], rows[first.id]["activity"]), ("fix", "Latest work."))
+        self.assertEqual((rows[first.id]["role"], rows[first.id]["activity"]), ("review", "Latest work."))
         self.assertEqual((rows[first.id]["work"], rows[first.id]["state"]), ("idle", "completed"))
         self.assertEqual(rows[ancient.id]["state"], "unknown")
         self.assertEqual(rows[absent.id]["state"], "unknown")
@@ -1873,9 +1904,10 @@ class WorkerCommandTests(unittest.TestCase):
             code, output, errors = self.command("list", "--json", "--all")
         self.assertEqual(code, 0, errors)
         self.assertEqual(len(cast(list[object], json.loads(output))), 2)
-        for path in (*paths, staff.record_path(), accounts.accounts_config_file(),
-                     accounts.groups_file()):
+        for path in (*paths, staff.record_path()):
             self.assertEqual(reads.count(path), 1, str(path))
+        for path in (accounts.accounts_config_file(), accounts.groups_file()):
+            self.assertEqual(reads.count(path), 0, str(path))
 
     def test_text_list_numbers_rows_and_keeps_the_worker_fields(self) -> None:
         self.assertEqual(self.command("list"), (0, "", ""))
@@ -1895,6 +1927,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_list_keeps_dispatch_role_separate_from_observation(self) -> None:
         opened = self.opened("impl2", "review")
         self.fixture.dispatch(opened.row, "review", completed=True)
+        _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("review"))
         code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)
         listing = cast(list[dict[str, object]], json.loads(output))
@@ -1908,7 +1941,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.world.add(row, "w1:p1", family="codex")
         self.fixture.world.locations["w1:p1"]["agent_status"] = "working"
         self.fixture.dispatch(row, "astra-designer")
-        home = self.fixture.root / "selected-codex"
+        home = self.fixture.root / ".codex2"
+        _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("astra-designer"))
+        _ = staff.set_home(row.id, staff.SessionHome(home))
         with patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex2", home)) as selected:
             code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)
@@ -1918,12 +1953,14 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(listing[0]["role"], "astra-designer")
         self.assertEqual({key: listing[0].get(key) for key in ("work", "account", "home")},
                          {"work": "busy", "account": "codex2", "home": str(home)})
-        selected.assert_called_once_with("workers")
+        selected.assert_not_called()
 
     def test_list_closed_worker_reports_work_account_and_home(self) -> None:
         row = self.fixture.worker("astra-reviewer", family="claude")
         self.fixture.dispatch(row, "astra-reviewer", completed=True)
-        home = self.fixture.root / "selected-claude"
+        home = self.fixture.root / ".claude2"
+        _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("astra-reviewer"))
+        _ = staff.set_home(row.id, staff.SessionHome(home))
         with patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", home)) as selected:
             code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)
@@ -1933,7 +1970,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(listing[0]["role"], "astra-reviewer")
         self.assertEqual({key: listing[0].get(key) for key in ("work", "account", "home")},
                          {"work": "idle", "account": "claude2", "home": str(home)})
-        selected.assert_called_once_with("unit")
+        selected.assert_not_called()
 
     def test_list_worker_without_backend_reports_account_unavailable(self) -> None:
         row = self.fixture.worker("missing-backend", family="codex")
@@ -1945,8 +1982,10 @@ class WorkerCommandTests(unittest.TestCase):
         listing = cast(list[dict[str, object]], json.loads(output))
         self.assertEqual(len(listing), 1)
         self.assertEqual(listing[0]["account"],
-                         {"state": "AccountUnavailable", "reason": "worker backend is unavailable"})
+                         {"state": "AccountUnavailable", "reason": "worker home is unavailable"})
         self.assertNotIn("home", listing[0])
+        self.assertEqual(listing[0]["role"],
+                         {"state": "WorkerRoleUnavailable", "reason": "dispatch role is unavailable"})
 
     def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
         unit_runs.report_anomaly.cache_clear()

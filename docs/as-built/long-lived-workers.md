@@ -53,6 +53,12 @@ current assignment.
 ### Staff identity and admission
 
 A worker has one fixed staff id, name, parent, and worktree.
+Its `role` records its last dispatch. Its `home` records the absolute account folder.
+`KnownWorkerRole | WorkerRoleUnknown` and `SessionHome | HomeUnknown` represent these values.
+Missing keys mean unknown. Serialization omits missing values.
+An invalid role or home remains unknown and retains its raw JSON value.
+`staff.set_worker_role` serves `progress_history.begin_dispatch`, including Astra policy dispatches.
+`staff.set_home` serves pane publication through `pane_launch`.
 Its `current_session` selects its current Claude session or Codex thread.
 A family switch changes `current_session` and preserves the fixed staff id.
 The [staff design](staff-accessors.md#staff-identity-and-backends) owns row fields and backend evidence.
@@ -523,11 +529,9 @@ An unreadable design prints one warning per operation; other designs remain read
 
 A pane binding uses `worker.py` operations. A mesh binding uses `assign.sh` for prime and follow operations.
 `worker.py list --json` gives each pane worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
-It also computes three fields at read time and stores none of them:
-- `work`: `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
-- `account`: the label of the account the member opens on, from `member_account.resume_account`.
-- `home`: that account's home as an absolute path.
-With no staff backend entry, `account` is `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
+The staff row supplies `role` and `home`. The `home` folder name supplies the account label.
+`work` is `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
+An unknown role uses `WorkerRoleUnavailable`. An unknown home uses `AccountUnavailable` and omits `home`.
 `worker.py list --json --all` reads pane workers for every manager and adds each parent's name as `manager`.
 It needs no caller row and makes no process, pane, or thread read.
 `state` uses the saved dispatch status or staff hold; `activity` uses the saved pass activity, then its status.
@@ -535,7 +539,7 @@ History lookup resolves fixed manager ids through the staff record, even after a
 History lookup reads the last 64 KiB of each file, plus one byte to skip a leading partial line.
 History-only dispatches outside this window use the same unknown fields as missing dispatches.
 It skips invalid lines and decodes only wanted worker events.
-Stored account history resolves only the unit group and reads its history once.
+Listing reads no role map or account history. Missing dispatch history does not change the staff role or home.
 Per-manager listing keeps its live observations.
 An ended design identity cannot reopen.
 `config/design_roles.conf` controls new role creation.

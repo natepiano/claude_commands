@@ -109,8 +109,10 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertTrue((self.destination / ".git").is_file())
         self.assertEqual(self.git("branch", "--show-current", cwd=self.destination), "cargo-liner-source")
         self.assertEqual(self.git("rev-parse", "--show-toplevel", cwd=self.destination), str(self.destination))
-        self.assertEqual(staff.by_id(self.owner.id),
-            replace(self.owner, worktree=staff.PresentWorktree(remote.local_machine(), self.destination)))
+        current = staff.by_id(self.owner.id)
+        assert current is not None
+        self.assertEqual(current,
+            replace(self.owner, worktree=staff.PresentWorktree(remote.local_machine(), self.destination), home=current.home))
         self.assertEqual((self.destination / "kept.txt").read_text(), "Keep this work.\n")
         for row in backend.starts:
             self.assertEqual(row.current_session, self.owner.current_session)
@@ -512,6 +514,8 @@ class UnitFolderMoveTests(FolderRenameFixture):
                         pane_record.write("agents", pane_record.launch("w1:p1", str(self.owner.current_session),
                             str(self.source), {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")}, [kind]))
                     before = file_versions(self.records)
+                    current = staff.by_id(self.owner.id)
+                    assert current is not None
                     unknown = herdr.UnknownConversation("source (conversation unreadable)")
                     with (mock.patch.object(herdr, "read_conversation", return_value=unknown),
                           mock.patch.object(sessions, "running_sessions", return_value=[]),
@@ -527,7 +531,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
                     killed.assert_not_called()
                     self.assertFalse(self.source.exists())
                     self.assertTrue(self.destination.exists())
-                    self.assertEqual(staff.by_id(self.owner.id), replace(self.owner,
+                    self.assertEqual(staff.by_id(self.owner.id), replace(current,
                         worktree=staff.PresentWorktree(remote.local_machine(), self.destination)))
                     self.assertEqual(file_versions(self.records), before)
                     restore()
