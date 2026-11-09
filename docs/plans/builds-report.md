@@ -854,44 +854,22 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - Format an age once, from seconds. Text that is formatted and then parsed back fails at `updated_at=0`.
 
 ### Phase 40 — /build:queue retires when the build page covers it · status: done
-**Depends on:** Phase 39; queue-unit's Phase 10m. This phase was queue-unit's Phase 10n.
 
-From the user (C959, 2026-11-04, through builds): "we are moving to the new build html page - we will use /build:queue for reference until we can retire it". From the builds showrunner (not the user), 2026-11-08: do this one last, after Phase 39.
+#### As-built
 
-#### Work Order
-
-**Goal:** The `/build:queue` view goes once the build page shows each thing it shows; its controls stay.
-
-**Spec:**
-- List what `/build:queue` shows and confirm the page shows each item, the queue 10m wait states included. Then remove the plain-text view route and the view code that only it uses.
-- The unit-board queue pane runs `build_queue.py --json --columns <n> --you <session> [selector]` (`mods/unit-board/hooks/register.tsx:326`). Keep that `--json` route and its selector card output unchanged; only the plain-text output (`plain(lines)`, `build_queue.py:167`) goes.
-- The page does not show the Mac idle alert yet. `build_queue.py:163` prints `mac_idle_alert.alert_line(state_dir() / "alert.json", ...)` as a red first line (Mac idle, unreachable, unreadable watch). Add it to the feed (`memory_feed.py`) and show it as a red line at the top of the page (`memory_live.html`) before the text route goes.
-- `build_queue.py` keeps the `bump`, `clear` and `admit-head` controls: the page does not have them, and they stay until the user approves a replacement (architect review of queue 18, 2026-11-06).
-- Keep each formatter that a current caller uses: the queue card uses `queue_view` formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`; `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code. Keep `queue_lines.step_text`: the card and the build page use it.
-- The queue card and the unit-board queue pane stay unless the user says otherwise.
+- `build_queue.py` with no control word and no `--json` prints `build queue: the queue view is on the build page; run /build:page` and exits 3. It reads no admission state first.
+- The `--json` route that the unit-board queue pane runs (`mods/unit-board/hooks/register.tsx:326`) and its selector cards do not change. `bump`, `clear` and `admit-head` do not change.
+- The feed has `mac_idle_alert` (from `mac_idle_alert.alert_line`, empty when there is no alert) and `priority_text` (`head_facts.priority_text`). The build page shows the alert as a red line above the title and the priority line above Head.
+- Each `queue_view` formatter still has a caller (the `--json` route, the card or the feed), so `queue_view.py` did not change.
 
 **Files:**
-- `commands/build/queue.md` — the controls only.
-- `scripts/build_queue/build_queue.py` — no view routes.
-- `scripts/build_queue/queue_view.py` — no code that only the view routes used.
-- `scripts/build_queue/memory_feed.py` — the Mac idle alert text in the feed.
-- `scripts/build_queue/memory_live.html` — the alert as a red line at the top.
-- `scripts/build_queue/test_build_queue.py` — tests for the removed plain-text route go; the `--json` route tests stay.
-- `scripts/build_queue/test_memory_feed.py`, `scripts/build_queue/memory_page_proof.mjs` — the alert in the feed and on the page.
+- `scripts/build_queue/build_queue.py` — controls, the `--json` route and the plain-view refusal.
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html` — the alert and priority on the page.
+- `commands/build/queue.md`, `commands/build/status.md`, `docs/as-built/build-memory-admission.md`, `docs/as-built/build-targets.md` — the controls, the pane and the page.
+- `scripts/build_queue/test_build_queue.py`, `test_queue_evidence.py`, `test_memory_feed.py`, `test_queue_view.py`, `memory_page_proof.mjs` — tests of the plain route moved to `--json` with the same expected content.
 
-**Workers:** `1 writer + 1 tester`
-- writer — `commands/build/queue.md`, `build_queue.py`, `memory_feed.py`, `memory_live.html` and the view code that only the text route uses.
-- tester — `test_build_queue.py`, `test_memory_feed.py`, `test_queue_view.py`, `test_queue_card.py`, `memory_page_proof.mjs`, the golden files only the text route reads, and the suites of the shared formatters.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 39 put cloud rows in the main table; the page and the text view show the same rows. `memory_feed.py` calls the cloud helpers in `queue_view.py` (`cloud_update_age` and the cloud row code), and card and feed tests import support from `test_queue_view.py`: keep both. Every test that renders a golden with a vCPU column patches `os.cpu_count` to 17 (`QueueViewFixtureTests`, `QueueTests.setUp`).
-
-**Acceptance gate:**
-- The summary lists each `/build:queue` item and where the page shows it, the cloud rows, the Head cloud slot count, the red late age and the Mac idle alert included.
-- The unit-board queue pane tests (`mods/unit-board/tests/queue.test.ts`) pass with no change to them.
-- No caller of the removed code remains (LSP `findReferences` or `rg`).
-- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
+**Gotchas:**
+- The `--json` route renders with colour. A test compares its text exactly with a colour render. `test_queue_card` compares the non-colour page exactly with `golden/card_1.txt`.
 
 ### Phase 41 — The vault sync keeps the Mac main ref and files its stop question · status: done
 
