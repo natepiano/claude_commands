@@ -1384,7 +1384,7 @@ The independent writer checked the required closure cases.
 | --- | --- | --- | --- |
 | Open route | `a433b49e-d462-472a-9f5b-3e767f5be8b6:b62a1ee7-5c52-40f8-b0bc-07a44602b9db:F001` | Owner berth-unit; due at phase 44 checkpoint; no matching closure | C2 `CASE_ROUTE` |
 | Cross-run closure | `822b6b3d-e256-4b3a-9081-4dae6186616a` | Exact source key; evidence names checkpoint, passing gate, and accepted closure review | C2 `CASE` |
-| Wrong key | `a867b3fe-3d74-48e3-9194-5f73e98d68fe` | Uses phase label `43c` instead of the instance; not closed | C2 `CASE` |
+| Wrong key | `a867b3fe-3d74-48e3-9194-5f73e98d68fe` | Uses phase label `43c` instead of the instance, so this event closes nothing; later event `247a37ce-16cf-412a-8e90-724eb73bf44f` (2026-11-07T14:42:02Z) closes the route with the instance key | C2 `CASE` |
 | Missing acceptance evidence | `6c471f0a-dd5a-4a36-90fb-f2af9fecca6f` | Key matches F030, but evidence names no commit, passing result, or accepted review; inconclusive | C2 `CASE` |
 
 The cross-run case refers to source `9ea324fb-cb62-4f94-be65-ec0f2cf45bee:6ce43bb9-65cb-43f4-a119-c0313fbd925f:F032`.
