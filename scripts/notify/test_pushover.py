@@ -6,12 +6,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import platform
 import subprocess
 import tempfile
 import time
 import unittest
 import urllib.error
 import urllib.parse
+from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -98,6 +100,89 @@ class ParentSourceTests(unittest.TestCase):
         with mock.patch("scripts.notify.pushover.subprocess.run", return_value=completed) as run:
             self.assertEqual(pushover.parent_source(), command[:80])
         self.assertEqual(run.call_args.args[0][:3], ["ps", "-o", "args="])
+
+
+class MacDeliveryTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = {key: value for key, value in os.environ.items() if key != "NOTIFY_STATE_DIR"}
+        environment["HOME"] = str(folder)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        _ = self.enterContext(mock.patch.object(platform, "system", return_value="Darwin"))
+        _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", folder / "log"))
+        _ = self.enterContext(mock.patch.object(pushover, "parent_source", return_value="Mac unit"))
+        _ = self.enterContext(mock.patch.object(pushover, "read_keys", side_effect=AssertionError("Mac read keys")))
+        _ = self.enterContext(mock.patch.object(pushover, "post_message", side_effect=AssertionError("Mac posted locally")))
+        _ = self.enterContext(mock.patch.object(silence, "keep_here", side_effect=AssertionError("Mac checked silence locally")))
+
+    def test_deliver_asks_natedev_for_normal_and_blocked_pushes(self) -> None:
+        replies = (("0", 0, "pushover: sent\n", ""),
+                   ("2", 0, "pushover: sent, receipt fixture\n", ""),
+                   ("2", 1, "", "pushover: refused: fixture refusal\n"))
+        for priority, status, out, error in replies:
+            with self.subTest(priority=priority, status=status):
+                asked: list[tuple[list[str], str]] = []
+
+                def asker(argv: Sequence[str], text: str) -> subprocess.CompletedProcess[str]:
+                    asked.append((list(argv), text))
+                    return subprocess.CompletedProcess(argv, status, stdout=out, stderr=error)
+
+                draft = review.Draft("Mac unit", priority, "Build done", ActionRequired("Check the build"), "The build passed.", False)
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    code = pushover.deliver(draft, detail="reviewed", key="build", text_id="fixture.admitted", asker=asker)
+                self.assertEqual((code, output.getvalue(), errors.getvalue()), (status, out, error))
+                self.assertEqual(asked[0][0], [*silence.SSH, pushover.REMOTE + " deliver"])
+                self.assertEqual(json.loads(asked[0][1]), {
+                    "source": "Mac unit", "priority": priority, "title": "Build done",
+                    "message": "Action: Check the build\nThe build passed.", "detail": "reviewed",
+                    "key": "build", "text_id": "fixture.admitted", "due": "",
+                    "need": "blocked" if priority == "2" else "note", "reference": push_reference.NO_REFERENCE})
+
+    def test_cancel_asks_natedev_and_preserves_its_reply(self) -> None:
+        for status, out, error in ((0, "pushover: cancelled 1\n", ""), (2, "", "pushover: fixture refusal\n")):
+            with self.subTest(status=status):
+                asked: list[tuple[list[str], str]] = []
+
+                def asker(argv: Sequence[str], text: str) -> subprocess.CompletedProcess[str]:
+                    asked.append((list(argv), text))
+                    return subprocess.CompletedProcess(argv, status, stdout=out, stderr=error)
+
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    code = pushover.cancel(["--source", "Mac unit", "power supply"], asker=asker)
+                self.assertEqual((code, output.getvalue(), errors.getvalue()), (status, out, error))
+                self.assertEqual(asked, [([*silence.SSH,
+                    pushover.REMOTE + " cancel --source 'Mac unit' 'power supply'"], "")])
+
+    def test_unreachable_natedev_logs_the_cause_without_a_local_post(self) -> None:
+        failures = ((255, "ssh: connection refused\n", "connection refused"),
+                    (0, "", "no answer"),
+                    (OSError("ssh unavailable"), "", "ssh unavailable"),
+                    (TimeoutError("ssh timed out"), "", "ssh timed out"))
+        count = 0
+        for operation in ("deliver", "cancel"):
+            for status, error, cause in failures:
+                with self.subTest(operation=operation, cause=cause):
+                    def asker(argv: Sequence[str], text: str) -> subprocess.CompletedProcess[str]:
+                        del text
+                        if isinstance(status, Exception):
+                            raise status
+                        return subprocess.CompletedProcess(argv, status, stdout="", stderr=error)
+
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                        if operation == "deliver":
+                            draft = review.Draft("Mac unit", "0", "Build done", NoActionRequired(), "The build passed.", False)
+                            code = pushover.deliver(draft, asker=asker)
+                        else:
+                            code = pushover.cancel(["power"], asker=asker)
+                    self.assertEqual((code, output.getvalue()), (1, ""))
+                    self.assertIn(cause, errors.getvalue())
+                    records = [cast(pushover.PushLogRecord, json.loads(line))
+                               for line in pushover.LOG_FILE.read_text().splitlines()]
+                    count += 1
+                    self.assertEqual(len(records), count)
+                    self.assertIn(cause, records[-1]["outcome"])
+                    self.assertEqual(records[-1]["source"], "Mac unit")
 
 
 class PushoverTests(unittest.TestCase):
@@ -1067,6 +1152,39 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
         self.assertEqual(self.log_lines()[-1]["outcome"], "kept: silence until off")
 
+    def test_natedev_delivery_command_keeps_or_posts_the_reviewed_push(self) -> None:
+        for silent, priority in ((False, "0"), (True, "0"), (True, "2")):
+            with (self.subTest(silent=silent, priority=priority),
+                  mock.patch.dict(os.environ, {"HOME": str(self.keys.parent),
+                      "NOTIFY_STATE_DIR": str(self.keys.parent / f"state-{silent}-{priority}")})):
+                if silent:
+                    self.silence_on()
+                push: silence.KeptPush = {"source": "Mac unit", "priority": priority, "title": "Build done",
+                    "message": "Action: Check the build\nThe build passed.", "detail": "reviewed",
+                    "key": "build", "text_id": "fixture.admitted", "due": "",
+                    "need": "blocked" if priority == "2" else "note", "reference": push_reference.NO_REFERENCE}
+                posted: list[dict[str, list[str]]] = []
+
+                def post(_url: str, data: bytes) -> tuple[int, bytes]:
+                    posted.append(urllib.parse.parse_qs(data.decode()))
+                    return 200, b'{"status":1}'
+
+                with (mock.patch("sys.stdin", io.StringIO(json.dumps(push))),
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    code = pushover.main(["deliver"], self.keys, post)
+                self.assertEqual(code, 0, errors.getvalue())
+                self.assertEqual(errors.getvalue(), "")
+                if silent and priority != "2":
+                    self.assertEqual(output.getvalue(), "pushover: kept: silence until off\n")
+                    self.assertEqual(posted, [])
+                    self.assertEqual(silence.read_kept(), [push])
+                else:
+                    self.assertEqual(output.getvalue(), "pushover: sent\n")
+                    self.assertEqual(len(posted), 1)
+                    self.assertEqual(posted[0]["priority"], [priority])
+                    self.assertEqual(posted[0]["message"], [footed(push["message"], "Mac unit")])
+                    self.assertEqual(silence.read_kept(), [])
+
     def test_key_reaches_the_kept_push_and_a_newer_push_with_it_replaces_the_older(self) -> None:
         self.silence_on()
         with redirect_stdout(io.StringIO()):
@@ -1110,7 +1228,7 @@ class PushoverTests(unittest.TestCase):
     def test_silence_release_discards_saved_repeat_flood_pushes_and_posts_other_pushes(self) -> None:
         self.silence_on()
         with redirect_stdout(io.StringIO()):
-            kept = silence.keep({"source": "send-repeat-guard", "priority": "0",
+            kept = silence.keep_here({"source": "send-repeat-guard", "priority": "0",
                 "title": "Repeated messages held", "message": "No action needed.",
                 "detail": "", "key": "old-flood", "text_id": "message.repeat_flood"})
             self.assertIsInstance(kept, silence.Kept)
