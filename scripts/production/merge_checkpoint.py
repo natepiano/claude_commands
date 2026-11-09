@@ -398,11 +398,13 @@ def ancestry(request: MergeRequest) -> bool:
                    "push your branch to origin and resend the checkpoint")
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,
                   request.production.merge_branch).returncode == 0
-    if not isinstance(request.kind, CodeCheckpoint) and good(git(
-            checkout, "rev-list", "--no-merges",
-            f"{request.production.merge_branch}..{request.commit}^"), "ancestry"):
-        raise checkpoint_gate.Stop("ancestry", "held", f"phase {request.phase} code checkpoint has not merged",
-                   "wait for the phase code checkpoint to merge, then resend the shrink")
+    if not isinstance(request.kind, CodeCheckpoint):
+        closing = good(git(checkout, "rev-list", "--first-parent", "--no-merges", "-n", "1",
+                           request.commit), "ancestry")
+        if good(git(checkout, "rev-list", "--no-merges",
+                    f"{request.production.merge_branch}..{closing}^"), "ancestry"):
+            raise checkpoint_gate.Stop("ancestry", "held", f"phase {request.phase} code checkpoint has not merged",
+                       "wait for the phase code checkpoint to merge, then resend the shrink")
     checkpoint_gate.report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
            ("; already merged" if already else ""))
     return already
