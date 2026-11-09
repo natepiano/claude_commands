@@ -22,7 +22,7 @@
   - Why needed: `Resumable` and `Idle` already distinguish the states, but `PausedSeat.turn_live` repeats that distinction.
   - Completion condition: remove `turn_live` and use the existing states. Preserve active-worker commands, idle-worker text, and existing threads. Test both states through `stop_resume`.
   - Revealed by: models-unit Phase 3s simplify lens; target corrected by the Phase 8g architect review.
-- [ ] **Cut the Git process starts in fast_track and the copies refresh**
+- [x] **Cut the Git process starts in fast_track and the copies refresh**
   - Target: `scripts/production/fast_track.py` (`reconcile` and its Git calls), `scripts/production/test_fast_track.py`, `scripts/copies/copies.py` (remote refresh).
   - Why needed: build speed is a top priority. The natest P33 profile measured: `test_fast_track.py` drives 2937 Git calls in `fast_track.py` (27.6 s). `reconcile` repeats `rev-parse` (898), `update-ref` (777) and `cat-file` (283). The `copies.py` remote refresh makes 403 fetches (870 calls, 10.1 s).
   - Completion condition: one injected Git runner serves `fast_track.py`, so tests start fewer processes. `reconcile` reads each ref and object once. The remote refresh fetches each remote once. Fewer measured Git calls and less time in a new profile. Add no check.
