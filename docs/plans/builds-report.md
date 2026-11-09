@@ -954,3 +954,30 @@ From the user (C959, 2026-11-04, through builds): "we are moving to the new buil
 
 **Ruled out:**
 - A catch or default for a deleted `vault.question_production` key: the key ships in the same commit as the code that reads it.
+
+### Phase 42 — Build log tests compare file times with a file-system clock · status: done
+
+From the builds showrunner (not the user), 2026-11-09: aws found a flake on a cloud gate. Add it as a small phase now.
+
+**Goal:** No build log test compares a kernel file time with `time.time()`.
+
+**Spec:**
+- The kernel stamps file times from a coarse clock. That clock can be one tick behind `time.time()`.
+- `test_record_rerun.py` `test_late_finish_refreshes_completion_before_rename_and_survives_a_stop` failed once at line 667: `assertGreaterEqual(pending.stat().st_mtime, now)` missed by 0.16 ms.
+- That test reads `now` from the file system: touch a file first and use its `st_mtime`. Lines 667 and 684 compare with that value. `old` stays three days before it.
+- `test_record.py` line 975 has the same defect: `released_at = time.time()`, then the marker's `st_mtime` must be at least that. Take `released_at` from the `st_mtime` of `meminfo` after its write.
+- No sleep. No tolerance constant. The assertions keep their meaning.
+
+**Files:**
+- `scripts/buildlog/test_record_rerun.py` — `now` from a touched file.
+- `scripts/buildlog/test_record.py` — `released_at` from the `meminfo` file time.
+
+**Workers:** `1 writer`
+- writer — both files.
+
+**State:** none.
+
+**Verification:**
+- `scripts.buildlog.test_record_rerun` and `scripts.buildlog.test_record` pass, with and without `PYTHONPATH`.
+- `basedpyright` on both files: 0 errors, 0 warnings, 0 notes.
+- The unit's targeted test passes.
