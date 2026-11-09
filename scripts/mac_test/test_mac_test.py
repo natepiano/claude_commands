@@ -2941,6 +2941,23 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         _ = record.pop("idle_since")
         self.assertEqual(self.read_claim(), record)
 
+        with self.subTest(activity_bytes=True):
+            _ = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
+            with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    ["ssh"], 0, stdout="active=3\nwork=3\nrc=0\n", stderr="")):
+                _ = self.watch_once()
+            current = self.read_claim()
+            transfers = cast(list[dict[str, object]], current["transfers"])
+            self.assertEqual(transfers, [{"operation": "ssh_activity",
+                "sent_bytes": len(mac_test.mac_activity_script().encode()),
+                "received_bytes": len("active=3\nwork=3\nrc=0\n".encode()), "complete": True}])
+            args = mac_test.CliArguments()
+            args.pid = os.getpid()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(mac_test.command_release(args, self.paths), 0)
+            self.assertEqual(output.getvalue(), "copy_bytes=" + json.dumps(transfers) + "\n")
+
     def test_parked_app_sets_work_idle_without_releasing_claim_and_test_clears_it(self) -> None:
         record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
         with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 0)), \

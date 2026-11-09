@@ -10,7 +10,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 import fcntl
 import json
@@ -27,7 +27,7 @@ import tempfile
 import time
 import traceback
 from types import FrameType
-from typing import Literal, NewType, TextIO, TypedDict, cast, final
+from typing import BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
@@ -39,6 +39,7 @@ from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import repository, store
+from scripts.buildlog import sync as buildlog_sync
 from scripts.build_targets import target_config
 from scripts.lib import build_folders
 
@@ -313,6 +314,7 @@ class AttemptEvidence:
     cleanup: Literal["confirmed", "unconfirmed"] = "unconfirmed"
     unresolved_count: int | UnresolvedLeftoverCount = UnresolvedLeftoverCount()
     evidence_at: float = 0.0
+    traffic: buildlog_sync.TransferLedger = field(default_factory=buildlog_sync.TransferLedger)
 
 
 MacOffloadResult = (
@@ -555,7 +557,7 @@ class IdleProcess:
 class RunningProcess:
     """The child process currently owned by the runner."""
 
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[str] | subprocess.Popen[bytes]
 
 
 class NoClaimInterrupt:
@@ -790,12 +792,13 @@ class ProcessController:
         arguments: Sequence[str],
         deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
     ) -> CapturedCommandResult:
+        if arguments[0] == "rsync":
+            arguments = [*arguments[:2], "--stats", *arguments[2:]]
         try:
             process = subprocess.Popen(
                 arguments,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
             )
         except OSError:
             return COMMAND_COULD_NOT_START
@@ -810,11 +813,30 @@ class ProcessController:
                 stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
-                _, _ = process.communicate()
+                stdout, stderr = process.communicate()
+                self.observe_command(arguments, stdout, stderr)
+                if arguments[0] in ("ssh", "rsync"):
+                    self.attempt_evidence.traffic.transfers[-1]["complete"] = False
                 return COMMAND_TIMED_OUT
-            return CommandOutput(process.returncode, stdout, stderr)
+            self.observe_command(arguments, stdout, stderr)
+            return CommandOutput(process.returncode,
+                stdout.decode().replace("\r\n", "\n").replace("\r", "\n"),
+                stderr.decode().replace("\r\n", "\n").replace("\r", "\n"))
         finally:
             self.active = IDLE_PROCESS
+
+    def observe_command(self, arguments: Sequence[str], stdout: bytes, stderr: bytes) -> None:
+        if arguments[0] not in ("ssh", "rsync"):
+            return
+        if arguments[0] == "ssh":
+            operation = "ssh_control"
+        elif any(word.startswith("--files-from=") for word in arguments):
+            operation = "rsync_scripts"
+        elif ":" in arguments[-2]:
+            operation = "rsync_fetch"
+        else:
+            operation = "rsync_source"
+        self.attempt_evidence.traffic.observe_bytes(operation, list(arguments), stdout, stderr)
 
     def capture_copy(
         self, arguments: Sequence[str], deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
@@ -836,8 +858,6 @@ class ProcessController:
                 arguments,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
             )
         except OSError:
             return MISSING_MAC_STATUS
@@ -846,15 +866,24 @@ class ProcessController:
             process.kill()
             _ = process.wait()
             return MISSING_MAC_STATUS
-        output = cast(TextIO, raw_output)
+        output = cast(BinaryIO | TextIO, raw_output)
         self.active = RunningProcess(process)
         status: RemoteRunStatus = MISSING_MAC_STATUS
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         mismatch = ""
         build_target_directory = ""
+        received_bytes = 0
+        finished_output = False
         try:
-            for line in output:
+            for raw_line in output:
+                if isinstance(raw_line, bytes):
+                    received_bytes += len(raw_line)
+                    line = raw_line.decode()
+                else:
+                    received_bytes += len(raw_line.encode("utf-8"))
+                    line = raw_line
+                line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
                 if marker.startswith("build_target_directory="):
                     build_target_directory = marker.removeprefix("build_target_directory=")
@@ -898,10 +927,15 @@ class ProcessController:
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
+            finished_output = True
             exit_status = process.wait()
         finally:
             self.active = IDLE_PROCESS
             output.close()
+            if arguments[0] == "ssh":
+                self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
+                    "sent_bytes": len(arguments[-1].encode("utf-8")),
+                    "received_bytes": received_bytes, "complete": finished_output})
         if mismatch and not isinstance(status, (ReportedMacStatus, InterruptedTargetStatus)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
@@ -1257,7 +1291,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
 
 
 def release_claim(controller: ProcessController, target: str = "") -> None:
-    _ = controller.capture(
+    result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
             str(Path(__file__).with_name("mac_test.py")),
@@ -1267,6 +1301,11 @@ def release_claim(controller: ProcessController, target: str = "") -> None:
             *(["--target", target] if target else []),
         ]
     )
+    if isinstance(result, CommandOutput):
+        for line in result.stdout.splitlines():
+            if line.startswith("copy_bytes="):
+                transfers = cast(list[buildlog_sync.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
+                controller.attempt_evidence.traffic.transfers.extend(transfers)
 
 
 def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
@@ -1419,7 +1458,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture_copy(["rsync", "-rlpc", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", "-rlptc", "--compress", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
@@ -1846,7 +1885,7 @@ def fetch_folder(
         landing = partial / folder.value
         landing.mkdir(parents=True)
         copied = controller.capture([
-            "rsync", "-rlp", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
+            "rsync", "-rlp", "--compress", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
             f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/{folder.value}/", f"{landing}/",
         ])
         if not isinstance(copied, CommandOutput) or copied.status != 0:
@@ -1948,8 +1987,9 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownR
                    target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
     """End and count one mirror's work without exposing the check to a second signal."""
     try:
+        arguments = ["ssh", *ssh_options(config), host, leftover_check_script(repository, target, slot)]
         result = subprocess.run(
-            ["ssh", *ssh_options(config), host, leftover_check_script(repository, target, slot)],
+            arguments,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1961,6 +2001,9 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownR
         return LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s")
     except OSError:
         return LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)")
+    ledger = buildlog_sync.active_transfers.get()
+    if isinstance(ledger, buildlog_sync.TransferLedger):
+        ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
         if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
             from scripts.mac_test import linux_runner
@@ -2185,8 +2228,8 @@ def claimed_run(
         if release_allowed:
             release_claim(controller, request.target)
             if sync_after_release:
-                from scripts.buildlog import sync as buildlog_sync
-                buildlog_sync.sync_target(request.target)
+                with buildlog_sync.measure_transfers(evidence.traffic):
+                    buildlog_sync.sync_target(request.target)
 
 
 @dataclass(frozen=True)
@@ -2496,6 +2539,11 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     """Append each attempt independently of the final verify call target."""
     from scripts.buildlog import record
 
+    class MeasuredSshAttempt(record.SshAttempt):
+        transfers: list[buildlog_sync.TransferBytes]
+        sent_bytes: int
+        received_bytes: int
+
     if not request.target:
         return
     repository = repository_identity(request.repo_root)
@@ -2507,7 +2555,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                if isinstance(result, (FailedOnMac, FailedOnTarget)) else "lost"
                if isinstance(result, (LostMacRun, InterruptedTargetRun)) else "no_tests"
                if isinstance(result, NoTestMatchedOnMac) else "declined")
-    attempt: record.SshAttempt = {
+    attempt: MeasuredSshAttempt = {
         "call_id": request.call_id, "target": request.target,
         "repo_identity": (repository.key if isinstance(repository, KnownRepository) and repository.key
                           else store.UNKNOWN_IDENTITY),
@@ -2516,6 +2564,9 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         "outcome": outcome, "completion": evidence.completion, "cleanup": evidence.cleanup,
         "unresolved_count": evidence.unresolved_count if isinstance(evidence.unresolved_count, int) else None,
         "evidence_at": evidence.evidence_at or time.time(),
+        "transfers": evidence.traffic.transfers,
+        "sent_bytes": sum(transfer["sent_bytes"] for transfer in evidence.traffic.transfers),
+        "received_bytes": sum(transfer["received_bytes"] for transfer in evidence.traffic.transfers),
     }
     if isinstance(result, LostMacRun):
         attempt["reason"] = result.detail
@@ -2551,17 +2602,15 @@ def main() -> int:
     config = read_config(Path(settings)) if settings else read_config()
     controller = ProcessController()
     started = time.monotonic()
+    result: MacOffloadResult = LostMacRun(0, "runner did not complete")
     try:
-        with interrupt_handlers(controller):
+        with interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
             result = run_offload(controller, config, request, started)
         status = write_result(result, request.result, request.last_decline, request.verb, request.target,
                               controller.attempt_evidence, request.fetch)
-        try:
-            persist_attempt(request, result, controller.attempt_evidence, started)
-        except (OSError, ValueError) as error:
-            print(f"offload: cannot record the attempt: {error}", file=sys.stderr)
         return status
     except OffloadInterrupted as interrupted:
+        result = LostMacRun(elapsed_seconds(started), f"interrupted by signal {interrupted.signal_number}")
         return 128 + interrupted.signal_number
     except Exception:
         traceback.print_exc()
@@ -2571,6 +2620,11 @@ def main() -> int:
             except OSError:
                 pass
         return 75
+    finally:
+        try:
+            persist_attempt(request, result, controller.attempt_evidence, started)
+        except (OSError, ValueError) as error:
+            print(f"offload: cannot record the attempt: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":
