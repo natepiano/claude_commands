@@ -1952,6 +1952,15 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(rows[row.id]["role"], "review")
             self.assertEqual(rows[row.id]["activity"], "Check the saved work.")
             self.assertEqual(rows[row.id]["home"], str(Path.home() / ("." + label)))
+        self.assertEqual(self.command("list", "--all"),
+                         (0, "1 same-name review codex2 - busy\n2 same-name review claude2 - idle\n", ""))
+        for hold, state in ((staff.Paused("TEST", "TEST", "Hold the worker."), "paused"),
+                            (staff.Exited("TEST", "TEST", "Exit the worker."), "exited")):
+            with self.subTest(state=state):
+                _ = staff.set_hold(first.id, hold)
+                self.assertEqual(self.command("list", "--all"),
+                                 (0, f"1 same-name review codex2 - {state}\n2 same-name review claude2 - idle\n", ""))
+        _ = staff.set_hold(first.id, staff.Active())
         record = staff.local_snapshot()
         cases: tuple[tuple[worker_panes.WorkerDispatchState | OSError | ValueError, str, str], ...] = (
             (worker_panes.ReleasedWorkerPass.NO_PROMPT_DELIVERED, "no prompt was delivered", "idle"),
@@ -2163,7 +2172,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.command("list"), (0, "", ""))
         self.assertEqual(self.dispatch("impl01"), worker.ExitCode.OK)
         self.assertEqual(self.finish("impl01"), turn_end.TurnOutcome.DONE)
-        self.assertEqual(self.command("list"), (0, "1 impl01 impl account unknown ClosedWorker\n", ""))
+        self.assertEqual(self.command("list"), (0, "1 impl01 impl - closed -\n", ""))
         for number in range(2, 11):
             self.assertEqual(self.dispatch(f"impl{number:02}"), worker.ExitCode.OK)
             self.assertEqual(self.finish(f"impl{number:02}"), turn_end.TurnOutcome.DONE)
@@ -2174,17 +2183,50 @@ class WorkerCommandTests(unittest.TestCase):
         members = staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)
         numbers = [" 1", " 2", " 3", " 4", " 5", " 6", " 7", " 8", " 9", "10"]
         self.assertEqual(output.splitlines(), [
-            f"{number} {row.name} impl account unknown ClosedWorker" for number, row in zip(numbers, members, strict=True)])
-        known: dict[str, object] = {"name": "known", "role": "impl", "account": "codex2", "state": "ClosedWorker"}
+            f"{number} {row.name} impl - closed -" for number, row in zip(numbers, members, strict=True)])
+        cases = (
+            ("idle", "open idle"),
+            ("working", "open busy"),
+            ("stopped", "open exited"),
+            ("paused", "open paused"),
+            ("exited", "open exited"),
+            ("unknown", "open unknown"),
+        )
+        columns = ["- closed -"] * len(members)
+        _ = staff.set_home(members[6].id, staff.SessionHome(self.fixture.root / ".codex2"))
+        for index, (status, expected) in enumerate(cases):
+            row = members[index]
+            pane = f"w1:list{index}"
+            self.fixture.world.add(row, pane, live=status != "stopped", family="codex")
+            self.fixture.world.locations[pane]["agent_status"] = status if status in ("working", "unknown") else "idle"
+            if status == "paused":
+                _ = staff.set_hold(row.id, staff.Paused("TEST", "TEST", "Hold the worker."))
+            elif status == "exited":
+                _ = staff.set_hold(row.id, staff.Exited("TEST", "TEST", "Exit the worker."))
+            if index == 0:
+                _ = staff.set_home(row.id, staff.SessionHome(self.fixture.root / ".codex2"))
+            columns[index] = f"{'codex2' if index == 0 else 'account unknown'} {expected}"
+        code, output, errors = self.command("list")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(output.splitlines(), [
+            f"{number} {row.name} impl {column}"
+            for number, row, column in zip(numbers, members, columns, strict=True)])
+        self.fixture.world.add(members[0], "w1:duplicate", family="codex")
+        self.fixture.world.unknown["w1:list1"] = "TEST process is unreadable"
+        code, output, errors = self.command("list")
+        self.assertEqual(code, 0, errors)
+        self.assertIn(f" 1 {members[0].name} impl - unknown - duplicate native identities; panes retained", output.splitlines())
+        self.assertIn(f" 2 {members[1].name} impl - unknown - TEST process is unreadable", output.splitlines())
+        known: dict[str, object] = {"name": "known", "role": "impl", "account": "codex2", "pane": "open", "state": "idle"}
         unknown: dict[str, object] = {"name": "unknown", "role": {"state": "WorkerRoleUnavailable"},
-                                      "account": {"state": "AccountUnavailable"}, "state": "ClosedWorker"}
+                                      "account": {"state": "AccountUnavailable"}, "pane": "open", "state": "idle"}
         for fields, expected in (
                 (unknown, "role unknown account unknown"),
                 ({key: value for key, value in known.items() if key != "account"}, "impl account unknown"),
                 ({key: value for key, value in known.items() if key != "role"}, "role unknown codex2")):
             with self.subTest(fields=fields), patch.object(worker, "list_workers", return_value=[known, fields]):
                 self.assertEqual(self.command("list"),
-                                 (0, f"1 known impl codex2 ClosedWorker\n2 {fields['name']} {expected} ClosedWorker\n", ""))
+                                 (0, f"1 known impl codex2 open idle\n2 {fields['name']} {expected} open idle\n", ""))
                 code, output, errors = self.command("list", "--json")
                 self.assertEqual(code, 0, errors)
                 self.assertEqual(cast(list[dict[str, object]], json.loads(output)), [known, fields])
@@ -2254,7 +2296,7 @@ class WorkerCommandTests(unittest.TestCase):
         code, output, errors = self.command("list")
         self.assertEqual(code, 0, errors)
         self.assertIn("role unknown", output)
-        self.assertIn("account unknown", output)
+        self.assertEqual(output, "1 missing-backend role unknown - closed -\n")
         self.assertNotIn("{", output)
 
     def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
