@@ -787,33 +787,49 @@ The earlier cause: `resolve_staff_recipient` matched a bare name globally over s
 
 ### Phase 32 — Each leftover source deletes its own output  · status: done
 
+#### As-built
+
+A read-only report. It went to the sdlc showrunner on 2026-11-09, grouped by production for routing. No repository file changed.
+
+- Seven of the eight `/tmp` and `~/rust` leftovers came from one-off worker commands (`git clone` or `tempfile.mkdtemp` into `/tmp`), not from committed code. The worker prompt rule covered only test projects. Phase 33 widens it.
+- The run-active mark stays because `end_session.sh` exits on a failed role cleanup before it removes the mark, and `finish-run` never removes it. Phase 33 fixes this.
+- Gate copies (`copies.py`, builds verify and queue), `cargo-port-live` (cargo-liner port), and the other inventory items went to their owners through the showrunner.
+
+**Gotchas:** a `TemporaryDirectory` block does not run on SIGTERM unless the process turns the signal into an exception. The showrunner ruled this out of scope: `TMPDIR` is cleared at reboot.
+
+### Phase 33 — A run that stops removes its own mark, and workers make folders that delete themselves  · status: todo
+
+**Depends on:** Phase 32
+
 #### Work Order
 
-**Goal:** a report that names, for each kind of leftover the phase 28 cleanup removed and for every other place in `~/.claude` that makes a folder outside a self-deleting `with` block, the code that made it, whether that code now deletes its own output when it ends, its owner (unit and production), and the smallest fix where it still leaves output.
+**Goal:** every way a unit run ends removes that run's run-active mark, also when a later cleanup step fails. Every worker prompt tells the worker that a folder it makes for its own use is made in a `with` block under `TMPDIR`.
 
 **Spec:**
-- Context (user, 2026-11-09, via the sdlc showrunner): processes must clean up after themselves. A cleanup after the fact does not solve the problem. The user ran the phase 28 removal script; every item below is now gone.
-- Find the source of each leftover kind:
-  1. 27 old gate copies under `~/worktrees/gates/.claude`. The 2026-11-07 change that moved `~/.claude` gates to `~/worktrees/gates/claude_commands` (queue 18a) left them. Say whether that change, or the gate copy code, removes the old folder, and whether the gate copy code removes each copy it makes when the gate ends.
-  2. Gate copies of retired units (`~/worktrees/gates/checkout/<unit>-gate*`, `~/worktrees/gates/reload/<unit>-gate*`). Phase 28's As-built says `retire_unit` and `tidy_wrapped` now remove them through `copies.unit_owner`. Confirm that against the current code on `origin/main`, and say whether a gate copy of a live unit is removed when its gate ends.
-  3. Test folders in `/tmp`: `/tmp/buildlog-prephase-lint-test-cba752fb`, `/tmp/opencascade-rs-d12c6e`, `/tmp/y-state-split-ruz07wxn`, and 20 `/tmp/cargo-port-live.*`. A new `/tmp/y-state-split-root` exists now; include it.
-  4. Clones `/tmp/audit-p4-patch-check-izjb2vf_` and `~/rust/startup-unit-cover-ready`.
-  5. A stale run-active mark: `/tmp/claude/unit/active/0a713a32-389e-446b-a7bc-5ab7a753b383`. The cargo-liner unit run stopped (last written 2026-10-31) without `end_session.sh`. Find which stop path skips the end step. The fix: a run that stops removes its own mark.
-- Search the code first: `~/.claude` at `origin/main` and the repositories under `~/rust`. Use the name stems (`buildlog-prephase-lint-test`, `opencascade-rs`, `y-state-split`, `cargo-port-live`, `audit-p4-patch-check`, `startup-unit-cover-ready`).
-- When no code makes a name, find the session that ran the command. Search the session transcripts under `~/.claude*/projects` and `~/.codex/sessions` for the name. Name that session's unit.
-- For each source: quote the line that makes the output and the file and line. Say whether the same code deletes it on every exit (success, failure, interrupt). Name its owner: the unit and its production, from the commit that added the line (`git log -S`), the plan slug in its subject, and staff.
-- For each source that still leaves output, propose the smallest fix: the process deletes what it made when it ends. Name the file and the change in one sentence.
-- Fix shape (user, 2026-11-09: "i like how tempdir works - it always cleans up after itself - could we set up our processes to work that way?"): a folder that a process makes for its own use is made in a `with` block under `TMPDIR` (Python `tempfile.TemporaryDirectory`, Rust `tempfile::TempDir`). The block deletes it when it ends, also on an error. Only a folder that must outlive its process (for example, a folder for the user to try a change) uses `scratch.py`; for each such case, say why it must outlive the process.
-- Inventory: name every place in `~/.claude` at `origin/main` that makes a folder without this shape and is not in `scratch.py` (for example `tempfile.mkdtemp`, `mkdir -p` under `/tmp`, `mktemp -d`, `git clone` or `git worktree add` to a temporary path). For each: file and line, whether the same code deletes it on every exit, its owner (unit and production), and the fix in the shape above or the reason it must outlive its process.
-- Add no new check, scan or sweep.
-- Read only. Do not edit code, delete files or change state.
+- Context (user rule, 2026-11-09, via the sdlc showrunner): our processes clean up after themselves, the way tempdir does. A folder a process makes for its own use is made in a `with` block under `TMPDIR` (Python `tempfile.TemporaryDirectory`, Rust `tempfile::TempDir`). Use `scratch.py` only for a folder that must outlive its process, with the reason. Add no check or scan. Add no signal handlers: `TMPDIR` is cleared at reboot, so a kill is rare enough.
+- Phase 32 found (origin/main 4b7ee03d3):
+  1. `scripts/direct/end_session.sh:88` runs `design_roles.py unbind-run "${run}" || exit 1`. When it fails, the script exits before it removes the mark (line 98). The cargo-liner berth run hit this twice on 2026-10-31 (`design_roles: missing or invalid repository`), and a `| tail` on the call hid the exit.
+  2. `progress_history.py finish-run` (`_finish_run`, about line 6568) marks the run finished but never removes the mark. The worker hook path (`assign.py:354`, `finish_run=True`) and the failed-launch path (`assign.py:756`) use it.
+  3. A second `finish-run` on a finished run returns at once (about line 6579), so a retry never removes the mark.
+- One end step owns the mark. Put it beside `activate` in `scripts/lib/unit_runs.py`. Given a run folder, it removes the mark that names that run, and only a mark whose first line still names that run. It works on a retry. For a new run, `activate` records in the run folder which mark it wrote, so the end step finds it without a scan.
+- `finish-run` calls the end step, also when the run is already finished. `end_session.sh` calls the same end step for each run it ends; it does not remove the mark itself.
+- In `end_session.sh`, a failed role cleanup (`unbind-run`) or any other cleanup step does not stop the end step. The script still exits non-zero and prints the failed step when one failed.
+- No pipe hides the exit: in `docs/direct/final_gate_commit.md` (<RunSummary/>) and `docs/direct/launch_implementation.md`, the `end_session.sh` call is one command with no pipe.
+- Worker prompt rule: in `docs/direct/write_prompt_contract.md`, replace the test-only instruction at item 6 (about line 88) with one verbatim instruction that every implementation, fix, test and research prompt carries: "A folder you make for your own use (a clone, a test project, a copy, a download) is made in a `with` block under `TMPDIR` (Python `tempfile.TemporaryDirectory`, Rust `tempfile::TempDir`), which removes it when the block ends. Never make one under `/tmp` or `~/rust` by hand. Use `scratch.py` only for a folder that must outlive your command, and say why in your summary. Never commit a test project to the repo." Put the same sentence in the review standing instructions (`config/review/code.md`). Phase 32 traced 7 of 8 leftovers to one-off worker commands.
+- Old marks: about 40 marks under `/tmp/claude/unit/active` stay from runs that ended before this fix. Write a one-off program outside the repository (in the worker's scratch) that calls the new end step once for each mark whose run is finished, or whose director session is not live (`unit_runs.marker_must_stay`). It never touches a mark of a live run. It runs once at deploy, then it is deleted. The worker does not run it; the director names it in the checkpoint notice.
+- Tests: add rows to the existing tests (`scripts/direct/test_end_session.py`, `scripts/lib/test_unit_runs.py`, the `finish-run` tests in `scripts/direct/test_progress_history*.py`). Cover: `finish-run` removes the mark; a retry on a finished run removes a mark that stayed; a failed `unbind-run` still removes the mark and the script exits non-zero; a mark that names another run stays. Tests use fixture folders only, never `/tmp/claude/unit` or a live run.
 
 **Files:**
-- `docs/plans/build-followups-hierarchies.md` — this Work Order only; the worker writes no repository file. The report goes in the worker's final reply.
+- `scripts/lib/unit_runs.py` — the end step; `activate` records its mark.
+- `scripts/direct/progress_history.py` — `finish-run` calls the end step.
+- `scripts/direct/end_session.sh` — calls the end step; cleanup failures do not stop it.
+- `docs/direct/final_gate_commit.md`, `docs/direct/launch_implementation.md` — the end call without a pipe.
+- `docs/direct/write_prompt_contract.md`, `config/review/code.md` — the folder rule.
+- `scripts/lib/test_unit_runs.py`, `scripts/direct/test_end_session.py`, `scripts/direct/test_progress_history*.py` — rows.
 
-**Workers:** 1 writer; one read-only search, so nothing splits.
-- `impl` — the report, in its final reply.
+**Workers:** 1 writer; the end step, its callers and the prompt rule are one small change across shared files, so nothing splits.
+- `impl` — all files above.
 
-**State:** none.
+**State:** new runs record their mark in the run folder. Old marks get the deploy one-off.
 
-**Acceptance gate:** every leftover kind and every inventory place has a quoted line and file, a yes or no on self-cleanup, an owner, and a fix in the `with` block shape or the reason it must outlive its process.
+**Acceptance gate:** the targeted test is green; basedpyright reports 0 on `scripts/lib` and `scripts/direct`; the new test rows pass.
