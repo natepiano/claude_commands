@@ -2046,3 +2046,78 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Ruled out:**
 - Direct policy calls for the remaining cases: they cannot prove Cargo input, cache reuse or remote command input.
+
+### Phase 103 — The progress history tests use half their CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Source:** next items, items 2 and 6a. On 2026-11-09 04:40 EST (`show.py top`), `direct/test_progress_history.py` is an eligible top module: 41.9 CPU s per gate, 284 tests. The profile on a copy of `ab2db04d7` (`module_cost.py --tests 10 --commands 10`) measured 41.8 CPU s, 2124 processes and 60.2 wall s. The supervisor process holds 16.7 CPU s of in-process test work. The removable fixture cost is in child starts: `phase_table.py` 39 starts and 9.0 CPU s, `findings.py` 46 starts and 3.4 CPU s, `python3 -c` 150 starts and 2.8 CPU s, `progress_history.py` 9 starts and 2.0 CPU s, `git` 1186 starts and 1.1 CPU s.
+
+**Goal:** `scripts/direct/test_progress_history.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Find what starts each `phase_table.py` process: the recorder's own refresh (`progress_history.py` `_refresh_phase_table`) or the test. Run a refresh in process where the test does not assert on the process boundary.
+3. Run `findings.py` and `progress_history.py` command calls in process through `scripts/production/cli_fixture.py` `invoke_cli`, as `scripts/direct/findings_test_support.py` and Phase 89 do. Keep a real process for each behavior that only a process proves: concurrent writers, exit codes across a process, any cwd or environment that the entry reads at start.
+4. Find what the 150 `python3 -c` starts run. Move each one in process when the test does not assert on a separate interpreter.
+5. Share expensive setup: build a seed Git repository once and copy it for each test, where tests make the same repository.
+6. Write a behavior map with a row for each assertion before you change a test. The module has 284 tests: group rows by test class and helper where the assertions are the same.
+7. Do not change `scripts/direct/progress_history.py`, `phase_table.py` or `findings.py`. sdlc owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+8. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_progress_history.py`
+
+**Workers:** 1 writer; one test file
+- `impl` — `test_progress_history.py`
+
+**Constraints from prior phases:**
+- Phase 89, Phase 97 and Phase 100: an in-process call of a real entry through `invoke_cli` cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
+- Phase 104 runs beside this phase and holds `scripts/aws_target/test_box.py`. Do not edit it.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file passes, and every module that imports a changed helper passes.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+- Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.
+
+### Phase 104 — The AWS box tests use half their CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** next items, items 2 and 6a. On 2026-11-09 04:40 EST (`show.py top`), `aws_target/test_box.py` is the top eligible module: 43.3 CPU s per gate, 61 tests. The profile on a copy of `ab2db04d7` (`module_cost.py --tests 10 --commands 10`) measured 37.7 CPU s, 1296 processes and 41.8 wall s. The supervisor holds 1.9 CPU s. Almost all other CPU is in the fake tools: each test writes a Python shim for `aws`, `ssh`, `git`, `nix`, `tailscale`, `systemctl`, `bash`, `rustc`, `cargo`, `cargo-nextest` and `cargo-mend` into its own `bin` folder, and each call starts a new interpreter (for example 73, 68 and 67 `aws` starts in single tests, about 20 ms of CPU each).
+
+**Goal:** `scripts/aws_target/test_box.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each fake tool start per test.
+2. Start with the slowest tests in the profile: `test_up_records_all_box_stages_and_resumes_after_configuration_failure` (4.5 CPU s), `test_checks_compare_plain_environment_versions_without_another_repository` (3.6) and `test_stopped_setup_rechecks_changed_system_and_local_versions` (2.7).
+3. Cut the cost of the fake tool starts. Options, in order: run the fake in process where `box.py` reaches the tool through a replaceable runner (for example `aws_target.py`'s run function), and keep a real process for each behavior that only a process proves (the `box.py` `Popen` path with stdin, an exit code, an environment the tool reads); make each shim start cheaper (fewer imports, `-S`/`-I`); share one `bin` folder for the module.
+4. `scripts/aws_target/test_deploy.py` imports `FAKE`, `SYSTEM`, `FakeMonotonicClock`, `FakeTailnet` and `write_aws_claim` from this module. It stays green, and its fake keeps the same behavior.
+5. Write a behavior map with a row for each assertion before you change a test. For each check that moves in process, show on a tempdir copy that breaking the function under test fails the new test.
+6. Do not change `scripts/aws_target/box.py`, `aws_target.py` or other production files. aws-unit owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/aws_target/test_box.py`
+
+**Workers:** 1 writer; one test file
+- `impl` — `test_box.py`
+
+**Constraints from prior phases:**
+- Phase 97 and Phase 100: an in-process call of a real entry cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
+- Phase 103 runs beside this phase and holds `scripts/direct/test_progress_history.py`. Do not edit it.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and `test_deploy.py` pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+- Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.

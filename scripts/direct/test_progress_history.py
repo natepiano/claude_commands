@@ -17,6 +17,7 @@ import io
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ from collections.abc import Callable
 from contextlib import chdir, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO, cast, override
+from typing import ClassVar, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.production import session_staff, staff, unit_config
@@ -37,13 +38,15 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 # These regressions check the private verifier's semantic result before wait closure.
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.findings_test_support import invoke_findings
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.production.cli_fixture import invoke_cli
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
-FINDINGS = Path(__file__).with_name("findings.py")
 BOARD = Path(__file__).with_name("board.sh")
 # Four reports per finished phase, as (raw percent, percent of the phase's time
 # already spent): the shape of startup-polish Phase 5's history on 2026-10-03.
@@ -76,6 +79,7 @@ def refresh_phase_table(session_dir: Path) -> None:
 
 
 class ProgressHistoryTests(unittest.TestCase):
+    repository_seed: ClassVar[Path]
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -85,12 +89,25 @@ class ProgressHistoryTests(unittest.TestCase):
     team_slot: str  # pyright: ignore[reportUninitializedInstanceVariable]
     last_recorder_stderr: str = ""
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        directory = tempfile.TemporaryDirectory(dir="/tmp")
+        cls.addClassCleanup(directory.cleanup)
+        cls.repository_seed = Path(directory.name)
+        _ = subprocess.run(["git", "init", "-b", "feature/rubric", str(cls.repository_seed)],
+                           check=True, capture_output=True, text=True)
+
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         # Socket fixtures need a short path even when the run's TMPDIR is long.
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.temporary.name)
+        cache = self.root / "cache"
+        seed_interpreter_cache(cache)
+        self.enterContext(patch.dict(os.environ, {"CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache)}))
         self.enterContext(patch.dict(os.environ, source_environment(self.root / "sources")))
         self.enterContext(isolated_source_readers())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -98,7 +115,7 @@ class ProgressHistoryTests(unittest.TestCase):
         _ = fixture_member("showrunner", name="recorder")
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "bevy_hana_rubric"
-        self.working_dir.mkdir()
+        _ = shutil.copytree(self.repository_seed, self.working_dir)
         # Pin the report interval and the timezone: without both, the clock line
         # renders from the machine's own direct.conf and local offset, and the
         # expected header would differ per machine.
@@ -112,13 +129,19 @@ class ProgressHistoryTests(unittest.TestCase):
         self.team_slot = ""
         self.models_config_file = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(self.models_config_file)
-        _ = subprocess.run(
-            ["git", "init", "-b", "feature/rubric"],
-            cwd=self.working_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) < 2 or Path(command[1]).resolve() != SCRIPT.with_name("phase_table.py"):
+                return run_process(command, **options)
+            environment = cast(dict[str, str], options.get("env", os.environ.copy()))
+            directory = Path(cast(str | Path, options.get("cwd") or Path.cwd()))
+            result = invoke_cli(phase_table, phase_table.main, command[2:], environment, directory)
+            if options.get("check"):
+                result.check_returncode()
+            return result
+
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
 
     @override
     def tearDown(self) -> None:
@@ -4746,13 +4769,8 @@ with patch.object(fcntl, "flock", admission):
         environment["UNIT_NOW_EPOCH"] = str(at)
         if arguments and arguments[0] == "dispatch":
             arguments = (*arguments, "--accepted-checks", "none: fixture has no accepted caller")
-        result = subprocess.run(
-            ["python3", str(FINDINGS), *arguments, "--session-dir", str(session_dir)],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_findings([*arguments, "--session-dir", str(session_dir)], environment, Path.cwd())
+        result.check_returncode()
         return result.stdout.strip()
 
     def run_pass(
@@ -8093,20 +8111,10 @@ class PhaseCountTests(unittest.TestCase):
     def _count(self, body: str, phase_percent: int = 0) -> dict[str, object]:
         plan = Path(self.temporary.name) / "plan.md"
         _ = plan.write_text(body, encoding="utf-8")
-        completed = subprocess.run(
-            [
-                "python3",
-                str(SCRIPT),
-                "phase-count",
-                "--plan-doc",
-                str(plan),
-                "--phase-percent",
-                str(phase_percent),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        environment = dict(os.environ, HOME=self.temporary.name)
+        completed = invoke_recorder(
+            ["phase-count", "--plan-doc", str(plan), "--phase-percent", str(phase_percent)],
+            environment, Path.cwd(), check=True)
         return cast("dict[str, object]", json.loads(completed.stdout))
 
     def test_counts_all_three_heading_forms(self) -> None:
