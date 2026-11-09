@@ -24,24 +24,11 @@ sdlc, 2026-11-09 08:10 EST: at 08:05 EST a cargo-liner port 4r worker ran `verif
 
 ### Phase 1 — The reap retries a pending completion only when its supervisor is gone  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `detached_runs.py start` and `reap` never call a worker's completion while that run's supervisor is alive, so a worker's run start never waits on its worker lock.
-
-**Spec:**
-1. `scripts/agents/detached_runs.py` `_reap_orphans_locked`: the branch for `status == "finished"` with `completion_pending` calls `_finish_record` only when the existing liveness read, `detached_run_process.supervises(pid, path)`, is false for the record's `pid`. Add no new liveness read (sdlc, 2026-11-09). A live supervisor owns its own completion. Change nothing else in the reap.
-2. Fix the `reap_orphans` docstring if it names the pending retry.
+`_reap_orphans_locked` in `scripts/agents/detached_runs.py` retries a finished record's pending completion only when `detached_run_process.supervises(pid, path)` is false. A live supervisor owns its own completion, so `detached_runs.py start` and `reap` never wait on the worker lock for it. A supervisor that dies after it writes `completion_pending` gets one retry from the next reap. The `reap_orphans` docstring needed no change.
 
 **Files:**
-- `scripts/agents/detached_runs.py` — the pending-completion retry in `_reap_orphans_locked`.
-- `scripts/agents/test_detached_runs.py` — add rows to the existing pending-completion test: a pending record with a live supervisor is not retried; a pending record whose supervisor is gone is retried once.
-- `docs/as-built/herdr-adoption.md` — one sentence for the rule beside its `reap_orphans` text.
-
-**Workers:** `1 writer` — one function and its test.
-- `impl` — all files above.
-
-**State:** none.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** basedpyright 0/0/0 on `scripts/agents/detached_runs.py` and its test; `scripts.agents.test_detached_runs` green; the targeted test green.
+- `scripts/agents/detached_runs.py`
+- Tests: `scripts/agents/test_detached_runs.py` (`PaneRunDeliveryTests`: a live supervisor is not retried; a gone supervisor is retried once)
+- Docs: `docs/as-built/herdr-adoption.md` (the `reap_orphans` rule)
