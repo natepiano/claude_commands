@@ -10,3 +10,9 @@ Run the command from the showrunner's session.
 The native session selects the showrunner row.
 The command uses the same roles, selector, transcript receipt, and exit codes.
 Only worker end and permanent removal delete worker rows.
+
+Assignment returns after submission. End the showrunner turn after any assigned synchronous review.
+The turn hook sends the result and reply path to the showrunner.
+Read that message before the next workflow step.
+
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.

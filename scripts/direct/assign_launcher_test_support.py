@@ -254,7 +254,20 @@ class AssignLauncherFixture(unittest.TestCase):
         return prepared
 
 
-class FirstDispatchFixture(AssignLauncherFixture):
+class HookAssignmentFixture(AssignLauncherFixture):
+    """Deliver native completion events after the launcher returns."""
+
+    @override
+    def launch(self, role: str = "implement", *options: str, paths: bool = True, session: bool = True,
+               execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
+        result = super().launch(role, *options, paths=paths, session=session, execution=execution)
+        if result.returncode == 0 and self.native.agent.submitted:
+            row = self.native.agent.row(self.native.agent.submitted[-1][0])
+            _ = self.native.finish(row.name)
+        return result
+
+
+class FirstDispatchFixture(HookAssignmentFixture):
     def first_assignment(self, role: str = "implement", *options: str) -> None:
         _ = self.successful(role, *options)
 

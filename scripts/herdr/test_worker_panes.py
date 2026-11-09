@@ -184,6 +184,18 @@ class PaneWorld(herdr.Herdr):
             observed = process_start.process_start(pid)
         return observed.start if isinstance(observed, process_start.Started) else None
 
+    @contextmanager
+    def process_starts(self) -> Generator[None]:
+        """Read pane process identities from this fixture's process directory."""
+        observed_start = process_start.process_start
+        def read(pid: int) -> process_start.ProcessStart:
+            if pid in self.processes:
+                with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
+                    return observed_start(pid)
+            return observed_start(pid)
+        with patch.object(process_start, "process_start", side_effect=read):
+            yield
+
     def signal(self, pid: int, number: int) -> None:
         """Stop only an agent that belongs to this fixture."""
         if pid not in self.processes:
@@ -395,7 +407,8 @@ class PaneWorld(herdr.Herdr):
             self.commands.append(command)
             self.report_reads_at_wait.append(self.report_reads_before_publish)
             states = {command[index + 1] for index, argument in enumerate(command[:-1]) if argument == "--until"}
-            if self.first_turn_timeout or self.turn_end_status.value not in states:
+            if self.first_turn_timeout or (self.turn_end_status.value not in states
+                                           and self.turn_end_status != herdr.AgentStatus.BLOCKED):
                 return subprocess.CompletedProcess(arguments, 1,
                     json.dumps({"error": {"code": "timeout", "message": "deadline"}}), "")
             self.locations[pane]["agent_status"] = self.turn_end_status.value
@@ -1212,6 +1225,10 @@ class WorkerPaneTests(StaffTestCase):
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        hook = next(argument.removeprefix("notify=") for argument in arguments if argument.startswith("notify="))
+        command = cast(list[str], json.loads(hook))
+        self.assertEqual(Path(command[1]).resolve(), Path(__file__).with_name("turn_end.py").resolve())
+        self.assertEqual(Path(command[0]).resolve(), Path(__file__).resolve().parents[1] / "lib/py")
         self.assertEqual(len(self.world.launches), 2)
 
     def test_resume_uses_the_pane_folder_only_for_codex(self) -> None:
@@ -1246,6 +1263,13 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(family, "claude")
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
 
+        arguments = self.world.requests[-1][1]
+        settings = arguments[arguments.index("--settings") + 1]
+        hooks = cast(dict[str, dict[str, list[dict[str, list[dict[str, object]]]]]], json.loads(settings))
+        command = hooks["hooks"]["Stop"][0]["hooks"][0]
+        self.assertIn("turn_end.py", str(command["command"]))
+        self.assertTrue(command["async"])
+
     def test_codex_launch_ignores_the_between_turn_compaction_limit(self) -> None:
         config = self.root / "conf/direct.conf"
         original = config.read_text()
@@ -1261,13 +1285,30 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(len(self.world.launches), index + 1)
 
     def test_same_role_keeps_a_worker_without_the_compaction_option(self) -> None:
-        result = self.start()
-        assert isinstance(result, worker_panes.OpenWorker)
-        self.dispatch(result.row, "impl")
-        arguments = self.world.requests[-1][1]
-        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
-        self.assertEqual(self.start(), result)
-        self.assertEqual((len(self.world.launches), self.world.stops), (1, []))
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+                before = len(self.world.launches), self.world.stops.copy()
+                name = "same-role-" + family
+                result = self.start(name)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.dispatch(result.row, "impl")
+                arguments = self.world.requests[-1][1]
+                self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+                self.assertEqual(self.start(name), result)
+                self.assertEqual((len(self.world.launches), self.world.stops), (before[0] + 1, before[1]))
+                self.completed_dispatch(result.row, "impl")
+                actual = self.world.foreground[result.pane][2]
+                index = (next(i for i, argument in enumerate(actual) if argument.startswith("notify=")) - 1
+                         if family == "codex" else actual.index("--settings"))
+                del actual[index:index + 2]
+                resumed = self.start(name)
+                self.assertIsInstance(resumed, worker_panes.OpenWorker)
+                assert isinstance(resumed, worker_panes.OpenWorker)
+                self.assertEqual(resumed.row, result.row)
+                self.assertNotEqual(resumed.terminal, result.terminal)
+                self.assertEqual(len(self.world.launches), before[0] + 2)
+                self.assertEqual(self.world.stops, [*before[1], str(result.row.current_session)])
 
     def test_role_change_resumes_a_worker_without_the_compaction_option(self) -> None:
         result = self.start()

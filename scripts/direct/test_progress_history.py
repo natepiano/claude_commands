@@ -3905,6 +3905,30 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(len(self.pass_events("dispatch-api", "pass_started")), 1)
         self.assertEqual(len(self.pass_events("dispatch-api", "pass_finished")), 1)
 
+    def test_hook_completion_keeps_the_delivery_and_closes_only_its_pass(self) -> None:
+        run = self.start_run("hook-completion", 41_000)
+        self.start_phase(run, 41_010)
+        prompt = self.root / "hook-prompt.txt"
+        _ = prompt.write_text("Complete the assigned work.\n")
+        instances: dict[str, str] = {}
+        for slot in ("impl", "test"):
+            instances[slot] = progress_history.begin_dispatch(run, slot=slot, phase="3", role=cast(staff.WorkerRole, slot),
+                worker_name=slot, worker_id=staff.StaffId(fixture_runtime_id("hook-" + slot)),
+                launcher_command=["assign.sh", "--role", slot], prompt=prompt, kind=slot, lens="")
+        delivery = progress_history.DispatchDelivery("The exact prompt.", instances["impl"], str(self.root / "reply.txt"),
+            actions=progress_history.CompletionActions(summary_file=str(self.root / "summary.txt"), held_role="held-reviewer",
+                finish_phase="3", finish_run=True))
+        progress_history.save_dispatch_delivery(run, instances["impl"], delivery)
+        before = self.pass_slots(run)["test"]
+        progress_history.complete_dispatch(run, "impl", instances["impl"])
+        progress_history.complete_dispatch(run, "impl", instances["impl"])
+        slots = self.pass_slots(run)
+        self.assertEqual(slots["impl"]["status"], "completed")
+        self.assertEqual(slots["test"], before)
+        self.assertEqual(progress_history.dispatch_delivery(slots["impl"]), delivery)
+        self.assertEqual(slots["impl"]["launcher_command"], ["assign.sh", "--role", "impl"])
+        self.assertEqual(len(self.pass_events("hook-completion", "pass_finished")), 1)
+
     def test_dispatch_worker_recovers_the_active_and_completed_worker_without_writes(self) -> None:
         session = self.start_run("dispatch-worker", 41_000)
         self.start_phase(session, 41_010)
@@ -3918,10 +3942,13 @@ with patch.object(fcntl, "flock", admission):
                 worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
-            for status in ("active", "completed"):
+            for status in ("active", "completed", "phase-completed"):
                 with self.subTest(status=status):
                     if status == "completed":
                         self.finish_slot_pass(session, "test", "completed", 41_030)
+                    elif status == "phase-completed":
+                        _ = self.run_command("finish-phase", "--session-dir", str(session),
+                            "--phase-id", "3", "--status", "completed", at=41_040)
                     before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
                               for path in session.rglob("*") if path.is_file()}
                     result = progress_history.dispatch_worker(
