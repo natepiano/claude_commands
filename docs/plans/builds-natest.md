@@ -1980,37 +1980,23 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - Other SSH paths in the module stay real.
 
 ### Phase 98 — The merge gate resources test never waits out its hang guard  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** builds showrunner order, 2026-11-08 23:xx EST, ranked after Phase 97. `production/test_merge_gate_suites_resources.py` took 617.75 s, 618.31 s and 625 s on three of 29 cloud gates that day; in 25 other gates it took 17-26 s. Each case passed. The extra 600 s equals `TEST_HANG_GUARD_SECS` (`scripts/lib/test_hang_guard.py`), and the box CPU was idle.
-
-**Goal:** no test in `scripts/production/test_merge_gate_suites_resources.py` waits out its hang guard; the cause of the long wait is found and fixed where it lives.
-
-**Spec:**
-1. The gate record names the slow test: `MergeGateResourcesTests.test_stop_during_a_blocking_read_returns_every_owned_slot`, 600.022 s in the last run (`show.py top`). Confirm it, and check the `waiting` / `released` waits near lines 140-200 as well.
-2. Reproduce the long wait before you change code. Run the test many times, alone and under CPU load, and record how often it waits.
-3. Find the cause. One lead to test, not a fact: the stop thread calls `os.kill(os.getpid(), signal.SIGTERM)` while the main thread blocks in `os.read`. If the kernel gives the signal to a thread other than the main thread, the main thread's read is not interrupted.
-4. Fix the cause where it lives. A defect in `scripts/production/merge_gate.py` is fixed there; send the director its evidence first, because another unit owns that file.
-5. Keep every assertion. Add no guard, refusal or check (user rule, 2026-11-05).
+- `SharedCPUPool.acquire` in `scripts/production/merge_gate.py` waits in `select` on the jobserver descriptor and a private signal wakeup pipe (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`, `signal.set_wakeup_fd`). A stop signal wakes the wait when the kernel delivers it to another thread, or when it arrives just before the wait starts. Either case used to leave the gate blocked in `read()` until the 600 s hang guard.
+- When the jobserver is readable, `acquire` takes the token through `try_acquire` inside `build_folders.defer_signals()`. Another gate can take the token first; the loop then waits again. `try_acquire` keeps the empty-read `GateRefused` and slot ownership.
+- `test_merge_gate_suites_resources.py` patches `select.select` and waits on the real `pool.blocking`. `test_stop_during_a_blocking_read_returns_every_owned_slot` has rows `before_wait`, `process` and `sender_thread` (`signal.pthread_kill` to the sender thread). `test_stop_after_blocking_acquisition_returns_the_new_slot_too` has rows `read` and `return`. Every row requires every token to return.
+- Measured on copies with a 3 s guard: guard waits 11/40 alone and 1/40 under CPU load before; 0/40 and 0/40 after.
 
 **Files:**
-- `scripts/production/test_merge_gate_suites_resources.py`
-- `scripts/production/merge_gate.py`
+- `scripts/production/merge_gate.py` — `SharedCPUPool.acquire` (owner sdlc devtools-unit)
+- `scripts/production/test_merge_gate_suites_resources.py` — the stop and acquire rows
 
-**Workers:** 1 writer; the test and its cause do not split
-- `impl` — `test_merge_gate_suites_resources.py`, `merge_gate.py`
+**Gotchas:**
+- The wakeup descriptor is set and restored inside `build_folders.defer_signals()`. `ExitStack` restores the previous wakeup descriptor before it closes the pipe.
 
-**Constraints from prior phases:**
-- `TEST_HANG_GUARD_SECS` is 600 s; a test that waits on it still passes, so the gate reports no failure.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- The repeat count and the long-wait count before and after the fix, alone and under load, in the checkpoint notice. After the fix, no run waits on the hang guard.
-- `test_merge_gate_suites_resources.py` and every importer of a changed file pass.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- A signal pipe in the test fixture only: it hides the production race.
 
 ### Phase 99 — The Claude assign launcher test file uses half its CPU  · status: todo
 **Depends on:** none
