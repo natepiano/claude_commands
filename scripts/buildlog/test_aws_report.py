@@ -202,12 +202,35 @@ class AwsReportTests(MeasurementFixture):
 
     def test_daily_charge_reconciliation_changes_cost_once_and_shows_its_difference(self) -> None:
         at = NOW + 86400
-        result = measurement.read_charges(self.settings, self.state, at, mock.Mock(return_value=Decimal(3)))
-        self.assertIsInstance(result, measurement.ChargeRead)
-        with mock.patch.object(time, "time", return_value=float(at)):
-            output = self.render()
-        self.assertIn("for $3.00", output)
-        self.assertIn("Actual charges: $3.00; reconciliation difference $1.00; query cost $0.00.", output)
+        result = measurement.read_charges(self.settings, self.state, at, self.charge_fetch(Decimal(3)))
+        reading = narrow(self, result, measurement.ChargeRead)
+        launches = [
+            {'time': MIDNIGHT, 'instance_type': 'm7a.8xlarge', 'result': 'launched'},
+            {'time': NOW, 'instance_type': 'm7a.8xlarge', 'result': 'launched'},
+            {'time': NOW, 'instance_type': 'm7a.4xlarge', 'result': 'launched'},
+            {'time': NOW, 'instance_type': 'm7a.4xlarge', 'result': 'refused'},
+            {'time': MIDNIGHT + 86400, 'instance_type': 'm7a.4xlarge', 'result': 'launched'},
+        ]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
+        usage = (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('0.06')),
+                 ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('0.02')),
+                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('0.03')),
+                 ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('2.89')))
+        for provisional in (False, True):
+            with self.subTest(provisional=provisional):
+                reading = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,
+                                           Decimal(3), reading.estimated_usd, reading.query_usd, usage, provisional)
+                _ = (self.state / 'charges' / f'{reading.day}.json').write_text(json.dumps(ledger.charge_record(reading)))
+                with mock.patch.object(time, 'time', return_value=float(at)):
+                    output = self.render()
+                self.assertIn('for $3.00', output)
+                state = 'provisional' if provisional else 'reported'
+                read_at = datetime.fromtimestamp(at, UTC).isoformat()
+                self.assertIn(f'AWS bill (account, UTC {DAY}, {state}): $3.00; '
+                              + f'read at {read_at}; query cost $0.00.', output)
+                self.assertIn('m7a.8xlarge: $0.0800; 2 launched boxes; $0.0400 per run (daily allocation)', output)
+                self.assertIn('m7a.4xlarge: $0.0300; 1 launched boxes; $0.0300 per run (daily allocation)', output)
+                self.assertIn('older Spot builder', output)
 
     def test_daily_queue_comparison_names_the_unmatched_load(self) -> None:
         self.write_records(

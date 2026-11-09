@@ -268,7 +268,16 @@ elif operation == 'describe-spot-price-history':
 elif operation == 'get-cost-and-usage':
     period = args[args.index('--time-period') + 1]
     assert all(len(part.split('=')[1]) == 10 for part in period.split(','))
-    reply({'ResultsByTime': [{'Total': {'UnblendedCost': {'Amount': '0.1', 'Unit': 'USD'}}}]})
+    bounds = dict(part.split('=', 1) for part in period.split(','))
+    first, end = (datetime.datetime.fromisoformat(bounds[key]) for key in ('Start', 'End'))
+    days = []
+    while first < end:
+        following = first + datetime.timedelta(days=1)
+        days.append({'TimePeriod': {'Start': first.date().isoformat(), 'End': following.date().isoformat()},
+                     'Estimated': False, 'Total': {}, 'Groups': [{'Keys': ['USE2-SpotUsage:m7a.4xlarge'],
+                         'Metrics': {'UnblendedCost': {'Amount': '0.1', 'Unit': 'USD'}}}]})
+        first = following
+    reply({'ResultsByTime': days})
 else:
     raise AssertionError((service, operation))
 '''
@@ -382,7 +391,7 @@ class DeploymentTests(CostFixture):
             'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'fixed_usd_per_month': '0.001',
             'retained_storage_usd_per_month': '0', 'root_storage_usd_per_month': '0',
             'ipv4_usd_per_month': '0', 'gp3_iops_usd_per_month': '0', 'gp3_throughput_usd_per_month': '0',
-            'region': 'us-east-1',
+            'region': 'us-east-1', 'cost_explorer_lookback_days': '1',
             'cost_explorer_tag_key': 'Project', 'cost_explorer_tag_value': 'fixture-build', 'accounting_zone': 'UTC',
         })
         for key, value in values.items():
@@ -2376,29 +2385,33 @@ else: raise AssertionError(args)
         _ = registry.write_text('targets=aws,natedev\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\nkind.natedev=local\nplatform.natedev=linux\n')
         controller = aws_target.Controller(self.settings, self.state, self.root / 'queue', clock=lambda: self.now,
                                            notify=lambda _event: True, publish=lambda _envelope: True)
-        self.assertEqual(controller.tick().state, 'stopped')
-        self.assertEqual(controller.tick().state, 'stopped')
-        self.set_clock(self.now + 120)
+        result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
+        result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
+        self.set_clock(self.now + 86400 + 120)
         save = cast(Callable[[ledger.CostLedger, ledger.LedgerEvidence], None], getattr(ledger.CostLedger, '_save'))
 
         def fail_reconciliation(book: ledger.CostLedger, state: ledger.LedgerEvidence) -> None:
-            if state.reconciliations:
+            if any(row.at == self.now for row in state.reconciliations):
                 raise OSError('the reconciliation write failed')
             save(book, state)
 
         with mock.patch.object(ledger.CostLedger, '_save', fail_reconciliation):
-            self.assertEqual(controller.tick().state, 'stopped')
+            result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
         book = ledger.CostLedger(self.state)
-        self.assertEqual(book.read_snapshot().reconciliations, [])
-        self.assertEqual(controller.tick().state, 'stopped')
-        queries = self.commands('get-cost-and-usage')
-        self.assertEqual(len(queries), 1)
         self.assertEqual(len(book.read_snapshot().reconciliations), 1)
+        result = controller.tick()
+        self.assertEqual(result.state, 'stopped', result.reason)
+        queries = self.commands('get-cost-and-usage')
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(len(book.read_snapshot().reconciliations), 2)
         self.assertNotIn('charge_error', (self.state / 'controller.json').read_text())
         settings = read_control_settings(self.settings)
         api = aws_target.AwsCli(settings.credentials_profile, settings.region, settings.aws_timeout_s)
         self.assertIsInstance(controller.refresh_charges(api, self.now), ledger.ChargeRead)
-        self.assertEqual(len(self.commands('get-cost-and-usage')), 1)
+        self.assertEqual(len(self.commands('get-cost-and-usage')), 2)
 
     def test_bootstrap_remote_idle_stop_requires_no_published_permission(self) -> None:
         configuration = deploy.bootstrap_configuration(self.settings, deploy.remote_configuration(self.settings))

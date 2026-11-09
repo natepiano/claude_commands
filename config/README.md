@@ -301,20 +301,24 @@ Equality refuses deployment, starts and new admission. `limit_action=drain` reje
 `observation_max_age_seconds=300` bounds instance state evidence for admission.
 Gaps past this age incur running costs at the fallback price.
 Stale latest evidence refuses admission.
-`cost_explorer_interval_seconds=86400` schedules reconciliation reads.
-`cost_explorer_read_usd=0.01` reserves each scheduled read's cost.
+`cost_explorer_interval_seconds=86400` schedules account billing reads.
+`cost_explorer_lookback_days=7` refreshes the last seven completed UTC days.
+This window captures delayed charges and later changes from AWS.
+`cost_explorer_read_usd=0.01` prices each API page.
 
-The controller reads the previous UTC day's actual charges when the daily read is due.
-Cost Explorer receives date-only UTC bounds. The ledger reconciles the reply against those same bounds.
-Accounting days can overlap these UTC periods.
-`cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` select the AWS resource charges.
-The resource deployment must apply this tag to every charged resource.
-Reports and target status read local evidence. They make no AWS call and create no coordination file.
-The controller saves each successful reply in `charges/<day>.json` before reconciliation.
-A retry reads the saved reply and does not repeat the successful query.
-The ledger adds only the reconciliation difference through its existing accounting rule.
-The report shows the actual charge and query cost separately.
-The scheduled query cost already belongs to the estimate. Reconciliation does not add it again.
+Both the controller and the gate worker use one Cost Explorer reader.
+It requests daily `UnblendedCost` for the account, grouped by `USAGE_TYPE`, and reads every page.
+It uses no tag filter and needs no tag activation or deployment change.
+`cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` still supply the deployment tags.
+The reader saves each day's account total, usage rows, provisional flag, and read time in `charges/<day>.json`.
+A later scheduled read replaces those values, including zero amounts.
+An old saved format requires an immediate read, regardless of the previous schedule.
+An empty daily reply is an error for both callers.
+The ledger retains the conservative spending estimate and adds each page fee once.
+Reports use the saved AWS bill and label provisional days.
+Spot compute includes the older Spot builder when it uses the same instance type.
+The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
+Reports read local evidence without an AWS call or a coordination file.
 `go-live.json` records the first permitted running observation for the wait comparison.
 
 `### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
