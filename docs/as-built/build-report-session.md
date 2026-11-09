@@ -1,8 +1,9 @@
 # Build cost analysis
 
 The user retired `/build:report` on 2026-11-03. The command file is removed.
-Run `buildlog costs [--days N]` on demand to rank build costs and show phase time.
-The default window is seven days. The command reads the index and progress history without changing them.
+Run `buildlog charts` to open the shared build page.
+The shared page shows build charts, phase time, and ranked costs.
+Use `--no-open` to print only the tailnet link.
 
 The round record is [builds-report-rounds.md](../plans/builds-report-rounds.md).
 

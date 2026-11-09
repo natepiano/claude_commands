@@ -6,14 +6,17 @@ import os
 import subprocess
 import sys
 import unittest
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.direct import assign
+from scripts.direct import assign, phase_table
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -65,6 +68,38 @@ def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subp
         return invoke_cli(assign, assign.main, arguments, environment, ROOT)
 
 
+@contextmanager
+def assignment_helpers() -> Generator[None]:
+    """Keep helper parsers and handlers in the fixture process."""
+    from scripts.direct.assign_claude_test_support import direct_launcher_helpers
+    from scripts.direct.findings_test_support import invoke_findings
+
+    cache = Path.home() / ".cache"
+    seed_interpreter_cache(cache)
+    with patch.dict(os.environ, {"CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache)}), direct_launcher_helpers():
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(command[1]).resolve() if len(command) > 1 else Path()
+            if path not in (ROOT / "scripts/direct/phase_table.py", ROOT / "scripts/direct/findings.py"):
+                return run_process(command, **options)
+            environment = cast(dict[str, str], options.get("env", os.environ.copy()))
+            directory = Path(cast(str | Path, options.get("cwd") or Path.cwd()))
+            result = (invoke_findings(command[2:], environment, directory) if path.name == "findings.py" else
+                      invoke_cli(phase_table, phase_table.main, command[2:], environment, directory))
+            if not options.get("capture_output"):
+                if options.get("stdout") is None:
+                    print(result.stdout, end="")
+                if options.get("stderr") is None:
+                    print(result.stderr, end="", file=sys.stderr)
+            if options.get("check"):
+                result.check_returncode()
+            return result
+
+        with patch.object(subprocess, "run", side_effect=run):
+            yield
+
+
 def read_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], json.loads(path.read_text()))
 
@@ -91,6 +126,7 @@ class AssignLauncherFixture(unittest.TestCase):
         _ = config.write_text((ROOT / "config/direct.conf").read_text())
         _ = config.with_name("shutdown.conf").write_text((ROOT / "config/shutdown.conf").read_text())
         self.addCleanup(self.native.doCleanups)
+        _ = self.enterContext(assignment_helpers())
         self.home = Path.home()
         self.session_dir = self.native.run_dir
         self.project = self.session_dir.parent / "project"
@@ -270,23 +306,3 @@ class HookAssignmentFixture(AssignLauncherFixture):
 class FirstDispatchFixture(HookAssignmentFixture):
     def first_assignment(self, role: str = "implement", *options: str) -> None:
         _ = self.successful(role, *options)
-
-
-@dataclass(frozen=True)
-class FirstDispatchArtifact:
-    """A completed first dispatch publishes this file."""
-
-    relative: Path
-    content: bytes
-    mode: int
-
-def snapshot_files(root: Path) -> dict[Path, bytes]:
-    """Read regular files before a dispatch."""
-    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
-            if path.is_file() and not path.is_symlink()}
-
-def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
-    """Keep files that the dispatch changed."""
-    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
-                 for relative, content in snapshot_files(root).items()
-                 if before.get(relative) != content)

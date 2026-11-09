@@ -499,7 +499,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
         self.assertEqual(self.git("show", "main:fast-fix.txt", cwd=self.origin), "keep this fast fix")
-        self.assertEqual(self.events("checkpoint-test"), test_events)
+        self.assertEqual(self.events("checkpoint-test"), [*test_events, []])
 
     def test_checkpoint_retry_integrates_main_fix_before_finishing_promotion(self) -> None:
         self.assert_interrupted_promotion_keeps_new_main_fix(handoff=False)

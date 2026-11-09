@@ -30,7 +30,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_sessio
 from scripts.lib import atomic_file, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
-from scripts.message import sessions
+from scripts.message import send, sessions
 from scripts.usage import agents_log
 
 from scripts.herdr import herdr
@@ -51,6 +51,7 @@ class DispatchAgent:
         self.replies: list[str] = []
         self.last_replies: dict[str, str] = {}
         self.notices: list[str] = []
+        self.notice_senders: list[send.SenderStamp] = []
         self.questions: dict[str, str | herdr.HerdrFailure] = {}
         self.answers: list[tuple[str, str]] = []
         self.answer_inputs: dict[str, str] = {}
@@ -115,6 +116,18 @@ class DispatchAgent:
     def pane_commands(self, case: unittest.TestCase) -> None:
         run = self.fixture.world.run
         composer = self.fixture.world.composer
+
+        def notify(options: send.Options, *, membership: staff.StaffSnapshot) -> send.Result:
+            del membership
+            if self.notice_failures:
+                self.notice_failures -= 1
+                return send.Result("failed", "director message failed")
+            self.notices.append(send.body_text(options))
+            origin = options.sender_origin
+            self.notice_senders.append(origin.stamp if isinstance(origin, send.ForwardedSender) else send.sender_stamp())
+            return send.Result("sent", "private director")
+
+        _ = case.enterContext(patch.object(send, "_send", side_effect=notify))
 
         def accept(pane: str, text: str) -> None:
             del self.questions[pane]
@@ -189,12 +202,6 @@ class DispatchAgent:
         _ = case.enterContext(patch.object(os, "kill", side_effect=self.fixture.world.signal))
 
     def run(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if len(args) > 1 and args[1].endswith("/message/send.py"):
-            if self.notice_failures:
-                self.notice_failures -= 1
-                return subprocess.CompletedProcess(args, 1, "", "director message failed")
-            self.notices.append(args[args.index("--text") + 1])
-            return subprocess.CompletedProcess(args, 0, "SENT: private director\n", "")
         if args[0] != "/nonexistent/herdr":
             return self.run_process(args, **kwargs)
         action, pane = args[4:6]
@@ -303,6 +310,8 @@ class WorkerCommandTests(unittest.TestCase):
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
+        atomic_file.write_text_atomic(config.with_name("send.conf"),
+                                      (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"
@@ -912,6 +921,26 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual((self.reply.read_bytes(), self.reply.stat().st_mtime_ns, self.fixture.staff_state()), before)
         self.assertEqual(len(self.agent.submitted), 1)
 
+    def test_completed_dispatch_rerun_repeats_its_notice_without_typing(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
+        notice, = self.agent.notices
+        path = self.run_dir / "progress_history_state.json"
+        before = path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()
+        reply = self.reply.read_bytes(), self.reply.stat().st_mtime_ns
+        for repeated in (1, 2):
+            with self.subTest(repeated=repeated):
+                self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(self.agent.notices, [notice] * (repeated + 1))
+                self.assertEqual(len(self.agent.submitted), 1)
+                self.assertEqual(len(self.fixture.world.launches), 1)
+                self.assertNotIn(pane, self.fixture.world.locations)
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()), before)
+                self.assertEqual((self.reply.read_bytes(), self.reply.stat().st_mtime_ns), reply)
+        self.assertEqual(self.finish(), turn_end.TurnOutcome.IGNORED)
+        self.assertEqual(len(self.agent.notices), 3)
+
     def test_dispatch_rerun_before_prompt_records_one_submission(self) -> None:
         target = herdr.check_target
         def interrupted(identity: str | herdr.AgentProcessIdentity, **kwargs: object) -> bool:
@@ -1238,6 +1267,42 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
             self.assertIn(self.agent.final, self.reply.read_text())
             self.assertTrue(source.exists())
+
+    def test_first_codex_dispatch_keeps_its_identity_during_the_warmup_hook(self) -> None:
+        world = self.fixture.world
+        wait = world.wait_turn_end
+        result = world.result
+        native_process = world.native_process
+        hook_running = False
+
+        def warmup_ended(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+            nonlocal hook_running
+            ended = wait(pane, timeout_ms)
+            hook_running = True
+            return ended
+
+        def fresh_codex(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
+            if hook_running and kind == "codex" and not reported:
+                raise ValueError("Codex launch identity is unavailable")
+            return native_process(pid, kind, reported)
+
+        def with_hook(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            value = result(*arguments, deadline=deadline)
+            if hook_running and arguments[:2] == ("pane", "process-info") and arguments[-1] != "w1:p0":
+                info = cast(dict[str, object], value["process_info"])
+                foreground = cast(list[object], info["foreground_processes"])
+                info["foreground_processes"] = [{"pid": 998088, "argv": [
+                    "python3", str(Path(turn_end.__file__).resolve())]}, *foreground]
+            return value
+
+        with patch.object(world, "wait_turn_end", side_effect=warmup_ended), \
+                patch.object(world, "result", side_effect=with_hook), \
+                patch.object(herdr, "native_process", side_effect=fresh_codex):
+            self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertTrue(hook_running)
+        self.assertEqual(len(self.agent.submitted), 1)
+        self.assertEqual(len(world.launches), 1)
+        self.assertEqual(len([entry for entry in world.commands if entry[:2] == ("agent", "wait")]), 1)
 
     def test_claude_delivery_returns_before_its_prompt_enters_the_transcript(self) -> None:
         _ = write_registry(self.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})

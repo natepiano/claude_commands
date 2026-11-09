@@ -522,9 +522,14 @@ def worker_labelled_pane(panes: Sequence[Mapping[str, object]], tab: str,
 def worker_run(member: staff.StaffRow, *,
                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
                scanned: dict[str, list[str]] | None = None) -> Path:
-    """Use the worker's newest state pass, with the parent's run as the default."""
+    """Use the recorded dispatch state before searching the parent's held runs."""
     parent = member
     if member.kind == "worker":
+        from scripts.direct import progress_history
+
+        dispatched = progress_history.recorded_dispatch_run(member.id)
+        if isinstance(dispatched, progress_history.RecordedDispatchRun):
+            return dispatched.directory
         record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
         parent = record.parent_of(member) or member
     runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record, scanned=scanned)
@@ -637,6 +642,9 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
             return ReleasedWorkerPass.NO_PROMPT_DELIVERED
         status, dispatch = latest.status, latest.instance_id
     if status == "completed":
+        completion = progress_history.hook_completion(passed)
+        if isinstance(completion, progress_history.HookCompletion) and completion.outcome == "done":
+            return ReleasedWorkerPass.ENDED
         return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "active":
         if progress_history.dispatch_delivery(passed).line:
@@ -709,14 +717,14 @@ def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> La
 
 
 def turn_end_command() -> list[str]:
-    """Give both families the same hook from the launch line."""
+    """Build the shared turn handler command for the Claude launch settings."""
     scripts = Path(__file__).resolve().parents[1]
     return [str(scripts / "lib/py"), str(scripts / "herdr/turn_end.py")]
 
 
 def _turn_end_arguments(kind: Literal["codex", "claude"]) -> list[str]:
     if kind == "codex":
-        return ["-c", "notify=" + json.dumps(turn_end_command())]
+        return []
     hooks = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": shlex.join(turn_end_command()), "async": True}]}]}}
     return ["--settings", json.dumps(hooks, separators=(",", ":"))]
 
@@ -798,7 +806,8 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
         same_permissions = (["--sandbox", policy.sandbox] in pairs and ["--ask-for-approval", "never"] in pairs
                             if policy.settings.kind == "codex" else ["--permission-mode", policy.permission] in pairs)
         if same_permissions and same_role:
-            return _turn_end_arguments(policy.settings.kind) in pairs
+            hook_arguments = _turn_end_arguments(policy.settings.kind)
+            return not hook_arguments or hook_arguments in pairs
         return all(expected[index:index + 2] in [actual[pos:pos + 2] for pos in range(len(actual) - 1)]
                    for index in range(0, len(expected), 2))
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:

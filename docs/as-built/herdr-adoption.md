@@ -171,6 +171,34 @@ Herdr checks the target before each key.
 Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
 A repeated saved launcher reads the transcript and returns without another submission.
+For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
+Each completion notice ends its first line with `; pass <dispatch instance id>`.
+An explicit rerun repeats the saved completion text with the same pass id.
+This rule also applies to a completed managed Astra review.
+The saved completion preserves the reason and pane for a close anomaly.
+A successful completed rerun sets its status file to `done` after it sends the notice.
+Each notice names the worker and uses its native identity, including reruns from the director.
+The saved completion supplies the sender identity for a retired managed Astra reviewer.
+The sender identity remains the same after a session change and retirement.
+Turn and run events send one notice when the outcome, reply, or run ids change.
+An unchanged outcome, reply, and run ids send no notice.
+Waiting notices add `; runs <run ids>` to the first line.
+The run ids include received results that still await a worker reply.
+An empty turn reply writes no reply file and adds no `; reply <path>` text.
+Run events retain the last worker reply while a result awaits a reply.
+A live run reports `waiting on runs`, including when an earlier result awaits a reply.
+A turn without DONE sends one `no DONE` notice when no pending work explains it.
+The notice includes the worker's last reply and leaves the pass active.
+Named adversary and contract reviews record `done` through the same hook.
+The hook also saves an assigned style review result.
+Each ignored event appends one JSON line to `$XDG_STATE_HOME/herdr/turn-end-ignored.jsonl`.
+The default path is `~/.local/state/herdr/turn-end-ignored.jsonl`.
+Each line records the time, exit reason, event kind, thread id, and worker name when known.
+This diagnostic changes no outcome and sends no notice.
+A refused launcher retry retains the existing pass and its run, including a run with one worker.
+A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+The review trial uses the latest completion duration for each pass.
+The hook follows the worker's link to its existing pass state, including runs outside the run root.
 Exit 0 means submitted. The turn hook records completion and sends the director its reply path.
 
 Pane starts record the account folder in the staff row's `home` through `staff.set_home`.
@@ -195,6 +223,9 @@ These calls complete a pane publication that preceded its staff row.
 
 Claude processes use their Claude session id.
 Codex processes use their Codex thread id.
+A fresh Codex uses its pane session report before it has a resume argument.
+The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
+Every other foreground process prevents the pane report from proving a sole Codex process.
 Copied `STAFF_ID` values, folders, names, and retired pane marks do not select rows.
 `RecordedLabels.resolve` and `StaffLabels.environment` remove retired identity from the environment.
 `session_staff.LaunchMembership` resolves a saved staff reference to the current native runtime id.
@@ -327,7 +358,7 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
-- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. The matching final reply proves completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
+- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
 The turn hook closes a completed pane after DONE.

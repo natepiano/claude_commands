@@ -226,8 +226,8 @@ def _stop_recorded(session: str, kind: str = "", *,
                   ) if pane_worker and row is not None and isinstance(row.parent, staff.ReportsTo) else None
     if isinstance(before, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
         return StopFailed(str(before.row.current_session), before.reason)
-    if isinstance(before, worker_panes.StoppedWorker) and _worker_stopped(
-            before, **({"codex": codex} if codex is not None else {})):
+    if isinstance(before, worker_panes.StoppedWorker) and isinstance(_worker_stopped(
+            before, **({"codex": codex} if codex is not None else {})), NotRunning):
         result: StopResult = NotRunning(str(before.row.current_session))
     else:
         _record_launches([session])
@@ -235,9 +235,10 @@ def _stop_recorded(session: str, kind: str = "", *,
         after = (None if codex is None else herdr.CodexConversations(
             {identity: pids for identity, pids in codex.live.items() if identity != result.session_id},
             codex.unknown)) if isinstance(result, (Stopped, NotRunning)) else codex
-        if before is not None and isinstance(result, (Stopped, NotRunning)) and not _worker_stopped(
-                before, **({"codex": after} if after is not None else {})):
-            return StopFailed(str(before.row.current_session), "worker stop has no fresh shell or closed-pane proof")
+        if before is not None and isinstance(result, (Stopped, NotRunning)):
+            proof = _worker_stopped(before, **({"codex": after} if after is not None else {}))
+            if isinstance(proof, StopFailed):
+                return proof
     if isinstance(result, (Stopped, NotRunning)):
         _retire_prompt(result.session_id)
     if isinstance(result, Stopped):
@@ -253,24 +254,32 @@ def _stop_recorded(session: str, kind: str = "", *,
 
 
 def _worker_stopped(before: worker_panes.WorkerPane, *,
-                    codex: herdr.CodexConversations | None = None) -> bool:
-    """Prove the recorded worker pane directly, even when the director has no tab."""
+                    codex: herdr.CodexConversations | None = None) -> NotRunning | StopFailed:
+    """Prove the worker stop and retain the observed pane processes on failure."""
     from scripts.herdr import worker_panes
 
+    identity = str(before.row.current_session)
     if isinstance(before, worker_panes.ClosedWorker):
-        return True
+        return NotRunning(identity)
+    details = "pane unobserved; foreground processes not read"
     if isinstance(before, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
         client = herdr.Herdr(herdr.shared_session())
+        details = f"pane {before.pane}; foreground processes not read"
         try:
             panes = client.panes()
             closed = not any(pane["pane_id"] == before.pane or pane.get("terminal_id") == before.terminal for pane in panes)
-            at_shell = (any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in panes)
-                        and isinstance(client.pane_activity(before.pane), herdr.PaneAtShell))
-            return ((closed or at_shell)
-                    and not isinstance(herdr.read_conversation(str(before.row.current_session), codex=codex), herdr.LiveConversation))
-        except (OSError, ValueError, herdr.HerdrFailure):
-            return False
-    return False
+            at_shell = False
+            if any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in panes):
+                activity = client.pane_activity(before.pane)
+                at_shell = isinstance(activity, herdr.PaneAtShell)
+                details = (f"pane {before.pane}; foreground processes: {', '.join(activity.commands) or 'none'}"
+                           if isinstance(activity, herdr.PaneRunning) else f"pane {before.pane}; at its shell")
+            if ((closed or at_shell)
+                    and not isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation)):
+                return NotRunning(identity)
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            details += f"; {error}"
+    return StopFailed(identity, f"worker stop has no fresh shell or closed-pane proof; {details}")
 
 
 def _retire_prompt(session_id: str) -> None:

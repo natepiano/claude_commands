@@ -106,7 +106,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 - `invoke.sh`'s ungated set (`buildlog_step_compiles`) and `width_trial._uses_memory_gate` decide which steps count as gated; they must agree. Both exempt `cargo [+tc] fmt`, `*/sweep.py` and `taplo`, so none of those counts in the all-steps gated-wait row.
 - The build log and `anon_peaks.jsonl` are evidence: nothing edits or deletes their records. A width filter replaces any need to drop stale records.
 - `verify.sh lint`'s clippy target scope equals CI's `clippy` job and `pre_release_checks.sh`; change all three together. Its fix passes and its judgment all use `--keep-going`.
-- Tooling failures (exit 2, exit 3, killed runs) are never cached; only a lint failure of the tree is.
+- Tooling failures, killed runs, and lost-token status 125 are never cached. Only a lint failure of the tree is cached.
 - `invoke.sh` must parse under the Mac's bash 3.2 (no `EPOCHSECONDS`, no associative arrays, `${arr[@]+"${arr[@]}"}` for empty arrays).
 - Tests never read the live `~/.local/state/buildlog` (`BUILDLOG_DIR` points at a temp dir) and never run real `cargo`. `test_nextest_width.py` sets the mode in every case, so it passes under any `LINT_TEST_WIDTH` default.
 

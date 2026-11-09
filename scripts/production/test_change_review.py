@@ -388,6 +388,24 @@ class ProducerWriterTests(ProducerFixture):
             self.assertEqual(row["Producer"], self.unit.id)
             self.assertEqual(row["Production"], production.owner.id)
 
+        with self.subTest(subject="checkpoint(old-branch): final change"):
+            _ = self.git("checkout", "-b", "draft-unit")
+            _ = self.git("commit", "--allow-empty", "-m",
+                         "fix(unit): draft change\n\nChange-Review: Draft change | Draft check | Draft result")
+            _ = self.git("commit", "--allow-empty", "-m",
+                         "checkpoint(old-branch): final change\n\nChange-Review: Final change | Read | Final result")
+            _ = self.git("commit", "--allow-empty", "-m",
+                         "queue(7): later change\n\nChange-Review: Queued later | Read | Later result")
+            _ = self.git("checkout", "main")
+            _ = self.git("merge", "--no-ff", "draft-unit", "-m", "Merge draft-unit into main")
+            _ = self.git("push", "origin", "main")
+            final_merge = self.git("rev-parse", "HEAD")
+            merge_checkpoint.record_publication_changes(
+                production, known_producer=change_review.KnownMergeProducer(final_merge, self.unit.id))
+            rows = change_review.pending(self.listing)
+            self.assertEqual([row["Change"] for row in rows],
+                             ["A visible change", "Queued change", "Final change", "Queued later"])
+
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
         _ = self.merge()
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
@@ -1850,11 +1868,25 @@ class CommitTest(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_a_verdict_commits_the_list(self) -> None:
-        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
-        self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C1", "--verdict", "works"),
-                         (0, "C1 landed\n", ""))
-        self.assertEqual(self.last(), ("change-review: hana verdict C1", ["change-review/change-review - hana.md"]))
-        self.assertIn("| C1 | A | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
+        for row, held in (("C1", False), ("C2", True)):
+            with self.subTest(held=held):
+                _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
+                command = ("verdict", "--production", DOC, "--list", str(self.path), "--row", row, "--verdict", "works")
+                lock = self.repo / ".git/index.lock"
+                if held:
+                    _ = lock.write_text("", encoding="utf-8")
+                code, output, error = run(*command)
+                self.assertEqual((code, output), (0, f"{row} landed\n"))
+                if held:
+                    self.assertIn(f"change review: {self.path} written but not committed: ", error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    lock.unlink()
+                    code, output, error = run(*command)
+                    self.assertEqual(code, 0)
+                    self.assertIn("already has this verdict", output)
+                self.assertEqual(error, "")
+                self.assertEqual(self.last(), (f"change-review: hana verdict {row}", ["change-review/change-review - hana.md"]))
+                self.assertIn(f"| {row} | A | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
 
     def test_unchanged_edit_keeps_list_bytes_timestamp_and_git_history(self) -> None:
         _ = change_review.append_rows(self.path, [GRID], date(2026, 10, 15), "216c4e1d", PRODUCTION, record=staff.snapshot())
@@ -2123,6 +2155,39 @@ class RepositoryTest(unittest.TestCase):
             self.assertEqual([commit.subject for commit in commits], ["queue(7): grid"])
             self.assertEqual(change_review.missing(commits), [])
             self.assertEqual(change_review.visible(commits), [GRID])
+
+        _ = self.merged("unit", "Merge initial checkpoints")
+        for layout in ("linear", "merged", "sibling", "checkpoints"):
+            with self.subTest(layout=layout):
+                _ = self.git("checkout", "unit")
+                previous = self.git("rev-parse", "HEAD")
+                earlier: list[str] = []
+                earlier_rows: list[Visible] = []
+                if layout == "checkpoints":
+                    earlier.append(self.commit("earlier.py",
+                                               "checkpoint(u): earlier\n\nChange-Review: Earlier change | Read | Earlier result"))
+                    earlier_rows.append(Visible("Earlier change", "Read", "Earlier result"))
+                if layout == "merged":
+                    _ = self.git("checkout", "-b", "draft-side")
+                _ = self.commit(f"draft-{layout}.py",
+                                "fix(u): draft\n\nChange-Review: Draft change | Draft check | Draft result")
+                if layout == "merged":
+                    _ = self.git("checkout", "unit")
+                    _ = self.git("merge", "--no-ff", "draft-side", "-m", "Merge worker draft")
+                final = self.commit(f"final-{layout}.py", f"checkpoint(u): final\n\n{SEE}")
+                _ = self.git("checkout", "-b", f"queue-{layout}", previous if layout == "sibling" else final)
+                queued = self.commit(f"queue-{layout}.py",
+                                     "queue(7): later change\n\nChange-Review: Queued later | Read | Queue result")
+                _ = self.git("checkout", "unit")
+                _ = self.git("merge", "--no-ff", f"queue-{layout}", "-m", "Merge queued change")
+                tip = self.git("rev-parse", "HEAD")
+                unit_commits = change_review.unit_commits(self.repo, tip, previous, "merge")
+                merged = self.merged("unit", f"Merge {layout} unit")
+                for commits in (unit_commits, change_review.merge_commits(self.repo, merged)):
+                    self.assertEqual(change_review.missing(commits), [])
+                    self.assertCountEqual([commit.sha for commit in change_review.review_commits(commits)], [*earlier, final, queued])
+                    self.assertCountEqual(change_review.visible(commits),
+                                          [*earlier_rows, GRID, Visible("Queued later", "Read", "Queue result")])
 
     def test_a_merge_reads_its_parents_with_one_git_command_and_refuses_unknown_commits(self) -> None:
         checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")

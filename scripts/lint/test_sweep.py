@@ -3831,7 +3831,9 @@ class FloorTests(SweepCase):
 
     def test_crossing_sends_both_channels_once_and_rearms_only_above_the_line(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            for free, expected in ((200, 0), (140, 2), (130, 2), (150, 2), (140, 2), (151, 2), (140, 4)):
+            _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\n")
+            for free, expected in ((200, 0), (140, 2), (130, 2), (150, 2), (140, 2), (151, 2), (140, 2),
+                                   (155, 2), (140, 2), (160, 2), (140, 4)):
                 with self.subTest(free=free, expected=expected):
                     self.finalize_crossing(free)
                     self.assertEqual(len(delivery.attempts), expected)
@@ -3842,14 +3844,24 @@ class FloorTests(SweepCase):
 
     def test_crossing_retries_only_the_channel_without_a_receipt(self) -> None:
         for failed in ("user", "natedev"):
-            with self.subTest(failed=failed), self.crossing_delivery({failed: [3, 0]}) as delivery:
-                self.finalize_crossing(140)
-                self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
-                self.finalize_crossing(130)
-                self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user", failed])
-                self.finalize_crossing(120)
-                self.assertEqual(len(delivery.attempts), 3)
-                self.assertEqual(sum(attempt.accepted for attempt in delivery.attempts), 2)
+            for margin_readings, retry_free in (((), 130), ((151, 150, 155), 140)):
+                with (self.subTest(failed=failed, margin_readings=margin_readings),
+                      self.crossing_delivery({failed: [3, 0]}) as delivery):
+                    _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\n")
+                    self.finalize_crossing(140)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                    receipts = self.saved_receipts()
+                    for free in margin_readings:
+                        with self.subTest(free=free):
+                            self.finalize_crossing(free)
+                            self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                            self.assertEqual(self.saved_receipts(), receipts)
+                    self.finalize_crossing(retry_free)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user", failed])
+                    self.assertIn(f"{retry_free:.1f} GiB", delivery.attempts[-1].text)
+                    self.finalize_crossing(120)
+                    self.assertEqual(len(delivery.attempts), 3)
+                    self.assertEqual(sum(attempt.accepted for attempt in delivery.attempts), 2)
 
     def test_saved_crossing_receipts_suppress_sends_after_a_restart(self) -> None:
         run = subprocess.run
@@ -4170,31 +4182,56 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             self.assertIn("their use is unknown", message)
 
     def test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key(self) -> None:
-        replies: dict[str, list[int]] = {}
-        with self.crossing_delivery(replies) as delivery:
-            save = sweep.write_floor_record
+        for crossing_start, failure_free in (("interrupted receipt", 140), ("failed delivery", 151)):
+            replies: dict[str, list[int]] = {} if crossing_start == "interrupted receipt" else {"natedev": [3]}
+            with self.subTest(crossing_start=crossing_start), self.crossing_delivery(replies) as delivery:
+                _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\n")
+                if crossing_start == "interrupted receipt":
+                    save = sweep.write_floor_record
 
-            def stop_after_send(path: Path, record: sweep.FloorRecord) -> None:
-                if delivery.attempts:
-                    raise RuntimeError("fixture stops before receipt save")
-                save(path, record)
+                    def stop_after_send(path: Path, record: sweep.FloorRecord) -> None:
+                        if delivery.attempts:
+                            raise RuntimeError("fixture stops before receipt save")
+                        save(path, record)
 
-            with mock.patch.object(sweep, "write_floor_record", side_effect=stop_after_send):
-                with self.assertRaisesRegex(RuntimeError, "before receipt save"):
+                    with mock.patch.object(sweep, "write_floor_record", side_effect=stop_after_send):
+                        with self.assertRaisesRegex(RuntimeError, "before receipt save"):
+                            self.finalize_crossing(140)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"])
+                    self.assertTrue(delivery.attempts[0].accepted)
+                else:
                     self.finalize_crossing(140)
-            self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"])
-            self.assertTrue(delivery.attempts[0].accepted)
-            replies["natedev"] = [3, 0]
-            with mock.patch.object(sweep, "free_bytes", return_value=140 * GIB):
-                for expected in (sweep.FailurePending, sweep.FailureReported):
-                    sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
-                        detail="new failed pass", lint_settings=conf.read("lint"))
-                    attempt = delivery.attempts[-1]
-                    self.assertEqual(attempt.key, "")
-                    self.assertIn("new failed pass", attempt.text)
-                    self.assertIsInstance(self.saved_record().failure, expected)
-            self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"] * 3)
-            self.assertEqual([attempt.accepted for attempt in delivery.attempts], [True, False, True])
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                    self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.PENDING, sweep.CrossingReceipt.ACCEPTED))
+                replies["natedev"] = [3, 0]
+                with mock.patch.object(sweep, "free_bytes", return_value=failure_free * GIB):
+                    for expected in (sweep.FailurePending, sweep.FailureReported):
+                        sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
+                            detail="new failed pass", lint_settings=conf.read("lint"))
+                        attempt = delivery.attempts[-1]
+                        self.assertEqual(attempt.key, "")
+                        self.assertIn("new failed pass", attempt.text)
+                        self.assertIsInstance(self.saved_record().failure, expected)
+                        if crossing_start == "failed delivery":
+                            self.assertNotIn("Free disk space fell", attempt.text)
+                            self.assertEqual(self.saved_receipts(),
+                                             (sweep.CrossingReceipt.PENDING, sweep.CrossingReceipt.ACCEPTED))
+                if crossing_start == "interrupted receipt":
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev"] * 3)
+                    self.assertEqual([attempt.accepted for attempt in delivery.attempts], [True, False, True])
+                else:
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts],
+                                     ["natedev", "user", "natedev", "natedev"])
+                    self.assertEqual([attempt.accepted for attempt in delivery.attempts], [False, True, False, True])
+                    before_retry = len(delivery.attempts)
+                    self.finalize_crossing(140)
+                    self.finalize_crossing(130)
+                    self.assertEqual([attempt.recipient for attempt in delivery.attempts[before_retry:]], ["natedev"])
+                    retry = delivery.attempts[before_retry]
+                    self.assertTrue(retry.accepted)
+                    self.assertIn("Free disk space fell", retry.text)
+                    self.assertIn("140.0 GiB remains", retry.text)
+                    self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
 
     def test_unsaved_crossings_use_one_fixed_natedev_key_and_no_phone(self) -> None:
         with self.crossing_delivery({}) as delivery:
@@ -4244,27 +4281,34 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_phone_floor_crossing_sends_once_until_free_space_rises(self) -> None:
         for machine in ("natedev", "Mac"):
-            with (self.subTest(machine=machine), self.crossing_delivery({}) as delivery,
-                  mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([]))):
-                base = delivery.base
-                policy = (sweep.MacFloor((str(base),), floor_claims.LockedClaims(frozenset()), base / "mirror")
-                          if machine == "Mac" else sweep.NatedevFloor.CURRENT)
-                send = cast(mock.Mock, sweep.send_floor_alert)
-                for free, expected in ((200, 0), (140, 1), (130, 1), (151, 1), (140, 2)):
-                    self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
-                                               recorded=True, policy=policy)[0], 0)
-                    messages = phone_calls(send)
-                    self.assertEqual(len(messages), expected)
-                    for call in messages:
-                        self.assertIn("Free disk space fell", call)
-                    self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
-                self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
-                text = phone_text(delivery.attempts)
-                self.assertIn(f"{machine} disk is low; {machine} tests can fail", text)
-                self.assertIn(f"{machine} has 140.0 GiB free", text)
-                self.assertIn(f"so {machine} test builds can fail", text)
-                if machine == "Mac":
-                    self.assertIn("This is the Mac disk.", messages[-1])
+            for reason, margin, readings in (
+                ("below the rearm line", 5, ((200, 0), (140, 1), (130, 1), (151, 1), (140, 1))),
+                ("above the rearm line", 5, ((200, 0), (140, 1), (160, 1), (140, 2))),
+                ("at the rearm line", 5, ((200, 0), (140, 1), (155, 1), (140, 1))),
+                ("configured margin", 12, ((200, 0), (140, 1), (160, 1), (140, 1))),
+            ):
+                with (self.subTest(machine=machine, reason=reason), self.crossing_delivery({}) as delivery,
+                      mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([]))):
+                    base = delivery.base
+                    _ = write_config_fixture(conf.path("lint"), f"sweep_phone_rearm_gib={margin}\n")
+                    policy = (sweep.MacFloor((str(base),), floor_claims.LockedClaims(frozenset()), base / "mirror")
+                              if machine == "Mac" else sweep.NatedevFloor.CURRENT)
+                    send = cast(mock.Mock, sweep.send_floor_alert)
+                    for free, expected in readings:
+                        self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
+                                                   recorded=True, policy=policy)[0], 0)
+                        messages = phone_calls(send)
+                        self.assertEqual(len(messages), expected)
+                        for call in messages:
+                            self.assertIn("Free disk space fell", call)
+                        self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
+                    self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
+                    text = phone_text(delivery.attempts)
+                    self.assertIn(f"{machine} disk is low; {machine} tests can fail", text)
+                    self.assertIn(f"{machine} has 140.0 GiB free", text)
+                    self.assertIn(f"so {machine} test builds can fail", text)
+                    if machine == "Mac":
+                        self.assertIn("This is the Mac disk.", phone_calls(send)[-1])
 
     def test_phone_floor_crossing_retries_a_failed_delivery(self) -> None:
         with self.crossing_delivery({"natedev": [3, 0], "user": [3, 0]}) as delivery:

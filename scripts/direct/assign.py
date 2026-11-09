@@ -7,6 +7,8 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections.abc import Callable
+from importlib import import_module
 import json
 import os
 import re
@@ -487,6 +489,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
               f"role={role}; status in {status}"], env)
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
               "header", slot, role], env, check=False)
+    previous_pass = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(slot))
     with log.open("a") as output:
         result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
     passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(slot))
@@ -499,7 +502,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                           json.dumps({"worker": selected, "round": number, "paths": paths}))
     if result.returncode:
         write_text_atomic(status, "error\n")
-        if result.returncode in (1, 2):
+        if result.returncode in (1, 2) and passed.get("instance_id") != previous_pass.get("instance_id"):
             passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(slot))
             progress_history.complete_dispatch(run, slot, text(passed.get("instance_id")), status="error")
             if role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1":
@@ -668,6 +671,11 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                                                prompt=prompt, launcher_command=command)
     if (isinstance(matched, progress_history.MatchedDispatch)
             and progress_history.dispatch_completed(run, args.new_worker, matched.instance_id)):
+        parent = worker_admission.parent(staff.snapshot(), run=run)
+        passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(args.new_worker))
+        repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
+                      import_module("scripts.herdr.turn_end").repeat_completion_notice)
+        repeat(matched.worker_name, parent, run, passed)
         return staff_worker.DispatchSubmission.SUBMITTED
     for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
@@ -727,7 +735,7 @@ def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
     """End a sole failed dispatch without changing its exit code."""
     try:
         passes = recorded_passes(run)
-        if any(entry.get("status") == "completed" for entry in passes):
+        if any(entry.get("status") in ("active", "refused", "completed") for entry in passes):
             return
         if any(entry.get("team_slot") != slot for entry in passes):
             return
