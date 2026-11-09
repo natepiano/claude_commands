@@ -944,22 +944,39 @@ def execute_durable(args: Arguments) -> int:
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
                               env: dict[str, str]) -> int:
     """Hold one pane reviewer until the worker command confirms its end."""
-    for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
-                      ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
-                       "--phase-title", "Astra review"]):
-        recorded = subprocess.run([PYTHON, PROGRESS, *arguments], env=env, text=True,
-                                  stderr=subprocess.STDOUT, check=False)
-        if recorded.returncode:
-            return recorded.returncode
-    command = [PYTHON, str(SCRIPTS / "../production/worker.py")]
-    parent = worker_admission.parent(staff.snapshot(), run=run)
-    target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
-    policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
-    current = launch(target, policy)
-    if not isinstance(current, worker_panes.OpenWorker):
-        return staff_worker.startup_result(target.name, current)
+    def record(arguments: list[str]) -> int:
+        try:
+            recorded = call([PYTHON, PROGRESS, *arguments], env, capture=True, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"assign.sh: review recording failed: {error}", file=sys.stderr)
+            return 1
+        if recorded.stdout:
+            print(recorded.stdout, end="")
+        if recorded.stderr:
+            print(recorded.stderr, file=sys.stderr, end="")
+        return recorded.returncode
+
+    run_started, phase_started, worker_started = False, False, False
     held, result = "", 1
     try:
+        result = record(["start-run", "--session-dir", str(run), "--working-dir", str(cwd)])
+        if result:
+            return result
+        run_started = True
+        result = record(["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
+                         "--phase-title", "Astra review"])
+        if result:
+            return result
+        phase_started = True
+        result = 1
+        parent = worker_admission.parent(staff.snapshot(), run=run)
+        target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
+        policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
+        current = launch(target, policy)
+        if not isinstance(current, worker_panes.OpenWorker):
+            result = staff_worker.startup_result(target.name, current)
+            return result
+        worker_started = True
         role = astra_roles.hold("reviewer", astra_roles.ExecProcess(os.getpid()), str(current.row.id))
         if isinstance(role, astra_roles.HoldWorkerUnavailable):
             return 1
@@ -974,16 +991,31 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                                 "--status", "error"], env=env, text=True,
                                stderr=subprocess.STDOUT, check=False)
             print(f"assign.sh: reviewer dispatch exited {result}; pending input is retained", flush=True)
-    except (OSError, ValueError) as error:
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
-        result = 1
+        result = result or 1
     finally:
-        ended = subprocess.run([*command, "end", args.new_worker, "--session-dir", str(run)],
-                               env=env, text=True, stderr=subprocess.STDOUT, check=False).returncode
-        if ended:
-            result = 1
-        elif held:
-            astra_roles.release(held)
+        if worker_started:
+            try:
+                ended = call([PYTHON, str(SCRIPTS / "../production/worker.py"), "end", args.new_worker,
+                              "--session-dir", str(run)], env, capture=True, check=False)
+                if ended.stdout:
+                    print(ended.stdout, end="")
+                if ended.stderr:
+                    print(ended.stderr, file=sys.stderr, end="")
+                if ended.returncode:
+                    result = 1
+                elif held:
+                    astra_roles.release(held)
+            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"assign.sh: reviewer end failed: {error}", file=sys.stderr)
+                result = 1
+        if run_started:
+            commands = (["finish-phase", "--phase-id", "astra-review"],) if phase_started else ()
+            for arguments in (*commands, ["finish-run"]):
+                finished = record([*arguments, "--session-dir", str(run),
+                                   "--status", "error" if result else "completed"])
+                result = result or finished
     return result
 
 

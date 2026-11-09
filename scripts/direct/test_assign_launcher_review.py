@@ -15,7 +15,7 @@ from unittest.mock import patch
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.astra import astra_roles
 from scripts.astra.design_role_test_support import HeldRolePaneCase
-from scripts.direct import assign, workers
+from scripts.direct import assign, recorder_state, workers
 from scripts.production import session_staff, staff, worker
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.atomic_file import write_text_atomic
@@ -417,8 +417,8 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=run_worker_command))
         _ = self.enterContext(patch.object(assign, "require_live_director"))
 
-    def run_review(self) -> subprocess.CompletedProcess[str]:
-        run = self.panes.root / "astra-run"
+    def run_review(self, run_name: str = "astra-run") -> subprocess.CompletedProcess[str]:
+        run = self.panes.root / run_name
         run.mkdir(exist_ok=True)
         write_text_atomic(run / "worker_transport", "herdr\n")
         return invoke_cli(assign, assign.main, ["--role", "review", "--operation", "astra-review",
@@ -459,6 +459,16 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         self.assertEqual((self.panes.command_case.run_dir / "progress_history_state.json").read_bytes(), holder_state)
         state = read_object(self.panes.root / "astra-run/progress_history_state.json")
         status = assign.object_map(assign.object_map(state["pass"])[row.name])["status"]
+        run_status = "error" if failed else "completed"
+        self.assertEqual(recorder_state.open_phase_ids(state), [])
+        self.assertEqual(state["status"], run_status)
+        events = [assign.object_map(cast(object, json.loads(line)))
+                  for line in Path(assign.text(state["history_file"])).read_text().splitlines()]
+        self.assertEqual([(event["event_type"], event["status"]) for event in events
+                          if event["event_type"] in ("phase_finished", "run_finished")],
+                         [("phase_finished", run_status), ("run_finished", run_status)])
+        self.assertEqual([event["status"] for event in events if event["event_type"] == "pass_finished"],
+                         [run_status])
         if not failed:
             reply = (self.panes.root / "astra-run/review.md").read_text().splitlines()
             self.assertEqual(reply[0], "Verdict: clear.")
@@ -474,6 +484,34 @@ class PaneAstraReviewTests(HeldRolePaneCase):
     def test_failed_pane_review_ends_its_row_and_hold(self) -> None:
         self.assert_review_lifetime(True)
 
+    def test_recording_failure_returns_an_error_and_attempts_remaining_finishes(self) -> None:
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        cases = (("finish-phase", False), ("finish-phase", True), ("finish-run", False))
+        for operation, dispatch_failed in cases:
+            with self.subTest(operation=operation, dispatch_failed=dispatch_failed):
+                def refuse_record(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if len(command) > 2 and command[1] == assign.PROGRESS and command[2] == operation:
+                        command = [*command, "--status", "recording-refused"]
+                    return run_process(command, **options)
+
+                def complete(pane: str) -> None:
+                    if dispatch_failed:
+                        _ = self.panes.world.foreground.pop(pane)
+
+                self.panes.command_case.agent.without_done = dispatch_failed
+                self.panes.command_case.agent.after_complete = complete
+                run_name = operation + ("-dispatch-error" if dispatch_failed else "-review")
+                with patch.object(subprocess, "run", side_effect=refuse_record):
+                    result = self.run_review(run_name)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("recording-refused", result.stderr)
+                if dispatch_failed:
+                    self.assertIn("pending input is retained", result.stdout)
+                    self.assertEqual(result.returncode, worker.ExitCode.NO_DONE)
+                state = read_object(self.panes.root / run_name / "progress_history_state.json")
+                self.assertEqual(recorder_state.open_phase_ids(state), [])
+                self.assertEqual(state["status"], "active" if operation == "finish-run" else "error")
+
     def test_failed_pane_end_returns_one_and_keeps_the_hold(self) -> None:
         def lose_process_evidence(pane: str) -> None:
             self.panes.world.unknown[pane] = "reviewer process is unreadable"
@@ -485,3 +523,6 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         self.assertEqual(record["staff_id"], row.id)
         self.assertEqual(self.panes.world.closed, [])
         self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
+        state = read_object(self.panes.root / "astra-run/progress_history_state.json")
+        self.assertEqual(recorder_state.open_phase_ids(state), [])
+        self.assertEqual(state["status"], "error")

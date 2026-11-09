@@ -1543,3 +1543,39 @@ A holding or waiting status that names any showrunner, or a sibling unit, reads 
 **Gotchas:** A held astra-role run never records a finish, so it can be a unit's newest run and show in Non-Phase Work.
 
 **Ruled out:** Reading every open run of a unit's current session — old runs never record a finish, so 64 stale runs showed as open.
+
+### Phase 8u — A held Astra review records the end of each turn  · status: done
+
+**Depends on:** panes 28f on sdlc (sdlc [10ac2210]). 28f owns the Astra pass end: `worker.dispatch` records it, and `assign.py` no longer calls `finish-pass`. Merge `origin/sdlc` before the 8u hash.
+
+Source: sdlc [16854249]. An `/astra_review` run and a held Astra role with no phase binding open phase `astra-review` and never finish it, so `/showrunner:units` can show a stale `astra-review` in Non-Phase Work.
+
+#### Work Order
+
+**Goal:** every run that records an `astra-review` phase records its finish, so a run with no review in progress has no open phase.
+
+**Spec:**
+1. In `scripts/astra/design_roles.py` `dispatch_turn`, for a design with no phase binding: after `assign.sh` returns, record `finish-phase` for phase `astra-review` in the design run. Use `--status completed` for exit 0 and `--status error` for a refusal. Record it on both paths, then raise the refusal as now.
+2. The next turn opens the phase again with the existing `start-phase` call. The run stays one record per design.
+3. When the role ends (`end` and `_finish_end`), record `finish-run --status completed` for an unbound design run that `dispatch_turn` started. A run that is already finished stays as it is.
+4. A design bound to a unit phase (`DesignBoundToPhase`) does not change: its phase belongs to the unit run.
+5. Fix the defect where the run is recorded. Do not change `scripts/production/unit_phases.py`.
+6. In `scripts/direct/assign.py` `execute_astra_review_herdr` (the `/astra_review` one-shot path, run folder `/tmp/claude/astra/<run>`): it records `start-run` and `start-phase astra-review`. The pass end stays in the one place 28f records it; 8u adds no `finish-pass` call. After the worker ends, on every path, record `finish-phase --phase-id astra-review` and then `finish-run`, each with `completed` when the review succeeded and `error` otherwise. A recording failure makes the exit non-zero and keeps the first error text.
+7. When a recording failure follows a refused dispatch in `dispatch_turn`, keep the dispatch's refusal text in the raised `RoleRefused`.
+8. Old open runs: write a one-off program at `/tmp/claude/unit/c96e80d9-b13e-4c13-aa6e-acfee5cbf068/phases/8u/finish_open_astra_runs.py`, outside the repository. It reads each run folder under `/tmp/claude/astra/` and `~/.local/state/astra/design-roles/` whose `progress_history_state.json` has status `active` and an open `astra-review` phase. It skips a run when a live process has that folder path in its command line. It records `finish-phase` and `finish-run --status stopped` for the others through `progress_history.py`, and prints one line per run. It has a `--dry-run` option. The director runs it once after the hash lands, then deletes it.
+
+**Files:**
+- `scripts/astra/design_roles.py`
+- `scripts/astra/test_design_roles.py`
+- `scripts/direct/assign.py`
+- `scripts/direct/test_assign_launcher_review.py`
+
+**Workers:** 1 writer.
+
+**State:** the design run's history record and `progress_history_state.json`, written through `progress_history.py` only.
+
+**Test:** add rows to the existing `test_design_roles.py` tests: a completed turn and a refused turn each leave no open phase; the next turn opens it again; an ended role finishes the run; a bound design records nothing in its own run; a one-shot `/astra_review` run that succeeds or fails ends with no open phase and a finished run. Run `~/.claude/scripts/lib/py -m unittest scripts.astra.test_design_roles scripts.direct.test_assign_launcher_review` from the worktree root.
+
+**Lint:** `basedpyright` on every changed Python file gives `0 errors, 0 warnings, 0 notes`.
+
+**Acceptance gate:** after a held review turn ends, `/showrunner:units` shows no `astra-review` in Non-Phase Work for that unit; both sdlc Merge tests lines pass.
