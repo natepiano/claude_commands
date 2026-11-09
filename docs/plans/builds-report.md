@@ -853,7 +853,7 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - A test that renders a vCPU column patches `os.cpu_count` to 17 (`QueueViewFixtureTests`, `QueueTests.setUp`). The real count differs per machine.
 - Format an age once, from seconds. Text that is formatted and then parsed back fails at `updated_at=0`.
 
-### Phase 40 — /build:queue retires when the build page covers it · status: todo
+### Phase 40 — /build:queue retires when the build page covers it · status: done
 **Depends on:** Phase 39; queue-unit's Phase 10m. This phase was queue-unit's Phase 10n.
 
 From the user (C959, 2026-11-04, through builds): "we are moving to the new build html page - we will use /build:queue for reference until we can retire it". From the builds showrunner (not the user), 2026-11-08: do this one last, after Phase 39.

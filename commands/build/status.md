@@ -4,7 +4,7 @@ description: Show build target status.
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_targets/build_targets.py status` and show its lines unchanged. `$ARGUMENTS` accepts only `--probe`: add it to run `~/.claude/scripts/lib/py ~/.claude/scripts/build_targets/build_targets.py status --probe`. Without it, this command only reads coordination state. `/build:mac status` instead settles block state and can change it.
 
-Use `/build:queue` for waiting steps, their wait reasons, and running steps' promised and measured memory.
+Use `/build:page` for waiting steps, their wait reasons, and running steps' promised and measured memory.
 
 The first line is `MAC IDLE` when no natedev build or test runs on the Mac for the configured alert interval (default 3 minutes) while eligible steps wait. It is bold red in a terminal and plain when piped. The holder clears a block with `/build:mac unblock`. For an idle claim, resume build or test work or release it so waiting steps can take the Mac. For a free Mac, the builds showrunner checks why waiting steps do not take it. The line clears when work starts or no eligible steps wait. `MAC UNREACHABLE` appears immediately for a connection outage; restore access. `MAC IDLE WATCH` names unreadable state or a reading past its configured freshness limit (default 5 minutes); repair the named state or check `buildlog-sample.timer`. This line reads the saved result and local timing config.
 
