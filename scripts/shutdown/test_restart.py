@@ -198,7 +198,6 @@ class CodexSnapshotTests(RestartTestCase):
         with (patch.dict(os.environ, environment),
               patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "w1:p1"}),
               patch.object(herdr, "native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
-              patch.object(herdr, "codex_rollout_threads", side_effect=herdr.NoOpenCodexRollout()),
               patch.object(herdr, "_process_display_name", return_value="TEST-gate"),
               patch.object(client, "listed", side_effect=listed_rows) as listed,
               patch.object(client, "result", return_value={"process_info": info}) as process,
@@ -240,7 +239,6 @@ class CodexSnapshotTests(RestartTestCase):
                                         read: object) -> None:
         with (patch.dict(os.environ, environment),
               patch.object(herdr, "native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
-              patch.object(herdr, "codex_rollout_threads", side_effect=herdr.NoOpenCodexRollout()),
               patch.object(herdr, "_process_display_name", return_value="TEST-worker"),
               patch.object(client, "listed", side_effect=listed_rows),
               patch.object(client, "result", side_effect=read) as process,
@@ -632,6 +630,7 @@ class MixedRestartTests(ShutdownTestCase):
         panes = world.locations
         shell_pids: dict[str, int] = {}
         live: dict[str, int] = {}
+        unconfirmed: dict[str, int] = {}
         shell_env: dict[str, dict[str, str]] = {}
         requests: list[str] = []
         signals: list[int] = []
@@ -665,15 +664,12 @@ class MixedRestartTests(ShutdownTestCase):
             else:
                 rollout = root / ".codex1/sessions" / f"rollout-{row.current_session}.jsonl"
                 write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": row.current_session}}) + "\n")
-                descriptors = proc / str(pid) / "fd"
-                descriptors.mkdir(exist_ok=True)
-                (descriptors / "3").symlink_to(rollout)
             live[pane] = pid
             panes[pane]["agent_session"] = {"kind": "id", "value": row.current_session}
 
         def info(pane: str) -> dict[str, object]:
             shell = shell_pids[pane]
-            pid = live.get(pane, shell)
+            pid = live.get(pane, unconfirmed.get(pane, shell))
             argv = (proc / str(pid) / "cmdline").read_text().strip("\0").split("\0")
             return {"process_info": {"shell_pid": shell, "foreground_process_group_id": pid,
                 "foreground_processes": [{"pid": pid, "name": argv[0], "argv": argv, "cwd": str(root / "mesh" if pane == "w1:p1" else root)}]}}
@@ -772,12 +768,11 @@ class MixedRestartTests(ShutdownTestCase):
                 signals.append(pid)
                 pane = next(pane for pane, current in live.items() if current == pid)
                 del live[pane]
+                if pid in surviving:
+                    unconfirmed[pane] = pid
+                    raise PermissionError("TEST worker stop is unconfirmed")
                 _ = panes[pane].pop("agent_session", None)
                 write_text_atomic(proc / str(shell_pids[pane]) / "task" / str(shell_pids[pane]) / "children", "")
-                if pid in surviving:
-                    stat = proc / str(pid) / "stat"
-                    write_text_atomic(stat, stat.read_text().replace("S " + str(shell_pids[pane]), "S 1", 1))
-                    raise PermissionError("TEST worker stop is unconfirmed")
                 shutil.rmtree(proc / str(pid))
         _ = self.enterContext(patch.object(Path, "read_bytes", proc_bytes))
         _ = self.enterContext(patch.object(os, "kill", side_effect=signal_process))
@@ -797,7 +792,8 @@ class MixedRestartTests(ShutdownTestCase):
                     shell_pids[pane] = 991000 + index
                     process(shell_pids[pane], 990999, ["zsh"], {})
             for pane in panes:
-                start(pane, ["codex" if int(pane[-1]) >= 4 else "claude", "--resume", str(rows[int(pane[-1])].current_session)])
+                kind = "codex" if int(pane[-1]) >= 4 else "claude"
+                start(pane, [kind, "resume" if kind == "codex" else "--resume", str(rows[int(pane[-1])].current_session)])
             with (patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as searches,
                   patch.object(herdr, "codex_conversations", wraps=herdr.codex_conversations) as scans,
                   patch.object(herdr, "_scan_herdr_processes", wraps=herdr._scan_herdr_processes) as processes,  # pyright: ignore[reportPrivateUsage]
@@ -1107,7 +1103,7 @@ class RestartTests(RestartTestCase):
               patch.object(restart, "stop_row", return_value=False),
               patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", str(row.current_session)])),
               patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                  herdr.RolloutThread(str(row.current_session)), "fresh", {})),
+                  herdr.PaneSessionReport(str(row.current_session)), "fresh", {})),
               patch.object(sessions, "process_liveness", return_value=sessions.LiveSessionProcess(990100)),
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p0", herdr.PromptSubmissionNotRequired())) as launch,
@@ -1146,7 +1142,7 @@ class RestartTests(RestartTestCase):
                       patch.object(restart, "stop_row", return_value=False),
                       patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", str(row.current_session)])),
                       patch.object(herdr, "native_process", side_effect=FileNotFoundError(reason) if reason.startswith("rollout") else None,
-                          return_value=herdr.NativeAgentProcess(herdr.RolloutThread(str(row.current_session)), "fresh", {})),
+                          return_value=herdr.NativeAgentProcess(herdr.PaneSessionReport(str(row.current_session)), "fresh", {})),
                       patch.object(sessions, "process_liveness", return_value=sessions.SessionNotLive()),
                       patch.object(os, "kill"),
                       patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
@@ -1529,7 +1525,7 @@ class RestartTests(RestartTestCase):
 
                 def native(pid: int, _kind: str) -> herdr.NativeAgentProcess:
                     identity = str(self.rows[pid - 990100].current_session)
-                    evidence = herdr.RolloutThread(identity) if kind == "codex" else herdr.EnvironmentThread(identity)
+                    evidence = herdr.PaneSessionReport(identity) if kind == "codex" else herdr.EnvironmentThread(identity)
                     return herdr.NativeAgentProcess(evidence, "fixture-start", {})
 
                 def signal_process(pid: int, number: int) -> None:

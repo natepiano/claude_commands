@@ -246,7 +246,9 @@ Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.
 A freestanding agent without a recorded folder uses the home folder.
-The native pane reader identifies resumed Codex sessions without an open rollout file.
+The native pane reader identifies Codex sessions from their resume arguments or pane reports.
+Callers without a report read the process's own pane through the same reader.
+No thread identity comes from an open rollout file.
 It finds the transcript and its account by the current session ID.
 Claude uses `--resume ID`. Codex uses `resume ID` in the worktree.
 The launch sends no work prompt.

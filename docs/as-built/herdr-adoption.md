@@ -315,6 +315,11 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A matching new user turn in the destination transcript proves submission. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
+Worker dispatch sends its prompt once with `agent prompt --wait`.
+If herdr reports `agent_prompt_stalled`, dispatch waits for working, blocked, or done.
+`WORKER_PROMPT_START_SECONDS` sets this start window to 60 seconds by default.
+A start timeout returns exit 5.
+
 The launcher records a completed pass, ends the worker's agent, and closes its pane.
 The close retains the staff row and native conversation.
 The next assign resumes that conversation in a new pane.
