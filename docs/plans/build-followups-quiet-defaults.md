@@ -14,7 +14,6 @@ Current maintenance: snapshot-removal replaces the historical snapshot-timer wir
 
 > **As-built disposition: amend** — `docs/as-built/showrunner-automation.md`, `docs/as-built/session-notifier.md`, `docs/as-built/phase-tables.md`
 
-> **Production: build-followups** — unit `enh-showrunner-unit`; production doc `docs/plans/build-followups-production.md`
 
 ## Source
 

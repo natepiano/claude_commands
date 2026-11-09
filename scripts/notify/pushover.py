@@ -34,6 +34,10 @@ usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent afte
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -46,17 +50,14 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
-import review
-import push_texts
-import silence
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from . import decision_priority
-else:
-    import decision_priority
-from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
+from scripts.notify import review
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.notify import silence
+from scripts.notify import decision_priority
+from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
@@ -104,6 +105,9 @@ class ReviewedPushRecord(review.MessageRecord):
 
 
 class PushLogRecord(TypedDict):
+    key: NotRequired[str]
+    template: NotRequired[str]
+    reference: NotRequired[push_reference.PushReference]
     time: str
     source: str
     priority: str
@@ -176,18 +180,24 @@ def sender_name(source: str) -> str:
     return " ".join(source.removeprefix(SESSION_SOURCE).split())[:SOURCE_MAX]
 
 
-def log(source: str, priority: str, title: str, message: str, outcome: str) -> None:
+def log(source: str, priority: str, title: str, message: str, outcome: str, *,
+        key: str = "", template: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE) -> None:
     entry: PushLogRecord = {"time": datetime.now().astimezone().replace(microsecond=0).isoformat(),
              "source": source, "priority": priority, "title": title, "message": message, "outcome": outcome}
+    if key or template or reference["kind"] != "none":
+        entry["key"] = key
+        entry["template"] = template
+        entry["reference"] = reference
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as out:
             _ = out.write(json.dumps(entry) + "\n")
     except OSError as error:
-        print(f"pushover: could not write log: {error}", file=sys.stderr)
+        print(f"pushover: could not write log: {error}; record: {json.dumps(entry)}", file=sys.stderr)
 
 
 class Arguments(TypedDict):
+    reference: push_reference.PushReference
     need: str
     priority: str
     source: str | None
@@ -206,6 +216,8 @@ class Arguments(TypedDict):
 def parse(argv: list[str]) -> Arguments | None:
     """Parse options without exiting, so callers get send()'s usage status."""
     priority = "0"
+    question = forwarded_reference = ""
+    remote_forward = False
     due = ""
     source: str | None = None
     action: str | None = None
@@ -217,6 +229,12 @@ def parse(argv: list[str]) -> Arguments | None:
     index = 0
     while index < len(argv) and argv[index].startswith("--"):
         option = argv[index]
+        if option == "--ssh-forwarded-reference":
+            if "SSH_CONNECTION" not in os.environ:
+                return None
+            remote_forward = True
+            index += 1
+            continue
         if option == "--answerable":
             answerable = True
             index += 1
@@ -225,13 +243,17 @@ def parse(argv: list[str]) -> Arguments | None:
             no_action = True
             index += 1
             continue
-        if option not in ("--priority", "--source", "--key", "--action", "--text-id", "--value", "--due") or index + 1 >= len(argv):
+        if option not in ("--priority", "--source", "--key", "--action", "--text-id", "--value", "--due", "--question", "--push-reference") or index + 1 >= len(argv):
             return None
         value = argv[index + 1]
         if option == "--priority":
             if value not in PRIORITIES:
                 return None
             priority = value
+        elif option == "--question":
+            question = value
+        elif option == "--push-reference":
+            forwarded_reference = value
         elif option == "--due":
             due = value
         elif option == "--source":
@@ -254,6 +276,13 @@ def parse(argv: list[str]) -> Arguments | None:
         _ = decision_priority.read_due(due)
     except ValueError:
         return None
+    try:
+        reference = push_reference.admission_reference(text_id, question, forwarded_reference, remote_forward=remote_forward)
+    except (OSError, ValueError) as error:
+        print(f"pushover: {error}", file=sys.stderr)
+        return None
+    if not push_key and reference["kind"] == "question":
+        push_key = "question:" + reference["path"]
     session: NotificationSession = NO_SESSION_LINE
     header = True
     need = "blocked" if priority == "2" else "decision" if priority == "1" or due else "note"
@@ -285,6 +314,7 @@ def parse(argv: list[str]) -> Arguments | None:
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
     return {
+        "reference": reference,
         "need": need,
         "due": due,
         "session": session,
@@ -354,7 +384,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             pass
     draft = review.Draft(source, priority, title, action,
                          trimmed_body(action, arguments["message"], arguments["session"], header=arguments["header"]),
-                         arguments["answerable"], arguments["session"], arguments["due"])
+                         arguments["answerable"], arguments["session"], arguments["due"], arguments["reference"])
     header, key = arguments["header"], arguments["key"]
     registered_text = bool(arguments["text_id"]) and not push_texts.agent_written(arguments["text_id"])
     claimed = False
@@ -462,13 +492,15 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
     """
     source, priority, title = draft.source, draft.priority, draft.title
+    if not key and draft.reference["kind"] == "question":
+        key = "question:" + draft.reference["path"]
     need = "blocked" if priority == "2" else "decision" if draft.due or priority == "1" else "note"
     priority = decision_priority.priority(need, draft.due)
     message = posted_message(draft.action, draft.body, draft.session, header=header)
     if priority != "2":
         kept = silence.keep({"source": source, "priority": priority, "title": title,
                              "message": message, "detail": detail, "key": key, "text_id": text_id,
-                             "due": draft.due, "need": need},
+                             "due": draft.due, "need": need, "reference": draft.reference},
                             deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
@@ -478,11 +510,29 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
-    """Discard retired flood alerts. Post other pushes as silence kept them."""
-    if push["text_id"] == "message.repeat_flood":
-        log(push["source"], push["priority"], push["title"], push["message"],
-            "dropped: retired template message.repeat_flood")
-        return 0
+    """Drop settled requests and retired alerts before posting kept pushes."""
+    reference = push.get("reference", push_reference.NO_REFERENCE)
+    reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
+    if reference["kind"] == "question":
+        try:
+            opening = push_reference.read_question(Path(reference["path"]))
+        except (OSError, ValueError) as error:
+            log(push["source"], push["priority"], push["title"], push["message"],
+                f"anomaly: question record {reference['path']}: {error}",
+                key=push["key"], template=push["text_id"], reference=reference)
+        else:
+            if opening.status == "closed":
+                reason = "question closed"
+            elif opening.since != reference["since"]:
+                reason = "question reopened"
+    elif reference["kind"] == "review_watch":
+        from scripts.production import review_regime
+        if review_regime.acknowledged():
+            reason = "report acknowledged"
+    if reason:
+        log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
+            key=push["key"], template=push["text_id"], reference=reference)
+        return push_reference.KeptPushDropped()
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))

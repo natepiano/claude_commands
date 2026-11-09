@@ -6,15 +6,15 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-import change_review
+from scripts.production import change_review
 from scripts.lib import conf
 from scripts.production import change_routing, staff
-import proposals_folder
-import proposals_table
-from production_units import Refusal, production_field
+from scripts.production import proposals_folder
+from scripts.production import proposals_table
+from scripts.production.production_doc import Refusal, production_field
 
 if TYPE_CHECKING:
-    from update_registration import QuestionStaff
+    from scripts.production.update_registration import QuestionStaff
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
@@ -37,7 +37,7 @@ def change_counts(doc: Path, record: staff.StaffSnapshot) -> tuple[int, int]:
     """Count the production tab and the unrouted tab in one routed pass."""
     try:
         scope = change_review.review_scope(doc, False, record)
-        routed = change_review.routed_review_entries(change_review.scope_list(doc), doc, record=record)
+        routed = change_review.routed_review_entries(change_review.scope_list(doc, record=record), doc, record=record)
         return (sum(owner.tab in scope for _, owner, _ in routed),
                 sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
     except (change_review.ChangeReviewError, OSError):
@@ -63,16 +63,12 @@ def open_efficiency(line: str) -> bool:
     return match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
 
 
-def _field_path(doc: Path, field: str) -> Path | None:
+def efficiency_ledger(doc: Path) -> Path | None:
+    """Read the configured efficiency ledger, or return None when it is unconfigured."""
     try:
-        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), field)).expanduser()
+        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), EFFICIENCY_LEDGER_FIELD)).expanduser()
     except Refusal:
         return None
-
-
-def efficiency_ledger(doc: Path) -> Path | None:
-    """The ledger the doc's Efficiency ledger line names, or None when it names none."""
-    return _field_path(doc, EFFICIENCY_LEDGER_FIELD)
 
 
 def efficiency(doc: Path) -> int:
@@ -97,38 +93,40 @@ def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | 
 
 
 def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
-    """Watch staff, all review lists, and delivery records for tab count changes."""
+    """Watch configuration, staff, review lists, and delivery records for count changes."""
     root = change_routing.review_root()
     record = record if record is not None else staff.snapshot()
     lists = change_review.lists_directory()
-    return [conf.path("change_review"), lists, *lists.glob(change_review.PREFIX + "*.md"),
+    return [conf.path("change_review"), conf.path("review_links"), lists, *lists.glob(change_review.PREFIX + "*.md"),
             *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
 
 def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
-    """Return the files that affect the counts and their containing folders.
+    """Watch the count sources and each open record."""
+    from scripts.production.update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
+                                     question_folder, question_records_for_document)
 
-    Watch each open record because closing it changes the file.
-    """
     try:
-        listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
-    except (change_review.ChangeReviewError, OSError):
+        if identities is None:
+            identities = QuestionStaff.read()
+        listed = [item.path for item in change_review.scope_lists(
+            change_review.scope_list(doc, record=identities.record), doc, record=identities.record)]
+    except (change_review.ChangeReviewError, staff.StaffRefused, OSError):
         listed = []
     folder = proposals_folder.issues_folder(doc)
+    queue = proposals_folder.ledger(doc)
     try:
-        queue = proposals_folder.ledger(doc)
         efficiency_queue = efficiency_ledger(doc)
     except OSError:
-        queue = None
         efficiency_queue = None
-    found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
+    found = [doc, *listed, *(path for path in (folder, queue) if path is not None)]
+    if efficiency_queue is not None:
+        found.append(efficiency_queue)
     if folder is not None:
         try:
             found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
         except OSError:
             pass
-    from update_registration import QuestionFolder, QuestionStaff, question_folder, question_records_for_document
-
     try:
         if identities is None:
             identities = QuestionStaff.read()
@@ -138,11 +136,8 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
                 found.append(questions.path)
             found.extend(record.path for record in question_records_for_document(doc, identities)
                          if record.status == "open")
-    except staff.StaffRefused as error:
-        print(f"questions: refused — {error}", file=sys.stderr)
-        raise SystemExit(2) from error
-    except OSError:
-        pass
+    except (staff.StaffRefused, RegistrationFailure, OSError) as error:
+        print(f"questions: unavailable — {error}", file=sys.stderr)
     return found
 
 

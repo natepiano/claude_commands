@@ -1,12 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Stop tests and builds outside a natedev hold, independent of their launch path."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
 import hashlib
-import importlib
 import json
 import os
 import shlex
@@ -18,29 +21,15 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import Literal, cast
 
-import build_hold
-from hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+from scripts.build_hold import build_hold
+from scripts.build_hold.hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-    import step_record
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
-
-
-class BuildLogWriter(Protocol):
-    def host_name(self) -> str: ...
-    def root(self) -> Path: ...
-    def utc_iso(self, epoch: float) -> str: ...
-    def append_line(self, path: Path, record: object) -> None: ...
-
-
-store = cast(BuildLogWriter, cast(object, importlib.import_module("store")))
-
+from scripts.direct import step_record
+from scripts.buildlog import store
+from scripts.lib.boot_identity import boot_identity
 
 @dataclass(frozen=True)
 class AllowedBuild:
@@ -66,9 +55,37 @@ class WouldStopBuild:
     owner: build_hold.OwningSession | build_hold.NoOwningSession
     reason: str
     holder: build_hold.Holder
+    stop_root: build_hold.AuditProcess
 
 
 BuildDecision = AllowedBuild | KeptBuild | WouldStopBuild
+
+
+@dataclass(frozen=True)
+class NotKept:
+    """No holder keeps this process or its step controller."""
+
+
+def keeping_holder(
+    process: build_hold.AuditProcess, ancestors: Sequence[build_hold.AuditProcess],
+    processes: Mapping[int, build_hold.AuditProcess], holders: Sequence[build_hold.Holder],
+) -> build_hold.Holder | NotKept:
+    """Check step controllers for the process and each ancestor."""
+    lineage = (process, *ancestors)
+    for item in (process, *ancestors):
+        call_id = item.environment.get("BUILDLOG_CALL_ID", "")
+        if not call_id:
+            continue
+        record = step_record.read(call_id)
+        if isinstance(record, step_record.StepRecord):
+            controller = processes.get(record.pid)
+            if (controller is not None and controller.uid == process.uid
+                    and controller.identity == build_hold.ProcessIdentity(record.pid, record.proc_start)):
+                lineage += (controller, *build_hold.audit_ancestors(controller, processes))
+    for holder in holders:
+        if any(item.identity in holder.keep for item in lineage):
+            return holder
+    return NotKept()
 
 
 def state_directory() -> Path:
@@ -124,12 +141,11 @@ def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
     if not process.argv:
         return False
     executable = Path(process.argv[0]).name
-    if executable in {"verify.sh", "merge_gate.py"}:
+    if executable == "verify.sh" or starts_suite_runner(process.argv):
         return True
     if executable.startswith("python"):
         target = python_target(process.argv[1:])
-        return (target[:2] == ("-m", "scripts.production.merge_gate")
-                or bool(target) and Path(target[0]).name == "merge_gate.py")
+        return starts_suite_runner(target)
     if executable not in {"bash", "sh", "dash", "zsh"}:
         return False
     for argument in process.argv[1:]:
@@ -150,7 +166,7 @@ def is_build(process: build_hold.AuditProcess) -> bool:
             arguments = arguments[1:]
         if arguments in {("-vV",), ("-V",), ("--version",)}:
             return False
-    if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright", "merge_gate.py"}):
+    if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright"} | SUITE_RUNNERS):
         return True
     if "rust-analyzer" in names:
         # Ownership needs ancestors, so it is checked by decide_builds.
@@ -160,8 +176,8 @@ def is_build(process: build_hold.AuditProcess) -> bool:
             return True
         target = python_target(process.argv[1:])
         return (target[:2] in {("-m", "unittest"), ("-m", "pytest")}
-                or target[:2] == ("-m", "scripts.production.merge_gate")
-                or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "merge_gate.py", "basedpyright"}
+                or starts_suite_runner(target)
+                or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "basedpyright"}
                                      or Path(target[0]).match("test_*.py")))
     if names & {"node", "nodejs"}:
         return any(Path(argument).name in {"basedpyright", "basedpyright.js"} for argument in process.argv[1:])
@@ -208,7 +224,7 @@ def protected_reason(
         # Missing, stale and unreadable records grant no permission.
         return ""
     if is_waiting_gate(process):
-        return "verify.sh or merge_gate.py waits at its own hold gate"
+        return "verify.sh or a suite runner waits at its own hold gate"
     if any(is_sccache_server(item) for item in (process, *ancestors)):
         return "sccache server compiles for the holder too"
     lineage = (process, *ancestors)
@@ -219,6 +235,16 @@ def protected_reason(
             and any(item.tty_nr != 0 or item.desktop_app for item in lineage)):
         return "user terminal or desktop app, with no agent ancestor or session marker"
     return ""
+
+
+def gate_job_root(
+    process: build_hold.AuditProcess, ancestors: Sequence[build_hold.AuditProcess],
+) -> build_hold.AuditProcess:
+    """Stop the waiting gate's job while the gate stays alive."""
+    for child, parent in zip((process, *ancestors), ancestors):
+        if is_waiting_gate(parent):
+            return child
+    return process
 
 
 def decide_builds(
@@ -243,15 +269,15 @@ def decide_builds(
         if reason or not holders:
             decisions.append(AllowedBuild(process, owner, reason or "no hold is in force"))
             continue
-        kept = next((holder for holder in holders if any(
-            item.identity in holder.keep for item in (process, *ancestors))), None)
-        if kept is not None:
+        kept = keeping_holder(process, ancestors, processes, holders)
+        if isinstance(kept, build_hold.Holder):
             decisions.append(KeptBuild(process, owner, kept))
             continue
         owner_key = build_hold.holder_path(Path(), owner.session_id).name if isinstance(owner, build_hold.OwningSession) else ""
         blocking = [holder for holder in holders if holder.key != owner_key] or list(holders)
         holder = min(blocking, key=lambda item: item.since)
-        decisions.append(WouldStopBuild(process, owner, f"test or build outside {holder.name}'s hold for {holder.purpose}", holder))
+        decisions.append(WouldStopBuild(process, owner, f"test or build outside {holder.name}'s hold for {holder.purpose}",
+                                       holder, gate_job_root(process, ancestors)))
     return tuple(decisions)
 
 
@@ -261,8 +287,8 @@ def record_build(
 ) -> None:
     """Audit and enforcement use the same permanent log and append writer."""
     try:
-        boot = (proc_root / "sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
+        boot = boot_identity(proc_root)
+    except (OSError, ValueError):
         boot = ""
     identity = build.process.identity
     hold_id = hashlib.sha256(json.dumps([holder.key, holder.since.isoformat()]).encode()).hexdigest()
@@ -342,11 +368,12 @@ class StopBuildsAndTests:
         protected: set[build_hold.ProcessIdentity] = {item.identity for item in (enforcer, *build_hold.audit_ancestors(enforcer, processes))} if enforcer else set()
         for identity, deadline in tuple(self.terminating.items()):
             process = processes.get(identity.pid)
-            lineage = (process, *build_hold.audit_ancestors(process, processes)) if process is not None else ()
-            owner = build_hold.audit_owner(process, lineage[1:]) if process is not None else build_hold.NoOwningSession()
+            ancestors = build_hold.audit_ancestors(process, processes) if process is not None else ()
+            owner = build_hold.audit_owner(process, ancestors) if process is not None else build_hold.NoOwningSession()
             # A route change cannot cancel termination of an old process.
             if (not holders or identity in protected or build_hold.owner_is_sole_holder(owner, holders)
-                    or any(item.identity in holder.keep for holder in holders for item in lineage)):
+                    or process is not None and isinstance(
+                        keeping_holder(process, ancestors, processes, holders), build_hold.Holder)):
                 del self.terminating[identity]
                 continue
             if now >= deadline:
@@ -355,17 +382,19 @@ class StopBuildsAndTests:
 
     def stop(self, build: WouldStopBuild, processes: Mapping[int, build_hold.AuditProcess],
              holders: Sequence[build_hold.Holder], enforcer_pid: int) -> None:
-        root = build.process
+        root = build.stop_root
         if root.identity in self.terminating:
             return
-        ancestors = build_hold.audit_ancestors(root, processes)
+        ancestors = build_hold.audit_ancestors(build.process, processes)
+        if isinstance(keeping_holder(build.process, ancestors, processes, holders), build_hold.Holder):
+            return
         # An ancestor can exit or a PID can be reused after the table read.
         if any(build_hold.process_start_time(item.identity.pid, self.proc_root) != item.identity.start_time
-               for item in (root, *ancestors)):
+               for item in (build.process, *ancestors)):
             return
         write_refusal(self.proc_root, build)
         classification: build_hold.BuildClass = "other_session" if isinstance(build.owner, build_hold.OwningSession) else "no_session"
-        self.record(build_hold.AuditedBuild(root, build.owner, classification, ()), build.holder, self.proc_root, "stopped")
+        self.record(build_hold.AuditedBuild(build.process, build.owner, classification, ()), build.holder, self.proc_root, "stopped")
         if isinstance(build.owner, build_hold.OwningSession):
             _ = self.register(build.owner.session_id)
         # Include all descendants, not only compilers. Parents precede their children.
@@ -387,7 +416,7 @@ class StopBuildsAndTests:
             owner = build_hold.audit_owner(process, parents)
             if protected_reason(process, parents, owner, holders, protected):
                 continue
-            if any(item.identity in holder.keep for holder in holders for item in (process, *parents)):
+            if isinstance(keeping_holder(process, parents, processes, holders), build_hold.Holder):
                 continue
             if process.identity not in self.terminating and self.signal_if_current(process.identity, signal.SIGTERM):
                 self.terminating[process.identity] = self.clock() + 2
@@ -398,7 +427,7 @@ class StopBuildsAndTests:
 def start() -> None:
     """Keep an active unit; otherwise start the service or one detached fallback."""
     script = Path(__file__).resolve()
-    python = str(Path(sys.executable).resolve())
+    python = str(script.parents[1] / "lib/py")
     if shutil.which("systemctl"):
         try:
             active = subprocess.run(["systemctl", "--user", "is-active", "build-hold-enforcer"],

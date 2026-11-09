@@ -5,17 +5,15 @@ argument-hint: "<unit> <what the user wants now>"
 
 # Bump
 
-Run in the showrunner session when the user calls a piece of work urgent: they
-want to use it now, and the full validation can come after. User, 2026-10-22,
-after trunk P140 (the 3D group box) waited days behind a flake fix and the
-merge queue.
+Run from any session when the user calls work urgent.
+A session that is not the owning showrunner sends steps 2–5 to the showrunner that owns the unit.
 
 `<unit>` owns the work. If no unit owns it yet, give it to the unit whose files
 it changes, and say so in one line.
 
 ## Steps
 
-1. **Top priority at once.** The user can type `/build:queue bump <unit>` in the showrunner session. For a specific reason, run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/memory_admit.py priority set --unit <unit> --why "<what>"`; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
+1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py bump <position|session|folder>` for a waiting step of the bumped unit. It gives that unit the queue priority until step 5 clears it; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
    one line: the bumped unit's merge goes first, and a build hold may come. Do
    not wait for the next update tick.
@@ -40,7 +38,7 @@ it changes, and say so in one line.
    and the showrunner with the failed step, tip and log; green goes to the
    showrunner. With a merge unit, use its full run. Keep the work top priority
    until the tip is green; red fixes come as follow-up checkpoints.
-5. **Tell the user.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/memory_admit.py priority clear`. When the demo build is installed, tell the user what to
+5. **Tell the user.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py clear`. When the demo build is installed, tell the user what to
    run and where, in one line, and send a `note` (<Notify/>). Then log
    `bump done: <unit>` once the tip is green, and return to the normal order.
 

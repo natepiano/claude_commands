@@ -2,13 +2,16 @@
 """Read each account's live Codex daemon and queue through its control socket."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import base64
 import json
 import os
 import socket
 import struct
-import sys
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +20,6 @@ from enum import Enum
 from pathlib import Path
 from typing import cast, final
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 
 _clock = time.monotonic

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import re
@@ -14,13 +16,11 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import fake_unit_host
-import production_lifecycle
+from scripts.production import fake_unit_host
+from scripts.production import production_lifecycle
 from scripts.production import showrunners, staff, unit_config
-import unit_lookup
-import tidy_wrapped
+from scripts.production import unit_lookup
+from scripts.production import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
 
 
@@ -110,26 +110,32 @@ class LifecycleFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         socket_for = showrunners.socket_for
-        marked_units = unit_lookup.marked_units
+        labeled_sessions = unit_lookup.labeled_sessions
         self.staff = StaffTestCase()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", marked_units))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", labeled_sessions))
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
-        self.addCleanup(shutil.rmtree, self.fixture_root)
+        self.addCleanup(self.remove_fixture)
         self.root = self.fixture_root
         self.bind_fixture()
         self.env = self.fixture_env.copy()
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
         self.staff.register_production("example", self.doc)
-        owner = fixture_member("showrunner", name="old-showrunner", doc=staff.LiveDoc("natedev", self.doc))
-        self.write(self.state / "notifier/showrunner-example/conf",
-                   f"TARGET=session:{owner.current_session}\nCHECK=production_check.sh {self.doc}\n")
+        owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc(remote.local_machine(), self.doc))
+        self.write(self.state / "notifier" / f"showrunner-{owner.id}" / "conf",
+                   f"TARGET=session:{owner.current_session}\nCHECK=production_check.sh {owner.id}\n")
         for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
             _ = fixture_member("unit", name=name, parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", folder))
+                               worktree=staff.PresentWorktree(remote.local_machine(), folder))
+
+    def remove_fixture(self) -> None:
+        """Release the next fixture path before removal can fail."""
+        finished = Path(tempfile.mkdtemp(prefix="finished-", dir=self.fixture_root.parent))
+        _ = self.fixture_root.rename(finished)
+        shutil.rmtree(finished)
 
     def bind_fixture(self) -> None:
         self.origin = self.root / "origin.git"
@@ -205,7 +211,6 @@ class LifecycleFixture(unittest.TestCase):
             "", "## Production Context", "",
             "- **Merge branch:** `production`",
             f"- **Showrunner checkout:** `{self.checkout}`",
-            "- **Showrunner session:** old-showrunner",
             "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles",
             "- **Updates:** every 15 minutes",
@@ -213,14 +218,7 @@ class LifecycleFixture(unittest.TestCase):
         ]
         if promote:
             lines.append(f"- **Promote:** {promote}")
-        lines.extend([
-            "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.alpha}` | alpha-branch | alpha | — | `alpha.txt` |",
-            f"| beta-unit | docs/plans/beta.md | `{self.beta}` | beta-branch | beta | — | `beta.txt` |",
-            "", "## Close-out", "",
-        ])
+        lines.extend(["", "## Close-out", ""])
         if close_out:
             lines.append(close_out)
         lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])
@@ -235,15 +233,15 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
-        runner = fixture_member("showrunner", name="old-showrunner",
-                              doc=staff.LiveDoc("natedev", self.doc))
+        runner = fixture_member("showrunner", name="example",
+                              doc=staff.LiveDoc(remote.local_machine(), self.doc))
         for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
             row = fixture_member("unit", name=name, parent=runner.id,
-                               worktree=staff.PresentWorktree("natedev", worktree))
+                               worktree=staff.PresentWorktree(remote.local_machine(), worktree))
             _ = unit_config.write(worktree, unit_config.UnitConfig(
                 unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
             self.staff.pane(f"fixture:{name}", session_id=row.id, environment={
-                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": f"{name}-unit",
+                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": name,
             })
             _ = self.staff.session_transcript(row.id, worktree, home=self.home)
         common_dir = Path(self.git("rev-parse", "--git-common-dir"))
@@ -254,19 +252,18 @@ class LifecycleFixture(unittest.TestCase):
     def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == name)
         with mock.patch.dict(os.environ, self.env):
-            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id,
-                unit_config.RecordedStartFolder(worktree), unit_config.Branch(branch)))
+            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id, unit_config.Branch(branch)))
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.
         with mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner"), \
              mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.state / "notifier"):
             return invoke_cli(production_lifecycle, production_lifecycle.main,
-                              [action, "--production", str(self.doc), *extra],
+                              [action, "--production", "example", *extra],
                               self.env, self.checkout, production_state=True)
 
     def run_lifecycle_process(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), action, "--production", str(self.doc),
+        return subprocess.run([sys.executable, str(SCRIPT), action, "--production", "example",
                                *extra], cwd=self.checkout, env=self.env, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -306,20 +303,25 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "lifecycle@example.invalid", cwd=destination)
         return destination
 
-    def showrunner(self, slug: str, *, live: bool = False) -> None:
-        """An update timer for `slug`'s showrunner, and with `live` a running session it is addressed to."""
-        doc = self.root / f"{slug}-production.md"
-        self.write(doc, f"# {slug}\n")
-        self.write(self.state / "notifier" / f"showrunner-{slug}" / "conf",
-                   f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {doc}\n")
+    def owner_id(self, production_name: str = "example") -> staff.StaffId:
+        return next(row.id for row in staff.find(kind="showrunner") if row.name == production_name)
+
+    def showrunner(self, production_name: str, *, live: bool = False) -> None:
+        """Publish the private owner and its update timer."""
+        doc = self.root / f"{production_name}-production.md"
+        self.write(doc, f"# {production_name}\n")
+        owners = [row for row in staff.find(kind="showrunner") if row.name == production_name]
+        owner = (staff.set_doc(owners[0].id, staff.LiveDoc(remote.local_machine(), doc)) if owners
+                 else fixture_member("showrunner", name=production_name, doc=staff.LiveDoc(remote.local_machine(), doc)))
+        self.write(self.state / "notifier" / f"showrunner-{owner.id}" / "conf",
+                   f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
         if live:
-            # This test's own process stands in for the session's: it is alive while the lifecycle runs.
             self.write(self.state / "sessions" / f"{os.getpid()}.json",
-                       json.dumps({"pid": os.getpid(), "name": f"{slug}-name", "sessionId": f"{slug}-session",
-                                   "messagingSocketPath": str(self.root / f"{slug}.sock")}))
+                       json.dumps({"pid": os.getpid(), "name": f"{production_name}-name", "sessionId": owner.current_session,
+                                   "messagingSocketPath": str(self.root / f"{production_name}.sock")}))
 
     def reports_to(self, child: str, parent: str) -> Path:
-        path = self.state / "showrunner" / child / "parent"
+        path = self.state / "showrunner" / self.owner_id(child) / "parent"
         self.write(path, parent + "\n")
         return path
 
@@ -331,8 +333,8 @@ class LifecycleFixture(unittest.TestCase):
 
     def merged_units(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
 
     def calls(self) -> str:

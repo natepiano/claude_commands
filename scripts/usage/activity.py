@@ -117,7 +117,7 @@ QUOTED_SEPARATORS = re.compile(r"[\s;|&<>()]")
 DISCARDED_REDIRECTION = re.compile(r"(?:&|\d*)>>?\s*/dev/null\b|\d*>&\d+-?")
 STATEMENT_SEPARATOR = re.compile(r"&&|\|\||;|\n|&")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-STATUS_FILE = re.compile(r"\.(log|out|output|status|exit|rc|done|pid|code)\b|/proc/loadavg|sentinel|marker|exit_code")
+STATUS_FILE = re.compile(r"\.(log|out|output|status|exit|rc|done|pid|code)\b|sentinel|marker|exit_code")
 CONTROL_WORDS = frozenset({"while", "until", "if", "elif", "then", "do", "!", "{", "(", "else"})
 NEUTRAL_WORDS = frozenset({"done", "fi", "}", ")", "break", "continue", "exit", "echo", "printf", "true", ":",
                            "date", "cd", "set", "for", "return", "local", "export", "esac"})
@@ -145,11 +145,14 @@ def quoted_text(match: re.Match[str]) -> str:
     return QUOTED_SEPARATORS.sub("_", content)
 
 
-def status_file_label(text: str) -> str | None:
-    match = STATUS_FILE.search(text)
-    if match is None:
-        return None
-    return f"*.{match.group(1)}" if match.group(1) else match.group(0)
+def status_file_label(paths: Iterable[str]) -> str | None:
+    for path in paths:
+        if "/proc/loadavg" in path:
+            return "/proc/loadavg"
+        match = STATUS_FILE.search(os.path.basename(path))
+        if match is not None:
+            return f"*.{match.group(1)}" if match.group(1) else match.group(0)
+    return None
 
 
 def statement_atom(statement: str) -> Atom:
@@ -173,10 +176,12 @@ def statement_atom(statement: str) -> Atom:
         arguments = words[2:] if name == "bash" else words[1:]
         if arguments and arguments[0] == "read":
             return WaitAtom("board.sh read")
-        if len(arguments) >= 4 and arguments[0] == "post" and arguments[3] == "status":
-            return StatusAtom()
+        if len(arguments) >= 3 and arguments[0] == "post":
+            kind_index = 3 if arguments[1].startswith("/") else 2
+            if len(arguments) > kind_index and arguments[kind_index] == "status":
+                return StatusAtom()
         return WorkAtom()
-    label = status_file_label(rest)
+    label = status_file_label(rest.split())
     if name == "tail" and ">" not in rest:
         return WaitAtom(f"tail {label}" if label else "tail")
     if name in STATUS_READERS and label and ">" not in rest and "<<" not in rest:
@@ -209,7 +214,7 @@ def shell_atoms(command: str) -> tuple[Atom, ...]:
 
 # Codex rollout records.
 
-STRING_LITERAL = r"""(["'`])((?:\\.|(?!\1).)*)\1"""
+STRING_LITERAL = r"""(["'`])((?:\\.|(?!\1)[^\\])*)\1"""
 TOOL_CALL = re.compile(r"tools\.(\w+)\(")
 COMMAND_FIELD = re.compile(r"""["']?cmd["']?\s*:\s*""" + STRING_LITERAL, re.S)
 CHARS_FIELD = re.compile(r"""["']?chars["']?\s*:\s*""" + STRING_LITERAL, re.S)
@@ -288,7 +293,7 @@ def claude_atoms(record: dict[str, object]) -> tuple[Atom, ...]:
         path = tool_input.get("file_path")
         if name == "Bash" and isinstance(command, str):
             atoms.extend(shell_atoms(command))
-        elif name == "Read" and isinstance(path, str) and (label := status_file_label(path)):
+        elif name == "Read" and isinstance(path, str) and (label := status_file_label((path,))):
             atoms.append(WaitAtom(f"Read {label}"))
         else:
             atoms.append(WorkAtom())

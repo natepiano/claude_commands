@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Read local showrunner timers, resolve their addresses and send production notices."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
 import math
 from time import monotonic
 import os
-import re
-import shlex
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -19,21 +20,22 @@ from importlib import import_module
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
+from scripts.lib.atomic_file import write_bytes_atomic
+
+from scripts.lib import conf as tunables
+from scripts.message import session_send
+
+CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 # Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
 SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
-SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
+SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or session_send.SEND_SCRIPT)
 PARENT_FILE = "parent"
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from user_zone import user_zone_name  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
+from scripts.lib.user_zone import user_zone_name  # noqa: E402
+from scripts.message.sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 from scripts.lib.session_paths import sessions_directory as sessions_directory
 from scripts.production import staff  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
@@ -48,11 +50,11 @@ class Showrunner(TypedDict):
     session: str
     # Where a message reaches it now. Empty while it is not running.
     socket: str
-    # The production's slug, which names the showrunner whatever its session is called.
-    slug: str
+    # The production name comes from the showrunner staff row.
+    name: str
     # The user's zone setting. A production doc's own User zone line is no longer read.
     zone: str
-    # The production doc, whose Units table says which units the showrunner has.
+    # The production doc. The staff rows whose parent is this showrunner are its units.
     doc: str
 
 
@@ -98,10 +100,17 @@ class ShowrunnerDiscovery(list[Showrunner]):
         return int(bool(self.lookup_failures))
 
 
-class Timer(NamedTuple):
-    """One complete update timer. It is what makes a production's showrunner exist, running or not."""
+class DiscoverMembership(NamedTuple):
+    """Read staff when no report snapshot was supplied."""
 
-    slug: str
+
+DISCOVER_MEMBERSHIP = DiscoverMembership()
+
+
+class Timer(NamedTuple):
+    """One complete timer for a staff owner."""
+
+    name: str
     target: str
     doc: Path
     zone: str
@@ -112,26 +121,54 @@ class NoTimer:
     reason: str
 
 
-def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot, *,
-              sources: Iterable[ShowrunnerSource] | None = None) -> Timer | NoTimer:
-    """Join a timer by its document and the recorded document owner."""
-    doc = row.doc
-    if not isinstance(doc, (staff.LiveDoc, staff.WrappedDoc)):
-        return NoTimer(f"{row.name}: production document is not recorded")
-    owner = snapshot.by_doc(doc.machine, doc.path)
-    if owner is None or owner.id != row.id or doc.machine != remote.local_machine():
-        return NoTimer(f"{row.name}: no local timer for the recorded document")
-    failures: list[ShowrunnerLookupFailure] = []
-    sources = sources if sources is not None else read_sources(
-        unreadable=UnreadableTimerPolicy.SKIP, on_failure=failures.append)
-    matches = [source.timer for source in sources
-               if source.timer.doc == doc.path]
-    if len(matches) > 1:
-        raise staff.StaffUnreadable(f"{row.name}: several timers name {doc.path}")
-    if not matches and failures:
-        reasons = "; ".join(f"showrunner-{failure.production}: {failure.reason}" for failure in failures)
-        raise OSError(f"{row.name}: no readable timer names {doc.path}; {reasons}")
-    return matches[0] if matches else NoTimer(f"{row.name}: no timer names {doc.path}")
+class TimerRegistration(NamedTuple):
+    """A staff owner's timer, independent of its production document."""
+
+    name: str
+    target: str
+    zone: str
+
+
+def _registration(instance: Path, record: staff.StaffSnapshot, *,
+                  dependencies: Callable[[Path], None] | None = None) -> TimerRegistration:
+    fields = _fields(instance / "conf", dependencies=dependencies)
+    target = fields["TARGET"]
+    if not target.startswith("session:") or not target[8:]:
+        raise ValueError("invalid TARGET")
+    owner = owner_for_timer(instance, record)
+    return TimerRegistration(owner.name, f"session:{owner.id}", user_zone_name())
+
+
+def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot) -> TimerRegistration | NoTimer:
+    """Read the fixed owner's timer without requiring a document."""
+    instance = NOTIFIER_STATE_DIR / f"showrunner-{row.id}"
+    if instance.exists():
+        return _registration(instance, snapshot)
+    return NoTimer(f"{row.name}: no timer for staff {row.id}")
+
+
+def owner_for(reference: str, record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
+    """Resolve a staff id or production label through the staff file."""
+    record = record if record is not None else staff.snapshot()
+    found = next((row for row in record.rows if row.kind == "showrunner"
+                and (row.id == reference or row.name == reference)), None)
+    if found is None:
+        raise ValueError(f"{reference}: no showrunner staff row")
+    return found
+
+
+def timer_name(reference: str, record: staff.StaffSnapshot | None = None) -> str:
+    """Return the timer folder name for the fixed staff owner."""
+    return f"showrunner-{owner_for(reference, record).id}"
+
+
+def owner_for_timer(instance: Path, record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
+    """Read the owner identified by the timer folder's staff id."""
+    record = record if record is not None else staff.snapshot()
+    owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+    if owner is None or owner.kind != "showrunner":
+        raise ValueError(f"{instance}: no showrunner staff row")
+    return owner
 
 
 @dataclass(frozen=True)
@@ -142,44 +179,17 @@ class ShowrunnerSource:
     document: str
 
 
-class CheckedDoc(NamedTuple):
-    path: Path
-
-
-class NoCheckedDoc(NamedTuple):
-    reason: str
-
-
-def defaults() -> ShowrunnerSettings:
-    return ShowrunnerSettings(threshold_percent=2, repeat_minutes=30, stall_minutes=5,
-                              faults_to="natedev", always=["natedev"])
-
-
 def load_settings() -> ShowrunnerSettings:
     return load_settings_from(CONFIG)
 
 
 def load_settings_from(path: Path) -> ShowrunnerSettings:
-    try:
-        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        if not isinstance(raw, dict):
-            raise ValueError("expected an object")
-        data = cast(dict[str, object], raw)
-        for key in ("threshold_percent", "repeat_minutes", "stall_minutes"):
-            if not isinstance(data.get(key), (int, float)) or isinstance(data[key], bool):
-                raise ValueError(f"invalid {key}")
-        if not isinstance(data.get("faults_to"), str) or not data["faults_to"]:
-            raise ValueError("invalid faults_to")
-        always = data.get("always")
-        if not isinstance(always, list) or not all(isinstance(item, str) for item in cast(list[object], always)):
-            raise ValueError("invalid always")
-        # A file written while showrunners were listed here still has the list; it is not read.
-        return ShowrunnerSettings(threshold_percent=cast(float, data["threshold_percent"]),
-                                  repeat_minutes=cast(float, data["repeat_minutes"]),
-                                  stall_minutes=cast(float, data["stall_minutes"]),
-                                  faults_to=cast(str, data["faults_to"]), always=cast(list[str], always))
-    except (OSError, ValueError, TypeError, KeyError) as error:
-        raise ValueError(f"{path}: {error}") from error
+    settings = tunables.read(path)
+    return ShowrunnerSettings(
+        threshold_percent=settings.number("threshold_percent"),
+        repeat_minutes=settings.number("repeat_minutes"),
+        stall_minutes=settings.number("stall_minutes"),
+        faults_to=settings.text("faults_to"), always=settings.values()["always"].split())
 
 
 def socket_for(target: str, *, deadline: float = math.inf) -> str | None:
@@ -206,34 +216,6 @@ def _fields(path: Path, *, dependencies: Callable[[Path], None] | None = None) -
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
 
 
-def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
-    """Read the production doc passed to an update instance's production check."""
-    try:
-        return _checked_doc(_fields(instance / "conf").get("CHECK"))
-    except (OSError, UnicodeError) as error:
-        return NoCheckedDoc(f"conf could not be read: {error}")
-
-
-def _checked_doc(check: str | None) -> CheckedDoc | NoCheckedDoc:
-    if check is None:
-        return NoCheckedDoc("CHECK is missing")
-    try:
-        command = shlex.split(check)
-    except ValueError as error:
-        return NoCheckedDoc(f"CHECK could not be parsed: {error}")
-    try:
-        script_index = next(index for index, token in enumerate(command)
-                            if Path(token).name == "production_check.sh")
-    except StopIteration:
-        return NoCheckedDoc("CHECK has no production_check.sh token")
-    if script_index + 1 >= len(command):
-        return NoCheckedDoc("CHECK has no production doc token")
-    path = Path(command[script_index + 1])
-    if not path.is_absolute():
-        return NoCheckedDoc("production doc path is relative")
-    return CheckedDoc(path)
-
-
 def session_name(session_id: str) -> str:
     """The live Claude session's name, or empty when it has none or is not running."""
     return _session_name(session_id)
@@ -258,33 +240,24 @@ def _session_name(session_id: str) -> str:
 
 
 def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = None,
-            expected_document: Path | None = None) -> ShowrunnerSource:
+            record: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP) -> ShowrunnerSource:
     fields = _fields(instance / "conf", dependencies=dependencies)
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
-    doc = _checked_doc(fields.get("CHECK"))
-    if isinstance(doc, NoCheckedDoc):
-        raise ValueError(doc.reason)
-    if expected_document is not None and doc.path.resolve() != expected_document.resolve():
-        raise ValueError(f"{instance}: timer document differs from stored document {expected_document}")
+    record = staff.snapshot() if isinstance(record, DiscoverMembership) else record
+    owner = owner_for_timer(instance, record)
+    if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        raise ValueError(f"{owner.name}: no production document")
+    path = owner.doc.path
     if dependencies is not None:
-        dependencies(doc.path)
+        dependencies(path)
     try:
-        document = doc.path.read_text(encoding="utf-8")
+        document = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise ValueError(f"production doc could not be read: {error}") from error
-    timer = Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
+    timer = Timer(owner.name, f"session:{owner.id}", path, user_zone_name())
     return ShowrunnerSource(timer, document)
-
-
-def read_bound_source(instance: Path, document: Path) -> ShowrunnerSource:
-    """Read a timer only when its document agrees with the caller's stored owner."""
-    return _source(instance, expected_document=document)
-
-
-def _timer(instance: Path) -> Timer:
-    return _source(instance).timer
 
 
 class UnreadableTimerPolicy(Enum):
@@ -302,6 +275,7 @@ def _report_source_failure(failure: ShowrunnerLookupFailure) -> None:
 def read_sources(state_dir: Path | None = None, *,
                  unreadable: UnreadableTimerPolicy,
                  dependencies: Callable[[Path], None] | None = None,
+                 record: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP,
                  on_failure: Callable[[ShowrunnerLookupFailure], None] = _report_source_failure,
                  ) -> list[ShowrunnerSource]:
     """Read each timer/doc once, applying the caller's policy to unreadable timers."""
@@ -310,7 +284,7 @@ def read_sources(state_dir: Path | None = None, *,
         if not instance.is_dir():
             continue
         try:
-            found.append(_source(instance, dependencies=dependencies))
+            found.append(_source(instance, dependencies=dependencies, record=record))
         except (OSError, KeyError, ValueError, UnicodeError) as error:
             if unreadable is UnreadableTimerPolicy.STRICT:
                 raise ValueError(f"{instance / 'conf'}: {error}") from error
@@ -327,14 +301,7 @@ class DiscoverSessions(NamedTuple):
 DISCOVER_SESSIONS = DiscoverSessions()
 
 
-class DiscoverMembership(NamedTuple):
-    """Read staff when no report snapshot was supplied."""
-
-
-DISCOVER_MEMBERSHIP = DiscoverMembership()
-
-
-def _registered(timer: Timer, *,
+def _registered(timer: TimerRegistration, *,
                 known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
                 deadline: float = math.inf,
                 membership: staff.StaffSnapshot | None = None) -> Showrunner:
@@ -351,7 +318,9 @@ def _registered(timer: Timer, *,
         live = record is not None and messaging_socket_exists(record)
         socket = record["messagingSocketPath"] if record is not None and live else ""
         name = record["name"] if record is not None and live else ""
-    return Showrunner(session=name, socket=socket or "", slug=timer.slug, zone=timer.zone, doc=str(timer.doc))
+    doc = (str(owner.doc.path) if owner is not None
+           and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else "")
+    return Showrunner(session=name, socket=socket or "", name=timer.name, zone=timer.zone, doc=doc)
 
 
 def registered_showrunners(
@@ -360,28 +329,28 @@ def registered_showrunners(
     deadline: float = math.inf,
     membership: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP,
 ) -> ShowrunnerDiscovery:
-    """Every showrunner that has an update timer, running or not.
-
-    The timer is addressed to the Claude session id and holds the production doc, so it is the one
-    record of a showrunner and holds no name: the name is looked up here, at each call. Raises OSError
-    when a timer conf cannot be read. Incomplete registrations are left out with a warning as before.
-    A failed session lookup is left out with the reason on stderr and in the result's failures.
-    Commands must return its exit_code
-    after processing the healthy rows. Supplied live session records avoid
-    rereading the registry or starting the sessions subprocess; an empty mapping means none are live.
-    """
+    """Read registered timers and resolve their current sessions through staff."""
     found: list[Showrunner] = []
     failures: list[ShowrunnerLookupFailure] = []
-    sources = read_sources(state_dir, unreadable=UnreadableTimerPolicy.RAISE)
     membership = staff.initial_snapshot() if isinstance(membership, DiscoverMembership) else membership
-    for index, source in enumerate(sources):
+    timers: list[TimerRegistration] = []
+    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+        if not instance.is_dir():
+            continue
+        owner = membership.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
         try:
-            # Share the remaining budget with later lookups and the caller's inspection work.
+            timers.append(_registration(instance, membership))
+        except (KeyError, ValueError, UnicodeError) as error:
+            name = owner.name if owner is not None else instance.name.removeprefix("showrunner-")
+            _report_source_failure(ShowrunnerLookupFailure(name, str(error)))
+    timers.sort(key=lambda timer: timer.name)
+    for index, timer in enumerate(timers):
+        try:
             began = monotonic()
-            lookup_deadline = began + max(0.0, deadline - began) / (len(sources) - index + 1)
-            found.append(_registered(source.timer, known_sessions=known_sessions, deadline=lookup_deadline, membership=membership))
+            lookup_deadline = began + max(0.0, deadline - began) / (len(timers) - index + 1)
+            found.append(_registered(timer, known_sessions=known_sessions, deadline=lookup_deadline, membership=membership))
         except (OSError, KeyError, ValueError, UnicodeError) as error:
-            failure = ShowrunnerLookupFailure(source.timer.slug, str(error))
+            failure = ShowrunnerLookupFailure(timer.name, str(error))
             if isinstance(error, OSError):
                 failures.append(failure)
             print(failure.diagnostic, file=sys.stderr)
@@ -389,31 +358,19 @@ def registered_showrunners(
 
 
 def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
-    """The production doc of the showrunner whose update timer is addressed to `session_id`."""
-    owner = staff.initial_snapshot().by_current_session(session_id) if session_id else None
-    reference = owner.id if owner is not None else session_id
-    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
-        try:
-            target = _fields(instance / "conf").get("TARGET")
-        except (OSError, UnicodeError):
-            continue
-        doc = checked_doc(instance)
-        if session_id and target == f"session:{reference}" and isinstance(doc, CheckedDoc):
-            return doc.path
+    """Read the current session's production document from staff."""
+    del state_dir
+    owner = staff.snapshot().by_current_session(session_id)
+    if (owner is not None and owner.kind == "showrunner"
+            and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+            and owner.doc.machine == remote.local_machine()):
+        return owner.doc.path
     return None
 
 
-def production_slug(doc: str) -> str:
-    """The slug a production's units are marked with: its doc's name without the suffix."""
-    slug = Path(doc).name.removesuffix("-production.md")
-    if not doc or slug == Path(doc).name:
-        raise ValueError(f"not a production doc: {doc or 'none registered'}")
-    return slug
-
-
-def session_state_dir(slug: str) -> Path:
+def session_state_dir(staff_id: str) -> Path:
     """The showrunner's own state, which a new session id, a restart and a reboot keep; a wrap deletes it."""
-    return SHOWRUNNER_STATE_DIR / slug / "session"
+    return SHOWRUNNER_STATE_DIR / staff_id / "session"
 
 
 # The showrunner state a scratchpad held before session_state_dir.
@@ -421,86 +378,78 @@ SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", 
                  "dailies_state.json")
 
 
-def copy_session_state(slug: str, scratch: Path) -> list[str]:
-    """Copy each state file the scratchpad holds and the state directory does not; a copy never replaces one."""
-    target = session_state_dir(slug)
-    target.mkdir(parents=True, exist_ok=True)
+def copy_session_state(staff_id: str, scratch: Path) -> list[str]:
+    """Copy missing scratchpad files to the fixed owner's session folder."""
+    target = session_state_dir(staff_id)
     copied: list[str] = []
     for name in SESSION_STATE:
         source, destination = scratch / name, target / name
-        if destination.exists() or not source.exists():
+        if not source.exists():
             continue
-        complete = target / f".{name}.copying"
-        if complete.is_dir():
-            shutil.rmtree(complete)
-        else:
-            complete.unlink(missing_ok=True)
-        if source.is_dir():
-            _ = shutil.copytree(source, complete)
-        else:
-            _ = shutil.copy2(source, complete)
-        os.replace(complete, destination)
-        copied.append(name)
+        files = sorted(source.rglob("*")) if source.is_dir() else [source]
+        changed = False
+        for file in files:
+            if not file.is_file():
+                continue
+            path = destination / file.relative_to(source) if source.is_dir() else destination
+            if not path.exists():
+                write_bytes_atomic(path, file.read_bytes())
+                changed = True
+        if changed:
+            copied.append(name)
     return copied
 
 
-def timer_scratch(slug: str) -> Path | None:
-    """The scratchpad of the session the production's update timer is addressed to, when it exists."""
+@dataclass(frozen=True)
+class TimerConfigurationUnreadable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class TimerTargetUnresolved:
+    target: str
+
+
+@dataclass(frozen=True)
+class TimerScratchAbsent:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class TimerScratchFound:
+    path: Path
+
+
+def timer_scratch(staff_id: str, record: staff.StaffSnapshot | None = None
+                  ) -> TimerConfigurationUnreadable | TimerTargetUnresolved | TimerScratchAbsent | TimerScratchFound:
+    """Find the scratchpad for the session that receives the production update timer."""
+    record = record if record is not None else staff.snapshot()
     try:
-        target = _fields(NOTIFIER_STATE_DIR / f"showrunner-{slug}" / "conf").get("TARGET", "")
-    except (OSError, UnicodeError):
-        return None
-    session_id = target.removeprefix("session:")
+        target = _fields(NOTIFIER_STATE_DIR / f"showrunner-{staff_id}" / "conf").get("TARGET", "")
+    except (OSError, UnicodeError) as error:
+        return TimerConfigurationUnreadable(" ".join(str(error).splitlines()))
+    owner = record.by_id(staff.StaffId(target.removeprefix("session:")))
+    session_id = owner.current_session if owner is not None else ""
     if not session_id or session_id == target:
-        return None
-    return next((path for path in sorted(SCRATCH_ROOT.glob(f"claude-*/*/{session_id}/scratchpad"))
-                 if path.is_dir()), None)
+        return TimerTargetUnresolved(target)
+    return next((TimerScratchFound(path) for path in sorted(SCRATCH_ROOT.glob(f"claude-*/*/{session_id}/scratchpad"))
+                 if path.is_dir()), TimerScratchAbsent(session_id))
 
 
-def adopt_session_state(slug: str) -> list[str]:
-    """Bring a showrunner's scratchpad state into its state directory once, with no step by anyone.
-
-    Only the state files the directory lacks are looked for, so a showrunner that has moved costs one
-    stat per file.
-    """
-    target = session_state_dir(slug)
+def adopt_session_state(staff_id: str, record: staff.StaffSnapshot | None = None) -> list[str]:
+    """Copy missing scratchpad state to the fixed owner's folder."""
+    target = session_state_dir(staff_id)
     if all((target / name).exists() for name in SESSION_STATE):
         return []
-    scratch = timer_scratch(slug)
-    return copy_session_state(slug, scratch) if scratch is not None else []
+    scratch = timer_scratch(staff_id, record)
+    if isinstance(scratch, TimerConfigurationUnreadable):
+        print(f"showrunners: timer configuration unreadable: {scratch.reason}", file=sys.stderr)
+    return copy_session_state(staff_id, scratch.path) if isinstance(scratch, TimerScratchFound) else []
 
 
-def former_slugs(text: str) -> tuple[str, ...]:
-    """Read former names only from the production's Production Context section."""
-    context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
-    formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
-    return tuple(re.findall(r"`([^`]+)`", formerly[1])) if formerly else ()
-
-
-def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
-    """Map a former production name to its current slug; leave other slugs unchanged."""
-    timers: list[Timer] = []
-    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
-        try:
-            timer = _timer(instance)
-        except (OSError, KeyError, ValueError, UnicodeError):
-            continue
-        if timer.slug == slug:
-            return slug
-        timers.append(timer)
-    for timer in timers:
-        try:
-            text = timer.doc.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        if slug in former_slugs(text):
-            return timer.slug
-    return slug
-
-
-def current_name(slug: str) -> str:
+def current_name(production_name: str) -> str:
     """The name now of the production's showrunner. Empty while it is not running or has no update timer."""
-    return _name_in(slug, require_complete(registered_showrunners()))
+    return _name_in(production_name, require_complete(registered_showrunners()))
 
 
 def require_complete(runners: list[Showrunner]) -> list[Showrunner]:
@@ -510,89 +459,61 @@ def require_complete(runners: list[Showrunner]) -> list[Showrunner]:
     return runners
 
 
-def _name_in(slug: str, runners: list[Showrunner]) -> str:
-    slug = canonical_slug(slug)
-    return next((runner["session"] for runner in runners if runner["slug"] == slug), "")
+def _name_in(production_name: str, runners: list[Showrunner]) -> str:
+    return next((runner["session"] for runner in runners if runner["name"] == production_name), "")
 
 
-def herdr_space(slug: str, doc: str) -> str:
-    """The shared herdr session's workspace for a production, named for its showrunner.
-
-    The doc's `Showrunner session:` line names it, else the slug. The name never depends on whether
-    the showrunner runs, so a unit restarted before its showrunner finds the same workspace.
-    """
-    try:
-        text = Path(doc).read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        text = ""
-    return space_from_text(slug, text)
-
-
-def space_from_text(slug: str, text: str) -> str:
-    """The workspace name from an already-read production document."""
-    line = re.search(r"^- \*\*Showrunner session:\*\*\s*`?([^`\s]+)`?\s*$", text, re.MULTILINE)
-    return line[1] if line else slug
-
-
-def current_address(slug: str, *, deadline: float = math.inf) -> str:
+def current_address(production_name: str, *, deadline: float = math.inf) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""
-    return _address_in(slug, require_complete(registered_showrunners(deadline=deadline)))
+    return _address_in(production_name, require_complete(registered_showrunners(deadline=deadline)))
 
 
-def _address_in(slug: str, runners: list[Showrunner]) -> str:
-    slug = canonical_slug(slug)
-    socket = next((runner["socket"] for runner in runners if runner["slug"] == slug), "")
+def _address_in(production_name: str, runners: list[Showrunner]) -> str:
+    socket = next((runner["socket"] for runner in runners if runner["name"] == production_name), "")
     return f"uds:{socket}" if socket else ""
 
 
 def named(showrunner: str) -> Showrunner:
-    """The showrunner called `showrunner` now, or whose production has that slug."""
-    slug = canonical_slug(showrunner)
+    """Find the registered showrunner by its staff name."""
     runners = require_complete(registered_showrunners())
-    # The production a slug resolves to wins over a session that happens to share the name.
-    found = (next((runner for runner in runners if runner["slug"] == slug), None)
-             or next((runner for runner in runners if runner["session"] == showrunner), None))
+    found = next((runner for runner in runners if runner["name"] == showrunner), None)
     if showrunner and found:
         return found
     raise ValueError(f"no showrunner with an update timer is called {showrunner} or runs that production")
 
 
 def timer_docs(state_dir: Path | None = None) -> dict[str, Path]:
-    """Each production with a complete update timer, by slug, with its doc, whether or not its showrunner runs."""
+    """Map each production name to its document when its update timer is complete."""
     found: dict[str, Path] = {}
     for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
         try:
-            timer = _timer(instance)
+            timer = _source(instance).timer
         except (OSError, KeyError, ValueError, UnicodeError):
             continue
-        found[timer.slug] = timer.doc
+        found[timer.name] = timer.doc
     return found
 
 
-def timer_slugs(state_dir: Path | None = None) -> set[str]:
+def timer_names(state_dir: Path | None = None) -> set[str]:
     """Every production with a complete update timer, whether or not its showrunner runs."""
     return set(timer_docs(state_dir))
 
 
-def own_slug() -> str:
+def own_name() -> str:
     """The production this session runs as showrunner. Empty when it runs none."""
-    doc = production_of(staff.runtime_id())
-    return production_slug(str(doc)) if doc is not None else ""
+    row = staff.snapshot().by_current_session(staff.runtime_id())
+    return row.name if row is not None and row.kind == "showrunner" else ""
 
 
-def name_refusal(slug: str, name: str) -> str:
-    """Why a showrunner session called `name` cannot run production `slug`; empty when it can.
-
-    One name per production (user, 2026-10-27): the slug is the showrunner's name, so a production
-    whose showrunner has another name is renamed first.
-    """
-    if name == slug:
+def name_refusal(production_name: str, name: str) -> str:
+    """Return the reason when the production name differs from its showrunner's session name."""
+    if name == production_name:
         return ""
     if not name:
-        return f"the showrunner of {slug} has no session name; name the session {slug}"
-    return (f"production {slug} has showrunner {name}, and a production's slug must be its showrunner's name; "
-            + f"rename the production first: `/showrunner:rename plan {slug} {name}`")
+        return f"the showrunner of {production_name} has no session name; name the session {production_name}"
+    return (f"production {production_name} has showrunner {name}, and a production's name must be its showrunner's name; "
+            + f"rename the production first: `/agents rename {production_name} {name}`")
 
 
 @dataclass(frozen=True)
@@ -606,33 +527,33 @@ class NoticeDelivery:
 def send_to_address(address: str, key: str, text: str, *, recipient: str,
                     sender: str = "showrunners") -> NoticeDelivery:
     """Send to a known session address with the same report as production notices."""
-    sent = subprocess.run([sys.executable, str(SEND), "--to", address, "--from", sender, "--key", key,
-                           "--text", text], capture_output=True, text=True, check=False)
+    sent = subprocess.run(session_send.send_argv("--to", address, "--from", sender, "--key", key,
+                           "--text", text, send_script=SEND), capture_output=True, text=True, check=False)
     if sent.returncode != 0:
         return NoticeDelivery((f"could not tell {recipient}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
                               failed=(recipient,))
     return NoticeDelivery((f"told {recipient}",))
 
 
-def deliver(slug: str, key: str, text: str, *, sender: str = "showrunners") -> NoticeDelivery:
+def deliver(production_name: str, key: str, text: str, *, sender: str = "showrunners") -> NoticeDelivery:
     """Resolve a production's current address and report whether its notice failed."""
-    address = current_address(slug)
+    address = current_address(production_name)
     if not address:
-        return NoticeDelivery((f"{slug} is not running: tell it when it starts",))
-    return send_to_address(address, key, text, recipient=slug, sender=sender)
+        return NoticeDelivery((f"{production_name} is not running: tell it when it starts",))
+    return send_to_address(address, key, text, recipient=production_name, sender=sender)
 
 
-def tell(slug: str, key: str, text: str, *, sender: str = "showrunners") -> str:
+def tell(production_name: str, key: str, text: str, *, sender: str = "showrunners") -> str:
     """Send one line and preserve the existing human-readable delivery report."""
-    return deliver(slug, key, text, sender=sender).lines[0]
+    return deliver(production_name, key, text, sender=sender).lines[0]
 
 
 def tell_others(texts: dict[str, str], key: str) -> NoticeDelivery:
     """Tell each production its line, but for the one this session runs, which reads the command's own output."""
-    own = own_slug()
-    deliveries = [deliver(slug, key, text) for slug, text in texts.items() if slug != own]
+    own = own_name()
+    deliveries = [deliver(production_name, key, text) for production_name, text in texts.items() if production_name != own]
     return NoticeDelivery(tuple(line for delivery in deliveries for line in delivery.lines),
-                          failed=tuple(slug for delivery in deliveries for slug in delivery.failed))
+                          failed=tuple(production_name for delivery in deliveries for production_name in delivery.failed))
 
 
 def main(argv: list[str]) -> int:
@@ -643,18 +564,20 @@ def main(argv: list[str]) -> int:
     _ = making_ready.add_argument("session", nargs="?")
     _ = making_ready.add_argument("--unit", action="append")
     naming = commands.add_parser("name")
-    _ = naming.add_argument("slug")
+    _ = naming.add_argument("production_name")
     addressing = commands.add_parser("address")
-    _ = addressing.add_argument("slug")
+    _ = addressing.add_argument("production_name")
     # Does nothing: a unit's run state is read from its run records. Delete once no session started before that is left.
     setting_status = commands.add_parser("status")
     _ = setting_status.add_argument("session", nargs="?")
     _ = setting_status.add_argument("--unit")
     _ = setting_status.add_argument("--state")
     _ = commands.add_parser("list")
+    doc_command = commands.add_parser("doc")
+    _ = doc_command.add_argument("id")
     for lookup in ("parent", "children", "root"):
         looking_up = commands.add_parser(lookup)
-        _ = looking_up.add_argument("slug")
+        _ = looking_up.add_argument("production_name")
     _ = commands.add_parser("tree")
     attaching = commands.add_parser("attach")
     _ = attaching.add_argument("child")
@@ -664,30 +587,36 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     action = cast(str, args.action)
     try:
+        if action == "doc":
+            row = owner_for(cast(str, args.id))
+            if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.machine == remote.local_machine():
+                print(row.doc.path)
+                return 0
+            return 1
         if action in ("list", "name", "address", "tree"):
             runners = registered_showrunners()
             if action == "list":
                 for runner in runners:
-                    print(f"{runner['slug']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
+                    print(f"{runner['name']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
                           + f"\t{runner['doc']}")
             elif action == "tree":
-                lines = cast(Callable[[list[Showrunner]], list[str]], import_module("showrunner_tree").tree_lines)(runners)
+                lines = cast(Callable[[list[Showrunner]], list[str]], import_module('scripts.production.showrunner_tree').tree_lines)(runners)
                 for line in lines:
                     print(line)
             else:
-                slug = cast(str, args.slug)
-                found = _name_in(slug, runners) if action == "name" else _address_in(slug, runners)
-                if not found and any(failure.production == canonical_slug(slug) for failure in runners.lookup_failures):
+                production_name = cast(str, args.production_name)
+                found = _name_in(production_name, runners) if action == "name" else _address_in(production_name, runners)
+                if not found and any(failure.production == production_name for failure in runners.lookup_failures):
                     return runners.exit_code
                 if not found:
-                    raise ValueError(f"the showrunner of {slug} is not running")
+                    raise ValueError(f"the showrunner of {production_name} is not running")
                 print(found)
             return runners.exit_code
         elif action in ("parent", "children", "root"):
-            return cast(Callable[[str, str], int], import_module("showrunner_tree").main)(
-                action, cast(str, args.slug))
+            return cast(Callable[[str, str], int], import_module('scripts.production.showrunner_tree').main)(
+                action, cast(str, args.production_name))
         elif action in ("attach", "detach"):
-            return cast(Callable[[str, str, str], int], import_module("showrunner_parent").main)(
+            return cast(Callable[[str, str, str], int], import_module('scripts.production.showrunner_parent').main)(
                 action, cast(str, args.child), (cast(str | None, args.parent) or "") if action == "attach" else "")
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)

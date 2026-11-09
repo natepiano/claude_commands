@@ -2,32 +2,38 @@
 
 from __future__ import annotations
 
-import sys
 import fcntl
 import json
 import os
 import subprocess
 import unittest
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import datetime, timedelta
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import Quota, Report
 from scripts.whoami import usage_store
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.accounts import accounts, moves, next_moves, role_map
-from user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 setUpModule = support.setUpModule
+
+
+def write_settings(config: quota_alert.Config) -> None:
+    """Write the five settings with their configured types."""
+    _ = quota_alert.CONFIG.write_text(
+        f"# range: 0..\nthreshold_percent={config['threshold_percent']}\n"
+        + f"# range: 0..\nrepeat_minutes={config['repeat_minutes']}\n"
+        + f"# range: 0..\nstall_minutes={config['stall_minutes']}\n"
+        + f"faults_to={config['faults_to']}\nalways={' '.join(config['always'])}\n")
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
@@ -93,33 +99,30 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         """Guard the fixture patch that prevents real phone sends."""
         self.assertIsNot(quota_alert.tell_user, REAL_TELL_USER)
 
-    def test_load_config_reads_the_named_object_layout_registry(self) -> None:
-        named_config = self.root / "named-showrunners.json"
-        _ = named_config.write_text(json.dumps({
-            "threshold_percent": 7,
-            "repeat_minutes": 45,
-            "stall_minutes": 9,
-            "faults_to": "fault-handler",
-            "always": ["always-there"],
-            "showrunners": [{
-                "session": "named-director",
-                "zone": "America/New_York",
-                "units": [{"session": "named-unit", "status": "run-finished"}],
-            }],
-        }), encoding="utf-8")
+    def test_load_config_reads_the_shared_configuration(self) -> None:
+        named_config = self.root / "named-showrunners.conf"
+        _ = named_config.write_text(("""# range: 0..
+threshold_percent=7
+# range: 0..
+repeat_minutes=45
+# range: 0..
+stall_minutes=9
+faults_to=fault-handler
+always=always-there
+"""), encoding="utf-8")
 
         with mock.patch.object(quota_alert, "CONFIG", named_config):
             config = quota_alert.load_config()
 
         self.assertEqual(config["threshold_percent"], 7)
         self.assertEqual(config["always"], ["always-there"])
-        # A list of showrunners left in the file is not read: they are found by their update timers.
+        # Read showrunners from the staff record.
         self.assertNotIn("showrunners", config)
 
     def test_codex_two_percent_reminder_pushes_once_per_episode_without_session_repeat(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        write_settings(config)
         for minute, left in ((0, "3"), (2, "2"), (10, "1"), (32, "1")):
             _ = self.alert([self.note("codex1.md", "active", left)], self.now + timedelta(minutes=minute))
             self.assertEqual(len(self.noted), 0 if minute == 0 else 1)
@@ -140,7 +143,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_workers_self_target_keeps_the_low_reminder_due_without_pushing_a_fallback(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        write_settings(config)
         entry = next_moves.add_next_move("workers", 1, "codex1")
         note = self.note("codex1.md", "active", "2")
         for minute in (0, 2, 32):
@@ -156,7 +159,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_runnable_workers_entry_keeps_the_reminder_due_until_removed(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        write_settings(config)
         _ = next_moves.add_next_move("workers", 1, "codex2")
         note = self.note("codex1.md", "active", "2")
         _ = self.alert([note], self.now)
@@ -242,6 +245,22 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                              ["natedev", "boss of bosses", "new director"])
             self.assertEqual(quota_alert.recipients(quota_alert.load_config(), "natedev"),
                              ["boss of bosses", "new director"])
+
+    def test_recipient_identity_merges_ids_names_and_the_here_exclusion(self) -> None:
+        from scripts.message import sessions
+
+        record: sessions.SessionRecord = {"pid": 998001, "sessionId": "fixture-director", "name": "natedev",
+            "messagingSocketPath": "", "updatedAt": 0, "tmux": "", "formerNames": ["old director"]}
+        registry = sessions.RegistryRead((sessions.RegistryObservation(record, {}),), ())
+        config = quota_alert.load_config()
+        config["always"] = ["fixture-director", "session:fixture-director", "old director"]
+        with (mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS),
+              mock.patch.object(sessions, "read_registry", return_value=registry),
+              mock.patch.object(quota_alert, "registered_showrunners", return_value=running("natedev"))):
+            self.assertEqual(quota_alert.recipients(config), ["session:fixture-director"])
+            for here in ("fixture-director", "session:fixture-director", "natedev", "old director"):
+                with self.subTest(here=here):
+                    self.assertEqual(quota_alert.recipients(config, here), [])
 
     def test_low_recovery_closes_the_episode_without_telling_sessions(self) -> None:
         _ = self.alert([self.note("codex1.md", "active", "1")], self.now)

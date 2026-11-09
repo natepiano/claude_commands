@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -14,7 +14,9 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.maintenance import agent_notes_job as job
+from scripts.maintenance import vault_commit
 from scripts.maintenance.settings import Part, Schedule, settings
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 
 class JobTests(unittest.TestCase):
@@ -27,9 +29,31 @@ class JobTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.config = self.root / "job.toml"
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = self.config.write_text((job.ROOT / "config/agent_notes.toml").read_text())
         self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}))
+
+    def test_refusal_part_hands_moves_to_the_detached_batch_before_stopping(self) -> None:
+        from scripts.accounts import refusal_watch, moves
+        from scripts.shutdown import stop_resume
+
+        def refusal_pass(**_options: object) -> list[str]:
+            results = stop_resume.move_sessions(["member"], "claude5", why="auto: head", cause="auto",
+                                               source_accounts={"member": "claude4"})
+            self.assertEqual(results, [stop_resume.MoveHandedOff("member")])
+            return []
+
+        with (patch.dict(os.environ, {"HOME": str(self.root)}),
+              patch.object(refusal_watch, "run", side_effect=refusal_pass),
+              patch.object(stop_resume, "_detach") as detach,
+              patch.object(stop_resume, "_stop") as stop,
+              patch.object(moves, "append_move") as append):
+            self.assertEqual(job._perform(Part.REFUSALS), 0)  # pyright: ignore[reportPrivateUsage]
+        stop.assert_not_called()
+        append.assert_not_called()
+        detach.assert_called_once_with(["batch", "--target", "claude5", "--why", "auto: head", "--cause", "auto",
+            "--warn-seconds", "0", "--source-account", "member=claude4", "--", "member"], "move")
 
     def test_successful_parts_are_saved_and_a_rerun_retries_only_the_failure(self) -> None:
         def part(name: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
@@ -66,6 +90,94 @@ class JobTests(unittest.TestCase):
         with patch.object(job, "run_part", side_effect=part):
             self.assertTrue(all(item.exit_code == 0 for item in job.run_job()))
 
+    def vault_git(self, *arguments: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.root / "rust/hanadocs"), *arguments], check=True,
+            capture_output=True, text=True,
+        ).stdout.rstrip("\n")
+
+    def init_vault(self) -> Path:
+        vault = self.root / "rust/hanadocs"
+        vault.mkdir(parents=True)
+        _ = self.vault_git("init", "-q", "-b", "main")
+        _ = self.vault_git("config", "user.name", "Fixture")
+        _ = self.vault_git("config", "user.email", "fixture@example.test")
+        _ = self.vault_git("config", "commit.gpgsign", "false")
+        return vault
+
+    def test_phase_notes_join_an_existing_commit_without_causing_note_only_commits(self) -> None:
+        vault = self.init_vault()
+        git = self.vault_git
+        agent_note = vault / "agents/notes.md"
+        agent_note.parent.mkdir()
+        _ = agent_note.write_text("date_modified: 1\noriginal agent note\n")
+        hand = vault / "hand.md"
+        _ = hand.write_text("original hand note\n")
+        old_note = vault / "showrunners/show/old-unit.md"
+        old_note.parent.mkdir(parents=True)
+        _ = old_note.write_text(f"---\nphase_table: true\nunit: {unit_membership('show', 'old-unit').id}\n---\nold unit\n")
+        _ = git("add", ".")
+        _ = git("commit", "-qm", "Initial notes")
+        original_head = git("rev-parse", "HEAD")
+        old_note.unlink()
+        note = old_note.with_name("new-unit.md")
+        note_text = f"---\nphase_table: true\nunit: {unit_membership('show', 'new-unit').id}\n---\nnew unit\n"
+        _ = note.write_text(note_text)
+        _ = hand.write_text("unrelated hand change\n")
+        _ = git("add", "hand.md")
+
+        with patch.object(Path, "home", return_value=self.root), patch("builtins.print"):
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(git("rev-parse", "HEAD"), original_head)
+            _ = agent_note.write_text("date_modified: 2\noriginal agent note\n")
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(git("rev-parse", "HEAD"), original_head)
+            _ = agent_note.write_text("date_modified: 3\nchanged agent note\n")
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(git("show", "HEAD:showrunners/show/new-unit.md"), note_text.strip())
+        self.assertNotIn("showrunners/show/old-unit.md", git("ls-tree", "-r", "--name-only", "HEAD").splitlines())
+        self.assertEqual(git("show", "HEAD:hand.md"), "original hand note")
+        self.assertEqual(git("status", "--porcelain"), "M  hand.md")
+
+    def test_content_commit_leaves_unrelated_showrunner_markdown_unchanged(self) -> None:
+        vault = self.init_vault()
+        folder = vault / "showrunners/tools"
+        folder.mkdir(parents=True)
+        agent_note = vault / "agents/notes.md"
+        agent_note.parent.mkdir()
+        _ = agent_note.write_text("original agent note\n")
+        design = folder / "design.md"
+        deleted = folder / "deleted-design.md"
+        _ = design.write_text("original design\n")
+        _ = deleted.write_text("kept design\n")
+        _ = self.vault_git("add", ".")
+        _ = self.vault_git("commit", "-qm", "Initial notes")
+
+        _ = design.write_text("unrelated design edit\n")
+        _ = self.vault_git("add", "showrunners/tools/design.md")
+        deleted.unlink()
+        personal = folder / "personal.md"
+        _ = personal.write_text("# Personal note\nphase_table: true\n")
+        disabled = folder / "disabled.md"
+        _ = disabled.write_text("---\nphase_table: false\nproduction: tools\nunit: disabled\n---\n")
+        phase = folder / "unit.md"
+        phase_text = f"---\nphase_table: true\nunit: {unit_membership('tools', 'tools-unit').id}\n---\n"
+        _ = phase.write_text(phase_text)
+        _ = agent_note.write_text("changed agent note\n")
+        with patch.object(Path, "home", return_value=self.root), patch("builtins.print"):
+            self.assertEqual(job._perform(Part.VAULT), 0)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(self.vault_git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.vault_git("show", "HEAD:showrunners/tools/unit.md"), phase_text.strip())
+        self.assertEqual(self.vault_git("show", "HEAD:showrunners/tools/design.md"), "original design")
+        self.assertEqual(self.vault_git("show", "HEAD:showrunners/tools/deleted-design.md"), "kept design")
+        self.assertEqual(set(self.vault_git("status", "--porcelain", "--untracked-files=all").splitlines()), {
+            "M  showrunners/tools/design.md", " D showrunners/tools/deleted-design.md",
+            "?? showrunners/tools/personal.md", "?? showrunners/tools/disabled.md",
+        })
+
     def test_a_hung_part_times_out_without_costing_a_parallel_part(self) -> None:
         script = self.root / "part.py"
         _ = script.write_text("import signal,sys\nif sys.argv[-1] == 'notes': signal.pause()\nprint('completed')\n")
@@ -78,49 +190,16 @@ class JobTests(unittest.TestCase):
         self.assertEqual((bad.outcome, bad.exit_code), (job.Outcome.TIMED_OUT, 124))
         self.assertLess(bad.seconds, 2)
 
-    def test_preserved_note_is_a_logged_skip_and_does_not_fail_or_repeat_the_job(self) -> None:
-        script = self.root / "part.py"
-        _ = script.write_text(
-            "import os,sys\n"
-            + "if sys.argv[-1] == 'hierarchy':\n"
-            + " print('hana hierarchy: left as it stands: no unit director')\n"
-            + " sys.exit(os.EX_TEMPFAIL)\n")
-        with patch.object(job, "__file__", str(script)), patch("sys.argv", ["agent-notes"]):
-            with patch("builtins.print") as output:
-                self.assertEqual(job.main(), 0)
-            lines = [str(cast(object, call.args[0])) for call in output.call_args_list]
-            self.assertTrue(any(line.startswith("hierarchy: skipped;") for line in lines))
-            self.assertIn("hana hierarchy: left as it stands: no unit director", lines)
-            with patch.object(job, "run_part") as run:
-                self.assertTrue(all(item.outcome is job.Outcome.NOT_DUE for item in job.run_job()))
-            run.assert_not_called()
-
-    def test_hierarchy_refusal_uses_the_skip_protocol_without_changing_the_note(self) -> None:
-        from scripts.maintenance import hana_hierarchy
-
-        with patch.object(hana_hierarchy, "gather", side_effect=hana_hierarchy.Refused("no directors")), \
-                patch("builtins.print") as output:
-            self.assertEqual(job._perform(Part.HIERARCHY), os.EX_TEMPFAIL)  # pyright: ignore[reportPrivateUsage]
-        output.assert_called_once_with("hana hierarchy: left as it stands: no directors", file=sys.stderr)
-
-    def test_hierarchy_source_command_failure_is_not_a_skip(self) -> None:
-        from dataclasses import replace
-        from scripts.maintenance import hana_hierarchy
-
-        script = self.root / "source.py"
-        for source in ("raise SystemExit(2)\n", "import signal; signal.pause()\n"):
-            with self.subTest(source=source):
-                _ = script.write_text(source)
-                with patch.object(hana_hierarchy, "ROSTER", str(script)), \
-                        patch.object(hana_hierarchy, "settings", return_value=replace(settings(), hierarchy_read_seconds=0.1)), \
-                        patch("builtins.print"):
-                    self.assertEqual(job._perform(Part.HIERARCHY), 1)  # pyright: ignore[reportPrivateUsage]
-
     def test_unexpected_part_exits_still_fail_the_job(self) -> None:
         script = self.root / "part.py"
         _ = script.write_text("raise SystemExit(2)\n")
         with patch.object(job, "__file__", str(script)), patch("sys.argv", ["agent-notes"]), patch("builtins.print"):
             self.assertEqual(job.main(), 1)
+
+    def test_a_vault_without_note_paths_succeeds(self) -> None:
+        with patch.object(Path, "home", return_value=self.root), patch.object(
+                vault_commit, "git", return_value=subprocess.CompletedProcess[str]([], 0, stdout="")):
+            self.assertEqual(job.perform(Part.VAULT), 0)
 
     def test_runtime_configuration_controls_each_parts_interval_and_deadline(self) -> None:
         original = self.config.read_text()

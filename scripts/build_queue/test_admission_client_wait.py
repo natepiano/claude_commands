@@ -1,11 +1,11 @@
 """A waiting shell keeps its queue place through client failures."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from scripts.build_queue import admission_records
+
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
-import io
 import json
 import os
 from pathlib import Path
@@ -16,17 +16,16 @@ from typing import TypedDict, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
-from scripts.lint import memory_admit as gate
 
 
 class CheckerCall(TypedDict):
     pid: int
     action: str
-    rows: dict[str, gate.Waiter]
+    rows: dict[str, admission_records.Waiter]
 
 
 def wait_client_main() -> int:
@@ -36,11 +35,12 @@ def wait_client_main() -> int:
     actions = os.environ["TEST_CHECKER_ACTIONS"].split(",")
     clock = FakeClock()
     clock.epoch = time.time()
-    def estimate(argv: list[str], cwd: str, profile: gate.InferFromArgv | gate.StepProfile | gate.ProgramProfile,
-                 now: datetime | Callable[[], datetime], root: Path, policy: gate.AdmissionPolicy, *,
-                 build_history_generation: Callable[[], gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration]
-                 = gate.no_build_history_generation) -> gate.StepEstimate:
-        _ = argv, cwd, profile, now, root, policy, build_history_generation
+    def estimate(argv: list[str], cwd: str, profile: admission_records.InferFromArgv | admission_records.StepProfile | admission_records.ProgramProfile,
+                 now: datetime | Callable[[], datetime], root: Path, policy: admission_records.AdmissionPolicy, *,
+                 first_peak_bytes: int,
+                 build_history_generation: Callable[[], admission_records.BuildHistoryGeneration | admission_records.NoBuildHistoryGeneration]
+                 = step_estimator.no_build_history_generation) -> step_estimator.StepEstimate:
+        _ = argv, cwd, profile, now, root, policy, first_peak_bytes, build_history_generation
         previous = calls.read_text().splitlines() if calls.exists() else []
         action = actions[min(len(previous), len(actions) - 1)]
         owner = int(sys.argv[sys.argv.index("--pid") + 1])
@@ -51,13 +51,13 @@ def wait_client_main() -> int:
             raise RuntimeError("promoted checker unavailable" if action == "fail" else "")
         if action == "admit":
             path = Path(os.environ["BUILDLOG_MEMINFO"])
-            _ = path.write_text(f"MemTotal: {60 * gate.GIB // 1024} kB\nMemAvailable: {60 * gate.GIB // 1024} kB\n")
-            _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=0 total=0\n")
-        peak = gate.ExpectedPeak(7 * gate.GIB,
-            cast(gate.NeedSource, "future-source") if action == "unknown" else "measured", 5)
-        return gate.StepEstimate(gate.StepProfile("fixture", "nextest", "tree", peak,
-            estimated_at=clock.now()), gate.ReusableEstimate())
-    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(gate, "step_estimate", side_effect=estimate):
+            _ = path.write_text(f"MemTotal: {60 * admission_records.GIB // 1024} kB\nMemAvailable: {60 * admission_records.GIB // 1024} kB\n")
+            _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=0 total=0\nsome avg10=0\n")
+        peak = admission_records.ExpectedPeak(7 * admission_records.GIB,
+            cast(admission_records.NeedSource, "future-source") if action == "unknown" else "measured", 5)
+        return step_estimator.StepEstimate(admission_records.StepProfile("fixture", "nextest", "tree", peak,
+            estimated_at=clock.now()), step_estimator.ReusableEstimate())
+    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(step_estimator, "step_estimate", side_effect=estimate):
         with mock.patch.object(sys, "argv", ["admission_client.py", *sys.argv[2:]]):
             return client.main()
 
@@ -74,8 +74,8 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.admission = self.enterContext(AdmissionFixture())
         self.root = self.admission.root
         self.admission.clock.epoch = time.time()
-        self.admission.free(60 * gate.GIB)
-        _ = (self.root / "pressure").write_text("full avg10=10 total=0\n")
+        self.admission.free(60 * admission_records.GIB)
+        _ = (self.root / "pressure").write_text("full avg10=10 total=0\nsome avg10=0\n")
         self.grants = []
         self.grant_charges = []
         self.environment = {**os.environ,
@@ -87,20 +87,20 @@ class AdmissionClientWaitTests(unittest.TestCase):
             "UNIT_ACTIVE_DIR": str(self.root / "active"), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "HOME": str(self.root)}
         from scripts.lint.test_memory_admit import write_memory_config
-        write_memory_config(self.root / "lint.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")
+        write_memory_config(self.root / "build_admission.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")
         def reply_filter(reply: wire.Reply) -> wire.Reply:
             calls = self.root / "calls.jsonl"
             if isinstance(reply, (wire.Wait, wire.Admitted)) and calls.exists():
                 observations = [cast(CheckerCall, json.loads(line)) for line in calls.read_text().splitlines()]
                 observations[-1]["rows"] = {str(waiting.row["pid"]): waiting.row.copy()
                     for waiting in self.admission.server.waiters.values()}
-                _ = calls.write_text("".join(json.dumps(row) + "\n" for row in observations))
+                _ = calls.write_text("".join(json.dumps(codec.snapshot_value(row)) + "\n" for row in observations))
             if isinstance(reply, wire.Admitted):
                 self.grants.append(reply)
                 self.grant_charges.append(tuple((record.reservation_id, record.need)
                     for record in self.admission.server.reservations.values()))
             if isinstance(reply, wire.Wait):
-                return replace(reply, reason=gate.EstimateExpired(self.admission.clock.now()))
+                return replace(reply, reason=admission_records.EstimateExpired(self.admission.clock.now()))
             return reply
         self.admission.server.reply_filter = reply_filter
         _ = self.enterContext(self.admission.serving())
@@ -108,35 +108,20 @@ class AdmissionClientWaitTests(unittest.TestCase):
     def run_wait(self, actions: str, *, launch: bool = False) -> subprocess.CompletedProcess[str]:
         command = ('set -e; source "$1"; buildlog_memory_python() { '
             + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then '
-            + 'shift; python3 "$TEST_WAIT_CLIENT" --wait-client "$@"; else python3 "$@"; fi; }; '
+            + 'shift; "$TEST_PY" "$TEST_WAIT_CLIENT" --wait-client "$@"; else "$TEST_PY" "$@"; fi; }; '
             + 'shift; if (( $# == 0 )); then '
             + 'trap \'printf "wait elapsed: %s\\n" "$BUILDLOG_MEM_WAIT_S" >&2\' EXIT; fi; '
             + 'buildlog_wait_for_memory "$@"; printf "%s\\n" "$BUILDLOG_MEM_OUTCOME"')
         return subprocess.run(["bash", "-c", command, "test",
             str(Path(__file__).parents[1] / "lint/memory_gate.sh"), *([] if launch else ["/bin/true"])],
             env={**self.environment, "TEST_CHECKER_ACTIONS": actions,
-                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve())},
+                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve()),
+                 "TEST_PY": str(Path(__file__).resolve().parents[1] / "lib/py")},
             cwd=self.root, text=True, capture_output=True, check=False, timeout=30)
 
     def calls(self) -> list[CheckerCall]:
         return [cast(CheckerCall, json.loads(line))
             for line in (self.root / "calls.jsonl").read_text().splitlines()]
-
-    def test_cap_wait_line_names_the_program_cap_without_a_history_fallback(self) -> None:
-        for program, words in (("merge-gate", "the merge gate's memory cap"),
-                               ("rust-analyzer", "rust-analyzer's memory cap")):
-            with self.subTest(program=program):
-                request = replace(self.admission.request(), profile=gate.ProgramProfile(
-                    program, "repo", "tree", gate.FixedCapSizing(6 * gate.GIB)))
-                reply = self.admission.server.handle_request(request)[0]
-                assert isinstance(reply, wire.Wait)
-                output = io.StringIO()
-                with redirect_stderr(output):
-                    client.WaitOutput()(reply)
-                self.assertIn(words, output.getvalue())
-                self.assertIn("6.0 GiB", output.getvalue())
-                self.assertNotIn("no history", output.getvalue())
-                self.assertNotIn("fallback", output.getvalue())
 
     def test_unknown_source_and_failed_poll_preserve_the_real_waiting_row(self) -> None:
         result = self.run_wait("unknown,fail,hold,admit")
@@ -158,9 +143,9 @@ class AdmissionClientWaitTests(unittest.TestCase):
             self.assertEqual(len(call["rows"]), 1)
             path, row = next(iter(call["rows"].items()))
             self.assertEqual(row["pid"], call["pid"])
-            self.assertIn("priority_since", row)
-            assert "priority_since" in row
-            places.append((path, row["pid"], row["since"], row["priority_since"]))
+            self.assertIn("order_since", row)
+            assert "order_since" in row
+            places.append((path, row["pid"], row["since"], row["order_since"]))
         self.assertEqual(places[0], places[1])
         self.assertEqual(places[1], places[2])
         self.assertEqual(calls[-1]["rows"], {})

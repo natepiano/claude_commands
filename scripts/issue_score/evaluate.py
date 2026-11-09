@@ -9,19 +9,14 @@ import json
 import math
 from pathlib import Path
 import stat
-import sys
 from typing import Literal, cast
 
 from scripts.lib import conf
-from .selection import UseConfiguredValue
+from scripts.lib.conf import UseConfiguredValue
 
-from . import client, decide, questions, vault
-from .records import ScoredIssue, state_dir as configured_state_dir
+from scripts.issue_score import client, decide, questions, vault
+from scripts.issue_score.records import ScoredIssue, state_dir as configured_state_dir
 
-# renumber.py imports writer_lock by bare name, so its directory must be on sys.path.
-PRIORITIZE_DIR = str(Path(__file__).resolve().parents[1] / "prioritize")
-if PRIORITIZE_DIR not in sys.path:
-    sys.path.insert(0, PRIORITIZE_DIR)
 from scripts.prioritize import renumber
 
 Split = Literal["tune", "holdout", "all"]

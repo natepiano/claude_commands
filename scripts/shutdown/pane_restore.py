@@ -7,129 +7,127 @@ Run: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py [--sess
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-for dependency in ("whoami", "message", "herdr", "lib"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import herdr  # noqa: E402
-import pane_launch  # noqa: E402
-import pane_record  # noqa: E402
+from scripts.herdr import herdr, pane_launch
+from scripts.shutdown import pane_record
+from scripts.lib import conf
+from scripts.shutdown.codex_trust import trust_arguments
+from scripts.whoami import agent_accounts
+from scripts.whoami.account import named_account_environment
 from scripts.shutdown.launch_names import LaunchNames
-import sessions  # noqa: E402
-from scripts.production import staff, staff_sources  # noqa: E402
-from scripts.whoami.account import named_account_environment  # noqa: E402
+from scripts.production import staff  # noqa: E402
+from scripts.accounts import accounts
+from scripts.shutdown import restart
 
-START_TIMEOUT_MS = 90_000
 SERVER_TIMEOUT_MS = 60_000
 
 
-def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, live: set[str]) -> str:
-    """Why the pane stays as it is; empty when it is resumed."""
-    if entry is None:
-        return "no launch entry" if pane.session_id else ""
-    if entry["session_id"] in live:
-        return "it already runs"
-    return ""
-
-
-@dataclass(frozen=True)
-class ResolvedResume:
-    """The saved publication and its current member identity for a restore."""
-
-    original: pane_record.PaneLaunch
-    proof: pane_launch.VerifiedResume
-
-
-def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession,
-            launch: pane_record.PaneLaunch | ResolvedResume) -> None:
-    if isinstance(launch, ResolvedResume):
-        original, proof = launch.original, launch.proof
-    else:
-        original = launch
-        proof = pane_launch.VerifiedResume(launch, frozenset({launch["session_id"]}))
-    entry = proof.expected
+def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
+                  original: pane_record.PaneLaunch, entry: pane_record.PaneLaunch, *, reported_unknown: str) -> None:
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr.HerdrFailure("the pane runs a program")
     kind = pane_launch.agent_kind(entry)
     account = ({"CODEX_HOME": entry["config_dir"]} if kind == "codex"
                else named_account_environment(Path(entry["config_dir"])))
-    environment = {**entry["environment"], **account}
     title = entry["name"] or pane.label
-    launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, kind,
-        pane_record.resume_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
+    launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], {**entry["environment"], **account},
+        kind, trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
+        int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=title, reported_unknown=reported_unknown)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)
     attempt = pane_launch.resume_attempt(path, launched.pane)
-    # Ordering the tabs keeps each pane's id (herdr review, 2026-10-19).
-    fresh = next((item for item in client.tab_sessions() if item.pane_id == pane.pane_id), None)
-    if fresh is not None and ((fresh.session_id and fresh.session_id != entry["session_id"])
-                              or not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell)):
-        print(f"{pane.pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
+    if restart.pane_holds_other_work(client, pane.pane_id, entry["session_id"]):
         return
-    pane_launch.finish_restore(path, original, attempt, proof, close=client.close_tab_confirmed)
+    pane_launch.finish_restore(path, original, attempt,
+        pane_launch.VerifiedResume(entry, frozenset({entry["session_id"]})), close=client.close_tab_confirmed)
 
 
 def restore(session: str, *, dry_run: bool) -> int:
     client = herdr.Herdr(session)
     names = LaunchNames.read()
+    record = names.tab_record
+    failures = 0
     try:
-        if isinstance(names.record, staff.StaffSnapshot):
-            for note in herdr.repair_retained_launches(names.record, pane_record.record_directory(), dry_run=dry_run):
-                print(note)
+        for note in herdr.repair_retained_launches(record, pane_record.record_directory(), dry_run=dry_run):
+            print(note)
     except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
+        failures += 1
+    selected: dict[staff.StaffId, staff.StaffRow] = {}
+    target_accounts: dict[staff.StaffId, accounts.AccountSelection] = {}
+    saved_panes: list[herdr.TabSession] = []
     entries = pane_record.read(session)
-    live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
-    codex_unknown = ""
-    if any(pane_launch.agent_kind(entry) == "codex" for entry in entries.values()):
-        try:
-            live.update(herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host))
-        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
-            codex_unknown = str(error)
-            print(f"pane_restore: Codex liveness anomaly: {error}", file=sys.stderr)
-    failures = 0
+    live: set[str] = set()
     for pane in client.tab_sessions():
         saved = entries.get(pane.pane_id)
-        try:
+        reference = saved["session_id"] if saved is not None else pane.session_id or ""
+        row = record.by_member_reference(reference)
+        if row is None:
+            if saved is None:
+                print(f"{pane.pane_id} {pane.label}: left as it is: no launch entry")
+                continue
+            saved_panes.append(pane)
+            continue
+        parent = record.parent_of(row) if row.kind == "worker" else None
+        holder = parent if parent is not None else row
+        selected[holder.id] = holder
+        if saved is not None and holder.id == row.id:
+            home = Path(saved["config_dir"])
+            target_accounts[holder.id] = (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(home), home)
+                if pane_launch.agent_kind(saved) == "codex" else accounts.NamedAccount(accounts.claude_config_label(home), home))
+        if dry_run:
             entry = names.resume(saved) if saved is not None else None
-            if entry is not None:
-                entry["environment"] = names.environment(entry)
-            if entry is not None and pane_launch.agent_kind(entry) == "codex" and codex_unknown:
-                raise herdr.HerdrFailure(f"cannot exclude a running copy: {codex_unknown}")
-            label = entry["name"] if entry is not None and entry["name"] else pane.label
-            reason = skip_reason(pane, entry, live)
-            if entry is None or reason:
-                if reason:
-                    print(f"{pane.pane_id} {label}: left as it is: {reason}")
+            account = entry["config_dir"] if entry is not None else "retained account"
+            print(f"{pane.pane_id} {row.name}: resume {row.current_session} on {account}")
+    for holder in (() if dry_run else selected.values()):
+        try:
+            with staff.row_operation(str(holder.id)):
+                current = staff.initial_snapshot()
+                row = current.by_id(holder.id)
+                if row is not None:
+                    with herdr.restore_staff(current):
+                        _ = restart.start_row(row, current, client, target_account=target_accounts.get(holder.id, ""))
+        except restart.ClaudeTrustWriteFailed:
+            failures += 1
+        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
+            failures += 1
+            print(f"{holder.name}: not resumed: {error}", file=sys.stderr)
+    for pane in saved_panes:
+        saved = entries[pane.pane_id]
+        try:
+            entry = names.resume(saved)
+            entry["environment"] = names.environment(entry)
+            label = entry["name"] or pane.label
+            observed = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+            if isinstance(observed, herdr.UnknownConversation):
+                herdr.conversation_note(observed)
+            if isinstance(observed, herdr.LiveConversation) or entry["session_id"] in live:
+                print(f"{pane.pane_id} {label}: left as it is: it already runs")
                 continue
             if dry_run:
                 print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {entry['config_dir']}")
                 continue
-            if saved is None:
-                raise ValueError(f"{pane.pane_id}: original launch is unavailable")
-            owner = names.tab_record.by_member_reference(saved["session_id"])
-            reference = str(owner.id) if owner is not None else saved["session_id"]
-            with staff.row_operation(reference):
-                current_names = LaunchNames.read()
-                entry = current_names.resume({**saved, "session_id": reference})
-                entry["environment"] = current_names.environment(entry)
-                current_live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
-                if pane_launch.agent_kind(entry) == "codex":
-                    current_live.update(herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host))
-                if entry["session_id"] in current_live:
-                    print(f"{pane.pane_id} {label}: unchanged")
+            with staff.row_operation(entry["session_id"]):
+                current = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+                if isinstance(current, herdr.LiveConversation):
+                    print(f"{pane.pane_id} {label}: left as it is: it already runs")
                     continue
-                with herdr.restore_staff(current_names.tab_record, labels=current_names.labels):
-                    _resume(session, client, pane, ResolvedResume(saved, current_names.resume_proof(saved, entry)))
+                if isinstance(current, herdr.UnknownConversation) and not isinstance(observed, herdr.UnknownConversation):
+                    herdr.conversation_note(current)
+                with herdr.restore_staff(record, labels=names.labels):
+                    _resume_saved(session, client, pane, saved, entry,
+                        reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
+                            observed.reason if isinstance(observed, herdr.UnknownConversation) else ""))
             live.add(entry["session_id"])
             print(f"{pane.pane_id} {label}: resumed {entry['session_id']}")
         except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:

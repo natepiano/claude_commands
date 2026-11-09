@@ -10,26 +10,35 @@ passes, since a run started before the rename may stay open past that date.
 
 A test points a reader at its own folder with an override, which replaces both names.
 
-A run's director is recorded in the run folder itself, not read off the markers: a director runs
-independent phases side by side, each in its own run folder, and its one marker names only one of
-them. implement.sh and review.sh call `record-director` on every dispatch, so no step depends on a
-model remembering to write it. `held` lists every run a director holds, so its run end stops the
-workers of each one, not only the run its marker names.
+Staff supplies each run's current owner. Run records keep task history.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
+from functools import cache
 from pathlib import Path
+from importlib import import_module
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+if TYPE_CHECKING:
+    from scripts.production import staff
+
 RUN_TEMP_NAME = "tmp"
-RUN_ROOT = Path("/tmp/claude/unit")
-FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
+# SCRATCH_ROOT also selects the parent folder for temporary unit runs.
+RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"
+FORMER_RUN_ROOT = RUN_ROOT.parent / "delegate"
+ASTRA_RUN_ROOT = Path(os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra")
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.
@@ -37,12 +46,9 @@ HEARTBEAT = "heartbeat.log"
 # A run whose log moved within this window is live. Ten beats of slack, because
 # worker cleanup that reads a live run as dead removes its working workers.
 LIVE_HEARTBEAT_SECS = 600
-# The Claude session that directs the run, one line, rewritten by each dispatch.
-DIRECTOR_FILE = "director"
-# The run's Claude worker launch log, separate from the unit's durable worker ledger.
-WORKERS_LOG = "workers"
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
+OWNER_FIELD = "owner_staff_id"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
 # UNIT_HISTORY_DIR. Both sit under the state folder, read at each call, since a caller may change HOME.
@@ -58,6 +64,28 @@ new, former = state / '{HISTORY_NAME}', state / '{FORMER_HISTORY_NAME}'
 root = Path(sys.argv[1] or os.environ.get('UNIT_HISTORY_DIR') or os.environ.get('PLAN_DELEGATE_HISTORY_DIR')
             or (former if not new.exists() and former.exists() else new)).expanduser()
 """
+
+
+@dataclass(frozen=True)
+class RunOwnerUnrecorded:
+    reason: str
+
+
+def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
+    """Resolve a fixed owner first; older runs can still name their director."""
+    from scripts.production import staff
+
+    reference = fields.get(OWNER_FIELD)
+    if isinstance(reference, str) and reference:
+        row = record.by_id(staff.StaffId(reference))
+        if row is None or row.kind not in ("unit", "showrunner"):
+            raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
+        return row
+    identity = fields.get("main_agent")
+    agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
+    reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
+    row = record.owner_of(reference) if isinstance(reference, str) and reference else None
+    return row if row is not None and row.kind in ("unit", "showrunner") else RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -78,6 +106,20 @@ def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
 def run_temp_path(run: Path) -> Path:
     """Name the temporary folder that shares the run's lifetime."""
     return run / RUN_TEMP_NAME
+
+
+
+
+
+
+
+
+
+
+class RunStaffAtUse(Enum):
+    LOCAL = "read the local staff record"
+
+
 
 
 def activate(run: Path, session_id: str) -> None:
@@ -128,84 +170,105 @@ def marker_must_stay(path: Path) -> bool:
     The marker name is the session id; its age and target's existence say nothing
     about the owning process. Reuse the registry's process-identity check.
     """
-    if TYPE_CHECKING:
-        from ..message import sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import sessions
+    from scripts.message import sessions
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
-def record_director(run: Path, session_id: str) -> None:
-    """Name the run's director. A Codex worker that dispatches a peer inherits the director's
-    session id, so it writes the same one; a Claude worker has its own, so a session the run lists
-    as its Claude worker writes nothing. The last write wins, so a director that takes over the
-    run under a new session id takes its edges with it."""
-    if not session_id or not run.is_dir() or _claude_worker(run, session_id):
-        return
-    staged = run / f".{DIRECTOR_FILE}.{os.getpid()}"
-    _ = staged.write_text(f"{session_id}\n", encoding="utf-8")
-    _ = staged.replace(run / DIRECTOR_FILE)
+@cache
+def report_anomaly(message: str) -> None:
+    """Print each run anomaly once per process."""
+    print(message, file=sys.stderr)
 
 
-def _claude_worker(run: Path, session_id: str) -> bool:
-    """Whether the run launched this session as a Claude worker: a launch record names it, or a
-    line of the `workers` ledger, whose short id prefixes its session id."""
-    for path in run.glob("impl_worker_*.json"):
-        try:
-            record = _json_object(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError):
-            continue
-        if record.get("family") == "claude" and record.get("worker_id") == session_id:
-            return True
-    try:
-        ledger = (run / WORKERS_LOG).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return False
-    return any(short and session_id.startswith(short) for short in (line.partition("\t")[0].strip() for line in ledger))
+def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
+             record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> str:
+    """Read the run owner's current session from staff."""
+    from scripts.production import staff
 
-
-def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
-    """The run's director: its recorded one, else the session that started it, from the
-    `run_started` event that opens its history, for a run nothing has dispatched in since
-    dispatches began recording it. The state's own `main_agent` is not used: in runs started before
-    2026-10-17 a pass opened inside a worker rewrote it with that worker's thread, and
-    progress_history reads the director from here to repair it."""
     if dependencies is not None:
-        dependencies(run / DIRECTOR_FILE)
+        dependencies(staff.record_path())
+        dependencies(run / STATE_FILE)
+    admission = import_module("scripts.production.worker_admission")
+    missing_owner = cast(type[ValueError], admission.RunOwnerUnavailable)
     try:
-        recorded = (run / DIRECTOR_FILE).read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        recorded = ""
-    return recorded or _started_by(run, dependencies=dependencies)
+        find_parent = cast(Callable[..., staff.StaffRow], admission.parent)
+        return find_parent(staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record, run=run).current_session
+    except missing_owner as error:
+        if _has_resumable_workers(run, record=record):
+            report_anomaly(f"anomaly: {run}: {error}")
+        return ""
+    except (OSError, ValueError) as error:
+        report_anomaly(f"anomaly: {run}: {error}")
+        return ""
 
 
-def held_by_session(root_override: str | Path | None = None) -> dict[str, list[str]]:
-    """Read each folder's director once, in root order and then name order."""
-    found: dict[str, list[str]] = {}
-    seen: set[Path] = set()
+def run_folders(root_override: str | Path | None = None) -> list[Path]:
+    """List unique run folders in root and name order, without marker folders."""
+    folders: dict[Path, Path] = {}
     for root in run_roots(root_override):
         try:
-            folders = sorted(root.iterdir())
+            candidates = sorted(root.iterdir())
         except OSError:
             continue
-        for folder in folders:
-            resolved = folder.resolve()
-            if folder.is_dir() and resolved not in seen:
-                seen.add(resolved)
-                found.setdefault(director(folder), []).append(str(folder))
+        for folder in candidates:
+            if folder != root / "active" and folder.is_dir():
+                _ = folders.setdefault(folder.resolve(), folder)
+    return list(folders.values())
+
+
+def _has_resumable_workers(run: Path, *, record: staff.StaffSnapshot | RunStaffAtUse) -> bool:
+    from scripts.direct import worker_state
+    from scripts.production import staff
+
+    def read_record(path: Path) -> dict[str, object]:
+        try:
+            raw = cast(object, json.loads(path.read_text()))
+        except (OSError, UnicodeError, ValueError):
+            return {}
+        return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+
+    state = read_record(run / STATE_FILE)
+    if state.get("status") == "ended":
+        return False
+    names: set[str] = set()
+    for path in worker_state.worker_status_paths(run):
+        names.add(path.name.split("_status", 1)[0])
+        try:
+            if path.read_text().strip() in ("implementing", "running"):
+                return True
+        except OSError:
+            continue
+    if not names:
+        return False
+    snapshot = staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record
+    recorder = import_module("scripts.direct.progress_history")
+    read_dispatch = cast(Callable[[staff.StaffId, Path], object], recorder.active_dispatch)
+    active_dispatch_type = cast(type[object], recorder.ActiveDispatch)
+    return any(isinstance(read_dispatch(row.id, run), active_dispatch_type)
+               for row in snapshot.find(kind="worker") if row.name in names)
+
+
+def held_by_session(root_override: str | Path | None = None, *,
+                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
+    """Read each run's director once, in root and name order."""
+    found: dict[str, list[str]] = {}
+    for folder in run_folders(root_override):
+        if (folder / STATE_FILE).is_file():
+            found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
 
 
 def held(session_id: str, root_override: str | Path | None = None,
          active_override: str | Path | None = None, *,
-         scanned: dict[str, list[str]] | None = None) -> list[str]:
+         scanned: dict[str, list[str]] | None = None,
+         record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> list[str]:
     """List directed folders with the verified marker first, then the shared scan's order."""
     if not session_id:
         return []
-    folders = held_by_session(root_override) if scanned is None else scanned
+    folders = held_by_session(root_override, record=record) if scanned is None else scanned
+    active = Path(root_override) / "active" if root_override is not None and active_override is None else active_override
     try:
-        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
+        lines = marker(session_id, active).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         lines = []
     runs: list[str] = []
@@ -214,7 +277,7 @@ def held(session_id: str, root_override: str | Path | None = None,
         owner = next((session for session, paths in folders.items()
                       if any(Path(path).resolve() == resolved for path in paths)), None)
         if owner is None:
-            owner = director(Path(target))
+            owner = director(Path(target), record=record)
             if owner == session_id:
                 # Cache an outside target only after its marker owner matches its director.
                 folders.setdefault(owner, []).append(target)
@@ -227,32 +290,6 @@ def held(session_id: str, root_override: str | Path | None = None,
             seen.add(resolved)
             runs.append(folder)
     return runs
-
-
-def _json_object(text: str) -> dict[str, object]:
-    try:
-        raw = cast(object, json.loads(text))
-    except ValueError:
-        return {}
-    return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
-
-
-def _started_by(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
-    if dependencies is not None:
-        dependencies(run / STATE_FILE)
-    try:
-        history = _json_object((run / STATE_FILE).read_text(encoding="utf-8")).get("history_file")
-        if not isinstance(history, str) or not history:
-            return ""
-        if dependencies is not None:
-            dependencies(Path(history))
-        with Path(history).open(encoding="utf-8") as handle:
-            event = _json_object(handle.readline())
-    except (OSError, UnicodeError):
-        return ""
-    agent = event.get("main_agent") if event.get("event_type") == "run_started" else None
-    session = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
-    return session if isinstance(session, str) else ""
 
 
 class FormerOwner(NamedTuple):
@@ -291,10 +328,10 @@ def removal_check(running: Mapping[str, str]) -> int:
     return 1
 
 
-def live_run_folders(now: float) -> list[Path]:
+def live_run_folders(now: float, roots: Sequence[Path] | None = None) -> list[Path]:
     """Run folders under either name whose heartbeat moved in the live window."""
     live: list[Path] = []
-    for root in run_roots():
+    for root in run_roots() if roots is None else roots:
         for beat in sorted(root.glob(f"*/{HEARTBEAT}")):
             try:
                 if now - beat.stat().st_mtime < LIVE_HEARTBEAT_SECS:
@@ -354,27 +391,16 @@ def main(argv: list[str]) -> int:
         return 0
     if argv and argv[0] == "held":
         return _held_main(argv[1:])
-    if len(argv) == 2 and argv[0] == "record-director":
-        try:
-            record_director(Path(argv[1]), os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
-        except OSError as error:
-            print(f"unit_runs: director not recorded in {argv[1]}: {error}", file=sys.stderr)
-            return 1
-        return 0
     if argv == ["history-root"]:
         print(history_root())
         return 0
     if argv == ["move-history"]:
         return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | record-director <run folder> | activate <run folder> <session id> | held <session id>",
+        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id>",
               file=sys.stderr)
         return 2
-    if TYPE_CHECKING:
-        from ..message.sessions import running_sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        from sessions import running_sessions
+    from scripts.message.sessions import running_sessions
 
     return removal_check({record["sessionId"]: record["name"] for record in running_sessions()})
 

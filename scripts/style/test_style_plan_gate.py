@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import ticket_owner_id
+from scripts.production.cli_fixture import process_boundary
+
 import io
 import os
 import re
@@ -9,7 +12,6 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
@@ -17,25 +19,24 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import style_proposals
-import proposal_issue
-from issues import frontmatter
+from scripts.style import style_plan
+from scripts.style import style_proposals
+from scripts.production import proposal_issue
+from scripts.production.issues import frontmatter
 
-import berth_board
-import fake_fmt
-import rules
-import style_ledger
+from scripts.lib import berth_board
+from scripts.style import fake_fmt
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
 class StylePlanTests(StylePlanFixture):
     def test_gate_and_checkpoint_use_only_current_parameter_blockers(self) -> None:
-        from test_approved_renames import PARAMETER_CHANGES
+        from scripts.style.test_approved_renames import PARAMETER_CHANGES
         for label, source, current, blocked in PARAMETER_CHANGES:
             with self.subTest(parameter=label):
                 case = StylePlanTests()
@@ -77,7 +78,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_unread_local_body_refuses_gate_and_checkpoint_after_a_signature_change(self) -> None:
-        from test_approved_renames import UNREAD_LOCAL_BODIES
+        from scripts.style.test_approved_renames import UNREAD_LOCAL_BODIES
         for label, source in UNREAD_LOCAL_BODIES:
             with self.subTest(body=label):
                 case = StylePlanTests()
@@ -110,7 +111,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_proved_item_with_unread_body_passes_gate_and_checkpoint(self) -> None:
-        from test_approved_renames import UNREAD_ITEM_BODIES
+        from scripts.style.test_approved_renames import UNREAD_ITEM_BODIES
         for label, source in UNREAD_ITEM_BODIES:
             with self.subTest(body=label):
                 case = StylePlanTests()
@@ -136,7 +137,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_generic_parameters_refuse_gate_and_checkpoint(self) -> None:
-        from test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        from scripts.style.test_approved_renames import GENERIC_PARAMETER_BINDINGS
         self.assert_local_declarations_refuse_gate_and_checkpoint(GENERIC_PARAMETER_BINDINGS)
 
     def assert_local_declarations_refuse_gate_and_checkpoint(self, forms: tuple[tuple[str, str], ...]) -> None:
@@ -171,11 +172,11 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_field_expression_bindings_refuse_gate_and_checkpoint(self) -> None:
-        from test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        from scripts.style.test_approved_renames import FIELD_EXPRESSION_BINDINGS
         self.assert_local_declarations_refuse_gate_and_checkpoint(FIELD_EXPRESSION_BINDINGS)
 
     def test_gate_anchor_matrix_never_adopts_a_build_coordinate_or_current_sibling(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         for probe in ("missing_anchor", "later_field", "removed", "raw_pair"):
             with self.subTest(probe=probe):
                 case = StylePlanTests()
@@ -222,7 +223,7 @@ class StylePlanTests(StylePlanFixture):
                     case.doCleanups()
 
     def test_gate_and_checkpoint_cannot_admit_an_identical_sibling_instead_of_the_recorded_item(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         source = IDENTICAL_BINDING_ITEMS
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
         edited = source.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
@@ -241,7 +242,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
 
     def test_gate_and_checkpoint_refuse_a_duplicate_recorded_item_path(self) -> None:
-        from test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        from scripts.style.test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
         source = DUPLICATE_BINDING_ITEM_PATH
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
         self.write(path, source.replace("|g| g", "|checkout_info| checkout_info", 1))
@@ -259,7 +260,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
 
     def test_gate_and_checkpoint_accept_a_precisely_proved_format_capture_rename(self) -> None:
-        from test_approved_renames import CAPTURE_BINDING_ITEM
+        from scripts.style.test_approved_renames import CAPTURE_BINDING_ITEM
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(CAPTURE_BINDING_ITEM)
         edited = CAPTURE_BINDING_ITEM.replace("g =", "checkout_info =").replace("{g}", "{checkout_info}")
         self.write(path, edited)
@@ -297,7 +298,7 @@ class StylePlanTests(StylePlanFixture):
         self.assert_inner_attribute_refuses_gate_and_checkpoint("trait")
 
     def assert_inner_attribute_refuses_gate_and_checkpoint(self, kind: str) -> None:
-        from test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        from scripts.style.test_approved_renames import INHERITED_INNER_ATTRIBUTES
         source = next(source for label, source in INHERITED_INNER_ATTRIBUTES if label == kind)
         ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
         self.write(path, source.replace("|g| g", "|checkout_info| checkout_info"))
@@ -386,15 +387,15 @@ class StylePlanTests(StylePlanFixture):
         issue = self.approved_decision(rule, (), "rename")
         ledger = self.ledger()
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-        judging = ledger.next_ticket_id("judging")
-        ledger.ticket_add(judging, "judging", "read", "names", ".", [path], [rule])
+        ticket = ledger.next_ticket_id()
+        judging = ledger.next_ticket_id()
+        ledger.ticket_add(judging, ticket_owner_id("judging"), "read", "names", ".", [path], [rule])
         ledger.ticket_assign(judging, "main")
         _ = ledger.ticket_base(judging)
         finding = ledger.hold(rule, path, 2, source.splitlines()[1], "rename", "g", "checkout_info", blob, judging)
         ledger.file_held(finding.finding_id, issue)
         ledger.ticket_drop(judging)
-        ticket = "names-unit-1"
-        ledger.ticket_add(ticket, "names-unit", "proposal", "names", "crates/alpha", [path], [rule],
+        ledger.ticket_add(ticket, ticket_owner_id("names"), "proposal", "names", "crates/alpha", [path], [rule],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         ledger.ticket_assign(ticket, "main")
         _ = ledger.ticket_base(ticket)
@@ -410,8 +411,8 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("documented-module", "tier: D\nfamily: modules\ninput_scope: file\n")
         issue = self.approved_decision(rule, (), "restructure")
         ledger = self.ledger()
-        ticket = "modules-unit-1"
-        ledger.ticket_add(ticket, "modules-unit", "structure", "modules", "crates/alpha", [path], [rule],
+        ticket = "3001"
+        ledger.ticket_add(ticket, ticket_owner_id("modules"), "structure", "modules", "crates/alpha", [path], [rule],
                           cells=((rule, path),))
         ledger.ticket_assign(ticket, "main")
         _ = ledger.ticket_base(ticket)
@@ -450,7 +451,7 @@ class StylePlanTests(StylePlanFixture):
         target = self.repo / self.sources[0]
         _ = target.write_text(target.read_text().replace("old module", "current module"))
         self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
-        _ = issue.write_text(issue.read_text().replace("plan: approved", 'plan: ""'))
+        _ = issue.write_text(re.sub(r"unit: [^\n]*\n", "", issue.read_text()))
         code, output = self.reference_gate(ticket)
         self.assertEqual(code, 1, output)
         self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
@@ -523,54 +524,56 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
 
+    # Keep one gate case in a child interpreter with the shared queue fake.
+    @process_boundary
     def test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         second = self.rule("structure-other", "tier: D\nfamily: modules\n")
         self.sync()
         ledger = self.ledger()
         paths = self.sources[:2]
-        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+        ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha",
                           list(paths), [rule, second], cells=tuple((name, path) for name in (rule, second) for path in paths))
-        ledger.ticket_assign("modules-unit-1", "demo-style-names")
-        _ = ledger.ticket_base("modules-unit-1")
+        ledger.ticket_assign("3001", "demo-style-names")
+        _ = ledger.ticket_base("3001")
         for path in paths:
-            self.record(second, path, self.tip, "modules-unit-1")
-        self.record(rule, paths[0], self.tip, "modules-unit-1")
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
-                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+            self.record(second, path, self.tip, "3001")
+        self.record(rule, paths[0], self.tip, "3001")
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual((result.returncode, result.stdout), (1, f"unjudged: {rule} {paths[1]}\n"))
         with self.assertRaisesRegex(style_ledger.LedgerError, f"unjudged cells: {rule} {paths[1]}"):
-            ledger.ticket_checkpoint("modules-unit-1", self.tip)
-        self.record(rule, paths[1], self.tip, "modules-unit-1")
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
-                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+            ledger.ticket_checkpoint("3001", self.tip)
+        self.record(rule, paths[1], self.tip, "3001")
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
-        ledger.ticket_checkpoint("modules-unit-1", self.tip)
-        self.assertEqual(ledger.ticket_open("modules-unit")[0]["state"], "checkpointed")
+        ledger.ticket_checkpoint("3001", self.tip)
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("modules"))[0]["state"], "checkpointed")
 
     def test_gate_reports_a_locked_ledger_as_an_error_and_a_rerun_gives_the_review(self) -> None:
         database = self.ledger().database
         _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.05))
         with closing(sqlite3.connect(database)) as holder:
             _ = holder.execute("BEGIN EXCLUSIVE")
-            self.assertEqual(self.reference_gate("names-unit-9"), (2, "error: database is locked\n"))
+            self.assertEqual(self.reference_gate("9"), (2, "error: database is locked\n"))
             holder.rollback()
-        self.assertEqual(self.reference_gate("names-unit-9"), (1, "review: unknown ticket names-unit-9\n"))
+        self.assertEqual(self.reference_gate("9"), (1, "review: unknown ticket 9\n"))
 
     def test_gate_passes_a_footprint_error_through_as_exit_two(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         ledger = self.ledger()
         ledger.set_tip(self.tip)
         path = self.sources[0]
-        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+        ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha",
                           [path], [rule], cells=((rule, path),))
-        ledger.ticket_assign("modules-unit-1", "demo-style-names")
-        _ = ledger.ticket_base("modules-unit-1")
-        self.record(rule, path, self.tip, "modules-unit-1")
+        ledger.ticket_assign("3001", "demo-style-names")
+        _ = ledger.ticket_base("3001")
+        self.record(rule, path, self.tip, "3001")
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET base=? WHERE id=?", ("0" * 40, "modules-unit-1"))
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
-                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+            _ = connection.execute("UPDATE tickets SET base=? WHERE id=?", ("0" * 40, "3001"))
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertTrue(result.stdout.startswith("error: "), result.stdout)
 
@@ -579,15 +582,15 @@ class StylePlanTests(StylePlanFixture):
         ledger = self.ledger()
         ledger.set_tip(self.tip)
         path = self.sources[0]
-        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+        ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha",
                           [path], [rule], cells=((rule, path),))
-        ledger.ticket_assign("modules-unit-1", "demo-style-names")
-        _ = ledger.ticket_base("modules-unit-1")
-        self.record(rule, path, self.tip, "modules-unit-1")
+        ledger.ticket_assign("3001", "demo-style-names")
+        _ = ledger.ticket_base("3001")
+        self.record(rule, path, self.tip, "3001")
         _ = (self.unit / path).write_text("pub fn value()  {}\n")
         self.unformatted(path)
-        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
-                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "3001"], capture_output=True, text=True, check=False)
         self.assertEqual((result.returncode, result.stdout, result.stderr),
                          (1, f"mechanical\nreview: not formatted (rustfmt +nightly): {path}\n", ""))
 
@@ -679,19 +682,19 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn("crates/alpha/Cargo.toml", selected.files)
         self.assertEqual(set(selected.cells), {(structure, path) for path in self.sources[:2]} | {(manifest, "crates/alpha")})
         ledger = self.ledger()
-        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", selected.crate,
+        ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", selected.crate,
                           list(selected.files), list(selected.rules), cells=selected.cells)
-        ledger.ticket_assign("modules-unit-1", "demo-style-names")
-        _ = ledger.ticket_base("modules-unit-1")
+        ledger.ticket_assign("3001", "demo-style-names")
+        _ = ledger.ticket_base("3001")
         for path in self.sources[:2]:
-            self.record(structure, path, self.tip, "modules-unit-1")
+            self.record(structure, path, self.tip, "3001")
         output = io.StringIO()
         with redirect_stdout(output):
-            self.assertEqual(style_plan.gate(self.unit, "modules-unit-1"), 1)
+            self.assertEqual(style_plan.gate(self.unit, "3001"), 1)
         self.assertEqual(output.getvalue(), f"unjudged: {manifest} crates/alpha\n")
-        self.record(manifest, "crates/alpha", self.tip, "modules-unit-1")
-        self.assertEqual(style_plan.gate(self.unit, "modules-unit-1"), 0)
-        phase = style_plan.phase_text(ledger.ticket_open("modules-unit")[0], ledger.pinned_rule_texts("modules-unit-1"),
+        self.record(manifest, "crates/alpha", self.tip, "3001")
+        self.assertEqual(style_plan.gate(self.unit, "3001"), 0)
+        phase = style_plan.phase_text(ledger.ticket_open(ticket_owner_id("modules"))[0], ledger.pinned_rule_texts("3001"),
                                       self.plan, "context")
         self.assertIn(f"Record `{manifest}` once with `--path crates/alpha` after reading the manifests.", phase)
         self.assertIn("Owned pending verdict cells (record only these rule/path pairs):", phase)
@@ -994,9 +997,9 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual([argument for argument in arguments if argument.startswith("--")], ["--repo", "--ticket"])
         self.assertEqual(arguments[arguments.index("--repo") + 1], ".")
         self.assertNotIn("--head", arguments)
-        self.assertEqual(arguments[arguments.index("--ticket") + 1], "names-unit-1")
+        self.assertEqual(arguments[arguments.index("--ticket") + 1], "1")
         base = self.tip
-        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], base)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["base"], base)
         self.assertEqual(self.git("for-each-ref", "refs/style-tickets"), "")
         expected = self.plan.read_bytes()
         _ = (self.unit / self.sources[0]).write_text("pub fn changed() {}\n")
@@ -1004,7 +1007,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.git("commit", "-qm", "Ticket change", cwd=self.unit)
         _ = self.plan.write_text(self.plan_header())
         self.assertEqual(self.run_next()[0], 0)
-        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], base)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["base"], base)
         self.assertEqual(self.git("for-each-ref", "refs/style-tickets"), "")
         self.assertNotEqual(self.git("rev-parse", "HEAD", cwd=self.unit), self.tip)
         self.assertIn(gate, self.plan.read_text())
@@ -1023,8 +1026,8 @@ class StylePlanTests(StylePlanFixture):
             finding = ledger.hold(rule, self.sources[0], 1, "value", "type", "u32", "u64", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+                             + f'unit: {unit_staff_id("names")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+        self.proposals_field(folder)
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])),
               mock.patch.object(style_proposals, "proposal_command") as start,
               mock.patch.object(style_ledger.Ledger, "cells", autospec=True, side_effect=style_ledger.Ledger.cells) as coverage):
@@ -1041,7 +1044,7 @@ class StylePlanTests(StylePlanFixture):
         with mock.patch.object(style_proposals, "proposal_command", side_effect=start_issue):
             result = self.run_next()
         self.assertEqual(result[0], 0, result)
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"]), ("proposal", str(issue), [self.sources[0]]))
         self.assertEqual(frontmatter(issue)["stage"], ["active"])
 
@@ -1050,26 +1053,26 @@ class StylePlanTests(StylePlanFixture):
         last = self.rule("structure-last", "tier: D\nfamily: modules\n")
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha", [], [last, first])
-            ledger.ticket_assign("modules-unit-1", "style/main")
-            _ = ledger.ticket_base("modules-unit-1")
-        self.record(first, "crates/alpha", self.tip, "modules-unit-1")
+            ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "modules", "crates/alpha", [], [last, first])
+            ledger.ticket_assign("3001", "style/main")
+            _ = ledger.ticket_base("3001")
+        self.record(first, "crates/alpha", self.tip, "3001")
         output = io.StringIO()
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint,
               redirect_stdout(output)):
-            self.assertEqual(style_plan.gate(self.repo, "modules-unit-1"), 1)
+            self.assertEqual(style_plan.gate(self.repo, "3001"), 1)
             footprint.assert_not_called()
         self.assertEqual(output.getvalue(), f"unjudged: {last} crates/alpha\n")
 
-        self.record(last, "crates/alpha", self.tip, "modules-unit-1")
+        self.record(last, "crates/alpha", self.tip, "3001")
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(style_plan, "format_check", return_value=0),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
-            self.assertEqual(style_plan.gate(self.repo, "modules-unit-1"), 0)
+            self.assertEqual(style_plan.gate(self.repo, "3001"), 0)
             footprint.assert_called_once()
         arguments = cast(list[str], footprint.call_args.args[0])
         self.assertIn("style_footprint.py", arguments[1])
@@ -1079,31 +1082,31 @@ class StylePlanTests(StylePlanFixture):
         first, last = self.rule("read-first"), self.rule("read-last")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                           list(self.sources[:2]), [first, last])
-        ledger.ticket_assign("names-unit-1", "style/main")
-        _ = ledger.ticket_base("names-unit-1")
+        ledger.ticket_assign("1", "style/main")
+        _ = ledger.ticket_base("1")
         before = {(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}
         for rule in (first, last):
             for path in self.sources[:2]:
-                self.record(rule, path, self.tip, "names-unit-1")
-        _ = ledger.ticket_yield("names-unit-1", self.sources[0])
+                self.record(rule, path, self.tip, "1")
+        _ = ledger.ticket_yield("1", self.sources[0])
         self.assertEqual({(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}, before)
         with (mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(style_plan, "format_check", return_value=0),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
-            self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
+            self.assertEqual(style_plan.gate(self.repo, "1"), 0)
             footprint.assert_called_once()
         with style_ledger.open_ledger(self.repo) as reopened:
-            reopened.ticket_checkpoint("names-unit-1", self.tip)
-            self.assertEqual(reopened.ticket_open("names-unit")[0]["state"], "checkpointed")
+            reopened.ticket_checkpoint("1", self.tip)
+            self.assertEqual(reopened.ticket_open(ticket_owner_id("names"))[0]["state"], "checkpointed")
 
     def test_coverage_gate_uses_the_base_exposed_by_ticket_origin(self) -> None:
         _ = self.rule("read")
         self.sync()
         self.assertEqual(self.run_next()[0], 0)
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         for rule in ticket["rules"]:
             for path in ticket["files"]:
                 self.record(rule, path, self.tip, ticket["id"])
@@ -1114,25 +1117,25 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(style_plan, "format_check", return_value=0),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
-            self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
+            self.assertEqual(style_plan.gate(self.repo, "1"), 0)
         arguments = cast(list[str], run.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--base") + 1], "base-from-origin")
 
     def test_coverage_gate_excludes_direct_branch_point_work_taken_in_from_the_style_branch(self) -> None:
         ticket = self.take_style_work_into_judged_ticket()
         result = subprocess.run(
-            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
             capture_output=True, text=True, check=False,
         )
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
-        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], ticket["base"])
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["base"], ticket["base"])
         self.assertEqual(ticket["base"], self.tip)
 
     def test_coverage_gate_still_reviews_ticket_edits_after_taking_in_style_branch_work(self) -> None:
         ticket = self.take_style_work_into_judged_ticket()
         _ = (self.unit / ticket["files"][0]).write_text("pub fn value() { let count = 7; }\n")
         result = subprocess.run(
-            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 1, result)

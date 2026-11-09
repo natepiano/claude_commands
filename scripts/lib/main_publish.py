@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 from typing import cast
 
 from scripts.lib.atomic_file import write_text_atomic
@@ -43,6 +45,11 @@ class NoPendingMacPull:
 @dataclass(frozen=True)
 class MacPulled:
     """The Mac completed its pull."""
+
+
+@dataclass(frozen=True)
+class MacPullPending:
+    """The Mac is unreachable and its pull is queued."""
 
 
 @dataclass(frozen=True)
@@ -130,16 +137,19 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,
            *, subject_prefix: str, unchanged: str) -> str:
-    """Commit only the named file; restore its previous content when commit fails."""
+    """Commit only the named file; restore it if Git fails and HEAD lacks its contents."""
     if not message.startswith(subject_prefix):
         raise Refusal(f"commit subject must start with {subject_prefix!r}")
     committed = git(checkout, "commit", "-q", "--only", "-m", message, "--", str(conf))
     if committed.returncode:
-        if isinstance(before, MissingFile):
-            conf.unlink(missing_ok=True)
+        if git(checkout, "diff", "--quiet", "HEAD", "--", str(conf)).returncode == 0:
+            print(f"anomaly: git commit: {first_line(committed)}; the commit exists", file=sys.stderr)
         else:
-            write_text_atomic(conf, before.text)
-        raise Refusal(f"git commit: {first_line(committed)}; {unchanged}")
+            if isinstance(before, MissingFile):
+                conf.unlink(missing_ok=True)
+            else:
+                write_text_atomic(conf, before.text)
+            raise Refusal(f"git commit: {first_line(committed)}; {unchanged}")
     return git(checkout, "rev-parse", "--short", "HEAD").stdout.strip()
 
 
@@ -214,3 +224,15 @@ def queue(change: PendingMacPull) -> None:
     # Keep the original zone queue format so installed sync jobs can drain it.
     write_text_atomic(path, json.dumps(dict(zone=change.label, text=change.text,
                                            since=change.since, reason=change.reason), indent=2) + "\n")
+
+
+def queue_pull_only(label: str, reason: str) -> None:
+    """Queue a pull and retain any waiting zone notice."""
+    queue(PendingMacPull(label, "", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), reason))
+
+
+def clear_pull_only() -> None:
+    """Clear a completed pull and retain any waiting zone notice."""
+    pending = read_queue()
+    if isinstance(pending, PendingMacPull) and not pending.text:
+        queue_path().unlink(missing_ok=True)

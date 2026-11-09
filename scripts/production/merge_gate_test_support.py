@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from scripts.build_queue import admission_records
+
+from scripts.shutdown import remote
+
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 import json
 import contextlib
@@ -17,14 +21,16 @@ from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
-from scripts.lint import memory_admit
-from scripts.lint.memory_test_support import fake_memory_readings
-from scripts.production import merge_gate
+from scripts.lib import build_folders
+from scripts.lint import memory_admit, sweep
+from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.production import merge_gate, staff, targeted_test
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
+from scripts.test_times.gate_record import GateRunRecord
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -35,6 +41,16 @@ SCRIPT = Path(__file__).with_name("merge_gate.py")
 FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "fixture_b", "fixture_c")
 # Each folder holds test_first.py, and lib also holds test_second.py.
 
+
+def install_test_runner(checkout: Path) -> Path:
+    """Install the real runner and its descendant helper in a fixture checkout."""
+    for relative in ("test_times/module_run.py", "lib/descendants.py"):
+        destination = checkout / "scripts" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copyfile(SCRIPT.parents[1] / relative, destination)
+    return checkout / "scripts/test_times/module_run.py"
+
+
 TOOL_STUB = '''#!/usr/bin/env python3
 import json
 import os
@@ -42,7 +58,8 @@ from pathlib import Path
 import sys
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
-sys.path.insert(0, os.environ["MERGE_GATE_TEST_REPO"])
+with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_until
 state = Path(os.environ["MERGE_GATE_TEST_STATE"])
 name = Path(sys.argv[0]).name
@@ -61,11 +78,11 @@ if name == "basedpyright":
         # The parent publishes only after measuring this type job's real RSS.
         wait_until((state / "types-sampled").exists, state, timeout=TEST_HANG_GUARD_SECS)
     if (state / "types-red").exists():
-        print("fixture type error")
+        print("scripts/fixture.py:1: error: fixture type error")
         print("1 error, 0 warnings, 0 notes")
         raise SystemExit(1)
     print("0 errors, 0 warnings, 0 notes")
-    raise SystemExit(3)
+    raise SystemExit(0)
 if name == "uv":
     if (state / "uv-fails").exists():
         print("fixture: no network", file=sys.stderr)
@@ -90,6 +107,11 @@ if name == "style_sync.py":
                               capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
     raise SystemExit(1 if (state / "notify-fails").exists() else 0)
+if name == "send.py":
+    if (state / "send-fails").exists():
+        print("fixture message failed", file=sys.stderr)
+        raise SystemExit(3)
+    raise SystemExit(0)
 raise SystemExit("unexpected tool: " + name)
 '''.replace("__TEST_HANG_GUARD_SECS__", str(TEST_HANG_GUARD_SECS))
 
@@ -134,9 +156,18 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
-            self.assertEqual(os.environ.get("PYTHONPATH"), os.environ.get("MERGE_GATE_TEST_PYTHONPATH"))
+            self.assertEqual(os.environ.get("PYTHONPATH"), str(Path.cwd()))
+            self.assertNotIn(os.environ["MERGE_GATE_TEST_PYTHONPATH"], sys.path)
+            self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
+        if (state / "sample-module-memory").exists():
+            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
+                exec(package_root.read(), {"__file__": package_root.name})
+            from scripts.direct.wait_for_test_state import wait_until
+            (state / (str(os.getpgrp()) + ".memory-ready")).touch()
+            wait_until((state / (str(os.getpgrp()) + ".memory-done")).exists,
+                       state, timeout=TEST_HANG_GUARD_SECS)
         death = state / ("signal-" + suite)
         if death.exists():
             if death.read_text() == "once":
@@ -157,9 +188,9 @@ class FixtureTest(unittest.TestCase):
             statuses = [subprocess.run(command, env=environment, check=False, timeout=TEST_HANG_GUARD_SECS).returncode for command in commands]
             (state / "tool-statuses.json").write_text(json.dumps(statuses))
         if (state / "concurrency-barrier").exists():
-            (state / (str(os.getpid()) + ".started")).touch()
+            (state / (str(os.getpgrp()) + ".started")).touch()
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-            while not (state / (str(os.getpid()) + ".released")).exists():
+            while not (state / (str(os.getpgrp()) + ".released")).exists():
                 if time.monotonic() >= deadline:
                     self.fail("runner never released the module")
                 time.sleep(0.01)
@@ -182,18 +213,11 @@ class FixtureTest(unittest.TestCase):
             Path("unit.txt").write_text("gate debris\\n")
             self.fail("fixture edited a tracked checkpoint file")
         if (state / "hold-module").exists() and suite == "hooks":
-            (state / "module-held.tmp").write_text(str(os.getpid()))
+            (state / "module-held.tmp").write_text(str(os.getpgrp()))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "module-held.tmp", state / "module-held")
             signal.alarm(TEST_HANG_GUARD_SECS)
             signal.pause()
-        if (state / "grow-memory").exists() and suite == "hooks":
-            # Grows until the runner kills it; past 2 GiB the cap failed to stop it.
-            blocks = []
-            while len(blocks) < 256:
-                blocks.append(b"x" * (8 << 20))
-                time.sleep(0.02)
-            self.fail("fixture grew to 2 GiB and was never killed")
         if (state / "barrier").exists() and suite == "lib":
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while True:
@@ -254,6 +278,8 @@ class GateFixtureSeed:
 
 
 class MergeGateFixture(unittest.TestCase):
+    suite_mode: ClassVar[merge_gate.SuiteMode] = merge_gate.SuiteMode.MERGE_GATE
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -281,7 +307,7 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(prefix="merge-gate-test-")
+        directory = tempfile.TemporaryDirectory(dir=build_folders.tmpfs_temporary_parent(), prefix="merge-gate-test-")
         cls.addClassCleanup(directory.cleanup)
         cls.fixture_root = Path(directory.name) / "case"
         cls.fixture_snapshot = Path(directory.name) / "snapshot"
@@ -290,8 +316,11 @@ class MergeGateFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        from scripts.message import session_send
+
         _ = self.enterContext(LauncherHangGuard(self.id()).protect())
         self.restore_fixture(suites_for_case(self))
+        _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission_started = True
@@ -324,8 +353,49 @@ class MergeGateFixture(unittest.TestCase):
     def module_count(self) -> int:
         return len(self.suites) + int("lib" in self.suites)
 
+    def configure_gate(self, overrides: str) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_admission.conf", overrides)
+
     def record_module_peaks(self, peaks: dict[str, float]) -> None:
         merge_gate.save_measures(self.state / "runner" / "module_peak_mib.json", peaks)
+
+    @contextlib.contextmanager
+    def sampling_module_memory(self, attempts: dict[str, Sequence[float]]) -> Generator[list[merge_gate.RunningGateJob]]:
+        """Sample real, held modules with private per-attempt memory readings."""
+        self.write(self.state / "sample-module-memory", "held")
+        started: list[merge_gate.RunningGateJob] = []
+        counts: dict[str, int] = {}
+        readings: dict[int, float] = {}
+        sampled: set[int] = set()
+        start = merge_gate.start_gate_job
+
+        def start_held(suite: str, path: Path, argv: list[str], repo: Path,
+                       environment: dict[str, str], log: Path, *,
+                       kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log, kind=kind)
+            started.append(job)
+            if kind is merge_gate.GateJobKind.TEST_MODULE:
+                key = f"{suite}/{job.module}"
+                values = attempts.get(key, (32.0,))
+                number = counts.get(key, 0)
+                readings[job.process.pid] = values[min(number, len(values) - 1)]
+                counts[key] = number + 1
+                wait_for_file(self.state / f"{job.process.pid}.memory-ready")
+            return job
+
+        def sample(roots: set[int]) -> dict[int, float]:
+            result = {pid: readings.get(pid, 32.0) for pid in roots}
+            result[os.getpid()] = sum(value for pid, value in result.items() if pid != os.getpid()) + 32.0
+            for pid in roots & readings.keys():
+                # The next sample releases a job even if the runner fails to stop it.
+                if pid in sampled:
+                    (self.state / f"{pid}.memory-done").touch()
+                sampled.add(pid)
+            return result
+
+        with mock.patch.object(merge_gate, "start_gate_job", side_effect=start_held), \
+                mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample):
+            yield started
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -338,7 +408,7 @@ class MergeGateFixture(unittest.TestCase):
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
         self.environment = {
-            **os.environ, "HOME": str(home), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -364,7 +434,7 @@ class MergeGateFixture(unittest.TestCase):
         readings.mkdir(exist_ok=True)
         self.environment.update(fake_memory_readings(readings))
         self.environment.update({
-            "BUILDLOG_DIR": str(root / "buildlog"), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+            "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "merge-gate",
             "NOTIFIER_SESSIONS_DIR": str(home / "sessions"),
@@ -411,8 +481,9 @@ class MergeGateFixture(unittest.TestCase):
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
     def occupy_memory_queue(self) -> wire.Admitted:
-        request = self.admission.request(need=21 * memory_admit.GIB, step="build")
-        return only_admitted(self.admission.server.handle_request(request))
+        request = self.admission.request(need=21 * admission_records.GIB, step="build")
+        with self.admission.loop_turn():
+            return only_admitted(self.admission.server.handle_request(request))
 
     def assert_gate_released(self) -> None:
         self.assertEqual(self.admission.server.reservations, {})
@@ -421,7 +492,7 @@ class MergeGateFixture(unittest.TestCase):
             self.assertEqual(list(self.admission_directory.glob("*." + suffix)), [], suffix)
 
     @contextlib.contextmanager
-    def observing_admission(self, observe: Callable[[memory_admit.AdmissionWaitSnapshot], None]) -> Generator[None]:
+    def observing_admission(self, observe: Callable[[admission_records.AdmissionWaitSnapshot], None]) -> Generator[None]:
         server = self.admission.server
         previous = server.reply_filter
 
@@ -433,16 +504,18 @@ class MergeGateFixture(unittest.TestCase):
                 waiter = record.queue_waiter
                 inputs = server.last_inputs
                 result = server.last_result
-                self.assertIsInstance(inputs, memory_admit.QueueInputs)
+                self.assertIsInstance(inputs, admission_records.QueueInputs)
                 self.assertIsInstance(result, memory_admit.PassResult)
-                assert isinstance(inputs, memory_admit.QueueInputs)
+                assert isinstance(inputs, admission_records.QueueInputs)
                 assert isinstance(result, memory_admit.PassResult)
-                outcome = next(row for row in result.rows if row.owner == memory_admit.waiter_owner(waiter))
-                peak = memory_admit.ExpectedPeak(reply.need, reply.source, waiter.get("need_runs", 0),
+                outcome = next(row for row in result.rows if row.owner == admission_records.waiter_owner(waiter))
+                peak = admission_records.ExpectedPeak(reply.need, reply.source, waiter.get("need_runs", 0),
                     memory_admit.read_need_basis(waiter.get("need_basis")))
-                available = inputs.host.available if isinstance(inputs.host, memory_admit.HostMemory) else 0
-                observe(memory_admit.AdmissionWaitSnapshot(outcome.decision, peak, tuple(inputs.running),
-                    available, record.repo, record.step, server.last_policy, server.last_fallbacks))
+                available = inputs.host.available if isinstance(inputs.host, admission_records.HostMemory) else 0
+                policy = server.last_policy
+                assert isinstance(policy, admission_records.AdmissionPolicy)
+                observe(admission_records.AdmissionWaitSnapshot(outcome.decision, peak, tuple(inputs.running),
+                    available, record.repo, record.step, policy, server.last_diagnostics))
             return previous(reply)
 
         server.reply_filter = observed
@@ -459,6 +532,8 @@ class MergeGateFixture(unittest.TestCase):
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"
         self.write(self.quiet_production, "# quiet\n")
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
         _ = self.git(self.root, "init", "--bare", str(self.origin))
         _ = self.git(self.root, "init", "-b", "main", str(self.checkout))
         _ = self.git(self.checkout, "config", "user.name", "Merge Gate Fixture")
@@ -466,7 +541,12 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.git(self.checkout, "remote", "add", "origin", str(self.origin))
         self.write(self.checkout / "settings.json", '{"fixture": true}\n')
         self.write(self.checkout / "subject.txt", "base\n")
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
+        _ = install_test_runner(self.checkout)
+        shim = self.checkout / "scripts/lib/py"
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copy2(SCRIPT.parents[1] / "lib/py", shim)
         for suite in self.suites:
             self.write(self.checkout / "scripts" / suite / "test_first.py", SUITE_MODULE)
         if "lib" in self.suites:
@@ -481,7 +561,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "uv", "ssh", "suite-python", "style_sync.py", "systemd-run"):
+        for name in ("basedpyright", "uv", "ssh", "suite-python", "style_sync.py", "systemd-run", "send.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -516,23 +596,38 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.git(checkout, "commit", "-m", subject)
         return self.git(checkout, "rev-parse", "HEAD")
 
+    def gate_run_records(self) -> list[GateRunRecord]:
+        paths = sorted(Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl"))
+        return [cast(GateRunRecord, cast(object, row))
+                for row in sweep.build_log_rows(paths) if row.get("kind") == "gate_run"]
+
+    def prepare_affected_subject(self) -> tuple[Path, str]:
+        subject = self.checkout / "scripts/hooks/affected_subject.py"
+        self.write(subject, "VALUE = 1\n")
+        self.write(self.checkout / "scripts/hooks/test_first.py", "from scripts.hooks import affected_subject\n" + SUITE_MODULE)
+        return subject, self.commit(self.checkout, "dependency fixture")
+
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
                  ignored_signals: bool = False, callers_production: bool = False,
-                 own_process: bool = False) -> subprocess.CompletedProcess[str]:
+                 own_process: bool = False, preamble: str = "",
+                 type_dirs: Sequence[str] = ("scripts/production",)) -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
              "--previous-checkpoint", previous or self.base,
-             "--unit", "fixture-unit", "--phase", "phase-2",
-             "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+             "--unit", "fixture", "--phase", "phase-2",
+             "--body", "Fixture checkpoint gate.",
+             *(["--type-dirs", *type_dirs] if type_dirs else []),
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
-             *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
+             *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
              *extra]
-        # The gate measures itself and descendants; cap assertions need their own gate process.
+        if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST:
+            arguments = ["--repo", str(self.checkout),
+                         *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
         if own_process or ignored_signals:
             return subprocess.run(
-                [*self.gate_command(ignored_signals=ignored_signals), *arguments], cwd=self.root,
+                [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
                 env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         from scripts.production import showrunners
@@ -545,24 +640,32 @@ class MergeGateFixture(unittest.TestCase):
                 "SHOWRUNNER_STATE_DIR": home / ".local/state/showrunner",
             }.items():
                 _ = scope.enter_context(mock.patch.object(showrunners, name, value))
-            return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
+            entry = targeted_test if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST else merge_gate
+            return invoke_cli(entry, lambda: entry.main(arguments), arguments,
                               self.environment, self.root)
 
-    def gate_command(self, *, ignored_signals: bool = False) -> list[str]:
+    def gate_command(self, *, ignored_signals: bool = False, preamble: str = "") -> list[str]:
         source = "import sys, signal; "
         if ignored_signals:
             source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
-        source += (f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
-                   "from scripts.production import merge_gate; "
-                   "raise SystemExit(merge_gate.main(sys.argv[1:]))")
-        return [sys.executable, "-c", source]
+        source += ("from scripts.production import merge_gate; \n"
+                   + "from pathlib import Path\nimport os\nfrom scripts.message import session_send\n"
+                   + "session_send.SEND_SCRIPT = Path(os.environ['MERGE_GATE_TEST_STATE']).parent / 'bin/send.py'\n"
+                   + ("from scripts.production import targeted_test as entry\n"
+                      if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST else "entry = merge_gate\n")
+                   + preamble + "\n"
+                   + "raise SystemExit(entry.main(sys.argv[1:]))")
+        return [str(SCRIPT.parents[1] / "lib/py"), "-c", source]
 
-    def run_promote_only(self) -> subprocess.CompletedProcess[str]:
+    def run_promote_only(self, *extra: str, explicit_checkout: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
+            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT),
+             *(["--repo", str(self.checkout)] if explicit_checkout else []), "--merge-branch", "integration",
              "--promote-only", "--main-repo", str(self.main),
-             "--ssh", str(self.bin / "ssh")], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+             "--ssh", str(self.bin / "ssh"),
+             *([] if "--production" in extra else ["--production", "quiet"]), *extra],
+            cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def calls(self) -> list[ToolCall]:
@@ -576,6 +679,12 @@ class MergeGateFixture(unittest.TestCase):
     def pass_records(self) -> list[dict[str, object]]:
         path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def write_nightly_red_marker(self) -> tuple[Path, str]:
+        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        notice = json.dumps({"tree": "red-tree", "at": "2026-10-29T00:00:00+00:00"})
+        self.write(marker, notice)
+        return marker, notice
 
     def clear_gate_events(self) -> None:
         for name in ("modules.jsonl", "tools.jsonl", "types-ran"):
@@ -609,11 +718,15 @@ class MergeGateFixture(unittest.TestCase):
 
     def review_list(self) -> tuple[Path, Path]:
         """A change-review list holding C7, and the production doc that names it."""
-        review = self.root / "change-review.md"
+        review = Path(self.environment["HOME"]) / "rust/hanadocs/change-review/change-review - fixture-showrunner.md"
         self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                    + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
         doc = self.root / "production.md"
-        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n")
+        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n"
+                   + f"- **Repository:** `{self.checkout}`\n- **Showrunner checkout:** `{self.checkout}`\n"
+                   + "- **Merge branch:** `integration`\n")
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
         return review, doc
 
     def publish_for_promotion(self) -> merge_gate.GateArguments:

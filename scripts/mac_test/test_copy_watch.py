@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -16,21 +17,16 @@ import time
 import unittest
 from unittest import mock
 from collections.abc import Callable
-from typing import TYPE_CHECKING, TypedDict, cast, final, override
+from typing import TypedDict, cast, final, override
 
-import copy_watch
-import mac_test
-import offload
-if TYPE_CHECKING:
-    from ..direct import step_record
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-    from ..lib import test_hang_guard
-    from ..lib.process_group import send_process_group
-else:
-    from scripts.direct import step_record
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
-    from scripts.lib import test_hang_guard
-    from scripts.lib.process_group import send_process_group
+from scripts.lib import process_start as process_identity
+
+
+from scripts.mac_test import copy_watch, offload
+from scripts.direct import step_record
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib import test_hang_guard
+from scripts.lib.process_group import send_process_group
 
 
 SCRIPT = Path(__file__).with_name("copy_watch.py")
@@ -166,7 +162,7 @@ class LineKindTests(unittest.TestCase):
 class WakeupTests(unittest.TestCase):
     def test_unknown_repository_checks_parent_within_one_second(self) -> None:
         with mock.patch.object(os, "getppid", return_value=100) as parent:
-            wakeup = copy_watch.Wakeup(7)
+            wakeup = copy_watch.Wakeup(7, 100)
 
             def parent_exits(readers: list[int], writers: list[int], errors: list[int],
                              timeout: float) -> tuple[list[int], list[int], list[int]]:
@@ -182,6 +178,19 @@ class WakeupTests(unittest.TestCase):
 
 
 class StepProgressTests(unittest.TestCase):
+    def test_darwin_leader_uses_one_start_and_rejects_zombies_and_pid_reuse(self) -> None:
+        start = "Tue Nov  3 23:00:00 2026"
+        with mock.patch.object(sys, "platform", "darwin"), \
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, start + " S\n", "")) as read, \
+                mock.patch.object(os, "getpgid", return_value=42):
+            progress = copy_watch.StepProgress(copy_watch.StepInfo(42, Path("unused")))
+            read.assert_called_once()
+            self.assertTrue(progress.leader_alive())
+            for output in (start + " Z\n", "Wed Nov  4 00:00:00 2026 S\n"):
+                read.return_value = subprocess.CompletedProcess([], 0, output, "")
+                self.assertFalse(progress.leader_alive())
+
+
     def test_linux_only_and_selected_linux_records_never_become_mac_copy_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -200,8 +209,8 @@ class StepProgressTests(unittest.TestCase):
                 "VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc"),
             }):
                 cases = (
-                    (step_record.SshAllowed(("aws",)), step_record.StepState.WAITING_HOLD, ""),
-                    (step_record.SshAllowed(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
+                    (step_record.AnyTarget(("aws",)), step_record.StepState.WAITING_HOLD, ""),
+                    (step_record.AnyTarget(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
                 )
                 for permission, state, selected in cases:
                     with self.subTest(state=state):
@@ -323,7 +332,7 @@ class CandidateTests(unittest.TestCase):
         path = self.directory / f"{call_id}.json"
         record: copy_watch.CandidateRecord = {
             "pid": pid,
-            "proc_start": proc_start if proc_start is not None else mac_test.process_start_time(pid) or "",
+            "proc_start": proc_start if proc_start is not None else (identity.start if isinstance(identity := process_identity.process_start(pid), process_identity.Started) else ""),
             "call_started": started,
             "call_id": call_id,
         }
@@ -378,7 +387,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.repo=\n")
         busy: ClaimRecord = {
             "pid": os.getpid(),
-            "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "proc_start": (identity.start if isinstance(identity := process_identity.process_start(os.getpid()), process_identity.Started) else ""),
             "what": "nextest other",
             "worktree": str(self.repository),
             "since": datetime.now(timezone.utc).isoformat(),
@@ -421,6 +430,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             "--info", str(self.info), "--result", str(self.result), "--runner", str(self.runner),
             "--settings", str(self.root / "mac_test.conf"), "--repo-root", str(self.repository),
             "--package", "sample", "--call-id", "v-call", "--call-started", call_started,
+            "--parent-pid", str(os.getpid()),
         ]
         if filter_run:
             arguments.append("--filter-run")
@@ -584,7 +594,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         newer = self.state / "copy_candidates" / "repo" / "v-newer.json"
         newer.parent.mkdir(parents=True)
         record: copy_watch.CandidateRecord = {
-            "pid": os.getpid(), "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "pid": os.getpid(), "proc_start": (identity.start if isinstance(identity := process_identity.process_start(os.getpid()), process_identity.Started) else ""),
             "call_started": 2000.0, "call_id": "v-newer",
         }
         _ = newer.write_text(json.dumps(record))
@@ -633,7 +643,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertEqual(self.result.read_text(), "copy=\ncopy_s=\ncopy_count=\nnatedev_s_at_end=\n")
 
-    def assert_parent_loss_stops_watcher(self, *, running_copy: bool) -> None:
+    def assert_parent_loss_stops_watcher(self, *, running_copy: bool, before_start: bool = False) -> None:
         if not running_copy:
             claims = self.state / "claims"
             claims.mkdir(parents=True)
@@ -641,29 +651,41 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.start_step()
         self.result = self.root / "removed-results" / "result"
         self.result.parent.mkdir()
-        # The watcher and its runner inherit this parent's output pipe. EOF
-        # proves they closed it; cleanup owns only this new process group.
+        if before_start:
+            self.result.parent.rmdir()
+        # The watcher and its runner inherit this parent's output pipe.
+        # EOF proves both processes closed the pipe. Cleanup owns only this new process group.
+        # The delayed wrapper starts the watcher after its parent exits.
         parent: subprocess.Popen[str] = subprocess.Popen([
             sys.executable, "-c",
-            "import signal, subprocess, sys\n"
-            + "child = subprocess.Popen(sys.argv[1:])\n"
+            "import os, signal, subprocess, sys\n"
+            + "sys.argv[sys.argv.index('--parent-pid') + 1] = str(os.getpid())\n"
+            + ("child = subprocess.Popen([sys.executable, '-c', "
+               + repr("import os, sys, time\n"
+                      + "parent = int(sys.argv[1])\n"
+                      + "while os.getppid() == parent: time.sleep(0.01)\n"
+                      + "os.execv(sys.executable, [sys.executable, *sys.argv[3:]])\n")
+               + ", str(os.getpid()), *sys.argv[1:]])\n"
+               if before_start else "child = subprocess.Popen(sys.argv[1:])\n")
             + "print(child.pid, flush=True)\n"
-            + "signal.pause()\n",
+            + ("" if before_start else "signal.pause()\n"),
             *self.watcher_arguments(),
         ], env={**self.environment, "TEST_COPY_MODES": "hold"},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
             assert parent.stdout is not None
             watcher_pid = int(cast(str, parent.stdout.readline()))
-            _ = (self.root / "compile").write_text("go\n")
-            if running_copy:
-                self.wait_until((self.root / "runner-ready").exists, "the copy to run")
-            else:
-                self.wait_until(self.candidate().exists, "the watcher to be ready")
-            self.result.parent.rmdir()
+            if not before_start:
+                _ = (self.root / "compile").write_text("go\n")
+                if running_copy:
+                    self.wait_until((self.root / "runner-ready").exists, "the copy to run")
+                else:
+                    self.wait_until(self.candidate().exists, "the watcher to be ready")
+                self.result.parent.rmdir()
             started = time.monotonic()
-            parent.kill()
-            output, _ = parent.communicate(timeout=4.0)
+            if not before_start:
+                parent.kill()
+            output, _ = parent.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertLess(time.monotonic() - started, 4.0)
             self.assertNotIn("Traceback", output)
             self.assertTrue(self.result.exists())
@@ -682,6 +704,20 @@ class CopyWatchProcessTests(unittest.TestCase):
 
     def test_parent_killed_stops_a_running_copy(self) -> None:
         self.assert_parent_loss_stops_watcher(running_copy=True)
+
+    def test_parent_already_exited_before_watcher_initializes(self) -> None:
+        self.assert_parent_loss_stops_watcher(running_copy=False, before_start=True)
+
+    def test_missing_parent_pid_is_an_argument_error(self) -> None:
+        arguments = self.watcher_arguments()
+        index = arguments.index("--parent-pid")
+        del arguments[index:index + 2]
+        errors = io.StringIO()
+        with mock.patch("sys.stderr", errors), self.assertRaises(SystemExit) as failure:
+            _ = copy_watch.parser().parse_args(arguments[2:])
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("--parent-pid", errors.getvalue())
+        self.assertFalse(self.result.exists())
 
 
 if __name__ == "__main__":

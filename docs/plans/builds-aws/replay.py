@@ -1,8 +1,12 @@
 """Phase 0 replay: natedev's memory queue with and without an AWS box (scratch analysis)."""
 import heapq, sqlite3, statistics, sys
 from collections import defaultdict
+from pathlib import Path
 
-DB = "/home/natepiano/.local/state/buildlog/index.sqlite"
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from scripts.buildlog.index import index_path
+
+DB = index_path()
 SINCE = "2026-10-24T00:00:00Z"
 TICK = 5.0
 GIB = 1073741824.0

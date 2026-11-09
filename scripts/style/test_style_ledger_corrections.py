@@ -2,27 +2,29 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import ticket_owner_id
+
 import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import cast, final
 
-import rules
-import style_ledger
-from ledger_test_support import LedgerTestCase
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.ledger_test_support import LedgerTestCase
 
 
 @final
 class HeldCellCorrectionTests(LedgerTestCase):
-    ticket = "names-1"
+    ticket = "1"
 
     def correction_fixture(self, *, hold: bool = True, merge: bool = True) -> tuple[str, str, Path]:
         rule = self.rule("correction")
         path = self.sources[0]
         with self.ledger() as ledger:
             ledger.set_tip(self.initial_tip, "main")
-            ledger.ticket_add(self.ticket, "names", "read", "names", "crates/alpha", [path], [rule])
+            ledger.ticket_add(self.ticket, ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
             ledger.ticket_assign(self.ticket, "main")
             _ = ledger.ticket_base(self.ticket)
             ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket=self.ticket, worker="judge")
@@ -44,7 +46,8 @@ class HeldCellCorrectionTests(LedgerTestCase):
         return result.stdout + result.stderr
 
     def start_judgment(self, ledger: style_ledger.Ledger, rule: str, path: str, ticket: str, family: rules.Family = "names") -> str:
-        ledger.ticket_add(ticket, ticket.rsplit("-", 1)[0], "read", family, "crates/alpha", [path], [rule])
+        owner = "first-clean-" + str(int(ticket) - 50000) if ticket in ("50001", "50002") else "judge"
+        ledger.ticket_add(ticket, ticket_owner_id(owner), "read", family, "crates/alpha", [path], [rule])
         ledger.ticket_assign(ticket, "main")
         _ = ledger.ticket_base(ticket)
         return ticket
@@ -53,7 +56,7 @@ class HeldCellCorrectionTests(LedgerTestCase):
         rule = self.rule("open")
         with self.ledger() as ledger:
             ledger.set_tip(self.initial_tip)
-            ticket = self.start_judgment(ledger, rule, self.sources[0], "judge-1")
+            ticket = self.start_judgment(ledger, rule, self.sources[0], "4001")
             first = ledger.hold(rule, self.sources[0], 1, "first", "restructure", "before", "after", self.blob(rule), ticket)
             second = ledger.hold(rule, self.sources[0], 2, "second", "restructure", "before", "after", self.blob(rule), ticket)
             ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "held", ticket=ticket)
@@ -74,7 +77,7 @@ class HeldCellCorrectionTests(LedgerTestCase):
                 rule = self.rule(f"first-clean-{index}")
                 path = self.sources[0]
                 ledger.set_tip(self.initial_tip)
-                ticket = self.start_judgment(ledger, rule, path, f"first-clean-{index}-1")
+                ticket = self.start_judgment(ledger, rule, path, str(50000 + index))
                 finding = ledger.hold(rule, path, 1, "required change", "restructure", "before", "after",
                                       self.blob(rule), ticket)
                 if filed:
@@ -93,7 +96,7 @@ class HeldCellCorrectionTests(LedgerTestCase):
                 path = self.sources[0]
                 base = self.git("rev-parse", "HEAD")
                 ledger.set_tip(base)
-                ticket = self.start_judgment(ledger, rule, path, f"judge-{index}")
+                ticket = self.start_judgment(ledger, rule, path, f"{4000 + index}")
                 finding = ledger.hold(rule, path, 1, "required change", "restructure", "before", "after", self.blob(rule), ticket)
                 ledger.record(rule, path, base, self.blob(rule), "held", ticket=ticket)
                 ledger.ticket_drop(ticket)
@@ -121,7 +124,7 @@ class HeldCellCorrectionTests(LedgerTestCase):
         rule = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
         with self.ledger() as ledger:
             ledger.set_tip(self.initial_tip)
-            ticket = self.start_judgment(ledger, rule, "crates/alpha", "judge-1", "modules")
+            ticket = self.start_judgment(ledger, rule, "crates/alpha", "4001", "modules")
             finding = ledger.hold(rule, self.sources[0], 1, "split", "restructure", "before", "after", self.blob(rule), ticket)
             ledger.record(rule, "crates/alpha", self.initial_tip, self.blob(rule), "held", ticket=ticket)
             before = ledger.database.read_bytes()
@@ -177,6 +180,7 @@ class HeldCellCorrectionTests(LedgerTestCase):
     def test_preview_reads_the_previous_schema_without_migration_or_writes(self) -> None:
         rule, path, database = self.correction_fixture()
         with closing(sqlite3.connect(database)) as connection, connection:
+            _ = connection.execute("DROP TABLE ticket_counter")
             _ = connection.execute("DROP TABLE held_cell_corrections")
             _ = connection.execute("DROP TABLE rename_dispositions")
             _ = connection.execute("DROP TABLE rename_outer_binding_blocks")

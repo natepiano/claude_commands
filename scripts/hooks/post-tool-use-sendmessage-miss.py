@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Point a failed native name lookup to send.py without sending or blocking."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
 import re
 import shlex
 import sys
-from pathlib import Path
 from typing import cast
 
 
@@ -41,12 +44,11 @@ def main() -> None:
                 or not re.match(rf"No agent named ['\"]{re.escape(name)}['\"] is reachable\.", message)):
             return
 
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import roster
-        import send
+        from scripts.message import roster
+        from scripts.message import send
         from scripts.production import staff
-        import sessions
-        from relay_identity import RelayIdentity, live_relay_identity, message_sender_name, relay_senders_directory
+        from scripts.message import sessions
+        from scripts.message.relay_identity import RelayIdentity, live_relay_identity, message_sender_name, relay_senders_directory
 
         membership = staff.snapshot()
         observed = roster.roster(os.environ, roster.ThisMachine(), membership=membership)

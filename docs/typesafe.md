@@ -1,6 +1,6 @@
 # TypeSafe here
 
-Use this guide from `~/.claude`. Ask `typesafe-unit` for anything it does not cover.
+Use this guide from `~/.claude`. Ask `typesafe` for anything it does not cover.
 
 ## Access and data
 
@@ -131,7 +131,7 @@ print("reservations USD", client._pending(p.with_suffix(".pending.json")))
 PY
 ```
 
-Reconcile billed but unrecorded requests with `typesafe-unit` first; keep unresolved reservations. For a confirmed stale reservation, replace `STALE_ID` below with its UUID. Clear only that entry, under the client's lock and atomic writer:
+Reconcile billed but unrecorded requests with `typesafe` first; keep unresolved reservations. For a confirmed stale reservation, replace `STALE_ID` below with its UUID. Clear only that entry, under the client's lock and atomic writer:
 
 ```python
 from scripts.issue_score import client

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Load and prove a worktree's nix environment before starting a process.
 
 Envrc files below ~/rust, ~/worktrees or ~/.claude*, and in linked worktrees
@@ -9,6 +9,10 @@ Other directories keep direnv's explicit approval boundary.
 No envrc means the caller's environment is retained, without running direnv.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import stat
@@ -19,11 +23,6 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from scripts.lib.conf import ConfigRead
-
-if __name__ == "nix_env":
-    _ = sys.modules.setdefault("scripts.lib.nix_env", sys.modules[__name__])
-elif __name__ == "scripts.lib.nix_env":
-    _ = sys.modules.setdefault("nix_env", sys.modules[__name__])
 
 # Internal, one-session handoff from the healer to shutdown restart. These are
 # consumed before opening a pane and never exported to the resumed agent.
@@ -44,11 +43,15 @@ class Refused(NamedTuple):
     reason: str
 
 
+def _remaining_timeout(cap: float) -> float:
+    """Load deadline support only when a subprocess needs a timeout."""
+    from scripts.lib import operation_deadline
+
+    return operation_deadline.remaining(cap)
+
+
 def _settings() -> ConfigRead:
-    if __package__:
-        from . import conf
-    else:
-        import conf  # pyright: ignore[reportImplicitRelativeImport]
+    from scripts.lib import conf
 
     return conf.read("nix_env")
 
@@ -113,14 +116,12 @@ def registered_copy(envrc: Path) -> bool:
         if not stat.S_ISREG(envrc.lstat().st_mode):
             return False
         folder = envrc.parent.resolve(strict=True)
-        repository_root = str(Path(__file__).resolve().parents[2])
-        if repository_root not in sys.path:
-            sys.path.insert(0, repository_root)
         from scripts.lib import copy_record
 
-        if envrc.name != ".envrc" or copy_record.copy_folder(folder) != folder:
+        record_path = copy_record.record_path(folder)
+        if envrc.name != ".envrc" or record_path is None:
             return False
-        record = copy_record.read_record(folder / copy_record.RECORD)
+        record = copy_record.read_record(record_path)
         if not isinstance(record, copy_record.Registered):
             return False
         source_path = record.fields.get("source_path")
@@ -134,12 +135,26 @@ def registered_copy(envrc: Path) -> bool:
         environment = _git_environment()
         expected = subprocess.run(
             ["git", "rev-parse", "--verify", "--end-of-options", f"{source_commit}:.envrc"],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=timeout, check=True)
+            cwd=source, env=environment, capture_output=True, text=True, timeout=_remaining_timeout(timeout), check=True)
         actual = subprocess.run(
             ["git", "hash-object", "--no-filters", "--", str(folder / ".envrc")],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=timeout, check=True)
+            cwd=source, env=environment, capture_output=True, text=True, timeout=_remaining_timeout(timeout), check=True)
         return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def generated_source(root: Path) -> bool:
+    """Accept a scratch record that marks files written by our code."""
+    try:
+        folder = root.resolve(strict=True)
+        from scripts.lib import copy_record
+
+        if folder.parent != copy_record.root().resolve():
+            return False
+        record = copy_record.read_record(folder / copy_record.RECORD)
+        return isinstance(record, copy_record.Registered) and record.fields.get("generated_source") is True
+    except (OSError, ValueError, RuntimeError):
         return False
 
 
@@ -178,7 +193,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         try:
             for command in commands:
                 result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                                        text=True, timeout=timeout, check=False)
+                                        text=True, timeout=_remaining_timeout(timeout), check=False)
                 if result.returncode:
                     reason = last_line(result.stderr, f"direnv exit {result.returncode}")
                     if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
@@ -228,6 +243,8 @@ def main(arguments: list[str]) -> int:
         print(json.dumps(outcome.env))
         return 0
     if len(arguments) >= 2 and arguments[0] == "exec":
+        from scripts.lib.models_registry import agent_environment
+
         program = arguments[1]
         if not Path(program).is_absolute():
             print("nix_env: exec requires an absolute program path", file=sys.stderr)
@@ -241,7 +258,7 @@ def main(arguments: list[str]) -> int:
         else:
             _ = outcome.env.pop("NIX_ENV_ENVRC", None)
         try:
-            os.execvpe(program, arguments[1:], outcome.env)
+            os.execvpe(program, arguments[1:], agent_environment(outcome.env))
         except OSError as error:
             print("nix_env: " + last_line(str(error), type(error).__name__), file=sys.stderr)
             return 1

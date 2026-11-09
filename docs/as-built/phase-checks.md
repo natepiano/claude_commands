@@ -1,14 +1,13 @@
 # Phase checks
 
-**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of seven checks: the assertion guard, cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each check has one place in the phase. Lint can repeat clippy and fmt to apply multiply-add repairs. The phase's workers fix the remaining failures. Run end does not repeat lint or style review. Each Cargo checkpoint needs its rustdoc pass. There is no separate `/clippy` skill.
+**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of six checks: cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each check has one place in the phase. Lint can repeat clippy and fmt to apply multiply-add repairs. The phase's workers fix the remaining failures. Run end does not repeat lint or style review. Each Cargo checkpoint needs its rustdoc pass. There is no separate `/clippy` skill.
 
 ## How it works
 
-**The seven checks** (defined in `docs/direct/phase_checks.md`)
+**The six checks** (defined in `docs/direct/phase_checks.md`)
 
 | Check | Runs in | Over |
 | --- | --- | --- |
-| assertion guard (`scripts/direct/assertion_guard.py`) | the first stage of every `verify.sh lint`, and the checkpoint commit hook | `.rs` and `.py` changes against explicit bases or the newer upstream/production merge-branch base (nearest remote without upstream), plus independent merged-in parents throughout the judged history and pending merge heads for staged changes; findings must appear against every base; uniquely bound same-file bare `const` names pair outside nested macros (also range-pattern endpoints in the second trusted `matches!` argument) for exact `&str`/`&'static str` string, char or bool literals, or unsigned numeric spelling with a proven matching primitive type (suffix, or default i32/f64); Rust binding renames pair only when the whole test has equal tokens under one unique name map, including every initializer. The proof reads plain `let` and single-name `for` declarations. Each renamed read must remain within its binding scope. Nested blocks and line wrapping retain the proof. Bare `vec!` arguments and the first `matches!` argument can contain proved reads. Changed checks, literals, macros or removed assertions still produce reports. Shadowing, other patterns, parameters, format captures, observing macros, member names, paths, types and ambiguous maps refuse the proof; glob census only refuses names; non-ASCII code, raw identifiers, extern-crate aliases, incomplete macro paths, trusted macro-name imports, `macro_use`, definitions and untrusted item/statement macros refuse pairing; other typed bindings, byte strings, imports, statics and qualified paths stay written |
 | cargo mend `--fix` | the workers' last `verify.sh lint` | the workspace |
 | fmt (nightly) | the same `lint` | the named package plus every member that differs from HEAD |
 | taplo fmt `--check` | the same `lint` | the workspace TOML, run from the cargo workspace root |
@@ -16,13 +15,21 @@
 | rustdoc `-D warnings` | `verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace |
 | style review | the reviewer worker assigned by `<ReviewPromptContract/>` | the phase range selected under `<ReviewPromptContract/>` |
 
-`verify.sh lint` runs its stages in this order: assertion guard, mend, fmt, taplo, clippy. The assertion guard reads one `git diff -U0` and the commit messages from the base, and reports removed, weaker, changed (a note that does not block), test removed and test turned off; it judges a multi-line assertion as one whole statement and ignores whitespace, so a reflow or a move is no finding. A finding blocks unless an `Assertion-Change: <path>::<test> — <why>` line in the run's work orders (`UNIT_SESSION_DIR`) or a commit message names it. It takes about 0.5 s on the 87,000-line cargo-liner-tile checkpoint e21d5b93. On that checkpoint it reports 73 blocking findings, four of them weaker, among them `draw.rs:2644`; `grep -e weaker -e blocking` on its output keeps only the weaker lines and the total. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
-
-Use `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted` beside the per-test form.
-This form covers deleted tests with the same prefix in that path.
-The prefix rules only `test removed` findings.
-It does not rule assertions in tests that remain.
-A prefix that matches no removed test blocks.
+`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy.
+Mend rewrites the code first.
+Fmt formats what mend wrote.
+Clippy judges first.
+A passing judgment skips repairs.
+A failed judgment starts up to three `cargo clippy --fix` and fmt passes, followed by a final judgment.
+Every clippy run in this path uses `--keep-going`.
+`invoke_clippy_fix` removes `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` from cargo's environment on Linux and macOS.
+It sets `--jobs` from `clippy_fix_jobs` in `config/lint.conf`.
+The valid range is 1..9999. Missing or invalid values use 8; invalid values print one warning.
+Plain `invoke_clippy` keeps the shared build pool.
+Fix steps keep memory admission, lint gating and build log records, including the `--fix` argument.
+The director runs workspace rustdoc through `verify.sh doc` after staging, immediately before the checkpoint commit.
+The checkpoint requires its pass record for the exact tree.
+[Lint-step fix](build-followups-mul-add.md#lint-step-fix) defines the pass rules.
 
 **Files and their roles**
 
@@ -31,7 +38,10 @@ A prefix that matches no removed test blocks.
 - `docs/direct/launch_implementation.md` — the launcher's `phase_reservation.py claim` saves the repository's full `HEAD` id to `${PHASE_DIR}/phase_baseline` and `git status --short` to `${PHASE_DIR}/progress_baseline_status` on the first launch, before the worker opens; a git failure stops the launch. Later launches, including repairs and reopened phases, keep both baselines. Ad hoc work uses `${SESSION_DIR}/phases/adhoc`.
 - `docs/direct/dual_review.md` — `<ReviewPromptContract/>` owns the style assignment's completion and retry rules, baseline and artifact paths. It assigns a reviewer until the phase result returns, including after cancellation. The director reads the findings ledger and reported result.
 - `docs/direct/write_prompt_contract.md` — item 2 keeps implementation, fix and test workers from loading the guide; reviewer prompts follow `<ReviewPromptContract/>`. Item 6 supplies the repair rules.
-- `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract, names `verify.sh lint` in VerificationContract as the phase lint checks under `<PhaseChecks/>`, and runs the step at ExecutionSteps step 6 (`<PhaseChecks/>` at `<DualReview/>`). It also holds `<FixDispatch/>`, `<FinalGate/>`, and the RunSummary `**Style review:**` line (each phase's reviewed range and result).
+- `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract and runs it at ExecutionSteps step 6, within `<DualReview/>`.
+- `docs/direct/verification.md` — VerificationContract names `verify.sh lint` as the phase lint checks under `<PhaseChecks/>`.
+- `docs/direct/repair_rounds.md` — holds `<FixDispatch/>`.
+- `docs/direct/final_gate_commit.md` — holds `<FinalGate/>` and the RunSummary `**Style review:**` line, which records each phase's reviewed range and result.
 - `scripts/lint/style_review.py` and `config/review/style.md` — the shared input/report runner and its one read-only assignment template.
 - `scripts/direct/verify.sh` — the `lint`, `doc` and `final` arms. There is no `fmt` arm.
 - `config/lint.conf` and `scripts/lint/lint_config.sh` — the on/off switches.
@@ -46,6 +56,11 @@ the report and completion state; the reviewer returns text and never writes
 files. `<ReviewPromptContract/>` defines phase paths and retries.
 
 **How findings flow**
+
+Broad review runs `adversary`, `contract`, and armed `rerun` lenses.
+The [daily simplify run](simplify-lens.md) starts after the code ready notice.
+Its held items stay outside repair batches.
+The contract reviewer retains the style assignment.
 
 - The reviewer includes style violations in its normal findings summary. `<Synthesize/>` confirms, deduplicates and opens them with `--caught-by worker --lens contract`, using the same severity gate and closure process as code findings. The reviewer does not write the ledger.
 - A lint failure is fixed by the worker that ran `lint`, before it reports done.
@@ -75,13 +90,14 @@ files. `<ReviewPromptContract/>` defines phase paths and retries.
 
 ## Invariants
 
-- Each of the seven checks runs at the place `<PhaseChecks/>` names. The lint check owns its multiply-add repair rounds and the format and judgment that follow them.
+- Each of the six checks runs at the place `<PhaseChecks/>` names.
+  The lint check owns its multiply-add repairs and the format and judgment that follow them.
 - After the last phase, lint and style review do not repeat: `verify.sh final` stays check plus tests, `verify.sh` has no `fmt` arm, and `<FinalGate/>`, `<FinalGateCommit/>` and `/unit:checkpoint` do not lint, reformat or style-review. Each later Cargo checkpoint still needs its rustdoc pass.
 - `config/review/style.md` is the one reviewer protocol. Callers use the shared preparer and never restate its steps.
 - The assigned reviewer owns phase style review; the director, implementation, fix and test workers do not load the guide. The reviewer loads it once per applicable phase under `<StyleReview/>`.
 - A contract file stays the one definition of its tag. Call sites name `<PhaseChecks/>` and `<StyleReview/>` and never restate them.
 - An off check reports `Off`, never clean, and no replacement check runs.
-- A cargo mend `--fix` rollback is a hard stop. `verify.sh` names it (and points at `/mend_fix`), and the repair prompt says to stop and keep the tree for inspection.
+- A cargo mend `--fix` rollback is a hard stop. `verify.sh` names the rollback. The repair prompt says to stop and keep the tree for inspection.
 - `lint` reruns only after a repair changes the tree.
 - An invalid baseline or failed diff leaves style owed; code review still runs.
 - Phase prompts never call `verify.sh final`, raw cargo, or their own cargo flags.

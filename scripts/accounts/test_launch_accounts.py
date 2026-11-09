@@ -441,9 +441,9 @@ def session_launch(identity: str):
     def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
         for path, source in (
                 ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
-                ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
-                 + 'open_window claude -n "$session_name" /berth_fix'),
-                ("agents/agent_bg.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
+                ("fixtures/window-launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /fixture\n'
+                 + 'open_window claude -n "$session_name" /fixture'),
+                ("fixtures/background.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
             with self.subTest(path=path):
                 self.assertTrue(any("no resolved account" in problem
                                     for problem in shell_launch_account_violations(source, path)))
@@ -453,7 +453,7 @@ def session_launch(identity: str):
 claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
 subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
 '''
-        self.assertEqual(shell_launch_account_violations(source, "direct/implement.sh"), [])
+        self.assertEqual(shell_launch_account_violations(source, "direct/assign_claude.py"), [])
 
     def test_shell_launchers_do_not_pick_or_set_an_unresolved_account(self) -> None:
         for arguments in ("--print prompt", "-p prompt", "prompt", ""):

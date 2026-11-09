@@ -5,7 +5,7 @@ import type { PaneState } from "../types";
 import type { BoardData, BoardPhase, BoardTime } from "../types/board";
 
 export const NOW = Date.UTC(2026, 9, 16, 18, 0);
-export const BOARD = "/test-state/unit-board/show.json";
+export const BOARD = "/test-state/unit-board/00000000-0000-4000-8000-000000000001.json";
 export const RUN = "/history/runs/current.jsonl";
 export const DISCOVERY = "/history/runs";
 export const REGISTRY = "/test-home/.local/state/notifier";
@@ -30,7 +30,7 @@ export function fixture(): BoardData {
   const open = phase("2", "open");
   open.start = time(-60, "17:00");
   return { production: "show", as_of: time(0, "18:00"), zone: "America/New_York",
-    utc_offset_minutes: -240, sources: [RUN, DISCOVERY], units: [{
+    utc_offset_minutes: -240, live: false, sources: [RUN, DISCOVERY], units: [{
       key: "alpha", plan: "plan.md", state: "running", phase: { kind: "plan", id: "2", of: 3, title: "Delivery 2" },
       phases: [done, open, phase("3", "todo")], finish: { kind: "predicted", at: time(42, "18:42") },
       stage: "Repair round 2", summary: "Finishing the retry path",
@@ -95,7 +95,7 @@ export function engineFiles(on: On) {
       return { value: { exitCode: 1, stdout: "", stderr, isStdoutTruncated: false, isStderrTruncated: false } };
     }
     const paths = boards.map((board, index) => {
-      const path = index === 0 ? BOARD : `/test-state/unit-board/${board.production}.json`;
+      const path = index === 0 ? BOARD : `/test-state/unit-board/00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}.json`;
       files.set(path, JSON.stringify(board));
       mtimes.set(path, clock.now());
       return path;

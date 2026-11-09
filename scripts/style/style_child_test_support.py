@@ -10,8 +10,8 @@ import tempfile
 from typing import Unpack, cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import queue_place
+from scripts.lint.memory_test_support import admission_configuration_fixture
 
 
 @final
@@ -37,7 +37,8 @@ class UnqueuedStylePlace:
         if self.real_startup:
             sidecar = Path(self.storage.name) / "program.cgroup"
             _ = sidecar.write_text("")
-            place = queue_place.QueuePlace(Path(self.storage.name) / "private.reservation", sidecar)
+            place = queue_place.QueuePlace(Path(self.storage.name) / "private.reservation", sidecar,
+                                           configuration=admission_configuration_fixture())
             self.startups.append(place)
             def started() -> None:
                 self.before_started()
@@ -79,16 +80,20 @@ class StyleQueueFake:
         self.real_startup: bool = False
         self.before_started: Callable[[], None] = lambda: None
         self.calls: list[tuple[str, Path]] = []
+        self.batch_calls: list[tuple[tuple[str, ...], bool]] = []
         self.refusals: dict[str, str] = {}
         self.places: list[UnqueuedStylePlace] = []
         self.before_start: Callable[[Path, Sequence[str]], None] = lambda _repo, _arguments: None
         self.after_close: Callable[[], None] = lambda: None
 
     @contextmanager
-    def __call__(self, program: str, repo: Path) -> Generator[queue_place.QueuePlace]:
-        self.calls.append((program, repo))
-        if program in self.refusals:
-            raise queue_place.QueuePlaceRefused(self.refusals[program])
+    def __call__(self, program: str | Sequence[str], repo: Path, *, batch: bool = False) -> Generator[queue_place.QueuePlace]:
+        arguments = (program,) if isinstance(program, str) else tuple(program)
+        name = Path(arguments[0]).name
+        self.calls.append((name, repo))
+        self.batch_calls.append((arguments, batch))
+        if name in self.refusals:
+            raise queue_place.QueuePlaceRefused(self.refusals[name])
         place = UnqueuedStylePlace(repo, self.before_start, self.real_startup, self.before_started)
         self.places.append(place)
         try:
@@ -110,13 +115,12 @@ def style_cli_command(script: Path, *arguments: str) -> list[str]:
     """Use the same queue fake in a child Python interpreter."""
     bootstrap = (
         "import runpy, sys; "
-        f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
-        "from style_child_test_support import unqueued_style_children; "
+        "from scripts.style.style_child_test_support import unqueued_style_children; "
         "sys.argv = sys.argv[1:]\n"
         "with unqueued_style_children():\n"
         "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
     )
-    return [sys.executable, "-c", bootstrap, str(script), *arguments]
+    return [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", bootstrap, str(script), *arguments]
 
 
 def install_refusal_tools(root: Path) -> None:

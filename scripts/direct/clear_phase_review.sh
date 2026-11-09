@@ -39,6 +39,36 @@ FILES=(
   "${SESSION_DIR}/phases/${PHASE_ID}"/ux_shots_*
 )
 
+
+# Select reviewers from staff before removing their phase files.
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+while IFS= read -r worker; do
+  FILES+=(
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_status"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_pid"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_summary"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_reply"*
+    "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_agent"*.log
+  )
+done < <("${SCRIPT_DIR}/../lib/py" - "${SESSION_DIR}" "${SCRIPT_DIR}/../.." <<'PYTHON'
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[2]).resolve()))
+from scripts.direct import progress_history
+from scripts.production import staff, worker_admission
+
+os.environ["UNIT_RUN_DIR"] = sys.argv[1]
+record = staff.local_snapshot()
+parent = worker_admission.parent(record, run=Path(sys.argv[1]))
+for row in record.find(kind="worker", parent=parent.id):
+    dispatch = progress_history.last_dispatch(row.id)
+    if isinstance(dispatch, progress_history.RecordedDispatch) and dispatch.role == "review":
+        print(row.name)
+PYTHON
+)
+
 if ((${#FILES[@]})); then
   rm -f -- "${FILES[@]}"
 fi

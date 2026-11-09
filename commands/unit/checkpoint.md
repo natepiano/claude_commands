@@ -121,7 +121,7 @@ Loop/verbose only:
    or `held` at the unit's HEAD and no tracked diff, make no commit. Capture
    `git rev-parse HEAD` once and require
    `git merge-base --is-ancestor <captured HEAD> refs/heads/<style merge branch>`.
-   The standing-unit fast-forward exception in `docs/production_format.md`
+   The standing fast-forward exception in `docs/production_format.md`
    item 5 keeps HEAD on the style merge branch's history after a phase-start sync.
    On failure, report one line to the style showrunner and leave the ticket
    assigned until it answers. On success, from `Active`, replace the durable
@@ -222,12 +222,17 @@ Loop/verbose only:
    session). Example:
    `Change-Review: The unit board shows each unit's phase | In a showrunner session on natedev, type /showrunner:unit_board | Each row has a Phase column`.
    A line without all three parts is refused.
+   Add ` | after <step>` as a fourth field when the change needs a rebuild, restart or deploy.
+   Example: `Change-Review: The service shows review links | Open the review page | The links appear | after restart`.
+   The session that completes the step runs the printed `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>` command.
    A change the user can check outside the app counts as visible too: a
    table's columns, a status line, a command's output.
    A hook refuses the commit without it and the merge refuses the checkpoint;
-   the merge turns each visible line into a row on the change-review list.
+   `list_ready` adds each ready line after the merge reaches `origin/main` and the final promotion step succeeds.
+   A line with `after <step>` waits for `live`.
+   The command requires both arguments and releases only the named step.
 
-   After every successful checkpoint commit, enrolled or not, run `python3 ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
+   After every successful checkpoint commit, enrolled or not, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
    A failed commit is an unsuccessful ending: do not invoke release, leave
    `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of
@@ -337,8 +342,8 @@ Loop/verbose only:
    `Checkpoint <short hash> — phase N: <title>.` with its push note, if any.
    This report follows successful release when the phase was active.
 9. In a production unit, run
-   `python3 ~/.claude/scripts/direct/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
-   and `python3 ~/.claude/scripts/direct/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
+   and `~/.claude/scripts/lib/py ~/.claude/scripts/direct/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
    and keep both lines for <ProductionUnit/> item 3's checkpoint notice.
 </CheckpointCommit>
 

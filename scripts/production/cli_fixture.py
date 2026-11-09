@@ -14,12 +14,25 @@ import signal
 import shutil
 import subprocess
 import sys
+import unittest
 from types import ModuleType
 from typing import cast
 from unittest.mock import patch
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def process_boundary[**P](test: Callable[P, None]) -> Callable[P, None]:
+    """Keep this test at the process boundary after a rename."""
+    setattr(test, "process_boundary", True)
+    return test
+
+
+def process_boundary_for_case(case: unittest.TestCase) -> bool:
+    """Read the process requirement from the current test method."""
+    method: object = getattr(type(case), case._testMethodName, None)
+    return getattr(method, "process_boundary", False) is True
+
 
 class _Parsed(Exception):
     """Stop a real CLI immediately after argument parsing."""
@@ -47,8 +60,9 @@ def parse_arguments(main: Callable[[list[str]], int], arguments: list[str]) -> a
 @contextmanager
 def production_paths(environment: Mapping[str, str]) -> Generator[None]:
     """Bind source readers to the same fixture paths for direct and CLI calls."""
-    import dailies_render
+    from scripts.production import dailies_render
     from scripts.production import showrunners
+    from scripts.message import session_send
     from scripts.whoami import note_file
 
     home = Path(environment.get("HOME", str(Path.home())))
@@ -67,7 +81,7 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
             "SESSIONS": Path(environment.get("SHOWRUNNERS_SESSIONS") or
                              str(Path(showrunners.__file__).parents[1] / "message/sessions.py")),
             "SEND": Path(environment.get("SHOWRUNNERS_SEND") or
-                         str(Path(showrunners.__file__).parents[1] / "message/send.py")),
+                         str(session_send.SEND_SCRIPT)),
         }.items():
             _ = scope.enter_context(patch.object(showrunners, name, value))
         yield
@@ -86,7 +100,7 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
     # patch.object will then restore caller paths rather than fixture paths.
     if production_state:
         with patch.object(sys, "path", sys.path.copy()):
-            _ = import_module("dailies_render")
+            _ = import_module('scripts.production.dailies_render')
             _ = import_module("scripts.production.showrunners")
 
     before = vars(module).copy()

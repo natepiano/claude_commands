@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Review phone drafts; keep one owner for delivery of a held push."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -18,24 +22,24 @@ import time
 import threading
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
 
-import reply_asks
-import push_texts
+from scripts.notify import reply_asks
+from scripts.notify import push_texts
+from scripts.notify import push_reference
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-import nix_env
+from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
+from scripts.lib import nix_env
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
 
 if TYPE_CHECKING:
-    from ..accounts import accounts
+    from scripts.accounts import accounts
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path.home() / ".local/state/notify"
@@ -107,6 +111,7 @@ class Draft:
     answerable: bool
     session: NotificationSession = NO_SESSION_LINE
     due: str = ""
+    reference: push_reference.PushReference = field(default_factory=lambda: push_reference.NO_REFERENCE)
 
 
 @dataclass(frozen=True)
@@ -234,12 +239,12 @@ Verdict = Approved | Rewritten | Questions | Failed | Withheld
 
 @dataclass(frozen=True)
 class QuestionKey:
-    slug: str
+    name: str
     text: str
 
     @property
     def digest(self) -> str:
-        return hashlib.sha256((self.slug + self.text).encode()).hexdigest()[:16]
+        return hashlib.sha256((self.name + self.text).encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -343,6 +348,7 @@ ClaimDelivery = ClaimSent | ClaimCancelled | ClaimFailed
 
 
 class MessageRecord(TypedDict):
+    reference: NotRequired[push_reference.PushReference]
     session: NotRequired[str]
     title: str
     action: str | None
@@ -460,6 +466,8 @@ def switched_off() -> bool:
 def message_record(draft: Draft) -> MessageRecord:
     action = draft.action.text if isinstance(draft.action, ActionRequired) else None
     record: MessageRecord = {"title": draft.title, "action": action, "body": draft.body}
+    if draft.reference["kind"] != "none":
+        record["reference"] = draft.reference
     if isinstance(draft.session, SessionLine):
         record["session"] = draft.session.text
     return record
@@ -523,7 +531,8 @@ def _draft(value: object) -> Draft:
         raise ValueError("priority")
     return Draft(_text(record, "source"), priority, _text(record, "title"),
                  _action(record), _text(record, "body"), answerable, _session(record),
-                 _text(record, "due") if "due" in record else "")
+                 _text(record, "due") if "due" in record else "",
+                 push_reference.read_reference(record.get("reference")))
 
 
 def length_failures(draft: Draft) -> list[str]:
@@ -651,8 +660,6 @@ def validate(value: object, draft: Draft, revision: bool,
 
 def reviewer_environment() -> tuple[dict[str, str], str]:
     # Import the shared account modules from this checkout, not the writer's login.
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
     environment = dict(os.environ)
@@ -756,7 +763,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         loaded = nix_env.ensure(Path.cwd(), environment)
         if isinstance(loaded, nix_env.Refused):
             return Unreviewed(loaded.reason, details())
-        environment = loaded.env
+        from scripts.lib.models_registry import agent_environment
+
+        environment = agent_environment(loaded.env)
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
             return Unreviewed(f"reviewer exit {result.returncode}", details())
@@ -834,7 +843,7 @@ def review_question(key: QuestionKey, question: str, revision: bool = False, *,
         raise ValueError("question needs nonempty text")
     path = state_path() / "questions" / f"{key.digest}.json"
     context = QuestionReview(key)
-    draft = Draft(key.slug, "0", "", NoActionRequired(), question, False)
+    draft = Draft(key.name, "0", "", NoActionRequired(), question, False)
     timeout = review_timeout_seconds()
     outcome = _review(draft, revision or path.exists(), runner, context, timeout_seconds=timeout)
     log_review(draft, outcome, sample=context)
@@ -858,7 +867,7 @@ def review_question(key: QuestionKey, question: str, revision: bool = False, *,
     else:
         result = QuestionReviewFailed(question, tuple(outcome.failed_rules), outcome.failures)
     if isinstance(result, (QuestionAwaitingFacts, QuestionReviewFailed)):
-        record = QuestionHoldRecord(slug=key.slug, text=key.text, question=question,
+        record = QuestionHoldRecord(slug=key.name, text=key.text, question=question,
                                     details=list(result.questions if isinstance(result, QuestionAwaitingFacts) else result.details))
         path.parent.mkdir(parents=True, exist_ok=True)
         scratch = path.with_suffix(".tmp")
@@ -1172,7 +1181,7 @@ class PushChannel(Protocol):
 
 
 def push_channel() -> PushChannel:
-    return cast(PushChannel, cast(object, importlib.import_module("pushover")))
+    return cast(PushChannel, cast(object, importlib.import_module('scripts.notify.pushover')))
 
 
 def expiry_post(url: str, data: bytes) -> tuple[int, bytes]:
@@ -1334,20 +1343,20 @@ class QuestionRegistration(TypedDict):
     question: NotRequired[str]
 
 
-def registered_questions(since: datetime) -> list[str]:
+@dataclass(frozen=True)
+class QuestionRegistrationsIncomplete:
+    reason: str
+
+
+def registered_questions(since: datetime) -> list[str] | QuestionRegistrationsIncomplete:
     """Read outstanding questions and registrations made within the sample window."""
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    questions: list[str] = []
-    sys.path.insert(0, str(ROOT))
     question_store = importlib.import_module("scripts.production.update_registration")
     read_fields = cast(Callable[[], Sequence[Mapping[str, str]]], question_store.read_all_open_fields)
-    for fields in read_fields():
-        for field in ("text", "reviewed", "question"):
-            text = fields.get(field)
-            if isinstance(text, str) and text.strip():
-                prose = reply_asks.question_prose(text)
-                if prose:
-                    questions.append(prose)
+    try:
+        records: list[Mapping[str, object]] = list(read_fields())
+    except OSError as error:
+        return QuestionRegistrationsIncomplete(str(error))
     for path in (root / "outstanding").glob("*.history.jsonl"):
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
@@ -1356,18 +1365,14 @@ def registered_questions(since: datetime) -> list[str]:
         for line in lines:
             try:
                 record = _object(cast(object, json.loads(line)))
-                registration = QuestionRegistration(time=_text(record, "time"), text=_text(record, "text"))
-                stamp = datetime.fromisoformat(registration["time"].replace("Z", "+00:00"))
-                if stamp.tzinfo is not None and stamp >= since and registration["text"].strip():
-                    for field in ("text", "reviewed", "question"):
-                        text = record.get(field)
-                        if isinstance(text, str) and text.strip():
-                            prose = reply_asks.question_prose(text)
-                            if prose:
-                                questions.append(prose)
+                stamp = datetime.fromisoformat(_text(record, "time").replace("Z", "+00:00"))
+                if stamp.tzinfo is not None and stamp >= since and _text(record, "text").strip():
+                    records.append(record)
             except ValueError:
                 continue
-    return questions
+    return [prose for fields in records for field in ("text", "reviewed", "question")
+            if isinstance(text := fields.get(field), str) and text.strip()
+            and (prose := reply_asks.question_prose(text))]
 
 
 def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
@@ -1383,14 +1388,18 @@ def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
             print(f"review: cannot read transcript {path}: {error}", file=sys.stderr)
             unreadable += 1
     registered = registered_questions(cutoff)
+    if isinstance(registered, QuestionRegistrationsIncomplete):
+        print(f"review: question registrations incomplete: {registered.reason}", file=sys.stderr)
     eligible: list[TranscriptReply] = []
     unregistered = 0
     for reply in replies:
         asks = reply_asks.reply_questions(reply.text)
-        if asks.sentences:
+        if (asks.sentences or asks.has_choices) and isinstance(registered, QuestionRegistrationsIncomplete):
+            continue
+        if asks.sentences and isinstance(registered, list):
             unregistered += int(any(not any(question in item or item in question for item in registered)
                                     for question in asks.sentences))
-        elif asks.has_choices:
+        elif asks.has_choices and isinstance(registered, list):
             unregistered += int(not any(item in reply_asks.question_prose(reply.text) for item in registered))
         else:
             eligible.append(reply)
@@ -1461,7 +1470,7 @@ def text_approvals(value: object) -> dict[str, dict[str, TextApproval]]:
 
 def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_process,
           authority: TextApprovalAuthority = REVIEWER_APPROVAL_REQUIRED) -> int:
-    import push_texts
+    from scripts.notify import push_texts
     if isinstance(authority, UserSpecifiedText) and (not approve or not authority.source.strip()):
         raise ValueError("a user spec requires --approve and a nonempty source")
     entries = push_texts.catalog()
@@ -1507,13 +1516,13 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
 
 
 def list_texts() -> int:
-    import push_texts
+    from scripts.notify import push_texts
     print(push_texts.listing(push_texts.catalog()))
     return 0
 
 
 def show_text(text_id: str) -> int:
-    import push_texts
+    from scripts.notify import push_texts
     entries = push_texts.catalog()
     for entry in entries:
         if entry.id == text_id:

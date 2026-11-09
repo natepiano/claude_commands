@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import tempfile
@@ -13,8 +14,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import store
-from test_index import use_test_log
+from scripts.buildlog import store
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
@@ -25,6 +26,55 @@ class StoreTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
+
+    def test_locked_rows_read_whole_objects_from_the_offset_and_ignore_an_absent_file(self) -> None:
+        path = self.root / "history.jsonl"
+        self.assertEqual(list(store.locked_rows(path)), [])
+        path.parent.mkdir(parents=True)
+        first = b'{"id":"first"}\n'
+        damaged = b'broken\nnull\n[]\n{"id":"\xff"}\n'
+        _ = path.write_bytes(first + damaged + b'{"id":"last"}\n{"id":"unfinished"}')
+        for start, expected in ((0, [{"id": "first"}, {"id": "last"}]),
+                                (len(first), [{"id": "last"}]),
+                                (2, [{"id": "last"}]),
+                                (path.stat().st_size, [])):
+            with self.subTest(start=start):
+                self.assertEqual(list(store.locked_rows(path, start)), expected)
+
+    def test_locked_rows_wait_for_an_appender_then_release_before_decoding(self) -> None:
+        path = self.root / "history.jsonl"
+        path.parent.mkdir(parents=True)
+        flock = fcntl.flock
+        with path.open("wb", buffering=0) as appender:
+            flock(appender.fileno(), fcntl.LOCK_EX)
+            _ = appender.write(b'{"id":"before"}\n')
+
+            def acquire_after_append(fd: int, operation: int) -> None:
+                self.assertEqual(operation, fcntl.LOCK_SH)
+                with self.assertRaises(BlockingIOError):
+                    flock(fd, operation | fcntl.LOCK_NB)
+                _ = appender.write(b'{"id":"after"}\n')
+                flock(appender.fileno(), fcntl.LOCK_UN)
+                flock(fd, operation)
+
+            decode = json.loads
+
+            def decode_without_lock(raw: str | bytes | bytearray) -> object:
+                with path.open("rb") as contender:
+                    flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return cast(object, decode(raw))
+
+            iterator = store.locked_rows(path)
+            try:
+                with mock.patch.object(fcntl, "flock", side_effect=acquire_after_append), \
+                        mock.patch.object(json, "loads", side_effect=decode_without_lock):
+                    self.assertEqual(next(iterator), {"id": "before"})
+                store.append_line(path, {"id": "later"})
+                self.assertEqual(list(iterator), [{"id": "after"}])
+            finally:
+                _ = list(iterator)
+            with path.open("rb") as contender:
+                flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_sample_record_lands_in_separate_host_month_file(self) -> None:
         epoch = datetime(2026, 10, 2, 12, tzinfo=UTC).timestamp()
@@ -99,6 +149,25 @@ class StoreTests(unittest.TestCase):
         store.append_line(path, {"id": "next"})
 
         self.assertEqual(path.read_bytes(), prefix + b'{"id":"next"}\n')
+
+    def test_whole_rows_uses_block_reads_on_an_unbuffered_handle(self) -> None:
+        path = self.root / "history.jsonl"
+        rows = [{"id": index, "text": "Δ" * 80} for index in range(2000)]
+        path.parent.mkdir(parents=True)
+        _ = path.write_bytes(b"".join((json.dumps(row) + "\n").encode() for row in rows))
+
+        class CountingReader(io.FileIO):
+            reads: int = 0
+
+            @override
+            def read(self, size: int | None = -1) -> bytes:
+                self.reads += 1
+                return super().read(size)
+
+        with CountingReader(path, "r") as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            self.assertEqual(list(store.whole_rows(handle, 0)), rows)
+            self.assertLessEqual(handle.reads, 2, "the reader must not read once per byte or row")
 
     def test_short_reads_during_tail_repair_preserve_whole_rows(self) -> None:
         path = self.root / "natedev" / "2026-10.jsonl"

@@ -6,8 +6,8 @@ import statistics
 import unittest
 from dataclasses import replace
 
-from stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
-from turns import Turn
+from scripts.model_study.stats import PRICES, bootstrap_diff, bootstrap_net, label_difference, percentile, request_cost
+from scripts.model_study.turns import Turn
 
 
 EMPTY_TURN = Turn(

@@ -10,8 +10,9 @@ import signal
 import unittest
 from unittest import mock
 from scripts.lib.process_group import send_process_group
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 INJECTED_EDIT_TIMEOUT_SECS = 300
@@ -21,6 +22,9 @@ setUpModule = support.setUpModule
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_a_stopped_switch_leaves_the_registry_alone(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        _ = config.write_text(config.read_text().replace(
+            "quota_edit_timeout_seconds=30", f"quota_edit_timeout_seconds={INJECTED_EDIT_TIMEOUT_SECS}"))
         _ = self.alert([self.note("codex1.md", "active", "0")], self.now)
         # A live descendant holds this pipe until the editor's whole group dies.
         # Without killpg it could still reach the real registry editor later.
@@ -67,7 +71,6 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 return process
 
             with (mock.patch.object(quota_alert, "AGENTS", editor),
-                  mock.patch.object(quota_alert, "EDIT_TIMEOUT", INJECTED_EDIT_TIMEOUT_SECS),
                   mock.patch.object(subprocess, "Popen", side_effect=start_editor)):
                 line = self.refuse()
             self.assertEqual(line, "switch to claude for codex1 failed: agents_set_all_assignments took longer "

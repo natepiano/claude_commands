@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import redirect_stderr
 from functools import cached_property
+import io
 from pathlib import Path
 import shlex
 import shutil
@@ -130,6 +132,69 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.config.read_text(), before)
         self.assertEqual(repo.head(), head)
         self.assertEqual(repo.remote_tip(), head)
+
+    def test_failed_commit_restores_config_when_another_file_commit_moves_head(self) -> None:
+        repo = self.repository
+        before = repo.change()
+        head = repo.head()
+        other = repo.checkout / "other.txt"
+        _ = other.write_text("concurrent zone change\n")
+        real_git = shutil.which("git")
+        assert real_git is not None
+        lock = repo.checkout / ".git/index.lock"
+        self.addCleanup(lock.unlink, missing_ok=True)
+        wrapper = repo.programs / "git"
+        _ = wrapper.write_text(
+            '#!/bin/sh\nset -e\nif [ "$3" = commit ]; then\n'
+            + f'  {shlex.quote(real_git)} -C "$2" commit -q --only '
+            + '-m "zone(UTC): concurrent change" -- other.txt\n'
+            + f'  touch {shlex.quote(str(lock))}\nfi\n'
+            + f'exec {shlex.quote(real_git)} "$@"\n',
+        )
+        wrapper.chmod(0o755)
+        errors = io.StringIO()
+
+        with redirect_stderr(errors), self.assertRaisesRegex(main_publish.Refusal, r"index\.lock.*unchanged"):
+            _ = main_publish.commit(
+                repo.checkout, repo.config, "tune(example): amount 2 -> 3",
+                main_publish.ExistingFile(before), subject_prefix="tune(", unchanged="unchanged",
+            )
+
+        self.assertNotEqual(repo.head(), head)
+        self.assertEqual(repo.git(repo.checkout, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"),
+                         "other.txt")
+        self.assertEqual(repo.git(repo.checkout, "show", "HEAD:other.txt"), "concurrent zone change")
+        self.assertEqual(repo.config.read_text(), before)
+        self.assertEqual(repo.git(repo.checkout, "diff", "HEAD", "--", str(repo.config)), "")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(repo.remote_tip(), head)
+
+    def test_rerere_failure_after_commit_keeps_the_new_file_and_allows_push(self) -> None:
+        repo = self.repository
+        before = repo.change()
+        changed = repo.config.read_text()
+        head = repo.head()
+        _ = repo.git(repo.checkout, "config", "rerere.enabled", "true")
+        lock = repo.checkout / ".git/MERGE_RR.lock"
+        lock.touch()
+        errors = io.StringIO()
+
+        with redirect_stderr(errors):
+            short_head = main_publish.commit(
+                repo.checkout, repo.config, "tune(example): amount 2 -> 3",
+                main_publish.ExistingFile(before), subject_prefix="tune(", unchanged="unchanged",
+            )
+
+        self.assertNotEqual(repo.head(), head)
+        self.assertEqual(short_head, repo.git(repo.checkout, "rev-parse", "--short", "HEAD"))
+        self.assertEqual(repo.config.read_text(), changed)
+        self.assertEqual(repo.git(repo.checkout, "show", "HEAD:config/example.conf"), changed.strip())
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: git commit: fatal: Unable to create '{lock}': File exists.; the commit exists",
+        ])
+        pushed, detail = main_publish.push(repo.checkout)
+        self.assertTrue(pushed, detail)
+        self.assertEqual(repo.remote_tip(), repo.head())
 
     def test_push_publishes_mixed_tune_and_zone_commits_in_either_order(self) -> None:
         repo = self.repository
@@ -455,7 +520,7 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(main_publish.queue_path(), queue_path)
         self.assertEqual(main_publish.read_queue(), change)
         result = subprocess.run(
-            [sys.executable, "-c", "from scripts.lib import main_publish; "
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.lib import main_publish; "
              + "value = main_publish.read_queue(); print(value)"],
             cwd=Path(__file__).resolve().parents[2], env=repo.env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
@@ -464,6 +529,21 @@ class MainPublishTests(PublicationTestCase):
         self.assertIn("example.amount=3", result.stdout)
         self.assertIn("approved change", result.stdout)
         self.assertIn("Mac asleep", result.stdout)
+        with self.subTest(queue="zone notice"):
+            main_publish.queue_pull_only("example.amount", "still asleep")
+            waiting = main_publish.PendingMacPull(change.label, change.text, change.since, "still asleep")
+            self.assertEqual(main_publish.read_queue(), waiting)
+            main_publish.clear_pull_only()
+            self.assertEqual(main_publish.read_queue(), waiting)
+        with self.subTest(queue="pull only"):
+            queue_path.unlink()
+            main_publish.queue_pull_only("example.amount", "Mac asleep")
+            pending = main_publish.read_queue()
+            self.assertIsInstance(pending, main_publish.PendingMacPull)
+            assert isinstance(pending, main_publish.PendingMacPull)
+            self.assertEqual((pending.label, pending.text, pending.reason), ("example.amount", "", "Mac asleep"))
+            main_publish.clear_pull_only()
+            self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
 
 
 if __name__ == "__main__":

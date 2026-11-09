@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repair rounds count dispatches, retain phase boundaries, and explain repairs."""
+"""Repair rounds group ledger relaunches and explain repairs without changing phase boundaries."""
 
 from __future__ import annotations
 
@@ -36,6 +36,8 @@ class Event(TypedDict, total=False):
     pass_elapsed_seconds: float
     team_slot: str
     fix_pass: int
+    launch_check: dict[str, object]
+    edits_landed: bool
     finding_id: str
     lens: str
     severity: str
@@ -94,13 +96,16 @@ def phase_events(*, run: str = "run-a", instance: str = "instance-a", phase: str
 def pass_events(start: float, finish: float, *, name: str = "pass-a", slot: str = "impl",
                 number: int = 1, activity: str = "Repair behavior", kind: str = "fix",
                 run: str = "run-a", instance: str = "instance-a",
-                phase: str = "1") -> list[dict[str, object]]:
+                phase: str = "1", ledger_round: int = 0, status: str = "completed") -> list[dict[str, object]]:
     opened = event("pass_started", start, run=run, instance=instance, phase=phase)
     opened.update(pass_instance_id=name, pass_kind=kind, pass_activity=activity,
                   pass_started_at=start, team_slot=slot, fix_pass=number)
+    if ledger_round:
+        opened["launch_check"] = {"fix_cause": {"round": ledger_round}}
     closed = opened.copy()
+    _ = closed.pop("launch_check", None)
     closed.update(event_type="pass_finished", timestamp_epoch=finish,
-                  pass_elapsed_seconds=finish - start, status="completed")
+                  pass_elapsed_seconds=finish - start, status=status)
     return [dict(opened), dict(closed)]
 
 
@@ -167,6 +172,103 @@ def reviewed_summary_events() -> list[dict[str, object]]:
 
 @final
 class RepairRoundTests(unittest.TestCase):
+    def test_relaunches_of_one_ledger_batch_count_one_round(self) -> None:
+        events = ledger_events()
+        for name, start, finish, status in (
+            ("refused-a", 10, 13, "error"),
+            ("refused-b", 70, 73, "error"),
+            ("landed", 100, 306, "completed"),
+        ):
+            events += pass_events(BASE + start, BASE + finish, name=name,
+                                  ledger_round=1, status=status)
+        first_batch = rounds.phase_rounds(events)
+        self.assertEqual(len(first_batch), 1)
+        first = first_batch[0]
+        self.assertEqual((first["passes"], first["covered"], first["fix_seconds"]), (3, ["F1"], 212))
+        self.assertEqual(len(rounds.phase_rounds(events)) + 1, 2)
+        for number in (2, 3):
+            start = BASE + number * 1_000
+            events += ledger_events(number, finding=f"F{number}", at=start - 5)
+            events += pass_events(start, start + 100, name=f"batch-{number}", ledger_round=number)
+        repairs = rounds.phase_rounds(list(reversed(events)))
+        self.assertEqual(len(repairs), 3)
+        self.assertEqual([repair["passes"] for repair in repairs], [3, 1, 1])
+        self.assertEqual([repair["covered"] for repair in repairs], [["F1"], ["F2"], ["F3"]])
+        self.assertEqual([repair["fix_passes"] for repair in repairs], [[1], [1], [1]])
+
+    def test_ledger_rounds_group_across_days_and_stay_separate_during_overlap(self) -> None:
+        events = pass_events(BASE, BASE + 100, name="batch-1", ledger_round=1)
+        events += pass_events(BASE + 10, BASE + 90, name="batch-2", ledger_round=2)
+        events += pass_events(BASE + 200_000, BASE + 200_100, name="retry", ledger_round=1)
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
+
+    def test_mixed_launch_metadata_keeps_one_batch_number_in_two_groups(self) -> None:
+        events = ledger_events()
+        events += pass_events(BASE + 10, BASE + 20, name="first", number=1)
+        events += pass_events(BASE + 30, BASE + 40, name="retry", ledger_round=1)
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([repair["ledger_rounds"] for repair in repairs], [[1], [1]])
+        self.assertEqual([repair["cause"] for repair in repairs], ["review-code", "other"])
+        self.assertEqual([repair["passes"] for repair in repairs], [1, 1])
+
+    def test_overlap_group_excludes_its_refunded_batch_number(self) -> None:
+        events = ledger_events() + ledger_events(number=2, at=BASE + 35, finding="F2")
+        events += pass_events(BASE + 10, BASE + 60, name="gate", number=99, activity="run tests")
+        events += pass_events(BASE + 20, BASE + 30, name="refunded", number=1)
+        events += pass_events(BASE + 40, BASE + 50, name="landed", number=2)
+        events.append(dict(event("finding_batch_abandoned", BASE + 70), round=1, edits_landed=False))
+        events.append(dict(event("finding_batch_landed", BASE + 80), round=2))
+        repair, = rounds.phase_rounds(events)
+        self.assertEqual(repair["ledger_rounds"], [2])
+        self.assertEqual(repair["passes"], 3)
+        self.assertEqual(repair["cause"], "review-code")
+
+    def test_missing_dispatch_keeps_ledger_identity_and_refund_rules(self) -> None:
+        events = pass_events(BASE, BASE + 10, name="batch", ledger_round=1)
+        events += pass_events(BASE + 20, BASE + 30, name="retry", ledger_round=1)
+        events += pass_events(BASE + 40, BASE + 50, name="gate", activity="run tests")
+        repairs = rounds.phase_rounds(events)
+        self.assertEqual([repair["ledger_rounds"] for repair in repairs], [[1], []])
+        self.assertEqual([repair["cause"] for repair in repairs], ["other", "gate"])
+        self.assertEqual([repair["passes"] for repair in repairs], [2, 1])
+        events.append(dict(event("finding_batch_abandoned", BASE + 60), round=1, edits_landed=False))
+        self.assertEqual([repair["ledger_rounds"] for repair in rounds.phase_rounds(events)], [[]])
+        events.append(dict(event("finding_batch_landed", BASE + 70), round=1))
+        self.assertEqual([repair["ledger_rounds"] for repair in rounds.phase_rounds(events)], [[1], []])
+
+    def test_refunded_batch_adds_no_round_unless_it_later_lands(self) -> None:
+        events = ledger_events() + pass_events(BASE + 10, BASE + 13, ledger_round=1, status="error")
+        abandoned = dict(event("finding_batch_abandoned", BASE + 20), round=1, edits_landed=False)
+        events.append(abandoned)
+        self.assertEqual(rounds.phase_rounds(events), [])
+        events.append(dict(event("finding_batch_landed", BASE + 30), round=1))
+        self.assertEqual(len(rounds.phase_rounds(list(reversed(events)))), 1)
+
+    def test_abandon_without_an_explicit_refund_keeps_the_round(self) -> None:
+        refund_fields: tuple[dict[str, object], ...] = ({}, {"edits_landed": True})
+        for fields in refund_fields:
+            with self.subTest(fields=fields):
+                events = ledger_events() + pass_events(BASE + 10, BASE + 13, ledger_round=1, status="error")
+                events.append(dict(event("finding_batch_abandoned", BASE + 20), round=1, **fields))
+                self.assertEqual(len(rounds.phase_rounds(events)), 1)
+
+    def test_refunded_legacy_batch_adds_no_round(self) -> None:
+        events = ledger_events() + pass_events(BASE + 10, BASE + 13, status="error")
+        events.append(dict(event("finding_batch_abandoned", BASE + 20), round=1, edits_landed=False))
+        self.assertEqual(rounds.phase_rounds(events), [])
+
+    def test_refused_dispatch_without_a_fix_pass_gives_no_round(self) -> None:
+        events = ledger_events()
+        events.append(dict(event("launch_refused", BASE + 10)))
+        self.assertEqual(rounds.phase_rounds(events), [])
+
+    def test_dispatch_with_a_started_fix_pass_gives_one_round(self) -> None:
+        events = ledger_events() + pass_events(BASE + 10, BASE + 20)[:1]
+        repair, = rounds.phase_rounds(events)
+        self.assertEqual((repair["round"], repair["passes"], repair["covered"]), (1, 1, ["F1"]))
+        self.assertEqual(repair["finished_at"], 0)
+
     def test_rerun_finding_assigns_repair_to_code_review(self) -> None:
         events = ledger_events(lens="rerun") + pass_events(BASE + 10, BASE + 20, name="rerun-repair")
         repairs = rounds.phase_rounds(events)
@@ -206,23 +308,19 @@ class RepairRoundTests(unittest.TestCase):
                           built[1]["passes"], built[1]["fix_seconds"]),
                          (BASE + 30, BASE + 100, 2, 90))
 
-    def test_repeated_ledger_number_without_workers_keeps_each_dispatch(self) -> None:
+    def test_repeated_ledger_number_without_workers_gives_no_round(self) -> None:
         events = ledger_events(finding="CODE")
         events += ledger_events(at=BASE + 25, finding="UX", lens="ux")
         built = rounds.phase_rounds(events)
-        self.assertEqual([(repair["cause"], repair["covered"]) for repair in built],
-                         [("review-code", ["CODE"]), ("review-ux", ["UX"])])
-        self.assertEqual([repair["started_at"] for repair in built], [BASE + 6, BASE + 26])
-        self.assertEqual([(repair["passes"], repair["fix_seconds"], repair["finished_at"])
-                          for repair in built], [(0, 0, 0), (0, 0, 0)])
+        self.assertEqual(built, [])
 
-    def test_batch_after_the_last_matching_worker_stays_ledger_only(self) -> None:
+    def test_batch_after_the_last_matching_worker_adds_no_round(self) -> None:
         events = pass_events(BASE + 10, BASE + 20, activity="Repair failing tests")
         events += ledger_events(at=BASE + 25, finding="UNSTARTED", lens="ux")
         built = rounds.phase_rounds(events)
         self.assertEqual([(repair["cause"], repair["covered"], repair["fix_seconds"])
                           for repair in built],
-                         [("gate", [], 10), ("review-ux", ["UNSTARTED"], 0)])
+                         [("gate", [], 10)])
 
     def test_worker_start_at_dispatch_time_is_eligible_but_wrong_number_is_not(self) -> None:
         events = ledger_events(number=2, at=BASE + 9)
@@ -240,10 +338,10 @@ class RepairRoundTests(unittest.TestCase):
         phase = load_one(restarted_batch_events())
         self.assertEqual([(repair["cause"], repair["covered"]) for repair in phase["rounds"]],
                          [("review-code", ["CODE"]), ("gate", []),
-                          ("review-ux", ["UX"]), ("review-code", ["UNSTARTED"])])
+                          ("review-ux", ["UX"])])
         self.assertEqual((phase["findings"], phase["fix_seconds"], phase["past_landing"]),
-                         (3, 30, 1))
-        self.assertEqual(phase["causes"], {"review-ux": 1, "review-code": 2, "gate": 1,
+                         (3, 30, 0))
+        self.assertEqual(phase["causes"], {"review-ux": 1, "review-code": 1, "gate": 1,
                                            "merge": 0, "live": 0, "other": 0})
 
     def test_phase_rounds_exposes_one_dispatch_with_all_concurrent_passes(self) -> None:
@@ -589,15 +687,15 @@ class RoundsCommandTests(unittest.TestCase):
     def test_json_cli_reports_each_batch_once_after_fix_numbers_restart(self) -> None:
         report = self.report(restarted_batch_events(), cli=True)
         row, = report["rows"]
-        self.assertEqual(row["rounds"], 4)
+        self.assertEqual(row["rounds"], 3)
         self.assertEqual([(repair["round"], repair["cause"], repair["covered"])
                           for repair in row["round_details"]],
                          [(1, "review-code", ["CODE"]), (2, "gate", []),
-                          (3, "review-ux", ["UX"]), (4, "review-code", ["UNSTARTED"])])
-        self.assertEqual((row["findings"], row["fix_seconds"], row["past_landing"]), (3, 30, 1))
-        self.assertEqual(row["causes"], {"review-ux": 1, "review-code": 2, "gate": 1,
+                          (3, "review-ux", ["UX"])])
+        self.assertEqual((row["findings"], row["fix_seconds"], row["past_landing"]), (3, 30, 0))
+        self.assertEqual(row["causes"], {"review-ux": 1, "review-code": 1, "gate": 1,
                                         "merge": 0, "live": 0, "other": 0})
-        self.assertEqual(report["_meta"]["rounds"], 4)
+        self.assertEqual(report["_meta"]["rounds"], 3)
         self.assertEqual(report["_meta"]["causes"], row["causes"])
 
     def test_runs_rejects_until_before_reading_events(self) -> None:

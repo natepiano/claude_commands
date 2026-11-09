@@ -3,9 +3,9 @@
 
 setopt no_unset pipe_fail extended_glob
 (( $# == 1 )) || exit 1
-[[ -r $1 ]] || exit 1
+doc=$("${0:A:h:h}/lib/py" "${0:A:h}/showrunners.py" doc "$1") || exit 1
 
-for line in "${(@f)$(<$1)}"; do
+for line in "${(@f)$(<$doc)}"; do
   if [[ $line == *'Status: PRODUCTION — '* ]]; then
     doc_status=${${line#*'Status: PRODUCTION — '}%%[^a-z]*}
     case $doc_status in

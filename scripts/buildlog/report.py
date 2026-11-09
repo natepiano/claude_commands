@@ -16,22 +16,17 @@ from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from decimal import Decimal
 import time
-from typing import TYPE_CHECKING, Literal, NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
-import ci
-import holds
-import index
-import disk
-import health
-import memory
-import moments
-import store
-import record
-import sync
-import rust_release
-import aws_report
-import mac_test
-from mac_outcome import (
+from scripts.buildlog import ci, holds
+from scripts.buildlog import index
+from scripts.buildlog import disk, health, memory, moments
+from scripts.buildlog.moments import COLD_BUILD_MIN_CRATES
+from scripts.buildlog import store
+from scripts.buildlog import record
+from scripts.buildlog import sync, rust_release, aws_report
+from scripts.mac_test import mac_test
+from scripts.buildlog.mac_outcome import (
     DECLINE_REASONS,
     CacheReuse,
     DurationNotRecorded,
@@ -55,18 +50,10 @@ from mac_outcome import (
     local_target_names,
 )
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
-from user_zone import user_zone  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..aws_target import measurement
-    from ..build_targets.target_config import SshTarget, is_aws_target, read_targets
-else:
-    from scripts.aws_target import measurement
-    from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
+from scripts.lib import conf
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.aws_target import measurement
+from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
 
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
@@ -101,8 +88,7 @@ NO_REBUILD_CRATES = 0
 EDITED_CRATE_MIN_CRATES = NO_REBUILD_CRATES + 1
 EDITED_CRATE_MAX_CRATES = 3
 CASCADE_MIN_CRATES = EDITED_CRATE_MAX_CRATES + 1
-CASCADE_MAX_CRATES = 49
-COLD_BUILD_MIN_CRATES = CASCADE_MAX_CRATES + 1
+CASCADE_MAX_CRATES = COLD_BUILD_MIN_CRATES - 1
 NO_REBUILD_LABEL = "none"
 EDITED_CRATE_LABEL = f"edited crate ({EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates)"
 CASCADE_LABEL = f"cascade ({CASCADE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
@@ -244,17 +230,13 @@ def gib(value: object) -> str:
     return f"{float(value) / GIB:.1f} GiB" if isinstance(value, int | float) else ""
 
 
-def nearest_rank(values: Sequence[float], percent: int) -> float:
-    return sorted(values)[(percent * len(values) + 99) // 100 - 1]
-
-
 def percentile_values(value: object) -> list[float]:
     return [float(part) for part in value.split(",")] if isinstance(value, str) and value else []
 
 
 def p95(value: object) -> str:
     values = percentile_values(value)
-    return seconds(nearest_rank(values, 95)) if values else ""
+    return seconds(moments.nearest_rank(values, 95)) if values else ""
 
 
 @dataclass(frozen=True)
@@ -657,13 +639,15 @@ def held_target_waits(connection: sqlite3.Connection, day: str) -> tuple[WaitMea
 
 
 def warm_step_clause() -> str:
-    """Same-folder finished history must cover the selected targets or defaults."""
+    """Match real folders or legacy checkout groups before checking target coverage."""
     # A sweep can delete these outputs without a build-log row. That loss is
     # intentionally invisible until the floor sweeper records its removals.
+    # Legacy checkout groups preserve history without claiming a real folder.
     earlier = (
-        "prior.host = steps.host AND prior.target_folder = steps.target_folder"
-        " AND prior.build_base = steps.build_base AND prior.started_at_us < steps.started_at_us"
-        " AND prior.finished_s IS NOT NULL"
+        "prior.host = steps.host"
+        + " AND prior.build_history_group = steps.build_history_group"
+        + " AND prior.build_base = steps.build_base AND prior.started_at_us < steps.started_at_us"
+        + " AND prior.finished_s IS NOT NULL"
     )
     group_coverage = " OR ".join(
         f"(built.value = '{group}' AND wanted.value LIKE '{member} %')"
@@ -671,7 +655,8 @@ def warm_step_clause() -> str:
                               ("--examples", "--example"), ("--benches", "--bench"))
     )
     return (
-        "(steps.build_base IS NOT NULL AND steps.target_folder IS NOT NULL AND steps.build_items IS NOT NULL AND CASE"
+        "(steps.build_base IS NOT NULL AND steps.build_items IS NOT NULL"
+        + " AND steps.build_history_group IS NOT NULL AND CASE"
         + " WHEN steps.build_items = '[]' THEN EXISTS (SELECT 1 FROM steps AS prior WHERE "
         + earlier + " AND (prior.build_items = '[]' OR EXISTS (SELECT 1 FROM json_each(prior.build_items) AS built"
         + " WHERE built.value = '--all-targets')))"
@@ -783,8 +768,8 @@ def package_rebuild_rows(steps: Sequence[KnownCrateStep]) -> list[list[str]]:
         [
             name,
             count(rebuilds.steps),
-            seconds(nearest_rank(rebuilds.compile_samples, 50)) if rebuilds.compile_samples else "—",
-            seconds(nearest_rank(rebuilds.compile_samples, 95)) if rebuilds.compile_samples else "—",
+            seconds(moments.nearest_rank(rebuilds.compile_samples, 50)) if rebuilds.compile_samples else "—",
+            seconds(moments.nearest_rank(rebuilds.compile_samples, 95)) if rebuilds.compile_samples else "—",
             seconds(rebuilds.compile_s),
         ]
         for name, rebuilds in ranked
@@ -1245,7 +1230,7 @@ def test_builds_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     for scope, values in builds.items():
         if values:
-            body.append([day, scope, seconds(sum(values)), seconds(nearest_rank([float(value) for value in values], 75))])
+            body.append([day, scope, seconds(sum(values)), seconds(moments.nearest_rank([float(value) for value in values], 75))])
 
     return [
         "### Test builds (temporary)",
@@ -1372,7 +1357,7 @@ def moment_p50_table(before: dict[tuple[str, str, str], list[float]],
     rows: list[list[str]] = []
     for key in sorted(before.keys() & after.keys(), key=lambda key: (-len(after[key]), key)):
         before_runs, after_runs = before[key], after[key]
-        before_p50, after_p50 = nearest_rank(before_runs, 50), nearest_rank(after_runs, 50)
+        before_p50, after_p50 = moments.nearest_rank(before_runs, 50), moments.nearest_rank(after_runs, 50)
         difference = "—"
         if len(before_runs) >= MIN_PROFILE_RUNS and len(after_runs) >= MIN_PROFILE_RUNS and before_p50 > 0:
             difference = f"{(after_p50 - before_p50) / before_p50:+.0%}".replace("-", "−")
@@ -1436,12 +1421,11 @@ def memory_window_rows(connection: sqlite3.Connection, start: datetime, end: dat
     stall = (100 * stall_us / (sampled_s * 1_000_000) if sampled_s
              else moments.RateUnavailable("no known full-stall intervals"))
     parameters = moments.window_parameters(start, end)
-    bounds = ("started_at >= :first_day AND started_at < :last_day"
-              + " AND julianday(started_at) >= julianday(:start) AND julianday(started_at) < julianday(:end)")
+    bounds = moments.window_bounds("started_at")
     waits = cast(list[tuple[float]], connection.execute(
         f"SELECT mem_wait_s FROM steps WHERE {bounds} AND {natedev_step_predicate()} AND mem_wait_s IS NOT NULL",
         parameters).fetchall())
-    wait_p90 = (nearest_rank([row[0] for row in waits], 90) if waits
+    wait_p90 = (moments.nearest_rank([row[0] for row in waits], 90) if waits
                 else moments.RateUnavailable("no recorded waits"))
     retries, stopped = cast(tuple[int, int], connection.execute(
         "SELECT coalesce(sum(mem_kills), 0) - coalesce(sum(mem_kill_stopped), 0),"
@@ -1524,7 +1508,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
         lines += [
-            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
+            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under a Cargo target folder; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
             "Full memory stall: stall_full_us deltas ÷ sampled elapsed microseconds, natedev's 60 s samples; resets, boot changes and gaps are unknown.",
             "Memory wait p90: nearest-rank 90th percentile of recorded mem_wait_s on natedev steps started in the window, zero waits included.",
             "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",
@@ -1695,7 +1679,7 @@ def matched_local_failures(
 
 
 def median_duration(values: Sequence[float]) -> float:
-    return nearest_rank(values, 50) if values else 0.0
+    return moments.nearest_rank(values, 50) if values else 0.0
 
 
 def mac_step_predicate(alias: str = "steps") -> str:
@@ -1769,7 +1753,7 @@ def copy_saving_estimate(call: ReportedTestCall, steps: Sequence[ComparableNated
         step.duration_s for step in steps if step.package == call.package
     ]
     remaining = [duration - elapsed for duration in durations if duration > elapsed]
-    return nearest_rank(remaining, 50) if remaining else 0.0
+    return moments.nearest_rank(remaining, 50) if remaining else 0.0
 
 
 def daily_mac_copies(connection: sqlite3.Connection, day: str, calls: Sequence[ReportedTestCall]) -> DailyMacCopies:
@@ -2195,7 +2179,7 @@ def tests_per_edit_section(connection: sqlite3.Connection, day: str) -> list[str
         ])
     recovery_rows = [
         [label, count(recovery.failures), seconds(recovery.minutes_to_green * 60 / recovery.recovered) if recovery.recovered else "",
-         seconds(nearest_rank(recovery.recovery_minutes, 95) * 60) if recovery.recovery_minutes else ""]
+         seconds(moments.nearest_rank(recovery.recovery_minutes, 95) * 60) if recovery.recovery_minutes else ""]
         for label, recovery in zip(EDIT_BINS, window.recovery_bins, strict=True)
     ]
     unresolved = sum(recovery.failures - recovery.recovered for recovery in window.recovery_bins)
@@ -2271,10 +2255,23 @@ def disk_section() -> list[str]:
     if snapshot is None:
         return []
     rows = [[row["label"], gib(row["bytes"])] for row in snapshot["rows"]]
-    rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
-    floor = snapshot["floor"]
-    free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
-    rows.append([free_label, gib(snapshot["free"])])
+    capacities = snapshot.get("filesystems", [])
+    if capacities:
+        seen: set[str] = set()
+        for capacity in capacities:
+            if capacity["device"] in seen:
+                continue
+            seen.add(capacity["device"])
+            label = f"{capacity['path']} ({capacity['device']}, {capacity['device_name']})"
+            rows.append([f"{label} used", gib(capacity["used"])])
+            rows.append([f"{label} free", gib(capacity["free"])])
+    else:
+        rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
+        floor = snapshot["floor"]
+        free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
+        rows.append([free_label, gib(snapshot["free"])])
+    rows.extend([f"Cargo outputs unavailable: {reason}", "unavailable"]
+                for reason in snapshot.get("output_unavailable", []))
     measured = sync.sync_time(snapshot["measured_at"], datetime.now())
     return [
         f"### Disk: {snapshot['host']}",

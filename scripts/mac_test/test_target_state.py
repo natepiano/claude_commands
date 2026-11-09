@@ -14,29 +14,31 @@ import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING, Self, TypedDict, cast, override
+
+from scripts.lib import process_start as process_identity
+
 import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("mac_test", "build_targets", "build_hold", "buildlog", "lib", "lint"):
-    sys.path.insert(0, str(SCRIPTS / directory))
 
 if TYPE_CHECKING:
-    from . import mac_test, offload
-    from ..build_targets import targets
-    from ..build_hold import build_hold
-    from ..buildlog import record, store
-    from ..lib import conf
-    from ..lint.memory_test_support import write_config_fixture, config_environment
+    from scripts.mac_test import mac_test, offload
+    from scripts.build_targets import targets
+    from scripts.build_hold import build_hold
+    from scripts.buildlog import record, store
+    from scripts.lib import conf
+    from scripts.message import sessions
+    from scripts.lint.memory_test_support import write_config_fixture, config_environment
 else:
-    import mac_test
-    import offload
-    import targets
-    import build_hold
-    import record
-    import store
-    import conf
-    from memory_test_support import write_config_fixture, config_environment
+    from scripts.mac_test import mac_test, offload
+    from scripts.build_targets import targets
+    from scripts.build_hold import build_hold
+    from scripts.buildlog import record
+    from scripts.buildlog import store
+    from scripts.lib import conf
+    from scripts.message import sessions
+    from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
 TARGET_NAMES = ("mac", "aws", "linux-two")
@@ -111,11 +113,11 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
         _ = self.enterContext(mock.patch.object(build_hold, "datetime", HoldClock))
-        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", return_value="fake-start"))
+        _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fake-start")))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity",
                                               return_value=offload.KnownRepository("project")))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
-        _ = self.enterContext(mock.patch.object(build_hold, "live_sessions", return_value=[]))
+        _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(mac_test, "start_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "send_message", return_value=True))
@@ -130,7 +132,7 @@ class IsolatedTargetState(unittest.TestCase):
 
     def record_command(self, arguments: list[str], **_options: object) -> mock.Mock:
         """Write hold events synchronously and refuse all other child commands."""
-        self.assertEqual(arguments[:3], [sys.executable, str(SCRIPTS / "buildlog/record.py"), "hold-event"])
+        self.assertEqual(arguments[:3], [str(SCRIPTS / "lib/py"), str(SCRIPTS / "buildlog/record.py"), "hold-event"])
         record.hold_event(arguments[3:])
         return mock.Mock(wait=mock.Mock(return_value=0))
 
@@ -459,7 +461,7 @@ class TargetStateTests(IsolatedTargetState):
         result = self.block("aws")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
-        with mock.patch.object(mac_test, "process_start_time", return_value=None), \
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()), \
                 mock.patch.object(targets, "utc_now", return_value=NOW + timedelta(days=1)):
             self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Free)
             state = targets.target_state(self.selected_target("aws"))

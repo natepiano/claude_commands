@@ -4,15 +4,12 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from functools import cached_property
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
-import pane_record  # noqa: E402
-import pane_launch  # noqa: E402
-from pane_launch import PaneLaunch  # noqa: E402
+from scripts.shutdown import pane_record  # noqa: E402
+from scripts.herdr import pane_launch  # noqa: E402
+from scripts.herdr.pane_launch import PaneLaunch  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.production import session_staff, staff
@@ -86,8 +83,7 @@ class LaunchNames:
 
         membership = self.membership
         if isinstance(membership, session_staff.LaunchMembership):
-            return StaffLabels(membership.record, membership.sources.productions,
-                               membership.sources.showrunner_members(membership.record))
+            return StaffLabels(membership.record)
         return pane_launch.StaffLabelsRead.UNAVAILABLE
 
     @classmethod
@@ -122,6 +118,11 @@ class LaunchNames:
             return current
         current["session_id"] = owner.current_session
         current["name"] = owner.name
+        from scripts.production import staff
+
+        unit = self.record.parent_of(owner) if owner.kind == "worker" else owner
+        if unit is not None and unit.kind == "unit" and not isinstance(unit.worktree, staff.WorktreeUnfilled):
+            current["cwd"] = str(unit.worktree.path)
         return current
 
     def resume_proof(self, original: PaneLaunch, current: PaneLaunch) -> pane_launch.VerifiedResume:

@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import sys
+from scripts.style.ledger_test_support import ticket_owner_id
+
 import unittest
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_proposals
+from scripts.style import style_proposals
 
-import style_ledger
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 
 
 @final
@@ -33,7 +32,7 @@ class StylePlanTests(StylePlanFixture):
             for _ in expected:
                 code, _, errors = self.run_next()
                 self.assertEqual(code, 0, errors)
-                ticket = ledger.ticket_open("names-unit")[0]
+                ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
                 self.assertEqual(ticket["kind"], "proposal")
                 tickets.append(ticket["files"])
                 ledger.ticket_checkpoint(ticket["id"], self.tip)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import errno
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
 from scripts.production import fast_track
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -53,7 +54,8 @@ class ChangedValueTests(unittest.TestCase):
             self.assertNotIn(name, os.environ)
         self.assertIn("BUILDLOG_DIR", os.environ)
         with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
-            output.write(json.dumps({"kind": "test", "module": __name__,
+            output.write(json.dumps({"kind": "test", "module": __name__.rsplit(".", 1)[-1],
+                                     "package_module": __name__,
                                      "cwd": str(Path.cwd()), "private_git": (Path.cwd() / ".git").is_dir(),
                                      "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True, timeout=__HANG_GUARD__).strip(),
                                      "common": subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, timeout=__HANG_GUARD__).strip()}) + "\\n")
@@ -101,39 +103,76 @@ sys.exit(3)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
 
 
-INTERRUPTED_GIT = '''#!/usr/bin/env python3
-import os
-from pathlib import Path
-import signal
-import subprocess
-import sys
-
-control = Path(os.environ["FAST_TRACK_TEST_CONTROL"])
-marker = control / "stop-git"
-point = marker.read_text() if marker.exists() else ""
-args = sys.argv[1:]
-is_push = "push" in args and "HEAD:main" in args
-is_restore = "restore" in args
-stop = point in ("before-push", "after-push") and is_push or point in ("before-restore", "after-restore") and is_restore
-if stop:
-    marker.unlink()
-    (control / "stopped-copy").write_text(args[args.index("-C") + 1])
-    if point in ("before-push", "before-restore"):
-        os.kill(os.getppid(), signal.SIGKILL)
-        sys.exit(0)
-result = subprocess.run([os.environ["FAST_TRACK_REAL_GIT"], *args], check=False, timeout=__HANG_GUARD__)
-ready = os.environ.get("FAST_TRACK_PAUSE_COMMIT")
-if ready and "commit" in args and result.returncode == 0 and not Path(ready).exists():
-    Path(ready).touch()
-    with Path(os.environ["FAST_TRACK_COMMIT_RELEASE"]).open() as release:
-        release.read()
-if stop and point not in ("before-push", "before-restore") and result.returncode == 0:
-    os.kill(os.getppid(), signal.SIGKILL)
-sys.exit(result.returncode)
-'''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
+GIT_ARGUMENTS = '''operation=
+destination=
+checkout=
+previous=
+for argument do
+    if [ -z "$operation" ]; then
+        case "$previous" in
+            -C) checkout=$argument; previous=; continue ;;
+            -c) previous=; continue ;;
+        esac
+        case "$argument" in
+            -C|-c) previous=$argument ;;
+            -*) ;;
+            *) operation=$argument ;;
+        esac
+    elif [ "$argument" = HEAD:main ]; then
+        destination=main
+    fi
+done
+'''
 
 
-FETCH_RACE_GIT = '''#!/usr/bin/env python3
+INTERRUPTED_GIT = '''#!/bin/sh
+# Use the real Git process unless this command needs an interruption event.
+''' + GIT_ARGUMENTS + '''
+point=
+marker="$FAST_TRACK_TEST_CONTROL/stop-git"
+if [ -f "$marker" ]; then IFS= read -r point < "$marker" || :; fi
+stop=
+case "$point:$operation:$destination" in
+    *-push:push:main|*-restore:restore:*) stop=yes ;;
+esac
+if [ -n "$stop" ]; then
+    rm "$marker"
+    printf '%s' "$checkout" > "$FAST_TRACK_TEST_CONTROL/stopped-copy"
+    case "$point" in
+        before-*) kill -KILL "$PPID"; exit 0 ;;
+    esac
+fi
+ready=${FAST_TRACK_PAUSE_COMMIT:-}
+pause=
+if [ "$operation" = commit ] && [ -n "$ready" ] && [ ! -f "$ready" ]; then pause=yes; fi
+set -- "$FAST_TRACK_REAL_GIT" "$@"
+if [ -x "$FAST_TRACK_BOUND_GIT" ]; then set -- "$FAST_TRACK_BOUND_GIT" "$@"; fi
+if [ -z "$stop$pause" ]; then
+    exec "$@"
+fi
+"$@" || exit
+if [ -n "$pause" ]; then
+    : > "$ready"
+    cat "$FAST_TRACK_COMMIT_RELEASE" > /dev/null
+fi
+if [ -n "$stop" ]; then kill -KILL "$PPID"; fi
+'''
+
+
+FETCH_RACE_GIT = '''#!/bin/sh
+''' + GIT_ARGUMENTS + '''
+if { [ "$checkout" = "$FAST_TRACK_FETCH_DIRECTOR" ] && [ "$operation" = fetch ] && [ "$#" -eq 5 ] && [ "$4" = origin ] && [ "$5" = main ]; } ||
+   { [ "$operation" = push ] && [ "$destination" = main ]; }; then
+    exec "$FAST_TRACK_FETCH_LOGIC" "$@"
+fi
+if [ -x "$FAST_TRACK_BOUND_GIT" ]; then
+    exec "$FAST_TRACK_BOUND_GIT" "$FAST_TRACK_REAL_GIT" "$@"
+fi
+exec "$FAST_TRACK_REAL_GIT" "$@"
+'''
+
+
+FETCH_RACE_LOGIC = '''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
@@ -141,6 +180,9 @@ import subprocess
 import sys
 
 args = sys.argv[1:]
+git = [os.environ["FAST_TRACK_REAL_GIT"]]
+if Path(os.environ["FAST_TRACK_BOUND_GIT"]).is_file():
+    git.insert(0, os.environ["FAST_TRACK_BOUND_GIT"])
 control = Path(os.environ["FAST_TRACK_TEST_CONTROL"])
 director = Path(os.environ["FAST_TRACK_FETCH_DIRECTOR"])
 lock = Path(os.environ["FAST_TRACK_FETCH_LOCK"])
@@ -154,7 +196,7 @@ if is_fetch and (armed.exists() or plan["point"] == "before-push"):
     failure = plan["failures"][len(rows)] if len(rows) < len(plan["failures"]) else ""
     if failure == "lock":
         if plan["point"] == "before-push" and not rows:
-            subprocess.run([os.environ["FAST_TRACK_REAL_GIT"], "-C", str(director),
+            subprocess.run([*git, "-C", str(director),
                             "update-ref", "refs/remotes/origin/main", "HEAD^"],
                            check=True, timeout=__HANG_GUARD__)
         lock.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +204,7 @@ if is_fetch and (armed.exists() or plan["point"] == "before-push"):
     if failure == "other":
         result = subprocess.CompletedProcess(args, 128, "", "fatal: fixture fetch transport failed\\n")
     else:
-        result = subprocess.run([os.environ["FAST_TRACK_REAL_GIT"], *args],
+        result = subprocess.run([*git, *args],
                                 capture_output=True, text=True, check=False, timeout=__HANG_GUARD__)
     with events.open("a") as output:
         output.write(json.dumps({"returncode": result.returncode, "stderr": result.stderr}) + "\\n")
@@ -171,7 +213,7 @@ if is_fetch and (armed.exists() or plan["point"] == "before-push"):
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     sys.exit(result.returncode)
-result = subprocess.run([os.environ["FAST_TRACK_REAL_GIT"], *args], check=False, timeout=__HANG_GUARD__)
+result = subprocess.run([*git, *args], check=False, timeout=__HANG_GUARD__)
 if "push" in args and "HEAD:main" in args and result.returncode == 0:
     armed.touch()
 sys.exit(result.returncode)
@@ -180,6 +222,8 @@ sys.exit(result.returncode)
 
 @final
 class FastTrackTests(MergeCheckpointFixture):
+    production_name: str = "example"
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.config: Path = Path()
@@ -194,6 +238,7 @@ class FastTrackTests(MergeCheckpointFixture):
         super().build_fixture()
         for path, content in {
             "scripts/__init__.py": "", "scripts/sample/__init__.py": "",
+            "scripts/lib/py": (REPOSITORY / "scripts/lib/py").read_text(),
             "scripts/sample/item.py": MODULE,
             "scripts/sample/note.txt": "before\n",
             "scripts/production/add_unit.py": "VALUE = 'staff writer'\n",
@@ -205,6 +250,7 @@ class FastTrackTests(MergeCheckpointFixture):
             "scripts/production/merge_gate.py": "raise AssertionError('gate ran')\n",
         }.items():
             self.write(self.checkout, path, content)
+        (self.checkout / "scripts/lib/py").chmod(0o755)
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fast-track fixture modules")
         _ = self.git("push", "origin", "HEAD:main", "HEAD:production")
@@ -221,6 +267,8 @@ class FastTrackTests(MergeCheckpointFixture):
         self.events_path = self.root / "fast-track-events.jsonl"
         self.control = self.root / "fast-track-control"
         self.control.mkdir()
+        bounded_git = self.bin / "bounded-git"
+        self.env["FAST_TRACK_BOUND_GIT"] = str(bounded_git)
         common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=self.unit))
         self.env.update({
             "FAST_TRACK_STATE_DIR": str(self.records_dir),
@@ -264,11 +312,16 @@ class FastTrackTests(MergeCheckpointFixture):
         _ = self.config.write_text("\n".join(lines) + "\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(COMMAND), *arguments], cwd=self.unit,
-                              env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        # The interruption wrapper must kill a child process.
+        if (self.control / "stop-git").exists() or process_boundary_for_case(self):
+            return subprocess.run([sys.executable, str(COMMAND), *arguments], cwd=self.unit,
+                                  env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        args = list(arguments)
+        with LauncherHangGuard("fast-track CLI").protect():
+            return invoke_cli(fast_track, lambda: fast_track.main(args), args, self.env, self.unit)
 
     def fast_track(self, *paths: str) -> subprocess.CompletedProcess[str]:
-        return self.command("--unit", "alpha-unit", "--production", str(self.doc),
+        return self.command("--unit", "alpha", "--production", self.production_name,
                             "--why", "repair the sample", *(paths or ("scripts/sample/item.py",)))
 
     def change_module(self) -> None:
@@ -293,6 +346,7 @@ class FastTrackTests(MergeCheckpointFixture):
     def move_main_during_check(self) -> str:
         writer = self.control / "writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "maintenance.auto", "false", cwd=writer)
         _ = self.git("config", "user.name", "Concurrent Writer", cwd=writer)
         _ = self.git("config", "user.email", "writer@example.invalid", cwd=writer)
         self.write(writer, "concurrent.txt", "another fix\n")
@@ -318,12 +372,25 @@ class FastTrackTests(MergeCheckpointFixture):
         _ = (self.control / "fetch-plan.json").write_text(json.dumps({
             "point": point, "failures": failures, "persistent": persistent,
         }))
+        logic = self.bin / "fetch-race.py"
+        self.executable(logic, FETCH_RACE_LOGIC)
+        self.env["FAST_TRACK_FETCH_LOGIC"] = str(logic)
         self.executable(self.bin / "git", FETCH_RACE_GIT)
         return lock
 
     def director_fetches(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line))
                 for line in (self.control / "fetch-events.jsonl").read_text().splitlines()]
+
+    def test_fetch_wrapper_skips_python_logic_for_ordinary_git_commands(self) -> None:
+        _ = self.arrange_fetch_failures("after-push", ["lock"])
+        self.env["FAST_TRACK_FETCH_LOGIC"] = str(self.root / "missing-fetch-logic")
+        _ = (self.control / "fetch-plan.json").write_text("invalid fetch plan")
+        result = subprocess.run([str(self.bin / "git"), "-C", str(self.unit), "rev-parse", "HEAD"],
+                                env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), self.initial)
+        self.assertFalse((self.control / "fetch-events.jsonl").exists())
 
     def test_post_push_ref_lock_retries_then_restores_and_promotes(self) -> None:
         self.change_module()
@@ -482,8 +549,8 @@ class FastTrackTests(MergeCheckpointFixture):
                 self.assert_refused(self.fast_track("scripts/sample/entry.py"), "scripts/production/add_unit.py")
         self.assertEqual(self.observations("types"), [])
 
-    def test_resume_unit_cannot_bypass_the_staff_writer_refusal(self) -> None:
-        path = "scripts/production/resume_unit.py"
+    def test_agents_cannot_bypass_the_staff_writer_refusal(self) -> None:
+        path = "scripts/shutdown/shutdown.py"
         self.write(self.unit, path, "from add_unit import VALUE\n")
         self.assert_refused(self.fast_track(path), "refused path")
 
@@ -495,8 +562,8 @@ class FastTrackTests(MergeCheckpointFixture):
         os.mkfifo(release)
         environment = {**self.env, "FAST_TRACK_PAUSE_COMMIT": str(ready),
                        "FAST_TRACK_COMMIT_RELEASE": str(release)}
-        with subprocess.Popen([sys.executable, str(COMMAND), "--unit", "beta-unit",
-                               "--production", str(self.doc), "--why", "repair the sample",
+        with subprocess.Popen([sys.executable, str(COMMAND), "--unit", "beta",
+                               "--production", self.production_name, "--why", "repair the sample",
                                "scripts/sample/item.py"], cwd=self.unit, env=environment,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as beta:
             try:
@@ -512,6 +579,12 @@ class FastTrackTests(MergeCheckpointFixture):
                 stdout, stderr = beta.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(beta.returncode, 2, stdout + stderr)
             finally:
+                try:
+                    with os.fdopen(os.open(release, os.O_WRONLY | os.O_NONBLOCK), "w") as output:
+                        _ = output.write("continue\n")
+                except OSError as error:
+                    if error.errno != errno.ENXIO:
+                        raise
                 if beta.poll() is None:
                     beta.kill()
                     _ = beta.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -519,7 +592,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
         self.assertIn("already on main", retry.stdout)
         row, = self.records()
-        self.assertEqual((row["unit"], row["commit"]), ("alpha-unit", tip))
+        self.assertEqual((row["unit"], row["commit"]), ("alpha", tip))
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
 
     def test_pending_finds_a_pushed_fix_without_a_fast_track_rerun(self) -> None:
@@ -532,14 +605,14 @@ class FastTrackTests(MergeCheckpointFixture):
         # Review discovery must not need a safe restore or a successful promotion.
         self.write(self.unit, "scripts/sample/item.py", "later local edit\n")
         _ = (self.state / "mac-rc").write_text("1\n")
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
         self.assertIn(tip, pending.stdout)
         self.assertIn('VALUE = "after"', pending.stdout)
         row, = self.records()
         self.assertEqual((row["commit"], row["review"]), (tip, "pending"))
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), "later local edit\n")
-        again = self.command("--pending", "--unit", "alpha-unit")
+        again = self.command("--pending", "--unit", "alpha")
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(self.records(), [row])
 
@@ -593,6 +666,11 @@ class FastTrackTests(MergeCheckpointFixture):
             _ = valid_doc.write_text(self.doc.read_text())
             self.doc.unlink()
             self.doc = valid_doc
+            self.production_name = "valid-production"
+            from scripts.production import staff
+            from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+            with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+                _ = fixture_member("showrunner", name=self.production_name, doc=staff.LiveDoc("natedev", valid_doc))
         else:
             _ = self.git("restore", "--staged", "--worktree", "scripts/sample/item.py", cwd=self.unit)
             self.write(self.unit, "local.txt", "unrelated local commit\n")
@@ -617,7 +695,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assert_unrelated_attempt_does_not_block(missing_production=True)
 
     def close_restore(self, attempt: Path) -> subprocess.CompletedProcess[str]:
-        return self.command("--unit", "alpha-unit", "--close-restore", attempt.stem)
+        return self.command("--unit", "alpha", "--close-restore", attempt.stem)
 
     def test_overlapping_unsafe_restore_names_an_idempotent_close_that_preserves_edits(self) -> None:
         tip, attempt = self.interrupted_module_push()
@@ -703,6 +781,39 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertEqual(self.records(), [row])
 
+    def test_unpublished_candidate_survives_checkout_reset_and_source_pruning(self) -> None:
+        self.change_module()
+        self.interrupt_git("before-push")
+        stopped = self.fast_track()
+        self.assertEqual(stopped.returncode, -9, stopped.stdout + stopped.stderr)
+        attempt, = (self.records_dir / "attempts").glob("*.json")
+        state = fast_track.read_attempt(attempt)
+        candidate = state["restore"]["record"]["commit"]
+        reference = f"refs/fast-track/attempts/{attempt.stem}/commit"
+        self.assertEqual(self.git("rev-parse", reference, cwd=self.unit), candidate)
+        tree = Path((self.control / "stopped-copy").read_text())
+        _ = self.git("checkout", "--force", "--detach", self.initial, cwd=tree)
+        _ = self.git("reflog", "expire", "--expire=now", "--all", cwd=tree)
+        _ = self.git("gc", "--prune=now", cwd=tree)
+        _ = self.git("reflog", "expire", "--expire=now", "--all", cwd=self.unit)
+        _ = self.git("gc", "--prune=now", cwd=self.unit)
+        self.assertEqual(self.git("cat-file", "-t", candidate, cwd=self.unit), "commit")
+        self.assertIn('VALUE = "after"', self.git("show", f"{candidate}:scripts/sample/item.py", cwd=self.unit))
+
+    def test_repeated_checks_reuse_checkout_and_keep_ignored_target(self) -> None:
+        self.change_module()
+        first = self.fast_track()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        tree = Path(str(self.observations("types")[0]["cwd"]))
+        cache = tree / "target" / "warm-cache"
+        cache.parent.mkdir(exist_ok=True)
+        _ = cache.write_text("keep")
+        self.write(self.unit, "scripts/sample/note.txt", "new note\n")
+        second = self.fast_track("scripts/sample/note.txt")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(Path(str(self.observations("types")[-1]["cwd"])), tree)
+        self.assertEqual(cache.read_text(), "keep")
+
     def test_rerun_recovers_a_push_that_stopped_before_the_review_record(self) -> None:
         self.change_module()
         self.interrupt_git("after-push")
@@ -721,7 +832,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
         self.assertEqual(len(self.observations("types")), 1)
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertIn(tip, pending.stdout)
         self.assertIn('VALUE = "after"', pending.stdout)
 
@@ -843,7 +954,7 @@ class FastTrackTests(MergeCheckpointFixture):
 
     def test_safe_unrelated_attempt_keeps_its_index_worktree_and_restore_record(self) -> None:
         tip, attempt = self.interrupted_module_push()
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
         index = self.git("write-tree", cwd=self.unit)
         content = (self.unit / "scripts/sample/item.py").read_bytes()
@@ -863,12 +974,34 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(self.git("write-tree", cwd=self.unit), index)
         self.assertEqual((self.unit / "scripts/sample/item.py").read_bytes(), content)
 
+    def test_fast_track_without_a_build_cache_records_the_push_and_removes_its_copy(self) -> None:
+        _ = self.git("rm", "Cargo.toml")
+        _ = self.git("commit", "-m", "repository without a build cache")
+        _ = self.git("push", "origin", "HEAD:main", "HEAD:production")
+        _ = self.git("reset", "--hard", "production", cwd=self.unit)
+        _ = self.git("merge", "--ff-only", "production", cwd=self.promote)
+        self.change_module()
+
+        result = self.fast_track()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        row, = self.records()
+        self.assertEqual((row["unit"], row["commit"], row["review"]), ("alpha", tip, "pending"))
+        tests = self.observations("test")
+        self.assertEqual({row["module"] for row in tests}, {"test_item", "test_item_extra"})
+        for observed in tests:
+            checkout = Path(str(observed["cwd"]))
+            self.assertNotIn(checkout, (self.unit, self.checkout, self.promote))
+            self.assertTrue(observed["private_git"], observed)
+            self.assertFalse(checkout.exists())
+        self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+
     def test_one_command_shares_its_settings_through_fetch_and_recovery(self) -> None:
         self.change_module()
-        arguments = ["--unit", "alpha-unit", "--production", str(self.doc),
-                     "--why", "repair the sample", "scripts/sample/item.py"]
         with patch.object(conf, "read", wraps=conf.read) as reads:
-            result = invoke_cli(fast_track, lambda: fast_track.main(arguments), arguments, self.env, self.unit)
+            result = self.fast_track()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == "fast_track"],
                          ["fast_track"])
@@ -877,6 +1010,8 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
 
+    # Keep one complete CLI process case.
+    @process_boundary
     def test_push_checks_only_direct_tests_in_a_private_clone_and_restores_named_paths(self) -> None:
         self.change_module()
         self.env.update(PYTHONUNBUFFERED="1", REFUSAL_WATCH_INVENTORY="fixture", STAFF_OPERATION_FD="-1")
@@ -886,7 +1021,7 @@ class FastTrackTests(MergeCheckpointFixture):
         tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
         self.assertNotEqual(tip, self.initial)
         self.assertEqual(self.git("show", "-s", "--format=%B", tip, cwd=self.origin),
-                         "fast-track(alpha-unit): repair the sample\n\nFast-Track: alpha-unit")
+                         "fast-track(alpha): repair the sample\n\nFast-Track: alpha")
         self.assertEqual(self.git("show", f"{tip}:scripts/sample/item.py", cwd=self.origin),
                          MODULE.replace('VALUE = "before"', 'VALUE = "after"').strip())
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
@@ -897,6 +1032,8 @@ class FastTrackTests(MergeCheckpointFixture):
         tests = self.observations("test")
         self.assertEqual({row["module"] for row in tests}, {"test_item", "test_item_extra"})
         for row in tests:
+            with self.subTest(module=row["module"], case="package name"):
+                self.assertEqual(row["package_module"], "scripts.sample." + str(row["module"]))
             self.assertTrue(row["private_git"], row)
             self.assertEqual(row["branch"], "", row)
             self.assertEqual(Path(str(row["common"])), Path(str(row["cwd"])) / ".git")
@@ -907,10 +1044,10 @@ class FastTrackTests(MergeCheckpointFixture):
         for row in [*tests, *checks]:
             clone = Path(str(row["cwd"]))
             self.assertNotIn(clone, (self.unit, self.checkout, self.promote))
-            self.assertFalse(clone.exists(), "the temporary clone must be removed")
+            self.assertTrue((clone / ".git").is_dir(), "the standing checkout must remain")
         row, = self.records()
         self.assertEqual((row["unit"], row["commit"], row["why"], row["review"]),
-                         ("alpha-unit", tip, "repair the sample", "pending"))
+                         ("alpha", tip, "repair the sample", "pending"))
         self.assertRegex(str(row["patch_sha256"]), r"^[0-9a-f]{64}$")
         self.assertTrue(datetime.fromisoformat(str(row["time"]).replace("Z", "+00:00")).isoformat().endswith("+00:00"))
 
@@ -960,9 +1097,9 @@ class FastTrackTests(MergeCheckpointFixture):
         paths.update({"settings.json", "scripts/hooks/private/check.py", "scripts/lib/py",
                       ".local/state/staff/staff.json", "scripts/production/staff.py",
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
-                      "scripts/production/add_showrunner.py", "scripts/production/retire_unit.py",
+                      "scripts/production/add_showrunner.py", "scripts/shutdown/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/production/rename_unit.py",
+                      "scripts/accounts/moves.py", "scripts/shutdown/shutdown.py",
                       "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",
@@ -1102,24 +1239,24 @@ signal.pause()
         pushed = self.fast_track()
         self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
         row, = self.records()
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertEqual(pending.returncode, 0, pending.stderr)
         self.assertIn(str(row["commit"]), pending.stdout)
         self.assertIn('VALUE = "after"', pending.stdout)
         self.assertIn("diff --git", pending.stdout)
         self.assertRegex(pending.stdout, r"(?m)^#+ .+")
-        foreign = {**row, "unit": "beta-unit", "commit": self.initial,
+        foreign = {**row, "unit": "beta", "commit": self.initial,
                    "patch_sha256": hashlib.sha256(b"foreign").hexdigest()}
         later = {**row, "commit": self.initial, "patch_sha256": hashlib.sha256(b"later").hexdigest()}
         with (self.records_dir / "records.jsonl").open("a") as output:
             _ = output.write(json.dumps(foreign) + "\n" + json.dumps(later) + "\n")
-        marked = self.command("--mark-reviewed", "--unit", "alpha-unit", "--pass", "7d/1/contract",
+        marked = self.command("--mark-reviewed", "--unit", "alpha", "--pass", "7d/1/contract",
                               "--commit", str(row["commit"]))
         self.assertEqual(marked.returncode, 0, marked.stdout + marked.stderr)
         rows = self.records()
         self.assertEqual((rows[0]["review"], rows[0]["review_pass"]), ("reviewed", "7d/1/contract"))
         self.assertEqual([entry["review"] for entry in rows[1:]], ["pending", "pending"])
-        pending = self.command("--pending", "--unit", "no-such-unit")
+        pending = self.command("--pending", "--unit", "no-such")
         self.assertEqual((pending.returncode, pending.stdout), (0, ""))
 
 

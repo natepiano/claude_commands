@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import unittest
 from collections.abc import Sequence
 from unittest import mock
 
-import send_later
+from scripts.message import send_later
+from scripts.message import session_send
 
 SEND_ARGS = ["--to", "user", "--value", "description=it is ready"]
 
@@ -27,7 +29,12 @@ class SendLaterTests(unittest.TestCase):
         self.assertEqual(command[:3], ["systemd-run", "--user", "--collect"])
         self.assertIn("--on-active=10min", command)
         self.assertEqual(command[-len(SEND_ARGS):], SEND_ARGS)
-        self.assertEqual(command[-len(SEND_ARGS) - 1], str(send_later.SEND))
+        self.assertEqual(command[-len(SEND_ARGS) - 1], str(session_send.SEND_SCRIPT))
+
+    def test_the_timer_uses_the_sender_from_this_checkout(self) -> None:
+        command = self.capture(["--in", "10min", "--", *SEND_ARGS], "Linux")
+        self.assertEqual(command[-len(SEND_ARGS) - 1],
+                         str(Path(__file__).resolve().with_name("send.py")))
 
     def test_a_time_in_the_users_zone_uses_a_calendar_timer_in_utc(self) -> None:
         for zone, utc in (("America/Curacao", "19:30"), ("America/New_York", "19:30"), ("Europe/Paris", "13:30")):
@@ -45,7 +52,7 @@ class SendLaterTests(unittest.TestCase):
     def test_the_mac_makes_the_timer_on_natedev(self) -> None:
         command = self.capture(["--in", "1h", "--", *SEND_ARGS], "Darwin")
         self.assertEqual(command[:2], ["ssh", "natedev"])
-        self.assertIn("$HOME/.claude/scripts/message/send.py", command[2])
+        self.assertIn(str(session_send.SEND_SCRIPT).replace(str(Path.home()), "$HOME"), command[2])
         self.assertIn("'description=it is ready'", command[2])
 
     def test_run_silence_starts_silence_later(self) -> None:

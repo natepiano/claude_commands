@@ -134,6 +134,7 @@ class RoleMap:
     workers: str
     workers_claude: WorkersClaudeAccount = DEFAULT_WORKERS_CLAUDE_ACCOUNT
     provenance: RoleMapProvenance = field(default_factory=CurrentRoleMap, compare=False)
+    upcoming_moves: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,7 @@ class RoleMapDocument(TypedDict):
     groups: StoredGroupSelections
     workers: str
     workers_claude: NotRequired[WorkersClaudeRouteDocument]
+    upcoming_moves: NotRequired[list[str]]
 
 
 class RoleChangeDocument(TypedDict):
@@ -313,7 +315,7 @@ class RemoteCommandRefused(OSError):
 def ssh_role_map(arguments: tuple[str, ...], *, machine: str = ROLE_MAP_HOST) -> str:
     """Only transport boundary; callers never invoke remote account launches."""
     account_config = conf.read('accounts')
-    command = "python3 ~/.claude/scripts/accounts/accounts.py " + shlex.join(arguments)
+    command = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py " + shlex.join(arguments)
     result = subprocess.run(("ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={account_config.whole("role_map_connect_timeout_seconds")}",
                              machine, command), capture_output=True, text=True, timeout=account_config.whole("role_map_timeout_seconds"))
     if result.returncode:
@@ -346,25 +348,32 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
         if not isinstance(value, dict):
             raise ValueError(f"invalid {group} account")
         fields = cast(dict[str, object], value)
-        if (not isinstance(fields.get("label"), str) or not isinstance(fields.get("move_id"), str)
-                or not fields["move_id"] or fields.get("cause") not in ("by hand", "refusal", "auto")
-                or fields.get("window") not in ("weekly", "five_hour", "unknown")):
-            raise ValueError(f"invalid {group} transition")
-        if re.fullmatch(r"claude ?[1-9][0-9]*", str(fields["label"])) is None:
+        if re.fullmatch(r"claude ?[1-9][0-9]*", str(fields.get("label", ""))) is None:
             raise ValueError(f"invalid {group} account")
-        if "reset" in fields:
-            reset = fields["reset"]
-            if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
-                raise ValueError(f"invalid {group} reset")
-        if "why" in fields and not isinstance(fields["why"], str):
-            raise ValueError(f"invalid {group} reason")
+        if (not isinstance(fields.get("move_id"), str) or not fields["move_id"]
+                or fields.get("cause") not in ("by hand", "refusal", "auto")
+                or fields.get("window") not in ("weekly", "five_hour", "unknown")):
+            print(f"accounts: anomaly: invalid {group} transition metadata", file=sys.stderr)
+            groups[group] = cast(str, fields["label"])
+            continue
         selected = StoredGroupSelection(label=cast(str, fields["label"]), move_id=cast(str, fields["move_id"]),
             cause=cast(Literal["by hand", "refusal", "auto"], fields["cause"]),
             window=cast(Literal["weekly", "five_hour", "unknown"], fields["window"]))
         if "reset" in fields:
-            selected["reset"] = cast(str, fields["reset"])
+            try:
+                reset = fields["reset"]
+                if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
+                    raise ValueError
+            except ValueError:
+                print(f"accounts: anomaly: invalid {group} reset", file=sys.stderr)
+            else:
+                selected["reset"] = reset
         if "why" in fields:
-            selected["why"] = cast(str, fields["why"])
+            why = fields["why"]
+            if isinstance(why, str):
+                selected["why"] = why
+            else:
+                print(f"accounts: anomaly: invalid {group} reason", file=sys.stderr)
         groups[group] = selected
     return groups
 
@@ -377,11 +386,17 @@ def decode_role_map(text: str) -> RoleMap:
     groups, workers = fields.get("groups"), fields.get("workers")
     if not isinstance(groups, dict) or not isinstance(workers, str):
         raise ValueError("invalid role map")
-    return RoleMap(_groups(cast(dict[str, object], groups)), workers, _workers_claude_account(fields))
+    upcoming = fields.get("upcoming_moves", [])
+    if not isinstance(upcoming, list) or not all(isinstance(line, str) for line in cast(list[object], upcoming)):
+        raise ValueError("invalid upcoming moves")
+    return RoleMap(_groups(cast(dict[str, object], groups)), workers, _workers_claude_account(fields),
+                   upcoming_moves=tuple(cast(list[str], upcoming)))
 
 
 def _map_document(value: RoleMap) -> RoleMapDocument:
     document = RoleMapDocument(groups=value.groups, workers=value.workers)
+    if value.upcoming_moves:
+        document["upcoming_moves"] = list(value.upcoming_moves)
     if isinstance(value.workers_claude, NamedWorkersClaudeAccount):
         document["workers_claude"] = WorkersClaudeRouteDocument(
             label=value.workers_claude.label, until=value.workers_claude.until.isoformat())
@@ -693,7 +708,7 @@ def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHis
     try:
         worker_names.recover_pending_journal(path, role_history=True)
     except (OSError, ValueError) as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     return _read_recorded_auto_moves(path)
 
@@ -705,7 +720,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
     except FileNotFoundError:
         return RecordedAutoMoves(frozenset())
     except (OSError, ValueError) as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     consumed: set[str] = set()
     try:
@@ -725,7 +740,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
                     and isinstance(why, str) and why.startswith("auto: ")):
                 consumed.add(why.removeprefix("auto: "))
     except ValueError as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     return RecordedAutoMoves(frozenset(consumed))
 
@@ -773,5 +788,5 @@ def repair_selected_auto_moves(entries: tuple[AutoMoveTarget, ...], now: datetim
                         append_journal_line(output.fileno(), json.dumps(row, sort_keys=True), valid_row=lambda _row: True)
             return RecordedAutoMoves(frozenset(consumed))
     except (OSError, ValueError) as error:
-        print(f"account moves: cannot read recorded auto moves: {error}")
+        print(f"account moves: anomaly: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()

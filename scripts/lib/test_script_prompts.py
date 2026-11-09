@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import json
-import sys
 import tempfile
 import time
 import unittest
@@ -11,7 +10,6 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import script_prompts  # noqa: E402
 
 

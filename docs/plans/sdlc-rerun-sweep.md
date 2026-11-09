@@ -115,6 +115,8 @@ The owner is the unit in the file's last checkpoint subject. "unknown" means no 
 
 ## guild-process-unit (6)
 
+Closed by the roles-unit rerun work: see `docs/as-built/script-rerun-recovery.md`. The `scripts/guilds` paths are now `scripts/astra`.
+
 | Path:line | Q | On a rerun | Owner |
 |---|---|---|---|
 | `scripts/astra/astra_roles.py:276` | 2 | If an exec reviewer dies before its role is released and its pid is reused, rerunning `list` reports the dead reviewer as busy. The saved hold and liveness test carry no process start time, so an unrelated process keeps the old role visible as live. | guild-process-unit (checkpoint(sdlc-guild-process)) |
@@ -201,6 +203,8 @@ The owner is the unit in the file's last checkpoint subject. "unknown" means no 
 | `scripts/lint/tmp_sweep.py:1106` | 1 | Stop after exclusive creation of a cleanup plan, before its JSON is complete. Rerunning `--plan` refuses the existing path, and `--apply` cannot read it, so the same command cannot finish its plan. | resources-unit (checkpoint(builds-resources)) |
 
 ## roles-unit (14)
+
+The `send.py`, `progress_history.py` and `workers.py` rows are closed: see `docs/as-built/script-rerun-recovery.md`. The `review_pool.py` rows are closed because the file is gone. The `codex_mesh.py` and `mesh_runs.py` rows are dropped because that code is being retired.
 
 | Path:line | Q | On a rerun | Owner |
 |---|---|---|---|

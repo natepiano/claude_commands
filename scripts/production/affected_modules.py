@@ -1,22 +1,26 @@
-"""Conservative test selection from a certified commit and tracked source dependencies.
+"""Select tests from direct Python imports and transitive configuration reads.
 
-No source is imported or evaluated. Unreadable git state or source always requests
-the full suite; callers own certification, reporting and execution.
+No source is imported or evaluated. Callers own certification and execution.
 """
 from __future__ import annotations
 
 import ast
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from importlib.metadata import packages_distributions
+from io import BytesIO
 from pathlib import Path
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from typing import cast
+
+from scripts.production.gate_modules import is_test_module
+from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
 
 
 @dataclass(frozen=True)
@@ -35,7 +39,6 @@ class AffectedSelection:
     base: CertifiedBase
     changed_files: tuple[str, ...]
     modules: tuple[Path, ...]
-    tree_scanners: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -47,128 +50,90 @@ class GraphError(Exception):
     """Git or source cannot establish a safe dependency graph."""
 
 
-@dataclass
-class FilenameSearchState:
-    next_character: dict[str, int] = field(default_factory=dict)
-    fallback: int = 0
-    dependencies: set[str] = field(default_factory=set)
-
-
-class FilenameDependencies:
-    """Match all tracked basenames, including overlaps, in one text pass.
-
-    Failure links reuse the longest remaining prefix after a mismatch. This
-    avoids trying every filename at every character in large fixture strings.
-    """
-
-    def __init__(self, by_name: dict[str, set[str]]) -> None:
-        self.states: list[FilenameSearchState] = [FilenameSearchState()]
-        for name, paths in by_name.items():
-            state = 0
-            for character in name:
-                transitions = self.states[state].next_character
-                if character not in transitions:
-                    transitions[character] = len(self.states)
-                    self.states.append(FilenameSearchState())
-                state = transitions[character]
-            self.states[state].dependencies.update(paths)
-        queue = deque(self.states[0].next_character.values())
-        while queue:
-            state = queue.popleft()
-            for character, following in self.states[state].next_character.items():
-                queue.append(following)
-                fallback = self.states[state].fallback
-                while fallback and character not in self.states[fallback].next_character:
-                    fallback = self.states[fallback].fallback
-                fallback = self.states[fallback].next_character.get(character, 0)
-                self.states[following].fallback = fallback
-                self.states[following].dependencies.update(self.states[fallback].dependencies)
-
-    def in_text(self, text: str) -> set[str]:
-        dependencies: set[str] = set()
-        state = 0
-        for character in text:
-            while state and character not in self.states[state].next_character:
-                state = self.states[state].fallback
-            state = self.states[state].next_character.get(character, 0)
-            dependencies.update(self.states[state].dependencies)
-        return dependencies
-
-
 def git_output(repo: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(repo), *arguments],
-                            capture_output=True, text=True, check=False)
+                            capture_output=True, text=True, errors="replace", check=False)
     if result.returncode:
         raise GraphError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout
 
 
-def full_suite_trigger(path: str) -> bool:
-    name = Path(path).name
-    return (path.startswith("scripts/lib/")
-            or name in {"conftest.py", "settings.json", "merge_gate.py", "affected_modules.py", "models_config.sh"})
-
-
 # Bump the extractor version whenever source-fact semantics change.
-CACHE_FORMAT_VERSION = 1
-EXTRACTOR_VERSION = 2
+CACHE_FORMAT_VERSION = 2
+EXTRACTOR_VERSION = 6
+PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
+
+
+@dataclass(frozen=True)
+class ValidPython:
+    pass
+
+
+@dataclass(frozen=True)
+class InvalidPython:
+    message: str
 
 
 @dataclass(frozen=True)
 class SourceFacts:
     # Relative imports retain their level until resolved from the current path.
     imports: tuple[tuple[int, str, tuple[str, ...]], ...]
-    text: str
-    scans: bool
+    tokens: frozenset[str]
+    config_reads: frozenset[str]
+    syntax: ValidPython | InvalidPython = ValidPython()
+
+
+@dataclass(frozen=True)
+class SourceGraph:
+    imports: dict[str, set[str]]
+    tokens: dict[str, frozenset[str]]
+    config_reads: dict[str, frozenset[str]]
 
 
 def extract_facts(text: str, path: str) -> SourceFacts:
-    if path.endswith(".sh"):
-        return SourceFacts((), text, False)
-    tree = ast.parse(text, filename=path)
+    tokens = frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
+    config_reads = {Path(token).name.removesuffix(".conf") for token in tokens if token.endswith(".conf")}
+    try:
+        tree = ast.parse(text, filename=path)
+    except SyntaxError as error:
+        return SourceFacts((), tokens, frozenset(config_reads), InvalidPython(error.msg))
     imports: list[tuple[int, str, tuple[str, ...]]] = []
-    strings: set[str] = set()
-    recursive = {"walk", "rglob"}
-    globbers = {"glob", "iglob"}
-    calls: set[str] = set()
-    recursive_globs: set[str] = set()
-    # Each node is visited once. A ** string belongs to every enclosing call,
-    # including when nested in another expression, as in the old subtree walk.
-    pending: list[tuple[ast.AST, tuple[str, ...]]] = [(tree, ())]
-    while pending:
-        node, enclosing = pending.pop()
+    conf_modules: set[str] = set()
+    conf_functions: set[str] = set()
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imports.extend((0, alias.name, ()) for alias in node.names)
+            conf_modules.update(alias.asname or alias.name for alias in node.names
+                                if alias.name in {"conf", "scripts.lib.conf"})
         elif isinstance(node, ast.ImportFrom):
             imports.append((node.level, node.module or "", tuple(alias.name for alias in node.names)))
-            for alias in node.names:
-                if node.module == "os" and alias.name == "walk":
-                    recursive.add(alias.asname or alias.name)
-                if node.module == "glob" and alias.name in {"glob", "iglob"}:
-                    globbers.add(alias.asname or alias.name)
-        elif isinstance(node, ast.Call):
-            name = node.func.attr if isinstance(node.func, ast.Attribute) else (
-                node.func.id if isinstance(node.func, ast.Name) else "")
-            if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "conf" and node.args
-                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
-                strings.add(f"config/{node.args[0].value}.conf")
-            calls.add(name)
-            enclosing = (*enclosing, name)
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            strings.add(node.value)
-            if "**" in node.value:
-                recursive_globs.update(enclosing)
-        pending.extend((child, enclosing) for child in ast.iter_child_nodes(node))
-    # Aliases apply regardless of where their import appeared in the AST.
-    scans = bool(calls & recursive or recursive_globs & globbers or any("ls-files" in text for text in strings))
-    return SourceFacts(tuple(imports), "\0".join(sorted(strings)), scans)
+            if not node.level and node.module == "scripts.lib":
+                conf_modules.update(alias.asname or alias.name for alias in node.names if alias.name == "conf")
+            elif not node.level and node.module == "scripts.lib.conf":
+                conf_functions.update(alias.asname or alias.name for alias in node.names)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function = node.func
+        reader = isinstance(function, ast.Name) and function.id in conf_functions
+        if isinstance(function, ast.Attribute):
+            parts: list[str] = []
+            module = function.value
+            while isinstance(module, ast.Attribute):
+                parts.append(module.attr)
+                module = module.value
+            if isinstance(module, ast.Name):
+                reader = ".".join((module.id, *reversed(parts))) in conf_modules
+        first = node.args[0]
+        if reader and isinstance(first, ast.Constant) and isinstance(first.value, str):
+            config_reads.add(Path(first.value).name.removesuffix(".conf"))
+    return SourceFacts(tuple(imports), tokens, frozenset(config_reads))
 
 
 def indexed_files(repo: Path) -> tuple[set[str], dict[str, str]]:
     tracked: set[str] = set()
     blobs: dict[str, str] = {}
-    for entry in git_output(repo, "ls-files", "--stage", "-z", "--", "scripts", "config").split("\0"):
+    for entry in git_output(repo, "ls-files", "--stage", "-z").split("\0"):
         if not entry:
             continue
         metadata, path = entry.split("\t", 1)
@@ -186,8 +151,13 @@ def decoded_facts(value: object) -> SourceFacts:
     if not isinstance(value, dict):
         raise ValueError("invalid source facts")
     row = cast(dict[str, object], value)
-    imports, text, scans = row.get("imports"), row.get("text"), row.get("scans")
-    if not isinstance(imports, list) or not isinstance(text, str) or not isinstance(scans, bool):
+    imports, tokens, config_reads = row.get("imports"), row.get("tokens"), row.get("config_reads")
+    syntax_error = row.get("syntax_error")
+    if (not isinstance(imports, list) or not isinstance(tokens, list)
+            or not all(isinstance(token, str) for token in cast(list[object], tokens))
+            or not isinstance(config_reads, list)
+            or not all(isinstance(name, str) for name in cast(list[object], config_reads))
+            or syntax_error is not None and not isinstance(syntax_error, str)):
         raise ValueError("invalid source facts fields")
     decoded: list[tuple[int, str, tuple[str, ...]]] = []
     for item in cast(list[object], imports):
@@ -199,10 +169,11 @@ def decoded_facts(value: object) -> SourceFacts:
                 or not all(isinstance(name, str) for name in cast(list[object], names))):
             raise ValueError("invalid source import fields")
         decoded.append((level, module, tuple(cast(list[str], names))))
-    return SourceFacts(tuple(decoded), text, scans)
+    syntax = InvalidPython(syntax_error) if isinstance(syntax_error, str) else ValidPython()
+    return SourceFacts(tuple(decoded), frozenset(cast(list[str], tokens)), frozenset(cast(list[str], config_reads)), syntax)
 
 
-def read_fact_cache(path: Path) -> dict[str, dict[str, SourceFacts]]:
+def read_fact_cache(path: Path) -> dict[str, SourceFacts]:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
         if not isinstance(value, dict):
@@ -213,27 +184,23 @@ def read_fact_cache(path: Path) -> dict[str, dict[str, SourceFacts]]:
         blobs = row.get("blobs")
         if not isinstance(blobs, dict):
             return {}
-        result: dict[str, dict[str, SourceFacts]] = {}
-        for blob, kinds in cast(dict[str, object], blobs).items():
-            if not isinstance(kinds, dict):
-                return {}
-            result[blob] = {}
-            for kind, facts in cast(dict[str, object], kinds).items():
-                if kind not in {".py", ".sh"}:
-                    return {}
-                result[blob][kind] = decoded_facts(facts)
+        result: dict[str, SourceFacts] = {}
+        for blob, facts in cast(dict[str, object], blobs).items():
+            result[blob] = decoded_facts(facts)
         return result
     except (OSError, ValueError):
         return {}
 
 
-def write_fact_cache(path: Path, facts: dict[str, dict[str, SourceFacts]]) -> None:
+def write_fact_cache(path: Path, facts: dict[str, SourceFacts]) -> None:
     temporary: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         value = {"format": CACHE_FORMAT_VERSION, "extractor": EXTRACTOR_VERSION,
-                 "blobs": {blob: {kind: asdict(entry) for kind, entry in kinds.items()}
-                           for blob, kinds in facts.items()}}
+                 "blobs": {blob: {"imports": entry.imports, "tokens": sorted(entry.tokens),
+                                  "config_reads": sorted(entry.config_reads),
+                                  "syntax_error": entry.syntax.message if isinstance(entry.syntax, InvalidPython) else None}
+                           for blob, entry in facts.items()}}
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
             temporary = Path(output.name)
             json.dump(value, output)
@@ -254,49 +221,65 @@ def module_dependencies(module: str, tracked: set[str]) -> set[str]:
     return candidates & tracked
 
 
-def dependency_graph(repo: Path, tracked: set[str] | None = None, changed_files: Sequence[str] = (),
-                     *, state_dir: Path | None = None) -> tuple[dict[str, set[str]], set[str]]:
-    blobs: dict[str, str] = {}
-    if tracked is None or state_dir is not None:
-        indexed, blobs = indexed_files(repo)
-        if tracked is None:
-            tracked = indexed
-    cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
-    cached = read_fact_cache(cache_path) if cache_path is not None else {}
-    current: dict[str, dict[str, SourceFacts]] = {}
-    cache_changed = False
-    # Direct graph callers can inspect dirty trees; never cache their working
-    # edits under the index blob. The gate itself already requires a clean tree.
-    dirty: set[str] = set(git_output(repo, "diff-files", "--name-only", "-z", "--", "scripts", "config").split("\0")) if cache_path else set()
-    by_name: dict[str, set[str]] = defaultdict(set)
+def revision_files(repo: Path, revision: str) -> dict[str, str]:
+    return {path: entry.object for path, entry in parse_tree_listing(git_output(repo, "ls-tree", "-rz", revision)).items()
+            if entry.kind == "blob"}
+
+
+def blob_texts(repo: Path, blobs: set[str]) -> dict[str, str]:
+    try:
+        result = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"],
+                                input=("\n".join(sorted(blobs)) + "\n").encode(), capture_output=True, check=False)
+    except OSError as error:
+        raise GraphError(str(error)) from error
+    if result.returncode:
+        raise GraphError(result.stderr.decode("utf-8", errors="replace").strip() or "git cat-file failed")
+    replies = BytesIO(result.stdout)
+    texts: dict[str, str] = {}
+    for blob in sorted(blobs):
+        reply = read_batch_blob(replies)
+        if not isinstance(reply, GitBlob):
+            raise GraphError(f"{blob}: invalid Git blob response")
+        texts[blob] = reply.content.decode("utf-8")
+    return texts
+
+
+def dirty_paths(repo: Path) -> set[str]:
+    return parse_status_z(git_output(repo, "status", "--porcelain", "-z", "--untracked-files=all"))
+
+
+def worktree_files(repo: Path, dirty: set[str]) -> tuple[set[str], dict[str, str]]:
+    indexed, blobs = indexed_files(repo)
+    paths = {path for path in indexed | dirty if path.endswith(".py")}
+    return {path for path in paths if (repo / path).is_file()}, blobs
+
+
+def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
+                    cached: dict[str, SourceFacts], *, worktree: bool
+                    ) -> SourceGraph:
     bare_modules: dict[str, set[str]] = defaultdict(set)
-    # Keep removed data/shell files as dependency targets, so their old names
-    # still connect callers across suites. Deleted Python already forces full.
-    targets = tracked | {path for path in changed_files if path.startswith(("scripts/", "config/"))}
-    for path in targets:
-        by_name[Path(path).name].add(path)
-        if path.startswith("scripts/") and path.endswith(".py"):
-            name = Path(path).parent.name if Path(path).name == "__init__.py" else Path(path).stem
-            bare_modules[name].add(path)
-    mentions = FilenameDependencies(by_name)
+    for path in paths:
+        name = Path(path).parent.name if Path(path).name == "__init__.py" else Path(path).stem
+        bare_modules[name].add(path)
+    sources = sorted(paths)
+    missing = {blobs[path] for path in sources if path in blobs and blobs[path] not in cached}
+    texts = blob_texts(repo, missing) if not worktree and missing else {}
     external = set(sys.stdlib_module_names) | set(packages_distributions())
     graph: dict[str, set[str]] = {}
-    scanners: set[str] = set()
-    for path in sorted(tracked):
-        if not path.startswith("scripts/") or Path(path).suffix not in {".py", ".sh"}:
-            continue
-        kind = Path(path).suffix
+    tokens: dict[str, frozenset[str]] = {}
+    config_reads: dict[str, frozenset[str]] = {}
+    for path in sources:
         blob = blobs.get(path) if path not in dirty else None
-        facts = cached.get(blob, {}).get(kind) if blob is not None else None
+        facts = cached.get(blob) if blob is not None else None
         if facts is None:
-            cache_changed = True
-            facts = extract_facts((repo / path).read_text(encoding="utf-8"), path)
+            text = (repo / path).read_text(encoding="utf-8") if worktree else texts[blobs[path]]
+            facts = extract_facts(text, path)
             if blob is not None:
-                cached.setdefault(blob, {})[kind] = facts
-        if blob is not None:
-            current.setdefault(blob, {})[kind] = facts
-        if facts.scans:
-            scanners.add(path)
+                cached[blob] = facts
+        if isinstance(facts.syntax, InvalidPython) and is_test_module(path):
+            raise SyntaxError(f"{facts.syntax.message} ({path})")
+        tokens[path] = facts.tokens
+        config_reads[path] = facts.config_reads
         dependencies: set[str] = set()
         for level, module, names in facts.imports:
             if level:
@@ -304,64 +287,90 @@ def dependency_graph(repo: Path, tracked: set[str] | None = None, changed_files:
                 module = ".".join((*parents[:len(parents) - level + 1], *module.split("."))).rstrip(".")
             for imported in (module, *(f"{module}.{name}" for name in names)):
                 root = imported.split(".")[0]
-                if root == "scripts":
-                    dependencies.update(module_dependencies(imported, tracked))
-                elif root and root not in external:
-                    dependencies.update(bare_modules.get(root, set()))
-        # These full-suite triggers hold selection data, not runtime file uses.
-        # Their imports still contribute dependencies above.
-        if path not in {"scripts/production/affected_modules.py", "scripts/production/merge_gate.py"}:
-            dependencies.update(mentions.in_text(facts.text))
+                if root == "scripts" or root and root not in external:
+                    dependencies.update(module_dependencies(imported, paths))
+                    if root != "scripts":
+                        dependencies.update(bare_modules.get(root, set()))
         dependencies.discard(path)
         graph[path] = dependencies
-    if cache_path is not None and (cache_changed or current != cached):
+    return SourceGraph(graph, tokens, config_reads)
+
+
+def transitive_config_reads(graph: SourceGraph) -> dict[str, set[str]]:
+    importers: dict[str, set[str]] = defaultdict(set)
+    for path, dependencies in graph.imports.items():
+        for dependency in dependencies:
+            importers[dependency].add(path)
+    reads = {path: set(names) for path, names in graph.config_reads.items()}
+    pending = [path for path, names in reads.items() if names]
+    while pending:
+        source = pending.pop()
+        for importer in importers[source]:
+            added = reads[source] - reads[importer]
+            if added:
+                reads[importer].update(added)
+                pending.append(importer)
+    return reads
+
+
+def retain_facts(cache_path: Path | None, cached: dict[str, SourceFacts],
+                 before: set[str], blobs: set[str]) -> None:
+    current = {blob: facts for blob, facts in cached.items() if blob in blobs}
+    if cache_path is not None and current.keys() != before:
         write_fact_cache(cache_path, current)
-    return graph, scanners
+
+
+def source_blobs(paths: set[str], blobs: dict[str, str]) -> set[str]:
+    return {blob for path, blob in blobs.items() if path in paths}
+
+
+def dependency_graph(repo: Path, *, state_dir: Path | None = None
+                     ) -> tuple[dict[str, set[str]], dict[str, frozenset[str]]]:
+    dirty = dirty_paths(repo)
+    paths, blobs = worktree_files(repo, dirty)
+    cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
+    cached = read_fact_cache(cache_path) if cache_path is not None else {}
+    before = set(cached)
+    result = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
+    retain_facts(cache_path, cached, before, source_blobs(paths | dirty, blobs))
+    return result.imports, result.tokens
 
 
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
-                    modules: Sequence[Path], *, state_dir: Path | None = None) -> AffectedSelection | FullSuite:
+                    modules: Sequence[Path], dirty: set[str], *,
+                    state_dir: Path | None = None) -> AffectedSelection | FullSuite:
     try:
-        if git_output(repo, "status", "--porcelain", "--untracked-files=all").strip():
-            return FullSuite("tree not clean")
         if isinstance(base, NoCertifiedBase):
             return FullSuite("no certified base")
-        changes = git_output(repo, "diff", "--name-status", "-z", "-M", base.commit, "HEAD").split("\0")
-        changed: set[str] = set()
-        index = 0
-        while index < len(changes) and changes[index]:
-            status, path = changes[index:index + 2]
-            index += 2
-            changed.add(path)
-            if status.startswith(("R", "C")):
-                target = changes[index]
-                index += 1
-                changed.add(target)
-                if status.startswith("R") and (path.endswith(".py") or target.endswith(".py")):
-                    return FullSuite(f"Python file renamed: {path} -> {target}")
-            if status == "D" and path.endswith(".py"):
-                return FullSuite(f"Python file deleted: {path}")
-        for path in sorted(changed):
-            if full_suite_trigger(path):
-                return FullSuite(f"shared gate input changed: {path}")
-        graph, scanners = dependency_graph(repo, changed_files=tuple(changed), state_dir=state_dir)
-        dependents: dict[str, set[str]] = defaultdict(set)
-        for path, dependencies in graph.items():
-            for dependency in dependencies:
-                dependents[dependency].add(path)
-        reached = set(changed)
-        queue = deque(changed)
-        while queue:
-            for path in dependents[queue.popleft()] - reached:
-                reached.add(path)
-                queue.append(path)
-        orphan_suites = {Path(path).parts[1] for path in changed
-                         if path.startswith("scripts/") and len(Path(path).parts) >= 3 and not dependents[path]}
-        selected = tuple(path for path in modules if path.relative_to(repo).as_posix() in reached | scanners
-                         or path.relative_to(repo).parts[1] in orphan_suites)
-        if len(selected) * 5 > len(modules) * 2:
-            return FullSuite(f"more than 40% of modules affected ({len(selected)} of {len(modules)})")
-        return AffectedSelection(base, tuple(sorted(changed)), selected,
-                                 tuple(path for path in modules if path.relative_to(repo).as_posix() in scanners))
+        changes = git_output(repo, "diff", "--name-only", "-z", "--no-renames", base.commit, "HEAD")
+        changed = (set(changes.split("\0")) - {""}) | dirty
+        paths, blobs = worktree_files(repo, dirty)
+        cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
+        cached = read_fact_cache(cache_path) if cache_path is not None else {}
+        before = set(cached)
+        graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
+        config_reads = transitive_config_reads(graph)
+        configs = {Path(path).name.removesuffix(".conf") for path in changed
+                   if path.startswith("config/") and path.endswith(".conf")}
+        retained = source_blobs(paths | dirty, blobs)
+        python = {path for path in changed if path.endswith(".py")}
+        removed = {path for path in python if not (repo / path).is_file()}
+        old_graph: dict[str, set[str]] = {}
+        if removed:
+            old_blobs = revision_files(repo, base.commit)
+            old_paths = {path for path in old_blobs if path.endswith(".py")}
+            old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
+            retained.update(source_blobs(old_paths, old_blobs))
+        retain_facts(cache_path, cached, before, retained)
+        folders = {str(Path(path).parent) for path in python if not is_test_module(path)}
+        selected: list[Path] = []
+        for module in modules:
+            path = module.relative_to(repo).as_posix()
+            if (path in changed or graph.imports.get(path, set()) & python
+                    or old_graph.get(path, set()) & removed or graph.tokens.get(path, frozenset()) & changed
+                    or config_reads.get(path, set()) & configs
+                    or str(Path(path).parent) in folders):
+                selected.append(module)
+        return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
     except (GraphError, OSError, ValueError, SyntaxError) as error:
         return FullSuite(f"graph error: {error}")

@@ -4,6 +4,10 @@ The pure transition is also the log replay. One sender record serializes concurr
 receivers; literal-repeat episodes cover receivers together; rate episodes belong to one receiver.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -24,7 +28,6 @@ from pathlib import Path
 from subprocess import Popen
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -426,14 +429,20 @@ def isolated(command: list[str], request: str, budget: float) -> Decision:
             raise ValueError("invalid guard worker count")
         return Decision(raw["held"] is True, copies)
     except subprocess.TimeoutExpired:
-        process_group.send_process_group(child.pid, signal.SIGKILL)
         warn("operation deadline exceeded")
-        # Only subprocess creation is used: no Python state is forked by this caller.
-        threading.Thread(target=child.communicate, daemon=True).start()
         return Decision()
     except Exception as error:
         warn(str(error))
         return Decision()
+    finally:
+        # Interrupts and communication errors must also end the worker.
+        if child.poll() is None:
+            try:
+                process_group.send_process_group(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            # Reaping must not extend the caller's I/O safety ceiling.
+            threading.Thread(target=child.communicate, daemon=True).start()
 
 
 def bounded(operation: Literal["check", "event"], root: Path, attempt: Attempt, *,

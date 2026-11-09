@@ -2,6 +2,10 @@
 """Pause a review's dailies, then restore them only if the review stopped them."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -9,13 +13,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
-if TYPE_CHECKING:
-    from ..hooks import showrunner_footer as showrunner_footer
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    import showrunner_footer as showrunner_footer
+from scripts.production import showrunners
+
+from scripts.hooks import showrunner_footer as showrunner_footer
 
 
 ActionState = Literal["untouched", "attempted", "done", "skipped"]
@@ -32,16 +34,16 @@ def notifier_command() -> list[str]:
     return ["zsh", str(Path.home() / ".claude/scripts/message/notifier.sh")]
 
 
-def notifier(action: str, slug: str) -> str:
-    result = subprocess.run([*notifier_command(), action, f"showrunner-{slug}"],
+def notifier(action: str, instance: Path) -> str:
+    result = subprocess.run([*notifier_command(), action, instance.name],
                             capture_output=True, text=True, check=False, timeout=10)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"notifier {action} failed for {slug}")
+        raise RuntimeError(result.stderr.strip() or f"notifier {action} failed for {instance.name}")
     return result.stdout.strip()
 
 
-def record_path(slug: str) -> Path:
-    return showrunner_footer.review_pause_path(slug)
+def record_path(name: str) -> Path:
+    return showrunner_footer.review_pause_path(name)
 
 
 def read_record(path: Path) -> ReviewPauseRecord:
@@ -94,8 +96,8 @@ def reconcile_attempted(instance: Path, path: Path, record: ReviewPauseRecord) -
 
 
 def pause(instance: Path) -> str:
-    slug = instance.name.removeprefix("showrunner-")
-    path = record_path(slug)
+    name = showrunners.owner_for_timer(instance).name
+    path = record_path(name)
     existing = path.exists()
     record = read_record(path) if existing else ReviewPauseRecord(dailies="untouched")
     if not existing:
@@ -107,36 +109,36 @@ def pause(instance: Path) -> str:
     if enabled and record["dailies"] in ("untouched", "attempted"):
         record["dailies"] = "attempted"
         write_record(path, record)
-        _ = notifier("stop", slug)
+        _ = notifier("stop", instance)
         record["dailies"] = "done"
         write_record(path, record)
     if existing:
         return status(instance)
-    return f"{slug}: paused dailies" if record["dailies"] == "done" else f"{slug}: nothing to pause"
+    return f"{name}: paused dailies" if record["dailies"] == "done" else f"{name}: nothing to pause"
 
 
 def status(instance: Path) -> str:
-    slug = instance.name.removeprefix("showrunner-")
-    path = record_path(slug)
+    name = showrunners.owner_for_timer(instance).name
+    path = record_path(name)
     if not path.exists():
         return ""
     record = read_record(path)
     _ = reconcile_attempted(instance, path, record)
-    return f"{slug}: review paused dailies" if record["dailies"] == "done" else f"{slug}: review paused nothing"
+    return f"{name}: review paused dailies" if record["dailies"] == "done" else f"{name}: review paused nothing"
 
 
 def resume(instance: Path, answer: str) -> str:
-    slug = instance.name.removeprefix("showrunner-")
-    path = record_path(slug)
+    name = showrunners.owner_for_timer(instance).name
+    path = record_path(name)
     if not path.exists():
         return ""
     record = read_record(path)
     _ = reconcile_attempted(instance, path, record)
     restored = answer == "dailies" and record["dailies"] == "done"
     if restored:
-        _ = notifier("start", slug)
+        _ = notifier("start", instance)
     path.unlink()
-    return f"{slug}: turned on dailies" if restored else f"{slug}: left dailies off"
+    return f"{name}: turned on dailies" if restored else f"{name}: left dailies off"
 
 
 def main(argv: list[str]) -> int:

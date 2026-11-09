@@ -17,6 +17,7 @@ from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
 from scripts.production.merge_gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
@@ -62,9 +63,9 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_each_mode_waits_before_tests_types_or_promotion(self) -> None:
         arguments = ["--repo", str(self.gate.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
-                     "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit",
+                     "--previous-checkpoint", self.gate.base, "--unit", "fixture",
                      "--phase", "hold", "--type-dirs", "scripts/production",
-                     "--production", str(self.gate.quiet_production),
+                     "--production", "quiet",
                           "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
         for mode in ([], ["--tests-only"], ["--promote-only"]):
             with self.subTest(mode=mode):
@@ -175,8 +176,8 @@ class MergeGateHoldTests(TemporaryHoldTest):
             code = merge_gate.main([
                 "--repo", str(self.gate.checkout), "--merge-branch", "integration",
                 "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
-                "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit", "--phase", "hold",
-                "--production", str(self.gate.quiet_production), "--type-dirs", "scripts/production",
+                "--previous-checkpoint", self.gate.base, "--unit", "fixture", "--phase", "hold",
+                "--production", "quiet", "--type-dirs", "scripts/production",
             ])
         self.assertNotEqual(code, 0, output.getvalue())
         self.assertIn("natedev hold state cannot be read", output.getvalue())
@@ -249,7 +250,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
 
     def test_unreadable_hold_state_refuses_before_any_job(self) -> None:
         self.unreadable()
-        with self.assertRaisesRegex(merge_gate.GateRefused, "natedev hold state cannot be read"):
+        with self.assertRaisesRegex(GateRefused, "natedev hold state cannot be read"):
             _ = merge_gate.run_suites(self.gate.checkout, type_dirs=("scripts/production",))
         self.assertEqual(self.gate.calls(), [])
         self.assertEqual(self.gate.module_events(), [])

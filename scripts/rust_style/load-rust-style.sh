@@ -6,7 +6,7 @@ set -euo pipefail
 # repo needs >= 3.12.
 # Explicit discovery keeps the interpreter shim from writing its cache.
 export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
-PY="${HOME}/.claude/scripts/lib/py"
+PY="${0:A:h}/../lib/py"
 
 list_files=false
 project_root=""

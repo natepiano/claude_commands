@@ -17,14 +17,13 @@ from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from code_kind import is_test_code  # noqa: E402
+from scripts.lib.code_kind import is_test_code  # noqa: E402
 
-import gpu_xid
-import push_texts
-from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
-from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
+from scripts.notify import gpu_xid
+from scripts.notify import push_texts
+from scripts.message import session_send
+from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
+from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
 ROOT = Path(__file__).resolve().parents[2]
 EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}
@@ -58,7 +57,11 @@ def literal_delivery_calls(source: str) -> list[int]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.List, ast.Tuple, ast.Call)):
             arguments = node.args if isinstance(node, ast.Call) else node.elts
-            if len(arguments) > 2 and literal_path(arguments[2]) == "retire":
+            uses_builder = (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and isinstance(node.func.value, ast.Name) and node.func.value.id == "session_send"
+                            and node.func.attr == "send_argv")
+            command_index = 0 if uses_builder else 2
+            if len(arguments) > command_index and literal_path(arguments[command_index]) == "retire":
                 continue
             for left, right in zip(arguments, arguments[1:]):
                 if literal_path(left) == "--to" and literal_path(right) == "user":
@@ -144,6 +147,12 @@ class PushTextTests(unittest.TestCase):
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
                         purpose="Test.")
 
+    def test_blocked_mac_catalog_keeps_its_required_action(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "mac_idle.blocked")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertIsInstance(push.action, ActionRequired)
+        self.assertEqual(push.action, ActionRequired(cast(ActionTemplate, entry.action).text.format_map(push.values)))
+
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
         self.assertTrue(entries, "push_catalog.ENTRIES must include script and nixos pushes")
@@ -160,6 +169,25 @@ class PushTextTests(unittest.TestCase):
                     else:
                         self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
+
+    def test_decision_argv_carries_the_question_record_path(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        argv = push_texts.user_send_argv(push, question="/tmp/question-layout.md")
+        self.assertEqual(argv[argv.index("--question") + 1], "/tmp/question-layout.md")
+
+    def test_user_commands_use_the_current_sender_and_preserve_an_explicit_override(self) -> None:
+        entry = self.entry()
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        with tempfile.TemporaryDirectory() as folder:
+            current, override = Path(folder) / "current.py", Path(folder) / "override.py"
+            with mock.patch.object(session_send, "SEND_SCRIPT", current):
+                default = push_texts.user_send_argv(push)
+                explicit = push_texts.user_send_argv(push, send_script=override)
+                retired = push_texts.user_retire_argv("sender", "held")
+        self.assertEqual(default[:2], [sys.executable, str(current)])
+        self.assertEqual(explicit, [sys.executable, str(override), *default[2:]])
+        self.assertEqual(retired, [sys.executable, str(current), "retire", "--to", "user", "--from", "sender", "--key", "held"])
 
     def test_decision_choices_builds_the_approved_rows_and_keeps_structured_values(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
@@ -247,7 +275,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_reports_known_codes_without_extra_output(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, meaning + "\n")
@@ -256,7 +284,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_refuses_unknown_codes_on_one_line(self) -> None:
         for code, shown in (("999", "'999'"), ("999\nsecond line", "'999\\nsecond line'")):
             with self.subTest(code=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
@@ -272,7 +300,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertRegex(stopped, r"^(?:1 session|[1-9][0-9]* sessions)")
                 self.assertIn(stopped, push.message)
                 self.assertIn("Coding work stays stopped until the restart succeeds.", push.body)
-                self.assertEqual(cast(ActionRequired, push.action).text.count("/shutdown restart"), 1)
+                self.assertEqual(cast(ActionRequired, push.action).text.count("/agents restart"), 1)
                 self.assertIn("natedev", cast(ActionRequired, push.action).text)
                 self.assertLess(len(push.message), 500)
         self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
@@ -286,7 +314,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(example.values["stopped"], push.body)
             action = cast(ActionRequired, push.action).text
             self.assertEqual(action.count("accounts.py trust"), 1)
-            self.assertEqual(action.count("/shutdown restart"), 1)
+            self.assertEqual(action.count("/agents restart"), 1)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         unlisted = entries["shutdown.restart_untrusted_unlisted"]
@@ -298,7 +326,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(f'Trust the folders of the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                           cast(ActionRequired, push.action).text)
             self.assertNotIn("accounts.py trust", push.message)
-            self.assertNotIn("/shutdown restart", push.message)
+            self.assertNotIn("/agents restart", push.message)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         self.assertNotIn("shutdown.move_untrusted", entries)
@@ -312,7 +340,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertIn(example.values["stopped"], push.body)
                 self.assertIn(f'Resume the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                               cast(ActionRequired, push.action).text)
-                self.assertNotIn("/shutdown restart", push.message)
+                self.assertNotIn("/agents restart", push.message)
                 self.assertLess(len(push.message), 500)
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
@@ -383,44 +411,20 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(push.title, "natedev the /nate skill is ready")
         self.assertEqual(push.message, "It is ready now.")
 
-    def test_vault_stopped_text_names_the_cause_and_the_safe_fix_for_each_outage(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "vault.stopped")
-        fixes = {
-            "Some files in ~/rust/hanadocs on the Mac have changes that are not committed.":
-                "In a terminal on the Mac, commit or discard the changes in ~/rust/hanadocs.",
-            "~/rust/hanadocs on the Mac is not on the main branch.":
-                "In a terminal on the Mac, switch ~/rust/hanadocs to the main branch.",
-            "The Mac copy has commits that GitHub does not have, so a safe update is not possible.":
-                "In a terminal on the Mac, push the commits in ~/rust/hanadocs to GitHub.",
-            "An update would replace a file on the Mac that git does not track.":
-                "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name.",
-            "natedev could not reach the Mac for more than 24 hours.":
-                "Wake the Mac and connect it to the network.",
-            "The update failed with an error the job does not know.":
-                "In the Claude session named natedev, ask it to read the vault update error in the hourly log.",
-        }
-        self.assertEqual({example.values["reason"] for example in entry.examples}, set(fixes))
-        for example in entry.examples:
-            with self.subTest(example=example.name):
-                push = push_texts.render_entry(entry, example.values)
-                self.assertEqual(push.title, "Mac vault copy is not updating")
-                self.assertIn(example.values["reason"], push.body)
-                self.assertIn("It tries again each hour", push.body)
-                self.assertIsInstance(push.action, ActionRequired)
-                self.assertTrue(push.message.startswith("Action: "))
-                self.assertEqual(push.message.splitlines()[0], "Action: " + fixes[example.values["reason"]])
+    def test_vault_stops_have_no_phone_template(self) -> None:
+        self.assertNotIn("vault.stopped", {entry.id for entry in push_texts.catalog()})
 
-    def test_auto_mode_refusal_keeps_the_user_approved_lines(self) -> None:
+    def test_auto_mode_refusal_says_what_happened_and_what_to_type(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "cargo-liner-style: auto mode stopped modules")
+        self.assertEqual(push.title, "cargo-liner-style: modules commands refused")
         # The first line says what auto mode refused and where (user, 2026-10-23); each command follows on its own line.
         self.assertEqual(push.message.split("\n")[:5], [
-            "Session: modules", "Action: On natedev, in the modules pane, approve the prompt or add an allow rule",
+            "Session: modules", "Action: On natedev, in the modules pane, type: Go: run the refused commands",
             "Auto mode refused 2 shell commands in the modules session. The modules build waits for them.",
             "implement.sh --to modules-impl", "review.sh --to modules-test"])
-        self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Approve", "Allow rule"])
+        self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Go", "Allow rule"])
         self.assertTrue(push.body.endswith("auto mode lets these commands run from then on."))
         one = push_texts.render_entry(entry, entry.examples[1].values)
         self.assertTrue(one.body.startswith("Auto mode refused a shell command in the messaging session."
@@ -537,6 +541,14 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(literal_delivery_calls(imported + "\n" + call), [2])
         self.assertEqual(literal_delivery_calls('run(user_send_argv(render("good")))'), [])
         self.assertEqual(literal_delivery_calls('other.send("user", "text")'), [])
+
+    def test_shared_sender_builder_exempts_retirement_but_checks_delivery(self) -> None:
+        self.assertEqual(literal_delivery_calls(
+            'session_send.send_argv("retire", "--to", "user", "--key", "held")'), [])
+        self.assertEqual(literal_delivery_calls(
+            'session_send.send_argv("--to", "user", "--text", "literal")'), [1])
+        self.assertEqual(literal_delivery_calls(
+            'other.send_argv("retire", "--to", "user")'), [1])
 
     def test_rendered_binding_cannot_excuse_a_later_string_or_conditional_string(self) -> None:
         self.assertEqual(literal_delivery_calls('push = render("good")\npush = "literal"\nbroadcast.send("user", "script", push)'), [3])

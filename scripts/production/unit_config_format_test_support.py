@@ -35,7 +35,7 @@ def count_taplo(test: unittest.TestCase, root: Path) -> Generator[TaploInvocatio
     wrapper = directory / "taplo"
     write_text_atomic(wrapper, f"#!{sys.executable}\n"
                       + "import os, sys\nfrom pathlib import Path\n"
-                      + f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
+                      + f'with open(Path({str(Path(__file__).resolve().parents[2])!r}) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {{"__file__": package_root.name}})\n'
                       + "from scripts.lib.atomic_file import write_text_atomic\n"
                       + f"log = Path({str(log)!r})\n"
                       + "previous = log.read_text() if log.exists() else ''\n"

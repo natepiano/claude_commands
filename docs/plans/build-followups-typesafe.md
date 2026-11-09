@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready; approved by the user 2026-10-26.** A script that has TypeSafe's Jev score each hanadocs issue field, measured against the values the vault holds now, and then used by `/issue` to propose fields for a new issue.
 
-> **Production: natedev** — unit `typesafe-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -143,7 +142,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
   - `scripts/prioritize/renumber.py` — score formula (lines ~420–436: `4*(alignment-1) + 3*(impact-1) + URGENCY_BONUSES[...] - (effort-1) + goal bonus`); imported by `evaluate.py`, never copied
 - **Test lanes:** `scripts/issue_score/test_*.py`; tests never call the live API, they replay recorded responses from `scripts/issue_score/fixtures/`
 - **Build:** none
-- **Test:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`
+- **Test:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .`
 - **Lint:** `basedpyright scripts/issue_score` — pass is its `0 errors, 0 warnings` line
 - **Invariants:**
   - The scorer never writes inside `~/rust/hanadocs`.

@@ -19,8 +19,8 @@ Everything below is the contract.
 ---
 
 <PeriodicCI>
-A production unit (plan header carries `> **Production:**`) skips this
-contract and <CICleanup/>: the showrunner runs CI on the merge branch
+A unit whose staff parent is a showrunner skips this contract and <CICleanup/>.
+The showrunner runs CI on the merge branch
 (`~/.claude/docs/production_format.md` → <ProductionUnit/>).
 
 Loop and verbose only; `single` never pushes. Applies only when the plan doc

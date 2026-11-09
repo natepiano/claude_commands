@@ -6,6 +6,10 @@ This module starts no separate herdr session.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import itertools
@@ -15,14 +19,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import herdr
+from scripts.herdr import herdr
 
-SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "message"))
-from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
+from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
 
-sys.path.insert(0, str(SCRIPTS.parent))
-sys.path.insert(0, str(SCRIPTS / "production"))
 from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
 from scripts.accounts import accounts  # noqa: E402
@@ -72,6 +72,9 @@ def _attach_remote(host: RemoteHost, name: str) -> int:
         reason = " ".join(result.stderr.split()) or "no error message"
         print(f"herdr_sessions: {host.target}: {reason}", file=sys.stderr)
         return 1
+    if not result.stdout.strip():
+        print(f"herdr_sessions: {host.target}: remote session is unknown", file=sys.stderr)
+        return 1
     binary = herdr.herdr_binary()
     os.execvp(binary, [binary, "--remote", host.target, "--session", result.stdout.strip()])
 
@@ -93,7 +96,10 @@ def _tab_pane(name: str) -> str:
 
 def _attach(pane: str) -> None:
     shared = herdr.shared_session()
-    herdr.Herdr(shared).focus_tab_of(pane)
+    try:
+        herdr.Herdr(shared).focus_tab_of(pane)
+    except (herdr.HerdrFailure, OSError) as error:
+        print(f"herdr_sessions: focus failed: {error}", file=sys.stderr)
     binary = herdr.herdr_binary()
     os.execvp(binary, [binary, "session", "attach", shared])
 
@@ -115,9 +121,6 @@ def _launch(verb: str, arguments: list[str]) -> int:
     options = parser.parse_args(arguments[:separator], namespace=LaunchOptions())
     claude_arguments = arguments[separator + 1:]
     session_kind = herdr.security_session()
-    if not isinstance(session_kind, (herdr.DesktopSession, herdr.NotMacSession)):
-        print(herdr.MAC_DESKTOP_TERMINAL_REQUIRED)
-        return 1
     folder = Path(options.cwd).expanduser().resolve(strict=True)
     if not folder.is_dir():
         raise ValueError(f"{folder}: not a directory")
@@ -130,31 +133,20 @@ def _launch(verb: str, arguments: list[str]) -> int:
         config_dir = accounts.main_config_dir()
         pane_environment: dict[str, str] = {}
         unset_variables.update(account.NAMED_ACCOUNT_VARIABLES)
-        claude_json = Path.home() / ".claude.json"
     else:
         config_dir = selected.dir
         pane_environment = account.named_account_environment(config_dir)
-        claude_json = config_dir / ".claude.json"
-    trust = herdr.claude_trust(folder, claude_json)
-    if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
-        print(f"herdr_sessions: trust anomaly: {reason}", file=sys.stderr)
     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
     if options.prompt_file:
-        opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text(),
-                                      herdr.SessionTranscript(config_dir, options.session_id))
+        try:
+            opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text(),
+                                          herdr.SessionTranscript(config_dir, options.session_id))
+        except OSError as error:
+            print(f"herdr_sessions: {options.name}: prompt file is unreadable: {error}", file=sys.stderr)
     shared = herdr.shared_session()
-    _ = herdr.start_server(shared, 90_000, session_kind=session_kind)
-    server_environment = herdr.server_environment(shared)
-    for variable in sorted(unset_variables):
-        if variable in server_environment:
-            raise herdr.HerdrFailure(
-                f"herdr server {shared} carries {variable} from where it started, so a new tab would "
-                + "inherit it; start that server again from a shell without it"
-            )
-    taken = {pane.get("label") for pane in herdr.Herdr(shared).panes()}
-    if options.name in taken:
-        raise herdr.HerdrFailure(f"a tab named {options.name} is already open in herdr session {shared}")
+    _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
+    panes = herdr.Herdr(shared).panes()
+    taken = {pane.get("label") for pane in panes}
     name = options.name or next(candidate for candidate in (
         herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
         if candidate not in taken)
@@ -162,14 +154,14 @@ def _launch(verb: str, arguments: list[str]) -> int:
         claude_arguments.extend(["--resume", options.session_id])
     claude_arguments.extend(["-n", name])
     launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
-        kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
+        kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
+        unset_environment=frozenset(unset_variables))
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
     pane, outcome = launched.pane, launched.outcome
     if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
         reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
         print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
-        return 1
     if verb == "start" or options.attach:
         _attach(pane)
     return 0
@@ -253,8 +245,7 @@ def _main(argv: list[str]) -> int:
         if not any(session["name"] == shared for session in herdr.live_sessions()):
             if argv[1] == "list":
                 return 0
-            print(f"herdr_sessions: herdr session {shared} is not running", file=sys.stderr)
-            return 1
+            _ = herdr.restore_server(shared, 90_000, session_kind=herdr.security_session())
         if argv[1] == "sort-tabs":
             for label in herdr.Herdr(shared).sort_tabs().labels:
                 print(f"herdr_sessions: {label}: tab with several panes; order kept")

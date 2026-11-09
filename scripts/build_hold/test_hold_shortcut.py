@@ -8,13 +8,11 @@ import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, override
+from typing import override
 
-import test_build_hold
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.build_hold import test_build_hold
+from scripts.lib import test_hang_guard
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
@@ -45,12 +43,16 @@ class HoldShortcutTests(test_build_hold.IsolatedBuildHoldTest):
             + 'exit "$TEST_STATUS"\n'
         )
         python.chmod(0o755)
+        cache = self.scratch / "cache"
+        seed_interpreter_cache(cache, python)
         self.environment = {
             **os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "XDG_CACHE_HOME": str(cache), "CLAUDE_PYTHON": "",
             "BUILDLOG_CALL_ID": "c1", "BUILDLOG_CALLER": "verify",
             "BUILDLOG_HOLD_PID": "12345", "BUILDLOG_HOLD_WAIT_FILE": str(self.wait_file),
             "TEST_STARTS": str(self.starts), "TEST_STATUS": "0", "GLOBIGNORE": "",
         }
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def run_checks(self, setting: str = "", *, extra: Mapping[str, str] = EMPTY_ENVIRONMENT) -> subprocess.CompletedProcess[str]:
         self.starts.unlink(missing_ok=True)
@@ -86,6 +88,16 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
         (release / cycle_id).mkdir(parents=True, exist_ok=True)
         _ = (release / "current").write_text(cycle_id)
         _ = (release / cycle_id / "cycle.json").write_text('{"release_started_at":"2026-10-13T00:00:00+00:00"}')
+
+    def test_sourcing_memory_gate_without_a_hold_starts_no_python(self) -> None:
+        result = subprocess.run(
+            [BASH, "-c", 'set -euo pipefail; source "$1"', "bash", str(MEMORY_GATE)],
+            cwd=self.scratch, env={**self.environment, "BUILD_HOLD_DIR": str(self.holders),
+                                  "BUILDLOG_ADMISSION_CODE_VERSION": ""},
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.starts.exists(), "Sourcing memory_gate.sh starts no Python process")
 
     def test_empty_holder_directory_starts_no_hold_check(self) -> None:
         self.assert_checks(shortcut=0, starts=False)

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
-import io
-from contextlib import redirect_stderr
 import os
 import sqlite3
 import subprocess
@@ -16,94 +16,88 @@ from typing import TextIO, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import dailies_input
-import dailies_render
-from production_units import read_production
-from dailies_render import LENGTHS
-from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
+from scripts.production import dailies_input
+from scripts.production import dailies_render
+from scripts.production.production_doc import read_production
+from scripts.production.dailies_render import LENGTHS
+from scripts.production.dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.herdr import HerdrPlace
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import StaffTestCase, fixture_showrunner_name, recorded_unit, unit_membership, showrunner_relationship
-from unit_lookup import UnitState
-from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership, showrunner_relationship
+from scripts.production.unit_lookup import UnitState
+from scripts.production.dailies_input_test_support import (DailiesInputFixture, SCRIPT, SHIM, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
-from dailies_input_test_support import setUpModule as setUpModule
 
 
 class RowDailiesTests(StaffTestCase):
-    def test_incomplete_unit_facts_keep_the_dailies_row_and_one_named_problem(self) -> None:
-        fixture = self.row_production()
-        unavailable = fixture.worktree.with_name("unavailable-member")
-        for failure in ("branch", "configuration"):
-            with self.subTest(failure=failure):
-                if failure == "branch":
-                    _ = fixture.worktree.rename(unavailable)
-                else:
-                    _ = unavailable.rename(fixture.worktree)
-                    (fixture.worktree / ".unit.toml").unlink()
-                errors = io.StringIO()
-                with redirect_stderr(errors):
-                    units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
-                                                        record=staff.snapshot())
-                self.assertEqual([item.name for item in units], ["member-unit"])
-                self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                self.assertIn(fixture.unit.name, errors.getvalue())
-                self.assertIn(str(fixture.worktree), errors.getvalue())
-                if failure == "configuration":
-                    self.assertIn(".unit.toml", errors.getvalue())
-
-    def test_both_live_unit_label_forms_join_the_same_row_and_session(self) -> None:
+    def test_staff_name_joins_the_row_and_session(self) -> None:
         fixture = self.row_production()
         unit = staff.rename(fixture.unit.id, "writer")
         before = self.staff_file.read_bytes()
-        for label in ("writer", "writer-unit"):
-            with self.subTest(label=label):
-                live = unit_lookup.MarkedUnit(label, unit_lookup.LiveClaude(
-                    "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
-                    staff_id=unit.id)
-                with mock.patch.object(unit_lookup, "marked_units", return_value={label: live}):
-                    units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
-                                                        record=staff.snapshot())
-                self.assertEqual([(item.name, item.session) for item in units], [("writer-unit", "live-writer")])
-                self.assertEqual(self.staff_file.read_bytes(), before)
+        label = "writer"
+        live = unit_lookup.LabeledSession(label, unit_lookup.LiveClaude(
+            "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
+            identity=unit_lookup.LiveSession(unit.current_session))
+        with mock.patch.object(unit_lookup, "labeled_sessions", return_value={label: live}):
+            units = dailies_input.report_units(fixture.runner, staff.snapshot())
+        self.assertEqual([(item.name, item.session) for item in units], [("writer", "live-writer")])
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
-    def test_run_status_uses_the_row_worktree_when_the_table_names_another_folder(self) -> None:
+    def test_run_status_uses_the_row_worktree(self) -> None:
         fixture = self.row_production()
         runs = unit_lookup.RunStates({str(fixture.worktree): unit_lookup.RunRecord(
             self.root / "finished-run.jsonl", UnitState.RUN_FINISHED)})
         with mock.patch.object(unit_lookup, "read_run_states", return_value=runs):
-            units = dailies_input.units_from_doc(fixture.doc.read_text().splitlines(), fixture.slug,
-                                                 record=staff.snapshot())
-        self.assertEqual([(unit.name, unit.run) for unit in units], [("member-unit", UnitState.RUN_FINISHED)])
+            units = dailies_input.report_units(fixture.runner, staff.snapshot())
+        self.assertEqual([(unit.name, unit.run) for unit in units], [("member", UnitState.RUN_FINISHED)])
 
 
 class DailiesInputTests(DailiesInputFixture):
     @override
-    def timer(self, slug: str) -> None:
-        super().timer(slug)
-        doc = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+    def timer(self, name: str) -> None:
+        super().timer(name)
+        doc = self.doc if name == "example" else self.root / f"{name}-production.md"
         if doc != self.doc:
-            write_text_atomic(doc, self.doc.read_text().replace(
-                "- **Showrunner session:** test-showrunner", f"- **Showrunner session:** {slug}"))
-        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
-        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
-        conf = self.root / "notifier-state" / f"showrunner-{slug}" / "conf"
-        write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
+            write_text_atomic(doc, self.doc.read_text())
+        row = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == name)
+        _ = staff.set_doc(row.id, staff.LiveDoc(remote.local_machine(), doc))
+        conf = self.root / "notifier-state" / f"showrunner-{row.id}" / "conf"
+        write_text_atomic(conf, f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {row.id}\n")
 
-    @override
-    def production_doc(self, *, beta: bool = False) -> None:
-        super().production_doc(beta=beta)
-        for label, name in ((ALPHA, "alpha"), (BETA, "beta")) if beta else ((ALPHA, "alpha"),):
-            row = unit_membership(fixture_showrunner_name("example", self.doc), label)
-            folder = self.root / name
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
-            assert row.parent is not None
-            _ = staff.set_doc(row.parent, staff.LiveDoc("natedev", self.doc))
-            write_text_atomic(folder / ".unit.toml", f'plan = "docs/{name}.md"\nresponsibilities = []\n')
+    def test_fixed_judgment_id_survives_clear_and_unit_rename(self) -> None:
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        fixed_id = self.unit_id()
+        row = staff.by_id(fixed_id)
+        assert row is not None
+        _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("judgment-clear")))
+        self.rename_unit("renamed")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.unit()["unit"], fixed_id)
+        self.assertEqual(self.unit()["name"], "renamed")
+        current = staff.by_id(fixed_id)
+        assert current is not None
+        self.assertNotEqual(fixed_id, current.current_session)
+
+    def test_judgment_refuses_unknown_non_unit_foreign_and_duplicate_ids(self) -> None:
+        from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
+        original = cast(dict[str, object], json.loads(self.judgment.read_text()))
+        entry = cast(list[dict[str, object]], original["units"])[0]
+        other_owner = fixture_member("showrunner", name="other-production")
+        foreign = fixture_member("unit", name="foreign", parent=other_owner.id)
+        wrong_ids = (fixture_runtime_id("unknown-judgment"), other_owner.id, foreign.id)
+        for value in wrong_ids:
+            with self.subTest(value=value):
+                _ = self.judgment.write_text(json.dumps({**original, "units": [{**entry, "unit": value}]}))
+                _ = self.assert_refused_without_output(mention="no unit with this fixed id belongs to this production")
+        _ = self.judgment.write_text(json.dumps({**original, "units": [entry, entry]}))
+        _ = self.assert_refused_without_output(mention="duplicate unit")
 
     def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:
         self.production_doc(beta=True)
@@ -113,17 +107,19 @@ class DailiesInputTests(DailiesInputFixture):
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
-        self.assertEqual([unit["unit"] for unit in units], [ALPHA])
+        self.assertEqual([unit["unit"] for unit in units], [self.unit_id()])
         self.assertIn(f"left out, run finished and nothing waiting on the user: {BETA}", result.stdout)
 
-    def test_units_from_doc_reads_run_records_once_for_several_units(self) -> None:
+    def test_report_units_reads_run_records_once_for_several_units(self) -> None:
         self.production_doc(beta=True)
         self.finished_run(self.root / "beta")
         with (mock.patch.dict(os.environ, self.env),
-              mock.patch.object(unit_lookup, "marked_units", return_value={}),
+              mock.patch.object(unit_lookup, "labeled_sessions", return_value={}),
               mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
-            units = dailies_input.units_from_doc(self.doc.read_text(encoding="utf-8").splitlines(), "example")
-            reads.assert_called_once_with()
+            record = staff.snapshot()
+            owner = next(row for row in record.find(kind="showrunner") if row.name == "example")
+            units = dailies_input.report_units(owner, record)
+            reads.assert_called_once_with(record=record)
         self.assertEqual([(unit.name, unit.run) for unit in units],
                          [(ALPHA, UnitState.STANDING_BY), (BETA, UnitState.RUN_FINISHED)])
 
@@ -157,10 +153,11 @@ class DailiesInputTests(DailiesInputFixture):
                 report = self.report()
                 self.assertEqual(report["length"], length)
                 self.assertEqual(report["zone"], "America/Los_Angeles")
-                self.assertEqual(self.unit()["unit"], ALPHA)
+                self.assertEqual(self.unit()["unit"], self.unit_id())
+                self.assertEqual(self.unit()["name"], ALPHA)
                 self.assertNotIn("label", self.unit())
                 self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
-                rendered = subprocess.run([sys.executable, str(RENDERER), str(self.output),
+                rendered = subprocess.run([str(SHIM), str(RENDERER), str(self.output),
                                            "--at", "2026-10-06T17:00"],
                                           env=self.env, capture_output=True, text=True, check=False)
                 self.assertEqual(rendered.returncode, 0, rendered.stderr)
@@ -196,10 +193,6 @@ class DailiesInputTests(DailiesInputFixture):
         ])
 
     def test_real_phase_table_command_supplies_the_record_after_peer_handoff(self) -> None:
-        worktree = self.root / "alpha"
-        (worktree / ".git").unlink()
-        _ = recorded_unit(fixture_showrunner_name("example", self.doc), ALPHA,
-                          worktree, self.doc, plan="docs/alpha.md")
         plan = self.root / "alpha/docs/alpha.md"
         plan.parent.mkdir()
         _ = plan.write_text(
@@ -402,7 +395,7 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                 self.assertIn(
                     "phase tables: unavailable — "
-                    + "phase tables.alpha-unit.current."
+                    + "phase tables.alpha.current."
                     + "repair_rounds_since_first_stated_eta: "
                     + "expected a whole number from 0",
                     built.stdout,
@@ -456,7 +449,7 @@ class DailiesInputTests(DailiesInputFixture):
             "source": "stated", "stated_at": "2026-10-06T22:30:00+00:00",
             "basis": "the panel pass remains", "as_of": None,
         })
-        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        key = f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"
         old = {key: {"text": "ETA 18:40", "first_seen": "2026-10-06T14:00", "requested": False}}
         _ = (self.state / "eta_seen.json").write_text(json.dumps(old), encoding="utf-8")
         self.status_lines(f"== {ALPHA}", "● Checking panel labels")
@@ -496,7 +489,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertNotIn("tomorrow", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T16:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T16:00:00")
 
     def test_held_record_target_from_an_earlier_day_stays_on_that_day(self) -> None:
         self.open_phase_record(
@@ -527,7 +520,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertNotIn("tomorrow", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-05T16:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-05T16:00:00")
 
     def test_record_range_that_resolves_to_its_own_minutes_is_kept(self) -> None:
         self.open_phase_record(eta={
@@ -548,7 +541,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertIn("range 15:50–16:10", rendered.stdout)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T16:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T16:00:00")
 
     def test_record_range_more_than_a_day_from_eta_is_omitted(self) -> None:
         self.open_phase_record(eta={
@@ -586,7 +579,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-07T17:40:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-07T17:40:00")
 
     def test_record_target_far_after_its_source_uses_target_as_renderer_anchor(self) -> None:
         self.open_phase_record(eta={
@@ -604,7 +597,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
         saved = cast(dict[str, dict[str, object]], json.loads(
             (self.root / "render-state.json").read_text(encoding="utf-8")))
-        self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T17:00:00")
+        self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T17:00:00")
 
     def test_record_backed_session_flags_stay_first(self) -> None:
         self.open_phase_record()
@@ -662,19 +655,16 @@ class DailiesInputTests(DailiesInputFixture):
 
     def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
         _ = staff.set_worktree(
-            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
-            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).worktree)
+            unit_membership("example", ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership("example", ALPHA).worktree)
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
-            "---\nphase_table: true\nproduction: example\nunit: alpha-unit\n---\n\n# Alpha\n",
+            "---\nphase_table: true\nproduction: example\nunit: alpha\n---\n\n# Alpha\n",
             encoding="utf-8",
         )
-        content = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
-                                encoding="utf-8")
         _ = self.env.pop("DAILIES_PHASE_TABLE")
-        _ = self.assert_refused_without_output(mention="no live units: every Units row is retired")
+        _ = self.assert_refused_without_output(mention="no live units: every unit is retired")
         self.assertTrue(note.exists())
 
     def test_record_backed_input_renders_at_every_length_without_screen_eta(self) -> None:
@@ -685,7 +675,7 @@ class DailiesInputTests(DailiesInputFixture):
                 built = self.run_builder("--length", length)
                 self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                 rendered = subprocess.run(
-                    [sys.executable, str(RENDERER), str(self.output), "--at", AT],
+                    [str(SHIM), str(RENDERER), str(self.output), "--at", AT],
                     env=self.env, capture_output=True, text=True, check=False,
                 )
                 self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
@@ -736,25 +726,20 @@ class DailiesInputTests(DailiesInputFixture):
                          "the showrunner saw one more check")
 
     def test_retired_unit_needs_no_status_or_judgment_entry(self) -> None:
-        retired_row = (f"| `{BETA}` | (retired by the user; run done) | `{self.root / 'beta'}` | "
-                       f"`beta` | `{BETA}` | — | — |")
-        content = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(content.replace("\n\n## Gates", f"\n{retired_row}\n\n## Gates"),
-                                encoding="utf-8")
+        retired = unit_membership("example", BETA)
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree(local_machine(), self.root / "beta"),
+                               expected=retired.worktree)
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
-        self.assertEqual([unit["unit"] for unit in units], [ALPHA])
+        self.assertEqual([unit["unit"] for unit in units], [self.unit_id()])
 
     def test_all_retired_units_report_no_live_units(self) -> None:
         _ = staff.set_worktree(
-            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
-            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).worktree)
-        content = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
-                                encoding="utf-8")
+            unit_membership("example", ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"), expected=unit_membership("example", ALPHA).worktree)
         _ = self.assert_refused_without_output(
-            mention="no live units: every Units row is retired")
+            mention="no live units: every unit is retired")
 
     def test_short_session_without_judgment_label_uses_renderer_default(self) -> None:
         result = self.run_builder()
@@ -771,7 +756,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(self.output.read_text(encoding="utf-8"), "sentinel\n")
 
     def test_long_session_without_judgment_label_is_refused(self) -> None:
-        self.rename_unit("enh-showrunner-unit")
+        self.rename_unit("enh-showrunner")
         result = self.run_builder()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("judgment: failed", result.stdout)
@@ -779,7 +764,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertFalse(self.output.exists())
 
     def test_long_session_accepts_short_judgment_label(self) -> None:
-        self.rename_unit("enh-showrunner-unit")
+        self.rename_unit("enh-showrunner")
         fields = cast(dict[str, object], json.loads(self.judgment.read_text(encoding="utf-8")))
         units = cast(list[dict[str, object]], fields["units"])
         units[0]["label"] = "showrunn"
@@ -865,8 +850,8 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0)
 
     def test_unknown_status_unit_is_refused(self) -> None:
-        self.status_lines("== unknown-unit", "SESSION GONE")
-        _ = self.assert_refused_without_output(mention="unknown-unit")
+        self.status_lines("== unknown", "SESSION GONE")
+        _ = self.assert_refused_without_output(mention="unknown")
 
     def test_activity_before_first_unit_is_refused(self) -> None:
         _ = self.status.write_text(STAMP + "\n● Checking panel labels\n== " + ALPHA + "\n",
@@ -922,7 +907,7 @@ class DailiesInputTests(DailiesInputFixture):
     def test_user_run_restarts_notifier_once_and_logs_next_due(self) -> None:
         result = self.run_builder("--user-run")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["restart", f"showrunner-{self.production_id('example')}"]])
         self.assertEqual(self.report()["next_run"], "17:55")
         self.assertIn("next_due=", (self.checkout / "production.log").read_text(encoding="utf-8"))
 
@@ -940,7 +925,8 @@ class DailiesInputTests(DailiesInputFixture):
         config = self.home / ".claude/config/dailies.conf"
         config.parent.mkdir(parents=True)
         _ = (self.home / "ledger.md").write_text("- a — proposed\n- b — declined\n", encoding="utf-8")
-        _ = config.write_text("example.nightly-queue=lines ~/ledger.md — proposed$\nother.queue=files ~/*.md\n",
+        owner = showrunner_relationship("example")
+        _ = config.write_text(f"{owner.id}.nightly-queue=lines ~/ledger.md — proposed$\nother.queue=files ~/*.md\n",
                               encoding="utf-8")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -950,7 +936,8 @@ class DailiesInputTests(DailiesInputFixture):
     def test_a_bad_counts_line_leaves_the_counts_out_and_says_why(self) -> None:
         config = self.home / ".claude/config/dailies.conf"
         config.parent.mkdir(parents=True)
-        _ = config.write_text("example.queue=words ~/ledger.md\n", encoding="utf-8")
+        owner = showrunner_relationship("example")
+        _ = config.write_text(f"{owner.id}.queue=words ~/ledger.md\n", encoding="utf-8")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("counts", self.report())
@@ -959,7 +946,7 @@ class DailiesInputTests(DailiesInputFixture):
     def test_scheduled_run_reads_notifier_status_without_restart(self) -> None:
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.notifier_events(), [["status", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["status", f"showrunner-{self.production_id('example')}"]])
         self.assertEqual(self.report()["next_run"], "17:55")
 
     def test_each_completed_step_reports_once_before_input(self) -> None:
@@ -1013,26 +1000,47 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.report()["next_run"], "00:30+1")
 
-    def test_newest_child_handoff_labels_the_merge_topic_without_a_unit_phase(self) -> None:
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (aaaaaaa) into production")
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 shrink (bbbbbbb) into production")
-        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit alpha-unit to renamed-unit")
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (ccccccc) into production")
+    def record_merge_checkpoint(self, commit: str) -> None:
+        row = unit_membership("example", ALPHA)
+        assert isinstance(row.worktree, staff.PresentWorktree)
+        history = self.root / "history/runs/checkpoints.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        _ = history.write_text(json.dumps({"schema_version": 1, "event_type": "checkpoint", "phase_id": "2",
+                                          "working_dir": str(row.worktree.path), "checkpoint_commit": commit}) + "\n")
+        self.env["UNIT_HISTORY_DIR"] = str(history.parent.parent)
+
+    def test_merge_topic_reports_no_checkpoint_without_run_records(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Integrate completed work")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        merge = next(topic for topic in topics if topic["title"] == "Merge branch")
+        self.assertIn("last merge: no checkpoint merged", str(merge["update"]))
+
+    def test_merge_topic_reports_the_recorded_checkpoint_without_subject_labels(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Integrate completed work")
+        checkpoint = self.git("rev-parse", "HEAD")
+        self.record_merge_checkpoint(checkpoint)
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha phase 2 shrink (bbbbbbb) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit alpha to renamed")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha hand-off (ccccccc) into production")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         topics = cast(list[dict[str, object]], self.report()["topics"])
         merge_topics = [topic for topic in topics if topic["title"] == "Merge branch"]
         self.assertEqual(len(merge_topics), 1)
-        self.assertIn("last merge: alpha-unit style hand-off (ccccccc)", str(merge_topics[0]["update"]))
-        self.assertNotIn("alpha-unit phase", str(merge_topics[0]["update"]))
-        self.assertNotIn("renamed-unit", str(merge_topics[0]["update"]))
+        self.assertIn(f"last merge: {ALPHA} phase 2 ({checkpoint[:7]})", str(merge_topics[0]["update"]))
+        self.assertNotIn("shrink", str(merge_topics[0]["update"]))
+        self.assertNotIn("renamed", str(merge_topics[0]["update"]))
 
     def test_unpushed_merge_appears_as_merge_branch_topic_until_pushed(self) -> None:
         _ = self.git("checkout", "-b", "alpha")
         _ = (self.checkout / "alpha.txt").write_text("panel change\n", encoding="utf-8")
         _ = self.git("add", "alpha.txt")
         _ = self.git("commit", "-m", "panel change")
-        short = self.git("rev-parse", "--short=7", "HEAD")
+        checkpoint = self.git("rev-parse", "HEAD")
+        short = checkpoint[:7]
+        self.record_merge_checkpoint(checkpoint)
         _ = self.git("checkout", "production")
         _ = self.git("merge", "--no-ff", "-m",
                      f"Merge {ALPHA} phase 2 ({short}) into production", "alpha")
@@ -1041,7 +1049,7 @@ class DailiesInputTests(DailiesInputFixture):
         topics = cast(list[dict[str, object]], self.report()["topics"])
         merge_topics = [item for item in topics if item["title"] == "Merge branch"]
         self.assertEqual(len(merge_topics), 1)
-        self.assertIn(ALPHA, str(merge_topics[0]["update"]))
+        self.assertIn(f"{ALPHA} phase 2 ({short})", str(merge_topics[0]["update"]))
         _ = self.git("push", "origin", "production")
         pushed = self.run_builder()
         self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
@@ -1077,7 +1085,7 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertLess(result.stdout.index("review watch: ok"), result.stdout.index("bevy upgrade: ok"))
                 self.assertLess(result.stdout.index("bevy upgrade: ok"), result.stdout.index("merge branch: ok"))
                 args = cast(list[str], json.loads((self.root / "bevy-events.json").read_text()))
-                self.assertEqual(args, ["--production", str(self.doc), "line", "--json"])
+                self.assertEqual(args, ["--production", "example", "line", "--json"])
 
     def test_bevy_upgrade_empty_output_adds_no_topic(self) -> None:
         result = self.run_builder()
@@ -1171,11 +1179,11 @@ class DailiesInputTests(DailiesInputFixture):
             ("record locked\nmore detail", "record locked"),
             (b"record locked\nmore detail", "record locked"),
         )
-        production = read_production(self.doc)
-        command = [sys.executable, self.env["DAILIES_BEVY_UPGRADE"], "--production", str(self.doc), "line", "--json"]
+        production = read_production("example")
+        command = [str(SHIM), self.env["DAILIES_BEVY_UPGRADE"], "--production", "example", "line", "--json"]
         for stderr, reason in cases:
             with self.subTest(stderr=stderr), mock.patch.dict(os.environ, self.env), mock.patch(
-                "dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
+                "scripts.production.dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
             ) as run:
                 self.assertEqual(bevy_upgrade_watch(production), BevyUpgradeUnavailable(reason))
                 run.assert_called_once_with(command, capture_output=True, text=True, timeout=30, check=False)
@@ -1229,14 +1237,14 @@ class DailiesInputTests(DailiesInputFixture):
     def test_failed_restart_leaves_output_untouched(self) -> None:
         _ = self.notifier_failure.touch()
         _ = self.assert_refused_without_output("--user-run", mention="failed")
-        self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["restart", f"showrunner-{self.production_id('example')}"]])
 
     def test_stale_eta_keeps_time_and_requests_once_for_phase(self) -> None:
         first = self.run_builder()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         seen_path = self.state / "eta_seen.json"
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
-        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        key = f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"
         old = datetime.fromisoformat(AT) - timedelta(hours=2)
         seen[key]["first_seen"] = old.replace(tzinfo=None).isoformat()
         _ = seen_path.write_text(json.dumps(seen) + "\n", encoding="utf-8")
@@ -1249,6 +1257,28 @@ class DailiesInputTests(DailiesInputFixture):
         repeated = self.run_builder()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertNotIn("request /unit:eta:", repeated.stdout)
+
+    def test_screen_eta_keeps_its_fixed_key_after_rename_and_clear(self) -> None:
+        first = self.run_builder()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        identity = self.unit_id()
+        seen_path = self.state / "eta_seen.json"
+        before = seen_path.read_bytes()
+        seen = cast(dict[str, object], json.loads(before))
+        self.assertEqual(set(seen), {f"{identity}|Phase 2 of 3: panel labels stay clear"})
+        row = staff.rename(identity, "renamed")
+        self.status_lines("== renamed", "● Checking panel labels", "ETA 23:40")
+        renamed = self.run_builder("--at", "2026-10-06T17:20")
+        self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
+        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed"))
+        self.assertEqual(seen_path.read_bytes(), before)
+        _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("screen-eta-cleared")))
+        cleared = self.run_builder("--at", "2026-10-06T17:40")
+        self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
+        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed"))
+        self.assertEqual(seen_path.read_bytes(), before)
+        self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
+        self.assertNotIn("request /unit:eta:", renamed.stdout + cleared.stdout)
 
     def test_passed_eta_is_hidden_and_requests_once_for_phase(self) -> None:
         old = datetime.fromisoformat(AT) - timedelta(minutes=10)
@@ -1330,8 +1360,8 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertNotIn("19:35 PDT tomorrow", rendered.stdout)
                 saved = cast(dict[str, dict[str, object]], json.loads(
                     (self.root / "render-state.json").read_text(encoding="utf-8")))
-                self.assertEqual(saved[ALPHA]["eta"], "2026-10-06T19:35:00")
-                self.assertEqual(saved[ALPHA]["eta_text"], "19:35")
+                self.assertEqual(saved[self.unit_id()]["eta"], "2026-10-06T19:35:00")
+                self.assertEqual(saved[self.unit_id()]["eta_text"], "19:35")
                 log_line = (self.root / "dailies.log").read_text(encoding="utf-8").splitlines()[-1]
                 self.assertIn(f"{ALPHA} Phase 2 of 3 19:35 PDT, 60% done", log_line)
                 self.assertNotIn("tomorrow", log_line)
@@ -1416,7 +1446,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "00:30")
         self.assertNotIn("request /unit:eta:", result.stdout)
-        rendered = subprocess.run([sys.executable, str(RENDERER), str(self.output),
+        rendered = subprocess.run([str(SHIM), str(RENDERER), str(self.output),
                                    "--at", "2026-10-06T23:45"],
                                   env=self.env, capture_output=True, text=True, check=False)
         self.assertEqual(rendered.returncode, 0, rendered.stdout + rendered.stderr)
@@ -1481,7 +1511,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(requested.stdout.count(f"request /unit:eta: {ALPHA}"), 1)
         seen_path = self.state / "eta_seen.json"
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
-        self.assertEqual(seen[f"{ALPHA}|Phase 2 of 3: panel labels stay clear"], {"requested": True})
+        self.assertEqual(seen[f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"], {"requested": True})
         report = self.run_builder()
         self.assertEqual(report.returncode, 0, report.stdout + report.stderr)
         self.assertEqual(self.unit()["eta"], {"none": "none measured - requested"})
@@ -1497,7 +1527,7 @@ class DailiesInputTests(DailiesInputFixture):
                           f"== {BETA}", "● Checking button labels", "ETA 16:40")
         self.judgment_file(beta=True)
         review = self.root / "race-review.py"
-        _ = review.write_text(RACE_WATCH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        _ = review.write_text(RACE_WATCH_STUB.replace("__PYTHON__", sys.executable).replace("__SHIM__", str(SHIM)), encoding="utf-8")
         review.chmod(0o755)
         self.env.update({
             "DAILIES_REVIEW_REGIME": str(review),
@@ -1505,7 +1535,7 @@ class DailiesInputTests(DailiesInputFixture):
             "DAILIES_RACE_WAITING": str(WAITING),
             "DAILIES_RACE_UNIT": BETA,
             "DAILIES_RACE_PHASE": beta_phase,
-            "DAILIES_RACE_PRODUCTION": str(self.doc),
+            "DAILIES_RACE_PRODUCTION": "example",
             "DAILIES_RACE_STATE": str(self.state),
         })
 
@@ -1513,7 +1543,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn(f"request /unit:eta: {BETA}", result.stdout)
         seen = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
-        record = seen[f"{BETA}|{beta_phase}"]
+        record = seen[f"{self.unit_id(BETA)}|{beta_phase}"]
         self.assertIs(record["requested"], True)
         self.assertEqual(record["text"], "ETA 16:40")
 
@@ -1566,7 +1596,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", retried.stdout)
         seen = cast(dict[str, dict[str, object]], json.loads((self.state / "eta_seen.json").read_text()))
-        record = seen[f"{ALPHA}|Phase 2 of 3: panel labels stay clear"]
+        record = seen[f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"]
         self.assertEqual(record["first_seen"], AT)
         self.assertIs(record["requested"], True)
 
@@ -1602,7 +1632,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
         seen_path = self.state / "eta_seen.json"
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text(encoding="utf-8")))
-        key = f"{ALPHA}|Phase 2 of 3: panel labels stay clear"
+        key = f"{self.unit_id()}|Phase 2 of 3: panel labels stay clear"
         seen[key]["first_seen"] = "2026-10-06T14:00"
         seen[key]["requested"] = False
         _ = seen_path.write_text(json.dumps(seen, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1612,7 +1642,7 @@ class DailiesInputTests(DailiesInputFixture):
         old = {"phase": "Phase 2 of 3: panel labels stay clear", "eta": "2026-10-06T20:00:00",
                "eta_text": "20:00",
                "held": None, "first": "2026-10-06T20:00:00"}
-        _ = render_state.write_text(json.dumps({ALPHA: old}), encoding="utf-8")
+        _ = render_state.write_text(json.dumps({self.unit_id(): old}), encoding="utf-8")
         self.events.unlink()
 
         refused = self.run_builder("--user-run", "--render-state", str(render_state))
@@ -1627,7 +1657,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.judgment_file(alpha={"eta": {"percent": 60, "why": "the unit found another panel repair"}})
         accepted = self.run_builder("--user-run", "--render-state", str(render_state))
         self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
-        self.assertEqual(self.notifier_events(), [["restart", "showrunner-example"]])
+        self.assertEqual(self.notifier_events(), [["restart", f"showrunner-{self.production_id('example')}"]])
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["why"],
                          "the unit found another panel repair")
 
@@ -1654,8 +1684,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertIsNone(saved["interval"])
 
     def test_style_ledger_uses_its_child_environment_after_rules_were_imported(self) -> None:
-        with mock.patch.object(sys, "path", [str(SCRIPT.parent.parent / "style"), *sys.path]):
-            import style_rules
+        from scripts.style import style_rules
 
         outer_catalog = self.root / "outer-catalog"
         with mock.patch.object(style_rules, "NATE_STYLE_DIR", outer_catalog):
@@ -1767,8 +1796,9 @@ class DailiesInputTests(DailiesInputFixture):
                                     (0, '{"rules_done": 1}', "")):
             with self.subTest(code=code, output=output):
                 def command(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-                    if path.name == "style_ledger.py":
-                        self.assertEqual(arguments, ("summary", "--repo", str(self.checkout), "--json"))
+                    if path == SHIM and Path(arguments[0]).name == "style_ledger.py":
+                        self.assertEqual(arguments, (str(SCRIPT.parent.parent / "style/style_ledger.py"),
+                                                     "summary", "--repo", str(self.checkout), "--json"))
                         return subprocess.CompletedProcess([str(path), *arguments], code, output, error)
                     return original_command(path, *arguments)
 
@@ -1878,7 +1908,7 @@ class DailiesInputTests(DailiesInputFixture):
 
     def test_a_saved_report_that_cannot_be_written_never_fails_the_run(self) -> None:
         self.showrunner_state.mkdir(parents=True)
-        _ = (self.showrunner_state / "example").write_text("a file where the folder goes\n", encoding="utf-8")
+        _ = (self.showrunner_state / showrunner_relationship("example").id).write_text("a file where the folder goes\n", encoding="utf-8")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("saved report: unavailable — ", result.stdout)

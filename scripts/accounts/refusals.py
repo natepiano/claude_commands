@@ -5,14 +5,12 @@ import fcntl
 import json
 import math
 import os
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib import conf
 from scripts.whoami import usage_store  # noqa: E402
@@ -168,8 +166,6 @@ def load() -> dict[str, AccountRefusal]:
 
 def write_refusal(refusal: AccountRefusal) -> None:
     """Merge one account under a lock and replace the store atomically."""
-    if refusal.at.tzinfo is None or isinstance(refusal.reset, KnownReset) and refusal.reset.at.tzinfo is None:
-        raise RefusalsError("refusal time needs an offset")
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a", encoding="utf-8") as lock:

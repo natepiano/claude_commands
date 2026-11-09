@@ -182,7 +182,7 @@ state = Path(os.environ["MERGE_GATE_TEST_STATE"])
 (state / "types-memory-environment.json").write_text(json.dumps({
     "tripwire_present": "BUILDLOG_LIVE_MEMORY_TRIPWIRE" in os.environ}))
 print("0 errors, 0 warnings, 0 notes")
-raise SystemExit(3)
+raise SystemExit(0)
 ''')
         module_statuses: list[tuple[str, int]] = []
         finish = merge_gate.finish_gate_job

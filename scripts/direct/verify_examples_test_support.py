@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 import json
 import os
 import subprocess
 import shutil
-import sys
 import tempfile
 import tomllib
 import unittest
@@ -97,6 +96,7 @@ class ExampleWorkspaceFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.calls = self.root / "cargo-calls"
         self.metadata_calls = self.root / "metadata-calls"
@@ -105,8 +105,11 @@ class ExampleWorkspaceFixture(unittest.TestCase):
         cargo = stubs / "cargo"
         _ = cargo.write_text(r'''#!/bin/sh
 if [ "$1" = metadata ]; then
-    printf "metadata\n" >> "$METADATA_CALLS"
-    [ "$*" = "metadata --no-deps --format-version 1" ] || { echo "Unexpected cargo metadata call: $*" >&2; exit 99; }
+    case "$*" in
+        "metadata --no-deps --format-version 1") printf "example-scan\n" >> "$METADATA_CALLS" ;;
+        "metadata --format-version 1 --no-deps") printf "tree-key\n" >> "$METADATA_CALLS" ;;
+        *) echo "Unexpected cargo metadata call: $*" >&2; exit 99 ;;
+    esac
     printf "%s\n" "$TEST_METADATA"
     exit 0
 fi
@@ -134,6 +137,10 @@ fi
 if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
     printf "// changed during the test run\n" >> "$PACKAGE_ROOT/${EDIT_DURING_TEST_PATH:-src/lib.rs}"
 fi
+case "$1 $2" in
+    "mend --version"|"clippy --version"|"+nightly fmt")
+        case " $* " in *" --version "*) printf 'cargo fixture 1.0\n'; exit 0 ;; esac ;;
+esac
 case "$1 $2" in
     "check --workspace") exit "$FAKE_CHECK_EXIT" ;;
     "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
@@ -165,7 +172,7 @@ esac
             (self.root / name).mkdir()
         # This workspace's memory fixture must not inherit the host's PSI.
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
@@ -211,10 +218,6 @@ esac
             "UNIT_SESSION_DIR": str(self.root / "session"),
         }
 
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
     def package(self, name: str = "sample", *, manifest_extra: str = "", root: Path | None = None) -> Path:
         package_root = root or self.root
         package_root.mkdir(parents=True, exist_ok=True)
@@ -252,7 +255,8 @@ esac
         return self.calls.read_text().splitlines() if self.calls.exists() else []
 
     def metadata_count(self) -> int:
-        return len(self.metadata_calls.read_text().splitlines()) if self.metadata_calls.exists() else 0
+        # Count example scans; the tree-key read resolves Cargo output roots separately.
+        return self.metadata_calls.read_text().splitlines().count("example-scan") if self.metadata_calls.exists() else 0
 
     def refusal(self, name: str, source: Path, line: int, attribute: str, package: str = "sample") -> str:
         return (
@@ -301,18 +305,16 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
     def setUpClass(cls) -> None:
         builder = ExampleWorkspaceFixture()
         builder.setUp()
-        cls.addClassCleanup(builder.tearDown)
+        cls.addClassCleanup(builder.doCleanups)
         cls.fixture_root = builder.root
         seed = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="example-workspace-seed-"))
         cls.fixture_seed = Path(seed) / "seed"
         cls.fixture_environment = builder.environment.copy()
         # The fixture supplies the entire toolchain and 64 GiB of free memory.
         # Host Nix discovery and Python version probing are separate contracts.
-        cls.fixture_environment.update({"IN_NIX_SHELL": "pure", "BUILDLOG_BUILD_BUDGET_GIB": "64"})
+        cls.fixture_environment.update({"IN_NIX_SHELL": "pure"})
         _ = cls.fixture_environment.pop("CLAUDE_PYTHON", None)
-        cache = builder.root / "cache/claude" / cache_file_name()
-        cache.parent.mkdir(parents=True)
-        _ = cache.write_text(sys.executable + "\n")
+        seed_interpreter_cache(builder.root / "cache")
         _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(builder.root)
 
@@ -331,11 +333,6 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
-
-    @override
-    def tearDown(self) -> None:
-        if not self.seeded:
-            super().tearDown()
 
     def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
         """Test alpha, which depends on gamma, while another phase edits `edited`."""

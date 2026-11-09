@@ -8,9 +8,7 @@ from pathlib import Path
 from typing import final
 
 
-PRIORITIZE_DIR = Path(__file__).parents[1]
-sys.path.insert(0, str(PRIORITIZE_DIR))
-import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.prioritize import writer_lock
 
 
 @final
@@ -22,8 +20,7 @@ class WriterLockTests(unittest.TestCase):
                 (
                     "import sys",
                     "from pathlib import Path",
-                    "sys.path.insert(0, sys.argv[2])",
-                    "import writer_lock",
+                    "from scripts.prioritize import writer_lock",
                     "try:",
                     "    with writer_lock.acquire_writer_lock(",
                     "        Path(sys.argv[1]), timeout_seconds=0.05",
@@ -37,7 +34,7 @@ class WriterLockTests(unittest.TestCase):
             with writer_lock.acquire_writer_lock(path):
                 self.assertTrue(writer_lock.lock_is_held(path))
                 contender = subprocess.run(
-                    [sys.executable, "-c", code, str(path), str(PRIORITIZE_DIR)],
+                    [sys.executable, "-c", code, str(path)],
                     check=False,
                     capture_output=True,
                     text=True,
@@ -46,7 +43,7 @@ class WriterLockTests(unittest.TestCase):
             self.assertEqual(contender.returncode, 7, contender.stderr)
             self.assertFalse(writer_lock.lock_is_held(path))
             successor = subprocess.run(
-                [sys.executable, "-c", code, str(path), str(PRIORITIZE_DIR)],
+                [sys.executable, "-c", code, str(path)],
                 check=False,
                 capture_output=True,
                 text=True,

@@ -10,10 +10,36 @@ import sys
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import copy_record, nix_env, scratch
-from scripts.lib.nix_env_test_support import HELPER, NixFixture
+from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class GeneratedSourceTests(NixFixture):
+    def test_generated_source_requires_a_readable_registered_record_with_true_field(self) -> None:
+        with patch.dict(os.environ, {copy_record.ROOT_ENV: str(self.root / 'scratch')}):
+            folder = scratch.new('gate:generated-source', 'proof')
+            self.assertFalse(nix_env.generated_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
+            self.assertTrue(nix_env.generated_source(folder))
+            outside = self.root / 'outside'
+            outside.mkdir()
+            _ = (outside / copy_record.RECORD).write_bytes((folder / copy_record.RECORD).read_bytes())
+            self.assertFalse(nix_env.generated_source(outside))
+            nested = folder / 'nested'
+            nested.mkdir()
+            _ = (nested / copy_record.RECORD).write_bytes((folder / copy_record.RECORD).read_bytes())
+            self.assertFalse(nix_env.generated_source(nested))
+            with patch.object(copy_record, 'read_record', return_value=copy_record.UnreadableRecord('unreadable')):
+                self.assertFalse(nix_env.generated_source(folder))
+            with patch.object(copy_record, 'read_record', side_effect=OSError('read failed')):
+                self.assertFalse(nix_env.generated_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': 1})
+            self.assertFalse(nix_env.generated_source(folder))
+            (folder / copy_record.RECORD).unlink()
+            self.assertFalse(nix_env.generated_source(folder))
 
 
 class EnsureTests(NixFixture):
@@ -104,8 +130,20 @@ class EnsureTests(NixFixture):
         self.assertEqual(result.env, self.env)
         self.assertEqual(self.direnv_calls(), [])
 
+    def test_passed_deadline_refuses_before_direnv_runs(self) -> None:
+        import time
+        from scripts.lib import operation_deadline
+
+        _ = self.envrc(self.work)
+        with (operation_deadline.within(time.monotonic() - 1),
+              patch.object(subprocess, "run") as run):
+            result = nix_env.ensure(self.work, self.env)
+        self.assertEqual(result, nix_env.Refused(f"nix_env: {self.work}: deadline passed"))
+        run.assert_not_called()
+        self.assertEqual(self.direnv_calls(), [])
+
     def cli(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(HELPER), *arguments], cwd=self.work,
+        return subprocess.run([str(ROOT / "scripts/lib/py"), str(HELPER), *arguments], cwd=self.work,
                               env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def test_cli_ensure_json_and_refusal_exit(self) -> None:
@@ -169,7 +207,7 @@ class EnsureTests(NixFixture):
 
     def test_no_envrc_cli_import_budget(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-S", "-X", "importtime", str(HELPER), "ensure", str(self.work)],
+            [str(ROOT / "scripts/lib/py"), "-S", "-X", "importtime", str(HELPER), "ensure", str(self.work)],
             cwd=self.work, env=self.env, capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -332,7 +370,7 @@ class RegisteredCopyTests(GitNixFixture):
         # The standalone helper must find scratch even when started in the copy.
         Path(self.env["DIRENV_APPROVAL"]).unlink()
         result = subprocess.run(
-            [sys.executable, "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
+            [str(ROOT / "scripts/lib/py"), "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
             env={**self.env, "DIRENV_DENY": "1"}, capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -409,6 +447,93 @@ class RegisteredCopyTests(GitNixFixture):
         _ = self.envrc(outside)
         _ = (outside / copy_record.RECORD).write_bytes((checkout / copy_record.RECORD).read_bytes())
         self.assert_explicit_approval_required(outside)
+
+
+class RegisteredCloneTests(GitNixFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        locations = {copy_record.ROOT_ENV: str(self.root / "scratch"),
+                     copy_record.COPIES_ENV: str(self.root / "copies")}
+        self.env.update(locations)
+        os.environ.update(locations)
+
+    def clone(self, repository: Path, task_folder: Path | None = None) -> Path:
+        folder = task_folder if task_folder is not None else copy_record.root() / "task"
+        folder.mkdir(parents=True)
+        checkout = folder / "checkout"
+        _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
+        fields = {"task": "gate:nix-env", "test_hana_clone": True,
+                  "source_path": str(repository), "source_commit": self.git(checkout, "rev-parse", "HEAD")}
+        _ = (folder / copy_record.RECORD).write_text(json.dumps(fields), encoding="utf-8")
+        return checkout
+
+    def assert_clone_refused(self, checkout: Path) -> None:
+        self.assertFalse(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+        self.assert_explicit_approval_required(checkout)
+
+    def test_registered_clone_with_unchanged_envrc_is_approved_and_loads(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.assertEqual(copy_record.record_path(checkout), checkout.parent / copy_record.RECORD)
+        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+        _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
+        self.assertIsInstance(nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"}), nix_env.Loaded)
+        self.assertEqual(self.direnv_calls(), [
+            {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
+            {"args": ["export", "json"], "cwd": str(checkout)}])
+
+    def test_task_clone_parent_with_matching_envrc_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        parent = checkout.parent
+        _ = (parent / ".envrc").write_bytes((checkout / ".envrc").read_bytes())
+        self.assertIsNone(copy_record.record_path(parent))
+        self.assertFalse(nix_env.registered_copy(parent / ".envrc"))
+        self.assertFalse(nix_env.trusted_envrc(parent / ".envrc"))
+        self.assert_explicit_approval_required(parent)
+
+    def test_registered_clone_with_edited_envrc_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
+        self.assert_clone_refused(checkout)
+
+    def test_clone_without_source_commit_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        path = checkout.parent / copy_record.RECORD
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["source_commit"]
+        _ = path.write_text(json.dumps(fields), encoding="utf-8")
+        self.assert_clone_refused(checkout)
+
+    def test_checkout_outside_scratch_root_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"), self.root / "outside/task")
+        self.assertIsNone(copy_record.record_path(checkout))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_without_test_hana_clone_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        path = checkout.parent / copy_record.RECORD
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["test_hana_clone"]
+        _ = path.write_text(json.dumps(fields), encoding="utf-8")
+        self.assertIsNone(copy_record.record_path(checkout))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_from_untrusted_source_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.root / "outside/repo"))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_under_symlink_scratch_root_is_approved(self) -> None:
+        physical = self.root / "physical-scratch"
+        physical.mkdir()
+        copy_record.root().symlink_to(physical, target_is_directory=True)
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        self.assertEqual(copy_record.record_path(checkout), checkout.parent.resolve() / copy_record.RECORD)
+        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
 
 
 class NixConfigTests(NixFixture):

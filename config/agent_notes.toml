@@ -25,16 +25,10 @@ timeout_seconds = 45
 [parts.prune]
 interval_seconds = 120
 timeout_seconds = 60
-[parts.hierarchy]
-interval_seconds = 120
-timeout_seconds = 60
 [parts.vault]
 interval_seconds = 120
 timeout_seconds = 60
 
-[hierarchy]
-git_seconds = 30
-read_seconds = 60
 [vault]
 git_seconds = 30
 named_paths = 4

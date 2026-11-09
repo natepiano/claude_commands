@@ -1,72 +1,84 @@
 #!/usr/bin/env python3
-"""Delete a wrapped production's reminder state, counts, reports and state folder.
+"""Delete state for wrapped productions without active timers.
 
-Closed question records remain in the production's question folder.
-
-Usage: tidy_wrapped.py <production doc>...
-
-A production with an update timer or a status other than wrapped keeps its state.
+Closed questions remain in their question folders.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import production_units
-from scripts.production import staff
-from proposals_folder import issues_folder
+from scripts.production import showrunners, staff, unit_lookup  # noqa: E402
+from scripts.copies import copies  # noqa: E402
+from scripts.production.production_doc import WRAPPED  # noqa: E402
+from scripts.production.proposals_folder import issues_folder  # noqa: E402
 
 if TYPE_CHECKING:
-    from update_registration import QuestionStaff
+    from scripts.production.update_registration import QuestionStaff
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
-# The state folder holds these shared folders beside each production's own; a slug never names one.
-SHARED = frozenset(("footers-off", "review-paused", "outstanding", "counts", "reports"))
-SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 class TidyRefused(Exception):
     pass
 
 
-def outstanding_path(slug: str) -> Path:
-    if not SLUG.fullmatch(slug) or slug in SHARED:
-        raise TidyRefused(f"{slug!r} is not a production slug")
-    return STATE_DIR / "outstanding" / f"{slug}.json"
-
-
-def owned_paths(slug: str) -> tuple[Path, ...]:
-    outstanding = outstanding_path(slug)
-    return (STATE_DIR / "footers-off" / slug, STATE_DIR / "review-paused" / f"{slug}.json",
-            STATE_DIR / "outstanding" / f"{slug}.answered.jsonl",
-            outstanding, STATE_DIR / "counts" / slug,
-            STATE_DIR / "reports" / f"{slug}.json", STATE_DIR / slug)
+def owned_paths(owner: staff.StaffRow) -> tuple[Path, ...]:
+    identity = owner.id
+    return (STATE_DIR / "footers-off" / identity, STATE_DIR / "review-paused" / f"{identity}.json",
+            STATE_DIR / "outstanding" / f"{identity}.answered.jsonl",
+            STATE_DIR / "outstanding" / f"{identity}.history.jsonl",
+            STATE_DIR / "outstanding" / f"{identity}.lock",
+            STATE_DIR / "outstanding" / f"{identity}.json", STATE_DIR / "counts" / identity,
+            STATE_DIR / "reports" / f"{identity}.json", STATE_DIR / identity)
 
 
 def can_hold_questions(document: Path) -> bool:
     """Check for question storage before reading the staff record."""
-    return issues_folder(document) is not None or any(
+    folder = issues_folder(document)
+    return folder is not None or any(
         path.is_dir() for path in STATE_DIR.glob("*/questions")
     )
 
 
-def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
+def tidy(production_name: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
     """Close the production's questions and delete its state files."""
-    from update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
+    from scripts.production.update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
 
-    paths = owned_paths(slug)
+    identities = identities if identities is not None else QuestionStaff.read()
+    row = identities.owner(document) if document is not None else showrunners.owner_for(production_name, identities.record)
+    paths = owned_paths(row)
     if document is not None and can_hold_questions(document):
-        identities = identities if identities is not None else QuestionStaff.read()
         try:
-            if isinstance(question_folder(document, identities), QuestionFolder):
+            folder = question_folder(document, identities)
+            if isinstance(folder, QuestionFolder):
                 close_questions(document, identities)
+                directory = paths[-1]
+                if folder.path.parent == directory and directory.is_dir():
+                    paths = (*paths[:-1], *(path for path in directory.iterdir() if path != folder.path))
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
+    owners = {str(row.id)}
+    if document is not None:
+        record = identities.record
+        try:
+            for row in unit_lookup.doc_units(document, record):
+                owners.add(str(row.id))
+        except staff.StaffUnreadable:
+            pass  # a production with no showrunner row has no units
+    try:
+        for owner in sorted(owners):
+            copies.remove_trees(owner)
+    except copies.CopyError as error:
+        raise TidyRefused(str(error)) from error
     removed: list[Path] = []
     for path in paths:
         if path.is_dir() and not path.is_symlink():
@@ -79,41 +91,40 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
     return removed
 
 
-def wrapped_slug(doc: Path) -> str:
-    """The slug of a wrapped production with no update timer; anything else refuses."""
-    slug = doc.name.removesuffix("-production.md")
-    if slug == doc.name:
-        raise TidyRefused(f"{doc}: production doc name must end in -production.md")
+def wrapped_owner(doc: Path, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """Read the wrapped owner's staff name and require no update timer."""
+    owner = unit_lookup.doc_owner(doc, record)
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
-    if not status.startswith(production_units.WRAPPED):
+    if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
-    if (NOTIFIER_STATE_DIR / f"showrunner-{slug}").exists():
-        raise TidyRefused(f"{doc}: {slug} still has an update timer")
-    return slug
+    if (NOTIFIER_STATE_DIR / f"showrunner-{owner.id}").exists():
+        raise TidyRefused(f"{doc}: {owner.name} still has an update timer")
+    return owner
 
 
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: tidy_wrapped.py <production doc>...", file=sys.stderr)
         return 2
-    from update_registration import QuestionStaff, RegistrationFailure
+    from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 
     identities: QuestionStaff | None = None
     failed = False
     for name in argv:
         try:
-            slug = wrapped_slug(Path(name))
-            if identities is None and can_hold_questions(Path(name)):
+            if identities is None:
                 identities = QuestionStaff.read()
-            removed = tidy(slug, Path(name), identities=identities)
-        except (TidyRefused, RegistrationFailure, OSError, UnicodeError, ValueError) as error:
+            owner = wrapped_owner(Path(name), identities.record)
+            removed = tidy(owner.name, Path(name), identities=identities)
+        except (TidyRefused, RegistrationFailure, staff.StaffRefused, staff.StaffUnreadable,
+                OSError, UnicodeError, ValueError) as error:
             print(f"kept: {error}", file=sys.stderr)
             failed = True
             continue
         count = len(removed)
-        print(f"{slug}: removed {count} state file{'' if count == 1 else 's'}" if count
-              else f"{slug}: no state files")
+        print(f"{owner.name}: removed {count} state file{'' if count == 1 else 's'}" if count
+              else f"{owner.name}: no state files")
     return 1 if failed else 0
 
 

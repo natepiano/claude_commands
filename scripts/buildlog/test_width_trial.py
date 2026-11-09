@@ -18,9 +18,12 @@ from pathlib import Path
 from typing import NamedTuple, cast, override
 from unittest.mock import patch
 
-import store
-import width_trial as trial
-from test_index import use_test_log
+from scripts.buildlog import store
+from scripts.buildlog import index
+from scripts.buildlog import width_trial as trial
+from scripts.buildlog.test_index import configure_cleanup, encode, step, use_test_log
+
+from scripts.lint.memory_test_support import write_config_fixture
 
 use_test_log()
 
@@ -57,7 +60,7 @@ class WidthTrialTests(unittest.TestCase):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         self.root.mkdir()
-        self.index = self.root / store.INDEX_NAME
+        self.index = index.index_path_in(self.root)
         self.peaks = self.root / "admission" / "anon_peaks.jsonl"
         home = Path(temporary) / "home"
         hana = home / "rust/hana"
@@ -89,6 +92,22 @@ class WidthTrialTests(unittest.TestCase):
                 CREATE TABLE tests(step_id TEXT, host TEXT, repo TEXT, status TEXT);
                 """
             )
+
+    def test_report_builds_a_missing_index_from_records_in_the_selected_root(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "build_admission.conf")
+        self.index.unlink()
+        selected = self.root / "selected"
+        records = selected / "natedev" / "2026-10.jsonl"
+        records.parent.mkdir(parents=True)
+        entry = step("new-report", step="nextest", repo_path="/r/hana", caller="verify",
+                     started_at=iso(BASE + 1_000), ended_at=iso(BASE + 1_100),
+                     argv=["cargo", "nextest", "run", "--workspace", "--test-threads=16", "-E", "package(hana)"],
+                     duration_s=100.0, finished_s=10.0, mem_wait_s=0)
+        _ = records.write_bytes(encode(entry))
+        output = trial.report(BASE, BASE + trial.BLOCK_S, root=selected)
+        self.assertRegex(output, r"(?m)^physical\s+1\s+1\s+1$")
+        self.assertRegex(self.metric_line(output, "T whole-hana"), r"\s90\s")
 
     def clear_records(self) -> None:
         with closing(sqlite3.connect(self.index)) as database, database:

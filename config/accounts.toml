@@ -1,7 +1,2 @@
 [trust]
 folders = ["~/worktrees"]
-
-# Mirror Claude Code 2.1.296's executable: xi/RTs retries and proper-lockfile Nt/rt stale lock handling.
-[claude_config_lock]
-retries = [0.2, 0.4, 0.8, 1.6, 3.2, 4.0]
-stale_seconds = 10.0

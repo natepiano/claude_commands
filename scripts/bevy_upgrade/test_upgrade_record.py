@@ -5,24 +5,23 @@ import fcntl
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, final, override
+from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import production_units
-import pins
-import upgrade_record
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.bevy_upgrade import pins
+from scripts.bevy_upgrade import upgrade_record
+from scripts.production.production_doc import Production, read_production
+from scripts.production import staff
+from scripts.production.staff_test_support import (
+    fixture_member, fixture_runtime_id, isolated_staff_file,
+)
+from scripts.lib import test_hang_guard
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 LATER = datetime(2026, 10, 13, 1, 2, 3, tzinfo=timezone.utc)
@@ -35,10 +34,13 @@ def dependent(name: str, version: str = "1.0.0") -> pins.Dependent:
 @final
 class RecordTests(unittest.TestCase):
     root: Path = Path()
+    owner: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.production = production_units.Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
+        self.production = Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"),
+                                     staff.StaffRow(staff.StaffId(""), "showrunner", "demo", staff.StaffRoot(),
+                                                    current_session=staff.StaffId("")))
         self.current_pins = pins.Pins((), frozenset(), ())
 
     @override
@@ -57,54 +59,71 @@ class RecordTests(unittest.TestCase):
         _ = doc.write_text(
             "# Demo\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {checkout}\n"
-            + "- **Log:** log.md\n- **User zone:** America/New_York\n\n## Units\n",
+            + "- **Log:** log.md\n- **User zone:** America/New_York\n",
             encoding="utf-8",
         )
-        self.production = production_units.read_production(doc)
         self.current_pins = pins.Pins(("0.19.1",), frozenset({"bevy_ecs"}),
                                       (dependent("alpha"), dependent("zeta")))
         _ = cast(object, self.enterContext(mock.patch.dict(
-            os.environ, {"BEVY_UPGRADE_STATE_DIR": str(self.root / "state")},
+            os.environ, {"BEVY_UPGRADE_STATE_DIR": str(self.root / "state"),
+                         "HERDR_BIN": "/nonexistent/herdr", "HOME": str(self.root)},
         )))
 
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        owner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", doc))
+        self.owner = staff.update_current_session(owner.current_session,
+            staff.native_id(fixture_runtime_id("bevy-current")))
+        self.production = read_production(self.owner.name)
+
     def begin(self) -> upgrade_record.Record:
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             started = upgrade_record.start(self.production, "0.20", self.current_pins, NOW)
             upgrade_record.save(started)
         return started
 
     def test_state_override_and_record_path(self) -> None:
         self.assertEqual(upgrade_record.state_dir(), self.root / "state")
-        self.assertEqual(upgrade_record.record_path("demo"), self.root / "state/demo.json")
+        self.assertEqual(upgrade_record.record_path(self.owner.id), self.root / "state" / f"{self.owner.id}.json")
 
     def test_default_state_directory_uses_the_home(self) -> None:
-        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home")}, clear=True):
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "BEVY_UPGRADE_STATE_DIR": ""}):
             self.assertEqual(upgrade_record.state_dir(), self.root / "home/.local/state/bevy-upgrade")
 
+    def test_rename_and_clear_preserve_the_record_key(self) -> None:
+        _ = self.begin()
+        path = self.root / "state" / f"{self.owner.id}.json"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        _ = staff.rename(self.owner.id, "renamed-demo")
+        _ = staff.update_current_session(self.owner.current_session,
+                                        staff.native_id(fixture_runtime_id("bevy-cleared")))
+        self.assertEqual(upgrade_record.record_path(self.owner.id), path)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(sorted(item.name for item in path.parent.glob("*.json")), [path.name])
+
     def test_missing_record_loads_as_none(self) -> None:
-        with upgrade_record.locked("demo"):
-            self.assertIsNone(upgrade_record.load("demo"))
+        with upgrade_record.locked(self.owner.id):
+            self.assertIsNone(upgrade_record.load(self.owner.id))
 
     def test_unique_module_names_load_with_shutdown_first_on_the_path(self) -> None:
         directory = Path(__file__).resolve().parent
         shutdown = directory.parent / "shutdown"
         script = (
             "import sys\nfrom pathlib import Path\n"
-            + "sys.path.insert(0, sys.argv[1])\nsys.path.insert(0, sys.argv[2])\n"
-            + "import shutdown_record\nimport upgrade_record\nimport upgrade_report\n"
+            + "from scripts.shutdown import shutdown_record\nfrom scripts.bevy_upgrade import upgrade_record, upgrade_report\n"
             + "assert Path(shutdown_record.__file__).resolve() == Path(sys.argv[2]) / 'shutdown_record.py'\n"
             + "assert Path(upgrade_record.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_record.py'\n"
             + "assert Path(upgrade_report.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_report.py'\n"
         )
-        result = subprocess.run([sys.executable, "-c", script, str(directory), str(shutdown)],
-                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        result = subprocess.run([str(directory.parent / "lib/py"), "-c", script, str(directory), str(shutdown)],
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                                     "PYTHONPATH": str(shutdown)},
                                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_start_builds_the_specified_record_without_default_answers(self) -> None:
         started = self.begin()
         self.assertEqual(started, {
-            "slug": "demo", "production": str(self.production.doc), "checkout": str(self.production.checkout),
+            "staff_id": self.owner.id, "production": self.production.name, "checkout": str(self.production.checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1"], "pins_read": NOW.isoformat(),
             "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,
@@ -118,24 +137,24 @@ class RecordTests(unittest.TestCase):
 
     def test_record_round_trips_through_json(self) -> None:
         started = self.begin()
-        with upgrade_record.locked("demo"):
-            self.assertEqual(upgrade_record.load("demo"), started)
-        raw: object = json.loads(upgrade_record.record_path("demo").read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
+        with upgrade_record.locked(self.owner.id):
+            self.assertEqual(upgrade_record.load(self.owner.id), started)
+        raw: object = json.loads(upgrade_record.record_path(self.owner.id).read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
         self.assertEqual(raw, started)
-        self.assertEqual(list(upgrade_record.state_dir().glob("*.json")), [upgrade_record.record_path("demo")])
+        self.assertEqual(list(upgrade_record.state_dir().glob("*.json")), [upgrade_record.record_path(self.owner.id)])
 
     def test_unreadable_record_refuses_with_its_path(self) -> None:
         for content in (b"{bad json", b"\xff"):
-            with self.subTest(content=content), upgrade_record.locked("demo"):
-                path = upgrade_record.record_path("demo")
+            with self.subTest(content=content), upgrade_record.locked(self.owner.id):
+                path = upgrade_record.record_path(self.owner.id)
                 _ = path.write_bytes(content)
                 with self.assertRaises(upgrade_record.RecordFailure) as caught:
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
                 self.assertIn(str(path), str(caught.exception))
 
     def test_locked_holds_an_exclusive_flock_and_releases_it(self) -> None:
-        with upgrade_record.locked("demo"):
-            lock_path = upgrade_record.state_dir() / "demo.lock"
+        with upgrade_record.locked(self.owner.id):
+            lock_path = upgrade_record.state_dir() / f"{self.owner.id}.lock"
             self.assertTrue(lock_path.is_file())
             with lock_path.open("a") as competitor:
                 with self.assertRaises(BlockingIOError):
@@ -146,20 +165,20 @@ class RecordTests(unittest.TestCase):
 
     def test_failed_atomic_replace_keeps_the_previous_record(self) -> None:
         started = self.begin()
-        old_contents = upgrade_record.record_path("demo").read_bytes()
+        old_contents = upgrade_record.record_path(self.owner.id).read_bytes()
         updated = upgrade_record.set_note(started, "alpha", "new note")
-        with upgrade_record.locked("demo"), mock.patch("os.replace", side_effect=OSError("replace failed")):
+        with upgrade_record.locked(self.owner.id), mock.patch("os.replace", side_effect=OSError("replace failed")):
             with self.assertRaises((OSError, upgrade_record.RecordFailure)):
                 upgrade_record.save(updated)
-        self.assertEqual(upgrade_record.record_path("demo").read_bytes(), old_contents)
+        self.assertEqual(upgrade_record.record_path(self.owner.id).read_bytes(), old_contents)
 
     def test_locked_propagates_the_callers_oserror_and_releases_the_lock(self) -> None:
         failure = OSError("caller operation failed")
         with self.assertRaises(OSError) as caught:
-            with upgrade_record.locked("demo"):
+            with upgrade_record.locked(self.owner.id):
                 raise failure
         self.assertIs(caught.exception, failure)
-        with (upgrade_record.state_dir() / "demo.lock").open("a") as competitor:
+        with (upgrade_record.state_dir() / f"{self.owner.id}.lock").open("a") as competitor:
             fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(competitor, fcntl.LOCK_UN)
 
@@ -167,13 +186,13 @@ class RecordTests(unittest.TestCase):
         for operation in ("pathlib.Path.open", "fcntl.flock"):
             with self.subTest(operation=operation), mock.patch(operation, side_effect=OSError("lock failed")):
                 with self.assertRaises(upgrade_record.RecordFailure) as caught:
-                    with upgrade_record.locked("demo"):
+                    with upgrade_record.locked(self.owner.id):
                         self.fail("lock acquisition should have failed")
-            self.assertEqual(str(caught.exception), f"{self.root / 'state/demo.lock'}: lock failed")
+            self.assertEqual(str(caught.exception), f"{self.root / 'state' / f'{self.owner.id}.lock'}: lock failed")
 
     def test_same_target_start_refreshes_pins_and_keeps_answers_and_notes(self) -> None:
         started = self.begin()
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             started = upgrade_record.set_answer(started, "alpha", "approved", "use this crate", "2026-10-12")
             started = upgrade_record.set_note(started, "alpha", "keep the local fix")
             upgrade_record.save(started)
@@ -190,30 +209,30 @@ class RecordTests(unittest.TestCase):
 
     def test_a_second_open_target_is_refused_without_changing_the_record(self) -> None:
         started = self.begin()
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             with self.assertRaises(upgrade_record.RecordFailure) as caught:
                 _ = upgrade_record.start(self.production, "0.21", self.current_pins, LATER)
             self.assertEqual(str(caught.exception), "a watch for 0.20 is open; stop it first")
-            self.assertEqual(upgrade_record.load("demo"), started)
+            self.assertEqual(upgrade_record.load(self.owner.id), started)
 
     def test_start_refuses_targets_other_than_major_minor(self) -> None:
         for target in ("", "0", "0.20.0", "v0.20", "0.20-rc.1", " 0.20", "0.20\n"):
-            with self.subTest(target=target), upgrade_record.locked("demo"):
+            with self.subTest(target=target), upgrade_record.locked(self.owner.id):
                 with self.assertRaises(upgrade_record.RecordFailure) as caught:
                     _ = upgrade_record.start(self.production, target, self.current_pins, NOW)
                 self.assertEqual(str(caught.exception), "target must be major.minor, such as 0.20")
-                self.assertIsNone(upgrade_record.load("demo"))
+                self.assertIsNone(upgrade_record.load(self.owner.id))
 
     def test_start_archives_a_closed_watch_and_resets_answers_and_notes(self) -> None:
         old = self.begin()
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             old = upgrade_record.set_answer(old, "alpha", "declined", "stay on releases", "2026-10-12")
             old = upgrade_record.set_note(old, "alpha", "old upgrade note")
             old["closed"] = LATER.isoformat()
             upgrade_record.save(old)
             fresh = upgrade_record.start(self.production, "0.21", self.current_pins, LATER)
             upgrade_record.save(fresh)
-        archive = upgrade_record.state_dir() / "demo.0.20.closed.json"
+        archive = upgrade_record.state_dir() / f"{self.owner.id}.0.20.closed.json"
         archived: object = json.loads(archive.read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
         self.assertEqual(archived, old)
         self.assertEqual(fresh["target"], "0.21")
@@ -321,9 +340,9 @@ class RecordTests(unittest.TestCase):
         for value in dependencies.values():
             _ = value.pop("crates_io")
             _ = value.pop("error")
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
-            loaded = upgrade_record.load("demo")
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
+            loaded = upgrade_record.load(self.owner.id)
         self.assertEqual(loaded, current)
 
     def test_valid_added_fields_round_trip_for_every_target_variant(self) -> None:
@@ -341,10 +360,10 @@ class RecordTests(unittest.TestCase):
         }
         current["dependencies"]["alpha"]["error"] = "crates.io: HTTP 503"
         for target in targets:
-            with self.subTest(target=target), upgrade_record.locked("demo"):
+            with self.subTest(target=target), upgrade_record.locked(self.owner.id):
                 current["target_bevy"] = target
                 upgrade_record.save(current)
-                self.assertEqual(upgrade_record.load("demo"), current)
+                self.assertEqual(upgrade_record.load(self.owner.id), current)
 
     def test_load_validates_each_added_record_field_and_target_variant(self) -> None:
         current = self.begin()
@@ -356,12 +375,12 @@ class RecordTests(unittest.TestCase):
             ("target_bevy", {"status": "released", "version": 1, "date": "2026-10-12", "since": "2026-10-01"}),
         )
         for field, value in cases:
-            with self.subTest(field=field, value=value), upgrade_record.locked("demo"):
+            with self.subTest(field=field, value=value), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 raw[field] = value
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
     def test_load_validates_each_added_entry_field_and_read_fact(self) -> None:
         current = self.begin()
@@ -381,13 +400,13 @@ class RecordTests(unittest.TestCase):
         del incomplete["ready"]
         cases.append(("crates_io", incomplete))
         for field, value in cases:
-            with self.subTest(field=field, value=value), upgrade_record.locked("demo"):
+            with self.subTest(field=field, value=value), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 dependencies = cast(dict[str, dict[str, object]], raw["dependencies"])
                 dependencies["alpha"][field] = value
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
     def test_apply_pins_retains_facts_errors_and_record_check_times(self) -> None:
         current = self.begin()
@@ -416,9 +435,9 @@ class RecordTests(unittest.TestCase):
         for value in cast(dict[str, dict[str, object]], raw["dependencies"]).values():
             del value["branch"]
             del value["items"]
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
-            self.assertEqual(upgrade_record.load("demo"), current)
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
 
     def test_unlisted_crate_branch_and_items_round_trip_and_survive_pin_refresh(self) -> None:
         current = self.begin()
@@ -432,9 +451,9 @@ class RecordTests(unittest.TestCase):
             {"number": 8, "kind": "issue", "state": "closed", "title": "Track 0.20",
              "updated": NOW.isoformat(), "head": ""},
         ]
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             upgrade_record.save(current)
-            self.assertEqual(upgrade_record.load("demo"), current)
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
         branch, items, facts = value["branch"], value["items"], value["crates_io"]
         merged = upgrade_record.apply_pins(current, self.current_pins, LATER)
         self.assertEqual(merged["dependencies"]["alpha"]["branch"], branch)
@@ -480,13 +499,13 @@ class RecordTests(unittest.TestCase):
             invalid[key] = wrong
             cases.append(("crates_io", invalid))
         for field, invalid in cases:
-            with self.subTest(field=field, invalid=invalid), upgrade_record.locked("demo"):
+            with self.subTest(field=field, invalid=invalid), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 values = cast(dict[str, dict[str, object]], raw["dependencies"])
                 values["alpha"][field] = invalid
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
     def test_read_branch_without_repository_is_refused(self) -> None:
         current = self.begin()
@@ -494,27 +513,27 @@ class RecordTests(unittest.TestCase):
         values = cast(dict[str, dict[str, object]], raw["dependencies"])
         values["alpha"]["branch"] = {"status": "read", "name": "main", "rev": "abcdef",
                                      "committed": "2026-10-12", "requirement": "^0.20"}
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaises(upgrade_record.RecordFailure):
-                _ = upgrade_record.load("demo")
+                _ = upgrade_record.load(self.owner.id)
 
 
     def test_load_adds_unannounced_baseline_to_previous_phase_record(self) -> None:
         current = self.begin()
         raw = cast(dict[str, object], json.loads(json.dumps(current)))
         del raw["announced"]
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
-            self.assertEqual(upgrade_record.load("demo"), current)
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
 
     def test_announced_round_trips_and_pin_refresh_keeps_what_was_told(self) -> None:
         current = self.begin()
         current["announced"] = {"alpha": {"state": "port in PR", "repository": "owner/adapter",
                                             "items": {"7": "open", "8": "closed"}}}
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             upgrade_record.save(current)
-            self.assertEqual(upgrade_record.load("demo"), current)
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
         merged = upgrade_record.apply_pins(current, self.current_pins, LATER)
         self.assertEqual(merged["announced"], current["announced"])
 
@@ -528,12 +547,12 @@ class RecordTests(unittest.TestCase):
             {"alpha": {"state": "done", "repository": "", "items": {"7": 1}}},
         )
         for invalid in cases:
-            with self.subTest(value=invalid), upgrade_record.locked("demo"):
+            with self.subTest(value=invalid), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 raw["announced"] = invalid
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
-    def test_expired_live_holder_reclaim_keeps_its_build_running(self) -> None:
+    def test_expired_live_owner_keeps_its_token_and_build(self) -> None:
         board = self.root / "board"
         environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                        "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
@@ -30,21 +30,23 @@ class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
             self.assertIsNone(first.poll(), "holder exited before its lock expired")
 
             _ = (lock / "expires").write_text("0")
+            refused = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
+                                      "cargo", "--wait", "0"], capture_output=True, text=True,
+                                     check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
+            step_record["start"] = "not-the-running-group"
+            _ = (lock / "owned").write_text(json.dumps(step_record))
             second = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
                                      "cargo", "--wait", "0"], capture_output=True, text=True,
                                     check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-            self.assertIn("reclaimed from first", second.stdout)
-            self.assertIn("after its hold expired", (board / "board.log").read_text())
+            self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+            self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
+            self.assertNotIn("reclaimed from first", second.stdout)
             self.assertIsNone(first.poll(), "reclaim ended the live holder")
             self.assertIn(cargo_pid, self.live_group_processes(step_group),
                           "reclaim ended the live holder's cargo")
 
-            reclaimed_release = subprocess.run(
-                ["bash", str(BOARD), "release", str(board), "first", "cargo", "--pid", str(first.pid)],
-                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(reclaimed_release.returncode, 3, reclaimed_release.stderr)
-            self.assertIn("first does not hold cargo (holder is second)", reclaimed_release.stderr)
             wrong_process_release = subprocess.run(
                 ["bash", str(BOARD), "release", str(board), "first", "cargo", "--pid", "1"],
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -57,11 +59,8 @@ class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
             _ = (self.root / "release").touch()
             _, first_error = first.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(first.returncode, 0, first_error)
-            self.assertIn("first does not hold cargo (holder is second)", first_error)
-            released = subprocess.run(["bash", str(BOARD), "release", str(board), "second",
-                                       "cargo"], capture_output=True, text=True, check=False,
-                                      timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+            self.assertNotIn("does not hold cargo", first_error)
+            self.assertFalse(lock.exists())
         finally:
             _ = (self.root / "release").touch()
             if first.poll() is None:

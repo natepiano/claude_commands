@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 import ast
 import io
 import os
@@ -17,12 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-if TYPE_CHECKING:
-    from . import override_guard
-    from ..lib import test_hang_guard
-else:
-    from scripts.build_hold import override_guard
-    from scripts.lib import test_hang_guard
+from scripts.build_hold import override_guard
+from scripts.lib import test_hang_guard
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
@@ -101,7 +96,7 @@ def run_shell(program: str, arguments: Sequence[str], environment: Mapping[str, 
 class OverrideGuardPythonTests(unittest.TestCase):
     def test_wired_modules_keep_their_checkout_import_forms(self) -> None:
         checkout = SCRIPT_DIRECTORY.parent.parent
-        environment = child_environment({})
+        environment = child_environment({"XDG_CACHE_HOME": str(temporary_root(self) / "cache")})
         modules = (
             ("lint/memory_test_support.py", True, True),
             ("build_hold/build_hold_test_support.py", False, False),
@@ -119,12 +114,13 @@ class OverrideGuardPythonTests(unittest.TestCase):
                 + f"loader.discover({str(path.parent)!r}, pattern={path.name!r}); "
                 + "assert not loader.errors, '\\n'.join(loader.errors)"
             )
-            commands = [[sys.executable, "-B", "-c", discover]]
+            python = str(checkout / "scripts/lib/py")
+            commands = [[python, "-B", "-c", discover]]
             if package_import:
                 module = str(path.with_suffix("")).replace("/", ".")
-                commands.append([sys.executable, "-B", "-c", f"import {module}"])
+                commands.append([python, "-B", "-c", f"import {module}"])
             if direct_run:
-                commands.append([sys.executable, "-B", str(path), "--help"])
+                commands.append([python, "-B", str(path), "--help"])
             for command in commands:
                 with self.subTest(module=relative, command=command):
                     result = subprocess.run(
@@ -162,11 +158,11 @@ class OverrideGuardPythonTests(unittest.TestCase):
             override_guard.require_checkout(checkout)
 
     def test_build_hold_imports_as_a_scripts_package_module(self) -> None:
-        _ = temporary_root(self)
-        environment = child_environment({})
+        root = temporary_root(self)
+        environment = child_environment({"HOME": str(root), "CLAUDE_PYTHON": sys.executable})
         self.assertNotIn("PYTHONPATH", environment)
         result = subprocess.run(
-            [sys.executable, "-c", "from scripts.build_hold import build_hold"],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.build_hold import build_hold"],
             cwd=SCRIPT_DIRECTORY.parent.parent, env=environment,
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )

@@ -8,6 +8,9 @@ Send groups: `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py
 
 Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.
 
+For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
+Filing a question alone never sends a push.
+
 ## Outcomes and recovery
 
 - `SENT: <how>` (exit 0) means delivered; `SKIPPED: <why>` (exit 0) means acknowledged or inside the repeat window. `QUEUED: <why>` (exit 1) keeps a Claude message for later delivery; it has not arrived.

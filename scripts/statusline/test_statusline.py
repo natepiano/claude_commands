@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -13,12 +12,15 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NotRequired, TypedDict, final, override
+from typing import NotRequired, TypedDict, cast, final, override
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
-from scripts.production import session_labels, showrunners, staff
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.production import session_labels, staff
 from scripts.shutdown import remote
+from scripts.statusline import adhoc_items, assignment, rebuild_row
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
@@ -26,21 +28,26 @@ SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
 COMMAND = f'statusline="{Path(__file__).parent}"; . "$statusline/statusline.sh"'
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# Preserve the fixture PATH when NixOS starts a child shell.
+SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 # Where NixOS's glibc finds zone files; Claude Code's environment carries it.
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
-                 colors: Path | str = "", own: str = "",
-                 counts: str = "", staff_text: str = "", **marks: str) -> list[str]:
+                 colors: Path | str = "",
+                 counts: str = "", rebuild: str = "", adhoc: str = "", staff_text: str = "", **marks: str) -> list[str]:
     """Run statusline.jq once over every input and return its output lines.
 
     `colors` is a file path or temporary config text; empty text omits the argument.
     """
+    record = assignment.staff_record(staff_text)
+    label, role = assignment.assignment(record, str(cast(dict[str, object], inputs[0]).get("session_id", "")) if isinstance(inputs[0], dict) else "")
     stdin = "\n".join(json.dumps(each) for each in inputs)
     stored = [] if labels is None else ["--slurpfile", "labels", str(labels)]
-    parent = ["--arg", "staff", staff_text, "--arg", "own", own, "--arg", "counts", counts]
+    parent = ["--arg", "assignment", label, "--arg", "role", role, "--arg", "counts", counts,
+              "--arg", "rebuild", rebuild, "--arg", "adhoc", adhoc]
     with tempfile.TemporaryDirectory() as directory:
         configured: list[str] = []
         if colors:
@@ -52,14 +59,22 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
             ["jq", "-r", "--arg", "pwd", "/tmp", "--arg", "account", account,
              *stored, *parent, *configured, "-f", str(PROGRAM)],
             input=stdin, capture_output=True, text=True, check=True,
-            env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TZ": USER_ZONE.key, **ZONE_FILES, **marks},
+            env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TZ": USER_ZONE.key, **ZONE_FILES, **marks},
         )
     return result.stdout.splitlines()
 
 
-OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", None, current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
-UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", OWNER.id, current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"))
-WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", UNIT.id, current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
+def seed_rebuild_cache(home: Path) -> None:
+    """Keep shell tests on temporary answers without calling Nix or SSH."""
+    seed_interpreter_cache(home / ".cache")
+    cache = home / ".local/state/showrunner/rebuilds"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    _ = cache.write_text("\n9999999999\n" + str(SHIPPED_COLORS) + "\n", encoding="utf-8")
+
+
+OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
+UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"))
+WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", staff.ReportsTo(UNIT.id), current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
 
 
 def staff_text(*rows: staff.StaffRow) -> str:
@@ -82,6 +97,25 @@ class ShowrunnerRecord(TypedDict):
 
 
 class ColorTests(unittest.TestCase):
+    def test_direct_jq_without_a_label_shows_only_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            colors = Path(directory) / "statusline.conf"
+            _ = colors.write_text("role.showrunner=purple\n", encoding="utf-8")
+            for arguments in ([], ["--arg", "assignment", ""]):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        ["jq", "-r", "--arg", "pwd", "/tmp/fallback",
+                         "--arg", "role", "showrunner", *arguments,
+                         "--rawfile", "colors", str(colors), "-f", str(PROGRAM)],
+                        input=json.dumps({"workspace": {"current_dir": "/tmp/project"}}),
+                        capture_output=True, text=True, check=True,
+                        env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"]},
+                    )
+                    line = result.stdout.splitlines()[0]
+                    self.assertEqual(line, "/tmp/project")
+                    self.assertNotIn(" | ", line)
+                    self.assertNotIn("\x1b", line)
+
     def test_direct_jq_colors_the_entire_staff_assignment(self) -> None:
         line = status_lines({"session_id": UNIT.id}, colors=SHIPPED_COLORS, staff_text=staff_text(OWNER, UNIT))[0]
         self.assertEqual(line.split(" | ")[0], "\x1b[33mtrunk unit for show\x1b[0m")
@@ -101,19 +135,17 @@ class ColorTests(unittest.TestCase):
         payload = {**limits({"used_percentage": 20}, {"used_percentage": 9}), "session_id": OWNER.id,
                    "model": {"display_name": "Opus 5.5"}, "effort": {"level": "high"},
                    "context_window": ContextWindow(total_input_tokens=103_438, context_window_size=250_000)}
-        own = json.dumps({"sessionId": "sid", "name": "natedev"})
         for cwd, path in (("/etc/nixos/", "/etc/nixos"), (f"{home}/rust/hana_catalyst", "~/rust/hana_catalyst"),
                           (home, "~"), (f"{home}x/elsewhere", f"{home}x/elsewhere"), ("/", "/")):
             with self.subTest(cwd=cwd):
-                self.assertEqual(status_lines({**payload, "workspace": {"current_dir": cwd}}, own=own,
-                                             staff_text=staff_text(staff.StaffRow(OWNER.id, "showrunner", "natedev", None, current_session=OWNER.id)),
+                self.assertEqual(status_lines({**payload, "workspace": {"current_dir": cwd}},
+                                             staff_text=staff_text(staff.StaffRow(OWNER.id, "showrunner", "natedev", staff.StaffRoot(), current_session=OWNER.id)),
                                              STAFF_ID=OWNER.id), [
                     f"natedev showrunner | {path}", "claude1 | Opus 5.5 high | 103,438 | weekly 91% left"])
-        unit = json.dumps({"sessionId": "sid", "name": "cables"})
         lines = status_lines({**payload, "session_id": UNIT.id, "workspace": {"current_dir": f"{home}/rust/hana_catalyst_cables"}},
-                             own=unit, staff_text=staff_text(
-                                 staff.StaffRow(OWNER.id, "showrunner", "hana", None, current_session=OWNER.id),
-                                 staff.StaffRow(UNIT.id, "unit", "cables", OWNER.id, current_session=UNIT.id)), STAFF_ID=UNIT.id)
+                             staff_text=staff_text(
+                                 staff.StaffRow(OWNER.id, "showrunner", "hana", staff.StaffRoot(), current_session=OWNER.id),
+                                 staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id)), STAFF_ID=UNIT.id)
         self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables")
 
     def test_shipped_role_colors_and_plain_worker_and_unassigned(self) -> None:
@@ -241,6 +273,52 @@ class ColorTests(unittest.TestCase):
         line = status_lines({"session_id": "sid"}, colors="counts.questions=bright-red\n", counts=row)[-1]
         self.assertEqual(line, "For you: \x1b[91m\x1b[1m2\x1b[22m questions\x1b[0m, "
                          + "\x1b[1m1\x1b[22m change, \x1b[1m1\x1b[22m proposal")
+
+    def test_adhoc_items_come_first_with_pink_text_and_a_bold_number_in_every_role(self) -> None:
+        for identity in (OWNER.id, UNIT.id, "unassigned-session"):
+            for text in ("3 adhoc items", "1 adhoc item"):
+                with self.subTest(session=identity, adhoc=text):
+                    line = status_lines(
+                        {"session_id": identity}, colors=SHIPPED_COLORS, adhoc=text,
+                        counts=f"{identity} For you: 1 question, 2 changes, 130 efficiency",
+                        staff_text=staff_text(OWNER, UNIT),
+                    )[-1]
+                    count, words = text.split(" ", 1)
+                    self.assertEqual(line, f"For you: \x1b[38;5;211m\x1b[1m{count}\x1b[22m {words}\x1b[0m, "
+                                     + "\x1b[91m\x1b[1m1\x1b[22m question\x1b[0m, "
+                                     + "\x1b[96m\x1b[1m2\x1b[22m changes\x1b[0m, "
+                                     + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m")
+
+
+class AdhocItemsTests(unittest.TestCase):
+    def test_command_writes_the_session_count_and_zero_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
+            path = Path(directory) / ".local/state/adhoc_review/review-session"
+            self.assertEqual(adhoc_items.row("review-session"), "")
+            for remaining, expected in ((3, "3 adhoc items"), (1, "1 adhoc item"), (0, ""), (0, "")):
+                with self.subTest(remaining=remaining):
+                    result = subprocess.run(
+                        ["python3", str(Path(adhoc_items.__file__)), str(remaining)],
+                        env={**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": directory,
+                             "CLAUDE_CODE_SESSION_ID": "review-session"},
+                        capture_output=True, text=True, check=True,
+                    )
+                    self.assertEqual(result.stdout + result.stderr, "")
+                    self.assertEqual(adhoc_items.row("review-session"), expected)
+                    if remaining:
+                        self.assertEqual(path.read_text(encoding="utf-8"), str(remaining))
+                    else:
+                        self.assertFalse(path.exists())
+
+    def test_row_omits_invalid_or_nonpositive_counts_and_an_empty_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
+            path = Path(directory) / ".local/state/adhoc_review/review-session"
+            path.parent.mkdir(parents=True)
+            for contents in ("not a number", "1.5", "1_0", "0", "-1", ""):
+                with self.subTest(contents=contents):
+                    _ = path.write_text(contents, encoding="utf-8")
+                    self.assertEqual(adhoc_items.row("review-session"), "")
+            self.assertEqual(adhoc_items.row(""), "")
 
 
 def limits(five_hour: dict[str, float | None], seven_day: dict[str, float | None]) -> dict[str, object]:
@@ -405,12 +483,25 @@ class RoleTests(unittest.TestCase):
 
     def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), **marks}
+        seed_rebuild_cache(self.home)
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **marks}
         result = subprocess.run(
             [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
             check=True, env=env, cwd=self.home,
         )
         return result.stdout.splitlines()
+
+    def test_review_without_a_production_shows_only_its_own_adhoc_count_in_each_shell(self) -> None:
+        path = self.home / ".local/state/adhoc_review/review-session"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("3", encoding="utf-8")
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                lines = self.command_lines({"session_id": "review-session"}, shell=shell)
+                self.assertEqual(ANSI.sub("", lines[-1]), "For you: 3 adhoc items")
+                for identity in ("other-session", ""):
+                    other = self.command_lines({"session_id": identity}, shell=shell)
+                    self.assertNotIn("For you:", "\n".join(other))
 
     def test_reset_times_take_the_zone_from_the_setting_and_its_label(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
@@ -440,6 +531,20 @@ class RoleTests(unittest.TestCase):
         _ = path.write_text(staff_text(*rows), encoding="utf-8")
         return path
 
+    def test_the_unit_label_is_its_staff_name_and_never_its_plan(self) -> None:
+        runner = replace(OWNER, name="production", current_session=staff.StaffId("0c373d45-68b5-4292-85bb-2223c0ffe5b5"))
+        unit = replace(UNIT, current_session=staff.StaffId("59a78f32-fccb-4988-ae0a-a740b45a9859"),
+                       worktree=staff.PresentWorktree(remote.local_machine(), self.home))
+        _ = (self.home / ".unit.toml").write_text('plan = "docs/plans/roles.md"\nresponsibilities = []\n')
+        _ = self.write_staff(runner, unit)
+        self.assertEqual(assignment.assignment(staff.StaffSnapshot((runner, unit)), runner.current_session),
+                         ("production showrunner", "showrunner"))
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertEqual(self.first_line(runner.current_session, shell=shell), "production showrunner | ~")
+                self.assertEqual(self.first_line(unit.current_session, shell=shell),
+                                 "trunk unit for production | ~")
+
     def test_staff_assignment_survives_a_restart_without_any_environment_labels(self) -> None:
         _ = self.write_staff(OWNER, UNIT)
         self.showrunner_record(os.getpid(), "trunk", session_id="own-id")
@@ -452,7 +557,7 @@ class RoleTests(unittest.TestCase):
 
     def test_current_staff_parent_and_name_are_read_each_refresh(self) -> None:
         for name in ("initial", "renamed"):
-            _ = self.write_staff(staff.StaffRow(OWNER.id, "showrunner", name, None, current_session=OWNER.id), UNIT)
+            _ = self.write_staff(staff.StaffRow(OWNER.id, "showrunner", name, staff.StaffRoot(), current_session=OWNER.id), UNIT)
             for shell in SHELLS:
                 with self.subTest(name=name, shell=shell):
                     self.assertEqual(ANSI.sub("", self.command_lines({"session_id": UNIT.id}, shell=shell)[0]),
@@ -502,12 +607,12 @@ class RoleTests(unittest.TestCase):
                          "trunk unit for show | ~")
 
     def test_jq_and_queue_reader_agree_on_identity_unique_names_and_ambiguity(self) -> None:
-        other = staff.StaffRow(staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), "showrunner", "other", None, current_session=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"))
-        duplicate = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "unit", "trunk", other.id, current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
+        other = staff.StaffRow(staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), "showrunner", "other", staff.StaffRoot(), current_session=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"))
+        duplicate = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "unit", "trunk", staff.ReportsTo(other.id), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
         rows = (OWNER, UNIT, WORKER)
         for members in (rows, (*rows, other, duplicate)):
             _ = self.write_staff(*members)
-            reader = session_labels.StaffLabels(staff.StaffSnapshot(members), {}, {})
+            reader = session_labels.StaffLabels(staff.StaffSnapshot(members))
             for identity, name in (("", "trunk"), ("", "trunk-unit"), ("", "trunk_unit"),
                                    ("", "show"), ("", "missing"), ("", "bad name"),
                                    (UNIT.id, "show"), (OWNER.id, "trunk"), (WORKER.id, "trunk"),
@@ -525,26 +630,26 @@ class RoleTests(unittest.TestCase):
                     elif row.kind == "showrunner":
                         self.assertEqual(role, f"{row.name} showrunner")
                     else:
-                        parent = reader.record.by_id(row.parent) if row.parent is not None else None
+                        parent = reader.record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
                         self.assertIsNotNone(parent)
                         assert parent is not None
-                        self.assertEqual(role, f"{row.name} unit for {parent.name}")
+                        self.assertEqual(role, f"trunk unit for {parent.name}")
 
     def test_python_and_jq_share_timer_folder_and_name_precedence(self) -> None:
         machine = remote.local_machine()
         doc = self.home / "runner's production.md"
         runner = replace(OWNER, name="hana", doc=staff.LiveDoc(machine, doc))
         folder = str(self.home / "geometry material")
+        Path(folder).mkdir()
+        _ = (Path(folder) / ".unit.toml").write_text('plan = "docs/plans/material.md"\nresponsibilities = []\n')
         unit = replace(UNIT, name="geometry-material", worktree=staff.PresentWorktree(machine, Path(folder)))
-        other = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "showrunner", "other", None, current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
-        duplicate = replace(unit, id=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), parent=other.id)
-        source = showrunners.ShowrunnerSource(showrunners.Timer("different-slug", "session:runner-id", doc, "UTC"), "")
-        sources = {source.timer.slug: source}
-        instance = self.home / ".local/state/notifier/showrunner-different-slug"
+        other = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "showrunner", "other", staff.StaffRoot(), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
+        duplicate = replace(unit, id=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), parent=staff.ReportsTo(other.id))
+        instance = self.home / f".local/state/notifier/showrunner-{runner.id}"
         instance.mkdir(parents=True)
-        _ = doc.write_text("# No Units table\n")
+        _ = doc.write_text("# Production\n")
         _ = (instance / "conf").write_text(
-            f"TARGET=session:runner-id\nCHECK=zsh /scripts/production_check.sh {shlex.quote(str(doc))}\n")
+            f"TARGET=session:{runner.id}\nCHECK=zsh /scripts/production_check.sh {runner.id}\n")
         cases: list[tuple[str, tuple[staff.StaffRow, ...], dict[str, str], str, str, str, str]] = [
             ("folder gives no identity", (runner, unit, other), {}, "own-id", "other", folder, ""),
             ("timer gives no identity", (runner, unit, other), {}, "runner-id", "other", folder, ""),
@@ -572,13 +677,13 @@ class RoleTests(unittest.TestCase):
                 path = self.write_staff(*rows)
                 # Exercise the schema emitted by staff's current writer.
                 _ = path.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
-                reader = session_labels.StaffLabels(staff.StaffSnapshot(rows), sources, {source.timer.slug: runner})
+                reader = session_labels.StaffLabels(staff.StaffSnapshot(rows))
                 resolved = reader.environment(environment, session_id)
                 row = reader.record.by_id(staff.StaffId(resolved.get("CLAUDE_CODE_SESSION_ID", "")))
                 self.assertEqual(row.id if row is not None else "", expected)
                 self.showrunner_record(os.getpid(), name, session_id=session_id)
                 role = ("worker" if row is not None and row.kind == "worker"
-                        else f"{row.name} unit for hana" if row is not None and row.kind == "unit"
+                        else "geometry-material unit for hana" if row is not None and row.kind == "unit"
                         else f"{row.name} showrunner" if row is not None else "unassigned")
                 for shell in SHELLS:
                     rendered = self.command_lines({"session_id": session_id, "cwd": cwd}, shell=shell, **environment)
@@ -618,6 +723,8 @@ class RoleTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in ("statusline.sh", "statusline.jq"):
             _ = (scripts / name).write_text((PROGRAM.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
+        (scripts / "assignment.py").symlink_to(PROGRAM.with_name("assignment.py"))
+        (scripts.parent / "lib").symlink_to(PROGRAM.parent.parent / "lib", target_is_directory=True)
         command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
@@ -634,7 +741,7 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(self.role(), "unassigned")
 
     def test_notifier_timers_and_inherited_environment_do_not_assign_a_session(self) -> None:
-        self.timer("showrunner-show", "session:aaaa-1111")
+        self.timer(f"showrunner-{OWNER.id}", f"session:{OWNER.id}")
         self.assertEqual(self.role(SHOWRUNNER_UNIT="show", UNIT_TEAM_ROLE="impl"), "unassigned")
 
     def test_the_account_label_follows_the_role(self) -> None:
@@ -667,28 +774,30 @@ class CountsRowTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        seed_rebuild_cache(self.home)
         doc = self.home / "docs/plans/show-production.md"
         doc.parent.mkdir(parents=True)
         self.ledger = self.home / "ledger.md"
         _ = doc.write_text("# show\n\n> **Status: PRODUCTION — running**\n"
                            + f"- **Improvement queue:** {self.ledger}\n", encoding="utf-8")
-        instance = self.home / ".local/state/notifier/showrunner-show"
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
         instance.mkdir(parents=True)
-        _ = (instance / "conf").write_text(f"TARGET=session:{OWNER.id}\nCHECK=zsh /x/production_check.sh {doc}\n",
+        _ = (instance / "conf").write_text(f"TARGET=session:{OWNER.id}\nCHECK=zsh /x/production_check.sh {OWNER.id}\n",
                                            encoding="utf-8")
-        self.cache = self.home / ".local/state/showrunner/counts/show"
+        self.cache = self.home / f".local/state/showrunner/counts/{OWNER.id}"
         path = self.home / ".local/state/staff/staff.json"
         path.parent.mkdir(parents=True)
-        _ = path.write_text(staff_text(OWNER), encoding="utf-8")
+        _ = path.write_text(staff_text(replace(OWNER, doc=staff.LiveDoc(remote.local_machine(), doc))), encoding="utf-8")
 
 
     def questions(self, *items: OutstandingItem) -> None:
-        path = self.home / ".local/state/showrunner/outstanding/show.json"
+        path = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps(list(items)), encoding="utf-8")
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id}
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
         result = subprocess.run([shell, "-c", COMMAND], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         return [ANSI.sub("", line) for line in result.stdout.splitlines()]
@@ -707,7 +816,8 @@ class CountsRowTests(unittest.TestCase):
     def test_each_count_in_the_row_is_bold_inside_its_shipped_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
-        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id}
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json")}
         result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
@@ -755,7 +865,7 @@ class CountsRowTests(unittest.TestCase):
 
     def test_a_deferred_question_joins_the_row_when_its_time_comes(self) -> None:
         later = datetime.now(USER_ZONE) + timedelta(hours=1)
-        outstanding = self.home / ".local/state/showrunner/outstanding/show.json"
+        outstanding = self.home / ".local/state/showrunner/outstanding" / f"{OWNER.id}.json"
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 self.questions({"since": "2026-10-16T19:00", "text": "A", "after": later.strftime("%Y-%m-%dT%H:%M")})
@@ -770,6 +880,195 @@ class CountsRowTests(unittest.TestCase):
                                           encoding="utf-8")
                 os.utime(self.cache, ns=(built, built))
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question")
+
+
+class RebuildRowTests(unittest.TestCase):
+    def settings(self) -> rebuild_row.RebuildSettings:
+        return rebuild_row.RebuildSettings(Path("/test/nixos"), "main", "natedev", "MacBook-Pro", "mac", 60)
+
+    def answer(self, local: str, mac: str, expected: str = "/nix/store/main-system") -> str:
+        def run(command: list[str]) -> str:
+            self.assertIn(command[0], ("realpath", "ssh"))
+            return local if command[0] == "realpath" else mac
+        paths = rebuild_row.ExpectedSystems("a" * 40, (), expected, expected)
+        return rebuild_row.row(self.settings(), paths, run)
+
+    def test_8ab801c_differs_from_613d31d_then_the_1628_rebuild_clears_the_item(self) -> None:
+        self.assertEqual(self.answer("/nix/store/8ab801c-system", "/nix/store/main-system"), "rebuild natedev")
+        self.assertEqual(self.answer("/nix/store/main-system", "/nix/store/main-system"), "")
+
+    def test_both_machines_need_a_rebuild(self) -> None:
+        self.assertEqual(self.answer("/nix/store/old-linux", "/nix/store/old-darwin"), "rebuild natedev, rebuild mac")
+
+    def test_unreachable_mac_does_not_hide_the_local_item(self) -> None:
+        self.assertEqual(self.answer("/nix/store/old-linux", ""), "rebuild natedev")
+
+    def test_comment_only_commit_has_the_same_outpath(self) -> None:
+        self.assertEqual(self.answer("/nix/store/unchanged", "/nix/store/unchanged", "/nix/store/unchanged"), "")
+
+    def test_failed_or_invalid_eval_never_reports_a_rebuild(self) -> None:
+        for invalid in ("", "error", "/run/current-system", "/nix/store/a\n/nix/store/b"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.answer("/nix/store/old", "/nix/store/old", invalid), "")
+
+    def test_rebuild_items_follow_questions_and_changes(self) -> None:
+        line = status_lines({"session_id": "sid"}, counts="sid For you: 1 question, 2 changes, 1 proposal",
+                            rebuild="rebuild natedev, rebuild mac")[-1]
+        self.assertEqual(ANSI.sub("", line), "For you: 1 question, 2 changes, rebuild natedev, rebuild mac, 1 proposal")
+
+    def test_rebuild_alone_creates_the_row(self) -> None:
+        self.assertEqual(status_lines({}, rebuild="rebuild mac")[-1], "For you: rebuild mac")
+
+    def test_settings_read_values_at_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "statusline.conf"
+            text = ("rebuild.repo=/custom/repo\nrebuild.ref=custom\nrebuild.natedev=linux\n"
+                    + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\n")
+            _ = path.write_text(text, encoding="utf-8")
+            settings = rebuild_row.RebuildSettings.read(path)
+            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17))
+            _ = path.write_text(text.replace("interval=17", "interval=29"), encoding="utf-8")
+            self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
+
+    def test_cache_stores_the_last_evaluation_and_clears_after_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.cache={cache}\n", encoding="utf-8")
+            commands: list[list[str]] = []
+            running = "/nix/store/old"
+
+            def run(command: list[str]) -> str:
+                commands.append(command)
+                if command[0] == "git":
+                    return "a" * 40
+                if command[0] == "nix":
+                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
+                return running
+
+            rebuild_row.write(config, run)
+            line, due, source, details = cache.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(line, "rebuild natedev, rebuild mac")
+            self.assertGreater(int(due), time.time())
+            self.assertEqual(source, str(config))
+            self.assertEqual(rebuild_row.read(config).expected, rebuild_row.ExpectedSystems(
+                "a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "/nix/store/main", "/nix/store/main"))
+            commands.clear()
+            rebuild_row.write(config, run)
+            self.assertEqual(commands, [])
+            running = "/nix/store/main"
+            _ = cache.write_text("\n0\n" + str(config) + "\n" + details + "\n", encoding="utf-8")
+            rebuild_row.write(config, run)
+            self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[0], "")
+
+    def test_read_command_prints_both_one_or_no_machines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "custom-cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            for line, machines in (("rebuild natedev, rebuild mac", "natedev\nmac\n"),
+                                   ("rebuild mac", "mac\n"), ("", "")):
+                with self.subTest(line=line):
+                    _ = cache.write_text(line + "\n9999999999\n" + str(config) + "\n", encoding="utf-8")
+                    result = subprocess.run(
+                        ["python3", str(PROGRAM.with_name("rebuild_row.py")), "read", "--config", str(config)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, machines, ""))
+                    self.assertEqual(rebuild_row.read(config).row(), line)
+
+    def test_reader_hides_missing_or_invalid_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+            for text in ("invalid\n9999999999\n", "rebuild mac\ninvalid\n"):
+                with self.subTest(text=text):
+                    _ = cache.write_text(text, encoding="utf-8")
+                    self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+
+    def test_stale_cache_keeps_the_answer_for_the_reader_and_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            _ = cache.write_text("rebuild natedev, rebuild mac\n0\n" + str(config) + "\n", encoding="utf-8")
+            answer = rebuild_row.read(config)
+            self.assertTrue(answer.refresh_due)
+            self.assertEqual(answer.row(), "rebuild natedev, rebuild mac")
+            result = subprocess.run(
+                ["python3", str(PROGRAM.with_name("rebuild_row.py")), "read", "--config", str(config)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "natedev\nmac\n", ""))
+
+    def test_refresh_evaluates_once_per_commit_and_checks_running_systems_each_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.cache={cache}\n", encoding="utf-8")
+            commands: list[list[str]] = []
+            commit = "a" * 40
+            running = "/nix/store/old"
+
+            def run(command: list[str]) -> str:
+                commands.append(command)
+                if command[0] == "git":
+                    self.assertEqual(command, ["git", "-C", "/test/nixos", "rev-parse", "--verify", "main^{commit}"])
+                    return commit
+                if command[0] == "nix":
+                    self.assertIn(f"?rev={commit}", command[-1])
+                    self.assertIn('nixosConfigurations."natedev"', command[-1])
+                    self.assertIn('darwinConfigurations."MacBook-Pro"', command[-1])
+                    return json.dumps({"natedev": "/nix/store/main", "mac": "/nix/store/main"})
+                return running
+
+            rebuild_row.write(config, run)
+            self.assertEqual([command[0] for command in commands], ["git", "nix", "realpath", "ssh"])
+            for changed in (False, True):
+                with self.subTest(changed=changed):
+                    lines = cache.read_text(encoding="utf-8").splitlines()
+                    lines[1] = "0"
+                    _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    commands.clear()
+                    running = "/nix/store/main"
+                    if changed:
+                        commit = "b" * 40
+                    rebuild_row.write(config, run)
+                    self.assertEqual([command[0] for command in commands],
+                                     ["git", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
+                    self.assertEqual(rebuild_row.read(config).row(), "")
+
+    def test_failed_eval_is_cached_for_the_commit_without_a_false_item(self) -> None:
+        commands: list[list[str]] = []
+
+        def run(command: list[str]) -> str:
+            commands.append(command)
+            return "a" * 40 if command[0] == "git" else ""
+
+        expected = rebuild_row.expected_systems(self.settings(), rebuild_row.NoExpectedSystems(), run)
+        self.assertIsInstance(expected, rebuild_row.ExpectedSystems)
+        self.assertEqual(rebuild_row.row(self.settings(), expected, run), "")
+        commands.clear()
+        self.assertEqual(rebuild_row.expected_systems(self.settings(), expected, run), expected)
+        self.assertEqual([command[0] for command in commands], ["git"])
+
+    def test_shell_reads_a_fresh_cache_without_running_the_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            cache = home / ".local/state/showrunner/rebuilds"
+            cache.parent.mkdir(parents=True)
+            _ = cache.write_text("rebuild natedev\n9999999999\n/dev/null\n", encoding="utf-8")
+            built = cache.stat().st_mtime_ns
+            for shell in SHELLS:
+                result = subprocess.run([shell, "-c", COMMAND], input="{}", capture_output=True, text=True,
+                                        check=True, env={**SHELL_ENVIRONMENT, "HOME": directory, "PATH": os.environ["PATH"]}, cwd=home)
+                self.assertEqual(result.stdout.splitlines()[-1], "For you: rebuild natedev")
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(cache.stat().st_mtime_ns, built)
 
 if __name__ == "__main__":
     _ = unittest.main()

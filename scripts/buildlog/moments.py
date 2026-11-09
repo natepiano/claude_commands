@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,8 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import ClassVar, Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import unit_runs  # noqa: E402
+from scripts.lib import unit_runs
 
 
 type MetricKey = Literal[
@@ -26,6 +24,7 @@ type MetricKey = Literal[
     "reruns_per_phase", "clone_rebuilds_per_phase", "clone_hours_per_phase",
     "fail_reruns_per_phase", "wait_hours_per_run_hour",
 ]
+type NextestOutcome = Literal["passed", "failed", "unrecorded"]
 type ComparisonSide = Literal["before", "after"]
 
 
@@ -138,12 +137,17 @@ def _matches(fields: tuple[str, ...], patterns: tuple[str, ...], separator: str 
     return "(CASE " + " ".join(f"WHEN {text} GLOB '*{pattern}*' THEN 1" for pattern in patterns) + " ELSE 0 END)"
 
 
+def window_bounds(column: str) -> str:
+    """Keep indexed date bounds broad enough for offset-bearing timestamps."""
+    return (f"{column} >= :first_day AND {column} < :last_day"
+            + f" AND julianday({column}) >= julianday(:start) AND julianday({column}) < julianday(:end)")
+
+
 # sdlc_recheck.sql's nat predicate, with the measured window parameterized.
 # Sessions include both hosts, as in that predicate; only the result is natedev.
 HANA_CTE = f"""
 WITH w AS (
-    SELECT * FROM steps WHERE started_at >= :first_day AND started_at < :last_day
-    AND julianday(started_at) >= julianday(:start) AND julianday(started_at) < julianday(:end)
+    SELECT * FROM steps WHERE {window_bounds("started_at")}
 ), d AS MATERIALIZED (
     SELECT id, host, started_at, step, duration_s, mem_wait_s, status,
     crates_compiled, call_id, session, unit_session, cwd, repo,
@@ -154,8 +158,7 @@ WITH w AS (
         UNION ALL SELECT unit_session, direct FROM d WHERE unit_session IS NOT NULL AND unit_session <> ''
     ) GROUP BY k HAVING sum(direct) > sum(1-direct)
 ), callh AS MATERIALIZED (
-    SELECT id FROM calls WHERE started_at >= :first_day AND started_at < :last_day
-    AND julianday(started_at) >= julianday(:start) AND julianday(started_at) < julianday(:end)
+    SELECT id FROM calls WHERE {window_bounds("started_at")}
     AND ({_matches(('repo', 'repo_path', 'cwd', 'worktree', 'branch', 'package'), ('hana', 'tool-based-ui'), separator='')}
          OR session IN sess OR unit_session IN sess)
 ), population AS (
@@ -172,8 +175,6 @@ WITH w AS (
 
 def window_parameters(start: datetime, end: datetime) -> dict[str, str]:
     start, end = start.astimezone(UTC), end.astimezone(UTC)
-    # Indexed text bounds must admit offset-bearing spellings on adjacent
-    # dates; the julianday predicates select the exact instants afterward.
     return {"start": start.isoformat(), "end": end.isoformat(),
             "first_day": (start.date() - timedelta(days=1)).isoformat(),
             "last_day": (end.date() + timedelta(days=2)).isoformat()}
@@ -192,23 +193,39 @@ class PhaseFinished:
     working_dir: str
 
 
-def phase_events() -> tuple[PhaseFinished, ...]:
-    """Read local natedev history; redirected build logs never read live history."""
+@dataclass(frozen=True)
+class PhaseStartUnavailable:
+    """The finish has no valid phase_started_at field."""
+
+
+@dataclass(frozen=True)
+class ProgressFinish:
+    timestamp_epoch: float
+    phase_instance_id: str
+    working_dir: str
+    host: str
+    wall_s: float | PhaseStartUnavailable
+
+
+def progress_events() -> tuple[ProgressFinish, ...]:
+    """Read and validate only phase finishes from the shared history folder."""
     if os.environ.get("BUILDLOG_PROGRESS_DIR"):
         root = Path(os.environ["BUILDLOG_PROGRESS_DIR"])
     elif os.environ.get("BUILDLOG_DIR"):
         root = Path(os.environ["BUILDLOG_DIR"]) / "progress"
     else:
-        import store
+        from scripts.buildlog import store
 
         if store.host_name() != "natedev":
             return ()
         root = unit_runs.history_root() / "runs"
-    events: dict[str, PhaseFinished] = {}
+    events: dict[str, ProgressFinish] = {}
     for path in root.glob("*.jsonl"):
         try:
-            with path.open() as source:
+            with path.open("rb") as source:
                 for line in source:
+                    if b'"phase_finished"' not in line:
+                        continue
                     try:
                         value = cast(object, json.loads(line))
                     except ValueError:
@@ -216,14 +233,25 @@ def phase_events() -> tuple[PhaseFinished, ...]:
                     if not isinstance(value, dict):
                         continue
                     event = cast(dict[str, object], value)
-                    at, instance, directory = (event.get(key) for key in ("timestamp_epoch", "phase_instance_id", "working_dir"))
-                    if (event.get("event_type") == "phase_finished" and isinstance(at, (int, float))
-                            and not isinstance(at, bool) and isinstance(instance, str) and isinstance(directory, str)
-                            and event.get("host", "natedev") == "natedev" and hana_name(directory)):
-                        events[instance] = PhaseFinished(float(at), instance, directory)
+                    at, instance, directory, started = (event.get(key) for key in
+                        ("timestamp_epoch", "phase_instance_id", "working_dir", "phase_started_at"))
+                    host = event.get("host", "natedev")
+                    if (event.get("event_type") != "phase_finished" or not isinstance(at, (int, float))
+                            or isinstance(at, bool) or not isinstance(instance, str)
+                            or not isinstance(directory, str) or not isinstance(host, str)):
+                        continue
+                    wall = (float(at - started) if isinstance(started, (int, float))
+                            and not isinstance(started, bool) and started <= at else PhaseStartUnavailable())
+                    events[instance] = ProgressFinish(float(at), instance, directory, host, wall)
         except OSError:
             continue
     return tuple(events.values())
+
+
+def phase_events() -> tuple[PhaseFinished, ...]:
+    """Select finished natedev hana phases from the shared progress reader."""
+    return tuple(PhaseFinished(event.timestamp_epoch, event.phase_instance_id, event.working_dir)
+                 for event in progress_events() if event.host == "natedev" and hana_name(event.working_dir))
 
 
 @dataclass(frozen=True)
@@ -303,6 +331,9 @@ class UnrecordedIdentity:
     """SQL NULL identity; distinct from any recorded string, including empty."""
 
 
+UNRECORDED_IDENTITY = UnrecordedIdentity()
+
+
 @dataclass(frozen=True)
 class StepEndUnavailable:
     """A step without duration cannot supply an end for a later pair."""
@@ -312,8 +343,48 @@ class StepEndUnavailable:
 class PreviousNextest:
     ends_at: float | StepEndUnavailable
     call_id: str | UnrecordedIdentity
-    outcome: Literal["passed", "failed", "unrecorded"]
+    outcome: NextestOutcome
     clone: bool
+
+
+COLD_BUILD_MIN_CRATES = 50
+CLONE_BUILD_MIN_CRATES = 300
+SAME_WORKER_REPEAT_SECONDS = 3600
+
+
+def nextest_outcome(status: int | None) -> NextestOutcome:
+    """Convert the nullable SQL status to a named nextest outcome."""
+    return "unrecorded" if status is None else "passed" if status == 0 else "failed"
+
+
+def previous_nextest(at: float, duration: float | None, outcome: NextestOutcome,
+                     call_id: str | UnrecordedIdentity = UNRECORDED_IDENTITY, clone: bool = False) -> PreviousNextest:
+    return PreviousNextest(at + duration if duration is not None else StepEndUnavailable(), call_id, outcome, clone)
+
+
+def same_worker_window(previous: PreviousNextest, submitted: float) -> bool:
+    return isinstance(previous.ends_at, float) and submitted - previous.ends_at <= SAME_WORKER_REPEAT_SECONDS
+
+
+def same_worker_after_pass(previous: PreviousNextest, outcome: NextestOutcome, submitted: float) -> bool:
+    """Use the consecutive-session rule, including overlapping submissions."""
+    return previous.outcome == outcome == "passed" and same_worker_window(previous, submitted)
+
+
+@dataclass(frozen=True)
+class RecordedBuildTree:
+    repository: str
+    worktree: str
+    build_input: str
+    tree_key: str
+
+
+def passed_tree_rerun(previous: PreviousNextest, outcome: NextestOutcome, submitted: float,
+                      earlier: RecordedBuildTree | UnrecordedIdentity,
+                      current: RecordedBuildTree | UnrecordedIdentity) -> bool:
+    """Require the shared pass-pair rule and recorded proof of the same build tree."""
+    return (isinstance(current, RecordedBuildTree) and current == earlier
+            and same_worker_after_pass(previous, outcome, submitted))
 
 
 def window_totals(connection: sqlite3.Connection, start: datetime, end: datetime) -> dict[MetricKey, float]:
@@ -342,11 +413,10 @@ def window_totals(connection: sqlite3.Connection, start: datetime, end: datetime
         if kind != "nextest":
             continue
         totals["nextest"] += 1
-        outcome: Literal["passed", "failed", "unrecorded"] = (
-            "unrecorded" if status is None else "passed" if status == 0 else "failed")
+        outcome = nextest_outcome(status)
         if outcome == "failed":
             totals["failed"] += 1
-        clone = crates is not None and crates >= 300
+        clone = crates is not None and crates >= CLONE_BUILD_MIN_CRATES
         if clone:
             totals["clone_rebuilds"] += 1
             totals["clone_hours"] += hours
@@ -360,17 +430,15 @@ def window_totals(connection: sqlite3.Connection, start: datetime, end: datetime
                 totals["queue_hidden"] += 1
         previous = sessions.get(session) if session is not None else None
         if previous is not None and isinstance(previous.ends_at, float):
-            if submitted - previous.ends_at <= 3600:
-                if outcome == previous.outcome == "passed":
-                    totals["pass_reruns"] += 1
-                    totals["pass_hours"] += hours
-                if outcome == previous.outcome == "failed":
-                    totals["fail_reruns"] += 1
-                    totals["fail_hours"] += hours
+            if same_worker_after_pass(previous, outcome, submitted):
+                totals["pass_reruns"] += 1
+                totals["pass_hours"] += hours
+            if same_worker_window(previous, submitted) and outcome == previous.outcome == "failed":
+                totals["fail_reruns"] += 1
+                totals["fail_hours"] += hours
             if clone and previous.clone and at - previous.ends_at <= 14400:
                 totals["clone_repeats"] += 1
-        preceding = PreviousNextest(at + duration if duration is not None else StepEndUnavailable(),
-                                    call_id, outcome, clone)
+        preceding = previous_nextest(at, duration, outcome, call_id, clone)
         if cwd is not None:
             folders[cwd.split("/target/verify-doc", 1)[0]] = preceding
         if session is not None:
@@ -426,3 +494,7 @@ def comparison_windows(moments: Sequence[Moment], end: datetime) -> tuple[Compar
                        if (boundaries[moment.at][1] > end-timedelta(days=7) if moment in MOMENTS
                            else moment.at >= end-timedelta(days=7)))
     return tuple(sorted(windows, key=lambda window: window.moment.at, reverse=True))
+
+
+def nearest_rank(values: Sequence[float], percent: int) -> float:
+    return sorted(values)[(percent * len(values) + 99) // 100 - 1]

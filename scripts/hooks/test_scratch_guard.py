@@ -8,7 +8,6 @@ import os
 import secrets
 import stat
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,9 +18,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("pre-tool-use-scratch-guard.py")
-sys.path.insert(0, str(HOOK.parent))
 remake_session_temp = cast(Callable[[str], None],
-                           importlib.import_module(HOOK.stem).remake_session_temp)
+                           importlib.import_module(f"scripts.hooks.{HOOK.stem}").remake_session_temp)
 
 
 class HookDecision(TypedDict):
@@ -94,7 +92,7 @@ class ScratchGuardTests(unittest.TestCase):
         self.assert_refused(f"mkdir {rust}/scratch/{self.name}", f"{rust}/scratch/{self.name}")
 
     def test_copies_root_allows_a_new_pair_and_copy(self) -> None:
-        guard = importlib.import_module(HOOK.stem)
+        guard = importlib.import_module(f"scripts.hooks.{HOOK.stem}")
         private = self.temp / "claude"
         loose_folder = cast(Callable[[Path], Path | None], guard.loose_folder)
 
@@ -150,6 +148,71 @@ class ScratchGuardTests(unittest.TestCase):
             remake_session_temp(json.dumps({"session_id": "scratch-session"}))
             mkdir.assert_called_once_with(mode=0o700, parents=True, exist_ok=True)
 
+    def test_quoted_punctuation_is_data_inside_a_scratch_root(self) -> None:
+        for punctuation in ";&|(){}\n":
+            for word in ("'" + punctuation + "'", '"' + punctuation + '"',
+                         "'" + punctuation * 2 + "'", '"' + punctuation * 2 + '"'):
+                with self.subTest(word=word):
+                    self.assert_allowed(f"printf '%s\\n' {word} git clone a b", cwd=self.temp)
+        for operator in (";", "&&", "|", "\n"):
+            with self.subTest(operator=operator):
+                self.assert_refused(f"printf x{operator} git clone a b", str(self.temp / "b"), cwd=self.temp)
+        self.assert_refused("printf ';';git clone a b", str(self.temp / "b"), cwd=self.temp)
+
+    def test_escaped_punctuation_is_data_inside_a_scratch_root(self) -> None:
+        for punctuation in ";&|(){}\n":
+            for word in ("\\" + punctuation, ("\\" + punctuation) * 2):
+                with self.subTest(word=word):
+                    self.assert_allowed(f"printf '%s\\n' {word} git clone a b", cwd=self.temp)
+
+        self.assert_refused("printf \\;;git clone a b", str(self.temp / "b"), cwd=self.temp)
+
+    def test_empty_quoted_words_do_not_start_a_new_command(self) -> None:
+        for word in ("''", '""'):
+            with self.subTest(word=word):
+                self.assert_allowed(f"printf {word} git clone a b", cwd=self.temp)
+                self.assert_refused(f"printf {word};git clone a b", str(self.temp / "b"), cwd=self.temp)
+
+    def test_line_continuation_after_a_separator_does_not_hide_a_folder_command(self) -> None:
+        folder = self.temp / "new"
+        for space in ("", " "):
+            for command in (f"mkdir {folder}", f"cp -r source {folder}", f"cargo new {folder}"):
+                with self.subTest(space=space, command=command):
+                    self.assert_refused("printf x;\\\n" + space + command, str(folder), cwd=self.temp)
+
+    def test_line_continuation_inside_a_command_name_joins_the_word(self) -> None:
+        folder = self.temp / "new"
+        self.assert_refused(f"mk\\\ndir {folder}", str(folder), cwd=self.temp)
+        self.assert_refused(f"\\\nmkdir {folder}", str(folder), cwd=self.temp)
+
+    def test_line_continuation_before_a_folder_argument_is_deleted(self) -> None:
+        folder = self.temp / "new"
+        self.assert_refused(f"mkdir \\\n{folder}", str(folder), cwd=self.temp)
+
+    def test_double_quotes_delete_a_line_continuation(self) -> None:
+        folder = self.temp / "new"
+        self.assert_refused(f'"mk\\\ndir" {folder}', str(folder), cwd=self.temp)
+        self.assert_refused(f'mkdir "{self.temp}/ne\\\nw"', str(folder), cwd=self.temp)
+
+    def test_single_quotes_keep_a_line_continuation(self) -> None:
+        folder = self.temp / "literal\\\nname"
+        self.assert_allowed(f"'mk\\\ndir' {self.temp}/new", cwd=self.temp)
+        self.assert_refused(f"mkdir '{folder}'", str(folder), cwd=self.temp)
+        self.assert_refused(f"printf 'literal\\\ntext';\\\nmkdir {self.temp}/new",
+                            str(self.temp / "new"), cwd=self.temp)
+
+    def test_an_escaped_backslash_keeps_the_newline_separator(self) -> None:
+        folder = self.temp / "new"
+        for count in (1, 2, 4):
+            with self.subTest(backslashes=count):
+                self.assert_refused("printf x;" + "\\" * count + "\n mkdir " + str(folder),
+                                    str(folder), cwd=self.temp)
+        self.assert_allowed("printf x;" + "\\" * 3 + "\n mkdir " + str(folder), cwd=self.temp)
+
+    def test_quoted_separator_after_a_line_continuation_remains_data(self) -> None:
+        self.assert_allowed(f"printf x \\\n ';' mkdir {self.temp}/new", cwd=self.temp)
+        self.assert_refused(f"printf x \\\n ';';\\\nmkdir {self.temp}/new", str(self.temp / "new"), cwd=self.temp)
+
     def test_each_judged_command_making_a_loose_folder_is_refused(self) -> None:
         tmp, rust = os.path.realpath("/tmp"), self.home / "rust"
         for command, folder in [
@@ -185,6 +248,56 @@ class ScratchGuardTests(unittest.TestCase):
             f'mkdir "$WORK/{self.name}"',
         ]:
             self.assert_allowed(command)
+
+    def test_repository_creation_under_unit_and_session_roots_is_refused(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        for destination in ("/tmp/claude/unit/private-run/dylib_ab/hana",
+                            str(self.session_root / "scratch-session" / "dylib_ab" / "hana")):
+            for command in (f"git clone ~/rust/hana {destination}",
+                            f"git -C ~/rust/hana worktree add {destination}",
+                            f"cp -r ~/rust/hana {destination}", f"rsync -a ~/rust/hana/ {destination}"):
+                with self.subTest(command=command):
+                    output = self.run_hook(command)
+                    self.assertNotEqual(output, "")
+                    decision = cast(HookResponse, json.loads(output))["hookSpecificOutput"]
+                    self.assertEqual(decision["permissionDecision"], "deny")
+                    self.assertIn("build_folders.py run --owner O --name N -- CMD", decision["permissionDecisionReason"])
+        self.assert_allowed("mkdir -p /tmp/claude/unit/private-run/data")
+        self.assert_allowed("cp ~/rust/hana/file /tmp/claude/unit/private-run/file")
+
+    def test_repository_copy_with_an_equals_target_directory_is_refused(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy-parent"
+        destination.mkdir(parents=True)
+        self.assert_refused(f"cp -a --target-directory={destination} ~/rust/hana", f"{destination}/hana")
+
+    def test_rsync_previews_do_not_create_repository_copies(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        for option in ("--dry-run", "-n", "-an"):
+            with self.subTest(option=option):
+                self.assert_allowed(f"rsync {option} -a ~/rust/hana/ {destination}")
+        self.assert_refused(f"rsync -a ~/rust/hana/ {destination}", str(destination))
+
+    def test_rsync_times_flag_does_not_consume_the_repository_source(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        self.assert_refused(f"rsync -a -t ~/rust/hana/ {destination}", str(destination))
+
+    def test_rsync_option_values_do_not_enable_a_preview(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        for option in ("--exclude -n", "--exclude=-n", "--exclude --dry-run", "--include -n",
+                       "--filter -n", "--exclude-from -n", "-f -n", "-afn", "-e -n", "-aen"):
+            with self.subTest(option=option):
+                self.assert_refused(f"rsync -a {option} ~/rust/hana/ {destination}", str(destination))
+
+    def test_rsync_preview_flags_remain_flags_after_option_values(self) -> None:
+        (self.home / "rust" / "hana" / ".git").mkdir()
+        destination = self.session_root / "scratch-session" / "copy"
+        for option in ("--exclude -n --dry-run", "--exclude=-n -an", "-f -n -n", "-afn --dry-run"):
+            with self.subTest(option=option):
+                self.assert_allowed(f"rsync -a {option} ~/rust/hana/ {destination}")
 
     def test_words_that_are_data_are_never_judged(self) -> None:
         self.assert_allowed(f"cat <<'EOF' > notes.md\nmkdir /tmp/{self.name}\nEOF\necho done")

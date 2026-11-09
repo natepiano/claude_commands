@@ -2,6 +2,10 @@
 """Try the local postmaster outbox before handing delivery to the relay."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
@@ -11,24 +15,24 @@ import sys
 import time as time
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from math import inf
 from pathlib import Path
 from typing import Literal, TypeGuard, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import sessions  # noqa: E402
-from user_zone import user_zone  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 RELAY_ONLY_SENDERS = frozenset({"shutdown"})
 MAX_SAFE_INTEGER = 9007199254740991
 
 PostmasterMiss = Literal["absent", "stale", "self", "unclaimed", "outbox-error", "failed",
-                         "expired", "claimed-no-result", "relay-only-sender"]
+                         "expired", "relay-only-sender"]
+PostmasterStatus = Literal["delivered", "unresolved", "claimed-no-result"] | PostmasterMiss
 ModOutcome = Literal["delivered", "failed", "expired", "withdrawn", "abandoned"]
 
 
@@ -117,7 +121,13 @@ class RelayRequired:
     seconds: float
 
 
-Attempt = Delivered | RelayRequired
+@dataclass(frozen=True)
+class DeliveryUnconfirmed:
+    """The postmaster can have delivered; another transport must not send."""
+    seconds: float
+
+
+Attempt = Delivered | RelayRequired | DeliveryUnconfirmed
 
 
 @dataclass(frozen=True)
@@ -282,20 +292,28 @@ def _collect(root: Path) -> None:
     _prune(root, "delivered", 30 * 60)
 
 
-def _result(root: Path, entry: OutboxEntry, started: float) -> Attempt | ResultPending:
-    read = _read_json(root / "results" / f"{entry['id']}.json")
-    if not isinstance(read, JsonValue) or not is_outbox_result(read.value) or read.value["id"] != entry["id"]:
+def receipt(state: Path, entry_id: str) -> OutboxResult | ResultPending:
+    """Read a validated receipt for one published entry."""
+    read = _read_json(state / "postmaster" / "results" / f"{entry_id}.json")
+    if not isinstance(read, JsonValue) or not is_outbox_result(read.value) or read.value["id"] != entry_id:
         return ResultPending()
+    return read.value
+
+
+def _result(root: Path, entry: OutboxEntry, started: float) -> Attempt | ResultPending:
+    read = receipt(root.parent, entry["id"])
+    if isinstance(read, ResultPending):
+        return read
     seconds = time.monotonic() - started
-    match read.value["outcome"]:
+    match read["outcome"]:
         case "delivered":
-            return Delivered(seconds, read.value["sha256"] == entry["sha256"])
+            return Delivered(seconds, read["sha256"] == entry["sha256"])
         case "failed" | "expired" as reason:
             return RelayRequired(reason, seconds)
         case "withdrawn":
             return RelayRequired("unclaimed", seconds)
         case "abandoned":
-            return RelayRequired("claimed-no-result", seconds)
+            return DeliveryUnconfirmed(seconds)
 
 
 def _poll(root: Path, entry: OutboxEntry, started: float, deadline: float, interval: float) -> Attempt | ResultPending:
@@ -322,8 +340,31 @@ def _withdraw(root: Path, entry_id: str) -> bool:
     return True
 
 
+def unpublished(state: Path, entry_id: str) -> bool:
+    """Prove that no published entry, claim, or receipt remains."""
+    root = state / "postmaster"
+    return all(isinstance(_read_json(root / folder / f"{entry_id}.json"), MissingJson)
+               for folder in ("outbox", "claimed", "results"))
+
+
+def publish_entry(source: Path, target: Path) -> bool:
+    """Return false only when the entry replacement fails."""
+    try:
+        os.replace(source, target)
+        return True
+    except OSError:
+        return False
+
+
+def no_key_resolution(result: Delivered | RelayRequired) -> None:
+    """Unkeyed callers have no reservation stage to persist."""
+    del result
+
+
 def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id: str,
-            text: str, live: list[sessions.SessionRecord]) -> Attempt:
+            text: str, live: list[sessions.SessionRecord], *, deadline: float = inf,
+            publish: Callable[[Path, Path], bool] = publish_entry,
+            resolve: Callable[[Delivered | RelayRequired], None] = no_key_resolution) -> Attempt:
     started = time.monotonic()
     if sender in RELAY_ONLY_SENDERS:
         return RelayRequired("relay-only-sender", time.monotonic() - started)
@@ -336,34 +377,50 @@ def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id:
     wait = wait_seconds()
     grace = claim_grace_seconds()
     interval = poll_seconds()
-    deadline = time.monotonic() + wait
+    wait_deadline = min(time.monotonic() + wait, deadline)
     entry = wire_entry(entry_id, session, sender, reply_destination(sender, live), text,
                        int(time.time() * 1000) + int(wait * 1000))
     temporary = root / "outbox" / f".{entry_id}.json.tmp"
+    result: Attempt | ResultPending = ResultPending()
+    _collect(root)
+    publication_started = False
     try:
         try:
             temporary.parent.mkdir(parents=True, exist_ok=True)
             _ = temporary.write_text(json.dumps(entry), encoding="utf-8")
-            os.replace(temporary, root / "outbox" / f"{entry_id}.json")
         except OSError:
-            return RelayRequired("outbox-error", time.monotonic() - started)
-        result = _poll(root, entry, started, deadline, interval)
+            result = RelayRequired("outbox-error", time.monotonic() - started)
+            return result
+        publication_started = True
+        if not publish(temporary, root / "outbox" / f"{entry_id}.json"):
+            result = (RelayRequired("outbox-error", time.monotonic() - started) if unpublished(state, entry_id)
+                      else DeliveryUnconfirmed(time.monotonic() - started))
+            return result
+        result = _poll(root, entry, started, wait_deadline, interval)
         if not isinstance(result, ResultPending):
             return result
-        if not _withdraw(root, entry_id):
-            return RelayRequired("claimed-no-result", time.monotonic() - started)
-        try:
-            claimed = (root / "claimed" / f"{entry_id}.json").exists()
-        except OSError:
-            claimed = True
+        if time.monotonic() >= deadline:
+            result = DeliveryUnconfirmed(time.monotonic() - started)
+            return result
+        claimed = not _withdraw(root, entry_id)
         if not claimed:
-            return RelayRequired("unclaimed", time.monotonic() - started)
-        result = _poll(root, entry, started, time.monotonic() + grace, interval)
-        return (RelayRequired("claimed-no-result", time.monotonic() - started)
-                if isinstance(result, ResultPending) else result)
+            try:
+                claimed = (root / "claimed" / f"{entry_id}.json").exists()
+            except OSError:
+                claimed = True
+        if not claimed:
+            result = RelayRequired("unclaimed", time.monotonic() - started)
+            return result
+        result = _poll(root, entry, started, min(time.monotonic() + grace, deadline), interval)
+        if isinstance(result, ResultPending):
+            result = DeliveryUnconfirmed(time.monotonic() - started)
+        return result
     finally:
-        _cleanup(root, entry_id)
-        _collect(root)
+        if isinstance(result, (Delivered, RelayRequired)):
+            resolve(result)
+            _cleanup(root, entry_id)
+        elif not publication_started:
+            _cleanup(root, entry_id)
 
 
 def _today_counts(state: Path) -> tuple[Counter[str], Counter[str]]:

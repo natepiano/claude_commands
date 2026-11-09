@@ -8,6 +8,8 @@ import math
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,10 +17,12 @@ import textwrap
 from typing import ClassVar, cast, override
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.test_times.gate_record import ModuleTimes
+from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
 RUNNER = Path(__file__).with_name("module_run.py").resolve()
 
@@ -106,6 +110,128 @@ class DiscoveryBoundaries(unittest.TestCase):
 '''
 
 
+ORPHAN_PROCESS = '''\
+import os
+import select
+import signal
+import sys
+import unittest
+
+class OrphanProcess(unittest.TestCase):
+    def test_orphan(self):
+        reader, writer = os.pipe()
+        intermediate = os.fork()
+        if intermediate == 0:
+            os.close(reader)
+            if os.fork() != 0:
+                os._exit(0)
+            os.setsid()
+            os.write(writer, str(os.getpid()).encode())
+            os.close(writer)
+            for descriptor in (0, 1, 2):
+                os.close(descriptor)
+            while True:
+                signal.pause()
+        os.close(writer)
+        pid = int(os.read(reader, 32))
+        os.close(reader)
+        os.waitpid(intermediate, 0)
+        descriptor = os.pidfd_open(pid)
+        try:
+            print(pid, flush=True)
+            sys.stdin.buffer.read(1)
+            if __REAP__:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                reaped = select.poll()
+                reaped.register(descriptor, select.POLLHUP)
+                self.assertTrue(reaped.poll(__HANG_GUARD_MS__), "The orphan remains unreaped")
+            if __FAIL__:
+                self.fail("fixture failure after orphan launch")
+        finally:
+            os.close(descriptor)
+'''
+
+
+SENDER_REQUEST = '''\
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import unittest
+from unittest import mock
+
+from scripts.message import session_send
+from scripts.message import session_send_test_support
+
+def setUpModule():
+    session_send_test_support.forbid_real_sender()
+    sys.addaudithook(last_guard)
+
+real_sender = Path(session_send.__file__).resolve().with_name("send.py")
+python = str(real_sender.parents[1] / "lib/py")
+
+# This safety hook permits only harmless probes and blocks network delivery.
+def last_guard(event, arguments):
+    if event in ("socket.connect", "socket.sendto", "socket.bind"):
+        raise RuntimeError("the sender probe attempted network access")
+    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec"):
+        command = arguments[1]
+    elif event == "os.spawn":
+        command = arguments[2]
+    elif event == "os.system":
+        command = arguments[0]
+    else:
+        return
+    if str(Path(__file__).with_name("fake_sender.py")) not in str(command) and "--help" not in str(command):
+        raise RuntimeError("the sender probe attempted a live command")
+
+
+MODE = __MODE__
+
+class SenderRequest(unittest.TestCase):
+    def test_sender(self):
+        if MODE == "fake":
+            fake = Path(__file__).with_name("fake_sender.py")
+            fake.write_text("print('fake sender ran')\\n")
+            with mock.patch.object(session_send, "SEND_SCRIPT", fake):
+                result = subprocess.run(session_send.session_send_argv("fixture"),
+                                        capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, "fake sender ran\\n")
+        elif MODE == "cleared_environment":
+            child_environment = os.environ.copy()
+            marker = session_send_test_support.refusal_marker
+            # This isolated process keeps its environment empty through runner completion.
+            mock.patch.dict(os.environ, {}, clear=True).start()
+            session_send_test_support.forbid_real_sender()
+            self.assertIs(session_send_test_support.refusal_marker, marker)
+            result = subprocess.run([python, str(real_sender), "--help"],
+                                    env=child_environment, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(os.environ, {})
+            self.assertIsInstance(marker, session_send_test_support.SenderRefusalMarker)
+            self.assertEqual(marker.path.read_text(), "real sender refused\\n")
+        elif MODE == "caught":
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run([python, str(real_sender), "--help"], check=True)
+        else:
+            if MODE == "cd":
+                command = f"cd {shlex.quote(str(real_sender.parent))} && {shlex.quote(python)} send.py --help"
+                directory = None
+            elif MODE == "module":
+                command = [python, "-m", "scripts.message.send", "--help"]
+                directory = real_sender.parents[2]
+            else:
+                command = [python, str(real_sender), "--help"]
+                directory = None
+            result = subprocess.run(command, cwd=directory, shell=MODE == "cd", capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+if MODE == "expected_failure":
+    SenderRequest.test_sender = unittest.expectedFailure(SenderRequest.test_sender)
+'''
+
+
 @dataclass(frozen=True)
 class FixtureRun:
     timed: subprocess.CompletedProcess[str]
@@ -135,14 +261,15 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS"):
         _ = env.pop(key, None)
     env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
-                "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1"})
-    args = ["discover", "-s", str(folder), "-p", "test_fixture.py"]
+                "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": os.pathsep.join((str(root), str(folder)))})
+    args = [f"{name}.test_fixture"]
     standard = subprocess.run(
-        [sys.executable, "-m", "unittest", *args], cwd=root, env=env,
+        [str(RUNNER.parents[1] / "lib/py"), "-m", "unittest", *args], cwd=root, env=env,
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
     timed = subprocess.run(
-        [sys.executable, str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
+        [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
         env={**env, "TEST_TIMES_OUT": str(output), "CHECK_REMOVED": "1"},
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
@@ -171,11 +298,77 @@ class ModuleRunnerTests(unittest.TestCase):
         env = {**os.environ, "TEST_TIMES_OUT": str(cls.discovery_output),
                "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
                "BUILDLOG_DIR": str(root / "buildlog"), "PYTHONDONTWRITEBYTECODE": "1"}
-        _ = env.pop("PYTHONPATH", None)
+        env["PYTHONPATH"] = os.pathsep.join((str(root), str(folder)))
         cls.discovery_result = subprocess.run(
-            [sys.executable, str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
+            [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def sender_fixture(self, mode: str) -> FixtureRun:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config"
+            config.mkdir()
+            _ = (config / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
+            source = SENDER_REQUEST
+            return run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+
+    def test_real_sender_request_fails_the_module_with_one_diagnostic(self) -> None:
+        fixture = self.sender_fixture("uncaught")
+
+        self.assertNotEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+        self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+        self.assertNotIn("the tested guard allowed the real sender", fixture.timed.stderr)
+        self.assertEqual(fixture.times["tests_run"], 1)
+        self.assertEqual(fixture.times["failures"], 1)
+
+    def test_sender_from_its_folder_or_as_a_module_fails_with_one_diagnostic(self) -> None:
+        for mode in ("cd", "module"):
+            with self.subTest(mode=mode):
+                fixture = self.sender_fixture(mode)
+                self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+                self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+                self.assertIn("REFUSED: real scripts/message/send.py is forbidden in tests", fixture.timed.stderr)
+                self.assertNotIn("the sender probe attempted", fixture.timed.stderr)
+
+    def test_caught_sender_refusal_still_fails_the_module(self) -> None:
+        for mode in ("caught", "expected_failure"):
+            with self.subTest(mode=mode):
+                fixture = self.sender_fixture(mode)
+
+                self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+                self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+                self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+                self.assertNotIn("the tested guard allowed the real sender", fixture.timed.stderr)
+                self.assertEqual(fixture.times["tests_run"], 1)
+                self.assertEqual(fixture.times["failures"], 0)
+                self.assertEqual(fixture.times["errors"], 0)
+                expected_status = "expected_failure" if mode == "expected_failure" else "pass"
+                self.assertEqual(fixture.times["tests"][0]["status"], expected_status)
+
+    def test_cleared_environment_keeps_the_refusal_marker_and_fails_the_module(self) -> None:
+        fixture = self.sender_fixture("cleared_environment")
+
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.times["tests_run"], 1)
+        self.assertEqual(fixture.times["tests"][0]["status"], "pass")
+        self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        diagnostic = "test_fixture.py: started the real scripts/message/send.py"
+        self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
+        self.assertNotIn("the sender probe attempted", fixture.timed.stderr)
+
+    def test_fake_sender_module_passes_without_a_refusal_diagnostic(self) -> None:
+        fixture = self.sender_fixture("fake")
+
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertNotIn("started the real scripts/message/send.py", fixture.timed.stderr)
+        self.assertEqual(fixture.times["tests_run"], 1)
+        self.assertEqual(fixture.times["tests"][0]["status"], "pass")
 
     def test_normal_test_case_attribute_keeps_the_failure_entry(self) -> None:
         self.assertEqual(self.discovery_result.returncode, 1, self.discovery_result.stderr)
@@ -193,6 +386,74 @@ class ModuleRunnerTests(unittest.TestCase):
         self.assertEqual(imported[0]["status"], "pass")
         self.assertEqual(times["tests_run"], 2)
         self.assertEqual(times["failures"], 1)
+
+    def test_none_fixtures_keep_the_standard_runner_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = run_fixture(Path(directory), "none_fixtures", """import unittest
+setUpModule = None
+tearDownModule = None
+class Fixtures(unittest.TestCase):
+    setUpClass = None
+    tearDownClass = None
+    def test_runs(self):
+        pass
+""")
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
+        self.assertEqual(fixture.times["tests_run"], 1)
+
+    def test_a_class_without_an_imported_module_keeps_the_standard_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = run_fixture(Path(directory), "absent_module", """import unittest
+class Fixtures(unittest.TestCase):
+    __module__ = "absent_module"
+    def test_runs(self):
+        pass
+""")
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
+        self.assertEqual(fixture.times["tests_run"], 1)
+
+    def test_successful_class_fixture_has_its_own_cpu_measure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = """import time
+import unittest
+
+module_value = 0
+
+def setUpModule():
+    global module_value
+    module_value = 7
+
+class FixtureCPU(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        deadline = time.process_time() + 0.15
+        while time.process_time() < deadline:
+            pass
+        cls.value = module_value
+
+    def test_value(self):
+        self.assertEqual(self.value, 7)
+"""
+            fixture = run_fixture(root, "fixture_cpu", source)
+            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+            self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+            report = cast(dict[str, object], cast(object, fixture.times))
+            fixtures = cast(list[FixtureMeasure], report["fixtures"])
+            setup = next(row for row in fixtures if row["test"] == "setUpClass (test_fixture.FixtureCPU)")
+            test = cast(TestMeasure, fixture.times["tests"][0])
+            self.assertEqual(setup["kind"], "fixture")
+            self.assertEqual(test["kind"], "test")
+            self.assertGreater(setup["cpu_s"], 0.1)
+            self.assertGreater(setup["cpu_s"], test["cpu_s"])
+            self.assertGreater(setup["s"], 0)
+            self.assertEqual(fixture.times["tests_run"], 1)
+            self.assertEqual(fixture.times["tests_s"], test["s"])
+            self.assertTrue(any(row["test"] == "setUpModule (test_fixture)" for row in fixtures))
 
     def test_missing_arguments_print_one_usage_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -215,6 +476,31 @@ class ModuleRunnerTests(unittest.TestCase):
                 self.assertEqual(fixture.timed.stdout, fixture.standard.stdout)
                 self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
         self.assertIn("DeprecationWarning: fixture warning", self.outcomes.timed.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "scripts" / "fixture"
+            folder.mkdir(parents=True)
+            _ = (folder / "sibling.py").write_text("VALUE = 42\n", encoding="utf-8")
+            _ = (folder / "test_package_name.py").write_text(
+                "import sys, unittest\n"
+                + "from scripts.fixture import sibling\n"
+                + "class PackageImport(unittest.TestCase):\n"
+                + "    def test_package_name(self):\n"
+                + "        self.assertEqual(__name__, 'scripts.fixture.test_package_name')\n"
+                + "        self.assertNotIn('test_package_name', sys.modules)\n"
+                + "        self.assertEqual(sibling.VALUE, 42)\n", encoding="utf-8")
+            output = root / "times.json"
+            environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(folder), str(root))),
+                           "TEST_TIMES_OUT": str(output)}
+            for working_directory in (root, folder, Path("/home")):
+                with self.subTest(case="package name", cwd=working_directory):
+                    result = subprocess.run(
+                        [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_package_name.py"],
+                        cwd=working_directory, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual([row["test"] for row in read_times(output)["tests"]],
+                                     ["PackageImport.test_package_name"])
 
     def test_each_parent_has_one_outcome_with_error_precedence(self) -> None:
         rows = self.outcomes.times["tests"]
@@ -266,9 +552,9 @@ class ModuleRunnerTests(unittest.TestCase):
             output.mkdir()
             env = {**os.environ, "TEST_TIMES_OUT": str(output), "HOME": str(root / "home"),
                    "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")}
-            _ = env.pop("PYTHONPATH", None)
+            env["PYTHONPATH"] = str(root)
             result = subprocess.run(
-                [sys.executable, str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
+                [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -276,3 +562,77 @@ class ModuleRunnerTests(unittest.TestCase):
             self.assertEqual(len(warnings), 1, result.stderr)
             self.assertTrue(output.is_dir())
             self.assertEqual(list(root.glob(".output.*")), [])
+
+
+@unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
+class ModuleProcessCleanupTests(unittest.TestCase):
+    def test_ignored_sigchld_keeps_the_test_process_status_and_inheritance(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "test_signal.py").write_text(
+            """import signal, unittest
+class InheritedSignal(unittest.TestCase):
+    def test_sigchld(self):
+        self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN)
+""",
+            encoding="utf-8")
+        environment = {**os.environ, "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
+                       "BUILDLOG_DIR": str(root / "buildlog")}
+        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
+            _ = environment.pop(name, None)
+        environment["PYTHONPATH"] = str(root)
+        launcher = ("import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
+                    "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])")
+        for arguments, status in (([], 2), ([str(root), "test_signal.py"], 0)):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, "-c", launcher, str(RUNNER), *arguments],
+                    cwd=root, env=environment, capture_output=True, text=True, check=False,
+                    timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def run_orphan(self, *, fail: bool = False, terminate: bool = False, reap: bool = False) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        source = (ORPHAN_PROCESS.replace("__REAP__", repr(reap)).replace("__FAIL__", repr(fail))
+                  .replace("__HANG_GUARD_MS__", str(TEST_HANG_GUARD_SECS * 1000)))
+        _ = (root / "test_orphan.py").write_text(source, encoding="utf-8")
+        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
+            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
+            "PYTHONDONTWRITEBYTECODE": "1"})
+        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
+            _ = environment.pop(name, None)
+        environment["PYTHONPATH"] = str(root)
+        process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
+            cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True)
+        processes.track(process)
+        output = process.stdout
+        self.assertIsNotNone(output)
+        if output is None:
+            raise AssertionError("The runner has no output pipe")
+        self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0], "The orphan did not start")
+        line = cast(str, output.readline())
+        self.assertTrue(line.strip().isdigit(), line)
+        descriptor = os.pidfd_open(int(line))
+        self.addCleanup(os.close, descriptor)
+        if terminate:
+            send_process_group(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
+        expected = -signal.SIGTERM if terminate else 1 if fail else 0
+        self.assertEqual(process.returncode, expected, stdout + stderr)
+        # POLLHUP means the process was reaped, rather than left as a zombie.
+        observer = select.poll()
+        observer.register(descriptor, select.POLLHUP)
+        self.assertTrue(observer.poll(0), "The orphan remains alive or unreaped")
+
+    def test_normal_end_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan()
+
+    def test_failed_test_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan(fail=True)
+
+    def test_sigterm_to_the_runner_group_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan(terminate=True)
+
+    def test_a_running_test_sees_its_killed_orphan_reaped(self) -> None:
+        self.run_orphan(reap=True)

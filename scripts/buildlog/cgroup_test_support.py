@@ -1,15 +1,23 @@
-"""Shared raw cgroup files for scope and slice measurement regressions."""
+"""Shared cgroup and zram files for memory measurement tests."""
 
 from pathlib import Path
 import subprocess
 
 GIB = 2**30
 CPU = {"state": "measured", "usage_usec": 120000000, "user_usec": 90000000, "system_usec": 30000000}
+ZRAM_READING = {"state": "present", "data_bytes": 3 * GIB, "compressed_bytes": GIB}
 IO_LINES = (
     "254:0 rbytes=1048576 wbytes=2097152 rios=3 wios=4",
     "259:0 rbytes=1048576 wbytes=2097152 rios=3 wios=4",
     "253:0 rbytes=4096 wbytes=8192 rios=1 wios=2",
 )
+
+
+def write_zram(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    written = (path / "mm_stat").write_text(f"{3 * GIB} {GIB} 0 0 0\n")
+    if written <= 0:
+        raise AssertionError("The zram fixture is empty.")
 
 
 def write_cgroup(path: Path, *, with_io: bool = True) -> None:

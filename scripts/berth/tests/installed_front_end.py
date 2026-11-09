@@ -9,7 +9,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -35,7 +34,6 @@ INSTALLED_FRONT_END_ARTIFACTS = (
     SESSION_START_HOOK,
 )
 
-sys.path.insert(0, str(SCRIPTS_ROOT))
 
 
 def installed_front_end_artifact_digests() -> dict[str, str]:
@@ -86,11 +84,9 @@ class InstalledFrontEndFixture(unittest.TestCase):
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        scratch_root = Path("/tmp/claude")
-        scratch_root.mkdir(parents=True, exist_ok=True)
         self.temporary_directory: tempfile.TemporaryDirectory[str] = (
             tempfile.TemporaryDirectory(
-                prefix="cargo-berth-hook-rendering.", dir=scratch_root
+                prefix="cargo-berth-hook-rendering."
             )
         )
         self.fixture_root: Path = Path(self.temporary_directory.name)
@@ -297,11 +293,9 @@ exec \"$CARGO_BERTH_TEST_BINARY\" \"$command_name\" \"$@\"
     def new_scratch_post_tool_use_repository(
         self, initial_commit_count: int
     ) -> ScratchPostToolUseRepository:
-        """Construct an initialized repository below `/tmp/claude`."""
-
-        Path("/tmp/claude").mkdir(parents=True, exist_ok=True)
+        """Construct an initialized repository in a private temporary directory."""
         temporary_directory = tempfile.TemporaryDirectory(
-            prefix="cargo-berth-post-tool-use.", dir="/tmp/claude"
+            prefix="cargo-berth-post-tool-use."
         )
         fixture_root = Path(temporary_directory.name)
         repository_root = fixture_root / "repository"
@@ -325,7 +319,7 @@ exec \"$CARGO_BERTH_TEST_BINARY\" \"$command_name\" \"$@\"
         )
         _ = self.engine_command(repository_root, ["init", "--json"])
         _ = self.git_command(
-            repository_root, ["add", ".claude/config/berth.toml"]
+            repository_root, ["add", "--force", ".claude/config/berth.toml"]
         )
         _ = self.git_command(
             repository_root,

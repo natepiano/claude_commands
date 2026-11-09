@@ -4,20 +4,18 @@ from __future__ import annotations
 
 import re
 import sys
-from pathlib import Path
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import canonical_label
 
 SessionRole = Literal["showrunner", "unit", "worker", "freestanding"]
 ROLE_ORDER: tuple[SessionRole, ...] = ("showrunner", "unit", "worker", "freestanding")
 HEADING = "## Live sessions"
-SECTION = re.compile(r"^## Live sessions[ \t]*(?:\n|$)", re.MULTILINE)
+SECTION = re.compile(r"^## (?:Live sessions|Session history)[ \t]*(?:\n|$)", re.MULTILINE)
 NEXT_HEADING = re.compile(r"^#{1,2} ", re.MULTILINE)
 
 
@@ -120,25 +118,17 @@ def live_sessions(environment: Mapping[str, str]) -> ReadSessions | SessionsUnre
             local = roster.roster(environment, roster.ThisMachine())
             peer = peer_future.result()
     except Exception as error:
-        return SessionsUnread(str(error) or type(error).__name__)
-    kept: set[str] = set()
+        print(f"sessions: anomaly: {error}", file=sys.stderr)
+        return ReadSessions({}, frozenset())
     machines_read = {roster.machine_name(), *(entry.machine for entry in local.entries)}
     entries = list(local.entries)
     if isinstance(peer, roster.PeerNotReached):
-        kept.add(peer.host)
-        # SSH aliases (such as "mac") need not equal the hostname in saved rows.
-        from scripts.whoami.note_file import read_notes
-
-        kept.update(row.machine for note in read_notes() for row in section_rows(note.text)
-                    if row.machine not in machines_read)
+        print(f"sessions: anomaly: {peer.host}: {peer.reason}", file=sys.stderr)
     else:
-        unavailable = {entry.machine for entry in peer.entries
-                       if isinstance(entry.account, roster.AccountAttributionUnavailable)}
-        kept.update(unavailable)
-        machines_read.update(entry.machine for entry in peer.entries if entry.machine not in unavailable)
+        machines_read.update(entry.machine for entry in peer.entries)
         if not peer.entries:
             machines_read.add(roster.remote.other_machine())
-        entries += [entry for entry in peer.entries if entry.machine not in unavailable]
+        entries += peer.entries
     rows: dict[str, list[SessionRow]] = {}
     roles: dict[str, SessionRole] = {"showrunner": "showrunner", "unit director": "unit",
                                     "worker": "worker", "freestanding": "freestanding"}
@@ -152,7 +142,7 @@ def live_sessions(environment: Mapping[str, str]) -> ReadSessions | SessionsUnre
                       else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "—")
         rows.setdefault(canonical_label(entry.account.label), []).append(
             SessionRow(entry.name, roles[entry.role], entry.machine, _short_folder(entry.cwd), session_id))
-    return ReadSessions({label: tuple(items) for label, items in rows.items()}, frozenset(kept),
+    return ReadSessions({label: tuple(items) for label, items in rows.items()}, frozenset(),
                         unattributed, frozenset(machines_read))
 
 

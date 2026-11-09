@@ -10,17 +10,18 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
+from zoneinfo import TZPATH
 
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
-EXAMPLE_FIRST_LINE = "unassigned | /tmp/claude_commands"
+EXAMPLE_FIRST_LINE = "/tmp/claude_commands"
 ACCOUNT_FIRST_LINE = EXAMPLE_FIRST_LINE
 # The account leads the second line, then the model and tokens, then the quota windows.
 MODEL_TOKENS = "Opus 5.5 high | 182,340"
@@ -149,14 +150,10 @@ class AccountTests(unittest.TestCase):
     def test_own_claude_account_raises_when_login_is_unreadable(self) -> None:
         config_dir = self.root / "empty-config"
         config_dir.mkdir()
-        with (
-            patch.object(account, "claude_config_dir", return_value=config_dir),
-            self.assertRaisesRegex(
-                account.UnreadableAccount,
-                "this process's Claude account is unreadable",
-            ),
-        ):
-            _ = account.own_claude_account()
+        with (patch.object(account, "claude_config_dir", return_value=config_dir),
+              redirect_stderr(io.StringIO()) as output):
+            self.assertEqual(account.own_claude_account(), account.Account("claude", "", ""))
+        self.assertEqual(output.getvalue(), "account: anomaly: this process's Claude account is unreadable\n")
 
     def test_named_account_start_points_memory_at_the_default_directory(self) -> None:
         home = self.root / "home with 'quotes'"
@@ -589,7 +586,8 @@ class AccountTests(unittest.TestCase):
             arguments,
             capture_output=True,
             check=True,
-            env={"PATH": os.environ["PATH"]},
+            env={"PATH": os.environ["PATH"], "TZ": "America/New_York",
+                 "TZDIR": next(str(path) for folder in TZPATH if (path := Path(folder)).joinpath("America/New_York").is_file())},
             input=json.dumps(document),
             text=True,
         )
@@ -729,6 +727,7 @@ class AccountTests(unittest.TestCase):
             self.render_status_line(self.status_line_input(), ""),
             EXAMPLE_FIRST_LINE + f"\n{MODEL_TOKENS}\n",
         )
+
 
 
 if __name__ == "__main__":

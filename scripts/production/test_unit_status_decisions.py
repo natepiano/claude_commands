@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
-from dailies_input import StillWaiting
+from scripts.production.dailies_input import StillWaiting
 
 
 class UnitStatusTests(UnitStatusFixture):
@@ -12,7 +12,7 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertIn("=== DECISION for you from hook ===", outputs[0])
         self.assertIn("— gate: approve the blue path", outputs[0])
         self.assertIn("=== end hook ===", outputs[0])
-        self.assertEqual(seen, "hook|— gate: approve the blue path\n")
+        self.assertEqual(seen, f"{self.unit_ids['hook']}|— gate: approve the blue path\n")
 
     def test_repeated_gate_prints_still_waiting(self) -> None:
         gate = "● Choose the release path\n\n— gate: approve the blue path\n"

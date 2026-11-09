@@ -6,7 +6,6 @@
 
 > **As-built disposition: amend** — `docs/as-built/unit-board.md` (the queue pane); `docs/as-built/build-memory-admission.md` (snapshot, `queue_read`, `LineWaiter` checks, `match_waiters`; later the service); `docs/as-built/build-targets.md` (the `/build:queue` row)
 
-> **Production: builds** — unit `queue-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
@@ -36,17 +35,18 @@ only I can bump
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — the build queue: memory admission, the `/build:queue` and build-why views, and the unit-board queue pane.
+- **Project:** `~/.claude` — the build queue: memory admission, the `/build:queue` view and evidence cards, and the unit-board queue pane.
 - **Project started:** 2026-10-30T11:26:00-04:00
 - **Stack:** Python 3.13 (basedpyright strict, unittest); TypeScript mod under `mods/unit-board/` (its own tests in `mods/unit-board/tests/`).
-- **Layout:** `scripts/build_queue/` (`build_queue.py`, `build_why.py`, `head_facts.py` from report-unit 4e); `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`; `scripts/message/roster.py`; `mods/unit-board/hooks/` and `mods/unit-board/tests/`; `commands/build/queue.md`.
-- **Key files:** `scripts/lint/memory_admit.py` — admission decisions, the queue rows and `explain_queue`; `scripts/build_queue/build_queue.py` — the queue view and the bump CLI; `scripts/build_queue/build_why.py` — why the head waits; `scripts/build_queue/head_facts.py` — bump rows, head time, token waits; `mods/unit-board/hooks/register.tsx` — `tablePane()` and the `build:queue` command; `mods/unit-board/hooks/queue.tsx` — the pane view; `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py` — the queue service, its socket protocol and its client (new in Phase 5).
+- **Layout:** `scripts/build_queue/` (`build_queue.py`, `queue_evidence.py`, `head_facts.py` from report-unit 4e); `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`; `scripts/message/roster.py`; `mods/unit-board/hooks/` and `mods/unit-board/tests/`; `commands/build/queue.md`.
+- **Key files:** `scripts/lint/memory_admit.py` — admission decisions, the queue rows and `explain_queue`; `scripts/build_queue/build_queue.py` — the queue view and the bump CLI; `scripts/build_queue/queue_evidence.py` — recorded need, charge, and release text; `scripts/build_queue/head_facts.py` — bump rows, head time, token waits; `mods/unit-board/hooks/register.tsx` — `tablePane()` and the `build:queue` command; `mods/unit-board/hooks/queue.tsx` — the pane view; `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py` — the queue service, its socket protocol and its client (new in Phase 5).
 - **Test lanes:** `scripts/build_queue/test_*.py`, `scripts/lint/test_memory_admit.py`, `mods/unit-board/tests/queue.test.ts`.
 - **Test:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest <module>` from the worktree root; the mod's test command as `docs/as-built/unit-board.md` names it.
 - **Lint:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <the slot's own Python files>`; footer must read `0 errors, 0 warnings, 0 notes`.
 - **Ownership (showrunner, 2026-10-30):** queue-unit owns `scripts/build_queue/` and `commands/build/queue.md` (from report-unit), and `scripts/lint/memory_admit.py` with `scripts/lint/test_memory_admit.py` (from resources-unit), and `scripts/lint/memory_gate.sh` (from resources-unit, with Phase 7; builds showrunner, 2026-10-31). queue-unit also owns resources Phases 15 and 27, now Phases 8 and 9 of this plan: one owner for admission changes in `memory_admit.py` (builds showrunner, 2026-10-31). resources-unit keeps its other in-flight `memory_admit.py` phases until they land (admit-head, queue order, `/showrunner:bump` priority, strict-window cap, 24B); until then each `memory_admit.py` edit is coordinated with resources-unit through berth, and resources-unit reviews the diff. `scripts/message/roster.py` is shutdown-unit's (natedev): moving `unit_labels_for` and its file-only helpers to the new `scripts/message/unit_labels.py` is approved (showrunner, 2026-10-30), and the notice carries an also-touches line. `mods/unit-board/` is natedev unit-board-unit's; the build queue parts of `register.tsx` change under an also-touches line.
 - **Resources Phase 26 is built (58391add, on `origin/builds` at e2773be6, in this branch at d309bbed):** the queue order comes from `priority_rank` and the user's bump sets a priority in `memory_admit.py`; `bump_order`, `holds_younger` and `bump_waiter` are gone, and `priority_since` stays. Phase 4 carries its fields (Phase 4d). Phase 10 carries Phase 26's state into the queue service (Phase 10's Decided block, 2026-10-31).
 - **Cut over, no shadow (user, 2026-10-31):** "we should cutover and not try to run the old and the new at the same time." Phase 5 builds the queue service's new files, and no build uses them. Phase 10 makes the service live in one merge; nothing runs the service beside the old checker.
+- **Stored records (user, 2026-11-05):** main code keeps no reader of an old record shape. A phase that changes a stored record writes a conversion program outside the repository, proves it with a dry run, and names the deploy steps in its notice: stop the service, convert, land, start the service. The program is deleted after the deploy. Only the user can stop and start the service (root).
 - **Invariants:** admission rules live once, in `memory_admit.py`; a view prints admission's answer and repeats no budget or free arithmetic. The user's bump is a queue priority (resources Phase 26): only a showrunner sets or clears the one `QueuePriority` (`priority_set`, `priority_clear`), and the queue order is `waiter_order` = `(priority_rank, since, pid)`; nothing else moves a waiting step. Every answer about the queue comes in under 1 s.
 
 ## Queue service design — the user reviews it before any code
@@ -58,6 +58,720 @@ only I can bump
 - **After approval:** the design's migration phases become Phases 4+ of this plan through `/plan:to_phased_plan`, each with a Work Order, and go to the showrunner for approval before they run.
 
 ## Phases
+
+### Phase 10r — The CI card shows the running job, not runner uptime  · status: done
+**Depends on:** none (queue card and view only).
+
+1. **Ask (builds showrunner, 2026-11-04, a defect the user saw).** The `/build:queue` card for `hana-ci.slice` says "Started 41 h 27 min ago". That is the uptime of the runner services (`github-runner-hana-linux-1` and `-2`), not a CI job, so it reads as a stuck job. This is a wrong result, so it goes first.
+2. **Change.** Show whether a CI job runs now and that job's age. With no job, show "idle, runners up 41 h".
+3. **Swap is not RAM (builds ruling, 2026-11-04).** Measured 10:12 EST: the queue showed `hana-ci.slice` at 2.1 GiB with no CI job, while `memory.current` was 0.09 GiB and `memory.swap.current` was 1.98 GiB. The admission charge and the queue view use resident memory (`memory.current`) only, for every slice, never `memory.swap.current`. A card that shows swap shows it as its own labelled number, never in Using or in the charge.
+   - **Service rows (user, 2026-11-04).** A service slice (hana CI, compiler cache) always has its own row with its RAM use, at any size. An idle service shows "idle" and no age. A running CI job shows the age of the job, never the uptime of the runners.
+4. **Proof.** A fixture with a running job shows the job age. A fixture with only the runner services shows the idle line. A fixture slice with swap shows a charge equal to `memory.current`, and the swap only on its own label. A 0.1 GiB idle service fixture keeps its own row, with no age.
+
+### Phase 10t — The build budget follows measured use  · status: superseded by 10z (not landed)
+
+**Depends on:** 10r (both change `scripts/lint/memory_admit.py`; 10t's code starts when 10r is checkpointed; its design runs beside 10r).
+
+1. **The ask (user, 2026-11-04, via report-unit and builds).** "The memory budget should be dynamic. Measure promised vs used and free memory over the last 2 hours; raise the budget when there is no memory pressure, and lower it back to a floor when pressure rises." Reason: steps with different reservations start and use memory at different times, so the sum of reservations overstates real use.
+2. **Evidence.** The d3ce51b2e bump gate waited 6 min 32 s for memory while 22-31 GiB was free. The queue showed 10.5-16.5 GiB promised against 4.2-8.1 GiB measured across 29-46 running steps. gate_runs: 10 runs peaked at 4.1-4.7 GiB against a 6 GiB reservation. The live page showed merge gates using 0.1-1.7 GiB with 4.3-5.9 GiB reserved each, room 0 and 3-4 steps waiting.
+3. **The change.** The budget is a value the queue computes, not a fixed number. Today's `build_budget_gib` becomes the floor. Over a rolling window, the queue reads promised, used and free memory and the pressure signal. With no pressure in the window, it raises the budget one step at a time, up to a ceiling. When pressure rises, it drops the budget back to the floor at once. The free memory check and the safety floor stay as they are.
+4. **Config.** Every tunable lives in `config/build_admission.conf`, read at use: the window, the floor, the ceiling, the raise step and interval, the lower rule and the pressure signal. Each new key goes to builds with its value, what it did before, and the other choices, for the user.
+5. **Shown.** The queue view, the card and the memory page show the current budget, the floor, and why it moved last.
+6. **Proof.** A replay of the last 2 days of queue history: the wait time saved, and no step OOM-killed. Unit tests for raise, hold, drop to the floor, and the ceiling.
+7. **Constraints from 10r (checkpoint 64615a2c5).** Measured memory is resident only (cgroup memory.current minus inactive_file; RSS for processes); `swap_bytes` is kept apart and is never charged. Service rows (hana CI, compiler cache) are tagged in `scripts/build_queue/scope_activity.py`. An empty service row (no live process, zero RAM) is not a running step (`scripts/lint/memory_admit.py:1816`); idle CI with RAM still charges it. The design and rulings are in the session file phases/10t/design.md; ruling 8 adds `build_free_check_calm`.
+### Phase 10u — Gate copies belong to a staff row  · status: replaced by 18c
+
+Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary and the Phase 18 command with no `--owner` flag. 10u's `--owner` flag that refuses unknown names is not built (architect review of 18, 2026-11-06).
+
+### Phase 10w — A copy's origin is the source's GitHub remote  · status: done
+
+**Depends on:** none (split from 10u by builds, 2026-11-04; `scripts/copies/copies.py` only; runs beside 10t and before 10u).
+
+1. **The ask (builds, 2026-11-04).** The copy origin trap hit queue-unit (80299124b took builds' untested local merge) and sdlc devtools-unit (a phase branched from sdlc's untested local merge). Land it now, ahead of 10u.
+2. **The change.** A copy's `origin` is the source repo's own origin URL (GitHub), not `~/.claude`. A copy's `refs/remotes/origin/*` equal the source's `refs/remotes/origin/*`, never its `refs/heads/*`. Objects still come from the local repo. Existing copies heal on their next use.
+3. **Proof.** Tests: a copy's `origin/builds` equals the source's `origin/builds`, not local `builds`; the copy's origin URL equals the source's; an old copy heals on use. `docs/as-built/gate-checkouts.md` states the rule.
+
+### Phase 10j — Tests follow the 10w copy origin  · status: done (b4099a4cc)
+
+**Depends on:** 10w (b1fe9560c).
+
+1. **The ask (builds, 2026-11-04).** The 10i-10r-10w merge held on two reds caused by 10w: test_ci_points expects the old copy origin; test_merge_checkpoint_bump's fake git misses `clone` after 10w's `-c` options.
+2. **The change.** test_ci_points expects the source's origin; ci_points drops its now self-mapping url insteadOf; the fake git skips every leading -c and -C pair.
+3. **Proof.** test_ci_points, test_merge_checkpoint_bump and test_copies pass; basedpyright clean.
+
+### Phase 10l — A waiting client reads the queue's answer when the retry check is slow  · status: done (main d8c13aab4; builds-queue 2e485438b)
+
+**Depends on:** 10j (f93c24914).
+
+1. **The ask (builds, 2026-11-04 15:22 EST, top priority).** hana-migration's verify.sh doc step printed "admission service not answering since 13:39" for 103 min while the queue showed it running with 5.3 GiB kept. It blocked a hana release commit.
+2. **Cause.** While a step waits, the client runs the leave hook (the AWS retry check) every `running_pass_seconds`=5. `AcquisitionRetry.left_queue` sets `next_leave` before the hook runs. The hook takes 13-34 s, so `next_leave` is already past when it returns. `_line` then raises its timeout before `recv`, and the loop runs the hook again. The client never reads the socket: the grant sat unread (83 KB in the receive queue).
+3. **The change.** `left_queue` sets `next_leave` after the hook returns. A hook slower than the interval still leaves the client one interval to read.
+4. **Proof.** A regression test with a hook slower than the interval: the client reads a grant sent while the hook ran. test_admission_client passes; basedpyright clean.
+
+### Phase 10y — No younger step starts if it delays the first in line  · status: folded into 10z
+
+**Depends on:** 10t (both change admission in `scripts/lint/memory_admit.py`; 10y's code starts on 10t's tree after 10t is checkpointed; one admission rule, not a second path).
+
+1. **The ask (user, 2026-11-04 12:22 EST).** "notice that 3 merge gates each requiring 6GB have passed the waiting mend startup ... why are they all skipping past the first in line". Builds ruled go the same hour.
+2. **Evidence.** mend startup (need 7.3 GiB, queue priority) waited 58 min as first in line. Three merge gates (6.0 GiB each, using 0.1-0.4 GiB) started ahead of it. Cause: the backfill windows (the head's first 600 s, then 120 s of every 720 s) admit any younger step that fits; the strict windows admit younger starts until their total since the head's priority reaches budget minus head need (`strict_room`, `head_room_used`, memory_admit.py:1105, 3016, 3043).
+3. **The change.** While a step waits first in line, a younger step starts only if the first one could still start at once after it: charged + younger need + head need <= budget, and the free-memory check holds for both. The backfill and strict windows and their settings go (`head_seconds`, `strict_seconds`, `backfill_seconds`, `BackfillUntil`, `StrictUntil`, `strict_room`, `head_room_used`). The bump and the head override keep their meaning.
+4. **Shown.** The queue view, card and memory page drop the window text. A held younger step says it waits so the first in line can start.
+5. **Proof.** Unit tests: a younger step that would delay the head waits; a younger step that leaves room for the head starts; the head starts the moment it fits. A replay of today's 11:24-12:22 queue shows mend starting before the three gates.
+
+### Phase 10z — A run starts when it fits free memory, and the first in line is protected  · status: done
+
+#### As-built
+
+- There is no set budget. Room = free memory now − `safety_gib` (3) − the keep-aside of every running run − the CI keep-aside. A run starts when its need fits the room, pressure is calm and it is its turn. 10t's budget controller (`budget.py`, `budget_replay.py`) and 10y's backfill and strict windows are deleted; neither landed alone.
+- An admitted step keeps its accepted need for its whole life. Its keep-aside is max(0, need − anonymous use). A nextest step in an observed test phase uses its frozen need, max(test peak, history N × `test_phase_margin`). Need is never cut to a limit.
+- Order: bumped first, then the time the run first joined, then pid. A younger run starts only when its need fits room minus the first run's need. When no run of ours is admitted, no slot is held and pressure is calm, the first run starts even if it does not fit. Idle CI rows and unowned scopes are not runs of ours.
+- Pressure (full avg10 > 5, or swap > 85% with some avg10 > 25) holds starts while it lasts. An unreadable reading also holds starts. The head line then says "pressure unreadable: <path>", and after `reading_alert_seconds` one message goes to the natedev session. The alert clears when readings return.
+- When a step of a running run (BUILDLOG_RUN identity) ends, its charge stays as the run's slot for `slot_gap_seconds`. The next step takes the slot at once, with no spacing and no order. A larger next step gets its extra before any waiting run when the extra fits the room with no pressure. A restart drops held slots; state.json holds no slot fields.
+- At most one new start each `recovery_start_seconds`, at all times; slot reuse is not a start. Estimate refresh uses `estimate_refresh_seconds`.
+- The queue view, card, build-why and memory page show used, kept aside, room, safety and other, and the **cap** (anonymous use + CI use + free − safety), with the numbers of the last admission pass. The word "budget" is gone.
+- `session_send_argv` lives in `scripts/message/session_send.py`. `SEND_SCRIPT` is its one patch point, and a sender test fails if it starts the real `send.py`. Admission code never imports `sweep`: that edge made an import cycle.
+- Outside test fixtures use `AdmissionFixture.occupy_host` for a host with a run of ours and a complete calm pressure reading. An admission rule change runs every caller suite (direct `test_verify_*`, buildlog, hooks, merge admission) before the full gate.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — room, keep-aside, order, head protection, slots, spacing.
+- `scripts/build_queue/admission_service.py`, `admission_client.py` — pass evidence, the unreadable-reading alert, slot hold.
+- `scripts/build_queue/queue_view.py`, `queue_card.py`, `queue_evidence.py`, `head_facts.py` — cap and room text.
+- `scripts/message/session_send.py` — the session sender.
+- `config/build_admission.conf` — `safety_gib=3`, `slot_gap_seconds=10`, `estimate_refresh_seconds=600`, `reading_alert_seconds=300`, `recovery_start_seconds=5`, `test_phase_margin=1.2`; `peak_hold_seconds.merge-gate=180` stays. Deleted: the budget keys, `build_free_check_calm`, `head_seconds`, `strict_seconds`, `backfill_seconds`, `recovery_window_seconds`, `ramp_seconds`.
+- `docs/as-built/build-memory-admission.md` — the rules.
+
+**Ruled out:** a budget that follows measured use (10t); time windows that let younger runs pass the first in line (10y); slot fields in state.json; a cancel command.
+
+### Phase 10q — One sweep process loads store.py once  · status: done (bbae0f7eb)
+
+#### As-built
+
+- Phase 33 replaces the two module names with `scripts.buildlog.store` in every caller.
+- Phase 33 removes the aliases and `scripts/buildlog/__init__.py`.
+- `scripts/buildlog/test_repo_root_imports.py` checks the script entries from an unrelated working folder.
+
+**Files:**
+- `scripts/buildlog/store.py` — callers use its repository module name.
+
+**Binds later work:** callers import `scripts.buildlog.store` from the repo root.
+
+**Gotchas:** `scripts.buildlog` is a namespace package. It has no initializer or module aliases.
+
+**Ruled out:** record.py's `__package__` check (head_facts keeps a set `__package__` under sweep); a `find_spec` search or package import from store.py (it shadows modules through `sys.path` and runs an unrelated `scripts/__init__.py` from the cwd).
+
+### Phase 10s — A run with no scope reads its anonymous use from its processes  · status: done
+
+#### As-built
+
+- `process_memory(source, proc)` reads one anonymous use per step kind: a step with a scope reads its scope's `memory.stat` anon (`ScopeSource`); an in-process holder with no scope, such as the merge gate's `queue_place("merge-gate")`, sums `RssAnon` over its process tree (`ProcessSource`); otherwise `NoSource`. `MeasuredMemory.anonymous_source` holds the source, and resident bytes and swap stay separate values beside it. A gone pid or a zombie counts 0.
+- A missing or invalid `RssAnon` line, or a denied status read, makes that run's use `RunUseUnavailable`.
+- `run_memories` counts a shared process once, independent of order: the smallest process set takes it (reservation key breaks a tie); scopes count by depth, and an outer scope subtracts nested scopes.
+- `CapUnavailable(runs)` names the runs whose use is unavailable; `room_text` prints them and no use sum. An old reason-only `CapUnavailable` record reads as `runs=()` and prints `Cap unavailable; free …`.
+- `queue_place.py` samples a scope through `slice_working_set`, the one reader; `queue_view.py` rows use `hold.use`.
+- The admission service has no lock: one loop thread owns its state. The test fixture refuses an off-thread `handle_request`, `persist` or `run_pass`; tests call the server through `fixture.loop_turn()`.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — the anonymous-use readers, shared-process attribution, the cap record decoder.
+- `scripts/build_queue/queue_evidence.py`, `queue_place.py`, `queue_view.py` — cap text, scope sampler, rows.
+- `scripts/build_queue/admission_test_support.py` — the loop-thread guard.
+
+**Binds later work:** every new admission service test calls the server through `fixture.loop_turn()` and holds no fixture turn across a client call that needs the service loop. The holder pick for a memory wait uses the counted use from `run_memories`. A `RunUseUnavailable` run keeps its full keep-aside.
+
+**Gotchas:** a feed or client process started before an install keeps the old decoder; restart it after the install.
+
+**Ruled out:** a service lock (tests use the loop thread instead).
+
+### Phase 10x — The admission code keeps one way to do each thing  · status: done
+
+#### As-built
+
+- Admission decisions and shown numbers are the same as 10z and 10s; the golden views did not change. The code holds one way to do each thing, and main code holds no reader of an old record shape. An old-shape record makes the decoder refuse, and the service then fails at start.
+- `memory_room` takes `AdmissionPolicy` alone. `inputs_room` is the one room helper. `run_owner` and `reservation_run` are the one run lookup. `RunKeepAside` holds a typed run, `memory: RunMemory` and `bytes`. `ExplainedRunningStep.owner` is filled once. `ended_step_slot` and `slot_in_force` are the one slot rule. `ContinuationSlot(slot, owner)` names a continuation's slot.
+- `admission_walk` walks the given order once. `queue_fixture.py` builds `QueueInputs` that make `admission_pass` give each wanted reason.
+- The service reads a waiter's build run once for each pass and reads a step lifetime only when the owner has exited or is not ending. `_live_run` and `_run_alive` are its run helpers.
+- `step_pid_text`, `member_programs` and `reason_phrase` are the one copy of each text helper; `scope_activity.py` builds members once. `write_scope` is the one fixture helper for a scope.
+- Fields named `recovery` are now `spacing`. The config key `recovery_start_seconds` keeps its name.
+- `admission_client.py` names config absence as `ReadConfigurationAtUse`. Cleanup timing stays apart as `wire.CleanupTiming`.
+- `merge_gate_reservation_gib` and `merge_gate_governor_gib` have the range 0.125..64 in `config/build_admission.conf`; their values stay 4.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — room helper, run lookup, slots, walk, spacing names.
+- `scripts/build_queue/admission_service.py`, `admission_client.py`, `admission_protocol.py` — run helpers, spacing names, config absence.
+- `scripts/build_queue/queue_evidence.py`, `queue_view.py`, `queue_lines.py`, `queue_card.py`, `scope_activity.py` — one copy of each text helper.
+- `scripts/build_queue/queue_fixture.py`, `admission_test_support.py` — shared fixtures.
+- `scripts/buildlog/memory.py`, `scripts/mac_test/loopback_proof.py` — `memory_room` callers.
+
+**Binds later work:** `RunKeepAside` has `memory.use`, not `use`. A change to a stored record ships a conversion program outside the repository, as Delegation Context says.
+
+**Gotchas:** the service and the memory page feed keep the code they loaded until they restart. systemd keeps `build-admission.socket` active while the service fails at start. Only the user can stop and start the service (root).
+
+**Ruled out:** old-record readers in main code; importing `sweep` from admission code (the import cycle); dropping the member pid lines; deleting `PeakHold` or the test-phase path, which are in use.
+
+### Phase 12 — The merge gate reserves 4 GiB from config and no longer kills on memory  · status: done
+
+#### As-built
+
+- `config/build_admission.conf` has two keys, each 4 GiB. `merge_gate_reservation_gib` sizes the merge gate's build queue reservation (`gate_reservation` reads it when the gate joins the queue, `FixedCapSizing`). `merge_gate_governor_gib` bounds the gate's own test runner (`run_suites` reads it at start). `merge_gate_memory_gib(key)` reads both and turns an unusable value into `GateRefused` naming the key.
+- `SampledRSSAdmission.governor_mib` starts a job only when latest + reserved + expected stays within it and a CPU slot is free; with no job running it always starts one. At 4 GiB the full type check (4.76 GiB reservation) runs with no test module beside it.
+- The gate has no memory kill and no memory fail: the result and the reservation status depend only on test results. A module still running at the time limit still fails the gate. `--memory-cap-mib`, `DEFAULT_MEMORY_CAP_MIB` and `GateRun.memory_within_cap` are gone.
+- The runner prints `memory governor N GiB`; the summary prints the sampled peak with no cap. Gate ledger records keep the field `cap_mib`, which now holds the governor bound.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the two key readers, the governor, no memory kill or fail
+- `config/build_admission.conf` — `merge_gate_reservation_gib`, `merge_gate_governor_gib`
+- `scripts/production/merge_gate_test_support.py` — `MergeGateFixture.configure_gate`
+- `scripts/production/test_merge_gate*.py` — key, governor and no-kill tests
+- `scripts/buildlog/index.py` — the `cap_mib` column label
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md`
+
+**Binds later work:** the percent-done keep-aside phase deletes `merge_gate_reservation_gib` and its reader when the gate switches to the profile rule; `merge_gate_governor_gib` stays.
+
+**Ruled out:** one key for both uses; a `--memory-cap-mib` override beside config.
+
+### Phase 13 — A caller test's fake clock skips the start spacing when no caller run is live  · status: done
+
+#### As-built
+
+- `ObservedAdmissionServer` in `scripts/build_queue/admission_test_support.py` calls `ReadyToStart()` before an `AdmitRequest` or a `LaunchRequest` when no caller reservation, waiter or between-steps slot in force is live, so an idle caller fixture has no start spacing. The fake clock does not move. Occupied-host scenery does not count as a caller.
+- `caller_admission(skip_idle_spacing=False)` keeps the spacing for a test that checks it. The opt-out holds when a fixture is reused.
+- `allow_next_start()` takes `loop_turn()` itself, on an `RLock`.
+- `MemoryRoom.ci_use` (default 0, so a reply from an older service decodes as 0) and `MemoryRoom.cap_use` = `used + ci_use`. Cap = anonymous use + CI use + free - safety, at `memory_room`. `inputs_room` sums `ci_use` from readable `UnownedSliceMemory` service rows. Room, shortfall, kept memory and admission do not change.
+- `queue_evidence.room_text` and the `queue_view` cap bar use that one cap. The CI term is absent at 0. `ci_amount` prints CI use under 0.1 GiB in MiB.
+- `scripts/lint/memory_gate.sh` limits pipefail to a subshell around the admission pipeline, for bash 3.2 on the Mac.
+
+**Files:**
+- `scripts/build_queue/admission_test_support.py` — the skip rule, `caller_live`, `allow_next_start`
+- `scripts/build_queue/test_caller_admission_clock.py` — idle, live caller, scenery, opt-out and lock tests
+- `scripts/build_queue/queue_fixture.py` — `ci_step`
+- `scripts/lint/memory_admit.py` — `ci_use`, `cap_use`, `inputs_room`
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_view.py` — the cap text and bar
+- `scripts/lint/memory_gate.sh`, `scripts/lint/test_memory_gate_wait.py` — the pipefail scope
+- `docs/as-built/build-memory-admission.md` — the cap formula
+
+**Binds later work:** `MemoryRoom.ci_use` counts only CI rows with no reservation once hana CI builds wait in the queue, so a registered job counts once. A CI job has no run row, so it is not a holder of a memory wait while it has no reservation. Nothing in `run_gate` needs an `allow_next_start()` advance.
+
+**Gotchas:** a service that has not restarted reports the old cap. The speed numbers do not prove a gain under load: lint_judgment 162.8 to 131.5 s, cache_versions 120 to 149 s, token_loss 13.6 to 9.9 s.
+
+**Ruled out:** moving the fake clock ahead of real time; `recovery_start_seconds=0`; a mock of the admission result; a required `ci_use` wire field.
+
+### Phase 10o — The admission client starts with only what it uses  · status: done
+
+#### As-built
+
+- `release`, `width` and `token_wait` load no `admission_service`, `queue_view`, `head_facts` or `memory_admit`. `admit` and `launch` load the estimator inside `step_request`. Replies, wire shapes, stored records, config keys and printed text do not change.
+- `scripts/build_queue/system_clock.py` holds `SystemClock` (`now`, `monotonic`, `sleep`) and imports no service code.
+- `scripts/build_queue/admission_records.py` holds the records, `GIB`, `MemoryConfig`, `read_memory_config`, `warn_configuration_diagnostics`, `AdmissionWaitSnapshot`, `reason_phrase`, `behind_place` and `eligible_head_position`.
+- `scripts/build_queue/step_estimator.py` holds `step_estimate`, `program_peak_estimate` and the code only they reach. `TEST_STEPS` is in `scripts/lib/test_phase.py`.
+- Each moved name has one definition. `memory_admit.py` re-exports each moved public name (`from x import A as A`), and `queue_view.py` re-exports `reason_phrase`. `ADMISSION_CODE_PATHS` holds the three new modules.
+
+**Files:**
+- `scripts/build_queue/system_clock.py`, `scripts/build_queue/admission_records.py`, `scripts/build_queue/step_estimator.py` — new
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_code.py`, `scripts/build_queue/queue_view.py`
+- `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/lib/test_phase.py`
+- `docs/as-built/build-memory-admission.md`
+
+**Binds later work:** a test patches a moved name where the code now reads it. `memory_admit.py` imports `conf`, `test_phase` and `build_shape` by bare name, and a second import form loads a second copy whose classes do not match.
+
+**Gotchas:** the client still loads 158 modules, and the release list holds `scripts.message` and `scripts.build_hold.override_guard`.
+
+**Ruled out:** a new import test; the `build_hold.py` import, under the builds file freeze.
+
+### Phase 18a — A gate copy's folder comes from the repository's origin  · status: done
+
+#### As-built
+
+- `repository_name` in `scripts/copies/copies.py` follows local origins to the last one and takes the last URL part without `.git`. A cycle is an error. A source with no origin uses its main checkout's folder name.
+- A standing gate borrows from `final_object_store`, the last store in the source's chain. Only `initialize` follows that chain; other `initialize_git` callers keep their one-step source.
+- A workspace record holds `repository_identity`, and `workspace_repository` reads it.
+- `remove_trees` continues past a busy or failed tree or mirror, removes the rest, and raises one `CopyError` that names each one kept (exit 2). A copy whose objects another workspace borrows stays (`_gate_borrowers`).
+
+**Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py`, `scripts/lib/scratch.py`, `docs/as-built/gate-checkouts.md`.
+
+**Binds later work:** Phase 18 merges its `remove_trees` rewrite over this rule and verify's mirrors. A rename must not call `remove_trees` before Phase 18c. Deploy runs the session's `migrate_18a.py --apply` before repository cleanup.
+
+**Gotchas:** the 23 trees in `~/worktrees/gates/.claude` go idle after this lands; hierarchies Phase 28 deletes them.
+
+**Ruled out:** deleting stale gate folders in this phase; a name list for repositories.
+
+### Phase 20c — A merge gate near its end keeps less memory with rerun records in its history  · status: done
+
+#### As-built
+
+- The look-ahead window in `window_peak` stops at the end of `suites:1` (`GATE_FIRST_PASS` in `scripts/build_queue/progress_profile.py`).
+- A gate that reads a profile with old `suites:2` records now gets its first pass tail: measured 0.23 GiB at 85-86%, 0.14 GiB at 95%.
+- Crossings between `build:` and `test:` phases, and `build:1` to `build:2`, stay. A `suites:2` counter over measured bins follows the normal window rule.
+
+**Files:** `scripts/build_queue/progress_profile.py`, `scripts/build_queue/test_progress_profile.py`, `scripts/production/test_merge_gate_suites_admission.py`, `docs/as-built/build-memory-admission.md`.
+
+**Binds later work:** the service reads this rule after a restart. The Change-Review row comes after a live gate past 85% shows under 1 GiB.
+
+**Gotchas:** old-code gates still write `suites:2` records until each tree carries 20a; they have no effect on the first pass.
+
+**Ruled out:** removal of live records; a change to `merge_gate.py`.
+
+### Phase 18b — A repository with no build cache gets a fresh copy for each run  · status: done
+
+#### As-built
+
+- `keeps_build_cache(source, base)` in `scripts/copies/copies.py` is the one decision point. It reads `Cargo.toml` at the root of commit `base`. `standing` uses `available_tree` when it is true and `fresh_tree(owner)` when it is false.
+- `fresh_tree` makes a scratch folder with word `<owner>-gate` and removes it at success, at a caller exception and at a preparation failure. A fresh copy has no post-use work.
+- `scratch.new(throwaway=True)` marks the folder. `scratch.is_throwaway` tells `tmp_sweep.py` to treat a killed run's folder as saved work, so the sweep removes it.
+- Measured: one call on a synthetic tree of 2,003 files and 45 MB took 0.78 s (first call 0.53 s). This is one measure.
+
+**Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py`, `scripts/copies/test_review_remote_copies.py`, `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py`, caller test modules in `scripts/production/`, `scripts/style/test_crate_run.py`, `scripts/buildlog/test_rust_release.py`, `docs/as-built/gate-checkouts.md`.
+
+**Binds later work:** Phase 18c carries the owner type into `fresh_tree`'s scratch word. `remove_trees` still has the same standing-tree rule.
+
+**Gotchas:** a test fixture with a root manifest needs `fake_cargo_output_roots`, or the gate's real-cargo tripwire fails it. `gate_like.sh` does not run that tripwire. `rust_release.py` is frozen and its owner stays `toolchain-trial`.
+
+**Ruled out:** a repository name list; deleting stale gate folders in this phase.
+
+### Phase 18 — A standing gate tree takes its owner from the staff row and its folder from the repository's identity  · status: done
+
+#### As-built
+
+- `copies.py run` and `copies.py remove` take the owner from the calling session's staff row; a worker row uses its parent unit's name. The `--owner` flag is gone. A caller with no staff row gets a one-line error. `standing()` and `remove_trees()` keep an owner parameter for in-process callers (`merge_gate.py`, `style_sync.py`, `ci_points.py`, `bump_gate.py`); `rust_release.py` keeps its fixed owner (build freeze).
+- Retire (`retire_unit.py`) and the end of a unit run (`end_session.sh`) remove the unit's idle standing trees and workspaces with the shared call that `tidy_wrapped.py` uses. A busy tree prints one line and stays for the later cleanup. A kept remote mirror still refuses the retire: `remove_trees` raises `RemoteMirrorKept`.
+- `owned_workspaces` reads `repository_identity` from each workspace record (`workspace_repository`), so a workspace keeps its repository after its source is deleted.
+- Deploy step, 2026-11-06 22:54: a program outside the repository wrote `repository_identity` into 2 live workspace records whose origin was a deleted test project (identity = the origin path text). It skipped 10 landing copies that have no `owner_unit`. `migrate_18a.py` now plans nothing.
+- The copy guard's refusal text and the docs (`gate-checkouts.md`, `style-showrunner.md`, `style_production.md`, `mend_fix.md`, `adversarial.md`) name `copies.py run` with no flag.
+
+**Files:** `scripts/copies/copies.py`, `copy_guard.py` and their tests; `scripts/production/retire_unit.py`, `staff.py`, `tidy_wrapped.py` and their tests; `scripts/direct/end_session.sh`, `test_end_session.py`; the item 6 docs; one-line caller changes in `bevy_upgrade.py`, `build_queue.py`, `hana_shot.py`, `scratch.py`, `unit_runs.py`, `memory_admit.py`, `proposal_issue.py`, `worker_admission.py`, `session_types.py`, `crate_run.py`.
+
+**Binds later work:** 18c converts the same records from staff names to staff row ids; it keeps `repository_identity`, skips records with no `owner_unit`, and makes no lock file in a dry run.
+
+**Gotchas:** live workspace records include copies of deleted test projects, so `repository_name` cannot resolve every origin. Landing copies under `/tmp/claude/scratch` carry `source_path` with no `owner_unit`.
+
+**Ruled out:** a `--owner` flag that refuses unknown names (Phase 10u's design); a second repository-name rule beside 18a's.
+
+### Phase 18c — Gate copies belong to a staff row, and a rename removes nothing  · status: done
+
+#### As-built
+
+- `scripts/copies/copies.py` holds one closed owner type: `StaffOwner(row_id)` for a staff row and `RoleOwner(name)` for a fixed role with no staff row (the `owner.<role>` values and `rust_release.py`'s `toolchain-trial`). `standing()` reads frozen `rust_release.py` text at one boundary: a staff row id is a `StaffOwner`, all other text is a `RoleOwner`.
+- `GateRecord.owner`, `owner_unit`, the remote registry record and the mirror marker (`mark_mirror`) hold the row id. `remove_trees`, `owned_remote_mirrors` and the tree lookup compare owner types from those records. Readers show the current staff name, read from the id at read time. No reader parses an owner from a folder name.
+- A new gate folder is `<staff name at creation>-gate` or `<role>-gate`, with the next free suffix when another owner holds the name. A folder name never changes. `fresh_tree`'s scratch word uses the same name. The tree lookup reads the records in `<root>/<repo>/`.
+- A rename removes nothing and changes no copy. `remove_trees` is the one removal function. Retire keeps `RemoteMirrorKept`.
+- Every staff-row caller passes the row id: `tidy_wrapped.py`, `retire_unit.py`, `end_session.sh`, `caller_owner`, `source_owner`, `fast_track.py`, `bump_gate.py`, `ci_points.py`, `waiting.py`, `merge_gate.py` `nightly_owner`, `style_sync.py` `gate_owner`, `mac_test/offload.py`, `mac_test/linux_runner.py`, `production/mac_run.sh`, and the mirror and clone options.
+- A pending bump-gate record saves `owner_id` and `unit_id`. `bump_gate.py` reads `owner_id`. `merge_checkpoint.py` `send_result` reads the current sessions from the staff rows at each delivery attempt and sends from the current production name. It skips recipients in `delivered_to` before it reads their rows.
+- A `.removing` tombstone has no owner; `remove_trees` finishes each idle tombstone in its repository scope. A gate folder with no record is free: the tree lookup can claim it, and `remove_trees` selects it for no owner.
+- The deploy program `<phase folder>/migrate_18c.py` (outside the repository; dry run, then `--apply`) converts bare and `-unit` names to row ids in local records, the remote registry, mirror markers and every bump-gate record that lacks the ids. It moves no folder. A name no row holds or two rows hold, or a busy tree, stays and prints one line; a rerun finishes. `prove_migration.py` proves it.
+
+**Files:**
+- `scripts/copies/copies.py` — owner type, records, lookup, `remove_trees`
+- `scripts/production/merge_checkpoint.py`, `scripts/production/bump_gate.py` — bump-gate ids and delivery by staff row
+- `scripts/production/tidy_wrapped.py`, `retire_unit.py`, `fast_track.py`, `ci_points.py`, `waiting.py`, `merge_gate.py`, `mac_run.sh`, `scripts/style/style_sync.py`, `scripts/mac_test/offload.py`, `linux_runner.py`, `scripts/direct/end_session.sh` — callers pass the row id
+- `docs/as-built/gate-checkouts.md`, `docs/as-built/staff-accessors.md` — current rules
+- `scripts/copies/test_copies.py`, `test_remote_copies.py`, `scripts/production/test_merge_checkpoint_bump.py`, `merge_checkpoint_test_support.py`, `test_tidy_wrapped.py`, `test_retire_unit.py`, `scripts/direct/test_end_session.py` — proofs
+
+**Gotchas:** main code keeps no old-record reader, so old records read as unowned until the deploy runs. Tell hierarchies when this phase is on main.
+
+**Ruled out:** a second removal function (`remove_gate_trees`); row ids in folder names, because the user sees folder names in the project list.
+
+### Phase 20b — A clippy fix step leaves the machine-wide build tokens to other builds  · status: done
+
+#### As-built
+
+- A `cargo clippy --fix` step runs with `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` removed and with `--jobs` from `clippy_fix_jobs=8` in `config/lint.conf`. The `fixing` branch of `invoke_clippy` in `scripts/lint/invoke.sh` holds the call; a plain clippy step keeps the pool, on natedev and on the Mac alike.
+- `lint_config_clippy_fix_jobs` in `scripts/lint/lint_config.sh` reads the key with builtins only.
+- One real hana `clippy --fix`: installed 323 s wall, 0 s wait; new 394 s wall, 192 s wait. The load differed, so there is no speed claim. The real cargo process had no pool variables.
+- A waiting rustc holds its token: 86 of 105 samples had 20 or more shims with no compiler child, mean 27.4 idle holders, with 0 free tokens.
+
+**Files:** `config/lint.conf`, `scripts/lint/lint_config.sh`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `docs/as-built/phase-checks.md`, `scripts/direct/test_verify_lint_output.py`, `scripts/direct/test_verify_lint_judgment.py`, `scripts/direct/verify_lint_scope_test_support.py`, `scripts/direct/test_verify_token_renew.py`.
+
+**Binds later work:** a change to the fix call updates the four test files above that assert it.
+
+**Gotchas:** a proof on the shared pool holds tokens for every other build. A proof runs at a quiet time or in a small pool.
+
+**Ruled out:** a speed claim from the hana runs.
+
+### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
+
+#### As-built
+
+- `scripts/message/roster.py:1286` also catches `herdr.HerdrFailure`, so `send.py` keeps the session entries and delivers from a service with no herdr on its PATH.
+- `down_alert`'s phone push reads "The builds session did not take the message. Builds wait until the service answers."
+- A merge gate rerun sets `progress_total = 0`, so `publish_progress` publishes nothing, and `progress_profile.clear_counter` removes the counter file. The rerun keeps the full need. `progress_phase` is gone, and the first pass counter is `suites:1`.
+
+**Files:**
+- `scripts/message/roster.py`, `scripts/message/test_roster.py` — the catch
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py` — the push text, the proof with no herdr
+- `scripts/build_queue/progress_profile.py` — `clear_counter`
+- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate_suites_admission.py` — the rerun
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/merge-gate-and-test-speed.md` — the rerun rule
+
+**Binds later work:** a module that names `session_send_argv` installs `forbid_real_sender` in `setUpModule`, because `scripts/message/test_session_send.py` requires it.
+
+**Gotchas:** the installed `merge_gate.py` runs for every `--checkout` gate, so `suites:2` records keep arriving until this phase is installed. Stored `suites:2` records stay until removed.
+
+**Ruled out:** a reader in main code that skips stored `suites:2` records.
+
+### Phase 21 — Each moved admission name has one import path  · status: todo
+
+**Depends on:** 10o, and resources 0dfe65382 on the builds branch, because that branch conflicts in `memory_admit.py`. Source: builds showrunner, 2026-11-06 02:2x EST (design call).
+
+#### Work Order
+
+**Goal:** A name that phase 10o moved has one import path, its defining module. No caller reads it through `memory_admit`.
+
+**Spec:**
+
+1. **The rule (builds, 2026-11-06).** "The owner of a move switches every caller, and the old path goes." Phase 10o left 230 names re-exported from `memory_admit`, so one name has two import paths.
+2. **Callers.** A static walk on `136497f98` found 39 files that read a moved name through `memory_admit`. Each one imports it from `scripts/build_queue/admission_records.py`, `scripts/build_queue/step_estimator.py`, `scripts/build_queue/system_clock.py` or `scripts/lib/test_phase.py`. Run the walk again on the phase's merged tree; other units' landings change the list.
+3. **Test patches.** A `mock.patch` target on a moved name names the defining module. A patch that changes a name the code reads through another module keeps its effect; the tests prove it.
+4. **`memory_admit`.** Each `from x import A as A` form goes. `memory_admit` imports only the names it uses. A name it does not use leaves its import.
+5. **The frozen file.** `scripts/buildlog/mac_idle.py` gets the one import change, by builds' ruling on 2026-11-06. The notice names it on its also-touches line.
+6. **Behavior.** Replies, wire shapes, stored records, config keys and printed text do not change. No assertion changes.
+7. **Proof.** A one-off walk in the phase's folder prints no caller of a moved name through `memory_admit`, and the notice carries that result. Add no new import test: a new check goes to the user first. All caller suites pass. The client start measurement stays: `release` still loads no `memory_admit`.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — and the 39 files of item 2, as the walk lists them on the merged tree.
+
+**Workers:** `1 writer + 1 tester`
+- `impl2` — production callers and `memory_admit.py`.
+- `test2` — test files and test support, patch targets, and the walk.
+
+**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** none — no behavior changes.
+
+### Phase 10h — A memory wait names what holds it  · status: done
+
+#### As-built
+
+- `AdmissionWaitSnapshot.holder` is a `WaitHolder` in `scripts/build_queue/admission_records.py`: `SessionHolder(session_id, session_name)`, `UnitHolder(unit)` or `NoHolder()`. The field has a default, so a reply from an older service decodes as `{"kind":"none"}`.
+- `admission_wait_holder(decision, reason, inputs, room)` in `scripts/lint/memory_admit.py` names the recorded order hold, else the largest grouped charge over `MemoryRoom.runs`. The charge is `RunKeepAside.memory` plus anonymous use, with the full charge for unavailable use. A tie breaks on the owner key. Session identity wins over unit.
+- A wait has no holder for pressure, an unreadable reading, start spacing, an estimate refresh or an admitted row. Unregistered CI use is never a holder.
+- `wire.RunPlace.unit` (default empty) keeps a run's unit, so a held slot names that unit after its reservation ends. An older stored row reads as no unit, with no conversion.
+- `WaitOutput.last_holder` in `scripts/build_queue/admission_client.py` emits `holder <json>` after `first` and at each change, before notice throttling.
+
+**Files:**
+- `scripts/build_queue/admission_records.py` — the holder types
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — `PassRow.holder`, `wait_holder_identity`, `admission_wait_holder`
+- `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_client.py` and their tests
+- `docs/as-built/build-memory-admission.md` — the holder JSON and the held-slot rule
+
+**Binds later work:** the verify wait display reads the `holder` event. A new `StepMemory` kind or a new required snapshot field stops a waiting client from older code at the next service restart, so the notice names it. A `RunPlace` change is a stored record change.
+
+**Gotchas:** a held slot does not survive a service restart. The installed client decoder refuses a new memory kind with `invalid snapshot variant`. A client keeps its loaded code and emits no holder event until it restarts. The holder is computed for each waiter on each pass.
+
+**Ruled out:** a permanent test against the previous revision, because `git show HEAD` compares new code with new code after a commit; a `queue.json` version raise.
+
+### Phase 10k — Rust runs and merge gates keep aside memory by percent done  · status: done
+
+#### As-built
+
+- Each run of cargo build and check, clippy, cargo mend, nextest and the merge gate publishes a counter: a phase plus done of total. A merge gate's counter is suites done of suites total. Counter parsers, `CaptureReader`, the profile store and the window are in `scripts/build_queue/progress_profile.py`.
+- Each run records its highest anonymous use in each 5% of each phase, under `reservation_profile_key(row, host)` = host, step and gate shape.
+- `reservation_need` keeps aside max(0, highest recorded use from percent now to percent now + `progress_lookahead_percent` (20) - use now). The window crosses into the next phase. The rule works per step, before `run_memories` groups steps under one owner, and `RunKeepAside.memory` holds the value.
+- A nextest test phase keeps its frozen N and `test_phase_margin`, and the test peak does not freeze. Progress lowers the need only from measured anonymous use.
+- No counter, no profile and `RunUseUnavailable` keep the full need. A run with unavailable use writes no sample.
+- The merge gate uses `queue_place` default sizing with `program_first_peak_gib.merge-gate` (4). `merge_gate_reservation_gib` and `FixedCapSizing` are gone; `merge_gate_governor_gib` stays. Legacy gate records do not size a keep-aside.
+- Snapshot version 5, codec in `scripts/build_queue/snapshot_codec.py`. A version 4 read gives `NoQueueSnapshot` until the next pass. Old `FixedCapSizing` wire tags are refused. There is no restart conversion. The page hover shows phase, percent done, keep-aside and reason.
+
+**Files:**
+- `config/build_admission.conf` — `progress_lookahead_percent`, `program_first_peak_gib.merge-gate`
+- `scripts/build_queue/progress_profile.py`, `scripts/build_queue/snapshot_codec.py` — new
+- `scripts/build_queue/queue_snapshot.py`, `admission_service.py`, `admission_protocol.py`, `admission_client.py`, `admission_code.py`, `queue_place.py`, `queue_evidence.py`, `queue_fixture.py`
+- `scripts/lint/memory_admit.py` — `reservation_need`, `test_phase_charge`, `run_memories`, `reservation_profile_key`
+- `scripts/lint/invoke.sh` — `buildlog_exec_with_progress`, `without_progress_frames`
+- `scripts/production/merge_gate.py` — the gate's counter and first-peak sizing
+- `scripts/lib/boot_identity.py`, `scripts/lib/atomic_file.py` (`atomic_sample`)
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/merge-gate-and-test-speed.md`
+
+**Binds later work:** a cargo front outside `invoke.sh` sets the progress settings on the child only, and a CI call follows the same look-ahead once it has a counter. A holder's charge reads `RunKeepAside.memory`. A snapshot shape change raises the version and needs no conversion. A rename of the `merge-gate` step touches `program_first_peak_gib.merge-gate` and `peak_hold_seconds.merge-gate`, and a config key rename needs the user's approval. The build page feed imports `snapshot_codec`.
+
+**Gotchas:** `scripts/direct/tree_watch.py:235` puts every `CARGO_*` name into the build key, so a shell export of the progress settings changes the key of later steps. cargo refuses `always` on a pipe without a width. The replay of recorded gates had no cgroup OOM increments, so it does not prove safety for three future gates at once. `merge_gate.py` keeps its resident-plus-swap reading for its runner and governor; a profile reads only anonymous use.
+
+**Ruled out:** a restart conversion for snapshots or profiles; a full-need fallback from legacy gate records; resident bytes or swap in a profile.
+
+### Phase 19 — The merge gate runs no type check, and the daily run does  · status: done
+
+#### As-built
+
+- `merge_gate.py` with `--tests-only` or on the merge path runs no type job: `--type-dirs` defaults to no folders. An explicit `--type-dirs scripts` still runs the check. `gate_reservation(repo, temporary, hold, *, type_dirs=())` sizes from the folders.
+- `merge_gate.py --nightly`, from the 03:00 `claude-nightly.timer`, sets `NIGHTLY_TYPE_DIRS = ("scripts",)` and runs the full check. It splits `type_failures` from `failed`.
+- A nightly type failure tells the showrunner, with the failing files and the first `NIGHTLY_TYPE_DIAGNOSTIC_LINES` (20) lines, and writes no `full-required` marker. A red nightly with no failed job says the full suite is required.
+- `memory_admit.merge_gate_shape(argv)` returns `MERGE_GATE_TYPES` when `--type-dirs` is in the argv, else `MERGE_GATE_TESTS`. `admission_service.py` stores the shape, and `reservation_profile_key` keys on it, so a nightly profile does not raise a test-only gate's need.
+- Workers keep their type check on changed files and caller modules.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the type folder rule, the nightly split, `tell_nightly_red`
+- `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate_suites_types.py`
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — the gate shape
+- `scripts/build_queue/admission_service.py` — stores the shape
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/build-memory-admission.md`
+
+**Binds later work:** a rename of the `merge-gate` step carries the shape in the profile key.
+
+**Gotchas:** a type error can reach main, and the next 03:00 run reports it. Before this change, 142 full passing gates had wall median 1500 s, CPU median 6642 s and peak median 4649 MiB; one type job had wall median 164 s, CPU median 227 s and peak median 4067 MiB.
+
+**Ruled out:** a separate `type_gate.py`, a promotion hook or a new timer; a client that sends the gate shape.
+
+### Phase 24 — Each running row names its machine  · status: done
+
+#### As-built
+
+- The run rows of `build_queue.py view` show a `machine` column after `min` and before `pid`. The value is `scripts.buildlog.store.host_name()`, read once per view: the admission service admits work only on the machine where it runs.
+- A narrow view (60, 80) leaves the column out before it cuts a name, so `view_60.txt` and `view_80.txt` did not change.
+- The one-step card names the machine after the pid in its running line. The card has no second table.
+- `queue_fixture.py` sets a private host name, so no test reads the live host.
+
+**Files:** `scripts/build_queue/queue_view.py`, `queue_card.py`, `queue_fixture.py`; `test_queue_view.py`, `test_queue_card.py`; goldens `view_100.txt`, `view_140.txt`, `card_1.txt`, `card_4.txt`, `no_bump_100.txt`, `unit_override_view.txt`; `docs/as-built/build-memory-admission.md`; `commands/build/queue.md`.
+
+**Binds later work:** Phase 10g places steps on other hosts; its rows need a host per row from the service, because the view reads one `host_name()` for all rows.
+
+**Ruled out:** a new host name function; a per-row protocol field before 10g.
+
+### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: done
+
+#### As-built
+
+- In `_acquire` (`scripts/build_queue/admission_client.py`), only a parsed reply sets `retry.unreachable_deadline` to no limit. A connect does not clear it. A restart error (`ECONNRESET`, `EPIPE`, `TransportUnavailable`) starts the same limit as a missing socket: `unreachable_limit_seconds`.
+- The receive loop reads `retry.unreachable_deadline`, so an accepted silent connection stops at the limit. On a read timeout the order is: the leave check, the launch deadline, then `check_unreachable()`.
+- At the limit the client stops with "build queue unreachable for <time>; step stopped; cargo token given back".
+- A service that answers within the limit keeps the wait and its place. Launch clients keep their launch limit. Release uses `CleanupTiming`, which has no unreachable limit.
+
+**Files:**
+- `scripts/build_queue/admission_client.py` — the retry loop
+- `scripts/build_queue/test_admission_client.py` — stop at the limit with closed and silent connections, a valid reply after the limit, a reply that keeps the wait
+
+**Gotchas:** the socket tests assert the fixture clock, because elapsed-time bounds fail under load.
+
+**Ruled out:** a new config key.
+
+### Phase 15 — A queue priority change stops blocking other queue requests while it reads the roster  · status: done
+
+#### As-built
+
+- A priority set reads the session roster on the daemon thread `priority-roster`. The service loop keeps serving queries and releases during the read. One loop thread still changes service state, and an eventfd (`priority_events`) in the epoll set wakes the loop when the read ends.
+- `QueueChange` covers priority set, priority clear and head admission. `handle_request` sends each one, after its replay check, to `_submit_queue_change`. `OrderedQueueChange(request, connections)` keeps arrival order, and a later change waits behind the pending one. Queries and releases do not wait.
+- `PendingPriorityRoster(change, result: Future)` or `NoPendingPriorityRoster` holds the pending state. `_finish_priority_roster` runs in `run_once` after the ready loop. A retry with the same key joins the pending change and gets one reply.
+- Nothing about a pending change is saved, so a restart during the read leaves the priority unchanged, and the client retries. `_complete_queue_change` refuses all clients of the change on `ValueError` or `TypeError`, with no replay record.
+
+**Files:**
+- `scripts/build_queue/admission_service.py` — the pending change, the roster thread and the wake
+- `scripts/build_queue/admission_test_support.py` — `AdmissionFixture.completed_queue_change(request)`
+- `scripts/build_queue/test_admission_service.py` (`PendingPriorityTests`), `scripts/build_queue/test_queue_view.py`, `scripts/lint/test_memory_admit.py`
+
+**Binds later work:** a retry connection attaches to a pending change before the roster read ends, so authorization covers `_submit_queue_change`. A test of a queue change uses `completed_queue_change`, because the reply comes after the loop finishes the read.
+
+**Ruled out:** a service lock; saving a pending change.
+
+### Phase 16 — The copy guard refuses only what makes a repository tree  · status: todo
+
+**Depends on:** 18c, and verify P35 on GitHub builds, which hands `scripts/copies/` to queue-unit and edits `copy_guard.py`. Order of the copies items: 18c, then 16, then 17 (Phase 18 retrospective). The builds ruling of 2026-11-05 stands: "A broken guard is fixed at once".
+
+#### Work Order
+
+**Goal:** A command that makes no repository tree passes the copy guard, and a refusal says what the guard could not read.
+
+**Spec:**
+1. **Refused today.** `python3 - <<'EOF'` for a program that only rewrites a showrunner state file ("cannot parse Python program"). `python3 /dev/stdin`, `sed` loops and `bash -n` from the builds showrunner's commands. `python3 - <<EOF` with an expansion ("cannot resolve expanded interpreter stdin").
+2. **Fix.** Parse valid Python whose string holds nested quotes. A form with no tree-making operation passes. An input the guard cannot read gets a message that names what it cannot read, and the message names `copies.py` only for a tree-making operation.
+3. **Keep.** Each tree-making form in `test_copy_guard.py` stays refused. Change an assertion only for a form item 1 names, and state why in the summary.
+4. **Proof.** One regression test for each form in item 1, with the real hook command text.
+5. **Command list (architect review of 15 and 10o, 2026-11-06).** Before dispatch, the director writes `<phase folder>/refused_commands.md`: each complete command and its expected result, with the failing Python bodies, the expanded heredoc and the `sed` loop. Today the corpus has only a simple `sed` read (`test_copy_guard.py:145`). The prompt names this file.
+
+**Files:**
+- `scripts/copies/copy_guard.py`, `scripts/copies/shell_syntax.py` — the parser and the messages.
+- `scripts/copies/test_copy_guard.py` — the tests.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** copies and hook suites pass; basedpyright 0/0/0. Change-Review: a command that the guard refused now runs.
+
+### Phase 17 — copies.py list shows remote mirrors  · status: todo
+
+**Depends on:** 18c, 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items. The copy start object scan moved to natest's copies.py Git-work speed phase (builds, 2026-11-05). On `copies.py` the second lander resolves.
+
+#### Work Order
+
+**Goal:** `copies.py list` answers who holds a mirror.
+
+**Spec:**
+1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. The owner column shows the current staff name, looked up from the row id; a role owner shows its role name. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
+2. **Holder states (architect review of 18, 2026-11-06).** `RemoteMirror.session` stays stored after `remote_lease()` ends, so it can name a former holder. The session column names a holder only with live lease evidence. A mirror is in one of three named states: held (the current staff name, read through 18c's row id), idle, or unavailable.
+3. **Owner and holder are two columns (architect review of 18c, 2026-11-07).** `request_mirror` carries an owner and a holder as two values (`offload.py:2233`). The owner column shows the mirror's owner. The session column shows the live holder. Each has its own display rule. A role owner keeps its fixed role name.
+4. **Owner name states (architect review of 18c).** `owner_name` returns the raw row id when the staff read fails or the row is missing (`copies.py:82`). The list must not show a row id. The owner is in one of named states: a current staff name, a role name, or unavailable. An unavailable owner keeps its row in the list and keeps its lease state.
+5. **Proof.** List tests for remote-only records and mixed local and remote records. Lease-state tests for held, idle and unavailable, with a former holder that the list does not name. A renamed owner with a different live holder shows the new owner name and the holder. A missing staff row shows the owner as unavailable, keeps the row and keeps its lease state.
+
+**Files:**
+- `scripts/copies/copies.py` — the list.
+- `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py` — the tests.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns `copies.py`; `test` owns `test_copies.py` and `test_remote_copies.py`.
+
+**Acceptance gate:** copies suites pass; basedpyright 0/0/0. Change-Review: `copies.py list` output.
+
+### Phase 20 — One build queue outage sends one message to the builds session and no repeated phone pushes  · status: done
+
+#### As-built
+
+- A long outage of the build queue service sends one message. `down_alert` in `scripts/build_queue/admission_client.py` sends it to session `builds` with `session_send_argv`, sender `build-admission`. The text names the journal command and the restart command.
+- A send result other than `sent` adds one blocked phone push through `alert.blocked`, with the action "On natedev, run: sudo systemctl restart build-admission.socket build-admission.service". `--clears-when` runs `admission_client.py view`, which exits nonzero while the service is down.
+- The claim stays when a send sent or kept a message. It releases only when both sends return `failed`, `refused` or `retry`.
+- `_check_outage_alert()` in `scripts/build_queue/admission_service.py` runs from `run_once`. It clears the `build-admission` claim once, after `silence_seconds` of listener uptime, with the last usable config. A failed clear prints one line and retries. Listener setup clears nothing.
+- `build_admission.down` is not in the push catalog.
+
+**Files:**
+- `scripts/build_queue/admission_client.py` — `down_alert`
+- `scripts/build_queue/admission_service.py` — `_check_outage_alert`, `listener_started_at`
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the removed entry
+- `docs/as-built/build-memory-admission.md` — the startup section
+- `scripts/build_queue/test_admission_client.py`, `scripts/build_queue/test_admission_service.py`
+
+**Binds later work:** a move of `scripts/notify` to repo-root imports moves the bare `push_texts` import in `down_alert` too.
+
+**Gotchas:** `from scripts.notify import push_texts` beside a bare `push_catalog` loads a second `ActionTemplate`, and `render` raises `extra values ['action']`. The alert half runs from main at once; the service half needs a service restart.
+
+**Ruled out:** a nonzero send as the cause of the repeats; a new config key for the steady run.
+
+### Phase 26 — A cloud gate holds a cloud slot and shows its modules done  · status: done
+
+**Depends on:** none. aws builds the runner (builds-aws-up phase 5) and calls this phase's publish function. Priority over 27 (builds, 2026-11-07).
+
+1. **The ask (user ruling 2026-11-07, through builds; builds-aws-up phase 6).** Merge gates and targeted tests run on cloud Spot boxes as soon as possible. The queue tracks each cloud gate as one cloud slot and charges it no natedev memory. Up to 9 cloud gates run at once, and later ones wait. The HTML page and `/build:queue` show modules done of total for each cloud gate. Every tunable is in config.
+2. **Admission.** `AdmitRequest` gets a place: `LocalPlace` or `CloudPlace(target)`. The natedev route process admits through `admission_client` with step `merge-gate` or `targeted-test` and `CloudPlace("aws")`. Its pid is the run identity, so a dead route frees its slot. A cloud row needs no memory, takes no memory room, and gets no progress-memory adjustment. It waits only for a free cloud slot.
+3. **Slots.** `config/build_admission.conf` gets `cloud_gate_slots=9`, read at use. A waiting cloud gate names its wait: all cloud slots are in use, with the count.
+4. **Progress data (agreed with aws-unit, 2026-11-07).** The route writes `modules` done and total with `progress_profile.publish_counter(sidecar, ...)`, the file `merge_gate.py` writes today. A new module `scripts/build_queue/cloud_progress.py` holds `CloudProgress` (state `requesting|setup|running|uploading` as a named type, `size_vcpus`, `failed_modules` count, `updated_at`), its atomic writer `publish(sidecar, progress)` and its reader. The file is `<sidecar>.cloud.json`. A missing or unreadable file is a named state, not `None`.
+5. **View.** `queue_view` and `/build:queue` show cloud rows in their own group, with slots used of the total. Each row shows unit, step, state, modules done of total, vCPUs and elapsed time. A row with no update for `cloud_gate_stale_pushes` push intervals shows its age. `cloud_gate_stale_pushes=3` is a new key in `config/build_admission.conf` (builds, 2026-11-07). The push interval is aws's key `log_push_s=5` in `config/cloud_gate.conf`; the view reads it with `conf.read("cloud_gate").number("log_push_s")`; aws-unit names `conf.read_or_repository`, which is on builds-aws only (aws-unit correction, 2026-11-07). Until aws's route lands, a missing key is a named state and the view shows no stale age.
+6. **The HTML page.** The memory page shows the same cloud group. It changes the page files after the legend change ends (the same files).
+7. **Fallback.** A gate that falls back to natedev ends its cloud row and admits again as a local gate.
+8. **Proof.** Tests by behavior: a cloud admit charges no memory; the tenth cloud gate waits and names its wait; a dead route frees its slot; the view and card show the progress, the missing-file state and the stale age. Goldens for the card and view. Change-Review: a fake cloud row on a private service shows on the card.
+
+**Files:** `scripts/build_queue/admission_protocol.py`, `admission_client.py`, `admission_service.py`, `cloud_progress.py` (new), `queue_view.py`, `queue_card.py`, `scripts/lint/memory_admit.py`, `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf`, their tests and goldens, `docs/as-built/build-memory-admission.md`.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** the merge gate; basedpyright 0/0/0 on each changed file; adversary and contract reviews.
+
+### Phase 27 — The build memory page feed is a boot service  · status: todo
+
+**Depends on:** the memory page legend change now with the impl worker (the same two files). 10m keeps its other items.
+
+1. **The ask (user, 2026-11-07).** "we need to make this a service that runs outside of agent shells - a service that starts on boot so probably gets added to nixos". Today the feed runs in a queue-unit shell from the session folder, and it stops when that shell stops.
+2. **The files move into the repository.** `memory_feed.py` and `memory_live.html` move from the design folder to `scripts/build_queue/`. This is 10m item 2, pulled forward. The open command and its name stay in 10m.
+3. **Config.** The new file `config/memory_feed.conf` holds the output folder (the review link folder for `h7uj5c`) and the update interval (3 s). The feed reads both at start. No path or interval stays in code. All keys are new (builds, 2026-11-07: a new key needs no go; a moved or changed key does).
+4. **The service.** `/etc/nixos/modules/linux/development.nix` gets `systemd.services.build-memory-feed`, next to `build-admission`. It starts at boot (`wantedBy = [ "multi-user.target" ]`), runs as the user, restarts on failure, and has `ConditionPathExists` on the feed script. It runs outside `builds.slice`. The nixos change goes on a branch; the branch and hash go to builds, and natedev pushes it.
+5. **Cut-over.** After the deploy, the queue unit stops its shell copy of the feed. One feed writes the folder.
+6. **Proof.** The feed's tests pass from the repository path, with a test for the config read. After the deploy, `systemctl status build-memory-feed` is active, and the page's update time moves. Change-Review: the page updates with no agent shell running.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** build_queue suites pass; basedpyright 0/0/0; `nixos-rebuild build` passes on the branch.
+
+### Phase 28 — A reservation matches the memory a run really uses  · status: done
+
+1. **The ask.** The user, 2026-11-07 17:30: "this is completely busted - we've been running with about 1.2GiB reserved for merge gates for the last few days - this is completely unacceptable", and of a hana build "reserving 15.6GiB and using 0.2GiB - it is ridiculous".
+2. **Facts found.** The need for a run with progress is the highest anonymous use any recorded run of the same key had in the next 20% of progress, over 14 days (`progress_profile.merge_profiles`, `HISTORY_DAYS`). Two full merge gates today recorded 17.3 GiB (builds, 16:28) and 16.0 GiB (herdr, 16:58) in one 5% bin. Their own gate samplers saw at most 2.8 GiB for the whole job tree. The other 263 gate runs have a median of 0.9 GiB in those bins. The director moved the two records to `$SD/evidence/bad-gate-profiles-20261107/` (17:33). Hana `build:1` profiles show 10 to 15 GiB at the end of a build.
+3. **Cause, as found (research 17:50).** Hana's memory is real: one live hana scope read 5.89 GiB `anon` and 5.89 GiB summed process `RssAnon` (difference under 1 MiB), almost all in one `rustc`; the same build later reached 10.9 GiB. The gate outliers are not explained by the saved records, which hold no process list or reading source. The likely cause: test helpers that leave the gate's process tree stay in its scope; the scope reader (`memory_admit.py` `slice_working_set`) counts them and the gate sampler (`merge_gate.py`) does not. To prove it, each saved profile records its reading source, and at the run's highest bin the scope's processes (pid, command, `RssAnon`). The next outlier then names the process. Fix its lifetime where it lives in a later phase.
+4. **One run never sets the need.** Per bin, the need uses the Nth-highest recorded run, with N from a new config key `progress_profile_rank` (start 2). A key with fewer than N runs uses its lowest run in that bin. Director's call: N=2 keeps hana's end at 12.9 GiB (3 runs: 15.2, 12.9, 10.2) and stops any one bad run; the risk is a run 2.3 GiB over its reservation.
+5. **Proof.** The two moved records, put back in a test copy, give a gate need under 3 GiB. A replay of today's live profiles shows each step's need before and after.
+
+**Workers:** 1 writer, 1 tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
+### Phase 29 — A gate with no running module waits in line for a CPU slot  · status: done
+
+The stall of 2026-11-07 18:20 to 19:20: six merge gates were admitted by the memory queue. The fix-rounds gate ran 60 minutes with no module, while a gate that started 30 minutes later held 11 CPU slots. Each gate takes a slot from the shared pool `/dev/steve` (32 slots) before each module (`merge_gate.py` `SharedCPUPool.try_acquire`). When no slot is free, the gate sleeps 0.05 s and tries again, and it logs nothing. cargo and rustc wait in a blocking read, so the pool gives them each freed slot first. Builds ruled (a) and the request timing on 2026-11-07 19:30; it ruled out a cap on full gates.
+
+1. **Wait in line.** A gate with no running module and a pending module waits in a blocking read on the pool, in line with cargo. A gate with a running module keeps its present non-blocking try, so it still samples memory and collects results.
+2. **One wait line.** The gate prints `waits for a CPU slot` once when such a wait starts, and the wait time when it ends.
+3. **Signals.** A stop signal during the wait stops the gate at once and returns every slot it holds. A slot read just as the signal comes is returned.
+4. **Request timing.** `admission_service.py` logs the wall time and the CPU time of each request that takes longer than a configured limit (new key; start 0.25 s). The log line names the request kind. The next "no answer in 0.5 s" then shows whether the time goes to CPU work in the service or to a wait.
+5. **Proof.** Tests with a fake pool: a gate with no running module blocks and starts its module when a slot comes back; the wait line prints once; a stop signal during the wait returns the slots. A service test logs a slow request and logs no fast one.
+
+### Phase 30 — A build target command does not load the admission service  · status: done
+
+Builds asked on 2026-11-08 (verify 41p facts; the build_hold import chain item of 11-06). `build_targets.py` eligible, reserve and release-wait import `admission_service` through `mac_test.py` → `build_hold.py`. `build_hold.py:38` imports it at module top, and its only use is `admission_service.read_state` in `admitted_processes()` (`build_hold.py:567`). `admission_service` loads records, protocols, estimators, queue snapshots and the memory admission code at module top; the estimator loads SQLite and the build-log modules. The import costs eligible 310 ms, reserve 203 ms and release-wait 267 ms wall (about 110 ms under load).
+
+1. **build_hold.** `build_hold.py` no longer imports `admission_service`. `admitted_processes()` reads the service state through the smallest module that holds `read_state` and `ServiceState`. If those two move out of `admission_service.py`, `admission_service` imports them from there; one definition stays. If a move costs more than it saves, import inside `admitted_processes()`.
+2. **admission_service top-level imports.** Find each top-level import that only a rare path uses. Move it to its user when the gain is measurable for a service client or `build_targets.py`. Do not change the service's hot path.
+3. **Measure.** CPU time (user + system) and wall time per `build_targets.py` start for eligible, reserve and release-wait, before and after, at the same load: interleave the runs, 15 each. Also `python3 -X importtime` for the top modules.
+4. **Proof.** A test proves `build_hold` and `build_targets` import without `scripts.build_queue.admission_service` in `sys.modules`. The existing build_hold, build_targets and admission service tests pass.
+
+### Phase 31 — A build target command starts with only the imports it uses  · status: done
+
+After Phase 30, `build_targets.py` eligible, reserve and release-wait still use about 530 ms of CPU per start. Builds asked on 2026-11-08: trace the rest now; base the measure and every edit on verify phase 41p, which changes `build_targets.py` imports (ETA 06:30 on builds). The queue unit edits only queue-owned files and sends facts on other owners' files to builds.
+
+1. **Trace.** `python3 -X importtime` and a CPU profile of each command's start. List each import over 10 ms cumulative: the module, its cost, which caller pulls it in, whether the command uses it, and the owner of the file that imports it.
+2. **Queue-owned edits.** For each queue-owned module on the path that the command does not use, move the import to its user. Queue-owned: `scripts/build_queue/`, `scripts/lint/memory_admit.py`, and the files earlier queue phases changed.
+3. **Facts to builds.** For each import in another owner's file, send builds the module, its cost and the proposed move.
+4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, on top of 41p.
+5. **Proof.** An import test for each moved import. The existing tests of each changed module pass.
+
+### Phase 32 — A merge gate claims the memory its runs used  · status: done
+
+1. **The ask (builds, 2026-11-08 06:50).** `step_estimator.py:244` `program_peak_estimate` returns `FirstProgramPeak` for every `merge-gate`, so admission claims the fixed 4 GiB. A herdr merge gate peaked at 26.4 GiB anonymous while admission counted 4 GiB; natedev went into earlyoom and hana's gate was killed twice. Evidence: `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/83/memory_kill_report.md`.
+2. **Measured claims.** A merge-gate claim uses the measured anonymous peak history of its host, as other programs do. The fixed value applies only when no history exists.
+3. **Outliers never set the claim.** The claim is the 90th percentile of the host's merge-gate peaks in 14 days, the rule other programs use. The research (phases/32/notes/research.md) withdrew the first rule, the 2nd-highest peak: 1,348 of 1,352 rows are 4.5-4.8 GiB, and 4 runaway rows (16.7-26.4 GiB, all after 2026-11-07 21:00) would set every gate's claim near 21 GiB for 14 days. The p90 is 4.65 GiB. The gate keeps itself near its own 4 GiB start limit (`merge_gate_governor_gib`), so a runaway test module is a gate defect, not a sizing input: verify fixes the tests, and a module memory limit in `merge_gate.py` belongs to its owner.
+4. **tmpfs is not in this phase.** The builds slice held up to 27 GiB of shmem in the same minutes, and no reservation counts it. Builds ruled (2026-11-08): `scripts/lint/memory_admit.py` is a resources file, so resources adds shmem to the slice's used memory. Verify fixes the two runaway tests.
+5. **Research first.** Why `merge-gate` was excluded (`a4d4c9988`, Phase 10o), where merge-gate peaks are written, and how gate claims and Phase 28 progress profiles relate.
+6. **Proof.** Tests: no history gives the fixed value; history gives the Nth-highest; one runaway peak does not set the claim. A replay of today's records shows the herdr gate claim before and after.
+
+**Workers:** 1 researcher, then 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review.
+
+### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: done
+
+**Depends on:** 10z (the page reads the room evidence 10z publishes) and report-unit Phase 15 on builds (builds ruling, 2026-11-05). report Phase 15 builds one typed provider, `charts.page_data(days, n=3) -> PageData | IndexUnavailable`, and starts at once. report-unit waits for 10m only in its Phase 26.
+
+1. **The ask (user, 2026-11-04, change reviews C959 and C969, through builds).** C959: "we are moving to the new build html page - we will use /build:queue for reference until we can retire it". C969: leftover-process ages on the queue board, "this should be the case on the new html page too".
+2. **The page.** The Build Memory page (memory_live.html, fed by memory_feed.py) is served by review link h7uj5c. Phase 27 moved the page, the feed and the hover test to `scripts/build_queue/`, and the boot service `build-memory-feed` runs the feed from there. 10m adds one command to open the page. The command name needs the user's approval. New board features go on this page. report-unit's cost and chart views land on this page too, not on a second one.
+3. **report-unit's sections (report-unit, 2026-11-04; C950 and C948).** The page gets two sections: the build history charts and a top-3 cost list. report-unit owns the data: one function in `scripts/buildlog`, `charts.page_data(days, n=3)`, returns typed data for both sections, no HTML, read in under 1 s for 7 days (builds ruling, 2026-11-05). The feed calls the function and the page draws its data. There is no JSON file between them.
+4. **Leftover-process ages.** The page shows each leftover process with the same readable age as the queue board ("45 min", "19 h", "2 d"), from the same formatter.
+5. **/build:queue.** It gets no new work. It stays for reference until the page covers it; 10n retires it.
+6. **Wait states.** The page shows the three wait states the service records: unreadable pressure (with its path), start spacing, and head protection. 10z keeps the pressure text and `ReadingAlertTests`; 10h owns holder names.
+7. **Proof.** The feed's tests pass, with feed and page tests for each of the three wait states. A pixel check of the page shows the cap, the room, the leftover ages and report-unit's sections. Each item returns as its own Change-Review row.
+
+8. **Partial readings (architect review of 10q, 2026-11-05).** The feed reads each part of the page on its own. When one part is unavailable (the cap, pressure, a run's use), the page keeps the other parts and names the missing one. Use named availability states, not a bare `None` (today `memory_feed.py:109` stores missing pressure as `None`, and `MemoryPage.cap` uses `None`). 10s already keeps the rows with no cap line (`memory_feed.py:295`, `memory_live.html:354`); this item replaces the `None` fields. Acceptance tests: with the cap alone unavailable, the page keeps its rows, the room and the reason text, for both `CapUnavailable(runs=())` (an old record) and named unavailable runs.
+9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`, `test_memory_hover.py`). Phase 27 moved them to `scripts/build_queue/` (`memory_feed.py`, `memory_live.html`, `test_memory_feed.py`, `test_memory_hover.py`); they stay there, because the boot service runs that path. The feed takes `--code-root`, reads `captured.ci_use`, `captured.cap_use` and `room_text(captured)`, and imports `snapshot_codec`; its hover shows phase, percent done, keep-aside and reason. `memory_feed.pre10x.py` is deleted at the 10x deploy and does not move. The feed makes one call to report Phase 15's `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` (report e913e5fa2; types in `charts.py`; 0.42-0.48 s for 7 days on the live index). `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`; `start` and `end` bound the recent window in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`; `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`; `CostAction(action, owner)`. The feed checks that one result: on `IndexUnavailable(reason)` the page shows the reason in place of both sections, and `NoDataYet` shows an empty top list with its window. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable`: the feed passes `days` of at least `TOP_COST_RECENT_DAYS` and shows a config error as the page reason. 10m starts only after report Phase 15 is on builds (it lands with report 24-25, after a user answer); builds says when. The item 7 pixel check uses their data.
+10. **Prototype behavior to keep (2026-11-06).** The Running table shows a Machine column after Duration and before Unit, from `scripts.buildlog.store.host_name()` (page round 16, the user's ask). When one view read misses the client's 0.5 s limit, the feed writes the last good reading plus `read_error` and `error_at`, and the page keeps its data; only the first read of a feed with no good reading shows "The queue did not answer" (page round 17, the user's blank-page report).
+11. **Browser proof (architect review of 18, 2026-11-06).** The browser proof today is `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/adhoc/memory_page7/verify.mjs`: Machine column order, a first read with no answer, a kept reading, and the stale-reading messages. It moves with the page, and the tester owns it.
+12. **Feed restart at install (architect review of 10s, 2026-11-05).** A running feed keeps the decoder it loaded, so a schema change breaks it until it restarts. The feed notices when the installed admission code changes and exits with a failure status; the boot service (`Restart=on-failure`) starts it again with the new decoder. Test: a feed that started before a schema update reads the new record after the restart.
+
+13. **Project names.** The feed prints each running and waiting step with `queue_lines.step_text`, not the raw step (`memory_feed.py:398` and `:471` today). Feed tests: a known project, a missing project, and an absolute path repository that shows the step alone.
+14. **Progress line and row list.** The running rows keep the thin progress line. A browser test keeps a walk whose row list shrinks between two readings.
+15. **Page defects from the design checks of 2026-11-06.**
+    1. The unit shows twice in a row: remove the second line of the name.
+    2. "not recorded / 25%" and "not recorded / 5%" wrap: keep them on one line.
+    3. The swap list's second label sits 3 px above the main baseline.
+    4. The swap list has 31 rows: show the large rows and sum the rest in one line.
+    5. Swap use shows three times: keep the Swap used bar with its limit, put the GiB figures on its line, and remove the purple bar.
+    6. Hatched "Reserved, not used yet" blocks reach 2.06:1 in light and 2.61:1 in dark; the floor is 3:1.
+    7. Small grey swap tags reach 4.18:1 in light; the floor is 4.5:1.
+    8. Rows sit 6 px inside the card edges: align them with the card text.
+    9. A queued reservation value ends at x=351 against x=302 above: use the dim style.
+    10. A missing unit shows a bare dash: remove the dash and the dot.
+    11. The Unit and Pid columns move 39 px when a step queues: reserve the Duration width.
+    12. The lower axis runs past the cap: end it at the last tick before the cap.
+    13. "0.2 GiB · 1.1 GiB" has no header: add "Used · reserved".
+    14. Open Legend values sit about 850 px from their labels: put them in a column near the longest label.
+    15. "Next step room" puts its value on a second line: keep it on the first line, right-aligned to the label column end.
+
+**Workers:** `impl` owns `scripts/build_queue/memory_feed.py` and `scripts/build_queue/memory_live.html`; `test` owns `scripts/build_queue/test_memory_*.py` and the browser proof from item 11. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
+
+### Phase 10n — /build:queue retires when the build page covers it  · status: todo
+
+**Depends on:** 10m.
+
+1. **The ask.** C959 (above): retire /build:queue once the page covers it.
+2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the view routes and the view code that only they use. `build_queue.py` also carries the `bump`, `clear` and `admit-head` controls, which the page does not have: these routes stay until the user approves a replacement (architect review of 18, 2026-11-06). Keep each formatter that a current caller uses: the card uses queue_view formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`, and `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code (architect review of 15 and 10o, 2026-11-06). Keep `queue_lines.step_text`: the card and the build page use it. The queue card and the unit-board queue pane stay unless the user says otherwise.
+3. **Proof.** No caller of the removed code remains; the suites pass.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns `commands/build/queue.md`, `scripts/build_queue/build_queue.py` and the view code that only it uses; `test` owns `scripts/build_queue/test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
+
+### Phase 10v — Every run in builds.slice asks the queue before it starts  · status: not landing
+
+**Not landing (user, 2026-11-06):** "local python testing for units seems as if we should just allow that - and it shouldn't be part of build quueue". A unit's local Python test runs start at once. Cargo steps and gates keep their queue places. Detached Python runs move to `builds-detached.slice` in Phase 23.
+
+#### As-built
+
+- No entry point exists. A plain Python run in `builds.slice` does not ask the queue, and its memory lowers the cap and the room through Other.
+- The `targeted test` name for a unit's own full run is in natest's work: `program_first_peak_gib.targeted-test=4`, `peak_hold_seconds.targeted-test=180`.
+
+**Binds later work:** the detached run group phase keeps detached Python runs outside the queue. Do not route a plain Python run through the queue.
+
+**Ruled out:** one entry point that every `builds.slice` run must pass. User, 2026-11-06: "local python testing for units seems as if we should just allow that - and it shouldn't be part of build quueue".
 
 ### Phase 1 — /build:queue answers in under a second, one line per step, and says why each step waits  · status: done
 
@@ -292,7 +1006,7 @@ The builds showrunner asked (2026-10-31): merge `origin/builds` (a546fe66, the v
 
 #### As-built
 
-- `QueuePlace.popen` always starts the program in its own transient scope under `builds.slice`, nested when the holder already runs there (builds showrunner, 2026-11-01: option B). With no scope it raises `QueuePlaceRefused("the queued program requires a memory scope; set BUILDLOG_SCOPE=0 only for tests")` before the fork. `probe_scope_prefix()` is split out; `suite_scope_prefix()` keeps its output for `merge_gate.run_suites` and `style_plan.split_all`.
+- `QueuePlace.popen` always starts the program in its own transient scope under `builds.slice`, nested when the holder already runs there (builds showrunner, 2026-11-01: option B). With no scope it raises `QueuePlaceRefused("the queued program requires a memory scope; set BUILDLOG_SCOPE=0 only for tests")` before the fork. `probe_scope_prefix()` is split out; `suite_scope_prefix()` keeps its output for `merge_gate.run_suites`.
 - `StartedProgram.tracking` is `ScopedProgram | ProgramTree`. `ScopedProgram` samples the scope's `cgroup.procs` (`program_members`, nested scopes included). `ProgramTree` runs only with `BUILDLOG_SCOPE=0`, for tests, and is outside the guarantee.
 - `finish()` calls `stop_scope(scope, deadline, sample_seconds)`: it rereads the scope's `cgroup.procs` until it is empty, sends TERM until `program_stop_seconds`, then writes `cgroup.kill` (per-pid SIGKILL where the kernel has no `cgroup.kill`). The release runs only after the scope is empty. The leader's exit status stays the place's `status`.
 - Live check on natedev: holder 55.8 MB + program 71.6 MB = charge 127.8 MB; a `setsid()` grandchild whose parent exits before the first sample is stopped before the release. No fallback.
@@ -417,398 +1131,276 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - A shadow run beside the old checker (user, 2026-10-31): one cut-over, no second admitter.
 
 ### Phase 10a — One function names every /tmp and /dev/shm build folder  · status: done
-**Depends on:** Phase 10 (the queue service names the admission and build folders)
 
-Asked by the builds showrunner on 2026-11-02, after the Phase 10 checkpoint. Spec at phase start: list every place that makes a build folder under `/tmp` or `/dev/shm`, name the one function that makes the name, and move each maker to it. No code before the Phase 10 checkpoint.
+#### As-built
 
-Inventory and Work Order: Phase 10 architect review, 2026-11-03.
-
-#### Work Order
-
-**Goal:** One function names temporary build folders under `/tmp`, `/dev/shm`, or an inherited temporary parent. Existing helpers retain their ownership and cleanup rules.
-
-**Spec:**
-
-1. Add `scripts/lib/build_folders.py::create_build_folder` as the common entry point.
-2. Provide a CLI for shell callers of this function.
-3. Use named request variants for unique temporary folders and stable owner folders.
-4. Preserve explicit parents, existing prefixes, permissions, and cleanup lifetimes.
-5. Keep folder creation atomic.
-6. Delegate registered task folders to `scripts.lib.scratch.new()`.
-7. Retain `scratch.target()` as the task naming rule.
-8. Obtain scratch roots from `copy_record.root()` and `copy_record.copies_root()`.
-9. Obtain unit run roots from `unit_runs.run_roots()`.
-10. Replace the separate sweep-state default in `memory_admit.py` with `tmp_sweep.state_dir()`.
-11. Preserve the existing sweep classification of each folder.
-12. Update cleanup readers only where the common function changes their inputs.
-
-**Inventory and Files:**
-
-Paths below are relative to the repository. “Not named” means the supplied ownership documents assign no owner.
-
-| Maker or helper | Existing names or purpose | Required change | Owner |
-|---|---|---|---|
-| `scripts/production/merge_gate.py` | `merge-gate-*`, module folders, `promotion-index-*`, `merge-gate-nightly-*` | Use the common function, including the explicit `/dev/shm` parent. | natedev showrunner |
-| `scripts/production/fast_track.py` | Check, promotion, checkout, and temporary index folders | Use the common function. | Not named |
-| `scripts/production/waiting.py` | `production-scratch-*` test checkout | Use the common function. | Not named |
-| `scripts/production/bump_gate.py` | `bump-gate-*` checkout beneath the record parent | Preserve the explicit parent. | Not named |
-| `scripts/production/ci_points.py` | `ci-point-*` validation checkout beneath the state directory | Preserve the explicit parent. | Not named |
-| `scripts/style/bulk_run.py` | `bulk-rule-test-*` checkout | Use the common function. | Not named |
-| `scripts/style/style_sync.py` | `style-sync-lint-*` checkout and control files | Preserve owner records and interrupted-run cleanup. | Not named |
-| `scripts/buildlog/rust_release.py` | `rust-release-trial-<version>` beneath `default_trial_parent()` | Preserve replacement and retry behavior. | report-unit |
-| `scripts/direct/verify.sh` | Run `tmp/`, `verify-tree.*`, `verify-doc-*`, `verify-copy.*`, `verify-hold.*` | Use the common function through its CLI. | verify-unit |
-| `scripts/lint/invoke.sh` | Creates inherited `TMPDIR`; names the `lint-sweep` stamp directory | Use the common naming rule where it creates these folders. | verify-unit |
-| `scripts/direct/prepare_session.sh` | `/tmp/claude/unit/<uuid>` | Use the existing unit-root authority through the common entry point. | Not named |
-| `scripts/direct/implement.sh` | Session `tmp/` | Use the common function through its CLI. | Not named |
-| `scripts/agents/codex_mesh.py::_set_run` | Run `tmp/` | Preserve the exported `TMPDIR` and ownership. | Not named |
-| `scripts/hooks/session-start-temp-root.py` | `/tmp/claude/session/<session>` | Preserve stable names, permissions, and short socket paths. | resources-unit |
-| `scripts/lib/scratch.py` | Registered task folders | Retain registration and task lifetime rules. | resources-unit |
-| `scripts/lib/copy_record.py` | Scratch and copy roots | Retain the existing root readers. | Not named |
-| `scripts/lib/unit_runs.py` | Current and former unit roots | Retain current and former root handling. | Not named |
-| `scripts/build_queue/queue_place.py` | `queue-place-*` sidecar parent | Preserve the folder until program cleanup and release finish. | queue-unit |
-| `scripts/build_queue/admission_test_support.py` | `admit-test-*`, short `/tmp/admit-sock-*` parent | Preserve private state and socket isolation. | queue-unit |
-| `scripts/mac_test/copy_watch.py` | `copy-watch.*` control folder | Use the common function. | verify-unit |
-| `scripts/mac_test/linux_runner.py` | Staging folders beneath cache and mirror parents | Preserve explicit parents, including temporary fixture parents. | verify-unit |
-| `scripts/lint/style_review.py` | Review folders beneath a phase directory | Preserve the phase parent and ownership records. | Not named |
-| `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` | `checkpoint-doc-*`, `checkpoint-paths-*` | Use the common function for these build-check folders. | verify-unit |
-| `scripts/lint/memory_admit.py` | Separate `LINT_SWEEP_STATE_DIR` default | Call `scripts.lint.tmp_sweep.state_dir()`. | queue-unit |
-
-The scan also finds temporary folders for screenshots, messages, configuration validation, installation, and proposal text. These folders do not contain builds.
-
-`smoke_launch.sh` creates application configuration after the build finishes. Its temporary folder is an application launch folder.
-
-`demo_refusals.sh` creates a director demonstration fixture. It does not create a build workspace.
-
-Ordinary test roots remain private `tempfile` roots. Shared fixtures that name build or admission folders use the common function.
+- `scripts.lib.build_folders.create_build_folder(request: BuildFolderRequest) -> Path` accepts `UniqueBuildFolder(prefix, parent)` or `StableOwnerFolder(name, parent, mode)`. Unique allocation is atomic with mode `0700`. Stable allocation preserves existing contents and permissions.
+- `InheritedTemporaryParent` reads `TMPDIR` at allocation. `ExplicitBuildParent` preserves the supplied parent. `SystemTemporaryParent` selects `/tmp`. `UnitRunParent` uses `unit_runs.run_roots()`. The merge gate requires `/dev/shm` without a disk fallback.
+- `FOLDER_PREFIXES` defines build names. `MKDTEMP_SUFFIX_PATTERN` defines eight-character allocator suffixes. `temporary_build_folder(request: UniqueBuildFolder) -> Generator[Path]` uses standard-library cleanup and permission repair. Callers retain ownership records and cleanup order.
+- The CLI prints one path. Forms are `unique --kind KIND [--owner TEXT] [--parent PATH | --system-temp]` and `unique --prefix TEXT [--parent PATH | --system-temp]`. Stable forms are `stable --name NAME (--parent PATH | --unit-root)`, `stable --path PATH`, and `stable --run-temp RUN`. `run-temp-path RUN` only names the path.
+- `scratch.new()` and `scratch.target()` retain registration and task naming. `copy_record.root()` and `copy_record.copies_root()` retain root authority. `unit_runs.RUN_TEMP_NAME` names run temporary folders. `unit_runs.activate()` maintains current and former markers.
+- `memory_admit.is_fresh_test()` reads `tmp_sweep.state_dir()` at use. `tmp_sweep.TARGET_DELETES_NAME` names the shared deletion record. Private sweep roots select private copies folders. Admission state and snapshots remain outside temporary build folders.
 
 **Files:**
 
-- `scripts/lib/build_folders.py` — new: `create_build_folder` and its CLI
-- `scripts/lib/test_build_folders.py` — new: the helper tests
-- `scripts/production/merge_gate.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/fast_track.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/waiting.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/bump_gate.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/production/ci_points.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/style/bulk_run.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/style/style_sync.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/buildlog/rust_release.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/direct/verify.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/invoke.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/direct/prepare_session.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/direct/implement.sh` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/agents/codex_mesh.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/hooks/session-start-temp-root.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/build_queue/queue_place.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/build_queue/admission_test_support.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/mac_test/copy_watch.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/mac_test/linux_runner.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/style_review.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/memory_admit.py` — moves its folder maker to the common function (see the inventory for the owner)
-- `scripts/lint/test_memory_admit.py` — the shared sweep-state reader
-- `scripts/lint/test_tmp_sweep.py`, `scripts/lib/test_folder_audit.py`, `scripts/lib/test_scratch.py` — preserved cleanup classifications
-- `docs/as-built/build-memory-admission.md` — the folder naming rule
-  The tests beside each changed maker change with it. The notice records each cross-owner change.
+- `scripts/lib/build_folders.py`, `scripts/lib/unit_runs.py`, `scripts/lib/socket_test_support.py` — naming, run paths, markers, and short socket parents.
+- `scripts/production/{merge_gate,fast_track,waiting,bump_gate,ci_points}.py`, `scripts/style/{bulk_run,style_sync}.py` — temporary checkout and index callers.
+- `scripts/buildlog/rust_release.py` — shared trial prefix and inherited parent; Git creates the clone.
+- `scripts/direct/{verify,prepare_session,implement}.sh`, `scripts/lint/invoke.sh`, `scripts/agents/codex_mesh.py` — CLI allocations and run temporary folders.
+- `scripts/hooks/{session-start-temp-root,pre-tool-use-checkpoint-doc-gate}.py` — stable session roots and temporary checkpoint folders.
+- `scripts/build_queue/{queue_place,admission_test_support}.py`, `scripts/mac_test/{copy_watch,linux_runner}.py`, `scripts/lint/style_review.py` — sidecar, admission, staging, and review folders.
+- `scripts/lint/{tmp_sweep,sweep,folder_audit,memory_admit}.py` — shared names, ownership classification, and sweep-state reads.
+- `docs/as-built/build-memory-admission.md`, `scripts/lib/test_build_folders.py`, and adjacent tests — naming reference and cleanup coverage.
 
-**Workers:** `1 writer + 1 tester`
+**Gotchas:** `verify.sh` prepares a missing `TMPDIR` through `invoke.sh --prepare-temp` before environment loading. Script-copy fixtures require adjacent dependencies. `test_verify_nix_shell`, `test_verify_ssh_targets`, and `test_verify_step_owner` cover these dependencies. Sweeps also accept six-character shell suffixes until 2026-12-03. The SSH promotion check uses self-contained `tempfile.TemporaryDirectory(prefix="promotion-index-")` before the Mac fetch. The assertion guard can associate a decorator with the preceding test.
 
-- `impl` — The common function, its CLI, production callers, and documentation. Hub: `scripts/lib/build_folders.py`.
-- `test` — The new helper tests, shared fixtures, cleanup regressions, and affected caller tests.
+**Ruled out:** Unused `RegisteredTaskFolder`, `ScratchParent`, `CopiesParent`, `RequiredMemoryParent`, `task`, and `--mode` wrappers; their existing authorities remain separate.
 
-**State:** Existing scratch records, owner records, and unit markers keep their formats. The phase creates no second registry.
+### Phase 10b — The /build:queue card carries the build-why facts, and build-why goes  · status: done
 
-**Constraints from prior phases:**
+#### As-built
 
-1. Keep durable admission state outside temporary build folders.
-2. Preserve `admission/state.json` and the service-owned `admission/queue.json`.
-3. Preserve the short socket parent used by `AdmissionFixture`.
-4. Preserve Mac temporary-root handling.
-5. Preserve scope cleanup before queue-place release.
-6. Keep `tmp_sweep.state_dir()` as the sweep-state authority.
-7. Keep scratch task registration in `scratch.py`.
-8. Do not access the live admission service from tests.
-
-**Acceptance gate:**
-
-1. Test every inventory category through the common function.
-2. Test an inherited `TMPDIR`, an explicit parent, and `/dev/shm`.
-3. Test stable owner names and concurrent unique allocations.
-4. Test paths containing spaces.
-5. Test refusal when the required memory filesystem is unavailable.
-6. Test cleanup after normal completion and interruption.
-7. Test that live scratch ownership still prevents deletion.
-8. Test that `memory_admit.py` observes a changed `LINT_SWEEP_STATE_DIR` through `tmp_sweep.state_dir()`.
-9. Retain the admission fixture test with a long `TMPDIR`.
-10. Retain the service snapshot tests and AWS snapshot refusal test.
-11. Run affected tests and the full merge gate.
-12. Require `basedpyright` to report `0 errors, 0 warnings, 0 notes`.
-
-**Change-Review line:** build folders use one naming function | run a merge gate and a verify step with a private `TMPDIR` | their folders use the common function, and cleanup preserves live work.
-
-### Phase 10b — The /build:queue card carries the build-why facts, and build-why goes  · status: todo
-**Depends on:** Phase 10 (the card reads the queue service); Phase 10a (same build_queue files)
-
-The user returned change review C683 on 2026-11-02: "this seems to be duplicative with /build:queue # - both are showing information about where an item sits in a queue - these capabilities should be combined into the /build:queue # command". The builds showrunner decided: put the build-why facts in the card and keep one place for each fact.
-
-Decision (queue-unit, 2026-11-02): remove `build_why.py` and the `build-why` command; keep no alias, so there is one way to see a step. The card (shown below the queue view since Phase 10) gains the facts build-why showed and the card lacks: the head's recorded evidence, how long the first step has been head, and the release advice. Each fact appears once on the page. Spec at phase start: list build-why's facts against the card's, and every caller and doc of `build_why.py`.
-
-Resources Phase 42's card rules are not part of this phase (builds showrunner, 2026-11-03): the user keeps Phase 42 paused, so 10b builds the card without them. They return only when the user releases Phase 42.
-
-Work Order: Phase 10 architect review, 2026-11-03.
-
-#### Work Order
-
-**Goal:** `/build:queue <position|session|folder>` provides the facts currently available through build-why. Remove `build_why.py` without an alias.
-
-**Spec:**
-
-1. Keep the full queue view above the card.
-2. Keep one blank line between the view and card.
-3. Use one `QueueRead` for the complete page.
-4. Read optional head history once through `head_facts.read_head_facts()`.
-5. Resolve labels once for the complete page.
-6. Move explanation formatters into `scripts/build_queue/queue_evidence.py`.
-7. Make the card use those formatters.
-8. Keep admission rules and release calculations in `memory_admit.py`.
-9. Use the reply's policy and limits when formatting recorded evidence.
-10. Read no live configuration to reinterpret an earlier reply.
-11. Display each fact once on the complete page.
-12. Preserve useful “unknown” states when optional evidence is absent.
-13. Remove `scripts/build_queue/build_why.py`.
-14. Remove any remaining build-why command registration.
-15. Add no alias.
-
-No build-why command file exists under `commands/` in this tree. The remaining command instruction is in `commands/build/queue.md`.
-
-**Fact inventory:**
-
-| Fact | Current build-why output | Current card or queue output | Required destination |
-|---|---|---|---|
-| Reading time | Header | Queue header | Keep once in the header. |
-| Available RAM and total RAM | Header | Head checks show available RAM; total RAM is absent. | Add the missing total. |
-| Charged memory and budget | Header and totals | Queue budget display | Keep one summary. |
-| Pressure and recovery spacing | Header and detailed checks | Admission checks | Preserve values and thresholds without repeated paragraphs. |
-| Local load and CPU count | Header | Absent | Add one optional host line. |
-| Running step identities | Running table | Only a selected running step has details. | Add the running evidence required to explain the head. |
-| Admission time and running age | Running table | Selected running step | Share one rendering. |
-| Promise, charge, and current use | Running table | Selected running step lacks the promise. | Show all three values once. |
-| Charge basis | Detailed text | Absent | Add the recorded basis text. |
-| Total current use | Running totals | Absent | Add once. |
-| Head identity, need, and waiting age | Head section | Queue and card | Reuse the existing facts. |
-| Need source and basis | Detailed head text | Absent | Add runs, shape, history window, floor, factor, and cap evidence. |
-| Filter, package, and width | Need text | Absent | Add recorded values. |
-| Historical bump events | Counts and grouped records | Some records currently explain order. | Keep today's card text; do not change how bump records explain order. |
-| Current unit priority | Order text | Repeated through several lines | Keep today's card text. |
-| Strict or backfill window | Order text | Order check | Preserve the window and remaining time. |
-| Completed CPU-token waits | Durations and time spans | Absent | Add recorded waits and unknown states. |
-| Budget arithmetic | Detailed check | Existing check lines | Preserve the complete arithmetic once. |
-| Free-memory arithmetic | Detailed check | Existing check lines | Preserve reserve and unused growth terms. |
-| Followers that fit now | Line summary | Partial ahead-step list | Add count, need range, and oldest waiting age. |
-| Estimate expiry | Explicit text | Card text mentions a poll. | Describe the service refresh. |
-| Release advice | Minimum endings or recovery time | Absent | Add the existing counterfactual result. |
-| Unowned slice memory | Not fully represented by the old table | Queue and card | Preserve each row once. |
-
-**Head timing:**
-
-1. Describe `joined_at` as queue arrival.
-2. Describe elapsed time as time waiting.
-3. Show the existing order-window deadline separately.
-4. Add no `head_since` state.
-5. Remove “time as head” from this phase's Change-Review text.
-
-**Callers and documentation:**
-
-| Current reference | Required action |
-|---|---|
-| `scripts/build_queue/test_build_why.py` | Move retained formatter and behavior tests to the card and evidence tests. |
-| `scripts/build_queue/test_admission_protocol.py` | Import the new evidence formatters. Preserve serialized-reply parity tests. |
-| `scripts/build_queue/test_admission_service.py` | Preserve cap text and captured-policy tests through the new formatters. |
-| `scripts/build_queue/test_build_queue.py` | Replace build-why parity and CLI cases with combined-page cases. |
-| `scripts/build_queue/head_facts.py` | Correct the module description. Retain its bounded history reader. |
-| `scripts/lib/test_terminal_cells.py` | Correct the description of its consumers. |
-| `commands/build/queue.md` | Replace the build-why instruction with the selected queue page. |
-| `docs/as-built/build-memory-admission.md` | Describe the combined page and the new formatter location. |
-| `docs/plans/builds-production.md` | Remove build-why from the active unit description. |
-| `docs/plans/builds-report.md` | Correct active test references. |
-| `docs/plans/builds-resources.md` | Retarget active Phases 17, 19, 20, and 39 to the new formatter and tests. |
-| `docs/plans/builds-queue-service-design.md` | Mark obsolete user instructions as superseded. |
-| `docs/plans/builds-queue.md` | Correct remaining active references. Preserve completed-phase history. |
-
-Resources Phase 20 currently assigns release text to `build_why.release_text`. Retarget that ownership rule before deleting the file.
+- `/build:queue <position|session|folder>` shows the full queue, one blank line, and selected cards; `mine` uses the same layout.
+  One `QueueRead`, one optional `head_facts.read_head_facts(reading)`, and one label resolution supply the complete page.
+- Running and Queued sections share aligned memory bars with the budget summary.
+  Live runs show use against grants, including merge gates; runs without reservations show `between steps`.
+  Ended runs with processes have a separate section; empty scopes remain charged but have no row.
+  Staff records supply unit names; missing units use session names, and unit columns remove the showrunner prefix.
+- `queue_evidence.py` formats recorded need, package, filters, width, charge basis, pressure, arithmetic, token waits, follower fit, and release advice.
+  `need_text(source, *, budget: int, zone: ZoneInfo)` requires the recorded budget and an explicit zone; formatters never reinterpret replies through live configuration.
+- `build_queue.main` reads optional host load and computes `smallest_head_release` once for selected pages; `release_text` formats that result.
+  Admission rules remain in `memory_admit.py`; `MemoryPressure.condition` records `full` or `swap`, and both pressure formatters use that cause.
+- Cards show queue arrival, time waiting, and the separate order-window deadline; unavailable optional evidence remains unknown.
+  The pane retains its selection and last complete page after a failed refresh.
+- `build_why.py` and its command are absent; `queue_evidence.py` owns the retained formatters, including `release_text`.
 
 **Files:**
 
-- `scripts/build_queue/queue_evidence.py` — new home for explanation formatters.
-- `scripts/build_queue/queue_card.py`, `queue_view.py`, `head_facts.py`, `build_queue.py` — the combined page.
-- `scripts/build_queue/build_why.py` — delete.
-- `scripts/build_queue/test_queue_evidence.py` — new formatter tests.
-- `scripts/build_queue/test_queue_card.py`, `test_queue_view.py`, `test_head_facts.py`, `test_build_queue.py` — page and fact tests.
-- `scripts/build_queue/test_admission_protocol.py`, `test_admission_service.py` — retained consumer tests.
-- `scripts/build_queue/test_build_why.py` — remove after its retained cases move.
-- `scripts/lib/test_terminal_cells.py` — consumer description.
-- `mods/unit-board/tests/queue.test.ts` — combined-page and failed-refresh coverage.
-- `commands/build/queue.md`, `docs/as-built/build-memory-admission.md`, `docs/plans/builds-production.md`, `docs/plans/builds-report.md`, `docs/plans/builds-resources.md`, `docs/plans/builds-queue-service-design.md` — the command and doc changes in the table above
-  Queue-unit owns the Python queue files. Coordinate the pane tests with unit-board-unit and the resource-plan changes with resources-unit.
+- `scripts/build_queue/queue_evidence.py`, `queue_card.py`, `queue_view.py`, `build_queue.py` — evidence formatters, selected cards, section layout, and page inputs.
+- `scripts/build_queue/head_facts.py`, `queue_lines.py` — bounded history, shared clocks, and terminal alignment.
+- `scripts/build_queue/scope_activity.py`, `admission_service.py` — process ownership, live runs, and scope evidence.
+- `scripts/lint/memory_admit.py` — admission rules, recorded pressure causes, reservation matching, and release calculations.
+- `scripts/build_queue/test_queue_evidence.py`, `test_queue_card.py`, `test_queue_view.py`, `test_build_queue.py`, `golden/` — formatter, selection, section, and complete-page regressions.
+- `mods/unit-board/tests/queue.test.ts`, `selected_page_fixture.ts` — shared terminal/pane output and failed-refresh coverage.
+- `commands/build/queue.md`, `docs/as-built/build-memory-admission.md` — command instructions and evidence ownership.
 
-Queue-unit owns the Python queue files. Coordinate the pane tests with unit-board-unit and the resource-plan changes with resources-unit.
+**Binds later work:** `read_pressure(host, *, policy)` uses supplied thresholds; evidence formatters use reply policy and limits, with no new admission state or history format.
 
-**Workers:** `1 writer + 1 tester`
+**Gotchas:** Unselected pages perform no release search. History scans stop at 32 MiB, and bump details show at most eight groups. Missing step checks return `ReadingUnavailable`.
 
-- `impl` — The evidence formatters, page renderers, deletion, command text, and documentation. Hub: `queue_evidence.py`.
-- `test` — Migrated formatter tests, consumer tests, page tests, and pane regressions.
+**Ruled out:** A `build-why` alias; separate `head_since` state; live configuration reads for recorded evidence.
 
-**State:** The phase adds no admission state or history format. The pane keeps its selected card and last complete page.
+### Phase 10c — The admission settings live in config/build_admission.conf, and the code keeps no copy of them  · status: done
 
-**Constraints from prior phases:**
+#### As-built
 
-| State or outcome | Observer and visible effect | Ownership and acceptance |
-|---|---|---|
-| `admission/queue.json` | AWS control reads it. Invalid evidence prevents an AWS start. No new queue control is needed. | Phase 10 owns the implementation. Phase 10a preserves its path and existing snapshot tests. |
-| Memory wait history | `/history` and build reports show recorded waits. | Phase 11 preserves balanced events through `test_verify_token_memory_history`. |
-| Durable grant replay | The client receives the same reservation. The user sees one charge. | Phase 11 preserves distinct-reservation replay tests. No extra UI state is needed. |
-| Build-history generation | The client refreshes an invalid estimate. The user sees the normal waiting output. | Phases 10c and 11 preserve generation tests. This phase retains useful expiry text. |
+- `config/build_admission.conf` holds every admission key (the old `config/lint.conf` `[memory]` section, with `program_first_peak_gib.cargo=12`). `memory_admit.py` keeps no default copy of a value. Measured constants (`RELEASE_HEADROOM`, `ANON_SHARE`, `FILTERED_FLOOR`, `HISTORY_DAYS`) stay in code.
+- Each pass makes one `conf.read` and gets a usable or an unusable `MemoryConfig`. A recovered value is usable and warns once per process at the client boundary (`ConfigurationDiagnostic`). An unusable key stops grants with one refusal line that names the file, the key and the value.
+- Release and cleanup need no config: each grant saves its cleanup timing, and the service serves releases and cleanup while the config is unusable. Old ledger grants without cleanup timing restore after an upgrade.
+- The service listens with unusable config, answers views with the refusal, and watches the nearest existing config folder through `scripts/lib/inotify.py`; it re-arms the watch on each event and retries a failed watch.
+- Each request carries one hash of the loaded admission code (`scripts/build_queue/admission_code.py`), so `drain_check` counts only callers that run older code. Dead and reused caller records are pruned.
+- `ExplainReply` carries `ConfigurationDiagnostic` diagnostics; `ConfigFallback` is gone, with no alias.
+- Tests read fixture settings through `CONF_DIR`; no test depends on the live file.
 
-**Acceptance gate:**
+**Files:**
 
-1. Cover every row of the fact inventory.
-2. Compare terminal and pane output from the same `QueueRead`.
-3. Test head, follower, running, multiple-match, and empty selections.
-4. Test missing history, missing load, and unreadable optional records.
-5. Preserve cap-basis text and `LifetimePromise` text.
-6. Preserve failed-peak, test-phase, decay, and captured-policy cases.
-7. Test release advice for endings, recovery spacing, pressure, and expired estimates.
-8. Test that a failed pane refresh keeps the complete previous page.
-9. Keep the existing bounded service-failure behavior.
-10. Leave no executable caller or active acceptance gate importing `build_why`.
-11. Run the affected Python suites and unit-board tests.
-12. Require a clean type check and a green merge gate.
+- `config/build_admission.conf`, `config/lint.conf` — the admission keys and their move.
+- `scripts/lint/memory_admit.py` — `MemoryConfig`, one read per pass, the refusal line.
+- `scripts/build_queue/admission_service.py`, `admission_client.py`, `admission_protocol.py`, `admission_code.py`, `queue_place.py`, `queue_view.py` — consumers, the config watch, the code hash, diagnostics and the refusal in the view.
+- `scripts/lib/inotify.py` — the shared folder watch.
+- `scripts/mac_test/loopback_proof.py` — reads `cargo_first_peak_bytes()`.
+- `scripts/lint/fixtures/build_admission.conf` and the build_queue, lint, hooks and production admission tests — fixture settings through `CONF_DIR`.
+- `docs/as-built/build-memory-admission.md` — the settings file and the refusal.
 
-**Change-Review line:** the queue card contains the build-why facts | type `/build:queue 1` while a step waits | the queue appears above its evidence and release advice, with each fact shown once.
+**Gotchas:** A step loads the admission code without an extra Python start (gate fix). `admission_service.py` `main()` leaves argparse defaults to argparse; a namespace class attribute hides the default.
 
-### Phase 10c — The admission settings live in config/build_admission.conf, and the code keeps no copy of them  · status: todo
-**Depends on:** Phase 10 (scripts/lib/conf.py reads in memory_admit.py); Phase 10b (same memory_admit.py and build_queue files)
-**Config reader (builds showrunner, 2026-11-02):** devtools Phase 4r replaces `conf.text`, `number`, `whole`, `words` and `values` with `conf.read(file) -> ConfigRead`. If 4r is on main when this phase starts, use `conf.read`.
+**Ruled out:** Optional profile fields for a missing key; an alias for `ConfigFallback`; config reads in release or cleanup.
 
-**Why.** Showrunner request, 2026-11-02 (builds): config phase 2 gets a place in this plan. The `[memory]` admission keys sit in `config/lint.conf`, and `scripts/lint/memory_admit.py` keeps copies of their values (`FALLBACK = 12 * GIB` for `program_first_peak_gib.cargo`, `FALLBACK_BUILD_BUDGET_BYTES = 21 * GIB`, `FALLBACK_TEST_PHASE_MARGIN = 1.2`, `DEFAULT_MEMORY_CONFIG`). User rule 2026-10-31: tunables live in config, read at use; no hard-coded copy. The External note in Phase 10 holds this move until now.
+### Phase 10d — hana CI builds wait in the build admission queue  · status: done
 
-**Work Order.**
-1. Move every `[memory]` key from `config/lint.conf` to `config/build_admission.conf`, with its comments. Add `program_first_peak_gib.cargo=12`. Read the file through `scripts/lib/conf.py`, the approved reader on main.
-2. Remove the value copies from `memory_admit.py`: `FALLBACK` as a config value, `FALLBACK_BUILD_BUDGET_BYTES`, `FALLBACK_TEST_PHASE_MARGIN` and the default policy values. A missing or invalid key refuses with one line that names the file and the key: the service holds the queue and says why; a client exits with its checker-failure status. No silent default.
-3. Measured constants that are not tunables stay in code with their evidence comments (`RELEASE_HEADROOM`, `ANON_SHARE`, `FILTERED_FLOOR`, `HISTORY_DAYS`).
-4. The `ConfigFallback` warning path goes with the fallbacks. The views and `explain` show a config refusal in its place.
-5. Tests read a fixture `build_admission.conf` through `CONF_DIR`; no test depends on the live file.
-6. Update `docs/as-built/build-memory-admission.md` and every doc that names `config/lint.conf` `[memory]`.
+#### As-built
 
-**Constraints from the Phase 10 architect review (2026-11-03):**
-- Correct Work Order item 2 against the code now on the branch: `program_first_peak_gib.cargo=12` already exists in the config, and `FALLBACK_BUILD_BUDGET_BYTES`, `FALLBACK_TEST_PHASE_MARGIN` and `DEFAULT_MEMORY_CONFIG` are gone. At phase start, list the policy defaults that remain in code, their reader functions, the protocol diagnostics that carry config fallbacks, the config fixtures and their consumers. Remove each default from that list.
-- Config result: a named result type, usable or unusable. `conf.value_origin()` tells a live value from a recovered value. A recovered value (the repository file or the committed file, through `conf.read`) is usable and prints its warning once. An unavailable value is unusable: the service grants nothing while a key it needs is unusable, and it says why in the view.
-- Release and cleanup never need config: `persist()` in `admission_service.py` and `QueuePlace.finish()` in `queue_place.py` read config today. A config refusal must not stop a release, a reservation end or a scope cleanup.
-- A test edits a key to a bad value, sees grants stop with the refusal line, then edits it back and sees the next pass grant again. No grant uses the rejected value.
-- Use `conf.read` (devtools 4r is on builds at 92ce5f38a). One `ConfigRead` per pass.
+- `scripts/build_queue/ci_cargo_front.py` is the cargo front of a hana CI runner, packaged from the store so a runner account reads no `~/.claude`. Each building cargo call holds one reservation for its lifetime. Other commands pass through.
+- `--front <path>` names the front's own path. `cargo_path(explicit, front)` skips it, so the packaged wrapper does not select itself.
+- `end_with_front(front_pid)` sets `PR_SET_PDEATHSIG` with a `getppid` check, so cargo ends when the front is killed. Existing cargo descendants do not inherit the death signal.
+- `ServiceEstimateRequest` lets a client send no estimate: the service reads config and history and replies with the need it charged. `AcquisitionTiming` is separate from `CleanupTiming`, and `RunnerExecutionTiming` and `RunnerAdmitted` carry what a runner needs. A runner client reads no config and no history.
+- The service reads the peer account. A runner account gets a refusal for priority set and clear, `admit_head`, and any release, width, token, run place or replay request for an owner it did not register. Authorization comes before any saved state change.
+- `admission_client.width` uses `request_id()`, so a runner changes its own width through the client. `memory_admit.py:2447` removes a run's progress json, log and sidecar in a loop that catches only `PermissionError`, so runner files do not stop a release.
+- `config/build_admission.conf` `ci_label=hana CI · {runner} · {job}` is the queue label. `admission_records._ci_label(value)` validates it, so an invalid label cannot stop the service.
+- `memory_admit.unowned_slice_memory` subtracts registered CI use, and only an unregistered worker starts a `RunningServiceJob`, so a registered job counts once in the cap. `ci_keep_aside` applies only while a running CI job has no reservation. `ProgramTree.adopter` tracks a program the CI front adopts.
+- A CI call sets the progress settings on the child only and uses the look-ahead keep-aside.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `config/build_admission.conf`, `config/lint.conf`, `memory_admit.py`, the service and client consumers, `queue_place.py`, the docs; hub: `scripts/lint/memory_admit.py`
-- `test` — the config fixtures through `CONF_DIR`, the usable and unusable config tests, the protocol diagnostic tests and the release and cleanup regressions
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py`, `scripts/build_queue/test_ci_cargo_front.py` — the front
+- `scripts/build_queue/admission_service.py`, `admission_protocol.py`, `admission_client.py`, `admission_records.py` — peer authorization, service estimates, runner timing
+- `scripts/build_queue/queue_place.py`, `queue_view.py` — `ProgramTree.adopter`, the CI row
+- `scripts/lint/memory_admit.py` — one count of CI use, the release cleanup
+- `config/build_admission.conf` — `ci_label`
+- `docs/as-built/build-memory-admission.md` — the front, the socket rule, the limits
 
-**Acceptance.** `config/lint.conf` has no `[memory]` section; `memory_admit.py` holds no copy of a config value; a test with the key removed sees the refusal line; a release and a scope cleanup succeed while the config is unusable. Change-Review: open the Build queue pane; it reads as before; `config/build_admission.conf` holds the admission keys.
+**Binds later work:** natedev owns the NixOS activation: the socket group, the runner PATH, `ADMISSION_SOCKET` and `BindPaths` where needed. `hana-ci.slice` stays at `MemoryMax=34G`. Until that activation, a CI job has no reservation, so `ci_memory_margin_gib` and the mixed keep-aside rule stay. The deletion is its own todo phase, "The hana CI margin key goes after the runner activation". The runner client takes no local config read.
 
-### Phase 10d — hana CI builds wait in the build admission queue  · status: todo
-**Depends on:** Phase 10 (the admission client); Phase 10c (the CI admission reads build_admission.conf)
+**Gotchas:** an existing cargo descendant can survive a SIGKILL of the front. An absolute call to another cargo goes past the front. A service that has not restarted has no runner authorization, so the socket opens to the group only after the service is on main and live.
 
-**Why.** Showrunner decision, 2026-11-02 (builds): hana CI on natedev ran out of memory at 13:50 EST. The Test Suite and "Linux: Compile and Production Wiring" jobs built hana at the same time inside `hana-ci.slice` (`MemoryMax=18G`), and the kernel killed a 6.7 GB rustc. CI memory sits outside the 24 GiB admission budget, so two budgets split one machine. CI runner builds go through build admission, as every other build does, so one budget holds all build memory.
+**Ruled out:** a fixed 57G limit (user, 2026-11-05: "57GiB is impossible if we're running other programs"); a runner client that reads config or history; a copy of client code in `/etc/nixos`; an optional profile on `AdmitRequest` in place of a named request.
 
-**Work Order.**
-1. Hook point: each building cargo call in a runner job holds one admission reservation for its lifetime, the same contract as `scripts/build_hold/cargo` for sessions. Non-building commands pass through. The cargo-tile shim stays; the admission step runs in front of the real cargo.
-2. Client delivery: the runner accounts cannot read `~/.claude`. The client reaches them from the store, pinned from this repo the way `cargo-tile` is pinned from cargo-liner. No copy of client code in /etc/nixos.
-3. Identity: the owner is the cargo process (pid and start time). The service runs as natepiano and must read the runner process start time in /proc (no hidepid today; prove it in a test). The queue view labels the step "hana CI · <runner> · <job>" from the runner environment (`GITHUB_JOB`, `RUNNER_NAME`), through config, not hard-coded.
-4. Estimates and history: CI builds use the same history keys (repository, host, shape). The service writes their history rows. A CI kill records a failed peak like any other build.
-5. Waits: a CI step waits in the queue with the normal wait output in the job log. Priority and bump stay user-only. An admission outage follows the same client rule as other builds.
-6. Tests: a runner-account client admitted through the group socket in a fixture; two concurrent CI cargo calls that do not fit wait in order; the queue view shows the CI label.
+### Phase 22 — The hana CI margin key goes after the runner activation  · status: todo
 
-**What /etc/nixos must change (natedev pushes it; no unit edits /etc/nixos):**
-1. `modules/linux/development.nix` `build-admission.socket`: `SocketGroup = "build-admission"`, `SocketMode = "0660"`; add group `build-admission` with natepiano and the hana runner accounts. This changes the "runner accounts are in no group" rule in `hana-runners.nix` for this one socket; record it there.
-2. `modules/linux/hana-runners.nix`: put the pinned admission cargo front on each runner's PATH ahead of the cargo-tile shim; add `ADMISSION_SOCKET` only if the path differs from the default; `BindPaths` for `/run/build-admission` if the runner units' sandbox hides `/run`.
-3. `hana-ci.slice`: raise `MemoryMax` from 18G to the admission budget (24G), so admission decides and the slice only catches a wrong estimate. Keep `MemorySwapMax=2G` and the `steve-ci` slot pool (CPU slots, not memory).
-4. Order: the nixos change lands only after the admission cut-over enables the socket; until then CI keeps today's slice.
-
-**Constraints from the Phase 10 architect review (2026-11-03):**
-- Estimate inputs: `step_request()` in `admission_client.py` reads config and history through the home folder of the client's account. A runner account cannot read `/home/natepiano`. The service runs as natepiano and already reads both, so the service makes the estimate for a client that sends no estimate: the client sends the repository, host, shape and owner; the service reads config and history and replies with the need it charged. The runner client package holds no config or history path. A test runs an estimate under an account with no access to `/home/natepiano`.
-- Service authorization: `handle_request()` in `admission_service.py` accepts priority mutations and `admit_head` without a check of the connecting account; today only the CLI checks for a showrunner. Before the socket opens to a group, the service reads the peer account (`SO_PEERCRED`) and refuses from a runner account: priority set and clear, `admit_head`, and any release, width or token request for an owner that the runner did not register. Tests deny each of these to a runner account.
-- Cargo lifetime: `scripts/build_hold/cargo` handles holds and scopes but does not take memory admission. The CI front takes one admission reservation for the life of each building cargo call, the same contract as `queue_place` (`scripts/build_queue/queue_place.py`): descendants are tracked, memory is sampled, a cancel releases, and the release happens on every exit. It covers the toolchain shims (`cargo-tile`, rustup proxies) so that a call by full path still goes through admission; state each path that cannot be covered and why.
-- Owners: queue-unit owns the repository code and fixtures. natedev owns the NixOS package, the socket group, the sandbox and the slice changes.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — the CI cargo front, the service authorization and estimate path, the client package entry; hub: `scripts/build_queue/admission_service.py`
-- `test` — the runner-account fixtures, the authorization denial tests, the estimate-without-home test and the two-job ordering test
-
-**Acceptance.** Two hana CI jobs that would together pass the free budget run one after the other, shown in `/build:queue` with the CI label; no CI rustc dies at the slice cap. Change-Review: in the Build queue pane during a hana CI run, the CI step shows as "hana CI · <runner> · <job>" and waits behind a session build when memory is short.
-
-### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: todo
-**Depends on:** Phase 10 (the queue service holds the queue and the place record)
-**Blocked by:** none past Phase 10. Builds showrunner ask, 2026-10-31.
+**Depends on:** 10d, natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: the accounting transition of the CI queue phase, moved here at its shrink (director call, packaging).
 
 #### Work Order
 
-**Goal:** berth measured one `verify.sh lint` at about 45 min of queue time over three steps (10:21, 21:47, about 15) for a few minutes of work. Each step joined the back of the queue. After this phase, every later step of one `verify.sh` run takes the queue place of the run's first step. A step takes memory only while it runs; no memory is held between steps. The place ends when the run ends.
+**Goal:** A registered CI job is charged only through its reservation. The fixed CI margin is gone.
 
 **Spec:**
-1. **What verify passes.** The outermost `verify.sh` sets `BUILDLOG_RUN=<pid>:<start time>` once, from its own pid and the start-time field of `/proc/<pid>/stat`. A nested `verify.sh` keeps the value it got. `memory_gate.sh` passes it to `admission_client.py admit` with each step. The pid and start time together never match a reused pid.
-2. **The waiter owner today.** The service keys each waiter's place by its owner, `waiter_owner(row)` = `<pid>-<start_time>` (`memory_admit.py` :3554), and its first `since` (Phase 5 Spec 3). Each step of one `verify.sh` run is a different child process, so each step is a different owner and joins at the back.
-3. **Run identity at the service boundary.** `admission_protocol.py` defines `RunIdentity(pid: int, start_time: str) | NoRun()`. The client parses `BUILDLOG_RUN` once and sends the result in each `admit` as `run`. A missing or malformed value gives `NoRun`, and the step keeps its own place as today. `RunPlace(run: RunIdentity, since: float, first_owner: str)` is the service's one record per run. Both types go through the generic codec (`snapshot_value`, `parse_snapshot_value`) in the protocol and in `state.json`; there is no second form.
-4. **Rule.** The first waiter of a run makes its `RunPlace` with its own `since`. A later waiter with the same `RunIdentity`, from any child owner, takes that `since` as its place; its own owner, episode and reservation stay its own. The service watches the run's process with `os.pidfd_open`, as it watches owners, and drops the `RunPlace` when no live process has that pid and start time. A run never holds a reservation or a token between steps: a step takes memory only while it runs. The user's rulings stay: one place in line across memory and the CPU token, no `head_since`, and the user's queue priority (`QueuePriority`, resources Phase 26) has no end time. `waiter_order` stays `(priority_rank, since, pid)`; the run changes only the `since` it reads.
-5. **Restart.** `RunPlace` entries persist in `state.json` with the waiter places. At start the service opens a pidfd for each run and drops a run whose process is gone.
-6. **Tests.** Every case uses the one shared fixture in `admission_test_support.py` (in-process server, fake clock, per-test socket):
-   - A run's second step that arrives after two other waiters goes before them, and goes back to normal order after its run's process ends.
-   - A service restart between two steps of one run keeps the `RunPlace`; the second step takes the first step's `since`.
-   - Two steps of one run with different child owners share one place; each has its own episode and reservation.
-   - Nested `verify.sh`: the inner run keeps the outer `BUILDLOG_RUN`, so its steps take the outer run's place.
-   - PID reuse: a process with the run's pid and a different start time does not match, and its step gets its own place.
-   - `NoRun`: a step with no or a malformed `BUILDLOG_RUN` gets its own place, as today.
-   - `RunIdentity`, `NoRun` and `RunPlace` round-trip through the protocol and `state.json`.
-7. **Docs.** `docs/as-built/build-memory-admission.md`: the run place, its end, and `BUILDLOG_RUN`.
+
+1. **The wait.** natedev confirms the runner activation. builds asks the user, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
+2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:78`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
+4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove the tests of the mixed rule only with an approved assertion change.
 
 **Files:**
-- `scripts/direct/verify.sh` — sets `BUILDLOG_RUN` once in the outermost run (owner verify-unit; also-touches line)
-- `scripts/lint/memory_gate.sh` — passes `BUILDLOG_RUN` to `admission_client.py admit` (owner queue-unit)
-- `scripts/build_queue/admission_protocol.py` — `RunIdentity`, `NoRun`, `RunPlace`; the `run` field of `admit`
-- `scripts/build_queue/admission_service.py` — the `RunPlace` record, its pidfd watch, its `state.json` entry, the place rule
-- `scripts/build_queue/admission_client.py` — parses `BUILDLOG_RUN` and sends `run`
-- `scripts/build_queue/admission_test_support.py` — the shared service fixture gains a run owner helper
-- `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_admission_client.py` — Spec 6
-- `scripts/direct/test_verify_run_place.py` — new: the nested `verify.sh` case (owner verify-unit)
-- `docs/as-built/build-memory-admission.md` — Spec 7
+- `config/build_admission.conf`
+- `scripts/build_queue/admission_records.py`
+- `scripts/lint/memory_admit.py`
+- `scripts/lint/test_memory_admit.py`
+- `docs/as-built/build-memory-admission.md`
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `verify.sh`, `memory_gate.sh`, `admission_protocol.py`, `admission_service.py`, `admission_client.py` and the doc; hub: `scripts/build_queue/admission_protocol.py` (the service, the client and every test import its types)
-- `test` — the shared service fixture in `admission_test_support.py` and the run-lifetime regressions of Spec 6 in `test_admission_service.py`, `test_admission_client.py` and `test_verify_run_place.py`
+**Workers:** `1 writer`
+- `impl2` — the deletion and its tests.
 
-**State:** `RunPlace` entries in `admission/state.json`, written through `os.replace` with the waiter places and dropped when the run's process ends. A rerun after a crash keeps one `RunPlace` per run and makes no second place.
+**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file and each caller module.
 
-**Constraints from prior phases:**
-- Build rules (user, 2026-10-31, in force for every worker): fix every failure you can see before you rerun; do not run a test after each small edit, finish the edit round and run once. After a pass, do not run again until your edits are done. The phase gate and its listed tests still run in full.
-- Phase 10: the queue service is the one admitter; `state.json` holds the waiters, reservations and replay ledger; `memory_gate.sh` calls `admission_client.py admit`, `release`, `width` and `token_wait`. Every message goes through `admission_protocol.py` and the generic codec.
-- Phase 5: one place per step, keyed by owner and first `since`; one episode per `admit` call; the token path's second acquire takes the first one's place. The service watches owners with `os.pidfd_open`.
-- Resources Phase 26: `waiter_order` is `(priority_rank, since, pid)`; `QueuePriority` holds until a showrunner clears it or sets another unit.
-- Phase 9 architect review (2026-11-02), facts the Spec must keep:
-  - Detached verify: `verify.sh` (:909) starts a second verify process through `mesh_runs.py` and then exits. Set `BUILDLOG_RUN` in the detached process, after the detach, never before it; else every later step inherits a run whose process has ended. A regression shows later steps keep their place after the launching process exits.
-  - Run end: when the run's process ends, each waiter that took the run's `since` goes back to its own first `since` (its step's own arrival), in the waiter row and in its persisted `WaiterPlace`. A regression runs a run that exits while its child step still waits.
-  - Mac boundary: on the Mac (`OSTYPE` darwin), `verify.sh` reads no `/proc` and the client sends `NoRun`; the Mac keeps its claim admission. A regression with no `/proc` files covers it.
-  - Start time: `RunIdentity.start_time` uses the same form as `Owner.start_time` (the `/proc/<pid>/stat` field, a string), not an integer, and the run watch uses Phase 10's named live/gone owner result.
-- Phase 10 architect review (2026-11-03), facts the Spec must keep:
-  - Arrival and order are two fields. `_place_key()` in `admission_service.py` uses `since` as the place identity, and `Controller._queued()` in `aws_target.py` uses it as the waiting age. Keep each step's own arrival in `since`; add a separate order time that the run sets. `waiter_order` reads the order time. Reconnect keys, the token reacquire, the display age and AWS eligibility keep the step's own arrival. Tests cover reconnect, token reacquire, run end, the queue display and the AWS waiting threshold.
-  - State migration: the state codec needs exact fields. `read_state` migrates a Phase 10 `state.json` with no run places and keeps the build-history generation, pending finalizations, the queue priority and the replay ledger. An upgrade test reads a Phase 10 state file.
-  - Run watch: `_prune_watches()` keeps watches only for step owners and scopes. A run watch stays between steps, while no step of the run waits, until the run's process ends.
-  - `RunPlace.first_owner` is an `Owner`, not a string.
-  - Memory wait history: Phase 10's `--wait-events` path (`first`, `done`) keeps one balanced pair per step; `test_verify_token_memory_history` stays green. Durable grant replay keeps one reservation per step.
-  - Replace "waits for its queue place once" in the live check with "keeps its order while each step passes admission".
+**Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
 
-**Acceptance gate:**
-- `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest scripts.build_queue.test_admission_protocol scripts.build_queue.test_admission_service scripts.build_queue.test_admission_client scripts.build_queue.test_admission_client_wait scripts.direct.test_verify_run_place` green.
-- `basedpyright` over the changed Python files: `0 errors, 0 warnings, 0 notes`.
-- The notice has an `also touches` line for `verify.sh` and `test_verify_run_place.py` (verify-unit, against `origin/natedev-verify`).
-- A live check: one `verify.sh lint` with three steps keeps its order while each step passes admission; no later step goes to the back of the queue. The summary gives the three steps' wait times.
-- Change-Review line: later steps of one verify run keep the run's queue place | on natedev while other steps wait, run `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`, then type `/build:queue` between its steps | its second and third steps show the first step's place, not the back of the queue.
+### Phase 23 — Detached Python runs have their own group and count in Other  · status: todo
+
+**Depends on:** Phase 18 of the herdr worker-panes plan on GitHub builds. That phase renames `scripts/agents/mesh_runs.py` and its config. Source: user, 2026-11-06.
+
+#### Work Order
+
+**Goal:** A detached Python run stays outside the build queue and shows under Other on the memory page. A cargo or lint step inside a detached run still asks the queue and counts as a build.
+
+**Spec:**
+
+1. **User rulings.** "i think the workers detached python tests will almost never be that heavyh weight so it's good that they don't count against the build queue". "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc."
+2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the line that is `mesh_runs.py:647` today. The limits of `builds.slice` still hold it.
+3. **Reader.** The scope reader in `memory_admit.py` (line 2648 today) treats the child group as part of the one builds total, and it makes no row for that group. A reserved cargo step inside it counts once, as a build.
+4. **Page.** `memory_feed.py` makes no row for the group (line 419 today in the session prototype; `scripts/build_page/` after the build page moves). Its memory reads as Other.
+5. **Trace rule.** Remove only the rule that shows a detached process group as a run because its processes trace to a live run. Keep the service's registered run identity (`admission_service.py:910`), the held-run rows (`queue_view.py:272`) and the card that a person selects by owner (`queue_card.py:217`).
+6. **Proof.** Tests: a Python process in the group reads as Other and has no row; a reserved cargo descendant counts once; a cargo and a lint step inside a detached `verify.sh` ask the queue; a held run keeps its row.
+
+**Files:**
+- `scripts/agents/mesh_runs.py` — renamed by the herdr phase; use the new name.
+- `scripts/lint/memory_admit.py`
+- `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/test_queue_view.py`
+- `docs/as-built/build-memory-admission.md`
+
+**Workers:** `1 writer + 1 tester` — `impl` owns the launcher line, the reader and the feed; `test` owns their tests.
+
+**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** Detached Python runs count in Other | On natedev, open the memory page while a worker's detached Python tests run | The runs show no row, and Other holds their memory.
+
+### Phase 20d — A queue row names the project of its step  · status: done
+
+#### As-built
+
+- `queue_lines.step_text(step)` prints `<project> <step>`, or the step alone when no project is known. The Step column in `/build:queue`, its card and every other person-facing line use it. Matching and history keep `step.step`.
+- `RunningStep` and `WaitingStep` have `project=""`. `memory_admit.step_project(repository_name, repo)` fills it and returns empty for an absolute path, so a gate stays `merge-gate`.
+- `/build:queue` hides every `UnownedSliceMemory` row. `queue_card.py` still prints that row for a person who selects it, and the memory page shows the memory as Other.
+- `test_admission_client.py::test_import_does_not_load_memory_admission` holds the client import boundary.
+
+**Files:** `scripts/build_queue/queue_lines.py`, `scripts/build_queue/admission_records.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py`, `scripts/lint/memory_admit.py`, `scripts/build_queue/golden/`, `docs/as-built/build-memory-admission.md`.
+
+**Binds later work:** the build page feed prints `queue_lines.step_text`. The service restart after landing puts the new text in the snapshot.
+
+**Gotchas:** `queue_lines.py` holds the function because `queue_evidence.py` loads `memory_admit`, which the client must not load.
+
+**Ruled out:** a row for runs outside the queue in `/build:queue`.
+
+### Phase 23 — Detached Python runs show under Other  · status: todo
+
+**Depends on:** herdr-unit Phase 18, which renames `config/mesh_runs.conf` to `config/detached_runs.conf` (user-approved, 2026-11-06).
+
+1. **The ask (user, 2026-11-06).** "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc." The user approved the group name `builds-detached.slice`.
+2. **Outline.** Detached Python test runs start in `builds-detached.slice`, not `builds.slice`. They do not ask the queue (10v does not land). The memory page shows their memory in the Other group; `/build:queue` does not show them.
+3. The Work Order follows at phase start, after herdr's Phase 18 is on builds.
+
+### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
+**Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`). 18c also changes `linux_runner.py`, and 10g changes the offload path. The second to land resolves; the director names the merge owner before the work runs in parallel (architect review of 18, 2026-11-06).
+**Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
+
+**Scope (showrunner limits, 2026-11-03).** 10f does not change the callers that verify P18 moves to copies.py (merge_gate, bump_gate, fast_track, waiting, the style runs, rust_release). Its sweep never touches copies.py standing checkouts. Two checkpoints:
+1. A: `build_folder_path` is the one name rule; `build_folders.py run --owner O --name N -- CMD` makes a folder, runs CMD in it and deletes it when CMD and its descendants end; `scratch.target` uses the name rule; the scratch guard refuses a clone under a unit or session tmp root and names the command.
+2. B: `build_folders.py sweep` removes a marked folder only when its owner is gone (pid, start time, boot id; a read error keeps it); `tmp_sweep` calls it; one writer makes each removal record below, also for `linux_runner` floor and trim.
+
+**Progress (2026-11-04):** checkpoint A is on main, with the test fixes for a `CONF_DIR` that lacks `build_folders.conf` (`build_folders._settings` then reads the repository file) and config read at use in `tmp_sweep`, `style_sync` and `folder_audit`. Checkpoint B is open.
+
+**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason: `floor`, `trim`, or `owner-ended` for a folder that the sweep removes after its owner is gone (architect review of 10q, 2026-11-05). Source today: `scripts/mac_test/linux_runner.py:775-788` removes or trims a slot build folder after each step and prints only `mac_cleanup=0|1|kept` (`offload.py:797` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record. Test: an owner-ended removal writes one record with reason `owner-ended`, and a standing copy is never removed.
+
+**Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
+
+### Phase 10g — The queue decides where every step runs  · status: todo
+**Depends on:** verify-unit's Phase 27 hotfix on builds (the Work Order follows it), 10z and 10x (it changes the admission request and the queue service).
+**Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
+
+**Outline (the Work Order follows at phase start, after verify's Phase 27 hotfix lands):**
+1. A step's admission request carries its eligible hosts (natedev, the Mac, SSH slots) and each host's exclusion reason.
+2. The queue service places each step on the first host that is free for it, and decides again on every pass while the step waits (Mac free, Mac disk over the floor, slot free).
+3. `verify.sh` and the offload path run the step where the queue says; they make no host choice.
+4. `build_targets.py` eligibility, slot reserve and the spending-guard exclusion move behind the queue decision.
+5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
+6. Runs beside 10f where the file sets are disjoint.
+7. **Slots per host (architect review, 2026-11-05).** A local 10z slot cannot stand for memory kept on the Mac or an SSH target. Define placement, reservation and departure states per host. Tests: a move to another host releases the local claim, and a local claim is never reused on a remote host.
+8. **Machine column (Phase 24).** `/build:queue` (`queue_view.py`, `queue_card.py`) and the memory page feed read one `scripts.buildlog.store.host_name()` for every running row. When a step runs on another host, the service reply carries that host on its row, and both views show it in the Machine column. Tests: a running row placed on the Mac shows the Mac's name in the view, the card and the page.
+9. **Host-scoped run identity (architect review of 18, 2026-11-06).** Two hosts can give the same pid and start time; `running_builds()` groups runs by `run_owner(pid, start_time)` today. One named run identity carries the host through placement, sampling, grouping and release. Test: a mixed-host fixture with the same pid and start time on two hosts keeps two runs, with separate accounting and the right Machine labels.
+10. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
+
+### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
+
+#### As-built
+
+- The snapshot record parser in `scripts/lint/memory_admit.py` ignores unknown fields and fills a missing field from its dataclass default, at every nesting level. A missing field with no default and a wrong tag are still refused. A step that waits across a service restart (older client code) reads the new records.
+- The four single-field shims are gone. The `fallbacks` to `diagnostics` conversion stays because it renames a field.
+
+**Files:** `scripts/lint/memory_admit.py`; `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_admission_service.py`, `test_build_queue.py`, `test_queue_view.py` — added, removed and missing field regressions.
+
+**Ruled out:** A version field on each record; per-field shims.
+
+### Phase 10i — A local cargo step takes its token first, then asks for memory once  · status: done
+**Why.** Builds showrunner, 2026-11-03: fastest's clippy was admitted at 20:11 EST, gave its grant back to wait 24 min for the cargo token, then waited 5 min for memory again. Cause: `verify.sh` gives back the memory grant before a busy-token wait (the `TokenWaiting` end), then asks again. Showrunner ruling: queue owns the whole change as one phase.
+
+**Outline:**
+1. A local cargo step takes its board token first. Then it makes one memory request and holds both until it ends.
+2. A step with no token makes no memory request, so no idle grant blocks the token holder.
+3. Every local cargo path uses the same order, the steps after Mac routing included. Nested work reuses the held token.
+4. Cancel, failed admission and Mac departure give the token back.
+5. Files: `scripts/direct/verify.sh` 2833-2850, `scripts/lint/memory_gate.sh`, `test_verify_token_wait.py`, `test_verify_token_reservation.py`, `test_verify_token_memory_history.py`. verify-unit holds its edits there until queue merges.
+6. Evidence and proposed tests: `token_wait_findings.md` in the 10f session folder.
+7. Separate defect, sent to verify-unit: the call's own cargo token stayed held for 1 h after its sweep. verify Phase 36 fixes it; 10i builds on Phase 36 after it lands on builds.
+8. Design: `design.md` in the 10i session folder, with the director rulings at its end. Showrunner approved it 2026-11-03.
+9. **Removal, temporary path (showrunner condition, 2026-11-03).** The service keeps serving main's old two-pass shell only until 10i reaches main. **Trigger:** the first queue checkpoint after 10i is on origin/main. That checkpoint deletes `admission_client.token_wait` and the `token-wait` command, `TokenWaitRequest` and its codec and fixture row, the service `TokenWaiting` end and handler, `AdmitRequest.token_back_at` and the token-gap writer, and their tests. After it, one way remains. **Status (2026-11-05):** the behavior is done (`verify.sh:2968` takes the token before memory admission). This removal is still owed: origin/main does not yet hold `e539c2906`.
+10. **True wait cause (cargo-liner defect, 2026-11-03). Done (architect review of 10q, 2026-11-05):** `verify.sh:2692` reads the holder file with no newline, and `verify.sh:2698` names this call as the holder. No work remains; the text below is the record. `token_wait_note` in `scripts/direct/verify.sh` reads `locks/cargo.d/holder` with `read -r ... || holder=""`. board.sh writes that file with no newline, so `read` fails and the holder is cleared; every token wait then says "it came free just now". Run 20261103T220514-274283-ecf4 (handler-unit) printed that for 35 min while its own call held the token from 22:12:06 to 22:50:14. Read the whole file, name the holder agent and pid, and say "this call holds it" when `holder_pid` is the call. A memory wait prints the memory line, never a token line. Test: a holder file with no newline names its holder.
+
+### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: done
+
+#### As-built
+
+- Linux `verify.sh` exports `BUILDLOG_RUN=<pid>:<start_time>` after detachment through `step_record.py start <pid>`. Nested calls retain it. Darwin reads no `/proc` and uses `NoRun`.
+- `AdmitRequest.run` uses `RunIdentity(pid: int, start_time: str) | NoRun`, with shared `NO_RUN`. `BUILDLOG_RUN` is parsed once; missing or malformed values use `NoRun`. Older requests without `run` also use `NoRun`. `RunPlace(run: RunIdentity, since: float, first_owner: Owner)` persists through the generic codec in `state.json`. `read_state` defaults missing `run_places` without changing existing state.
+- Snapshot copies use `order_since=min(run.since, step.since)`; `waiter_order` sorts `(priority_rank, order_since, pid)`. Durable rows retain step `since` for reconnects, token reacquisition, display age, and AWS eligibility. Process watches remain between steps. The service restores run places and opens watches after restart. Each pass drops ended runs; waiting steps then use their own arrival order. Owners, episodes, and reservations remain per step. Runs hold no memory or CPU token between steps.
+
+**Files:**
+- `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_service.py` — run types, parsing, persistence, watches, and snapshot order.
+- `scripts/direct/verify.sh`, `scripts/direct/step_record.py` — exported identity and the shared process-start reader; `scripts/lint/memory_admit.py` — snapshot ordering and durable-row filtering.
+- `scripts/build_queue/admission_test_support.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_admission_client.py` — shared fixture and run-lifetime regressions.
+- `scripts/direct/test_verify_run_place.py`, `scripts/direct/test_step_record.py` — nested, detached, Darwin, and start-command regressions; `docs/as-built/build-memory-admission.md` — run-place contract.
+- `scripts/direct/verify_examples_test_support.py` — loop cleanup precedes temporary-folder removal.
+
+**Gotchas:** The PID and start-time string identify a run together. Without `--state-dir`, the service namespace defaults to the buildlog admission folder, including under systemd.
+**Ruled out:** Merging `RunIdentity` with `Owner`; removing the client's Darwin guard; storing resolved run order in durable waiter rows.
 
 ### Phase 7 — A promote never refuses a step that already waits for memory  · status: done
 
@@ -832,3 +1424,20 @@ Queue-unit owns the Python queue files. Coordinate the pane tests with unit-boar
 **Gotchas:** a running bash keeps the `memory_gate.sh` functions it read at its start, so a step that waits across a promote runs the old loop against the new checker. For this reason no shell holds a closed list of checker values.
 
 **Ruled out:** a version-matching rule between the shell and the checker; a test that loads a previous release.
+
+### Phase 25 — A queue view answers inside its limit  · status: done
+
+#### As-built
+
+- One `OperatingSystemReader` thread reads the process table, the unowned slices, the scope activity files and the memory readings at the pass cadence (`waiting_pass_seconds` while steps wait, `running_pass_seconds` else). It returns raw evidence only and wakes the loop through an eventfd. The loop applies the current configuration and reservation records (need, width, peak hold) at each pass, so a pending configuration or a width change takes effect at once. The loop thread still owns all service state and makes no `/proc` or cgroup read.
+- `update()` wakes the reader when the cadence changes from running to waiting. A read that raises does not end the reader; the loop raises it as the pass did before.
+- Each reading carries `started_monotonic`. An Admit, Launch or estimate request for an owner whose pid and start time the reading lacks waits as a `DeferredOwnerRequest` and asks for an early read. It runs on the first reading that started after it arrived. A finished, refused or closed connection drops its deferred requests.
+- Each reply tree is encoded once (`snapshot_codec.py` returns scalars directly and caches dataclass field names). View and Explain bytes are encoded on the first request after a pass and kept until the next pass ends. Mine keeps its full content. `persist` encodes only the changed records; file bytes, fsync order and wire bytes do not change.
+- `query_timeout_seconds` stays 0.5; no configuration key changed.
+- Replay with no profiler (`measure_25.py --reuse`, 20 samples per group): a pass takes 16 ms median, 33 ms worst (372 ms median before). A View queued behind a pass, a Release, a TokenWait and a pending configuration waits 255 ms median, 406 ms worst; most of it is disk sync. The live probe after deploy is the proof.
+
+**Files:** `scripts/build_queue/admission_service.py`, `admission_protocol.py`, `snapshot_codec.py`; `test_admission_service.py`, `test_admission_protocol.py`; `docs/as-built/build-memory-admission.md`.
+
+**Binds later work:** a durable write still syncs the state file on the loop thread, so a View waits behind each Release and TokenWait sync. The next item "Durable writes leave the admission service loop" waits on the live probe.
+
+**Ruled out:** a larger `query_timeout_seconds`; a lock on service state; a second state-owning thread.

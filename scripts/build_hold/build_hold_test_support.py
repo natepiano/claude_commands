@@ -16,27 +16,19 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-import build_hold
-if TYPE_CHECKING:
-    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from ..lib import test_hang_guard
-else:
-    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from scripts.lib import test_hang_guard
-from override_guard import require_checkout
+from scripts.build_hold import build_hold
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.lib import test_hang_guard
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
-if TYPE_CHECKING:
-    from ..lib.socket_test_support import short_socket_directory
-    from ..lint.memory_test_support import fake_memory_readings
-else:
-    from scripts.lib.socket_test_support import short_socket_directory
-    from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lint.memory_test_support import fake_memory_readings
 
 _finish_writers: ContextVar[Callable[[], None] | None] = ContextVar("finish_hold_writers", default=None)
 

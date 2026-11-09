@@ -17,17 +17,14 @@ from typing import Literal, TypedDict, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount
 from scripts.whoami.agent_accounts import Report, observe_workers_home
 from scripts.whoami import account
-from quota_alert import (PROTOCOL, load_config, recipients, relay, showrunners_now,
+from scripts.whoami.quota_alert import (PROTOCOL, load_config, recipients, relay, showrunners_now,
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,
                          codex_alert_pass, selected_codex_report, codex_swap_line)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-import escalate  # noqa: E402
+from scripts.message import escalate  # noqa: E402
 # Percent of the five-hour window left at which the alert list is told.
 THRESHOLD = 20
 STATE = Path(os.environ.get("FIVE_HOUR_STATE_DIR")
@@ -114,13 +111,19 @@ def notice_state_lock(key: str) -> Generator[None]:
 @contextmanager
 def notice_claim(key: str) -> Generator[WarningDelivery | NoticeNotClaimed]:
     """Hold the send claim until this pass ends; a stopped owner releases it."""
-    with (STATE / f"{key}.claim").open("a") as claim:
+    with (STATE / f"{key}.claim").open("a+") as claim:
         try:
             fcntl.flock(claim.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            _ = claim.seek(0)
+            print(f"already claimed by {claim.read().strip() or key}")
             yield NoticeNotClaimed()
             return
         try:
+            _ = claim.seek(0)
+            _ = claim.truncate()
+            _ = claim.write(str(os.getpid()))
+            claim.flush()
             delivery: WarningDelivery | NoticeNotClaimed = NoticeNotClaimed()
             with notice_state_lock(key):
                 previous = read_delivery(key)

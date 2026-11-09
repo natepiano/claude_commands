@@ -16,6 +16,10 @@ is refused with exit 2 and the zones it could mean.
 ZONE_SSH, ZONE_BROADCAST and ZONE_STATE replace ssh, broadcast.py and the state folder in tests.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import os
 import platform
@@ -28,7 +32,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import main_publish, user_zone  # noqa: E402
 from scripts.lib.main_publish import Refusal as Refusal

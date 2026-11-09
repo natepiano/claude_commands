@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-import postmaster
-import sessions
+from scripts.message import postmaster
+from scripts.message import sessions
 
 ENTRY_ID = "0123456789abcdef0123456789abcdef"
 TEXT = "Message from Sender via postmaster: Question [01234567]\n\nQuestion"
@@ -141,7 +141,7 @@ class PostmasterTests(unittest.TestCase):
 
     def test_constants_and_entry_ids(self) -> None:
         self.assertEqual((postmaster.wait_seconds(), postmaster.claim_grace_seconds(),
-            postmaster.heartbeat_max_age_seconds(), postmaster.poll_seconds()), (3.0, 2.0, 2.0, 0.05))
+            postmaster.heartbeat_max_age_seconds(), postmaster.poll_seconds()), (3.0, 15.0, 2.0, 0.05))
         ids = [postmaster.new_entry_id() for _ in range(2)]
         self.assertNotEqual(ids[0], ids[1])
         for identity in ids:
@@ -234,11 +234,16 @@ class PostmasterTests(unittest.TestCase):
                     self.assertIsInstance(answer, postmaster.Delivered)
                     assert isinstance(answer, postmaster.Delivered)
                     self.assertEqual(answer.verbatim, matching)
+                elif outcome == "abandoned":
+                    self.assertIsInstance(answer, postmaster.DeliveryUnconfirmed)
+                    self.assertEqual(cast(dict[str, object], json.loads(self.path("results").read_text()))["outcome"], "abandoned")
+                    self.assertEqual(cast(dict[str, object], json.loads(self.path("claimed").read_text()))["id"], ENTRY_ID)
                 else:
                     self.assertIsInstance(answer, postmaster.RelayRequired)
                     assert isinstance(answer, postmaster.RelayRequired)
                     self.assertEqual(answer.reason, expected)
-                self.no_id_files()
+                if outcome != "abandoned":
+                    self.no_id_files()
 
     def test_unclaimed_deadline_withdraws_entry_before_check_and_cleans_files(self) -> None:
         self.heartbeat()
@@ -262,10 +267,45 @@ class PostmasterTests(unittest.TestCase):
                 answer = self.attempt()
                 if outcome == "delivered":
                     self.assertIsInstance(answer, postmaster.Delivered)
+                elif outcome == "missing":
+                    self.assertIsInstance(answer, postmaster.DeliveryUnconfirmed)
+                    self.assertEqual(cast(dict[str, object], json.loads(self.path("claimed").read_text()))["id"], ENTRY_ID)
+                    self.assertAlmostEqual(answer.seconds, postmaster.wait_seconds() + postmaster.claim_grace_seconds())
+                    self.result("delivered")
+                    self.assertEqual(cast(dict[str, object], json.loads(self.path("results").read_text()))["outcome"], "delivered")
                 else:
                     assert isinstance(answer, postmaster.RelayRequired)
-                    self.assertEqual(answer.reason, "unclaimed" if outcome == "withdrawn" else "claimed-no-result")
-                self.no_id_files()
+                    self.assertEqual(answer.reason, "unclaimed")
+                if outcome != "missing":
+                    self.no_id_files()
+
+    def test_uncertain_withdrawal_or_claim_read_never_permits_a_relay(self) -> None:
+        for failure in ("withdrawal", "claim-read"):
+            with self.subTest(failure=failure):
+                self.heartbeat()
+                self.clock.after_sleep = self.claim
+                original_replace, original_unlink, original_exists = os.replace, Path.unlink, Path.exists
+
+                def replace(source: str | Path, target: str | Path) -> None:
+                    if failure == "withdrawal" and str(target).endswith(".withdrawn"):
+                        raise OSError("cannot withdraw")
+                    original_replace(source, target)
+
+                def unlink(path: Path, missing_ok: bool = False) -> None:
+                    if failure == "withdrawal" and path == self.path("outbox"):
+                        raise OSError("cannot remove")
+                    original_unlink(path, missing_ok=missing_ok)
+
+                def exists(path: Path) -> bool:
+                    if failure == "claim-read" and path == self.path("claimed"):
+                        raise OSError("cannot read claim")
+                    return original_exists(path)
+
+                with patch.object(os, "replace", replace), patch.object(Path, "unlink", unlink), patch.object(Path, "exists", exists):
+                    answer = self.attempt()
+                self.assertIsInstance(answer, postmaster.DeliveryUnconfirmed)
+                self.assertEqual(cast(dict[str, object], json.loads(self.path("claimed").read_text()))["id"], ENTRY_ID)
+                self.assertAlmostEqual(answer.seconds, postmaster.wait_seconds() + postmaster.claim_grace_seconds())
 
     def test_half_written_result_is_polled_again(self) -> None:
         self.heartbeat()
@@ -370,8 +410,8 @@ class PostmasterTests(unittest.TestCase):
             ("t1", "s1", "s2", "t2"), ("s1", "t1", "t2", "s2"),
             ("s1", "t1", "s2", "t2"), ("s1", "s2", "t1", "t2"),
         ]
-        for order in orders:
-            with self.subTest(order=order):
+        for order, delayed in ((order, delayed) for order in orders for delayed in (False, True)):
+            with self.subTest(order=order, delayed=delayed):
                 self.heartbeat()
                 observed: list[str] = []
                 delivered: list[str] = []
@@ -387,7 +427,14 @@ class PostmasterTests(unittest.TestCase):
                             self.claim()
                         elif original_exists(self.path("outbox")):
                             delivered.append("mod")
-                            self.result("delivered")
+                            receipt_due = self.clock.elapsed + (5.535 if delayed else 0)
+
+                            def receipt() -> None:
+                                if self.clock.elapsed >= receipt_due:
+                                    self.result("delivered")
+
+                            self.clock.after_sleep = receipt
+                            receipt()
                         else:
                             self.result("withdrawn")
                 def withdraw(source: str | Path, target: str | Path, action: Callable[[str | Path, str | Path], None]) -> None:
@@ -522,24 +569,48 @@ class PostmasterTests(unittest.TestCase):
         self.assertFalse(self.path("outbox").exists())
 
     def test_next_written_attempt_removes_claim_and_withdrawn_result_left_by_late_mod(self) -> None:
-        self.heartbeat()
-        first = self.attempt()
-        assert isinstance(first, postmaster.RelayRequired)
-        self.assertEqual(first.reason, "unclaimed")
-        self.claim()
-        self.result("withdrawn")
-        stamp = self.clock.time()
-        for folder in ("claimed", "results"):
-            os.utime(self.path(folder), (stamp, stamp))
-        self.clock.elapsed += 601
-        self.heartbeat()
-        new_id = "f" * 32
-        def mod() -> None:
-            value: postmaster.OutboxResult = {"id": new_id, "outcome": "delivered", "detail": "",
-                "sha256": hashlib.sha256(TEXT.encode()).hexdigest(),
-                "claimed_ms": int(self.clock.time() * 1000), "finished_ms": int(self.clock.time() * 1000)}
-            self.write(self.directory / "results" / f"{new_id}.json", value)
-        self.clock.after_sleep = mod
-        self.assertIsInstance(postmaster.attempt(self.state, self.recipient, "Sender", new_id, TEXT, self.live), postmaster.Delivered)
-        self.no_id_files()
-        self.assertFalse(any(new_id in path.name for path in self.directory.rglob("*")))
+        outcomes: tuple[postmaster.ModOutcome, ...] = ("delivered", "abandoned")
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                self.clock.after_sleep = lambda: None
+                self.heartbeat()
+                first = self.attempt()
+                assert isinstance(first, postmaster.RelayRequired)
+                self.assertEqual(first.reason, "unclaimed")
+                self.claim()
+                self.result("withdrawn")
+                stamp = self.clock.time()
+                for folder in ("claimed", "results"):
+                    os.utime(self.path(folder), (stamp, stamp))
+                self.clock.elapsed += 601
+                self.heartbeat()
+                new_id = "f" * 32
+                def mod(receipt_outcome: postmaster.ModOutcome = outcome) -> None:
+                    value: postmaster.OutboxResult = {"id": new_id, "outcome": receipt_outcome, "detail": "",
+                        "sha256": hashlib.sha256(TEXT.encode()).hexdigest(),
+                        "claimed_ms": int(self.clock.time() * 1000), "finished_ms": int(self.clock.time() * 1000)}
+                    self.write(self.directory / "results" / f"{new_id}.json", value)
+                self.clock.after_sleep = mod
+                answer = postmaster.attempt(self.state, self.recipient, "Sender", new_id, TEXT, self.live)
+                self.assertIsInstance(answer, postmaster.Delivered if outcome == "delivered" else postmaster.DeliveryUnconfirmed)
+                self.no_id_files()
+                if outcome == "delivered":
+                    self.assertFalse(any(new_id in path.name for path in self.directory.rglob("*")))
+                else:
+                    retained = self.directory / "results" / f"{new_id}.json"
+                    self.assertTrue(retained.exists())
+                    stamp = self.clock.time()
+                    os.utime(retained, (stamp, stamp))
+                    os.utime(self.directory / "outbox" / f"{new_id}.json", (stamp, stamp))
+                    self.clock.elapsed += 601
+                    self.heartbeat()
+                    next_id = "e" * 32
+                    def abandoned() -> None:
+                        self.write(self.directory / "results" / f"{next_id}.json", postmaster.OutboxResult(
+                            id=next_id, outcome="abandoned", detail="", sha256=hashlib.sha256(TEXT.encode()).hexdigest(),
+                            claimed_ms=int(self.clock.time() * 1000), finished_ms=int(self.clock.time() * 1000)))
+                    self.clock.after_sleep = abandoned
+                    self.assertIsInstance(postmaster.attempt(self.state, self.recipient, "Sender", next_id, TEXT, self.live),
+                                          postmaster.DeliveryUnconfirmed)
+                    self.assertFalse(retained.exists())
+                    self.assertEqual([path.name for path in (self.directory / "results").glob("*.json")], [f"{next_id}.json"])

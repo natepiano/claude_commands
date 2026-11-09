@@ -1,0 +1,196 @@
+"""Two real detached verify callers receive only their own result and verdict."""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import unittest
+from pathlib import Path
+from typing import Callable, cast
+from unittest.mock import patch
+
+from scripts.agents import detached_runs
+from scripts.production import session_staff, staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture
+from scripts.direct.verify_token_wait_test_support import VERIFY
+from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
+
+
+PRIVATE_DELIVERY = """import json, os, sys
+sys.path.insert(0, os.environ["TEST_DETACHED_PACKAGE"])
+from pathlib import Path
+from unittest.mock import patch
+from scripts.agents import detached_runs
+from scripts.message import send
+from scripts.production import session_staff
+from scripts.lib.atomic_file import write_text_atomic
+
+def deliver(member, membership, text, **options):
+    path = session_staff.inbox_path(member.id)
+    previous = json.loads(path.read_text()) if path.exists() else {}
+    messages = previous.get("messages", [])
+    messages.append(text.split("\\n", 1)[1])
+    write_text_atomic(path, json.dumps({"messages": messages}))
+    return send.Result("queued", "private fixture")
+
+with patch.object(send, "deliver_worker_text", side_effect=deliver):
+    raise SystemExit(detached_runs.main(sys.argv[1:]))
+"""
+
+
+def setUpModule() -> None:
+    install_guard_test_budget()
+
+
+class DetachedTreeCancelTests(VerifyTreeCancelFixture):
+    def start_detached(self, fixture: VerifyTreeCancelFixture, identity: str, *, done_message: bool = False) -> Path:
+        session = fixture.board
+        session.mkdir(parents=True, exist_ok=True)
+        native = fixture_runtime_id(identity)
+        environment = {**fixture.environment, "CODEX_THREAD_ID": native,
+                       "CODEX_HOME": str(fixture.root / "codex"), "TEST_FINISH": "1",
+                       "DESIGN_ROLES_STATE": str(fixture.root / "roles")}
+        done_flags: list[str] = []
+        if done_message:
+            done = fixture.root / "done-message.txt"
+            _ = done.write_text("pass-only completion message")
+            done_flags = ["--done-message-file", str(done)]
+        # Retain each real process handle until fixture cleanup reaps it.
+        spawn = cast(Callable[..., subprocess.Popen[bytes] | subprocess.Popen[str]], subprocess.Popen)
+
+        def capture(*arguments: object, **options: object) -> subprocess.Popen[bytes] | subprocess.Popen[str]:
+            process = spawn(*arguments, **options)
+            fixture.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
+            return process
+
+        # Only the message transport uses a private fixture.
+        with patch.dict(os.environ, environment, clear=True), \
+                isolated_staff_file(fixture.root / "staff.json", environment), \
+                patch.object(detached_runs, "RUN_ROOTS", (fixture.root,)), \
+                patch.object(subprocess, "Popen", side_effect=capture), \
+                contextlib.chdir(fixture.workspace), contextlib.redirect_stdout(io.StringIO()) as output:
+            parent = unit_membership("fixture", identity)
+            _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", fixture.workspace), expected=parent.worktree)
+            _ = fixture_member("worker", name=identity, parent=parent.id, runtime_id=native,
+                                    backend=staff.CodexBackend(Path(os.environ["CODEX_HOME"])))
+            state_path = session / "progress_history_state.json"
+            state = cast(dict[str, object], json.loads(state_path.read_text())) if state_path.exists() else {}
+            state["owner_staff_id"] = parent.id
+            write_text_atomic(state_path, json.dumps(state))
+            wrapper = fixture.root / "scripts/agents/detached_runs.py"
+            wrapper.parent.mkdir(parents=True, exist_ok=True)
+            library = fixture.root / "scripts/lib"
+            library.mkdir(parents=True, exist_ok=True)
+            if not (library / "py").exists():
+                (library / "py").symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
+            write_text_atomic(wrapper, PRIVATE_DELIVERY)
+            environment["TEST_DETACHED_PACKAGE"] = str(Path(__file__).resolve().parents[2])
+            os.environ["TEST_DETACHED_PACKAGE"] = environment["TEST_DETACHED_PACKAGE"]
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            os.environ["PYTHONPATH"] = environment["PYTHONPATH"]
+            _ = self.enterContext(patch.object(detached_runs, "__file__", str(wrapper)))
+            status = detached_runs.main(["start", "--session-dir", str(session), "--to", identity,
+                                     "--label", identity + " verify test", *done_flags, "--",
+                                     "bash", str(VERIFY), "test", "sample"])
+        self.assertEqual(status, 0, output.getvalue())
+        records = list((session / detached_runs.DETACHED_RUNS_DIR).glob("*.json"))
+        self.assertEqual(len(records), 1)
+        record = cast(detached_runs.RunRecord, json.loads(records[0].read_text()))
+        fixture.started_groups.add(record["pid"])
+        self.assertEqual(record["staff_id"], native)
+        return records[0]
+
+    def finished_record(self, path: Path) -> detached_runs.RunRecord:
+        def finished() -> bool:
+            return cast(dict[str, object], json.loads(path.read_text())).get("status") == "finished"
+
+        # Directory events, not a status-file polling loop: completion replaces
+        # the run record atomically after it has delivered the message.
+        wait_until(finished, path.parent, timeout=TEST_HANG_GUARD_SECS)
+        return cast(detached_runs.RunRecord, json.loads(path.read_text()))
+
+    def inbox_path(self, fixture: VerifyTreeCancelFixture, identity: str) -> Path:
+        with isolated_staff_file(fixture.root / "staff.json", {}):
+            return session_staff.inbox_path(staff.native_id(fixture_runtime_id(identity)))
+
+    def inbox(self, fixture: VerifyTreeCancelFixture, identity: str) -> dict[str, object]:
+        return cast(dict[str, object], json.loads(self.inbox_path(fixture, identity).read_text()))
+
+    def test_two_simultaneous_callers_receive_only_their_own_cancellation_or_pass(self) -> None:
+        VerifyTreeCancelFixture.setUpClass()
+        self.addCleanup(VerifyTreeCancelFixture.doClassCleanups)
+        other = VerifyTreeCancelFixture()
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        self.addCleanup(other.tearDown)
+        first_identity, second_identity = "edited-worker", "stable-worker"
+        first_path = self.start_detached(self, first_identity, done_message=True)
+        second_path = self.start_detached(other, second_identity)
+        # Both must reach Cargo before either tree changes; a sequential run
+        # would not prove simultaneous callers are isolated.
+        try:
+            wait_until((self.control / "running").exists, self.control, timeout=TEST_HANG_GUARD_SECS)
+            wait_until((other.control / "running").exists, other.control, timeout=TEST_HANG_GUARD_SECS)
+        except TimeoutError:
+            logs = [path.with_suffix(".log").read_text(errors="replace") for path in (first_path, second_path)]
+            self.fail("detached verify did not reach Cargo: " + repr(logs))
+        self.assert_resources_held()
+        other.assert_resources_held()
+        self.edit_source()
+        first = self.finished_record(first_path)
+        self.assertEqual(first.get("exit_code"), 77, Path(first["log"]).read_text())
+        self.assert_no_cache_verdict()
+        self.assert_resources_released()
+        self.assertFalse(self.inbox_path(other, second_identity).exists(),
+                         "stable caller received the other caller's cancellation")
+        second_running = cast(dict[str, object], json.loads(second_path.read_text()))
+        self.assertEqual(second_running.get("status"), "running", "stable caller stopped with edited caller")
+        other.assert_resources_held()
+        _ = (other.control / "release").touch()
+        second = self.finished_record(second_path)
+        self.assertEqual(second.get("exit_code"), 0, Path(second["log"]).read_text())
+        other.assert_resources_released()
+        self.assertEqual(len(list((other.board / "verify_cache").glob("*.pass"))), 1)
+        cancelled = self.inbox(self, first_identity)
+        passed = self.inbox(other, second_identity)
+        self.assertEqual(self.inbox_path(self, first_identity).name,
+                         f"{first['staff_id']}.pending.json")
+        self.assertEqual(self.inbox_path(other, second_identity).name,
+                         f"{second['staff_id']}.pending.json")
+        cancelled_messages = cast(list[str], cancelled["messages"])
+        passed_messages = cast(list[str], passed["messages"])
+        self.assertEqual(len(cancelled_messages), 1, cancelled)
+        self.assertEqual(len(passed_messages), 1, passed)
+        cancel_text, pass_text = cancelled_messages[0], passed_messages[0]
+        self.assertIn("exit 77", cancel_text)
+        self.assertIn("cancelled", cancel_text.lower())
+        self.assertIn("resubmit", cancel_text.lower())
+        self.assertEqual(len(cancellation_lines(cancel_text, "test")), 1, cancel_text)
+        self.assertNotIn("pass-only completion message", cancel_text)
+        self.assertNotIn("FAIL", cancel_text)
+        self.assertIn("PASS (exit 0)", pass_text)
+        self.assertNotIn("cancelled", pass_text.lower())
+        self.assertNotIn("exit 77", pass_text)
+        self.assertFalse(self.inbox_path(self, second_identity).exists())
+        self.assertFalse(self.inbox_path(other, first_identity).exists())
+        self.assertEqual([(record.get("outcome"), record.get("status")) for record in self.records()],
+                         [("cancelled", 77)])
+        self.assertEqual([(record.get("outcome"), record.get("status")) for record in other.records()],
+                         [("ran", 0)])
+        for fixture in (self, other):
+            self.assertEqual(len([args for args in fixture.cargo_calls() if args[:2] == ["nextest", "run"]]), 1)
+        # Keep only small failed-run evidence in temporary fixtures; successful
+        # detached logs have now been read and can be removed.
+        for record in (first, second):
+            _ = Path(record["log"]).read_text()
+            Path(record["log"]).unlink()
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

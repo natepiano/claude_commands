@@ -2,23 +2,22 @@
 """Read configured build targets and their recorded holds and runs."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+
+import json
+import time
+from calendar import monthrange
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
-import time
-from typing import TYPE_CHECKING
 from pathlib import Path
-import sys
+from typing import TYPE_CHECKING, cast
 
-
-SCRIPTS = Path(__file__).resolve().parent.parent
-for directory in ("build_hold", "mac_test", "lint", "lib"):
-    sys.path.insert(0, str(SCRIPTS / directory))
-import build_hold
-import mac_test
-import offload
-from target_config import (
+from scripts.build_targets.target_config import (
     ConfigError as ConfigError,
     LocalTarget as LocalTarget,
     Platform as Platform,
@@ -28,12 +27,11 @@ from target_config import (
     is_aws_target,
 )
 
+
 if TYPE_CHECKING:
-    from ..aws_target import ledger as cost_ledger, measurement
-    from ..buildlog import record
-else:
     from scripts.aws_target import ledger as cost_ledger, measurement
-    import record
+    from scripts.buildlog import record
+    from scripts.mac_test import mac_test
 
 
 @dataclass(frozen=True)
@@ -172,6 +170,20 @@ class RepositorySlots:
 
 
 @dataclass(frozen=True)
+class RemovalComplete:
+    """No incomplete removal record remains."""
+
+
+@dataclass(frozen=True)
+class RemovalPending:
+    resources: tuple[str, ...]
+    storage_usd_per_day: Decimal
+
+
+REMOVAL_COMPLETE = RemovalComplete()
+
+
+@dataclass(frozen=True)
 class AwsStatusRow:
     target: str
     state: str
@@ -186,10 +198,15 @@ class AwsStatusRow:
     notices: tuple[cost_ledger.LimitEvent, ...]
     starting_at: int
     recovery: measurement.ControllerRecovery
+    removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
 
 
 def read_aws_status(target: SshTarget) -> AwsStatusRow | StateUnreadable:
     """Read local controller, ledger, claim, and result evidence without probes or writes."""
+    from scripts.aws_target import ledger as cost_ledger, measurement
+    from scripts.buildlog import record
+    from scripts.mac_test import mac_test
+
     try:
         paths = mac_test.state_paths(target.name)
         snapshot = measurement.read_status_measurement(target.settings, paths.directory, int(time.time()))
@@ -215,9 +232,22 @@ def read_aws_status(target: SshTarget) -> AwsStatusRow | StateUnreadable:
         reason = snapshot.controller.reason
         if not isinstance(permission, cost_ledger.PermissionAllowed):
             reason = '; '.join(filter(None, (reason, permission.reason)))
+        removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
+        removal_path = paths.directory / 'down.json'
+        if removal_path.exists():
+            value = cast(object, json.loads(removal_path.read_text()))
+            if not isinstance(value, dict):
+                raise ValueError('down.json: expected a removal record')
+            saved = cast(dict[str, object], value)
+            resources = tuple(str(saved[key]) for key in ('volume', 'budget') if saved.get(key))
+            inventory = cost_ledger.CostLedger(paths.directory).read_snapshot().inventories
+            names = ('retained_storage_usd_per_month', 'gp3_iops_usd_per_month', 'gp3_throughput_usd_per_month')
+            monthly_storage = sum((r.usd_per_month for r in inventory[-1].resources if r.name in names), Decimal(0)) if inventory else Decimal(0)
+            now = datetime.fromtimestamp(time.time(), timezone.utc)
+            removal = RemovalPending(resources, monthly_storage / monthrange(now.year, now.month)[1])
         return AwsStatusRow(target.name, snapshot.controller.state, snapshot.controller.at, reason, spending,
                             permission.at, monthly, snapshot.monthly_limit_usd, tuple(slots),
-                            record.read_attempt_results(target.name), snapshot.events, snapshot.controller.starting_at, snapshot.controller.recovery)
+                            record.read_attempt_results(target.name), snapshot.events, snapshot.controller.starting_at, snapshot.controller.recovery, removal)
     except (OSError, ValueError, mac_test.StateReadError, ConfigError) as error:
         return StateUnreadable(str(error))
 
@@ -229,9 +259,21 @@ def target_eligibility(
     repo_root: Path, package: str, routing: Routing
 ) -> tuple[EligibleTarget | ExcludedTarget, ...]:
     """Keep configured order while excluding Mac targets the test cannot use."""
+    configured = read_targets()
+    if all(target.platform == "linux" for target in configured):
+        return tuple(EligibleTarget(target) for target in configured)
+    return mac_policy_eligibility(repo_root, package, routing, configured)
+
+
+def mac_policy_eligibility(
+    repo_root: Path, package: str, routing: Routing, configured: tuple[Target, ...]
+) -> tuple[EligibleTarget | ExcludedTarget, ...]:
+    """Read repository policy when a configured target uses macOS."""
+    from scripts.mac_test import offload
+
     results: list[EligibleTarget | ExcludedTarget] = []
     repository = offload.repository_identity(repo_root)
-    for target in read_targets():
+    for target in configured:
         if target.platform == "linux":
             results.append(EligibleTarget(target))
         elif isinstance(routing, LocalRequired):
@@ -251,10 +293,13 @@ def target_eligibility(
 
 
 def utc_now() -> datetime:
+
     return datetime.now(timezone.utc)
 
 
 def running_job(claim: mac_test.HeldClaim) -> RunningJob:
+    from scripts.mac_test import mac_test
+
     record = claim.record
     since = mac_test.aware_timestamp(record["since"], claim.path, "since")
     session_id = record.get("holder_session", "")
@@ -265,20 +310,33 @@ def running_job(claim: mac_test.HeldClaim) -> RunningJob:
     return RunningJob(record["what"], since, IdleSince(idle), holder)
 
 
-def target_state(target: Target) -> TargetState:
-    """Read state without probing a host or changing coordination files."""
+def local_hold_state() -> TargetState:
+    """Read the local hold without importing remote claim readers."""
+    from scripts.build_hold import build_hold
+
     try:
-        if isinstance(target, LocalTarget):
-            holds = build_hold.natedev_holds(build_hold.holder_directory())
-            if not holds.in_force:
-                return Free()
-            holder = holds.in_force[0]
-            end = (
-                ReleaseEstimated(holder.release.at)
-                if isinstance(holder.release, build_hold.KnownReleaseEta)
-                else UntilReleased()
-            )
-            return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
+        holds = build_hold.natedev_holds(build_hold.holder_directory())
+        if not holds.in_force:
+            return Free()
+        holder = holds.in_force[0]
+        end = (
+            ReleaseEstimated(holder.release.at)
+            if isinstance(holder.release, build_hold.KnownReleaseEta)
+            else UntilReleased()
+        )
+        return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
+    except build_hold.ReleaseRecordReadError as error:
+        return StateUnreadable(build_hold.release_record_error_line(error))
+    except (OSError, UnicodeError, ConfigError) as error:
+        return StateUnreadable(str(error))
+
+
+def ssh_target_state(target: SshTarget) -> TargetState:
+    """Read remote claim records without probing the target."""
+    from scripts.build_hold import build_hold
+    from scripts.mac_test import mac_test, offload
+
+    try:
         paths = mac_test.state_paths(target.name)
         claims = mac_test.read_claims(paths)
         block = mac_test.read_claim_block(paths)
@@ -291,6 +349,8 @@ def target_state(target: Target) -> TargetState:
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
             return Held(block.holder, block.reason, block.since, block_end, session)
+        if isinstance(offload.read_failed_probe(target.name), offload.FailedProbe):
+            return Unreachable("failed probe")
         if is_aws_target(target):
             return read_aws_status(target)
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
@@ -303,3 +363,10 @@ def target_state(target: Target) -> TargetState:
         return StateUnreadable(build_hold.release_record_error_line(error))
     except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:
         return StateUnreadable(str(error))
+
+
+def target_state(target: Target) -> TargetState:
+    """Read state without probing a host or changing coordination files."""
+    if isinstance(target, LocalTarget):
+        return local_hold_state()
+    return ssh_target_state(target)

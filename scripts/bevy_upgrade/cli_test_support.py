@@ -1,10 +1,11 @@
 """Run the real CLI on a synthetic production with isolated state and external tools."""
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import shutil
 import socket
@@ -18,26 +19,24 @@ import unittest
 from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import upgrade_record as upgrade_record
-import bevy_upgrade
-import upstream
-from scripts.production import showrunners
-from cli_fixture import invoke_cli
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.bevy_upgrade import upgrade_record as upgrade_record
+from scripts.bevy_upgrade import bevy_upgrade
+from scripts.bevy_upgrade import upstream
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
+from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("bevy_upgrade.py")
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 REVISION = "1234567890abcdef1234567890abcdef12345678"
 ZONE = ZoneInfo("Pacific/Kiritimati")
+OWNER_ID = fixture_runtime_id("bevy-cli-owner")
+CURRENT_ID = fixture_runtime_id("bevy-cli-current")
 
 
 def setUpModule() -> None:
@@ -75,7 +74,7 @@ class CliFixture(unittest.TestCase):
         _ = shutil.copytree(self.snapshot, self.root)
         self.addCleanup(shutil.rmtree, self.root)
         self.checkout = self.root / "checkout"
-        self.doc = self.checkout / "demo-production.md"
+        self.doc = self.checkout / "different-document.md"
         self.env = dict(os.environ)
         self.env.update(cast(dict[str, str], json.loads((self.root / "environment.json").read_text())))
 
@@ -83,18 +82,18 @@ class CliFixture(unittest.TestCase):
         self.checkout.mkdir()
         _ = (self.checkout / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
         self.write_lock()
-        self.doc = self.checkout / "demo-production.md"
+        self.doc = self.checkout / "different-document.md"
         _ = self.doc.write_text(
             "# Demo\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {self.checkout}\n"
-            + f"- **Log:** log.md\n- **User zone:** {ZONE.key}\n\n## Units\n",
+            + f"- **Log:** log.md\n- **User zone:** {ZONE.key}\n",
             encoding="utf-8",
         )
         helper = self.root / "tool.py"
         _ = helper.write_text(
             "import fcntl, json, os, sys\nfrom pathlib import Path\n"
             + "kind, *args = sys.argv[1:]\n"
-            + "state = Path(os.environ['BEVY_UPGRADE_STATE_DIR']) / 'demo.json'\n"
+            + f"state = Path(os.environ['BEVY_UPGRADE_STATE_DIR']) / '{OWNER_ID}.json'\n"
             + "record = json.loads(state.read_text()) if state.exists() else {}\n"
             + "locked = False\n"
             + "lock = state.with_suffix('.lock')\n"
@@ -146,16 +145,20 @@ class CliFixture(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
-            "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json"),
+            "STAFF_FILE": str(self.root / "staff.json"), "HERDR_BIN": "/nonexistent/herdr",
             "BEVY_UPGRADE_NOTIFIER": str(notifier), "BEVY_UPGRADE_SEND": str(sender),
             "TEST_TOOL_HELPER": str(helper), "NOTIFIER_CALLS": str(self.root / "notifier-calls"),
-            "SEND_CALLS": str(self.root / "send-calls"), "TEST_SHOWRUNNER_ADDRESS": "uds:/test/session",
+            "SEND_CALLS": str(self.root / "send-calls"), "TEST_SHOWRUNNER_ADDRESS": f"session:{CURRENT_ID}",
             "TOOL_EVENTS": str(self.root / "tool-calls"), "RETIRE_EXIT": "0",
             "RETIRE_OUTCOME": "retired 1 queued message",
             "EXTERNAL_CALLS": str(self.root / "external-calls"),
-            "CLAUDE_CODE_SESSION_ID": "no-real-session", "PYTHONPATH": str(isolation),
+            "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "no-real-session", "PYTHONPATH": str(isolation),
             "PYTHONDONTWRITEBYTECODE": "1", "BEVY_UPGRADE_FIXTURES": str(self.root / "fixtures.json"),
         })
+        with isolated_staff_file(self.root / "staff.json", self.env):
+            owner = fixture_member("showrunner", name="demo", runtime_id=OWNER_ID,
+                                   doc=staff.LiveDoc(remote.local_machine(), self.doc))
+            _ = staff.update_current_session(owner.current_session, staff.native_id(CURRENT_ID))
         _ = (self.root / "environment.json").write_text(json.dumps({
             key: value for key, value in self.env.items() if value != os.environ.get(key)
         }))
@@ -173,7 +176,7 @@ class CliFixture(unittest.TestCase):
 
 
     def read_record(self) -> upgrade_record.Record:
-        return cast(upgrade_record.Record, json.loads((self.root / "state/demo.json").read_text(encoding="utf-8")))
+        return cast(upgrade_record.Record, json.loads((self.root / "state" / f"{OWNER_ID}.json").read_text(encoding="utf-8")))
 
 
     def assert_table(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -227,7 +230,7 @@ class CliFixture(unittest.TestCase):
 
 
     def retire_arguments(self) -> list[str]:
-        return ["retire", "--to", "uds:/test/session", "--from", "bevy-upgrade", "--key", "bevy-upgrade-demo"]
+        return ["retire", "--to", f"session:{CURRENT_ID}", "--from", "bevy-upgrade", "--key", f"bevy-upgrade-{OWNER_ID}"]
 
 
     def clear_calls(self) -> None:
@@ -237,7 +240,7 @@ class CliFixture(unittest.TestCase):
 
 
     def store_record(self, current: upgrade_record.Record) -> None:
-        _ = (self.root / "state/demo.json").write_text(json.dumps(current), encoding="utf-8")
+        _ = (self.root / "state" / f"{OWNER_ID}.json").write_text(json.dumps(current), encoding="utf-8")
 
 
     def make_branch_ready(self) -> None:
@@ -256,11 +259,9 @@ class CliFixture(unittest.TestCase):
 
     def run_cli_process(self, *arguments: str, explicit_production: bool = True,
                 count_saves: bool = False) -> subprocess.CompletedProcess[str]:
-        command = [sys.executable, str(SCRIPT)]
         counter = (
-            "import fcntl\nimport os\nimport sys\nfrom pathlib import Path\n"
-            + "sys.path.append(str(Path(sys.argv.pop(1)).parent))\n"
-            + "import upstream\n"
+            "import fcntl\nimport os\nfrom pathlib import Path\n"
+            + "from scripts.bevy_upgrade import upstream\n"
             + "factory = upstream.fixture_fetch\n"
             + "def traced_factory(path: Path) -> upstream.Fetch:\n"
             + "    fetch = factory(path)\n"
@@ -270,11 +271,10 @@ class CliFixture(unittest.TestCase):
             + "        return fetch(url)\n"
             + "    return traced_fetch\n"
             + ("upstream.fixture_fetch = traced_factory\n" if count_saves else "")
-            + "import bevy_upgrade\nimport upgrade_record\nfrom scripts.production import showrunners\n"
-            + "showrunners.current_address = lambda slug: os.environ['TEST_SHOWRUNNER_ADDRESS']\n"
+            + "from scripts.bevy_upgrade import bevy_upgrade, upgrade_record\n"
             + "save = upgrade_record.save\n"
             + "def counted_save(current: upgrade_record.Record) -> None:\n"
-            + "    lock = upgrade_record.record_path(current['slug']).with_suffix('.lock')\n"
+            + "    lock = upgrade_record.record_path(current['staff_id']).with_suffix('.lock')\n"
             + "    with lock.open('a') as competitor:\n"
             + "        try:\n"
             + "            fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
@@ -288,9 +288,9 @@ class CliFixture(unittest.TestCase):
             + ("upgrade_record.save = counted_save\n" if count_saves else "")
             + "raise SystemExit(bevy_upgrade.main())\n"
         )
-        command = [sys.executable, "-c", counter, str(SCRIPT)]
+        command = [str(SCRIPT.parents[1] / "lib/py"), "-c", counter]
         if explicit_production:
-            command.extend(["--production", str(self.doc)])
+            command.extend(["--production", "demo"])
         result = subprocess.run(command + list(arguments), cwd=self.checkout, env=self.env,
                                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         return result
@@ -298,11 +298,10 @@ class CliFixture(unittest.TestCase):
 
     def run_cli(self, *arguments: str, explicit_production: bool = True,
                 count_saves: bool = False) -> subprocess.CompletedProcess[str]:
-        # Keep one full interpreter/wrapper boundary; the other cases prove CLI behavior.
-        if self._testMethodName == "test_start_reads_the_production_checkout_and_writes_an_open_record":
+        if process_boundary_for_case(self):
             return self.run_cli_process(*arguments, explicit_production=explicit_production,
                                         count_saves=count_saves)
-        command = ["--production", str(self.doc)] if explicit_production else []
+        command = ["--production", "demo"] if explicit_production else []
         real_fetch = upstream.fixture_fetch
         real_save = upgrade_record.save
         real_run = subprocess.run
@@ -316,7 +315,7 @@ class CliFixture(unittest.TestCase):
             return traced_fetch
 
         def counted_save(current: upgrade_record.Record) -> None:
-            lock = upgrade_record.record_path(current["slug"]).with_suffix(".lock")
+            lock = upgrade_record.record_path(current["staff_id"]).with_suffix(".lock")
             with lock.open("a") as competitor:
                 try:
                     fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -350,12 +349,7 @@ class CliFixture(unittest.TestCase):
         def reject_network(*_args: object, **_kwargs: object) -> None:
             raise AssertionError("a test attempted network access")
 
-        def current_address(_slug: str) -> str:
-            return os.environ["TEST_SHOWRUNNER_ADDRESS"]
-
-        with mock.patch.object(subprocess, "run", run), mock.patch.object(
-            showrunners, "current_address", current_address,
-        ), mock.patch.object(socket.socket, "connect", reject_network), mock.patch.object(
+        with mock.patch.object(subprocess, "run", run), mock.patch.object(socket.socket, "connect", reject_network), mock.patch.object(
             urllib.request, "urlopen", reject_network,
         ), self.trace_calls(count_saves, traced_factory, counted_save):
             return invoke_cli(bevy_upgrade, bevy_upgrade.main, command + list(arguments),

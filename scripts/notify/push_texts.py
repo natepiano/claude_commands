@@ -4,23 +4,22 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-import re
 import string
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
+from scripts.lib.conf import UseConfiguredValue
+from scripts.message import session_send
+from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
+
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
 TEMPLATE_REQUIRED = "phone pushes require --text-id: decision.choices for choices, alert.blocked for emergencies, or nate.adhoc for notes"
-SEND_SCRIPT = Path(__file__).resolve().parents[1] / "message/send.py"
-# A unit id such as "types-unit": the whole value is one session name. The user knows it as "types".
-_UNIT_ID = re.compile(r"[A-Za-z0-9][\w-]*-unit")
 
 
 @dataclass(frozen=True)
@@ -51,8 +50,7 @@ class TemplateValues:
 
 
 def display_values(given: dict[str, str]) -> TemplateValues:
-    displayed = {key: shown_value(key, value) for key, value in given.items()}
-    return TemplateValues(displayed, dict(displayed))
+    return TemplateValues(dict(given), dict(given))
 
 
 @dataclass(frozen=True)
@@ -93,7 +91,7 @@ class RenderedPush:
 
 
 def catalog() -> tuple[PushText, ...]:
-    module = importlib.import_module("push_catalog")
+    module = importlib.import_module('scripts.notify.push_catalog')
     entries = cast(tuple[PushText, ...], module.ENTRIES)
     if len({entry.id for entry in entries}) != len(entries):
         raise ValueError("duplicate push text id")
@@ -105,10 +103,6 @@ def catalog() -> tuple[PushText, ...]:
     return entries
 
 
-def shown_value(key: str, value: str) -> str:
-    """A session name loses its "-unit" end: the {sender} and {session} values, and any value that is
-    a whole unit id. Free text keeps every word, "per-unit" included (reviewer, 2026-10-21)."""
-    return value.removesuffix("-unit") if key in ("sender", "session") or _UNIT_ID.fullmatch(value) else value
 
 
 @dataclass(frozen=True)
@@ -145,8 +139,7 @@ def decision_values(given: dict[str, str]) -> TemplateValues:
         raise ValueError("decision.choices: recommended_choice must name a listed choice")
     if "choice_labels" in given:
         raise ValueError("decision.choices: choice_labels is generated from choices")
-    displayed = {key: shown_value(key, value) if key in ("sender", "session") else value
-            for key, value in given.items()} | {"choice_labels": " or ".join(choice.label.lower() for choice in choices),
+    displayed = dict(given) | {"choice_labels": " or ".join(choice.label.lower() for choice in choices),
                     "choices": "\n".join(f"{choice.label}: {choice.effect}" for choice in choices)}
     return TemplateValues(displayed, dict(given))
 
@@ -204,11 +197,12 @@ def shown(entry: PushText) -> str:
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",
-                   priority: str = "", due: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False) -> list[str]:
+                   priority: str = "", due: str = "", question: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False,
+                   send_script: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
     """The send.py argv; a `key` lets `send.py retire --to user --key KEY` stop a blocked push's repeats.
     `self_clearing`: the caller retires its own blocked push, so send.py needs no --clears-when."""
-    command = [sys.executable, str(SEND_SCRIPT), "--to", "user", "--from", sender or rendered.sender,
-               "--need", rendered.need, "--text-id", rendered.id]
+    command = session_send.send_argv("--to", "user", "--from", sender or rendered.sender,
+                                     "--need", rendered.need, "--text-id", rendered.id, send_script=send_script)
     if key:
         command.extend(["--key", key])
     if self_clearing:
@@ -217,6 +211,8 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
         command.extend(["--value", f"{name}={value}"])
     if machine:
         command.extend(["--machine", machine])
+    if question:
+        command.extend(["--question", question])
     if due:
         command.extend(["--due", due])
     if priority:
@@ -228,7 +224,7 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
 
 def user_retire_argv(sender: str, key: str) -> list[str]:
     """The send.py argv that stops the repeats of the emergency push `user_send_argv` sent with `key`."""
-    return [sys.executable, str(SEND_SCRIPT), "retire", "--to", "user", "--from", sender, "--key", key]
+    return session_send.send_argv("retire", "--to", "user", "--from", sender, "--key", key)
 
 
 class FilledExampleRecord(TypedDict):

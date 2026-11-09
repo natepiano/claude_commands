@@ -6,7 +6,6 @@ import fcntl
 import time
 import os
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -21,7 +20,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.production import change_routing, staff, unrouted_alert
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, production_staff_record
 
 
 class UnroutedAlertTests(unittest.TestCase):
@@ -54,12 +53,14 @@ class UnroutedAlertTests(unittest.TestCase):
 
     def test_importing_the_alert_does_not_load_the_sender(self) -> None:
         command = """import sys
-sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+with open(Path(sys.argv[1]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 from scripts.production import unrouted_alert
 assert 'scripts.message.send' not in sys.modules
 assert 'send' not in sys.modules
 """
-        result = subprocess.run([sys.executable, "-I", "-c", command, str(Path(__file__).resolve().parents[2])],
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-I", "-c", command, str(Path(__file__).resolve().parents[2])],
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -166,7 +167,7 @@ assert 'send' not in sys.modules
                 send.assert_called_once()
 
     def test_unaccepted_send_outcomes_keep_alerts_pending(self) -> None:
-        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING")):
+        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING"), (6, "RETRY")):
             with self.subTest(header=header):
                 error = StringIO()
                 with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
@@ -218,12 +219,19 @@ assert 'send' not in sys.modules
         assert runner is not None
         unit = fixture_member("unit", name="orphan", parent=runner.id)
         record = staff.snapshot()
-        broken = replace(record, rows=tuple(replace(row, parent=None) if row.id == unit.id else row for row in record.rows))
+        broken = replace(record, rows=tuple(replace(row, parent=staff.StaffRoot()) if row.id == unit.id else row for row in record.rows))
         return change_routing.StaffRouting(broken, {}), runner, unit
 
     def test_routed_rows_and_saved_unrouted_rows_read_no_alert_record_and_send_nothing(self) -> None:
         router, runner, unit = self.orphan_router()
-        with (patch.object(Path, "read_text", side_effect=AssertionError("no record read")),
+        read_text = Path.read_text
+
+        def read_config(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path.suffix != ".conf":
+                raise AssertionError("no record read")
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with (patch.object(Path, "read_text", new=read_config),
               patch.object(unrouted_alert, "send_message") as send):
             self.assertEqual(router.owner(self.row, self.root / "change-review - top.md").tab, runner.name)
             owner = router.owner(self.row | {"Verdict": "works", "Producer": str(unit.id)}, self.root / "change-review - top.md")
@@ -232,6 +240,7 @@ assert 'send' not in sys.modules
         self.assertFalse((self.root / "links").exists())
 
     def test_a_failed_alert_keeps_the_broken_producer_unrouted(self) -> None:
+        _ = self.enterContext(production_staff_record())
         _ = self.enterContext(patch.object(change_routing, "configured_lists_directory", return_value=self.root))
         router, _, unit = self.orphan_router()
         with (patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
@@ -240,6 +249,7 @@ assert 'send' not in sys.modules
         self.assertEqual(owner.tab, "unrouted")
 
     def test_an_unrouted_list_in_the_real_folder_sends_once_through_the_fake_sender(self) -> None:
+        _ = self.enterContext(production_staff_record())
         router, _, unit = self.orphan_router()
         with (patch.object(change_routing, "configured_lists_directory", return_value=self.root),
               patch.object(unrouted_alert, "send_message") as send):

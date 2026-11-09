@@ -24,12 +24,10 @@ def clear_notes_directory_cache() -> None:
 
 def write_account_settings(
     path: Path, *, folders: tuple[str, ...] = (),
-    retries: tuple[float, ...] = (0.2, 0.4), stale_seconds: float = 10.0,
 ) -> None:
     """A complete scratch configuration, independent of the repository settings."""
     _ = path.write_text(
         f"[trust]\nfolders = {json.dumps(folders)}\n"
-        + f"[claude_config_lock]\nretries = {json.dumps(retries)}\nstale_seconds = {stale_seconds}\n"
     )
 
 
@@ -56,6 +54,5 @@ def scratch_account_home(home: Path, environment: Mapping[str, str], *, clear: b
         with (scratch_accounts_config() as config,
               patch.object(accounts, "trust_settings_file", return_value=settings),
               patch.dict(os.environ, {**environment, "HOME": str(home), "CONF_DIR": str(config)}, clear=clear),
-              scratch_showrunner_registry(home),
-              patch.object(accounts, "WORKERS_RUN_ROOTS", (home / "worker-runs",))):
+              scratch_showrunner_registry(home)):
             yield

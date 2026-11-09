@@ -16,13 +16,17 @@ compaction gets nothing.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys
 from pathlib import Path
 from typing import TypedDict, cast
 
-from direct_run import active_run
+from scripts.hooks.direct_run import active_run
 
 
 class SessionStartInput(TypedDict, total=False):
@@ -45,12 +49,13 @@ Before any further workflow action:
 1. Re-read ~/.claude/commands/unit/direct.md in full. Do not reconstruct the \
 workflow from the summary; a summarized workflow silently drops rules, and the \
 ones it drops are the ones that were not firing when compaction hit.
-2. Read back the handoff doc named in the summary and resume the control flow it \
+2. Read each stub file whose moment is live.
+3. Read back the handoff doc named in the summary and resume the control flow it \
 describes -- re-establish which dispatches are live without blocking on any of \
 them. The authorization state is the one thing the \
 summary has no reason to preserve -- take it from the handoff doc, not from \
 inference, and do not assume a phase is approved.
-3. Delete the handoff doc once the phase it describes is committed.
+4. Delete the handoff doc once the phase it describes is committed.
 
 Unit session directory: {session_dir}
 Status on demand (single read, never a wait loop): {session_dir}/heartbeat.log

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 import io
 import json
 import os
@@ -13,19 +15,67 @@ import sys
 import tempfile
 import threading
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from pathlib import Path
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-from typing import TypedDict, cast, override
+from typing import ClassVar, TypedDict, cast, override
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-import style_plan
-import style_rules
-import declarations
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
+from scripts.style import style_plan
+from scripts.style import style_rules
+from scripts.style import declarations
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+
+STYLE_UNIT_NAMES = (
+    "ancestor", "batch", "build", "built", "judge", "judging", "later", "legacy", "listed",
+    "machine-read", "modules", "names", "names-second", "new", "other", "other-names",
+    "other-values", "probe", "proposal", "queued", "read", "read-extra", "reader", "scope",
+    "types", "values", "values-read", "reader1", "reader2", "reader3",
+    "assigned", "candidate", "restamp", "worker", "drop", "holder-a", "holder-b",
+    "other-crate", "third-names", "judge-values", "first-clean-1", "first-clean-2", "assign", "vanished", "merged", "dropped", "live",
+)
+
+
+def style_unit_id(name: str) -> str:
+    """Return the native id supplied by the private style backend."""
+    return fixture_runtime_id("style:" + name)
+
+
+def ticket_owner_id(reference: str) -> str:
+    """Resolve a unit name supplied by a private test fixture."""
+    record = staff.initial_snapshot()
+    if record.by_id(staff.StaffId(reference)) is not None:
+        return reference
+    rows = [row for row in record.find(kind="unit") if row.name == reference]
+    if len(rows) == 1:
+        return str(rows[0].id)
+    return reference
+
+
+@contextmanager
+def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
+    """Create private ticket owners for the copied repository."""
+    with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+        owner = fixture_member("showrunner", name="sample-style")
+        members = (staff.SeedMember("owner", "showrunner", owner.name, owner.id, staff.RootSeedParent()), *(
+            staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
+            for name in STYLE_UNIT_NAMES
+        ))
+        record = staff.apply_seed(staff.SeedInput(tuple(members)))
+        for row in record.find(kind="unit", parent=owner.id):
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), root / ("unused-" + row.name)),
+                                  expected=row.worktree)
+        document = repo / ".git/style-production.md"
+        document.parent.mkdir(exist_ok=True)
+        _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
+        yield
 
 
 MACHINE_RENAME_BEFORE = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\nfn impl_item_surface_reference(\n"
@@ -51,16 +101,16 @@ def machine_rename_fixture(ledger: style_ledger.Ledger, definition: rules.Rule, 
     _ = git("commit", "-qm", "old judged parameter")
     base = git("rev-parse", "HEAD")
     ledger.set_tip(base)
-    ledger.ticket_add("machine-read-1", "machine-read", "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
-    ledger.ticket_assign("machine-read-1", "main")
-    _ = ledger.ticket_base("machine-read-1")
+    ledger.ticket_add("13001", ticket_owner_id("machine-read"), "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
+    ledger.ticket_assign("13001", "main")
+    _ = ledger.ticket_base("13001")
     finding = ledger.hold(definition.rule_id, "src/lib.rs", 4, MACHINE_RENAME_BEFORE.splitlines()[3],
-                          "rename", "item", "impl_item", definition.blob, "machine-read-1")
-    ledger.record(definition.rule_id, "src/lib.rs", base, definition.blob, "held", ticket="machine-read-1",
+                          "rename", "item", "impl_item", definition.blob, "13001")
+    ledger.record(definition.rule_id, "src/lib.rs", base, definition.blob, "held", ticket="13001",
                   input_scope=style_ledger.DeclaredInputScope.RULE)
-    _ = proposal.write_text("---\nunit: names-unit\nplan: /tmp/names.md\n---\nApproved rename\n")
+    _ = proposal.write_text("---\nunit: names\nplan: /tmp/names.md\n---\nApproved rename\n")
     ledger.file_held(finding.finding_id, proposal)
-    ledger.ticket_drop("machine-read-1")
+    ledger.ticket_drop("13001")
     _ = path.write_text(current)
     _ = git("add", ".")
     _ = git("commit", "-qm", "owner return type changed")
@@ -132,6 +182,7 @@ def remove_generation_schema(connection: sqlite3.Connection) -> None:
 
 def remove_finding_anchor_schema(connection: sqlite3.Connection) -> None:
     """A pre-32 fixture has no recorded source anchors."""
+    _ = connection.execute("DROP TABLE ticket_counter")
     _ = connection.execute("ALTER TABLE held_findings DROP COLUMN anchor_commit")
     _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_from_commit")
 
@@ -152,6 +203,7 @@ class LedgerTestCase(unittest.TestCase):
 
     template_repo: Path = Path()
     template_tip: str = ""
+    staff_seed: ClassVar[str] = ""
 
     @classmethod
     @override
@@ -162,6 +214,7 @@ class LedgerTestCase(unittest.TestCase):
         fixture = cls(methodName="runTest")
         fixture.repo = cls.template_repo
         _ = fixture.git("init", "-q", "--initial-branch=main")
+        _ = fixture.git("config", "maintenance.auto", "false")
         _ = fixture.git("config", "user.name", "Ledger tests")
         _ = fixture.git("config", "user.email", "ledger-tests@example.invalid")
         fixture.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\nresolver = "2"\n')
@@ -177,6 +230,8 @@ class LedgerTestCase(unittest.TestCase):
         fixture.write("crates/alpha/vendor/embedded.rs", "pub fn embedded() {}\n")
         fixture.write("README.md", "A sample workspace\n")
         cls.template_tip = fixture.commit("Create workspace")
+        with style_staff_fixture(cls.template_repo.parent, cls.template_repo):
+            cls.staff_seed = (cls.template_repo.parent / "staff.json").read_text(encoding="utf-8")
 
     @override
     def setUp(self) -> None:
@@ -186,7 +241,17 @@ class LedgerTestCase(unittest.TestCase):
         _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.rule_dir.mkdir(parents=True)
         self.initial_tip = self.template_tip
+        record = cast(dict[str, object], json.loads(self.staff_seed))
+        for member in cast(list[dict[str, object]], record["rows"]):
+            for field in ("doc", "worktree"):
+                if field in member:
+                    location = cast(dict[str, str], member[field])
+                    relative = Path(location["path"]).relative_to(self.template_repo.parent)
+                    location["path"] = str(self.root / relative)
+        _ = (self.root / "staff.json").write_text(json.dumps(record), encoding="utf-8")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HERDR_BIN": "/nonexistent/herdr",
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
         })))
@@ -220,7 +285,7 @@ class LedgerTestCase(unittest.TestCase):
 
     def cli_command(self, arguments: tuple[str, ...]) -> list[str]:
         prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
-        return [sys.executable, str(Path(style_ledger.__file__)), *arguments[:prefix],
+        return [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), *arguments[:prefix],
                 "--repo", str(self.repo), *arguments[prefix:]]
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
@@ -254,7 +319,7 @@ class LedgerTestCase(unittest.TestCase):
 
     def record(
         self, rule_id: str, path: str, commit: str, verdict: str = "clean", *,
-        rule_blob: str = "", detail: str = "", ticket: str = "unit-1",
+        rule_blob: str = "", detail: str = "", ticket: str = "27001",
         input_scope: style_ledger.DeclaredInputScope = style_ledger.DeclaredInputScope.RULE,
     ) -> None:
         _ = self.cli(
@@ -269,7 +334,7 @@ class LedgerTestCase(unittest.TestCase):
         return ledger
 
     def judgment_rows(self, database: Path) -> list[tuple[object, ...]]:
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             return cast(list[tuple[object, ...]], connection.execute("SELECT * FROM judgments ORDER BY id").fetchall())
 
     def site_fixture(self, family: rules.Family = "names", *, rule_name: str = "site-rule",
@@ -282,15 +347,15 @@ class LedgerTestCase(unittest.TestCase):
         tip = self.commit("Source site")
         ledger = self.ledger()
         ledger.set_tip(tip)
-        ledger.ticket_add("judge-1", "judge", "read", family, "crates/alpha", [PARENT_FILE], [rule])
-        ledger.ticket_assign("judge-1", "main")
-        _ = ledger.ticket_base("judge-1")
+        ledger.ticket_add("4001", ticket_owner_id("judge"), "read", family, "crates/alpha", [PARENT_FILE], [rule])
+        ledger.ticket_assign("4001", "main")
+        _ = ledger.ticket_base("4001")
         finding = ledger.hold(rule, PARENT_FILE, line, source.splitlines()[line - 1], kind, before, "fresh",
-                              self.blob(rule), "judge-1")
-        ledger.record(rule, PARENT_FILE, tip, self.blob(rule), "held", ticket="judge-1", worker="test",
+                              self.blob(rule), "4001")
+        ledger.record(rule, PARENT_FILE, tip, self.blob(rule), "held", ticket="4001", worker="test",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
         if not keep_ticket_open:
-            ledger.ticket_drop("judge-1")
+            ledger.ticket_drop("4001")
         ledger.file_held(finding.finding_id, self.root / "decision.md")
         return ledger, rule, ledger.named_held([finding.finding_id])[0]
 
@@ -313,8 +378,8 @@ class LedgerTestCase(unittest.TestCase):
             source="fn work(old: usize) -> usize { old }\n", line=1, keep_ticket_open=True)
         base = self.git("rev-parse", "HEAD")
         checkpoint = self.commit_tip(ledger, {PARENT_FILE: "// Judging ticket's comment.\nfn work(old: usize) -> usize { old }\n"})
-        ledger.ticket_checkpoint("judge-1", checkpoint)
-        ledger.ticket_drop("judge-1")
+        ledger.ticket_checkpoint("4001", checkpoint)
+        ledger.ticket_drop("4001")
         return ledger, finding, base, checkpoint
 
     def assert_extern_owner_move_refused(self, work: str) -> None:
@@ -367,7 +432,7 @@ class LedgerTestCase(unittest.TestCase):
             "--files", json.dumps(list(self.sources[:2])), "--rules", json.dumps(rule_ids),
         )
 
-    def hold_finding(self, rule: str, line: int, *, ticket: str = "external-1", rule_blob: str = "") -> str:
+    def hold_finding(self, rule: str, line: int, *, ticket: str = "36001", rule_blob: str = "") -> str:
         return self.cli(
             "held", "add", "--rule", rule, "--path", self.sources[0], "--line", str(line),
             "--text", f"pub fn old_name_{line}() {{}}", "--kind", "rename", "--before", "old_name",
@@ -398,22 +463,22 @@ class LedgerTestCase(unittest.TestCase):
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", list(self.sources[:2]), [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", list(self.sources[:2]), [rule],
                           proposal=str(issue), finding_ids=ids)
-        ledger.ticket_assign("names-1", "main")
+        ledger.ticket_assign("1", "main")
         for path in self.sources[:2]:
             self.write(path, "pub enum Outcome { New }\n")
         checkpoint = self.commit("Apply both approved renames")
         ledger.set_tip(checkpoint, "main")
-        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.ticket_checkpoint("1", checkpoint)
         return ledger, rule, issue, ids, checkpoint
 
     def withdrawn_checkpointed_ticket(self) -> tuple[style_ledger.Ledger, str, Path, tuple[str, ...], str]:
         """Reproduce the old withdrawal transaction's durable evidence after a checkpoint."""
         ledger, rule, issue, ids, checkpoint = self.checkpointed_decision_ticket()
-        ledger.ticket_drop("names-1")
+        ledger.ticket_drop("1")
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET updated_at='withdrawal-time' WHERE id='names-1'")
+            _ = connection.execute("UPDATE tickets SET updated_at='withdrawal-time' WHERE id='1'")
             _ = connection.executemany(
                 "UPDATE held_findings SET state='withdrawn',build_ticket='',updated_at='withdrawal-time' WHERE finding_id=?",
                 [(id,) for id in ids])
@@ -426,7 +491,7 @@ class LedgerTestCase(unittest.TestCase):
             ledger.record_person_applied({finding_id: style_ledger.ReadByPerson("reader")})
         self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
 
-    def refill_result(self, database: Path, unit: str = "names-unit") -> tuple[str, str, str, int, int, int, int]:
+    def refill_result(self, database: Path, unit: str = "names") -> tuple[str, str, str, int, int, int, int]:
         with closing(sqlite3.connect(database)) as connection:
             return cast(tuple[str, str, str, int, int, int, int], connection.execute(
                 "SELECT at,outcome,split_at,ready,changed,structure,other FROM refill_results WHERE unit=?", (unit,),
@@ -449,8 +514,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def judging_ticket(self, ledger: style_ledger.Ledger, rule: str, path: str) -> str:
         """Record the source revision before holding a fixture finding, independently of its build ticket."""
-        identity = ledger.next_ticket_id("judging")
-        ledger.ticket_add(identity, "judging", "read", "names", ".", [path], [rule])
+        identity = ledger.next_ticket_id()
+        ledger.ticket_add(identity, ticket_owner_id("judging"), "read", "names", ".", [path], [rule])
         ledger.ticket_assign(identity, "main")
         _ = ledger.ticket_base(identity)
         return identity
@@ -462,6 +527,7 @@ class LedgerTestCase(unittest.TestCase):
         base = self.commit("Binding declarations before the ticket")
         ledger = self.ledger()
         issue = self.root / "bindings.md"
+        _ = ledger.next_ticket_id()
         judging = self.judging_ticket(ledger, rule, path)
         ids: list[str] = []
         for line, old, new in pairs:
@@ -469,10 +535,10 @@ class LedgerTestCase(unittest.TestCase):
             ledger.file_held(finding.finding_id, issue)
             ids.append(finding.finding_id)
         ledger.ticket_drop(judging)
-        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [path], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [path], [rule],
                           proposal=str(issue), finding_ids=tuple(ids))
-        ledger.ticket_assign("names-1", "main")
-        self.assertEqual(ledger.ticket_base("names-1"), base)
+        ledger.ticket_assign("1", "main")
+        self.assertEqual(ledger.ticket_base("1"), base)
         return ledger, issue, base
 
     def held_rows(self, database: Path) -> list[tuple[object, ...]]:
@@ -480,7 +546,7 @@ class LedgerTestCase(unittest.TestCase):
             return cast(list[tuple[object, ...]], connection.execute("SELECT * FROM held_findings ORDER BY finding_id").fetchall())
 
     def checkpointed_type_findings(self) -> tuple[style_ledger.Ledger, str, str, str]:
-        """Two filed type findings; names-1 holds the first and merged at a checkpoint after the initial tip."""
+        """Two filed type findings; 1 holds the first and merged at a checkpoint after the initial tip."""
         rule, issue, _ = self.decision_findings()
         self.write(self.sources[2], "pub fn checkpoint() {}\n")
         checkpoint = self.commit("Build the type change")
@@ -490,10 +556,10 @@ class LedgerTestCase(unittest.TestCase):
                                     "outside") for line in (1, 2))
         for finding in (built, other):
             ledger.file_held(finding.finding_id, issue)
-        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/beta", [self.sources[2]], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/beta", [self.sources[2]], [rule],
                           proposal=str(issue), finding_ids=(built.finding_id,))
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET state='merged',checkpoint=? WHERE id='names-1'", (checkpoint,))
+            _ = connection.execute("UPDATE tickets SET state='merged',checkpoint=? WHERE id='1'", (checkpoint,))
         return ledger, built.finding_id, other.finding_id, checkpoint
 
     def assert_refused_after_a_write_during_the_check(self, ledger: style_ledger.Ledger, finding_id: str,
@@ -519,7 +585,7 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(self.held_rows(ledger.database), before)
 
     def judged_type_finding(self) -> tuple[style_ledger.Ledger, str, str]:
-        """A filed type finding judged by the read ticket names-1, which starts at the initial tip; and a later tip."""
+        """A filed type finding judged by the read ticket 1, which starts at the initial tip; and a later tip."""
         rule, issue, _ = self.decision_findings()
         self.write(self.sources[2], "pub fn judged() {}\n")
         judged = self.commit("Judge the finding")
@@ -527,25 +593,25 @@ class LedgerTestCase(unittest.TestCase):
         ledger.set_tip(judged, "main")
         finding = ledger.hold(rule, self.sources[2], 1, "value", "type", "u32", "u64", self.blob(rule), "outside")
         ledger.file_held(finding.finding_id, issue)
-        ledger.ticket_add("names-1", "names", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/beta", [self.sources[2]], [rule])
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET base=? WHERE id='names-1'", (self.initial_tip,))
-            _ = connection.execute("UPDATE held_findings SET ticket='names-1' WHERE finding_id=?",
+            _ = connection.execute("UPDATE tickets SET base=? WHERE id='1'", (self.initial_tip,))
+            _ = connection.execute("UPDATE held_findings SET ticket='1' WHERE finding_id=?",
                                    (finding.finding_id,))
         return ledger, finding.finding_id, judged
 
     def widen_ticket(self) -> tuple[style_ledger.Ledger, Path]:
-        """An approved proposal ticket names-1 that builds the finding in the first source, and its ledger."""
+        """An approved proposal ticket 1 that builds the finding in the first source, and its ledger."""
         rule, issue, ids = self.decision_findings()
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\n"
                              + f"style_rule_blob: {self.blob(rule)}\n---\n")
         ledger = self.ledger()
-        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
                           proposal=str(issue), finding_ids=ids[:1])
         return ledger, issue
 
-    def widen(self, *paths: str, ticket: str = "names-1", reason: str = "the move needs a new file",
+    def widen(self, *paths: str, ticket: str = "1", reason: str = "the move needs a new file",
               by: str = "showrunner") -> tuple[int, str]:
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(output):
@@ -575,8 +641,8 @@ class LedgerTestCase(unittest.TestCase):
         """Unfiled findings in path (a.rs unless named), renames of Parent::old unless named, that a dropped read ticket
         judged at the head of main."""
         rule = self.rule("names")
-        ticket = f"judge-{len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
-        ledger.ticket_add(ticket, "judge", "read", "names", "crates/alpha", [path], [rule])
+        ticket = f"{4000 + len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
+        ledger.ticket_add(ticket, ticket_owner_id("judge"), "read", "names", "crates/alpha", [path], [rule])
         ledger.ticket_assign(ticket, "main")
         _ = ledger.ticket_base(ticket)
         findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, self.blob(rule), ticket)
@@ -631,8 +697,8 @@ class LedgerTestCase(unittest.TestCase):
             if updated != (self.repo / path).read_text():
                 _ = self.commit_tip(ledger, {path: updated})
         rule = self.rule("names")
-        ticket = f"built-{len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
-        ledger.ticket_add(ticket, "built", "read", "names", "/".join(path.split("/")[:2]), [path], [rule])
+        ticket = f"{25000 + len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
+        ledger.ticket_add(ticket, ticket_owner_id("built"), "read", "names", "/".join(path.split("/")[:2]), [path], [rule])
         ledger.ticket_assign(ticket, "main")
         _ = ledger.ticket_base(ticket)
         finding_id = ledger.hold(rule, path, line, f"built {before} to {after}", kind, before, after, self.blob(rule), ticket).finding_id
@@ -701,9 +767,9 @@ class LedgerTestCase(unittest.TestCase):
         if case == "fork":
             _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::other")
         if case == "open build":
-            ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [PARENT_FILE], [self.rule("names")],
+            ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [PARENT_FILE], [self.rule("names")],
                               proposal=str(self.root / "decision.md"), finding_ids=(finding_id,))
-            ledger.ticket_assign("names-1", "main")
+            ledger.ticket_assign("1", "main")
         _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
         before = self.held_rows(ledger.database)
         answers = iter((True,))
@@ -715,7 +781,7 @@ class LedgerTestCase(unittest.TestCase):
         self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
         self.assertEqual(self.held_rows(ledger.database), before)
         if case == "open build":
-            ledger.ticket_drop("names-1")
+            ledger.ticket_drop("1")
 
     def assert_changed_trait_membership_is_left(self, before_header: str, after_header: str) -> None:
         ledger = self.ledger()
@@ -854,7 +920,7 @@ class LedgerTestCase(unittest.TestCase):
             try:
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS), "writer did not reach its stalled operation")
                 recorder.record(rule, self.sources[2], self.initial_tip, self.blob(rule), "clean",
-                                ticket="unit-1", worker="test-worker")
+                                ticket="27001", worker="test-worker")
             finally:
                 release.set()
                 thread.join(timeout=TEST_HANG_GUARD_SECS)
@@ -863,15 +929,15 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(self.states(rule)[self.sources[2]], "current")
 
     def judge_while_loading_rules(self, changes: int) -> tuple[style_ledger.Ledger, str, mock.MagicMock]:
-        """A names-1 ticket ready to checkpoint, and a catalog load whose first changes calls record a newer verdict for it."""
+        """A 1 ticket ready to checkpoint, and a catalog load whose first changes calls record a newer verdict for it."""
         rule = self.rule("read")
         path = self.sources[0]
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
-        ledger.ticket_assign("names-1", "main")
-        _ = ledger.ticket_base("names-1")
-        self.record(rule, path, self.initial_tip, "fixed", ticket="names-1")
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("1", "main")
+        _ = ledger.ticket_base("1")
+        self.record(rule, path, self.initial_tip, "fixed", ticket="1")
         self.write(path, "pub fn renamed() -> u32 { 1 }\n")
         checkpoint = self.commit("Ticket checkpoint")
         original = rules.load_rules
@@ -885,22 +951,22 @@ class LedgerTestCase(unittest.TestCase):
                     _ = connection.execute(
                         'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope) '
                         + 'SELECT rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,?,?,declared_scope '
-                        + "FROM judgments WHERE ticket='names-1' LIMIT 1",
+                        + "FROM judgments WHERE ticket='1' LIMIT 1",
                         (f"worker-{len(loads)}", datetime.now(timezone.utc).isoformat()))
             return original(repo)
 
         return ledger, checkpoint, self.enterContext(mock.patch.object(rules, "load_rules", side_effect=load))
 
     def removed_ticket(self) -> tuple[style_ledger.Ledger, str, str]:
-        """An assigned names-1 read ticket on the first two sources under a crate-scope rule, started at the initial tip."""
+        """An assigned 1 read ticket on the first two sources under a crate-scope rule, started at the initial tip."""
         rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
-        ledger.ticket_assign("names-1", "main")
-        return ledger, rule, ledger.ticket_base("names-1")
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        ledger.ticket_assign("1", "main")
+        return ledger, rule, ledger.ticket_base("1")
 
-    def record_removed(self, ledger: style_ledger.Ledger, rule: str, path: str, commit: str, ticket: str = "names-1") -> None:
+    def record_removed(self, ledger: style_ledger.Ledger, rule: str, path: str, commit: str, ticket: str = "1") -> None:
         ledger.record(rule, path, commit, self.blob(rule), "removed", ticket=ticket, worker="test-worker")
 
     def cell_rows(self, ledger: style_ledger.Ledger, path: str) -> list[tuple[str, str]]:
@@ -909,17 +975,17 @@ class LedgerTestCase(unittest.TestCase):
                 'SELECT "commit",verdict FROM judgments WHERE path=? ORDER BY id', (path,)).fetchall())
 
     def removed_by_another_ticket(self) -> tuple[style_ledger.Ledger, str, str, str]:
-        """names-1 judges both sources at the initial tip; other-names-1 deletes the second source, and the file comes back."""
+        """1 judges both sources at the initial tip; 8001 deletes the second source, and the file comes back."""
         ledger, rule, _ = self.removed_ticket()
         kept, path = self.sources[:2]
         for source in (kept, path):
-            self.record(rule, source, self.initial_tip, ticket="names-1")
-        ledger.ticket_add("other-names-1", "other-names", "read", "names", "crates/alpha", [path], [rule])
-        ledger.ticket_assign("other-names-1", "main")
-        _ = ledger.ticket_base("other-names-1")
+            self.record(rule, source, self.initial_tip, ticket="1")
+        ledger.ticket_add("8001", ticket_owner_id("other-names"), "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("8001", "main")
+        _ = ledger.ticket_base("8001")
         original = (self.repo / path).read_text()
         (self.repo / path).unlink()
-        self.record_removed(ledger, rule, path, self.commit("Another ticket deletes the file"), ticket="other-names-1")
+        self.record_removed(ledger, rule, path, self.commit("Another ticket deletes the file"), ticket="8001")
         self.write(path, original)
         return ledger, rule, path, self.commit("The file comes back")
 
@@ -950,7 +1016,7 @@ class LedgerTestCase(unittest.TestCase):
         rule = self.rule(f"structure-{ticket}", "tier: D\nfamily: modules\n")
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add(ticket, "modules-unit", "structure", "modules", "crates/alpha", [], [rule])
+        ledger.ticket_add(ticket, ticket_owner_id("modules"), "structure", "modules", "crates/alpha", [], [rule])
         ledger.ticket_assign(ticket, "main")
         self.record(rule, "crates/alpha", self.initial_tip, "waived", detail="accepted", ticket=ticket)
 
@@ -965,7 +1031,7 @@ class LedgerTestCase(unittest.TestCase):
 
     def yield_proposal(self, kept: tuple[str, str, str, str], freed: tuple[str, str, str, str],
                        files: dict[str, str] | None = None) -> tuple[str, str, Path]:
-        """Add an assigned proposal ticket proposal-1 with one finding at each (path, kind, before, after), at a tip
+        """Add an assigned proposal ticket 7001 with one finding at each (path, kind, before, after), at a tip
         that adds files; return the kept finding, the finding to yield and the decision."""
         rule = self.rule("decision")
         for path, text in (files or {}).items():
@@ -979,9 +1045,9 @@ class LedgerTestCase(unittest.TestCase):
                                   self.blob(rule), "outside")
             ledger.file_held(finding.finding_id, issue)
             identities.append(finding.finding_id)
-        ledger.ticket_add("proposal-1", "proposal", "proposal", "names", "crates/alpha", sorted({kept[0], freed[0]}),
+        ledger.ticket_add("7001", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", sorted({kept[0], freed[0]}),
                           [rule], proposal=str(issue), finding_ids=tuple(identities))
-        ledger.ticket_assign("proposal-1", "main")
+        ledger.ticket_assign("7001", "main")
         return identities[0], identities[1], issue
 
     yield_files: dict[str, str] = {

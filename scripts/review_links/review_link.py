@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Publish and refresh files at short review links on this machine's tailnet."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -14,12 +18,14 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from string import Template, ascii_lowercase, digits
+from string import Template
 from typing import cast
 from urllib.parse import quote
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file, conf
+
+
+SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 
 
 def private_name(name: str) -> bool:
@@ -154,7 +160,7 @@ def snapshot_at(root: Path, files: list[Path], name: str = "review", *, new: boo
             folder = root / index[source_set]
         else:
             for _ in range(allocation_tries):
-                folder = root / "".join(secrets.choice(ascii_lowercase + digits) for _ in range(6))
+                folder = root / secrets.token_hex(3)
                 try:
                     folder.mkdir()
                 except FileExistsError:
@@ -187,7 +193,7 @@ def main(arguments: list[str]) -> int:
     args = parser.parse_args(arguments)
     try:
         urls = snapshot(cast(list[Path], args.files), cast(str, args.name), new=cast(bool, args.new))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except SNAPSHOT_ERRORS as error:
         print(f"review_link: {error}", file=sys.stderr)
         return 2
     print("\n".join(urls))

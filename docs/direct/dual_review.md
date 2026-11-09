@@ -8,7 +8,7 @@ Read at the point of use from `/unit:direct`. Defines `<DualReview/>`,
 completes, or when `<EarlyReviewArm/>` arms a reviewer.
 
 <TeamReview>
-A phase's broad review runs `adversary`, `contract`, and `simplify` together.
+A phase's broad review runs `adversary` and `contract` together.
 It also runs `rerun` when <DualReview/> arms it.
 Each prompt names its lens. The director performs the main review under <DualReview/>.
 
@@ -17,7 +17,6 @@ Each prompt names its lens. The director performs the main review under <DualRev
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
 | `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions; and the repository's targets file (`docs/hana/targets.md` in hana), when present |
 | `rerun` | whether interrupted or failed work can finish when run again; lasting records, marks, locks, claims, state files, moved or deleted files, and lists of steps where one failure can stop later steps |
-| `simplify` | the complete phase diff, under the simplify instructions below |
 
 The `rerun` reviewer asks these questions for each lasting write or step list:
 
@@ -43,31 +42,10 @@ The `craft` lens remains off since 2026-10-04 (user: review trial ended).
 The `contract` reviewer also owns the phase style review under
 <ReviewPromptContract/>.
 
-The Codex lenses use the unit's own read-only reviewer. Dispatch with
-`assign.sh --role review`; it resumes `review`, or `review2` when `review` is
-busy. Keep both threads across phases and plans. Writers keep their own roles.
-
-The `simplify` lens uses the fresh reviewer path in `review.sh`, with task `direct.simplify` and no worker address.
-It keeps `Agent` for the agents in `SIMPLIFY_AGENTS`.
-This lens alone permits Claude subagents.
-`config/models.conf` selects its model and effort.
-`assign.py` reads `SIMPLIFY_LENS=on|off` from `config/direct.conf` at each launch.
-The review launcher reads `config/review/simplify.md` after it obtains the lock.
-That file defines the report rules and the standing instructions.
-The report permits a heading or preamble before `Pass` or item 1.
-Every Claude print launch disables background tasks and returns an error for `is_error` or an `errors` array.
-At each launch, the shared account picker selects a Claude account with room.
-The launcher prints its label on stderr and in the review log.
-No available quota, a Claude error, an empty report, or a busy run produces `error`; the phase continues under <DualReview/> step 6.
-`assign.py` replaces itself with `review.sh`.
-After it obtains the lock, `review.sh` clears the earlier report and writes the prompt.
-Every simplify launch starts a fresh review, including a retry after failure.
-`SIMPLIFY_AGENTS` supplies the prompt names and the required number of completed agents.
-`review.sh` holds `${PHASE_DIR}/review_launch_simplify.lock` until the review child exits.
-The lock owner alone writes the report, status, and summary.
-The status file contains one atomic status line.
-A rejected launch reports its reason on stderr and changes none of the shared files.
-`simplify_result finish` prints the review failure reason once.
+The Codex lenses use the unit's read-only workers.
+Dispatch with `assign.sh --role review` under <LongLivedWorkers/>.
+The worker command selects a free reviewer and retains its native conversation across phases.
+Writers keep their assigned roles.
 
 The worker is the address and the lens is the judgment. Pass the lens to
 `assign.sh`; its returned handle names the selected worker and summary. Each
@@ -81,7 +59,7 @@ applies to the `rerun` reviewer's attempt to build a rerun case.
 Findings come back in each dispatch's summary under `${PHASE_DIR}`. Every
 launch names its phase, lens and pass, so concurrent reviews keep separate
 files. The summary is the whole review result: <Synthesize/> reads every
-selected lens's summary, including `simplify` and `rerun` when armed, tags each finding
+selected lens's summary, including `rerun` when armed, tags each finding
 with the lens that caught it, and can tell two independent findings from
 one finding found twice.
 
@@ -100,20 +78,19 @@ command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error.
 Re-read the tree; trust nothing from memory about its state.
 ```
 
-In a run's own-worker review, the opening also gives the concrete
-`board.sh role ... review` command for the worker's first tool call. The reviewer
-narrates each change of activity as a short output line so the wrapper
-heartbeat remains live, and never polls, sleeps or narrates a wait. It receives no
-heartbeat path and never receives `${IMPL_SUMMARY}`. The reviewer runs read-only.
+For `herdr`, the reviewer posts no board lines and runs no suites.
+The director or a writer handles required board posts and suites.
+The reviewer reports each activity change as a short output line.
+It never polls, sleeps, or reports a wait.
+Give it no heartbeat path or `${IMPL_SUMMARY}`.
+The reviewer runs read-only.
 
-Do not repeat the implementer's listed verification. Apart from the assigned
-<StyleReview/>, a reviewer may run one specific omitted check only when a
-plausible regression lies outside the listed gate, and must name that command;
-a Codex reviewer runs it
-with `verify.sh` per the `## Builds and tests` section of
-<WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
-<TypeDesignContract/>; closure reviews apply <ClosureReview/>, including any
-style assignment still owed under this contract.
+Do not repeat the implementer's listed verification.
+For `herdr`, name an omitted check for the director or a writer when a plausible regression requires it.
+It names the command and uses `verify.sh` under <WritePromptContract/> item 3.
+Every Codex review prompt carries that item's `## Builds and tests` section verbatim.
+Broad reviews apply <TypeDesignContract/>.
+Closure reviews apply <ClosureReview/>, including any owed style assignment.
 
 Every review prompt carries the Three Gods sentence and the Type Design
 Contract under <WritePromptContract/>. Its standing-instructions line names
@@ -156,8 +133,7 @@ if no repair needs closure, dispatch that reviewer with the owed assignment
 alone. The director reads the ledger and result for <RunSummary/> and never
 substitutes a guide load or rule walk. Early reviews cannot carry this option:
 style input requires the final phase diff.
-The alternate `review.sh` entry point accepts the same range options and uses the
-same preparation and capture module, `scripts/lint/style_review.py`.
+Use `assign.sh` for every review dispatch.
 
 Every code review prompt, under any lens and in a closure review, also asks
 this, verbatim:
@@ -166,23 +142,17 @@ this, verbatim:
 List each existing assertion or test that the diff removes, weakens, changes
 (same assertion, other expected value) or turns off (ignore, skip, xfail), with
 its path, test name, old text and new text. If there is none, write "none".
-Each one that the work order does not name in an "Assertion-Change:" line is a
-finding.
+Each one that the work order does not call for is a finding.
 ```
 
-`assertion_guard.py` finds the same list mechanically, and it blocks lint and
-the checkpoint; the reviewer judges whether a ruled change is correct. In
-cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a 6,000-line
-diff passed every review (user, 2026-10-28).
+In cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a
+6,000-line diff passed every review (user, 2026-10-28).
 </ReviewPromptContract>
 
 <BroadReviewPrompt>
 Write one prompt per lens at
 `${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md`, each under
 <ReviewPromptContract/> with:
-
-For `simplify`, include the Work Order, phase paths, and any unit instructions relayed from the user.
-The remaining prompt contract applies to the Codex lenses.
 
 ```
 [the role-switch opening from <ReviewPromptContract/>]
@@ -279,11 +249,14 @@ final diff only.
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the selected
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
+   For `herdr`, Stage 2 uses `worker.py` with dispatch id `<dispatch id>-2`.
+   The launcher reads the transcript before input and requires `DONE <dispatch id>-2` to complete review.
+   Review Stage 2 reports through its status and summary files.
 2. Apply <ReviewDiffContract/>. Before the broad review, save the complete phase
    diff to a file and run this read-only check in every repository, including Rust:
 
    ```sh
-   python3 ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
+   ~/.claude/scripts/lib/py ~/.claude/scripts/direct/rerun_lens.py arm --diff <diff>
    ```
 
    `<diff>` is that saved diff, including new phase files, made with whole-file
@@ -302,7 +275,7 @@ final diff only.
    early. All broad reviewers read the same review copy and final diff.
    Create each lens's prompt under <ReviewPromptContract/>.
 3. Launch each reviewer under <DispatchContract/>.
-   Launch pass 1's `adversary`, `contract`, `simplify`, and armed `rerun` lenses in one message.
+   Launch pass 1's `adversary`, `contract`, and armed `rerun` lenses in one message.
    When the adversary is already armed, launch the other selected lenses together.
    Each call uses:
 
@@ -313,11 +286,12 @@ final diff only.
      --prompt "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md"
    ```
 
-   For `simplify`, also pass the required `--diff <saved phase diff path>`.
-
+   For `herdr`, name `--to review2` for a second lens that runs at the same time.
+   The worker command refuses automatic selection when all suitable workers are busy.
+   Give each additional concurrent lens a distinct available review name with `--to`.
    A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
-   Keep each dispatch handle. The allocator resumes `review`, then `review2`
-   when the first is busy. Read the summary path each dispatch returns.
+   Keep each dispatch handle and apply <LongLivedWorkers/> for selection and reuse.
+   Read the summary path each dispatch returns.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
@@ -359,11 +333,13 @@ contains only:
 - Each open id, severity, file:line, and title verbatim.
 - Paths named by the fix plus new post-fix paths.
 - Diff limited to those paths, including new files.
-- Three questions: for each id, `FIXED`, `NOT FIXED`, or `UNCLEAR` with
-  file/line evidence; for each id, the regression test that covers it and
-  whether it would fail without the repair — a testable id with no such test is
-  `NOT FIXED`; and whether this repair breaks any caller, consumer, transition,
-  or invariant of its changed symbols.
+- Three questions:
+
+  1. For each id, is it `FIXED`, `NOT FIXED`, or `UNCLEAR`, with file/line evidence?
+  2. For each id, does its test coverage meet the two test rules in [write_prompt_contract.md](write_prompt_contract.md), item 6?
+     State whether the covering test fails without the repair.
+     Mark an id `NOT FIXED` when those rules require coverage and that coverage is missing.
+  3. Does this repair break any caller, consumer, transition, or invariant of its changed symbols?
 - The `## Three Gods` section of <WritePromptContract/>, verbatim; a repair
   hunk that breaks one is a finding of the repair.
 - For a Codex reviewer, the `## Builds and tests` section of

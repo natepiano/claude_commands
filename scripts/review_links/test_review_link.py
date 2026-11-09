@@ -20,7 +20,6 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.review_links import review_link, serve
 
@@ -135,6 +134,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.env = {
             **os.environ,
             "HOME": str(home),
+            "CLAUDE_PYTHON": sys.executable,
             "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
             "CLAUDE_CODE_SESSION_ID": "12345678-abcd-4321-abcd-123456789abc",
         }
@@ -148,7 +148,7 @@ class ReviewLinkTests(unittest.TestCase):
 
     def run_link(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments], env=self.env,
+            ["/bin/bash", str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=self.env,
             text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
@@ -156,7 +156,7 @@ class ReviewLinkTests(unittest.TestCase):
         environment = dict(self.env)
         _ = environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), "--help"], env=environment, cwd=self.root,
+            ["/bin/bash", str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), "--help"], env=environment, cwd=self.root,
             text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -623,7 +623,7 @@ class SnapshotIdAllocationTests(unittest.TestCase):
             old.mkdir(parents=True)
             _ = (old / source.name).write_text("old content", encoding="utf-8")
             with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}),
-                  patch.object(secrets, "choice", side_effect=list("taken1fresh2"))):
+                  patch.object(secrets, "token_hex", side_effect=["taken1", "fresh2"])):
                 urls = review_link.snapshot([source])
             self.assertEqual(urls, ["http://natedev:8765/fresh2/source.txt"])
             self.assertEqual((old / source.name).read_text(encoding="utf-8"), "old content")
@@ -639,10 +639,10 @@ class SnapshotIdAllocationTests(unittest.TestCase):
             old.mkdir(parents=True)
             _ = (old / source.name).write_text("old content", encoding="utf-8")
             with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}),
-                  patch.object(secrets, "choice", return_value="a") as choose):
+                  patch.object(secrets, "token_hex", return_value="aaaaaa") as token_hex):
                 with self.assertRaisesRegex(FileExistsError, "after 10 tries"):
                     _ = review_link.snapshot([source])
-                self.assertEqual(choose.call_count, 60)
+                self.assertEqual(token_hex.call_count, 10)
             self.assertEqual(set(snapshots.iterdir()), {old, snapshots / ".index.lock"})
             self.assertEqual((old / source.name).read_text(encoding="utf-8"), "old content")
 

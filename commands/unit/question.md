@@ -18,10 +18,10 @@ those to the showrunner as before.
 
 ## Steps
 
-1. **The production.** Read the `> **Production:**` line of your plan header:
-   it names the production doc. Your unit name is your row's `Unit` cell in that
-   doc's Units table, as written (for example `alpha-unit`). No production line
-   means no production: end the turn on `— decision:` as `/unit:direct` says.
+1. **The production.** Read your staff row and its parent showrunner row.
+   The parent row gives the production name and its `doc.path`.
+   Your staff row gives your unit name.
+   Without a parent showrunner, end the turn on `— decision:` as `/unit:direct` says.
 2. **The question in full.** Write it so that it stands alone when the user
    reads it days later, with nothing else in front of them:
    - what is asked, and where (the unit, the phase, the file or the screen);
@@ -29,10 +29,10 @@ those to the showrunner as before.
    - each choice, and what it does;
    - the recommended choice, and why: `(recommended — <reason>)`.
    Also write a one-line text for it, the name the lists use (for example
-   `alpha-unit: keep the old key binding?`).
+   `alpha: keep the old key binding?`).
 3. **File it.** Run
    ```sh
-   python3 ~/.claude/scripts/production/update_registration.py ask --production <production doc> --unit <your unit> --text "<one line>" --question "<the full question>" [--urgency blocks]
+   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --production <showrunner name> --unit <your unit> --text "<one line>" --question "<the full question>" [--urgency blocks]
    ```
    Pass `--urgency blocks` when the phase cannot go on without the answer. The
    question review runs as it does for a showrunner's question.

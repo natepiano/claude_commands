@@ -6,12 +6,12 @@ worker's `apply_patch` had no berth check at all, so its first touch never turne
 `enrolled_awaiting_first_touch` state `Active`, and an `Active` record never followed a new
 reservation of its phase. This hook runs for Codex `PreToolUse` on
 `apply_patch`. It acts only for a worker of a running unit: the app-server a unit director starts
-carries the director's `CLAUDE_CODE_SESSION_ID` and, when codex_mesh started it for a run, that run
+carries the director's `CLAUDE_CODE_SESSION_ID`. A native worker receives its run
 as `UNIT_RUN_DIR`. The run named there is the session directory; when it is unset or
 names a folder that is gone, the director's run marker names it. Any other Codex session is left
 alone.
 
-Workers persist across phases and the mesh knows no phase, so each edited path goes to the open
+Workers continue across phases. Each edited path goes to the open
 phase that owns it (`phase_reservation.attribute`): the only open phase, else the one whose
 `files` list covers it. A path no single open phase owns refuses the edit. A recorder-open phase
 with no state file and no berth mapping of its own was never enrolled (FinalGate's `final`) and owns
@@ -33,6 +33,10 @@ edit can collide with a foreign reservation, where a refused one only costs the 
 Codex accepts only a refusal from a PreToolUse hook: an allow is an exit 0 with no output.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -40,18 +44,15 @@ import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-import phase_reservation  # noqa: E402
-import unit_runs  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.direct import phase_reservation  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 
 
 def _seat_session_dir() -> Path | None:
     """The unit's session directory when this Codex process is one of its workers.
 
-    The worker's own run comes first: codex_mesh names it as UNIT_RUN_DIR in the
+    The worker's own run comes first: the launcher names it as UNIT_RUN_DIR in the
     environment of every app-server it starts for a run, and a director running phases side by
     side marks just one of their runs. The marker is read when that variable is unset or names a
     folder that is gone, so a stale variable never lets an edit through unchecked.
@@ -128,13 +129,13 @@ def decide(raw: str) -> int:
             return _refuse("binding reservation ledger is unreadable") if held else 0
         if answer.status != phase_reservation.CLEAR:
             return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
-        acquisition = phase_reservation.own_acquisition(answer, root, phases, session_id)
-        if phase is not None and acquisition is not None:
-            try:
-                _ = phase_reservation.record_active(phase.directory, acquisition)
-            except OSError:
-                # The edit is protected either way; the checkpoint's backstop records Active.
-                pass
+        if phase is None:
+            continue
+        try:
+            _ = phase_reservation.record_own_acquisition(answer, root, phases, session_id, phase)
+        except OSError:
+            # The edit stays protected. The checkpoint backstop records Active later.
+            pass
     return 0
 
 

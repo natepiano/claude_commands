@@ -19,7 +19,7 @@
     "file_change_no_waits": {
       "objections": [
         {
-          "quote": "hana: auto mode stopped demo",
+          "quote": "hana: demo command refused",
           "rule": "title-names-the-stake"
         },
         {
@@ -27,80 +27,51 @@
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Allow rule: the work goes on now, and auto mode lets this command run from then on.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
           "quote": "Auto mode refused a file change in the demo session.",
           "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Allow rule: auto mode lets this command run from then on.",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
-      "time": "2026-10-23T19:45:25.542816-04:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
+      "time": "2026-11-06T06:23:26.488387-05:00"
     },
     "one_with_rule": {
       "objections": [
         {
-          "quote": "build-followups: auto mode stopped messaging",
+          "quote": "build-followups: messaging command refused",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "approve the prompt or add an allow rule",
+          "quote": "Go: the session runs this command now, and auto mode can refuse this command again.",
           "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "The merge of the messaging work waits for it.",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Session: messaging\nAction: On natedev, in the messaging pane, approve the prompt or add an allow rule\nAuto mode refused a git push in the messaging session, so its work cannot merge until you answer. The command:\ngit push origin build-followups-messaging\n\nApprove (recommended): this push runs now. Auto mode still checks later pushes, so a wrong push can still be stopped.\n\nAllow rule: this push runs now, and every git push from any session runs without a check after this. The rule: Bash(git push:*)",
-          "rule": "push-body-under-500"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
-      "time": "2026-10-23T19:45:14.182975-04:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
+      "time": "2026-11-06T06:23:15.528138-05:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style: auto mode stopped modules",
+          "quote": "cargo-liner-style: modules commands refused",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "implement.sh --to modules-impl\nreview.sh --to modules-test",
+          "quote": "implement.sh --to modules-impl",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Approve: the work goes on now, and auto mode can stop it on these commands again.\n\nAllow rule: the work goes on now, and auto mode lets these commands run from then on.",
+          "quote": "Go: the session runs these commands now, and auto mode can refuse these commands again.",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
-      "time": "2026-10-23T19:45:00.398996-04:00"
-    }
-  },
-  "build_admission.down": {
-    "down": {
-      "objections": [
-        {
-          "quote": "build admission service is down; builds wait",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "build admission service",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "build admission service is down; builds wait",
-          "rule": "what-happened-why-what-you-do"
-        }
-      ],
-      "reviewer": "user-spec: Phase 10 user Work Order, Spec 13: sends build admission service is down; builds wait. Keep the specified outage text.; reviewer: opus",
-      "sha256": "3741f0b48d7d5ba71bd63ef134424978c95da6eca114c4364a8d047102e8e53c",
-      "time": "2026-11-02T18:17:06.517179-05:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
+      "time": "2026-11-06T06:23:02.002895-05:00"
     }
   },
   "build_hold.blocking": {
@@ -152,6 +123,74 @@
       "time": "2026-11-01T12:00:00-05:00"
     }
   },
+  "mac_idle.blocked": {
+    "research_block": {
+      "objections": [
+        {
+          "quote": "It labeled the reservation \"P15 F11 L0 run\".",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Waiting work can use the Mac after /build:mac unblock by research.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "f76a5c0c26fb8355fa2c0eb9b7f1d3f6e440eb58aec3dcecc1130c5200b6a015",
+      "time": "2026-10-31T12:44:06.063942-04:00"
+    },
+    "three_waiting": {
+      "objections": [
+        {
+          "quote": "It labeled the reservation \"P15 F11 L0 run\".",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Waiting work can use the Mac after /build:mac unblock by research.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "f76a5c0c26fb8355fa2c0eb9b7f1d3f6e440eb58aec3dcecc1130c5200b6a015",
+      "time": "2026-10-31T12:44:18.928341-04:00"
+    }
+  },
+  "mac_idle.stuck": {
+    "free_mac": {
+      "objections": [
+        {
+          "quote": "On natedev, ask the builds showrunner to get the waiting steps onto the Mac",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "To restore Mac work: the builds showrunner checks why the waiting steps do not take the Mac.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "6271a0b3b4f4bbccd4806e62fc445bc50e8b76133d5939d21aa7c655c3bae145",
+      "time": "2026-10-31T12:44:42.963275-04:00"
+    },
+    "idle_research_claim": {
+      "objections": [
+        {
+          "quote": "The Mac reservation lists holder \"research\" and label \"P15 F11 L0 run\".",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "To restore Mac work: release of the idle claim P15 F11 L0 run.",
+          "rule": "short-plain-sentences"
+        },
+        {
+          "quote": "3 steps wait.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "6271a0b3b4f4bbccd4806e62fc445bc50e8b76133d5939d21aa7c655c3bae145",
+      "time": "2026-10-31T12:44:32.376815-04:00"
+    }
+  },
   "nate.adhoc": {
     "long_sender": {
       "objections": [
@@ -182,6 +221,91 @@
       "reviewer": "user-spec: User 2026-10-27 via showrunner: every push carries its sender and its template name on its own last line; pushover.py's Template line now names the template, so the body's own 'adhoc' line is removed (it showed the name twice). Earlier: user spec 2026-10-20 /nate templates.; reviewer: opus",
       "sha256": "34c6056666af87aa9e1690e5954230c489128561e5648a26c115e0db7eb215fb",
       "time": "2026-10-27T11:40:34.667654-04:00"
+    }
+  },
+  "nightly.not_run": {
+    "cold_credentials": {
+      "objections": [
+        {
+          "quote": "run github-warmup",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Why: GitHub credentials are cold.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "2061c49a150d75ef62b00b77ee7e06dbe7886c64e48e8d3c5146217e5bfc053d",
+      "time": "2026-11-06T10:46:38.779135-05:00"
+    },
+    "fetch_failed": {
+      "objections": [
+        {
+          "quote": "The next nightly run tries again.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "2061c49a150d75ef62b00b77ee7e06dbe7886c64e48e8d3c5146217e5bfc053d",
+      "time": "2026-11-06T10:46:25.461944-05:00"
+    }
+  },
+  "nightly.result": {
+    "did_not_finish": {
+      "objections": [
+        {
+          "quote": "The nightly check of main finished at 03:53 EST.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:44.705692-05:00"
+    },
+    "many_failed": {
+      "objections": [
+        {
+          "quote": "Full tests: failed in direct/test_assign.py, direct/test_board.py, message/test_send.py, notify/test_review.py, production/test_staff.py, shutdown/test_restart.py, settings/test_settings.py, whoami/test_usage.py and 12 more.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:37.448223-05:00"
+    },
+    "passed": {
+      "objections": [
+        {
+          "quote": "The nightly check of main finished at 03:53 EST.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:18.061908-05:00"
+    },
+    "tests_failed": {
+      "objections": [
+        {
+          "quote": "Full tests: failed in direct/test_simplify_lens.py, production/test_staff.py.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:24.309443-05:00"
+    },
+    "types_failed": {
+      "objections": [
+        {
+          "quote": "The nightly check of main finished at 03:53 EST.\nType check: failed with 3 errors, 1 warning, 0 notes.\nFull tests: passed.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
+      "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
+      "time": "2026-11-06T10:40:29.948005-05:00"
     }
   },
   "nix_heal.failed": {
@@ -271,13 +395,21 @@
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "cargo-liner: fixed why handler stopped",
+          "quote": "09:01 AST",
+          "rule": "times-carry-zone"
+        },
+        {
+          "quote": "the handler session",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "cargo-liner: fixed why handler hit a check",
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
-      "time": "2026-10-23T19:48:49.400678-04:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "7cf2db469273d701681a79ac90b96ec6c5cc6b743b3ec9f65a2299296afa7fa4",
+      "time": "2026-11-06T06:23:55.806386-05:00"
     },
     "typical": {
       "objections": [
@@ -286,21 +418,17 @@
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "hana: fixed why demo stopped",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "hana",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "14:23 AST",
+          "quote": "At 14:23 AST",
           "rule": "times-carry-zone"
+        },
+        {
+          "quote": "hana: fixed why demo hit a check",
+          "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
-      "time": "2026-10-23T19:48:41.507782-04:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "7cf2db469273d701681a79ac90b96ec6c5cc6b743b3ec9f65a2299296afa7fa4",
+      "time": "2026-11-06T06:23:48.742433-05:00"
     }
   },
   "permission.rca_fixed_rewritten": {
@@ -311,53 +439,61 @@
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "hana: fixed why demo stopped",
-          "rule": "title-names-the-stake"
+          "quote": "14:23 AST",
+          "rule": "times-carry-zone"
         },
         {
-          "quote": "hana",
-          "rule": "reader-starts-cold"
+          "quote": "hana: fixed why demo hit a check",
+          "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "717774694cd697ec398b79e979644b1c57255df845acbfa2655d3e438a55d07f",
-      "time": "2026-10-23T19:49:18.647629-04:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "d9008fdeef008c21c13d24c776a1ea37bda54cf163fa00296294b653463d1d84",
+      "time": "2026-11-06T06:24:01.951136-05:00"
     }
   },
   "permission.rca_started": {
     "prompt": {
       "objections": [
         {
-          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "quote": "A session now finds the cause and fixes it, so this does not happen again. A second push comes when the fix is in.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "cargo-liner: finding why handler stopped",
-          "rule": "title-names-the-stake"
+          "quote": "At 09:01 AST",
+          "rule": "times-carry-zone"
         },
         {
-          "quote": "The handler session",
+          "quote": "in the handler session",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "cargo-liner: finding why handler hit a check",
+          "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
-      "time": "2026-10-23T19:47:30.202480-04:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "061af204971c2047ec7a469ce023c71a37cd03f865fc18f633003f2ce13e965f",
+      "time": "2026-11-06T06:23:42.184395-05:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "quote": "A session now finds the cause and fixes it, so this does not happen again. A second push comes when the fix is in.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "hana: finding why demo stopped",
+          "quote": "14:23 AST",
+          "rule": "times-carry-zone"
+        },
+        {
+          "quote": "hana: finding why demo hit a check",
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
-      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
-      "time": "2026-10-23T19:47:21.747732-04:00"
+      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
+      "sha256": "061af204971c2047ec7a469ce023c71a37cd03f865fc18f633003f2ce13e965f",
+      "time": "2026-11-06T06:23:34.421590-05:00"
     }
   },
   "quota.claude_next_move": {
@@ -851,32 +987,32 @@
   "shutdown.restart_failed": {
     "one_long_name": {
       "reviewer": "opus",
-      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
-      "time": "2026-11-01T22:39:12.544136-05:00"
+      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
+      "time": "2026-11-07T12:59:46.071567-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
-      "time": "2026-11-01T22:39:06.696247-05:00"
+      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
+      "time": "2026-11-07T12:59:38.245148-05:00"
     }
   },
   "shutdown.restart_incomplete": {
     "long_account": {
       "reviewer": "opus",
-      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
-      "time": "2026-10-14T17:15:31.310232-04:00"
+      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
+      "time": "2026-11-07T13:00:09.523293-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
-      "time": "2026-10-14T17:15:20.109165-04:00"
+      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
+      "time": "2026-11-07T13:00:02.062164-05:00"
     }
   },
   "shutdown.restart_untrusted": {
     "typical": {
       "reviewer": "opus",
-      "sha256": "f57b6487a5078fa11193be0ca11dfc0b3c14d83684cc0d4d77e22cec98a3a7a6",
-      "time": "2026-11-01T23:38:17.230240-05:00"
+      "sha256": "ac22944a6753615e074a27bffe4dbba0c64c654aebf4f560a00a2ad57e560c95",
+      "time": "2026-11-07T12:59:55.219819-05:00"
     }
   },
   "shutdown.restart_untrusted_unlisted": {
@@ -1035,67 +1171,29 @@
     }
   },
   "sweep.disk_floor": {
-    "no_free_space": {
-      "objections": [
-        {
-          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "/tmp/claude-1000/scratch",
-          "rule": "reader-starts-cold"
-        }
-      ],
-      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
-      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
-      "time": "2026-10-21T00:55:33.124483-04:00"
+    "available": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-08 11:4x EST via the builds showrunner: choice 1, one shared sweep.disk_floor text with {machine}; title '{machine} disk is low; {machine} tests can fail'; user 12:3x told the builds showrunner to run this; reviewer: opus",
+      "sha256": "b7574f53336dcae46fdd6f2e84fd35e2f2ec72529ca9769d8e96f68985b486b8",
+      "time": "2026-11-08T12:35:01.252631-05:00"
     },
-    "typical": {
-      "objections": [
-        {
-          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "Action: In the Claude session named natedev, name the paths below that it may remove.\nThe natedev computer has 290.0 GiB free. Builds need 300.0 GiB. They may fail until 10.0 GiB more is free. Build cache cleanup freed 2.0 GiB and has no idle build output left.\n\n/tmp/claude-1000/scratch (recommended): frees 86.0 GiB. That alone is enough, and no running process is at risk.\n\n/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\nThe session removes only the paths you name.",
-          "rule": "push-body-under-500"
-        }
-      ],
-      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
-      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
-      "time": "2026-10-21T00:55:22.184346-04:00"
-    }
-  },
-  "vault.stopped": {
-    "branch": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:21.935422-04:00"
+    "insufficient": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-08 11:4x EST via the builds showrunner: choice 1, one shared sweep.disk_floor text with {machine}; title '{machine} disk is low; {machine} tests can fail'; user 12:3x told the builds showrunner to run this; reviewer: opus",
+      "sha256": "b7574f53336dcae46fdd6f2e84fd35e2f2ec72529ca9769d8e96f68985b486b8",
+      "time": "2026-11-08T12:35:18.613845-05:00"
     },
-    "command": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:54.834725-04:00"
+    "protected": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-08 11:4x EST via the builds showrunner: choice 1, one shared sweep.disk_floor text with {machine}; title '{machine} disk is low; {machine} tests can fail'; user 12:3x told the builds showrunner to run this; reviewer: opus",
+      "sha256": "b7574f53336dcae46fdd6f2e84fd35e2f2ec72529ca9769d8e96f68985b486b8",
+      "time": "2026-11-08T12:35:27.451432-05:00"
     },
-    "diverged": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:29.417975-04:00"
-    },
-    "tracked_changes": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:15.140122-04:00"
-    },
-    "unreachable": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:47.624690-04:00"
-    },
-    "untracked": {
-      "reviewer": "opus",
-      "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
-      "time": "2026-10-30T21:49:38.396991-04:00"
+    "unavailable": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-08 11:4x EST via the builds showrunner: choice 1, one shared sweep.disk_floor text with {machine}; title '{machine} disk is low; {machine} tests can fail'; user 12:3x told the builds showrunner to run this; reviewer: opus",
+      "sha256": "b7574f53336dcae46fdd6f2e84fd35e2f2ec72529ca9769d8e96f68985b486b8",
+      "time": "2026-11-08T12:35:09.855573-05:00"
     }
   }
 }

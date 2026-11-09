@@ -26,19 +26,11 @@ function reading<Value>(value: Value | null | undefined): AccountReading<Value> 
   return value === null || value === undefined ? { kind: 'unavailable' } : { kind: 'available', value };
 }
 
-function machineRoleCounts(account: StoredAccount, role: string, index: number): AccountReading<RoleSessionCounts> {
-  if (!account.role_counts_by_machine) return reading(account.role_counts?.[index]);
-  if (role === 'spare') return { kind: 'unavailable' };
-  const counts = Object.values(account.role_counts_by_machine).flatMap(machine => machine[role] ? [machine[role]!] : []);
-  const sum = (key: 'busy' | 'idle' | 'total') => counts.reduce((total, count) => total + count[key], 0);
-  return reading({ busy: sum('busy'), idle: sum('idle'), total: sum('total'),
-    shell: account.tool === 'codex' ? null : counts.reduce((total, count) => total + (count.shell ?? 0), 0) });
-}
-
 export function accountDisplay(account: StoredAccount): AccountDisplay {
   return {
-    label: account.label, roles: account.roles,
-    roleCounts: account.roles.map((role, index) => machineRoleCounts(account, role, index)),
+    label: account.label, roles: account.roles.map(role =>
+      account.selected_roles?.includes(role) ? `${role} ✓` : role),
+    roleCounts: account.roles.map((_, index) => reading(account.role_counts?.[index])),
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },
@@ -69,7 +61,7 @@ function dateText(value: AccountReading<string>, zone: string, now: number): str
   return days === 0 ? clock : `${new Intl.DateTimeFormat('en-US', { timeZone: zone, weekday: 'short' }).format(date)} ${clock}`;
 }
 
-type AccountColumn = 'dot' | 'label' | 'roles' | 'busy' | 'shell' | 'idle' | 'total' | 'left' | 'resets' | 'credits' | 'enabled';
+type AccountColumn = 'dot' | 'label' | 'roles' | 'busy' | 'idle' | 'paused' | 'exited' | 'total' | 'left' | 'resets' | 'credits' | 'enabled';
 interface AccountRow {
   cells: Record<AccountColumn, BoardLine>;
   facts: BoardLine[];
@@ -81,7 +73,7 @@ interface TableColumn {
   width: number;
 }
 
-const COUNT_COLUMNS = ['busy', 'shell', 'idle', 'total'] as const;
+const COUNT_COLUMNS = ['busy', 'idle', 'paused', 'exited', 'total'] as const;
 type CountColumn = typeof COUNT_COLUMNS[number];
 
 function countCells(count: AccountReading<RoleSessionCounts>): Record<CountColumn, string> {
@@ -92,19 +84,18 @@ function countCells(count: AccountReading<RoleSessionCounts>): Record<CountColum
 }
 
 function countSpans(counts: Record<CountColumn, string>): Record<CountColumn, BoardLine> {
-  return { busy: [span(counts.busy)], shell: [span(counts.shell)],
-    idle: [span(counts.idle)], total: [span(counts.total)] };
+  return { busy: [span(counts.busy)], idle: [span(counts.idle)], paused: [span(counts.paused)],
+    exited: [span(counts.exited)], total: [span(counts.total)] };
 }
 
 function totalRow(accounts: AccountDisplay[]): AccountRow {
   const counts = accounts.flatMap(account => account.roleCounts.flatMap(count =>
     count.kind === 'available' ? [count.value] : []));
-  const knownShell = counts.flatMap(count => count.shell === null ? [] : [count.shell]);
   const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
   const cells = countCells(reading<RoleSessionCounts>({
     busy: sum(counts.map(count => count.busy)),
-    shell: knownShell.length ? sum(knownShell) : null,
-    idle: sum(counts.map(count => count.idle)), total: sum(counts.map(count => count.total)),
+    idle: sum(counts.map(count => count.idle)), paused: sum(counts.map(count => count.paused)),
+    exited: sum(counts.map(count => count.exited)), total: sum(counts.map(count => count.total)),
   }));
   return { cells: {
     dot: [], label: [span('total', 'default', 'bold')], left: [], roles: [], ...countSpans(cells),
@@ -219,8 +210,8 @@ function accountLines(accounts: AccountRow[], width: number): BoardLine[] {
   if (tableWidth(columns) <= width) {
     return [tableLine(columns, header), ...accounts.map(row => tableLine(columns, row.cells))];
   }
-  const first = columns.slice(0, 8);
-  const second = columns.slice(8);
+  const first = columns.slice(0, 9);
+  const second = columns.slice(9);
   if (tableWidth(first) <= width && tableWidth(second, 2) <= width) {
     return [tableLine(first, header), tableLine(second, header, 2),
       ...accounts.flatMap(row => [tableLine(first, row.cells),
@@ -246,6 +237,9 @@ export function AccountsView(elements: PaneElements, columns: number, status: St
   </Box>;
   return <Box flexDirection="column">
     {rows.map(drawLine)}
+    {status.upcoming_moves && <Box flexDirection="column" marginTop={1}>
+      {status.upcoming_moves.flatMap(line => line ? wrapLine([span(line)], width) : [[]]).map(drawLine)}
+    </Box>}
     {status.problems.length > 0 && <Box flexDirection="column" marginTop={1}>
       {wrapLine([span('Problems', 'default', 'bold')], width).map(drawLine)}
       {status.problems.flatMap(problem => wrapLine([span(`• ${problem}`, 'warning')], width)).map(drawLine)}

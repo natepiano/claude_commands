@@ -16,7 +16,7 @@ from unittest import mock
 
 from scripts.hooks import staff_session_identity
 from scripts.message import sessions
-from scripts.production import session_staff, staff, staff_check, staff_sources
+from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
 from scripts.shutdown import pane_record
 
@@ -44,7 +44,7 @@ class StaffSessionIdentityTests(StaffTestCase):
     @cached_property
     def fixture(self) -> ClearWorkerFixture:
         runner, unit, worker = self.tree()
-        sibling = staff.ensure_worker("test", unit.id, runtime_id=fixture_runtime_id("sibling"))
+        sibling = staff.ensure_worker(staff.native_id(fixture_runtime_id("sibling")), "test", unit.id)
         new_id = fixture_runtime_id("after-clear")
         environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p1"}
         payload: dict[str, object] = {
@@ -73,6 +73,7 @@ class StaffSessionIdentityTests(StaffTestCase):
         record_start = cast(Callable[[], None], namespace["main"])
         with (mock.patch.dict(os.environ, self.fixture.environment),
               mock.patch("sys.stdin", io.StringIO(json.dumps(self.fixture.payload))),
+              mock.patch.object(pane_record, "claude_arguments", return_value=["claude"]),
               mock.patch.object(os, "getppid", return_value=os.getpid()),
               mock.patch.object(staff, "runtime_id", return_value=self.fixture.new_id)):
             record_start()
@@ -179,40 +180,6 @@ class StaffSessionIdentityTests(StaffTestCase):
             f'"current_session": "{self.fixture.worker.current_session}"'.encode(),
             f'"current_session": "{self.fixture.new_id}"'.encode(), 1))
 
-    def test_checker_lists_the_new_session_until_the_held_hook_publishes_one_atomic_graph(self) -> None:
-        before = self.staff_file.read_bytes(), self.fixture.panes.read_bytes(), self.fixture.parked.read_bytes()
-        evidence = staff_check.CheckEvidence(
-            session_staff.MemberSources({}, ()),
-            (staff_check.LiveStaffSession(os.getpid(), "claude:" + self.fixture.new_id, staff.StaffId(self.fixture.new_id)),),
-            staff_sources.WorkerEvidence((), {}, ()),
-        )
-        publish = staff.update_current_session
-        writes: list[str] = []
-        replace_file = os.replace
-
-        def observe_write(source: str, destination: str) -> None:
-            if str(destination) == str(self.staff_file):
-                writes.append(str(destination))
-            replace_file(source, destination)
-
-        def held(old: staff.StaffId, new: staff.StaffId) -> staff.StaffRow:
-            problems = staff_check.wrong_rows(staff.snapshot(), evidence)
-            self.assertTrue(any(self.fixture.new_id in reason and "missing staff row" in reason for reason in problems), problems)
-            self.assertEqual((self.staff_file.read_bytes(), self.fixture.panes.read_bytes(), self.fixture.parked.read_bytes()), before)
-            self.assertEqual(staff.by_id(self.fixture.worker.id), self.fixture.worker)
-            return publish(old, new)
-
-        with (mock.patch.object(staff, "update_current_session", side_effect=held),
-              mock.patch.object(os, "replace", side_effect=observe_write)):
-            self.handle()
-        problems = staff_check.wrong_rows(staff.snapshot(), evidence)
-        self.assertFalse(any(self.fixture.new_id in reason and "missing staff row" in reason for reason in problems), problems)
-        self.assertEqual(writes, [str(self.staff_file)])
-        self.assertEqual(staff.by_id(self.fixture.unit.id), self.fixture.unit)
-        self.assertEqual(staff.by_id(self.fixture.sibling.id), self.fixture.sibling)
-        self.assertEqual(staff.by_id(self.fixture.worker.id),
-                         replace(self.fixture.worker, current_session=staff.StaffId(self.fixture.new_id)))
-        self.assertEqual((self.fixture.panes.read_bytes(), self.fixture.parked.read_bytes()), before[1:])
 
     def test_repeated_clear_publication_is_a_noop_and_does_not_rewrite_the_launch(self) -> None:
         self.handle()

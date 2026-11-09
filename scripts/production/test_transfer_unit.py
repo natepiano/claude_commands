@@ -1,69 +1,27 @@
-"""Transfer units between disposable productions with real Git worktrees."""
+"""Change the staff parent without publishing work."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership
-
-import json
-import os
-import shutil
-import tempfile
-import subprocess
-import sys
 import unittest
-from pathlib import Path
-from typing import cast, final, override
-from unittest import mock
-from collections.abc import Callable
-from contextlib import ExitStack
 from dataclasses import replace
+from pathlib import Path
+from typing import override
+from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from scripts.astra import design_roles
-from scripts.astra.design_role_test_support import write_empty_binding_record
-from scripts.direct import workers
+from scripts.message import send
 from scripts.production import staff, staff_move, unit_config
-from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
-from scripts.production.rename_rerun_test_support import final_files, saved_fixture
-from scripts.production.staff_test_support import SOURCES_SCRIPT
-from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.transfer_unit_test_support import (
-    UnitTransferFixture, SCRIPT,
-)
-import transfer_unit
-from rename_state import write_text
-import fake_showrunner
-import fake_unit_host
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS as PROCESS_TIMEOUT
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import stall_watch
+from scripts.production.staff_test_support import unit_membership
+from scripts.production.transfer_unit_test_support import UnitTransferFixture
 
 
-@final
 class UnitTransferTests(UnitTransferFixture):
-    def test_transfer_uses_staff_after_the_worktree_column_is_removed(self) -> None:
-        from scripts.production.staff_test_support import without_worktree_column
-        document = self.giving / "docs/plans/demo-production.md"
-        without_worktree_column(document)
-        _ = self.git("add", str(document), cwd=self.giving)
-        _ = self.git("commit", "-m", "Remove the display column", cwd=self.giving)
-        self.assert_ok(self.transfer("apply"))
-        self.assertTrue(self.unit.is_dir())
-        row = unit_membership("other", "alpha-unit")
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.unit))
-
-
-    def test_transfer_uses_the_absolute_plan_when_the_director_runs_elsewhere(self) -> None:
-        document = self.giving / "docs/plans/demo-production.md"
-        plan = self.unit / "docs/plans/alpha.md"
-        _ = document.write_text(document.read_text().replace("docs/plans/alpha.md", str(plan)))
-        _ = self.git("add", str(document), cwd=self.giving)
-        _ = self.git("commit", "-m", "Record the branch plan", cwd=self.giving)
+    def test_transfer_keeps_the_staff_folder_when_the_director_runs_elsewhere(self) -> None:
         director = self.root / "director-folder"
         director.mkdir()
-        row = unit_membership("demo", "alpha-unit")
+        row = unit_membership("demo", "alpha")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", director), expected=row.worktree)
         self.assert_ok(self.transfer("apply"))
-        retained = unit_membership("other", "alpha-unit")
+        retained = unit_membership("other", "alpha")
         self.assertEqual(retained.id, row.id)
         self.assertEqual(retained.worktree, staff.PresentWorktree("natedev", director))
         self.assertTrue(self.unit.is_dir())
@@ -71,23 +29,16 @@ class UnitTransferTests(UnitTransferFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        for slug, checkout in (("demo", self.giving), ("other", self.receiving)):
-            owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
-            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", checkout / f"docs/plans/{slug}-production.md"))
-
-    @override
-    def add_destination(self, slug: str) -> Path:
-        doc = super().add_destination(slug)
-        owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
-        return doc
+        for production_name, checkout in (("demo", self.giving), ("other", self.receiving)):
+            owner = next(row for row in staff.find(kind="showrunner") if row.name == production_name)
+            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", checkout / f"docs/plans/{production_name}-production.md"))
 
     def test_transfer_changes_only_parent_and_preserves_locations_and_config_bytes(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit), expected=row.worktree)
         receiving = next(row for row in staff.find(kind="showrunner") if row.name == "other")
-        assert row.parent is not None
-        giving = staff.by_id(row.parent)
+        assert isinstance(row.parent, staff.ReportsTo)
+        giving = staff.by_id(row.parent.id)
         assert giving is not None
         parents = tuple(staff.set_doc(parent.id, staff.LiveDoc(
             "natedev", checkout / "docs/plans" / f"{parent.name}-production.md"))
@@ -97,553 +48,102 @@ class UnitTransferTests(UnitTransferFixture):
         path = self.unit / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(receiving.id)))
         self.assertEqual(tuple(staff.by_id(parent.id) for parent in parents), parents)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertTrue(self.unit.is_dir())
         self.assertEqual(self.git("check-ignore", ".unit.toml", cwd=self.unit), ".unit.toml")
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(receiving.id)))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
-    def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
-        self.env['DESIGN_ROLES_STATE'] = str(self.root / 'state/astra/design-roles')
-        with mock.patch.dict(os.environ, self.env):
-            bad = write_empty_binding_record(self.unit, design_roles.UnitHolder('unrelated', 'other-unit'),
-                                             lifecycle=design_roles.RoleOpen('unrelated-thread'))
-        completed = self.transfer('apply')
-        self.assert_ok(completed)
-        self.assertEqual(completed.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
-        self.assertTrue(bad.is_file())
-        verified = self.transfer('verify')
-        self.assert_ok(verified)
-        self.assertEqual(verified.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
-
-    def test_transfer_moves_the_running_tab_and_sends_three_notices_without_launch_commands(self) -> None:
-        pid = self.running_unit()
-        log = self.seed_record()
-        process = self.root / "proc" / str(pid)
-        before_process = {path.name: path.read_bytes() for path in process.iterdir() if path.is_file()}
-        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
-                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
-        self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
-        self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
-        calls = fake_unit_host.calls(self.env)
-        moves = [command for command in calls if command[2:4] == ["pane", "move"]]
-        self.assertEqual(moves, [["--session", "agents", "pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"]])
-        self.assertIn(["--session", "agents", "tab", "rename", "w2:t1", "alpha"], calls)
-        messages = self.messages()
-        self.assertEqual([command[command.index("--to") + 1] for command in messages],
-                         ["session:5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", self.showrunner_addresses["demo"], self.showrunner_addresses["other"]])
-        self.assertTrue(all("alpha-unit" in command[command.index("--text") + 1] for command in messages))
-        self.assertFalse(log.exists(), "transfer ran a shutdown command")
-        self.assertFalse(any(command[2:4] in (["agent", "start"], ["pane", "close"], ["tab", "create"])
-                             for command in calls), calls)
-        self.assertFalse(any("shutdown.py" in word or "launch_agent" in word for command in self.commands
-                             for word in command), self.commands)
-        self.assertEqual({path.name: path.read_bytes() for path in process.iterdir() if path.is_file()}, before_process)
-        before = final_files(self.root)
-        self.assert_ok(self.transfer("apply"))
-        self.assertEqual(final_files(self.root), before)
-        self.assertEqual(self.messages(), messages)
-        self.assertEqual(fake_unit_host.calls(self.env), calls)
+    def test_transfer_preserves_staff_keyed_stall_files(self) -> None:
+        row = unit_membership("demo", "alpha")
+        directory = self.root / "state/stall-watch"
+        directory.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(stall_watch, "STATE_DIR", directory):
+            watch = stall_watch.watched_staff_unit("demo", "alpha", row)
+            stretch, prompt = watch.stretch_path, watch.prompt_path
+            _ = stretch.write_text('{"since": 17}\n')
+            _ = prompt.write_text('{"key": "stall-watch:prompt:' + row.id + '"}\n')
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (stretch, prompt)}
+            self.assert_ok(self.transfer("apply"))
+            moved = unit_membership("other", "alpha")
+            watch = stall_watch.watched_staff_unit("other", "alpha", moved)
+            self.assertEqual(watch.stretch_path, stretch)
+            self.assertEqual(watch.prompt_path, prompt)
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
 
     def test_plan_then_apply_finishes_source_updates_after_a_staff_move(self) -> None:
-        _ = self.running_unit()
-        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        _ = staff_move.move_unit("demo", "alpha-unit", "other")
-        # The former pane launch can name a retired identity while the resumed
-        # receiving pane pins the current row. Only the target selector resolves it.
-        self.pane("w1:p1", session_id="689f1253-a9a2-5ce1-974f-0061257d1b36", environment={
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": "81f54a2b-5266-5561-9976-2d7e73a96e96",
-        })
-        self.pane("w2:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
-            "SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,
-        })
+        row = unit_membership("demo", "alpha")
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == "other")
+        _ = staff_move.move_unit("demo", "alpha", "other")
         before = self.staff_file.read_bytes()
         planned = self.transfer("plan")
         self.assert_ok(planned)
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id, current_session=row.id,
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, staff.ReportsTo(parent.id), current_session=row.id,
                                 worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
-        self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
-        self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
         self.assert_ok(self.transfer("verify"))
 
-    def test_transfer_completes_when_the_receiving_showrunner_is_not_running(self) -> None:
-        self.remove_showrunner_session("cc9c5b71-6f71-5499-a4bb-e6ad5d02930d")
-        completed = self.transfer("apply")
-        self.assert_ok(completed)
-        self.assertEqual(completed.stdout.splitlines().count("other is not running: tell it when it starts"), 1)
-        self.assertEqual(len(self.messages()), 2)
-        self.assertEqual(self.messages()[-1][self.messages()[-1].index("--to") + 1], self.showrunner_addresses["demo"])
-        self.assert_ok(self.transfer("verify"))
-        before = final_files(self.root)
+    def test_transfer_changes_only_the_staff_parent(self) -> None:
+        row = unit_membership("demo", "alpha")
+        parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        with mock.patch.object(staff_move, "move_unit", wraps=staff_move.move_unit) as move_tab:
+            result = self.transfer("apply")
+            self.assert_ok(result)
+        move_tab.assert_called_once_with("demo", "alpha", "other",
+                                         identity=staff_move.PinnedUnit(row.id, parent.id))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(parent.id)))
+        changed = {path for path in before if path.read_bytes() != before[path]}
+        self.assertEqual(changed, {self.staff_file})
+        expected = [["--to", str(row.id), "--from", "showrunners", "--key",
+                     f"transfer:{row.id}:{parent.id}", "--text", "Your unit now belongs to production other."]]
+        self.assertEqual(self.messages(), expected)
+        self.assertIn("told alpha", result.stdout)
+        self.assertFalse(any("shutdown.py" in word or "launch_agent" in word
+                             for command in self.commands for word in command))
+        settled = {path: path.read_bytes() for path in before}
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(final_files(self.root), before)
+        self.assertEqual({path: path.read_bytes() for path in before}, settled)
+        self.assertEqual(self.messages(), expected)
 
-    def test_failed_showrunner_notice_retries_at_its_current_address_with_the_same_key(self) -> None:
-        self.env["TRANSFER_SEND_FAIL_TO"] = self.showrunner_addresses["other"]
-        failed = self.transfer("apply")
-        self.assert_refused(failed, "could not tell other: fixture recipient unavailable")
-        attempts = self.messages()
-        self.assertEqual(len(attempts), 3)
-        path = self.root / "state/showrunner/demo/transfer_unit.json"
-        saved = cast(dict[str, object], json.loads(path.read_text()))
-        self.assertEqual(saved["step"], next(index for index, step in enumerate(transfer_unit.STEPS)
-                                             if step.run.__name__ == "_tell_to"))
-        self.assertNotIn("from_address", saved)
-        self.assertNotIn("to_address", saved)
-        del self.env["TRANSFER_SEND_FAIL_TO"]
-        self.remove_showrunner_session("cc9c5b71-6f71-5499-a4bb-e6ad5d02930d")
-        address = self.running_showrunner("other", "cc9c5b71-6f71-5499-a4bb-e6ad5d02930d")
-        self.assertNotEqual(address, self.showrunner_addresses["other"])
+    def test_tab_move_failure_keeps_one_notice_after_the_parent_changes(self) -> None:
+        row = unit_membership("demo", "alpha")
+        parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
+        with mock.patch.object(staff_move, "move_unit", side_effect=OSError("tab move failed")):
+            result = self.transfer("apply")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("tab move failed", result.stderr)
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(parent.id)))
+        expected = [["--to", str(row.id), "--from", "showrunners", "--key",
+                     f"transfer:{row.id}:{parent.id}", "--text", "Your unit now belongs to production other."]]
+        self.assertEqual(self.messages(), expected)
+        self.assertIn("told alpha", result.stdout)
         self.assert_ok(self.transfer("apply"))
-        retried = self.messages()
-        self.assertEqual(retried[:3], attempts)
-        self.assertEqual(len(retried), 4)
-        self.assertEqual(retried[-1][retried[-1].index("--to") + 1], address)
-        self.assertEqual(retried[-1][retried[-1].index("--key") + 1], attempts[-1][attempts[-1].index("--key") + 1])
-        self.assert_ok(self.transfer("verify"))
+        self.assertEqual(self.messages(), expected)
 
-    def test_unfinished_transfer_refusal_names_its_exact_resume_command(self) -> None:
-        _ = self.pause_before_source_commit()
-        before = final_files(self.root)
-        refused = self.transfer("apply", "beta-unit", self.giving / "docs/plans/demo-production.md")
-        command = f"transfer_unit.py apply demo alpha-unit {self.receiving / 'docs/plans/other-production.md'}"
-        self.assert_refused(refused, f"the unfinished transfer is alpha-unit to other; resume it first with {command}")
-        self.assertEqual(final_files(self.root), before)
-
-    def test_completed_transfer_allows_another_destination_and_its_own_rerun(self) -> None:
+    def test_transfer_notice_address_resolves_to_the_moved_staff_row(self) -> None:
+        row = unit_membership("demo", "alpha")
+        parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
         self.assert_ok(self.transfer("apply"))
-        self.add_transfer_unit("beta")
-        third = self.add_destination("third")
-        self.assert_ok(self.transfer("apply", "beta-unit", third))
-        before = final_files(self.root)
-        repeated = self.transfer("apply")
-        self.assert_ok(repeated)
-        self.assertIn("done", repeated.stdout)
-        self.assertEqual(final_files(self.root), before)
-        rows = staff.snapshot()
-        alpha, beta = rows.by_path("other/alpha"), rows.by_path("third/beta")
-        assert alpha is not None and beta is not None
-        self.assertEqual(alpha.name, "alpha")
-        self.assertEqual(beta.name, "beta")
+        message = self.messages()[0]
+        target = message[message.index("--to") + 1]
+        self.assertEqual(target, str(row.id))
+        self.assertEqual(send.resolve_staff_recipient(target, staff.snapshot()),
+                         replace(row, parent=staff.ReportsTo(parent.id)))
 
-    def test_legacy_journal_resumes_after_the_destination_row_changed(self) -> None:
-        path = self.pause_before_source_commit()
-        legacy_staff_journal(path)
-        self.assert_transfer_resumed(path)
-        fields = cast(dict[str, object], json.loads(path.read_text()))
-        self.assertTrue(fields["staff_id"])
-        self.assertTrue(fields["parent_staff_id"])
-
-    def test_completed_legacy_journal_migrates_once_and_reports_done(self) -> None:
-        self.assert_ok(self.transfer("apply"))
-        expected = final_files(self.root)
-        legacy_staff_journal(self.root / "state/showrunner/demo/transfer_unit.json")
-        finished = self.transfer("apply")
-        self.assert_ok(finished)
-        self.assertIn("done", finished.stdout)
-        self.assertEqual(final_files(self.root), expected)
-
-    def test_shutdown_transfer_journal_resumes_before_removing_the_source_row(self) -> None:
-        path = self.pause_before_source_commit()
-        fields = cast(dict[str, object], json.loads(path.read_text()))
-        del fields["version"]
-        fields.update(step=3, account="owner@example.com", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
-        self.write(path, json.dumps(fields))
-        shutdown_log = self.seed_record()
-        self.assert_transfer_resumed(path)
-        self.assertEqual(len(self.messages()), 3)
-        self.assertFalse(shutdown_log.exists())
-
-    def test_retry_keeps_the_journaled_unit_when_its_old_name_is_reused(self) -> None:
-        path = self.pause_before_source_commit()
-        fields = cast(dict[str, object], json.loads(path.read_text()))
-        staff_id = staff.StaffId(cast(str, fields["staff_id"]))
-        renamed = staff.rename(staff_id, "panes")
-        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "demo")
-        replacement = fixture_member("unit", name="alpha", parent=parent.id,
-                                     runtime_id=fixture_runtime_id("replacement-alpha-backend"))
-        self.assert_transfer_resumed(path)
-        record = staff.snapshot()
-        self.assertEqual(record.by_id(staff_id), renamed)
-        self.assertEqual(record.by_id(replacement.id), replacement)
-
-    def test_completed_shutdown_transfer_reports_done_without_new_notices(self) -> None:
-        self.assert_ok(self.transfer("apply"))
-        path = self.root / "state/showrunner/demo/transfer_unit.json"
-        fields = cast(dict[str, object], json.loads(path.read_text()))
-        del fields["version"]
-        fields.update(account="owner@example.com", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
-        self.write(path, json.dumps(fields))
-        before = final_files(self.root)
-        repeated = self.transfer("apply")
-        self.assert_ok(repeated)
-        self.assertIn("done", repeated.stdout)
-        self.assertEqual(final_files(self.root), before)
-
-    def test_transfer_keeps_staff_ids_and_workers(self) -> None:
-        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        worker = fixture_member("worker", name="impl1", parent=row.id)
-        self.assert_ok(self.transfer("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
-                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
-        self.assertEqual(staff.snapshot().by_id(worker.id), worker)
-        saved = cast(dict[str, object], json.loads((self.root / "state/showrunner/demo/transfer_unit.json").read_text()))
-        self.assertEqual(saved["staff_id"], row.id)
-
-    def test_taken_staff_name_refuses_before_sources_change(self) -> None:
-        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        _ = fixture_member("unit", name="alpha", parent=parent.id)
-        before = final_files(self.root)
-        failed = self.transfer("apply")
-        self.assertEqual(failed.returncode, 2, failed.stderr)
-        self.assertIn("StaffRefused", failed.stderr)
-        self.assertEqual(final_files(self.root), before)
-        self.assertEqual(self.messages(), [])
-
-    def test_refused_later_request_preserves_the_completed_request_receipt(self) -> None:
-        self.assert_ok(self.transfer("apply"))
-        self.add_transfer_unit("beta")
-        third = self.add_destination("third")
-        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "third")
-        _ = fixture_member("unit", name="beta", parent=parent.id)
-        before = final_files(self.root)
-        messages = self.messages()
-        refused = self.transfer("apply", "beta-unit", third)
-        self.assertEqual(refused.returncode, 2, refused.stderr)
-        self.assertEqual(final_files(self.root), before)
-        self.assertEqual(self.messages(), messages)
-        repeated = self.transfer("apply")
-        self.assert_ok(repeated)
-        self.assertIn("done", repeated.stdout)
-        self.assertEqual(final_files(self.root), before)
-
-    def test_missing_staff_member_refuses_before_sources_change(self) -> None:
-        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        self.forget_rows(row.id)
-        before = final_files(self.root)
-        failed = self.transfer("apply")
-        self.assertEqual(failed.returncode, 2, failed.stderr)
-        self.assertEqual(final_files(self.root), before)
-        self.assertEqual(self.messages(), [])
-
-    def test_refused_live_move_leaves_every_doc_and_message_unchanged(self) -> None:
-        before = {path: path.read_bytes() for path in self.root.rglob("*.md")}
-        with mock.patch.object(staff_move, "move_unit",
-                               side_effect=staff.StaffRefused("live tab is not uniquely identified")):
-            refused = self.transfer("apply")
-        self.assertEqual(refused.returncode, 2, refused.stderr)
-        self.assertIn("live tab is not uniquely identified", refused.stderr)
-        self.assertEqual({path: path.read_bytes() for path in before}, before)
-        self.assertEqual(self.messages(), [])
-
-    def test_transfer_unit_rerun(self) -> None:
-        self.env.update(GIT_AUTHOR_DATE="2026-10-29T12:00:00Z", GIT_COMMITTER_DATE="2026-10-29T12:00:00Z")
-        with saved_fixture(self.root) as restore:
-            self.assert_ok(self.transfer("apply"))
-            self.assertEqual(len(self.messages()), 3)
-            expected = final_files(self.root)
-            for after in (False, True):
-                with self.subTest(after=after):
-                    restore()
-                    with stop_at_staff_write("move", after=after):
-                        failed = self.transfer("apply")
-                    self.assertNotEqual(failed.returncode, 0)
-                    self.assertIn("stopped at staff step", failed.stderr)
-                    self.assert_ok(self.transfer("apply"))
-                    self.assertEqual(final_files(self.root), expected)
-                    finished = self.transfer("apply")
-                    self.assert_ok(finished)
-                    self.assertIn("done", finished.stdout)
-                    self.assertEqual(final_files(self.root), expected)
-                    self.assertEqual(len(self.messages()), 3)
-
-    def test_seed_waits_between_staff_move_and_units_update(self) -> None:
-        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        commit_to = cast(Callable[[transfer_unit.UnitTransfer, Callable[[], None]], None], getattr(transfer_unit, "_commit_to"))
-        pending: list[subprocess.Popen[str]] = []
-
-        lock = self.staff_file.parent / "operation.lock"
-        with short_socket_directory() as directory, ExitStack() as contexts:
-            with mock.patch.object(self, "root", Path(directory)):
-                listener = contexts.enter_context(self.lock_notice(lock))
-            def pause(transfer: transfer_unit.UnitTransfer, save: Callable[[], None]) -> None:
-                self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
-                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
-                process = self.start_script(SOURCES_SCRIPT, "seed")
-                pending.append(process)
-                self.assert_operation_blocks(process, listener)
-                commit_to(transfer, save)
-
-            steps = tuple(step._replace(run=pause) if step.run is commit_to else step for step in transfer_unit.STEPS)
-            notices = {name: os.environ[name] for name in ("STAFF_TEST_LOCK_NOTICE", "STAFF_TEST_LOCK_TARGET")}
-            with mock.patch.object(transfer_unit, "STEPS", steps), mock.patch.dict(self.env, notices):
-                self.assert_ok(self.transfer("apply"))
-            output, errors = pending[0].communicate(timeout=PROCESS_TIMEOUT)
-        self.assertEqual(pending[0].returncode, 0, output + errors)
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "alpha", parent.id, current_session=row.id,
-                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled()))
-
-    def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
-        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
-        _ = shutil.copytree(self.root, snapshot)
-        self.assert_ok(self.transfer("apply"))
-        checkouts = (self.giving, self.receiving, self.unit)
-        expected_trees = [self.git("rev-parse", "HEAD^{tree}", cwd=path) for path in checkouts]
-        documents = (self.receiving / "docs/plans/other-production.md",
-                     self.giving / "docs/plans/demo-production.md")
-        expected_docs = [path.read_text() for path in documents]
-        for document in documents:
-            with self.subTest(document=document.name):
-                shutil.rmtree(self.root)
-                _ = shutil.copytree(snapshot, self.root)
-
-                def stop_after_write(path: Path, text: str) -> None:
-                    write_text(path, text)
-                    if path == document:
-                        raise OSError("fixture stop after document write")
-
-                with mock.patch.object(transfer_unit, "write_text", wraps=stop_after_write) as writes:
-                    self.assert_refused(self.transfer("apply"), "fixture stop after document write")
-                self.assertEqual(sum(call.args[0] == document for call in writes.call_args_list), 1)
-                self.assertNotEqual(self.git("status", "--porcelain", "--", str(document),
-                                             cwd=document.parents[2]), "")
-                # Recovery must not absorb an unrelated worktree or index edit.
-                expected = document.read_text()
-                head = self.git("rev-parse", "HEAD", cwd=document.parents[2])
-                self.write(document, expected + "unrelated edit\n")
-                self.assert_refused(self.transfer("apply"), f"{document} has uncommitted changes")
-                _ = self.git("add", str(document), cwd=document.parents[2])
-                self.write(document, expected)
-                self.assert_refused(self.transfer("apply"), f"{document} has uncommitted changes")
-                self.assertEqual(self.git("rev-parse", "HEAD", cwd=document.parents[2]), head)
-                self.assertIn("unrelated edit", self.git("diff", "--cached", cwd=document.parents[2]))
-                _ = self.git("reset", "HEAD", "--", str(document), cwd=document.parents[2])
-                if document == documents[0]:
-                    # A failed commit may already have staged the intended edit.
-                    _ = self.git("add", str(document), cwd=document.parents[2])
-                self.assert_transfer_resumed(self.root / "state/showrunner/demo/transfer_unit.json")
-                self.assertEqual([self.git("rev-parse", "HEAD^{tree}", cwd=path) for path in checkouts],
-                                 expected_trees)
-                self.assertEqual([path.read_text() for path in documents], expected_docs)
-                for checkout in checkouts:
-                    self.assertEqual(self.git("status", "--porcelain", cwd=checkout), "")
-                tips = [self.git("rev-parse", "HEAD", cwd=path) for path in checkouts]
-                self.assert_ok(self.transfer("verify"))
-                self.assertEqual([self.git("rev-parse", "HEAD", cwd=path) for path in checkouts], tips)
-
-    def test_verify_ignores_leftover_process_marks(self) -> None:
-        self.moved_unit_with_leftover_marks()
-        self.assert_ok(self.transfer("verify"))
-
-    def test_verify_allows_a_running_session_to_keep_its_original_marks(self) -> None:
-        self.moved_unit_with_leftover_marks()
-        pid = self.live_pid()
-        old = fake_showrunner.write_session(self.root / "state/sessions", "old", "66549537-4a24-5327-9a6e-e8eef3edab29", pid)
-        self.addCleanup(old.close)
-        fake_unit_host.place_process(self.env, pid, "w3:p3Y")
-        self.assert_ok(self.transfer("verify"))
-        self.assertIsNotNone(staff.snapshot().by_path("other/alpha"))
-
-    def test_resume_looks_up_the_moved_giving_checkout(self) -> None:
-        path = self.pause_before_source_commit()
-        self.move_giving_checkout()
-        self.assert_transfer_resumed(path)
-
-    def test_old_journal_ignores_stale_locations_for_both_productions(self) -> None:
-        path = self.pause_before_source_commit()
-        saved = cast(dict[str, object], json.loads(path.read_text()))
-        saved.update(from_doc=str(self.giving / "docs/plans/demo-production.md"), from_checkout=str(self.giving),
-                     to_doc=str(self.receiving / "docs/plans/other-production.md"), to_checkout=str(self.receiving))
-        self.write(path, json.dumps(saved))
-        self.move_giving_checkout()
-        old = self.receiving
-        self.receiving = old.with_name("claude-other-relocated")
-        _ = self.git("worktree", "move", str(old), str(self.receiving))
-        doc = self.receiving / "docs/plans/other-production.md"
-        self.write(doc, doc.read_text().replace(str(old), str(self.receiving)))
-        _ = self.git("add", str(doc), cwd=self.receiving)
-        _ = self.git("commit", "-m", "relocate receiving checkout", cwd=self.receiving)
-        self.assertFalse(old.exists())
-        self.assert_transfer_resumed(path)
-        saved = cast(dict[str, object], json.loads(path.read_text()))
-        for name in ("from_doc", "to_doc", "from_checkout", "to_checkout"):
-            self.assertNotIn(name, saved)
-
-
-    def test_plan_lists_the_steps_and_changes_nothing(self) -> None:
-        before = self.git("rev-parse", "demo", "other", "demo-alpha")
-        result = self.transfer("plan")
-        self.assert_ok(result)
-        self.assertIn("move alpha-unit's staff membership and live tab to other", result.stdout)
-        self.assertIn("tell alpha-unit its new production, doc and merge branch", result.stdout)
-        self.assertIn("tell demo showrunner", result.stdout)
-        self.assertIn("tell other showrunner", result.stdout)
-        self.assertIn("9. verify: alpha-unit shows under other and nowhere under demo", result.stdout)
-        self.assertEqual(self.messages(), [])
-        self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha"), before)
-
-    def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
-        result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", "demo", "alpha-unit",
-            str(self.receiving / "docs/plans/other-production.md"), "--scratch", str(self.root / "scratch")],
-            cwd=self.giving, env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("worker ownership changed; rerun apply", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
-
-    def test_transfer_rebinds_the_writer_ledger_without_changing_its_thread_or_owner(self) -> None:
-        run = self.root / "runs" / "carried"
-        run.mkdir(parents=True)
-        state = run / "progress_history_state.json"
-        self.write(state, json.dumps({"production": "demo", "unit": "alpha-unit", "working_dir": str(self.unit)}))
-        with mock.patch.dict(os.environ, self.env):
-            store = workers.UnitWorkerLedger(workers.ledger_path("demo", "alpha-unit"))
-            worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
-                workers.CodexThread("original-thread", str(self.root / "codex")), workers.Paused(),
-                [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
-            with store.locked() as ledger:
-                ledger.workers[worker.name] = worker
-        roster = run / "mesh_roster.json"
-        self.write(roster, json.dumps({"w7": {"thread_id": "original-thread", "role": "impl",
-            "status": "paused", "unit_ledger": str(store.path)}}))
-        record = run / "mesh_runs" / "kept-command.json"
-        with subprocess.Popen([sys.executable, "-c", "import sys; from pathlib import Path; sys.stdin.read(); Path('command-finished').write_text(str(Path.cwd()))",
-                               "mesh_runs.py", "supervise", str(record)],
-                              cwd=self.unit, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as command:
-            self.write(record, json.dumps({"worker": "w7", "status": "running", "pid": command.pid, "cwd": str(self.unit)}))
-            self.assert_ok(self.transfer("apply"))
-            self.assertIsNone(command.poll(), "transfer ended the paused worker's detached command")
-            _output, errors = command.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(command.returncode, 0, errors.decode())
-            self.assertEqual((self.unit / "command-finished").read_text(), str(self.unit))
-            self.assertTrue(record.exists())
-        with mock.patch.dict(os.environ, self.env):
-            target = workers.ledger_for_run(run)
-            self.assertEqual(target.path, workers.ledger_path("other", "alpha-unit"))
-            with target.locked() as ledger:
-                self.assertEqual(ledger.workers["w7"], worker)
-        self.assertFalse(store.path.exists())
-        self.assertEqual(json.loads(roster.read_text())["w7"]["unit_ledger"], str(target.path))
-
-    def test_apply_moves_the_row_header_and_state_and_keeps_the_branch(self) -> None:
-        tip = self.git("rev-parse", "demo-alpha")
-        self.assert_ok(self.transfer("apply"))
-        receiving = (self.receiving / "docs/plans/other-production.md").read_text(encoding="utf-8")
-        self.assertIn(f"| alpha-unit | docs/plans/alpha.md | `{self.unit}` | demo-alpha | — | — |", receiving)
-        giving = (self.giving / "docs/plans/demo-production.md").read_text(encoding="utf-8")
-        self.assertNotIn("alpha-unit", giving)
-        self.assertIn("beta-unit", giving)
-        self.assertEqual(self.git("log", "-1", "--format=%s", "other"), "chore(other): transfer unit alpha-unit from demo")
-        self.assertEqual(self.git("log", "-1", "--format=%s", "demo"), "chore(demo): transfer unit alpha-unit to other")
-        plan = (self.unit / "docs/plans/alpha.md").read_text(encoding="utf-8")
-        self.assertIn("> **Production: other** — unit `alpha-unit`; production doc `docs/plans/other-production.md`", plan)
-        self.assertIn("alpha prose stays.", plan)
-        # The branch keeps its commits and gains only the header commit, which is pushed.
-        self.assertEqual(self.git("rev-parse", "demo-alpha^"), tip)
-        self.assertEqual(self.git("rev-parse", "origin/demo-alpha"), self.git("rev-parse", "demo-alpha"))
-        self.assertTrue(self.unit.is_dir())
-        self.assertFalse(self.stall_path("demo", "alpha-unit").exists())
-        self.assertEqual(self.stall_path("other", "alpha-unit").read_text(encoding="utf-8"), '{"stretch": 17}\n')
-        self.assert_ok(self.transfer("verify"))
-
-    def test_a_held_role_moves_to_the_receiving_holder_and_keeps_its_thread_and_paths(self) -> None:
-        config = self.root / "design_roles.conf"
-        self.write(config, "[ownership]\nhost=fixture-host\n")
-        self.env.update({"DESIGN_ROLES_CONFIG": str(config), "DESIGN_ROLES_HOST": "fixture-host",
-                         "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
-                         "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership")})
-        document = str(self.unit / "docs/plans/alpha.md")
-        with mock.patch.dict(os.environ, self.env):
-            design_roles.register_repository("fixture-repo", {"fixture-host": str(self.unit)}, inventory_complete=True)
-            placement = design_roles.authority_request("reserve", {"repository_id": "fixture-repo",
-                "document": "docs/plans/alpha.md", "host": "fixture-host", "request_id": "transfer-fixture"})
-            design = design_roles.HeldDesign(design_roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1),
-                "fixture-repo", str(self.unit), document, "design", "2026-10-22T12:00:00+00:00",
-                design_roles.UnitHolder("demo", "alpha-unit"), design_roles.DesignUnbound(),
-                (design_roles.RoleInstance("designer", "demo-design-astra-designer", design_roles.RoleOpen("designer-thread")),
-                 design_roles.RoleInstance("reviewer", "demo-design-astra-reviewer", design_roles.RoleNotOpened())))
-            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            mesh = design_roles.mesh_directory(design.placement.design_id)
-        self.write(mesh / "mesh_roster.json", json.dumps({"demo-design-astra-designer": {
-            "thread_id": "designer-thread", "status": "done", "cwd": str(self.unit)}}))
-        self.assert_ok(self.transfer("apply"))
-        with mock.patch.dict(os.environ, self.env):
-            moved = design_roles.read_design(design.placement.design_id)
-        self.assertEqual(moved.holder, design_roles.UnitHolder("other", "alpha-unit"))
-        self.assertEqual((moved.repository, moved.document, moved.roles), (design.repository, design.document, design.roles))
-        self.assertEqual(moved.placement.generation, 2)
-        roster = cast(dict[str, dict[str, str]], json.loads((mesh / "mesh_roster.json").read_text(encoding="utf-8")))
-        self.assertEqual(roster["demo-design-astra-designer"]["cwd"], str(self.unit))
-        self.assert_ok(self.transfer("verify"))
-
-    def test_work_in_progress_stays_and_only_the_header_is_committed(self) -> None:
-        # showrunner, 2026-10-21: hierarchies-unit had its plan and other files edited, not committed.
+    def test_transfer_preserves_branch_tips_and_plan_bytes(self) -> None:
         plan = self.unit / "docs/plans/alpha.md"
-        self.write(plan, plan.read_text(encoding="utf-8") + "A new step, not committed.\n")
-        self.write(self.unit / "measure.py", "staged = True\n")
-        _ = self.git("add", "measure.py", cwd=self.unit)
-        tip = self.git("rev-parse", "demo-alpha")
+        before = plan.read_bytes()
+        tips = self.git("rev-parse", "demo", "other", "demo-alpha", "origin/demo-alpha")
         self.assert_ok(self.transfer("apply"))
-        self.assertEqual(self.git("rev-parse", "demo-alpha^"), tip)
-        self.assertEqual(self.git("diff", "--name-only", "demo-alpha^", "demo-alpha"), "docs/plans/alpha.md")
-        committed = self.git("show", "demo-alpha:docs/plans/alpha.md")
-        self.assertIn("> **Production: other**", committed)
-        self.assertNotIn("A new step", committed)
-        text = plan.read_text(encoding="utf-8")
-        self.assertIn("> **Production: other**", text)
-        self.assertIn("A new step, not committed.", text)
-        self.assertEqual(self.git("status", "--porcelain", cwd=self.unit), "M docs/plans/alpha.md\nA  measure.py")
-        self.assertEqual(self.git("diff", "--cached", "--name-only", cwd=self.unit), "measure.py")
-
-    def test_plan_refuses_a_receiving_doc_with_uncommitted_changes_before_any_stop(self) -> None:
-        doc = self.receiving / "docs/plans/other-production.md"
-        self.write(doc, doc.read_text(encoding="utf-8") + "edited\n")
-        self.assert_refused(self.transfer("plan"), "other-production.md has uncommitted changes")
-
-    def test_a_merge_in_progress_is_refused(self) -> None:
-        self.write(self.unit / "NOTES.md", "unit side\n")
-        _ = self.git("add", "NOTES.md", cwd=self.unit)
-        _ = self.git("commit", "-m", "unit side", cwd=self.unit)
-        self.write(self.receiving / "NOTES.md", "receiving side\n")
-        _ = self.git("add", "NOTES.md", cwd=self.receiving)
-        _ = self.git("commit", "-m", "receiving side", cwd=self.receiving)
-        merged = subprocess.run(["git", "merge", "--no-edit", "demo-alpha"], cwd=self.receiving, env=self.env,
-                                capture_output=True, text=True, check=False)
-        self.assertNotEqual(merged.returncode, 0)
-        self.assert_refused(self.transfer("plan"), "a merge is in progress")
-
-    def test_giving_only_commits_are_refused(self) -> None:
-        self.write(self.giving / "LATER.md", "giving only\n")
-        _ = self.git("add", "LATER.md")
-        _ = self.git("commit", "-m", "giving only")
-        _ = self.git("push", "origin", "demo")
-        _ = self.git("merge", "--no-edit", "demo", cwd=self.unit)
-        self.assert_refused(self.transfer("plan"), "commit(s) that other lacks")
-
-    def test_another_repository_is_refused(self) -> None:
-        elsewhere = self.root / "elsewhere"
-        elsewhere.mkdir()
-        _ = self.git("init", "-b", "far", cwd=elsewhere)
-        self.write(elsewhere / "docs/plans/far-production.md", self.production_doc(
-            "far", elsewhere, "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |"))
-        document = elsewhere / "docs/plans/far-production.md"
-        self.register_production("far", document)
-        _ = fixture_member("showrunner", name="far", doc=staff.LiveDoc("natedev", document))
-        self.assert_refused(self.transfer("plan", to=elsewhere / "docs/plans/far-production.md"),
-                            "another repository")
-
-    def test_a_unit_without_a_worktree_here_is_refused(self) -> None:
-        self.assert_refused(self.transfer("plan", unit="beta-unit"), "a Mac unit is not moved")
+        self.assertEqual(self.git("rev-parse", "demo", "other", "demo-alpha", "origin/demo-alpha"), tips)
+        self.assertEqual(plan.read_bytes(), before)
+        self.assertTrue(self.unit.is_dir())
+        self.assert_ok(self.transfer("verify"))
 
 
 if __name__ == "__main__":

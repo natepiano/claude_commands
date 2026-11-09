@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Count what config/dailies.conf names for one production, for the dailies' counts line.
+"""Read dailies counts keyed by the fixed showrunner staff id.
 
-Each line is `<production slug>.<label>=lines <file> <regex>`, the file's lines matching the
-regex, `<production slug>.<label>=files <glob>`, the files matching the glob, or
-`<production slug>.<label>=issues <folder> <tag>`, the open issues directly in the folder whose
-tags hold the tag. `~` expands, and a hyphen in the label reads as a space. A production with no
-lines gets no counts.
+Each key has the form `<staff id>.<label>`. Sources count lines, files, or open issues.
+A hyphen in a label becomes a space. Missing sources produce `not_found`.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import glob
 import os
@@ -15,7 +16,7 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
-from issues import open_issues
+from scripts.production.issues import open_issues
 
 LABEL = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
@@ -59,9 +60,9 @@ def config_path() -> Path:
 def parse_line(line: str, number: int) -> tuple[str, CountSpec]:
     where = f"dailies.conf line {number}"
     key, separator, value = line.partition("=")
-    slug, dot, label = key.strip().partition(".")
-    if not separator or not dot or not slug or not LABEL.fullmatch(label):
-        raise CountsFailure(f"{where}: expected <production slug>.<label>=lines <file> <regex> | files <glob> | issues <folder> <tag>")
+    staff_id, dot, label = key.strip().partition(".")
+    if not separator or not dot or not staff_id or not LABEL.fullmatch(label):
+        raise CountsFailure(f"{where}: expected <staff id>.<label>=lines <file> <regex> | files <glob> | issues <folder> <tag>")
     kind, _, rest = value.strip().partition(" ")
     rest = rest.strip()
     source: LineCount | FileCount | IssueCount
@@ -84,18 +85,18 @@ def parse_line(line: str, number: int) -> tuple[str, CountSpec]:
         source = IssueCount(Path(folder).expanduser(), tag.strip())
     else:
         raise CountsFailure(f"{where}: the count kind is lines, files or issues, not {kind or 'nothing'}")
-    return slug, CountSpec(label.replace("-", " "), source)
+    return staff_id, CountSpec(label.replace("-", " "), source)
 
 
-def read_specs(path: Path, slug: str) -> list[CountSpec]:
+def read_specs(path: Path, staff_id: str) -> list[CountSpec]:
     if not path.exists():
         return []
     specs: list[CountSpec] = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        line_slug, spec = parse_line(line, number)
-        if line_slug == slug:
+        owner_id, spec = parse_line(line, number)
+        if owner_id == staff_id:
             specs.append(spec)
     return specs
 
@@ -118,10 +119,10 @@ def count(spec: CountSpec) -> Counted | SourceNotFound:
             return Counted(spec.label, len(open_issues(folder, tag)))
 
 
-def production_counts(slug: str) -> list[dict[str, object]]:
-    """The input's `counts`: each label with its count, or `not_found` when its source is missing."""
+def production_counts(staff_id: str) -> list[dict[str, object]]:
+    """Read counts for a fixed staff id supplied by the command's staff snapshot."""
     counts: list[dict[str, object]] = []
-    for spec in read_specs(config_path(), slug):
+    for spec in read_specs(config_path(), staff_id):
         match count(spec):
             case Counted(label, number):
                 counts.append({"label": label, "count": number})

@@ -1,9 +1,8 @@
 # natedev shutdown-unit phases
 
-> **Production:** `docs/plans/natedev-production.md`
-> **Unit:** shutdown-unit · branch `natedev-shutdown` · as-built `docs/as-built/shutdown-and-restart.md`
+> **Unit:** agents (was shutdown-unit), under sdlc · branch `sdlc-agents` · as-built `docs/as-built/shutdown-and-restart.md`
 
-Earlier phases of this unit are recorded in the as-built and in the branch history. This plan holds Phase 4 and Phase 5, the follow-up Phase 4 routed.
+Earlier phases of this unit are recorded in the as-built and in the branch history. This plan holds Phases 4 to 17a.
 
 ## Phase 4: herdr's shutdown items and the pane-shell stop — done
 
@@ -59,3 +58,111 @@ The user's rule: "1 yes 2 yes 3 yes - plus a resume message". There is one way f
 - `rename_unit.py` stops with Phase 6 stop, moves with herdr's move, and resumes with Phase 6 resume; the record rewrite and the `shutdown.py restart --only` relaunch go.
 - `rename.py` uses the same stop, move and resume. herdr-unit deletes the `transfer_unit.py` journal at its own checkpoint (sdlc, 2026-10-30); this phase touches `transfer_unit.py` only if a stop or resume call is left in it.
 - The as-built docs that describe the old machinery are corrected: `shutdown-and-restart.md`, `unit-rename.md`, `unit-transfer.md`, `production-rename.md` and `long-lived-workers.md`.
+
+## One agents command (user decision 2026-11-07, via sdlc)
+
+The user's rule: one name, `agents`. One skill, `/agents`, and one program, `agents`. Everyone uses only these. The commands are status, pause, exit, resume, retire, restart, rename and move. `agents` with no arguments prints the same short usage as `agents help`.
+
+Each phase deletes the skill and the code it replaces when it lands. `staff.py` stays as the code that stores the staff record; no person or skill runs it. herdr-unit is the partner for worker rename and pane files. The accounts unit is the partner for move. Phases 10 and 15 run side by side. Phase 11 follows Phase 10, because it adds commands to the program Phase 10 makes. Phases 13 and 14 wait on Phase 12, because the three write the same staff rows. Phase 16 runs beside Phase 11. Phase 12 starts when a writer is free.
+
+### Phase 10: the agents program and the /agents skill — done
+
+- `agents` and `agents help` print one short usage.
+- `agents status`, `agents restart` and `agents resume NAME`. Resume of a paused unit sends it a message to continue. Resume of an exited unit starts it again on the current role account, the same as `resume <unit>` at the shell, which stays as the short form.
+- Deletes `/shutdown` and the shutdown.py command surface that `agents` replaces.
+
+### Phase 11: pause and exit — done
+
+- `agents pause NAME`: stop now by default. Workers stop at once, and the unit holds at its prompt. The pause record holds the time, the caller and why. The board shows `paused`.
+- `agents exit NAME`: the same stop rule. The director and its workers quit, the herdr tab stays at the shell prompt, and the staff row stays. The board shows `exited`.
+- "finish the current step" on either command lets workers finish their current task first, then hold or exit.
+- Deletes the `staff.py` pause and resume commands and the pause and resume text in `/showrunner:units`.
+- No draft keep: a move does not save or type back unsent composer text (user 2026-11-07, via sdlc: "this is overkill").
+- `agents stop --all` stops every live row and saves them for `agents restart`. Its dry run lists every live row and is fast.
+
+### Phase 11a: `agents restart ACCOUNT` selects only that account — done
+
+- Today `restart` reads ACCOUNT and does not use it. It restarts only the rows of that account.
+- Its own hash, so it merges alone. Tell accounts when it is on main.
+
+### Phase 11b: a unit rename takes `--to-branch` — done
+
+- `rename.py apply OLD NEW --to-branch BRANCH` works for a unit. NEW may equal the current name, so only the branch moves.
+- It uses the unit rename steps: stop, branch move, origin push and resume. The branch checks are one function for units and showrunners.
+- Request from cargo-liner, from the user 2026-11-07: "give the branch for the handler unit a better name".
+
+### Phase 11c: `agents restart` takes seconds — done
+
+- A restart takes one Codex snapshot, one worker-run search, one pane read and one process snapshot. Rows stop in parallel. Each output line names its row.
+- `agents restart --all --dry-run` took 457 s before and takes 2.0 s now. The restart record keeps the selection order.
+
+### Phase 11d: a real restart of stopped pane workers also takes one scan — done
+
+- Worker startup takes the shared run index and the shared Codex snapshot. Restore and stop find a worker's run through one resolver.
+- After a failed worker stop, a worker starts again only when the read proves its old process is gone.
+
+### Phase 12: retire, and resume of a retired unit — done
+
+- `agents retire NAME` removes the unit from active staff. Its row stays only as a retired record, and the board does not show it.
+- `agents resume NAME` of a retired unit refuses and names `--retired`. The showrunner asks the user yes or no before it runs `--retired`.
+- `retire_unit.py`, `resume_unit.py`, `/showrunner:retire_unit` and `/showrunner:resume_unit` are deleted.
+
+### Phase 12a: a worker stopped in the middle of a turn gets a working resume step — done
+
+- When the dispatch is already in the transcript and the worker is idle, the resume sends a continue prompt, not the saved assign command.
+- A dispatch that is already closed gets no resume note.
+
+### Phase 13: rename — done
+
+- `agents rename OLD NEW` renames a unit, a showrunner or a worker, `--to-branch` included. A worker's pane label is `<owner>-<name>`, from the one `worker_panes.agent_name` rule.
+- `rename.py`, `/showrunner:rename` and `/unit:rename` are deleted.
+
+### Phase 13a: cancelled
+
+- The one-off conversion of old qualified worker names runs as a program outside the repository (user rule 2026-11-05).
+
+### Phase 13b: two assign defects — done
+
+- A design role dispatch with no summary path ends clean: the reply goes beside the prompt.
+- `agent_name` keeps a name that already starts with `<owner>-`, so a label never gets two owner prefixes.
+
+### Phase 14: move — done
+
+- `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` calls the accounts move. `accounts.py` keeps the account board and the queued moves (`accounts.py next`).
+- `showrunner_move.py` and `/showrunner:move` are deleted.
+
+### Phase 15: the launch record takes the role account — done
+
+- A staff member takes its account from the current role account at launch. A session with no staff row opens on its family default: the workers account for Codex, the units account for Claude.
+- Copies of staff data leave `pane_launch.PaneLaunch`. Pane data stays there.
+- Also touches `scripts/herdr/pane_launch.py`; sdlc confirmed 2026-11-07 that it is free.
+
+### Phase 15b: worker list gives work, account and home — done
+
+- `worker.py list --json` gives `work`, `account` and `home` for each pane worker, computed at read time. A worker with no backend entry reports `AccountUnavailable`.
+- `member_account.resume_account` is the one account rule for resume, restart and the worker list.
+
+### Phase 16: a launch trusts its folder; the draft stash goes — done
+
+- A launch by our tools writes Claude trust for the target folder in the target account before it starts. It reuses the `copy_claude_trust` write, in one place. No user step (user rule 2026-11-07: a move or start needs no user work).
+- When trust cannot be written, the launch prints one anomaly line and stops cleanly.
+- Deletes the herdr 23 draft stash in `herdr.py` and its three tests (change row C1211). The user does not want the feature.
+
+### Phase 17: the worker list shows every pane worker without a live scan — done
+
+- `worker.py list --json --all` runs from any caller and lists every pane worker of every manager, with `manager`. It reads the staff record, the dispatch records and the account config once, with no process, herdr or Codex read. 301 rows in 1.03 s on natedev.
+
+### Phase 13c: Codex processes outside panes do not make sessions unknown; restart names live sessions — done
+
+- `herdr.codex_conversations()` counts an unknown Codex process only when it leads its terminal's foreground group and, on Linux, its session leader is a herdr pane shell. A failed process read keeps the entry. Every caller has the rule.
+- An unassigned live session in `agents restart` prints its tab, pane label and pane id.
+
+### Phase 13d: a worker's detached run belongs to that worker — done
+
+- `mesh_runs.py start` reads the caller first. A worker's run always uses that worker's run folder, name and staff id; `--to` is used only for a caller that is not a worker.
+
+### Phase 17a: `worker.py list --json --all` reads a bounded part of the history files
+
+- The list takes 1.8 s on natedev: it reads about 1,270 blocks of 64 KiB from 38 history files and parses about 21,800 events. A worker with no dispatch keeps a file open back to its creation, and a UUIDv4 row keeps it open to the first line.
+- The read cost does not grow with the history. No cache file and no live call.
+- Waits on the models-unit launch proof fix: no worker can start (sdlc 2026-11-08).

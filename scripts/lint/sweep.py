@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Keep a cargo project's target directory under a size budget.
 
 invoke.sh's run() starts `lint sweep` in the background after every build
@@ -55,7 +55,7 @@ The disk floor. Each budget fits the disk; together they do not (hana 96 GiB
 in each of 9 worktrees, 24 in 7 other repos, CI 160 x 2), and natedev's disk
 filled on 2026-10-03. When lint.conf sets sweep_free_floor_gib.<host> or
 sweep_free_floor_gib, the shortfall below that free-space floor sets how much
-build output goes. A target is a directory under FLOOR_ROOTS holding
+build output goes. A target is a directory under the configured sweep_floor_roots holding
 .rustc_info.json, or Cargo's cache tag beside a build tree: a folder cargo
 creates carries the tag from its first moment, and .rustc_info.json may come
 only when the first build ends, or never. Cargo's registry carries the same
@@ -84,7 +84,7 @@ Each such pass first runs tmp_sweep.py once an hour, which deletes agent
 scratch under /tmp/claude and /tmp/claude-<uid>/<project>/ that no process
 uses and where nothing changed in 4 hours, before the floor takes any build
 cache. Gate copies and scratch builds there had stayed until the disk filled.
-CI's targets are outside FLOOR_ROOTS, and its accounts cannot read lint.conf.
+CI's targets are outside the configured sweep_floor_roots, and its accounts cannot read lint.conf.
 By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
 used a median 3.0 h earlier. In a 60 GiB shortfall simulation, target-first order spared the
 active hana targets that the prior global unit order reached.
@@ -152,9 +152,14 @@ test binaries. A running app counts too, so its target waits for it to exit.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -165,40 +170,55 @@ import stat
 import subprocess
 import sys
 import time
-import tomllib
-from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+import uuid
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
 from copy import copy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+from functools import cache, cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
+from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.message import send_budget
-import conf
-from process_failure import failure_detail
-from user_zone import user_zone  # noqa: E402
+from scripts.message import send_budget, send_result, session_send
+from scripts.message.session_send import session_send_argv
+from scripts.lib import file_lock
+from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
+from scripts.lib import conf
+from scripts.lib.cargo_target_config import (
+    CargoFolderSetting,
+    cargo_folder_settings,
+    cargo_home_folder,
+    cargo_workspace_manifest,
+)
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
-    from . import tmp_sweep
-    from ..lib import scratch
-    from ..lib.atomic_file import write_text_atomic
-    from ..buildlog import record, store
-    from ..notify.push_texts import RenderedPush
-    from ..notify import review
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lint import tmp_sweep
-    import scratch
-    from atomic_file import write_text_atomic
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-    import record
-    import store
+    from scripts.copies import copies
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import record, store
+    from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
+                                              TargetFolderOverride, recorded_output_roots)
+    from scripts.notify.push_texts import RenderedPush
+    from scripts.notify import review
+else:
+    from scripts.copies import copies
+    from scripts.lib import scratch
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.buildlog import store
+    from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
+                                              TargetFolderOverride, recorded_output_roots)
+
+from scripts.lib.conf import UseConfiguredValue
+from scripts.lib import copy_record
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+from scripts.mac_test import floor_claims
+from scripts.mac_test.mirror_root import MacMirrorRoot
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -209,24 +229,21 @@ GIT_DIR = ".git"
 GITDIR_PREFIX = "gitdir:"
 COMMONDIR_FILE = "commondir"
 ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
-DEFAULT_DOC_INDEX_MIB = 250.0
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
 DOC_LOCK_NAME = ".lock"
 # The cross-crate stores every rustdoc run reads and rewrites at its end.
 MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
+# natedev's installed ~/.claude reflog first contains 2ae242c18 at this time:
+# 1548db836 HEAD@{2026-11-05T03:31:36-05:00}: merge 1548db8365b32844fb8543dcaa73cfa14a2b8d20: Fast-forward
+TARGET_OVERRIDE_RECORDER_CUT = datetime(2026, 11, 5, 8, 31, 36, tzinfo=UTC)
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
-PROC_LOCKS = "/proc/locks"
-# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
-# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
-PROC_LOCKS_READS = 3
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
 NEXTEST_ARG = "nextest"
-CARGO_TARGET_DIR_ENV = "CARGO_TARGET_DIR"
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
 FINGERPRINT_DIR = ".fingerprint"
 INCREMENTAL_DIR = "incremental"
@@ -235,9 +252,7 @@ INCREMENTAL_DIR = "incremental"
 COPY_DIRS = {"deps": "", "examples": "examples"}
 DEP_INFO_SUFFIX = ".d"
 # A dep-info file's first line starts with the output it describes.
-DEP_INFO_HEAD = 4096
 # target/debug, target/<triple>/debug, target/<custom>/<triple>/debug.
-MAX_TREE_DEPTH = 3
 FLOOR_KEY = "sweep_free_floor_gib"
 RECENT_KEY = "recent_minutes"
 FLOOR_LOCK_ALERT_KEY = "floor_lock_alert_minutes"
@@ -247,28 +262,14 @@ USE_STAMP = scratch.USE_STAMP
 # 421 GiB of idle targets under ~/.cache/trace-targets, where hana_catalyst agents point
 # CARGO_TARGET_DIR, had stayed unseen. ~/.cache/sccache holds no .rustc_info.json and no cargo
 # cache tag, so is_cargo_target never takes it.
-FLOOR_ROOTS = ("~/rust", "~/.local/state", "~/.cache", "/tmp")
 # Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
 # where <project> is the session's working directory with every / as -.
-FLOOR_STATE_ENV = tmp_sweep.STATE_ENV
-BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
-CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
-GROWTH_WINDOW_SECONDS = 30 * 60
-SNAPSHOT_MAX_AGE_SECONDS = 15 * 60
-ALERT_INTERVAL_SECONDS = 60 * 60
 # A phone push stays under this many characters (test_push_texts pins it for every catalog example).
-PUSH_TEXT_LIMIT = 500
 # The page names at most this many paths.
-PAGE_PATHS = 4
-NO_PAGE_PATHS = "No path is known: the disk measurement names no folder."
 # Three trace-driven sweeps on 2026-10-04 followed about 30 GiB of unexplained
 # loss each; their smallest removal was 35.2 GiB, versus 29.2 GiB at most otherwise.
-UNEXPLAINED_FALL_BYTES = 10 * GIB
-LARGE_REMOVAL_BYTES = 32 * GIB
 # A nightly worktree's target is 5 below its root, a scratch crate's under
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
-FLOOR_SEARCH_DEPTH = 8
-FLOOR_SKIP = frozenset({".git", "node_modules"})
 # cargo writes this at a target directory's root: early in a build into a
 # folder that already exists; into a folder it creates, when the first build
 # ends or never (31 finished scratch targets had none on 2026-10-08). It
@@ -284,12 +285,195 @@ InodeKey = tuple[int, int]
 GroupKind = Literal["unit", "incremental", "orphan"]
 
 
-class CargoMetadata(TypedDict, total=False):
-    target_directory: str
-    build_directory: str
+@dataclass(frozen=True)
+class NoRecordedEvidence:
+    """The floor cannot prove that a queue step built this target."""
+
+    path: str
 
 
 @dataclass(frozen=True)
+class CargoOutputIndex:
+    workspaces: tuple[CargoOutputRoots, ...] = ()
+    history: tuple[CargoOutputRoots, ...] = ()
+    no_recorded_evidence: tuple[NoRecordedEvidence, ...] = ()
+    known_trees: dict[str, list[str]] = field(default_factory=dict)
+
+    @cached_property
+    def linked_roots(self) -> dict[str, tuple[str, ...]]:
+        """Connected output roots, shared by all lookups in this index."""
+        connected: dict[str, set[str]] = {}
+        for mapping in self.workspaces:
+            target, build = str(mapping.target_directory), str(mapping.build_directory)
+            linked = connected.get(target, {target}) | connected.get(build, {build})
+            for root in linked:
+                connected[root] = linked
+        return {root: tuple(sorted(linked)) for root, linked in connected.items()}
+
+    def roots_for(self, root: str) -> tuple[str, ...]:
+        return tuple(path for path in self.linked_roots.get(root, (root,)) if os.path.isdir(path))
+
+    @cached_property
+    def output_owners(self) -> dict[Path, tuple[int, ...]]:
+        owners: dict[Path, list[int]] = {}
+        for position, mapping in enumerate(self.workspaces):
+            for root in {mapping.target_directory, mapping.build_directory}:
+                owners.setdefault(root, []).append(position)
+        return {root: tuple(positions) for root, positions in owners.items()}
+
+    def mappings_for(self, tree: Path) -> tuple[CargoOutputRoots, ...]:
+        positions = {position for root in (tree, *tree.parents)
+                     for position in self.output_owners.get(root, ())}
+        return tuple(self.workspaces[position] for position in sorted(positions))
+
+    def output_roots(self) -> set[str]:
+        return {str(path) for item in self.workspaces
+                for path in (item.target_directory, item.build_directory) if path.is_dir()}
+
+
+OUTPUT_ROOTS: ContextVar[CargoOutputIndex] = ContextVar("cargo_output_roots", default=CargoOutputIndex())
+
+
+@dataclass(frozen=True)
+class FilesystemFloor:
+    device: int
+    probe_path: str
+    floor_bytes: int
+    targets: tuple[str, ...]
+    root_device: bool
+    legacy_history_safe: bool = True
+
+    @property
+    def key(self) -> str:
+        return f"{os.major(self.device)}-{os.minor(self.device)}"
+
+    @property
+    def record_stem(self) -> str:
+        return "floor" if self.root_device else f"floor-{self.key}"
+
+
+FLOOR_FILESYSTEM: ContextVar[FilesystemFloor | UseConfiguredValue] = ContextVar(
+    "floor_filesystem", default=UseConfiguredValue.CURRENT)
+
+
+def on_floor_filesystem(path: str) -> bool:
+    """Keep paths on the current floor filesystem. A missing target is on no filesystem."""
+    filesystem = FLOOR_FILESYSTEM.get()
+    try:
+        return not isinstance(filesystem, FilesystemFloor) or output_device(path) == filesystem.device
+    except FileNotFoundError:
+        return False
+
+
+def cargo_output_cache_path() -> Path:
+    from scripts.lint import tmp_sweep
+
+    return tmp_sweep.state_dir() / "cargo-output-roots.json"
+
+
+def _cargo_mapping_rows(rows: object) -> tuple[CargoOutputRoots, ...]:
+    if not isinstance(rows, list):
+        return ()
+    mappings: list[CargoOutputRoots] = []
+    for value in cast(list[object], rows):
+        if not isinstance(value, dict):
+            continue
+        row = cast(dict[str, object], value)
+        paths = [row.get(key) for key in ("workspace_root", "target_directory", "build_directory")]
+        if all(isinstance(path, str) and os.path.isabs(path) for path in paths):
+            mappings.append(CargoOutputRoots(*(Path(cast(str, path)) for path in paths)))
+    return tuple(mappings)
+
+
+def _recorded_mapping_rows(rows: Iterable[RecordedStepOutput]) -> tuple[CargoOutputRoots, ...]:
+    """Keep output pairs that the recorded step can prove it built."""
+    mappings: list[CargoOutputRoots] = []
+    for row in rows:
+        target, build, folder = row.target_directory, row.build_directory, row.target_folder
+        if isinstance(folder, AbsoluteRecordedRoot) and folder != target:
+            continue
+        fixed_recorder = (isinstance(row.newest_start, KnownStepStart)
+                          and row.newest_start.instant > TARGET_OVERRIDE_RECORDER_CUT)
+        if row.target_folder_override is TargetFolderOverride.PRESENT and not fixed_recorder:
+            continue
+        workspace = row.worktree if isinstance(row.worktree, AbsoluteRecordedRoot) else row.cwd
+        if (isinstance(workspace, AbsoluteRecordedRoot) and isinstance(target, AbsoluteRecordedRoot)
+                and isinstance(build, AbsoluteRecordedRoot)):
+            mappings.append(CargoOutputRoots(workspace.path, target.path, build.path))
+    return tuple(mappings)
+
+
+def saved_cargo_output_roots() -> CargoOutputIndex:
+    try:
+        rows = cast(object, json.loads(cargo_output_cache_path().read_text()))
+        if isinstance(rows, list):
+            return CargoOutputIndex(_cargo_mapping_rows(cast(list[object], rows)))
+        if isinstance(rows, dict):
+            fields = cast(dict[str, object], rows)
+            return CargoOutputIndex(_cargo_mapping_rows(fields.get("workspaces")),
+                                    history=_cargo_mapping_rows(fields.get("history")))
+    except (OSError, ValueError):
+        pass
+    return CargoOutputIndex()
+
+
+def save_cargo_output_roots(index: CargoOutputIndex) -> None:
+    path = cargo_output_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        saved = saved_cargo_output_roots()
+        merged = {item.workspace_root: item for item in saved.workspaces}
+        history = set(saved.history) | set(index.history)
+        current: set[Path] = set()
+        for item in index.workspaces:
+            if item.workspace_root in current:
+                history.add(item)
+                continue
+            current.add(item.workspace_root)
+            old = merged.get(item.workspace_root)
+            if old is not None and old != item:
+                history.add(old)
+            merged[item.workspace_root] = item
+        def rows(mappings: Sequence[CargoOutputRoots]) -> list[dict[str, str]]:
+            return [{"workspace_root": str(item.workspace_root), "target_directory": str(item.target_directory),
+                     "build_directory": str(item.build_directory)} for item in mappings]
+        write_text_atomic(path, json.dumps({
+            "workspaces": rows([item for _, item in sorted(merged.items())]),
+            "history": rows(sorted(history, key=lambda item: (str(item.workspace_root), str(item.build_directory),
+                                                               str(item.target_directory)))),
+        }) + "\n")
+
+
+def discover_cargo_outputs(roots: Sequence[str], *,
+                           lint_settings: conf.ConfigRead) -> tuple[list[str], CargoOutputIndex]:
+    """Map recorded step pairs first, then saved pairs. Protect every other target."""
+    from scripts.buildlog import index as build_index
+
+    known_trees: dict[str, list[str]] = {}
+    discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees)
+    recorded = recorded_output_roots(build_index.index_path(), store.host_name())
+    cached = saved_cargo_output_roots()
+    mappings: tuple[CargoOutputRoots, ...] = ()
+    if isinstance(recorded, RecordedStepOutputs):
+        mappings = _recorded_mapping_rows(recorded.rows)
+    else:
+        print(f"lint sweep: recorded output roots unavailable: {recorded.reason}", file=sys.stderr)
+    resolve = cache(Path.resolve)
+    combined = tuple(dict.fromkeys(CargoOutputRoots(*(resolve(path) for path in (
+        item.workspace_root, item.target_directory, item.build_directory)))
+        for item in (*mappings, *cached.workspaces, *cached.history)))
+    mapped_paths = {path for item in combined for path in (item.target_directory, item.build_directory)}
+    mapped = {str(path) for path in mapped_paths if path.is_dir()}
+    added = sorted(mapped - set(discovered))
+    if added:
+        discovered = sorted(set(discovered) | set(target_dirs(added, lint_settings=lint_settings, known_trees=known_trees)))
+    protected = tuple(NoRecordedEvidence(path) for path in discovered if path not in mapped)
+    index = CargoOutputIndex(combined, no_recorded_evidence=protected, known_trees=known_trees)
+    return sorted(set(discovered) | mapped), index
+
+
+@dataclass(frozen=True, slots=True)
 class OutputVersion:
     """File identity, size and content modification time at candidate choice."""
 
@@ -344,6 +528,34 @@ class DiscoveredTargetRoots(list[str]):
 
 
 @dataclass
+class ScanDirectoryObservations:
+    """Directory entries and their cached stats, shared only during one scan."""
+
+    directories: dict[str, list[os.DirEntry[str]]] = field(default_factory=dict)
+
+    def entries(self, directory: str) -> list[os.DirEntry[str]]:
+        if directory not in self.directories:
+            self.directories[directory] = listing(directory)
+        return self.directories[directory]
+
+    def consume(self, directory: str) -> list[os.DirEntry[str]]:
+        if directory in self.directories:
+            return self.directories.pop(directory)
+        return listing(directory)
+
+    def child_times(self, directory: str) -> tuple[float, float]:
+        used, modified = 0.0, 0.0
+        for entry in self.entries(directory):
+            try:
+                child = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            used = max(used, child.st_atime, child.st_mtime)
+            modified = max(modified, child.st_mtime)
+        return used, modified
+
+
+@dataclass
 class Scan:
     discovered_targets: tuple[str, ...] = ()
     blocks: dict[InodeKey, int] = field(default_factory=dict)
@@ -353,6 +565,8 @@ class Scan:
     target_bytes: dict[str, int] = field(default_factory=dict)
     target_links: dict[str, dict[InodeKey, int]] = field(default_factory=dict)
     whole_targets: list[WholeTargetTake] = field(default_factory=list)
+    observations: ScanDirectoryObservations = field(default_factory=ScanDirectoryObservations)
+    changed_targets: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -372,7 +586,6 @@ UNKNOWN_HELD_ROOTS = UnknownHeldRoots()
 class KnownFloorLockHolder:
     pid: int
     started_at: float
-    command: str
 
 
 @dataclass(frozen=True)
@@ -397,6 +610,116 @@ class NoFloorLockAlert:
 
 
 @dataclass(frozen=True)
+class ObservedUnreadableFloorHold:
+    """An unreadable hold awaits a successful alert."""
+
+    pid: int
+    first_observed_at: float
+
+
+@dataclass(frozen=True)
+class ReportedUnreadableFloorHold:
+    """Natedev received the alert for this unreadable hold."""
+
+    pid: int
+    first_observed_at: float
+
+
+FloorLockAlertState = (DeliveredFloorLockAlert | NoFloorLockAlert
+                       | ObservedUnreadableFloorHold | ReportedUnreadableFloorHold)
+
+
+@dataclass(frozen=True)
+class LiveSweepProcess:
+    """The holder is a live sweep."""
+
+
+@dataclass(frozen=True)
+class OtherFloorProcess:
+    command: str
+
+
+@dataclass(frozen=True)
+class UnreadableFloorProcess:
+    """The holder command cannot be read."""
+
+
+@dataclass(frozen=True)
+class NoLockAlertNeeded:
+    """This observation needs no delivery."""
+
+
+@dataclass(frozen=True)
+class FloorLockAlertCandidate:
+    pid: int
+    started_at: float
+    command: str
+    receipt: DeliveredFloorLockAlert | ReportedUnreadableFloorHold
+
+
+@dataclass(frozen=True)
+class LockAlertTransition:
+    lock_alert: FloorLockAlertState
+    alert: NoLockAlertNeeded | FloorLockAlertCandidate
+
+
+class CrossingReceipt(Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+
+
+@dataclass(frozen=True)
+class AbovePhoneFloor:
+    """No low-space crossing is open."""
+
+
+@dataclass(frozen=True)
+class OpenPhoneCrossing:
+    identity: str
+    natedev: CrossingReceipt = CrossingReceipt.PENDING
+    phone: CrossingReceipt = CrossingReceipt.PENDING
+
+
+PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing
+
+
+@dataclass(frozen=True)
+class NoCrossingSend:
+    """This delivery does not report a low-space crossing."""
+
+
+NO_CROSSING_SEND = NoCrossingSend()
+UNSAVED_CROSSING_KEY = "natedev:unsaved-crossing"
+
+
+@dataclass(frozen=True)
+class CrossingSendKey:
+    key: str
+    repeat_minutes: float
+
+
+@dataclass(frozen=True)
+class NoFailure:
+    """This scope has no failure awaiting delivery or recovery."""
+
+
+@dataclass(frozen=True)
+class FloorFailureEvent:
+    status: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class FailurePending:
+    event: FloorFailureEvent
+
+
+@dataclass(frozen=True)
+class FailureReported:
+    """Natedev received this failure episode, which still needs recovery."""
+
+
+@dataclass(frozen=True)
 class FloorRecord:
     measured_at: float
     free_bytes: int
@@ -404,7 +727,11 @@ class FloorRecord:
     alert_history: NoDeliveredAlert | DeliveredAlert
     push_history: NoDeliveredAlert | DeliveredAlert
     held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
-    lock_alert: DeliveredFloorLockAlert | NoFloorLockAlert = NoFloorLockAlert()
+    lock_alert: FloorLockAlertState = NoFloorLockAlert()
+    filesystem: str = ""
+    measured_roots: tuple[str, ...] = ()
+    phone_crossing: PhoneCrossing = AbovePhoneFloor()
+    failure: NoFailure | FailurePending | FailureReported = NoFailure()
 
 
 @dataclass(frozen=True)
@@ -470,9 +797,68 @@ class UnavailableDiskMeasurement:
 DiskMeasurement = AvailableDiskMeasurement | UnavailableDiskMeasurement
 
 
+class FolderChoiceKind(Enum):
+    SCRATCH = "scratch"
+    TRASH = "trash"
+    PROTECTED = "protected"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class FolderChoice:
+    label: str
+    bytes: int
+    kind: FolderChoiceKind
+
+
+@dataclass(frozen=True)
+class AvailableFolderChoices:
+    choices: tuple[FolderChoice, ...]
+
+
+@dataclass(frozen=True)
+class InsufficientFolderChoices:
+    choices: tuple[FolderChoice, ...]
+
+
+@dataclass(frozen=True)
+class UnavailableFolderChoices:
+    """No current folder choice is available."""
+
+
+UNAVAILABLE_FOLDER_CHOICES = UnavailableFolderChoices()
+
+
+FolderChoices = AvailableFolderChoices | InsufficientFolderChoices | UnavailableFolderChoices
+
+
 class FloorAlertChannels(Enum):
     NATEDEV = "natedev"
     NATEDEV_AND_PHONE = "natedev_and_phone"
+
+
+class FloorMachine(Enum):
+    """The machine whose disk crossed the alert line."""
+
+    NATEDEV = "natedev"
+    MAC = "Mac"
+
+
+class FloorChannelOutcome(Enum):
+    NOT_ATTEMPTED = "not_attempted"
+    DELIVERED = "delivered"
+    QUEUED = "queued"
+    FAILED = "failed"
+
+    @property
+    def accepted(self) -> bool:
+        return self in (FloorChannelOutcome.DELIVERED, FloorChannelOutcome.QUEUED)
+
+
+@dataclass(frozen=True)
+class FloorAlertDelivery:
+    natedev: FloorChannelOutcome
+    phone: FloorChannelOutcome
 
 
 @dataclass(frozen=True)
@@ -506,36 +892,33 @@ def copied_name(name: str) -> str:
 
 
 def cargo_roots() -> list[str]:
-    """Target and build directories of the workspace in the working directory."""
-    proc = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
+    """Read both output roots through the shared Cargo reader."""
+    result = read_cargo_output_roots(Path.cwd())
+    if isinstance(result, CargoOutputUnavailable):
         return []
-    metadata = cast(CargoMetadata, json.loads(proc.stdout))
-    candidates = [
-        os.path.realpath(path)
-        for path in (metadata.get("target_directory"), metadata.get("build_directory"))
-        if path and os.path.isdir(path)
-    ]
-    roots: list[str] = []
-    for path in sorted(set(candidates)):
-        if not any(path.startswith(root + os.sep) for root in roots):
-            roots.append(path)
-    return roots
+    index = CargoOutputIndex((result,))
+    _ = OUTPUT_ROOTS.set(index)
+    return sorted(index.output_roots())
 
 
-def build_trees(root: str) -> list[str]:
+def build_trees(root: str, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
     """Directories under root that hold a .fingerprint/ dir."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    return _build_trees(root, lint_settings.whole("sweep_max_tree_depth"), lint_settings=lint_settings)
+
+
+def _build_trees(root: str, depth: int, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[str]:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     trees: list[str] = []
     frontier = [root]
-    for _ in range(MAX_TREE_DEPTH + 1):
+    for _ in range(depth + 1):
         next_frontier: list[str] = []
         for directory in frontier:
-            if directory != root and is_cargo_target(directory):
+            if directory != root and is_cargo_target(directory, lint_settings=lint_settings):
                 continue
             if os.path.isdir(os.path.join(directory, FINGERPRINT_DIR)):
                 trees.append(directory)
@@ -551,21 +934,43 @@ def build_trees(root: str) -> list[str]:
     return trees
 
 
-def is_cargo_target(directory: str) -> bool:
-    """Whether cargo built into directory."""
-    if os.path.isfile(os.path.join(directory, RUSTC_INFO)):
-        return True
-    # Cost: one more stat per directory without rustc info; reads and tree
-    # searches happen only where that stat finds a tag.
-    tag = os.path.join(directory, CACHE_TAG)
-    if not os.path.isfile(tag):
-        return False
+def has_cargo_tag(directory: str) -> bool:
+    """Check whether the cache tag identifies Cargo output."""
     try:
-        with open(tag, "rb") as handle:
-            lines = handle.read(512).decode("utf-8").splitlines()
+        with open(os.path.join(directory, CACHE_TAG), "rb") as handle:
+            return CARGO_TAG_LINE in handle.read(512).decode("utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return False
-    return CARGO_TAG_LINE in lines and bool(build_trees(directory))
+
+
+def is_cargo_target(directory: str, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> bool:
+    """Check whether Cargo built output in this directory."""
+    return (os.path.isfile(os.path.join(directory, RUSTC_INFO))
+            or (os.path.isfile(os.path.join(directory, CACHE_TAG)) and has_cargo_tag(directory)
+                and bool(build_trees(directory, lint_settings=lint_settings))))
+
+
+@dataclass(frozen=True)
+class EnclosingCargoTarget:
+    folder: str
+
+
+@dataclass(frozen=True)
+class NoEnclosingCargoTarget:
+    pass
+
+
+def enclosing_cargo_target(path: str, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> EnclosingCargoTarget | NoEnclosingCargoTarget:
+    """Find the nearest Cargo target that contains the resolved path."""
+    directory = Path(path).resolve()
+    for ancestor in (directory, *directory.parents):
+        if is_cargo_target(str(ancestor), lint_settings=lint_settings):
+            return EnclosingCargoTarget(str(ancestor))
+    return NoEnclosingCargoTarget()
 
 
 @dataclass(frozen=True)
@@ -585,6 +990,25 @@ def target_lock_paths(trees: list[str]) -> list[str]:
                      if parent.name == scratch.STYLE_TARGET_NAME}
     paths.extend(str(target / scratch.STYLE_LOCK_NAME) for target in sorted(style_targets))
     return paths
+
+
+def output_lock_trees(roots: Sequence[str], trees: Sequence[str], paths: Sequence[str] = ()) -> list[str]:
+    """Include artifact profile locks even when only intermediates have fingerprints."""
+    result = set(trees)
+    for mapping in OUTPUT_ROOTS.get().workspaces:
+        pair = (mapping.target_directory, mapping.build_directory)
+        if not set(map(str, pair)) & set(roots):
+            continue
+        for tree in trees:
+            for source in pair:
+                if Path(tree).is_relative_to(source):
+                    result.update(str(destination / Path(tree).relative_to(source)) for destination in pair)
+    for root in roots:
+        result.update(entry.path for entry in listing(root) if entry.is_dir(follow_symlinks=False)
+                      and any(os.path.exists(os.path.join(entry.path, name)) for name in LOCK_NAMES))
+    result.update(os.path.dirname(path) for path in paths if any(
+        os.path.exists(os.path.join(os.path.dirname(path), name)) for name in LOCK_NAMES))
+    return sorted(result)
 
 
 def lock_trees(trees: list[str]) -> TargetLocksAcquired | TargetLockBusy:
@@ -625,10 +1049,12 @@ def file_key(path: str) -> str:
         return ""
 
 
-def held_cargo_lock_files() -> set[str]:
+def held_cargo_lock_files(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> set[str]:
     """Observe Linux flocks without taking cargo locks during candidate choice."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     held: set[str] = set()
-    for _ in range(PROC_LOCKS_READS):
+    for _ in range(lint_settings.whole("sweep_proc_locks_reads")):
         try:
             with open(PROC_LOCKS, encoding="ascii", errors="replace") as handle:
                 for line in handle:
@@ -808,45 +1234,29 @@ def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> 
     return process_uses(check) if proc == PROC_DIR else process_uses(check, proc)
 
 
-def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
-    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
-
-    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
-    """
-    try:
-        stat = os.stat(lock)
-    except OSError:
-        return None
-    # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
-    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for _ in range(PROC_LOCKS_READS):
-        try:
-            with open(locks, encoding="ascii", errors="replace") as handle:
-                lines = handle.read().splitlines()
-        except OSError:
-            return None
-        for line in lines:
-            fields = line.split()
-            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-                return int(fields[4])
-    return None
+def lock_holder(lock: str, locks: str = PROC_LOCKS, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> int | None:
+    """Read the lock holder with the configured number of attempts."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    return file_lock.lock_holder(lock, locks, reads=lint_settings.whole("sweep_proc_locks_reads"))
 
 
-def floor_lock_holder(path: str) -> KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder:
+def floor_lock_holder(path: str, pid: int, command: bytes, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder:
     """Match the durable hold identity to the pid that currently owns the flock."""
-    pid = lock_holder(path)
-    if pid is None:
-        return NoFloorLockHolder()
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     try:
         raw = cast(object, json.loads(Path(path).read_text()))
         if isinstance(raw, dict):
             data = cast(dict[str, object], raw)
             started = data.get("started_at")
             if data.get("pid") == pid and _finite_number(started) and started >= 0:
-                command = (Path(PROC_DIR) / str(pid) / "cmdline").read_bytes()
-                text = command.replace(b"\0", b" ").decode(errors="replace").strip()
-                if text and lock_holder(path) == pid:
-                    return KnownFloorLockHolder(pid, float(started), text)
+                if command.rstrip(b"\0") and lock_holder(path, lint_settings=lint_settings) == pid:
+                    return KnownFloorLockHolder(pid, float(started))
     except (OSError, ValueError):
         pass
     return UnreadableFloorLockHolder(pid)
@@ -863,40 +1273,93 @@ def record_floor_lock(path: str, guard: int, started_at: float) -> None:
         os.fsync(handle.fileno())
 
 
-def alert_floor_lock(path: str, free: int, floor: int) -> None:
-    """Tell natedev once per overdue hold, retrying failed sends on later passes."""
+def _runs_sweep(command: bytes) -> bool:
+    argv = command.rstrip(b"\0").split(b"\0")
+    program = os.path.basename(argv[0])
+    if program == b"sweep.py":
+        return True
+    if re.fullmatch(rb"python(?:\d+(?:\.\d+)*)?", program):
+        for arg in argv[1:]:
+            if not arg.startswith(b"-"):
+                return os.path.basename(arg) == b"sweep.py"
+    return False
+
+
+def _command_text(command: bytes) -> str:
+    """Decode a process command for a report."""
+    return command.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+def next_lock_alert(previous: FloorLockAlertState,
+                    holder: KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder,
+                    process: LiveSweepProcess | OtherFloorProcess | UnreadableFloorProcess,
+                    now: float) -> LockAlertTransition:
+    """Compute the observation and delivery candidate without reading or writing state."""
+    if (isinstance(holder, NoFloorLockHolder) or isinstance(process, LiveSweepProcess)) and isinstance(previous, DeliveredFloorLockAlert):
+        return LockAlertTransition(previous, NoLockAlertNeeded())
+    if isinstance(holder, NoFloorLockHolder) or isinstance(process, LiveSweepProcess):
+        return LockAlertTransition(NoFloorLockAlert(), NoLockAlertNeeded())
+    if isinstance(holder, KnownFloorLockHolder):
+        receipt = DeliveredFloorLockAlert(holder.pid, holder.started_at)
+        if previous == receipt:
+            return LockAlertTransition(previous, NoLockAlertNeeded())
+        return LockAlertTransition(NoFloorLockAlert(),
+                                   FloorLockAlertCandidate(holder.pid, holder.started_at,
+                                                           process.command if isinstance(process, OtherFloorProcess)
+                                                           else "command is unreadable", receipt))
+    if isinstance(previous, (ObservedUnreadableFloorHold, ReportedUnreadableFloorHold)) and previous.pid == holder.pid:
+        observed = previous
+    else:
+        observed = ObservedUnreadableFloorHold(holder.pid, now)
+    command = process.command if isinstance(process, OtherFloorProcess) else "command is unreadable"
+    alert = (NoLockAlertNeeded() if isinstance(observed, ReportedUnreadableFloorHold)
+             else FloorLockAlertCandidate(holder.pid, observed.first_observed_at, command,
+                                          ReportedUnreadableFloorHold(holder.pid, observed.first_observed_at)))
+    return LockAlertTransition(observed, alert)
+
+
+def alert_floor_lock(path: str, free: int, floor: int, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    """Report an overdue hold once, then save its observation or delivery receipt."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     record_path = floor_record_path()
     with locked_floor_record(record_path) as previous:
-        holder = floor_lock_holder(path)
-        if not isinstance(holder, KnownFloorLockHolder):
-            return
-        seconds = int(conf.read("lint").number(FLOOR_LOCK_ALERT_KEY) * 60)
         now = time.time()
-        if now - holder.started_at < seconds:
-            return
-        identity = DeliveredFloorLockAlert(holder.pid, holder.started_at)
-        if isinstance(previous, FloorRecord) and previous.lock_alert == identity:
-            return
-        message = (f"natedev has {gib(free)} free, under the {gib(floor)} floor. "
-                   f"The disk floor sweep cannot run: pid {holder.pid} ({holder.command}) "
-                   f"has held floor.lock since {when(holder.started_at)}.")
-        if send_floor_alert(message, FloorAlertChannels.NATEDEV):
-            current = previous if isinstance(previous, FloorRecord) else FloorRecord(
-                now, free, 0, NoDeliveredAlert(), NoDeliveredAlert())
-            write_floor_record(record_path, replace(current, lock_alert=identity))
+        current = floor_record_or_new(previous, free)
+        process: LiveSweepProcess | OtherFloorProcess | UnreadableFloorProcess = UnreadableFloorProcess()
+        holder: KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder = NoFloorLockHolder()
+        pid = lock_holder(path, lint_settings=lint_settings)
+        if pid is not None:
+            try:
+                command = (Path(PROC_DIR) / str(pid) / "cmdline").read_bytes()
+            except OSError:
+                command = b""
+            if command:
+                process = LiveSweepProcess() if _runs_sweep(command) else OtherFloorProcess(_command_text(command))
+            holder = floor_lock_holder(path, pid, command, lint_settings=lint_settings)
+        transition = next_lock_alert(current.lock_alert, holder, process, now)
+        state = transition.lock_alert
+        candidate = transition.alert
+        seconds = int(lint_settings.number(FLOOR_LOCK_ALERT_KEY) * 60)
+        if isinstance(candidate, FloorLockAlertCandidate) and now - candidate.started_at >= seconds:
+            message = (f"natedev has {gib(free)} free, under the {gib(floor)} floor. "
+                       f"The disk floor sweep cannot run: pid {candidate.pid} ({candidate.command}) "
+                       f"has held floor.lock since {when(candidate.started_at)}.")
+            delivery = send_floor_alert(message, lint_settings=lint_settings)
+            if delivery.accepted:
+                state = candidate.receipt
+        if state != current.lock_alert:
+            write_floor_record(record_path, replace(current, lock_alert=state))
 
 
 def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
     """The live Claude session each pid runs under: the nearest ancestor a session record names."""
     if not pids:
         return {}
-    if TYPE_CHECKING:
-        from ..message import process_table
-        from ..message.sessions import live_sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import process_table
-        from sessions import live_sessions
+    from scripts.message import process_table
+    from scripts.message.sessions import live_sessions
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.CalledProcessError):
@@ -911,13 +1374,19 @@ def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
     return found
 
 
-def floor_holders(busy: dict[str, TargetUse | LockHeld], sizes: dict[str, int],
-                  locks: str = PROC_LOCKS) -> list[FloorHolder]:
+def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence], sizes: dict[str, int],
+                  locks: str = PROC_LOCKS, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[FloorHolder]:
     """Each busy target, largest first, with the pid that holds it and that pid's session when known."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     uses: list[tuple[str, int | None, str]] = []
     for root, use in busy.items():
+        if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
+            continue
         if isinstance(use, LockHeld):
-            uses.append((root, lock_holder(use.lock, locks), f"holds the cargo lock {use.lock}"))
+            uses.append((root, lock_holder(use.lock, locks, lint_settings=lint_settings), f"holds the cargo lock {use.lock}"))
         else:
             uses.append((root, use.pid, use.how))
     sessions = holder_sessions([pid for _, pid, _ in uses if pid is not None])
@@ -998,71 +1467,6 @@ def cargo_workspace_path_hash(manifest: Path) -> str:
     return os.path.join(hashed[:2], hashed[2:])
 
 
-def cargo_path_argument(argv: list[str], flag: str) -> str:
-    for index, arg in enumerate(argv):
-        if arg.startswith(flag + "="):
-            return arg.split("=", 1)[1]
-        if arg == flag and index + 1 < len(argv):
-            return argv[index + 1]
-    return ""
-
-
-def cargo_workspace_manifest(argv: list[str], cwd: str, cargo_home: str = "") -> Path:
-    """Find the workspace manifest without starting Cargo or reading its cache.
-
-    Cargo core/workspace.rs at 58bab51c: find_root_iter and is_excluded.
-    """
-    directory = Path(cwd)
-    named = cargo_path_argument(argv, "--manifest-path")
-    if named:
-        manifest = Path(os.path.abspath(directory / named))
-    else:
-        manifest = next((parent / "Cargo.toml" for parent in (directory, *directory.parents)
-                         if (parent / "Cargo.toml").is_file()), directory / "Cargo.toml")
-    table = cast(dict[str, object], tomllib.loads(manifest.read_text()))
-    if isinstance(table.get("workspace"), dict):
-        return manifest
-    package = table.get("package")
-    if isinstance(package, dict):
-        workspace = cast(dict[str, object], package).get("workspace")
-        if isinstance(workspace, str):
-            root = manifest.parent / workspace / "Cargo.toml"
-            root_table = cast(dict[str, object], tomllib.loads(root.read_text()))
-            if isinstance(root_table.get("workspace"), dict):
-                return root
-            raise ValueError("Cargo package.workspace does not name a workspace")
-    for parent in manifest.parent.parents:
-        if parent.parts[-2:] == ("target", "package"):
-            break
-        if cargo_home and manifest.is_relative_to(cargo_home) and not parent.is_relative_to(cargo_home):
-            break
-        root = parent / "Cargo.toml"
-        if not root.is_file():
-            continue
-        table = cast(dict[str, object], tomllib.loads(root.read_text()))
-        workspace = table.get("workspace")
-        if isinstance(workspace, dict):
-            matches: dict[str, bool] = {}
-            for key in ("exclude", "members"):
-                paths = cast(dict[str, object], workspace).get(key, [])
-                if not isinstance(paths, list) or any(not isinstance(path, str) for path in cast(list[object], paths)):
-                    raise ValueError("Cargo workspace membership cannot be read")
-                matches[key] = any(manifest.is_relative_to(parent / path) for path in cast(list[str], paths))
-            if matches["exclude"] and not matches["members"]:
-                continue
-            return root
-        package = table.get("package")
-        if isinstance(package, dict) and "workspace" in package:
-            raise ValueError("An ancestor Cargo manifest redirects workspace discovery")
-    return manifest
-
-
-@dataclass(frozen=True)
-class CargoFolderSetting:
-    value: str
-    base: Path
-
-
 def cargo_build_folder(setting: CargoFolderSetting, argv: list[str], cwd: str, cargo_home: str) -> str:
     """Expand build.build-dir before resolving it against its configuration root.
 
@@ -1093,51 +1497,8 @@ def nextest_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[s
     except OSError:
         entries = []
     environment = dict(entry.split("=", 1) for entry in entries if "=" in entry)
-    settings: dict[str, CargoFolderSetting] = {}
-
-    def read_settings(contents: str, base: Path) -> None:
-        try:
-            table = cast(dict[str, object], tomllib.loads(contents)).get("build")
-        except tomllib.TOMLDecodeError:
-            return
-        if isinstance(table, dict):
-            for key in ("target-dir", "build-dir"):
-                value = cast(dict[str, object], table).get(key)
-                if isinstance(value, str) and value:
-                    settings[key] = CargoFolderSetting(value, base)
-
-    def read_config(path: Path) -> None:
-        try:
-            read_settings(path.read_text(), path.parent.parent)
-        except (OSError, UnicodeError):
-            pass
-
-    cargo_home = environment.get("CARGO_HOME")
-    if not cargo_home and environment.get("HOME"):
-        cargo_home = os.path.join(environment["HOME"], ".cargo")
-    cargo_home = os.path.realpath(os.path.join(cwd, cargo_home)) if cargo_home else ""
-    configs = [Path(cargo_home)] if cargo_home else []
-    directory = Path(cwd)
-    configs.extend(parent / ".cargo" for parent in reversed((directory, *directory.parents)))
-    for config in configs:
-        legacy = config / "config"
-        read_config(legacy if legacy.is_file() else config / "config.toml")
-    for key, variables in (("target-dir", ("CARGO_BUILD_TARGET_DIR", CARGO_TARGET_DIR_ENV)),
-                           ("build-dir", ("CARGO_BUILD_BUILD_DIR",))):
-        for variable in variables:
-            if environment.get(variable):
-                settings[key] = CargoFolderSetting(environment[variable], directory)
-    for index, arg in enumerate(argv):
-        setting = arg.split("=", 1)[1] if arg.startswith("--config=") else (
-            argv[index + 1] if arg == "--config" and index + 1 < len(argv) else "")
-        if setting:
-            if "=" in setting:
-                read_settings(setting, directory)
-            else:
-                read_config(directory / setting)
-    named = cargo_path_argument(argv, TARGET_DIR_FLAG)
-    if named:
-        settings["target-dir"] = CargoFolderSetting(named, directory)
+    settings = cargo_folder_settings(argv, cwd, environment)
+    cargo_home = cargo_home_folder(cwd, environment)
     try:
         chosen = {cargo_build_folder(setting, argv, cwd, cargo_home) if key == "build-dir"
                   else os.path.realpath(setting.base / setting.value) for key, setting in settings.items()}
@@ -1149,24 +1510,14 @@ def nextest_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[s
                 and (cwd + os.sep).startswith(os.path.dirname(path) + os.sep))]
 
 
-def newest_times(directory: str) -> tuple[float, float]:
-    """Newest atime-or-mtime and newest mtime over a directory and its direct
-    children, leaving out the directory's own atime: listing it, as this scan
-    and du do, refreshes that."""
+def newest_times(directory: os.DirEntry[str], observations: ScanDirectoryObservations) -> tuple[float, float]:
+    """Use the directory mtime and immediate child times. Exclude the directory atime."""
     try:
-        modified = os.lstat(directory).st_mtime
+        modified = directory.stat(follow_symlinks=False).st_mtime
     except OSError:
         return 0.0, 0.0
-    used = modified
-    try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                child = entry.stat(follow_symlinks=False)
-                used = max(used, child.st_atime, child.st_mtime)
-                modified = max(modified, child.st_mtime)
-    except OSError:
-        pass
-    return used, modified
+    used, children_modified = observations.child_times(directory.path)
+    return max(modified, used), max(modified, children_modified)
 
 
 def listing(directory: str) -> list[os.DirEntry[str]]:
@@ -1177,22 +1528,30 @@ def listing(directory: str) -> list[os.DirEntry[str]]:
         return []
 
 
-def copied_up(directory: str) -> list[os.DirEntry[str]]:
+def copied_up(directory: str, observations: ScanDirectoryObservations) -> list[os.DirEntry[str]]:
     """Regular files in directory without a unit hash: the copies and their dep-info."""
     return [
         entry
-        for entry in listing(directory)
+        for entry in observations.entries(directory)
         if not entry.name.startswith(".")
         and isinstance(unit_hash(entry.name), NoUnitHash)
         and entry.is_file(follow_symlinks=False)
     ]
 
 
-def dep_info_output(path: str, directory: str) -> str | None:
+def dep_info_output(path: str, directory: str, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str | None:
     """Name of the copy in directory that a dep-info file says it describes."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    return _dep_info_output(path, directory, lint_settings.whole("sweep_dep_info_head_bytes"))
+
+
+def _dep_info_output(path: str, directory: str, head_bytes: int) -> str | None:
     try:
         with open(path, "rb") as handle:
-            head = handle.read(DEP_INFO_HEAD)
+            head = handle.read(head_bytes)
     except OSError:
         return None
     target, separator, _ = head.partition(b":")
@@ -1232,6 +1591,7 @@ def claim_copies(
     candidates: dict[str, list[tuple[os.DirEntry[str], Group]]],
     roots: dict[str, Group],
     orphans: Group,
+    head_bytes: int,
 ) -> None:
     """Give each copy in directory, with its dep-info, to the unit it came from,
     or to orphans when that unit is gone; leave a file that matches neither."""
@@ -1254,7 +1614,7 @@ def claim_copies(
             group is None
             and stat.st_nlink == 1
             and stem in dep_infos
-            and dep_info_output(dep_infos[stem].path, directory) is not None
+            and _dep_info_output(dep_infos[stem].path, directory, head_bytes) is not None
         ):
             group = orphans
         if group is None:
@@ -1267,38 +1627,65 @@ def claim_copies(
             continue
         group = owners.get(stem)
         if group is None:
-            name = dep_info_output(entry.path, directory)
+            name = _dep_info_output(entry.path, directory, head_bytes)
             if name is None or os.path.lexists(os.path.join(directory, name)):
                 continue
             group = orphans
         attach(entry.path, group, roots)
 
 
-def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
+def group_roots(trees: list[str], scan: Scan, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> dict[str, Group]:
     """Map each removable entry's path to its group, with last-use times filled in."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     roots: dict[str, Group] = {}
+    head_bytes = lint_settings.whole("sweep_dep_info_head_bytes")
+    shared_units: dict[tuple[str, str, str], Group] = {}
     for tree in trees:
+        tree_path = Path(tree)
+        mappings = OUTPUT_ROOTS.get().mappings_for(tree_path)
         directories = {source: os.path.normpath(os.path.join(tree, copied)) for source, copied in COPY_DIRS.items()}
-        copies = {source: copied_up(directory) for source, directory in directories.items()}
+        paired_directories: dict[str, list[str]] = {source: [directory] for source, directory in directories.items()}
+        for mapping in mappings:
+            if mapping.build_directory != mapping.target_directory and tree_path.is_relative_to(mapping.build_directory):
+                relative = tree_path.relative_to(mapping.build_directory)
+                for source, copied in COPY_DIRS.items():
+                    destination = str(mapping.target_directory / relative / copied)
+                    if destination not in paired_directories[source]:
+                        paired_directories[source].append(destination)
+        copies = {source: [entry for directory in paths for entry in copied_up(directory, scan.observations)]
+                  for source, paths in paired_directories.items()}
         # The hashed files each copy could have come from, by copied_name.
         candidates: dict[str, dict[str, list[tuple[os.DirEntry[str], Group]]]] = {
             source: {copied_name(entry.name): [] for entry in entries if not entry.name.endswith(DEP_INFO_SUFFIX)}
             for source, entries in copies.items()
         }
         units: dict[str, Group] = {}
+        workspace, profile = tree, ""
+        for mapping in mappings:
+            matched = next((root for root in (mapping.target_directory, mapping.build_directory)
+                            if tree_path.is_relative_to(root)), None)
+            if matched is not None:
+                workspace, profile = str(mapping.workspace_root), str(tree_path.relative_to(matched))
+                break
+        hashed_entries: dict[str, os.DirEntry[str]] = {}
         for hashed in HASHED_DIRS:
-            for entry in listing(os.path.join(tree, hashed)):
+            for entry in scan.observations.entries(os.path.join(tree, hashed)):
                 digest = unit_hash(entry.name)
                 if isinstance(digest, NoUnitHash):
                     continue
-                group = units.get(digest.value)
+                group = shared_units.get((workspace, profile, digest.value))
                 if group is None:
                     group = Group(kind="unit", build_tree=tree)
-                    units[digest.value] = group
+                    shared_units[(workspace, profile, digest.value)] = group
                     scan.groups.append(group)
+                units[digest.value] = group
                 attach(entry.path, group, roots)
+                hashed_entries[entry.path] = entry
                 if hashed == FINGERPRINT_DIR and entry.is_dir(follow_symlinks=False):
-                    used, compiled = newest_times(entry.path)
+                    used, compiled = newest_times(entry, scan.observations)
                     group.last_used = max(group.last_used, used)
                     group.compiled = max(group.compiled, compiled)
                 if hashed in candidates:
@@ -1312,17 +1699,21 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
                 mtimes: list[float] = []
                 for path in group.entries:
                     try:
-                        mtimes.append(os.lstat(path).st_mtime)
+                        entry = hashed_entries.get(path)
+                        state = entry.stat(follow_symlinks=False) if entry is not None else os.lstat(path)
+                        mtimes.append(state.st_mtime)
                     except OSError:
                         continue
                 group.last_used = group.compiled = max(mtimes, default=0.0)
         orphans = Group(kind="orphan", build_tree=tree)
-        for source, directory in directories.items():
-            claim_copies(directory, copies[source], candidates[source], roots, orphans)
+        for source, paths in paired_directories.items():
+            for directory in paths:
+                claim_copies(directory, [entry for entry in copies[source] if os.path.dirname(entry.path) == directory],
+                             candidates[source], roots, orphans, head_bytes)
         if orphans.entries:
             scan.orphans.append(orphans)
-        for entry in listing(os.path.join(tree, INCREMENTAL_DIR)):
-            _, modified = newest_times(entry.path)
+        for entry in scan.observations.entries(os.path.join(tree, INCREMENTAL_DIR)):
+            _, modified = newest_times(entry, scan.observations)
             group = Group(kind="incremental", entries=[entry.path], last_used=modified,
                           compiled=modified, build_tree=tree)
             scan.groups.append(group)
@@ -1330,17 +1721,15 @@ def group_roots(trees: list[str], scan: Scan) -> dict[str, Group]:
     return roots
 
 
-def walk(directory: str, owner: FloorTake | None, roots: dict[str, Group], scan: Scan) -> None:
-    discovered = scan.discovered_targets or tuple(target_dirs([directory]))
+def walk(directory: str, owner: FloorTake | None, roots: dict[str, Group], scan: Scan, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    discovered = scan.discovered_targets or tuple(target_dirs([directory], lint_settings=lint_settings))
     nested_targets = set(discovered) - {os.path.realpath(directory)}
     target_links = scan.target_links.setdefault(directory, {})
 
     def visit(directory: str, owner: FloorTake | None) -> None:
-        try:
-            with os.scandir(directory) as entries:
-                listed = list(entries)
-        except OSError:
-            return
+        listed = scan.observations.consume(directory)
         for entry in listed:
             if entry.path in nested_targets:
                 if isinstance(owner, WholeTargetTake):
@@ -1386,6 +1775,7 @@ class ConfirmedDeletion:
     bytes: int
     failures: int
     removed: int = 0
+    device_bytes: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1404,6 +1794,8 @@ class PendingUnlink:
     blocks: int
     links: int
     directory: bool
+    modified_ns: int = 0
+    size: int = 0
 
 
 @overload
@@ -1418,7 +1810,8 @@ def removed_entry_account(entry: PendingUnlink, confirmed: bool) -> ConfirmedDel
     """Only a returned unlink of the last link proves reclaimed blocks."""
     if not confirmed:
         return UnconfirmedReclaim(1, (entry.path,))
-    return ConfirmedDeletion(entry.blocks if not entry.directory and entry.links == 1 else 0, 0, 1)
+    freed = entry.blocks if not entry.directory and entry.links == 1 else 0
+    return ConfirmedDeletion(freed, 0, 1, {entry.device: freed})
 
 
 @dataclass
@@ -1436,6 +1829,7 @@ class TrimTake:
     stage: Literal["deleting", "publishing"] = "deleting"
     log_offset: int = 0
     unconfirmed_paths: list[str] = field(default_factory=list)
+    output_roots: tuple[str, ...] = ()
 
     def save(self) -> None:
         write_text_atomic(trim_intent_path(self.target), json.dumps(asdict(self)) + "\n")
@@ -1450,7 +1844,7 @@ class TrimTake:
                 continue
             self.pending.append(PendingUnlink(path, observed.st_dev, observed.st_ino,
                                               observed.st_blocks * 512, observed.st_nlink,
-                                              stat.S_ISDIR(observed.st_mode)))
+                                              stat.S_ISDIR(observed.st_mode), observed.st_mtime_ns, observed.st_size))
         self.at = time.time()
         self.save()
 
@@ -1465,8 +1859,11 @@ class TrimTake:
         if self.group_paths and all(
                 not os.path.lexists(path) or path in self.unconfirmed_paths for path in self.group_paths):
             self.remaining_groups = max(0, self.remaining_groups - 1)
-        self.pending = []
-        self.group_paths = []
+        unfinished_pair = len(self.output_roots) > 1 and any(
+            os.path.lexists(path) and path not in self.unconfirmed_paths for path in self.group_paths)
+        if not unfinished_pair:
+            self.pending = []
+            self.group_paths = []
         self.save()
 
     def recover(self) -> ConfirmedDeletion | UnconfirmedReclaim:
@@ -1480,15 +1877,34 @@ class TrimTake:
             except FileNotFoundError:
                 pass
             account = removed_entry_account(entry, False)
-            paths.extend(account.paths)
+            paths.extend(path for path in account.paths if path not in self.unconfirmed_paths)
         result = UnconfirmedReclaim(len(paths), tuple(paths)) if paths else ConfirmedDeletion(0, 0)
-        if self.group_paths:
-            self.confirm(result)
+        if len(self.output_roots) > 1 and self.stage == "deleting" and self.pending:
+            remaining: list[str] = []
+            for path in list(self.group_paths):
+                observed = {entry.path: OutputVersion(entry.device, entry.inode, entry.size, entry.modified_ns)
+                            for entry in self.pending if Path(entry.path).is_relative_to(path)}
+                retry = Group("unit", self.target, entries=[path], observed=observed)
+                if observed and group_unchanged(retry):
+                    remaining.append(path)
+                else:
+                    self.group_paths.remove(path)
+                    self.remaining_groups = max(1, self.remaining_groups)
+            if remaining:
+                retry = Group("unit", self.target, entries=remaining)
+                account = remove([retry])
+                self.bytes_freed += account.bytes
+                self.removed += account.removed
+                if account.removed:
+                    self.at = time.time()
+        self.confirm(result)
         return result
 
     def publish(self) -> bool:
         """An append seen after a stop is the same row, not another trim."""
         path = trim_intent_path(self.target)
+        if len(self.output_roots) > 1 and self.pending:
+            return False
         if not self.removed:
             path.unlink(missing_ok=True)
             return True
@@ -1522,11 +1938,13 @@ def read_trim_intent(path: Path) -> TrimTake:
     counts = [raw[name] for name in ("remaining_groups", "bytes_freed", "removed", "log_offset")]
     pending, group_paths, at = raw["pending"], raw["group_paths"], raw["at"]
     unconfirmed = raw.get("unconfirmed_paths", [])
+    output_roots = raw.get("output_roots", [])
     if (not isinstance(target, str) or not os.path.isabs(target) or trim_intent_path(target) != path
             or cause not in ("budget take", "floor take") or stage not in ("deleting", "publishing")
             or not all(isinstance(value, int) and value >= 0 for value in counts) or not _finite_number(at)
             or not isinstance(pending, list) or not isinstance(group_paths, list)
-            or not isinstance(unconfirmed, list)
+            or not isinstance(unconfirmed, list) or not isinstance(output_roots, list)
+            or not all(isinstance(root, str) and os.path.isabs(root) for root in cast(list[object], output_roots))
             or not all(isinstance(value, str) for value in cast(list[object], unconfirmed))
             or not all(isinstance(value, str) for value in cast(list[object], group_paths))):
         raise ValueError(f"invalid trim intent: {path}")
@@ -1545,10 +1963,12 @@ def read_trim_intent(path: Path) -> TrimTake:
                 or not all(isinstance(value, int) and value >= 0 for value in numbers)):
             raise ValueError(f"invalid unlink in {path}")
         entries.append(PendingUnlink(name, cast(int, numbers[0]), cast(int, numbers[1]),
-                                     cast(int, numbers[2]), cast(int, numbers[3]), directory))
+                                     cast(int, numbers[2]), cast(int, numbers[3]), directory,
+                                     cast(int, fields.get("modified_ns", 0)), cast(int, fields.get("size", 0))))
     return TrimTake(target, cause, cast(int, counts[0]),
                     float(at), cast(int, counts[1]), cast(int, counts[2]), entries,
-                    cast(list[str], group_paths), stage, cast(int, counts[3]), cast(list[str], unconfirmed))
+                    cast(list[str], group_paths), stage, cast(int, counts[3]), cast(list[str], unconfirmed),
+                    tuple(cast(list[str], output_roots)))
 
 
 @dataclass(frozen=True)
@@ -1573,22 +1993,21 @@ def load_trim_for_recovery(path: Path) -> TrimTake | DamagedTrimIntentSetAside:
 
 
 def build_log_rows(paths: Iterable[Path], start: int = 0) -> Iterator[dict[str, object]]:
-    """One JSON-line reader for rebuild evidence and trim publication recovery."""
+    """Read rows of each build-log file through store.locked_rows for rebuild evidence."""
     for path in paths:
-        with path.open("rb") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            yield from store.whole_rows(handle, start)
+        yield from store.locked_rows(path, start)
+        # A month that disappears after enumeration must fail the rebuild report.
+        if not path.exists():
+            raise FileNotFoundError(path)
 
 
 def trim_row_recorded(take: TrimTake) -> bool:
     path = store.host_file(store.host_name(), take.at)
-    if not path.exists():
-        return False
     extent = "whole" if take.remaining_groups == 0 else "partial"
     return any(row.get("kind") == "sweep_trim" and row.get("folder") == take.target
                and row.get("cause") == take.cause and row.get("at") == store.utc_iso(take.at)
                and row.get("bytes_freed") == take.bytes_freed and row.get("extent") == extent
-               for row in build_log_rows([path], take.log_offset))
+               for row in store.locked_rows(path, take.log_offset))
 
 
 @contextmanager
@@ -1606,7 +2025,8 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         groups = [group for group in scan.groups if owners.owner(group.build_tree) == TargetOwner(target)]
         whole_targets = [whole for whole in scan.whole_targets
                          if cause == "floor take" and whole.target == target]
-        take = TrimTake(target, cause, len(groups) + len(whole_targets))
+        take = TrimTake(target, cause, len(groups) + len(whole_targets),
+                        output_roots=OUTPUT_ROOTS.get().roots_for(target))
         recovered = True
         if path.exists():
             unfinished = load_trim_for_recovery(path)
@@ -1628,9 +2048,22 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
             TRIM_TAKES.reset(token)
 
 
-def recover_pending_trims(locked_targets: Sequence[str] = ()) -> None:
+def stamp_newer(root: str, moment: float) -> bool:
+    """Return whether the use stamp is newer than moment. A missing stamp returns False."""
+    try:
+        return os.stat(os.path.join(root, USE_STAMP)).st_mtime > moment
+    except FileNotFoundError:
+        return False
+
+
+def recover_pending_trims(locked_targets: Sequence[str] = (), *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
     """Publish unfinished takes even when the rerun has no output or shortfall left."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     directory = floor_record_path().parent / "trims"
+    tree_depth = lint_settings.whole("sweep_max_tree_depth")
     for path in sorted(directory.glob("*.json")):
         with path.with_suffix(".lock").open("a") as guard:
             try:
@@ -1641,16 +2074,33 @@ def recover_pending_trims(locked_targets: Sequence[str] = ()) -> None:
                 take = load_trim_for_recovery(path)
                 if isinstance(take, DamagedTrimIntentSetAside):
                     continue
-                locks = (TargetLocksAcquired([]) if take.target in locked_targets
-                         else lock_trees(build_trees(take.target)))
-                if isinstance(locks, TargetLockBusy):
-                    continue
-                try:
-                    _ = take.recover()
-                    if not take.publish():
+                with ExitStack() as guards:
+                    roots = take.output_roots or (take.target,)
+                    if len(roots) > 1:
+                        owners = TargetOwnerIndex(roots)
+                        if build_hold_targets(roots, {}, lint_settings=lint_settings) or process_uses(owners):
+                            continue
+                        acquired = True
+                        for root in sorted(roots):
+                            if root not in locked_targets and not guards.enter_context(scratch.removal_lock(Path(root))):
+                                acquired = False
+                                break
+                        if not acquired:
+                            continue
+                        if any(stamp_newer(root, take.at) for root in roots):
+                            continue
+                    trees = [tree for root in roots for tree in _build_trees(root, tree_depth, lint_settings=lint_settings)]
+                    trees = output_lock_trees(roots, trees, [entry.path for entry in take.pending])
+                    locks = (TargetLocksAcquired([]) if all(root in locked_targets for root in roots)
+                             else lock_trees(sorted(set(trees))))
+                    if isinstance(locks, TargetLockBusy):
                         continue
-                finally:
-                    release(locks.held)
+                    try:
+                        _ = take.recover()
+                        if not take.publish():
+                            continue
+                    finally:
+                        release(locks.held)
             except (OSError, ValueError, KeyError) as error:
                 print(f"lint sweep: could not recover {path}: {error}", file=sys.stderr)
 
@@ -1693,6 +2143,7 @@ def remove_entry(path: str) -> ConfirmedDeletion:
 def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDeletion:
     """Check opened directory identity and account for each unlink relative to its parent."""
     freed = failures = removed = 0
+    device_bytes: dict[int, int] = {}
     try:
         before = os.lstat(name, dir_fd=parent_fd)
         if stat.S_ISDIR(before.st_mode):
@@ -1707,6 +2158,8 @@ def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDe
                     freed += account.bytes
                     failures += account.failures
                     removed += account.removed
+                    for device, size in account.device_bytes.items():
+                        device_bytes[device] = device_bytes.get(device, 0) + size
                 if not os.path.samestat(before, os.lstat(name, dir_fd=parent_fd)):
                     raise OSError("directory changed before removal")
                 os.rmdir(name, dir_fd=parent_fd)
@@ -1721,23 +2174,32 @@ def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDe
                 display_path, before.st_dev, before.st_ino, before.st_blocks * 512, before.st_nlink, False), True)
             removed += account.removed
             freed = account.bytes
+            device_bytes.update(account.device_bytes)
     except FileNotFoundError:
         pass
     except OSError as error:
         failures += 1
         print(f"lint sweep: could not remove {display_path}: {error}", file=sys.stderr)
-    return ConfirmedDeletion(freed, failures, removed)
+    return ConfirmedDeletion(freed, failures, removed, device_bytes)
 
 
-def remove(groups: Sequence[FloorTake]) -> ConfirmedDeletion:
+def remove(groups: Sequence[FloorTake], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> ConfirmedDeletion:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     failures = 0
     freed = removed = 0
+    device_bytes: dict[int, int] = {}
     for group in groups:
         identity = group.target if isinstance(group, WholeTargetTake) else group.build_tree
         take = TRIM_TAKES.get().get(identity)
-        known_targets = ([group.target] if isinstance(group, WholeTargetTake)
-                         else [take.target] if take is not None else [])
-        if not record_before_delete([identity], known_targets=known_targets):
+        known_targets = ([group.target] if isinstance(group, WholeTargetTake) else
+                         list(take.output_roots) if take is not None and take.output_roots else
+                         [take.target] if take is not None else
+                         list(OUTPUT_ROOTS.get().roots_for(physical_root(group.build_tree)))
+                         if physical_root(group.build_tree) in OUTPUT_ROOTS.get().output_roots() else [])
+        if not record_before_delete([identity], known_targets=known_targets, lint_settings=lint_settings):
             failures += 1
             continue
         markers = {os.path.join(group.target, name) for name in (RUSTC_INFO, CACHE_TAG)} if isinstance(
@@ -1753,28 +2215,33 @@ def remove(groups: Sequence[FloorTake]) -> ConfirmedDeletion:
             failures += account.failures
             group_failures += account.failures
             removed += account.removed
-    return ConfirmedDeletion(freed, failures, removed)
+            for device, size in account.device_bytes.items():
+                device_bytes[device] = device_bytes.get(device, 0) + size
+    return ConfirmedDeletion(freed, failures, removed, device_bytes)
 
 
 def reclaim(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int],
-            dry_run: bool) -> ReclamationEstimate | ConfirmedDeletion:
+            dry_run: bool, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> ReclamationEstimate | ConfirmedDeletion:
     """Keep scan estimates separate from the live unlink account."""
     if dry_run:
-        return freed_by(group, scan, remaining)
+        projected = replace(group, inodes=selected_inodes(group))
+        return freed_by(projected, scan, remaining)
     identity = group.target if isinstance(group, WholeTargetTake) else group.build_tree
     take = TRIM_TAKES.get().get(identity) if isinstance(group, WholeTargetTake) or group.kind != "orphan" else None
     if take is not None:
-        if take.stage == "publishing":
+        if take.stage == "publishing" or len(take.output_roots) > 1 and take.pending:
             return ConfirmedDeletion(0, 1)
         take.prepare(group)
-    account = remove([group])
+    account = remove([group], lint_settings=lint_settings)
     if take is not None:
         take.confirm(account)
     return account
 
 
 def directory_blocks(directory: str, seen: set[InodeKey] | None = None,
-                     excluded: Sequence[str] = ()) -> int:
+                     excluded: Collection[str] = ()) -> int:
     """Disk blocks under a directory, counting inodes already in seen once."""
     if seen is None:
         seen = set()
@@ -1818,8 +2285,12 @@ def try_lock(path: str) -> int | None:
     return fd
 
 
-def prune_doc_index(roots: list[str], budget: int, dry_run: bool) -> int:
+def prune_doc_index(roots: list[str], budget: int, dry_run: bool, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> int:
     """Remove a doc tree whose cross-crate index has grown past the budget."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     failures = 0
     for root in roots:
         doc = os.path.join(root, DOC_DIR)
@@ -1838,7 +2309,7 @@ def prune_doc_index(roots: list[str], budget: int, dry_run: bool) -> int:
         try:
             size = directory_blocks(doc)
             if not dry_run:
-                if not record_before_delete([root], known_targets=[root]):
+                if not record_before_delete([root], known_targets=[root], lint_settings=lint_settings):
                     failures += 1
                     continue
                 try:
@@ -1869,48 +2340,65 @@ def when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
-def scan_roots(roots: list[str], trees: list[str]) -> Scan:
-    discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(target_dirs(roots))
+def scan_roots(roots: list[str], trees: list[str], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> Scan:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(target_dirs(roots, lint_settings=lint_settings))
     scan = Scan(discovered_targets=discovered)
-    owners = group_roots(trees, scan)
+    owners = group_roots(trees, scan, lint_settings=lint_settings)
     for root in roots:
         if scan.groups:
-            walk(root, None, owners, scan)
+            walk(root, None, owners, scan, lint_settings=lint_settings)
         else:
             whole = WholeTargetTake(root)
             whole.retained.add(os.path.join(root, "doc", ".lock"))
-            walk(root, whole, owners, scan)
+            walk(root, whole, owners, scan, lint_settings=lint_settings)
             scan.whole_targets.append(whole)
     return scan
 
 
-def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
+def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> Scan:
     """Scan independent targets with bounded IO concurrency and no cargo locks."""
-    def scan_target(root: str) -> Scan:
-        discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(trees)
-        scan = scan_roots(DiscoveredTargetRoots([root], discovered), trees[root])
-        if scan.whole_targets:
-            whole, = scan.whole_targets
-            orphan_paths = [path for orphan in scan.orphans for path in orphan.entries]
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    discovered = tuple(roots.discovered) if isinstance(roots, DiscoveredTargetRoots) else tuple(roots)
+    output_index = OUTPUT_ROOTS.get()
+    def scan_target(cluster: tuple[str, ...]) -> Scan:
+        _ = OUTPUT_ROOTS.set(output_index)
+        scan = scan_roots(DiscoveredTargetRoots(cluster, discovered),
+                          [tree for root in cluster for tree in trees[root]], lint_settings=lint_settings)
+        for whole in scan.whole_targets:
+            orphan_paths = [path for orphan in scan.orphans for path in orphan.entries
+                            if Path(path).is_relative_to(whole.target)]
             protected = {str(parent) for path in (*whole.retained, *orphan_paths)
-                         for parent in Path(path).parents if parent.is_relative_to(root)}
+                         for parent in Path(path).parents if parent.is_relative_to(whole.target)}
             removable = set(whole.observed) - protected
             whole.entries = [path for path in whole.observed if path in removable
                              and str(Path(path).parent) not in removable]
-            whole.observed = {path: version for path, version in whole.observed.items()
-                              if path not in protected}
-        scan.target_bytes[root] = sum(scan.blocks.values())
+            whole.observed = {path: version for path, version in whole.observed.items() if path not in protected}
+        for root in cluster:
+            scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
         return scan
 
-    if not roots:
-        return Scan()
-    if len(roots) == 1:
-        return scan_target(roots[0])
-    discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(trees)
+    paired_roots = output_index.roots_for
+    clusters: list[tuple[str, ...]] = []
+    assigned: set[str] = set()
+    for root in roots:
+        if root not in assigned:
+            cluster = tuple(path for path in paired_roots(root) if path in roots)
+            clusters.append(cluster)
+            assigned.update(cluster)
+    if not clusters:
+        return Scan(discovered_targets=discovered)
+    if len(clusters) == 1:
+        return scan_target(clusters[0])
     combined = Scan(discovered_targets=discovered)
-    with ThreadPoolExecutor(max_workers=4) as workers:
-        for scan in workers.map(scan_target, roots):
-            # Count a shared inode once, keeping its full link count across targets.
+    with ThreadPoolExecutor(max_workers=lint_settings.whole("sweep_scan_workers")) as workers:
+        for scan in workers.map(scan_target, clusters):
             combined.blocks.update(scan.blocks)
             combined.links.update(scan.links)
             combined.groups.extend(scan.groups)
@@ -1922,10 +2410,12 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
 
 
 def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool,
-          recent_minutes: float) -> int:
+          recent_minutes: float, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     if not dry_run:
-        recover_pending_trims(roots)
-    scan = scan_roots(roots, trees)
+        recover_pending_trims(roots, lint_settings=lint_settings)
+    scan = scan_roots(roots, trees, lint_settings=lint_settings)
     total = sum(scan.blocks.values())
     label = ", ".join(roots)
     state = "within" if total <= budget else "over"
@@ -1938,7 +2428,7 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
         left, failures = shrink(
             scan, total, budget, dry_run,
             lambda group: (float(group.last_used > now - recent_minutes * 60), *unit_age(group, now)),
-        )[:2]
+         lint_settings=lint_settings)[:2]
     if left > budget:
         print(
             f"lint sweep: {gib(left)} remains over budget in output this sweep never removes"
@@ -1949,9 +2439,13 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
 
 def shrink(
     scan: Scan, total: int, budget: int, dry_run: bool, removal_order: RemovalOrder
+, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> tuple[int, int, list[tuple[Group, int]]]:
     """Remove the orphans, then groups in removal_order until total fits budget,
     and say what went; return the size left, failures, and groups taken."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
     remaining = dict(scan.links)
     failures = 0
@@ -1959,7 +2453,7 @@ def shrink(
     if scan.orphans:
         orphaned = 0
         for group in scan.orphans:
-            account = reclaim(group, scan, remaining, dry_run)
+            account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
             orphaned += account.bytes
             failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
             failures += failed
@@ -1978,7 +2472,7 @@ def shrink(
         if left <= budget:
             break
         chosen.append(group)
-        account = reclaim(group, scan, remaining, dry_run)
+        account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
         left -= account.bytes
         failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
         failures += failed
@@ -1995,38 +2489,115 @@ def shrink(
     return left, failures, taken
 
 
-def target_dirs(roots: Sequence[str]) -> list[str]:
+@dataclass
+class TargetRootSearch:
+    """One directory branch, with its targets and Cargo build-tree exclusions."""
+
+    frontier: list[tuple[str, int]]
+    owned_trees: set[str] = field(default_factory=set)
+    targets: set[str] = field(default_factory=set)
+    checkouts: list[str] = field(default_factory=list)
+    known_trees: dict[str, list[str]] = field(default_factory=dict)
+
+
+DISCOVERY_BRANCH_LEVELS = 3
+
+
+def target_dirs(roots: Sequence[str], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    checkouts: list[str] | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    known_trees: dict[str, list[str]] | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[str]:
     """Every cargo target directory under roots."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     found: set[str] = set()
     owned_trees: set[str] = set()
-    for root in roots:
-        frontier = [(os.path.expanduser(root), 0)]
-        while frontier:
-            directory, depth = frontier.pop()
-            if directory in owned_trees:
-                continue
-            if is_cargo_target(directory):
-                found.add(os.path.realpath(directory))
-                # A target can contain another target in residue, but Cargo's
-                # own build trees belong to this root and need no root search.
+    search_depth = lint_settings.whole("sweep_floor_search_depth")
+    tree_depth = lint_settings.whole("sweep_max_tree_depth")
+    skipped = frozenset(lint_settings.words("sweep_floor_skip"))
+    marker_names = frozenset(("Cargo.toml", RUSTC_INFO, CACHE_TAG))
+
+    def visit(search: TargetRootSearch, directory: str, depth: int) -> None:
+        if directory in search.owned_trees:
+            return
+        children: list[os.DirEntry[str]] = []
+        markers: set[str] = set()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if entry.is_dir(follow_symlinks=False):
+                        if name == GIT_DIR:
+                            markers.add(GIT_DIR)
+                        if name not in skipped:
+                            children.append(entry)
+                    elif name in marker_names and entry.is_file():
+                        markers.add(name)
+        except OSError:
+            # Marker reads can still succeed when the directory cannot be listed.
+            markers.update(name for name in marker_names if os.path.isfile(os.path.join(directory, name)))
+            git_directory = os.path.join(directory, GIT_DIR)
+            if os.path.isdir(git_directory) and not os.path.islink(git_directory):
+                markers.add(GIT_DIR)
+        if "Cargo.toml" in markers:
+            search.checkouts.append(directory)
+        if RUSTC_INFO in markers or (CACHE_TAG in markers and has_cargo_tag(directory)):
+            trees = _build_trees(directory, tree_depth, lint_settings=lint_settings)
+            if RUSTC_INFO in markers or trees:
+                target = os.path.realpath(directory)
+                search.targets.add(target)
+                search.known_trees[target] = trees
+                # Exclude Cargo build trees when searching for nested targets.
                 depth = 0
-                owned_trees.update(build_trees(directory))
-                if directory in owned_trees:
-                    continue
-            if depth < FLOOR_SEARCH_DEPTH:
-                # Style keeps one cache under the common git directory. Do not walk git objects.
-                retained = os.path.join(directory, GIT_DIR, scratch.STYLE_TARGET_NAME)
-                if (os.path.isdir(os.path.join(directory, GIT_DIR))
-                        and not os.path.islink(os.path.join(directory, GIT_DIR))
-                        and not os.path.islink(retained) and is_cargo_target(retained)):
-                    found.add(os.path.realpath(retained))
-                frontier.extend(
-                    (entry.path, depth + 1)
-                    for entry in listing(directory)
-                    if entry.name not in FLOOR_SKIP and entry.path not in owned_trees
-                    and entry.is_dir(follow_symlinks=False)
-                )
+                search.owned_trees.update(trees)
+                if directory in search.owned_trees:
+                    return
+        if depth < search_depth:
+            # Style keeps its cache under .git. Do not search Git objects.
+            retained = os.path.join(directory, GIT_DIR, scratch.STYLE_TARGET_NAME)
+            if (GIT_DIR in markers
+                    and not os.path.islink(retained) and is_cargo_target(retained, lint_settings=lint_settings)):
+                search.targets.add(os.path.realpath(retained))
+            search.frontier.extend((entry.path, depth + 1) for entry in children if entry.path not in search.owned_trees)
+
+    def search_branch(search: TargetRootSearch) -> TargetRootSearch:
+        while search.frontier:
+            directory, depth = search.frontier.pop()
+            visit(search, directory, depth)
+        return search
+
+    def collect(search: TargetRootSearch) -> None:
+        found.update(search.targets)
+        owned_trees.update(search.owned_trees)
+        if isinstance(known_trees, dict):
+            known_trees.update(search.known_trees)
+        if isinstance(checkouts, list):
+            checkouts.extend(search.checkouts)
+
+    # Branches share no directory traversal state. Preserve the depth from each configured root.
+    with ThreadPoolExecutor(max_workers=lint_settings.whole("sweep_discovery_workers")) as workers:
+        for root in roots:
+            search = TargetRootSearch([(os.path.expanduser(root), 0)], set(owned_trees))
+            for _ in range(DISCOVERY_BRANCH_LEVELS):
+                frontier, search.frontier = search.frontier, []
+                for directory, depth in frontier:
+                    visit(search, directory, depth)
+            collect(search)
+            branches = (TargetRootSearch([branch], set(search.owned_trees)) for branch in search.frontier)
+            for result in workers.map(search_branch, branches):
+                collect(result)
     return sorted(found)
+
+
+def physical_root(path: str) -> str:
+    matches = [root for root in OUTPUT_ROOTS.get().output_roots() if Path(path).is_relative_to(root)]
+    return max(matches, key=len) if matches else path
+
+
+def selected_inodes(group: FloorTake) -> list[InodeKey]:
+    filesystem = FLOOR_FILESYSTEM.get()
+    return [key for key in group.inodes if not isinstance(filesystem, FilesystemFloor) or key[0] == filesystem.device]
 
 
 def group_unchanged(group: FloorTake) -> bool:
@@ -2044,23 +2615,31 @@ def group_unchanged(group: FloorTake) -> bool:
 def shrink_floor(
     scan: Scan, total: int, budget: int, dry_run: bool,
     tree_targets: dict[str, str], trees: dict[str, list[str]],
-    busy: dict[str, TargetUse | LockHeld | BuildHoldTarget], removal_order: RemovalOrder,
+    busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence], removal_order: RemovalOrder,
     planned_at: float, owners: TargetOwnerIndex,
+*,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    policy: MacFloor | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> tuple[int, int, list[tuple[FloorTake, int]]]:
     """Plan unlocked; lock just one target for its deletions, then release it."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     orphan_batches: dict[str, list[FloorTake]] = {}
     target_batches: dict[str, list[FloorTake]] = {}
     for groups, target_groups in ((scan.orphans, orphan_batches), (scan.groups, target_batches)):
         for group in sorted(groups, key=removal_order):
+            if not selected_inodes(group):
+                continue
             root = tree_targets[group.build_tree]
             target_groups.setdefault(root, []).append(group)
     for whole in scan.whole_targets:
-        target_batches.setdefault(whole.target, []).append(whole)
+        if selected_inodes(whole):
+            target_batches.setdefault(whole.target, []).append(whole)
     batches = list(orphan_batches.items()) + sorted(
         target_batches.items(),
-        key=lambda batch: (target_last_use(batch[0], [
+        key=lambda batch: (max(target_last_use(root, [
             group for group in batch[1] if isinstance(group, Group)
-        ], scan.discovered_targets), batch[0]),
+        ], scan.discovered_targets) for root in OUTPUT_ROOTS.get().roots_for(batch[0])), batch[0]),
     )
     remaining = dict(scan.links)
     taken: list[tuple[FloorTake, int]] = []
@@ -2071,29 +2650,48 @@ def shrink_floor(
     for root, candidates in batches:
         if left <= budget:
             break
-        if root in busy:
+        paired_roots = OUTPUT_ROOTS.get().roots_for(root)
+        if any(paired in busy for paired in paired_roots):
             continue
-        # Uses can start while the unlocked scan is running.
-        current_holds = build_hold_targets([root], trees)
-        current_uses = process_use(root, owners)
-        if root in current_holds:
-            busy[root] = current_holds[root]
+        current_holds = (build_hold_targets(paired_roots, trees, lint_settings=lint_settings)
+                         if not isinstance(policy, MacFloor) else {})
+        current_uses: dict[str, TargetUse | LockHeld] = {}
+        if isinstance(policy, MacFloor):
+            current_uses.update(policy.uses(paired_roots))
+        else:
+            for paired in paired_roots:
+                current_uses.update(process_use(paired, owners))
+        current_holds = {path: use for path, use in current_holds.items() if path in paired_roots}
+        current_uses = {path: use for path, use in current_uses.items() if path in paired_roots}
+        if current_holds or current_uses:
+            busy.update(current_holds)
+            busy.update(current_uses)
             continue
-        if root in current_uses:
-            busy[root] = current_uses[root]
-            continue
-        lock = scratch.judgment_lock if dry_run else scratch.removal_lock
-        with lock(Path(root)) as idle:
-            if not idle:
-                busy[root] = LockHeld(os.path.join(root, ".claude-busy"))
+        with ExitStack() as guards:
+            lock = scratch.judgment_lock if dry_run else scratch.removal_lock
+            blocked_pair = False
+            for paired in paired_roots:
+                if not guards.enter_context(lock(Path(paired))):
+                    busy[paired] = LockHeld(os.path.join(paired, ".claude-busy"))
+                    blocked_pair = True
+                    break
+            if blocked_pair:
                 continue
-            locks = lock_trees(trees[root])
+            pair_trees = output_lock_trees(paired_roots,
+                [tree for paired in paired_roots for tree in trees.get(paired, [])],
+                [path for candidate in candidates for path in candidate.entries])
+            locks = lock_trees(pair_trees)
             if isinstance(locks, TargetLockBusy):
                 busy[root] = LockHeld(locks.path)
                 continue
             try:
-                root_groups = [group for group in scan.groups if tree_targets[group.build_tree] == root]
-                if target_last_use(root, root_groups, scan.discovered_targets) > planned_at:
+                changed = False
+                for paired in paired_roots:
+                    root_groups = [group for group in scan.groups if tree_targets[group.build_tree] == paired]
+                    if target_last_use(paired, root_groups, scan.discovered_targets) > planned_at:
+                        changed = True
+                        break
+                if changed:
                     continue
                 doc_lock = os.path.join(root, "doc", ".lock")
                 whole_batch = any(isinstance(candidate, WholeTargetTake) for candidate in candidates)
@@ -2105,7 +2703,7 @@ def shrink_floor(
                         continue
                     locks.held.append(held)
                 if whole_batch:
-                    checked = set(target_lock_paths(trees[root])) | {doc_lock}
+                    checked = set(target_lock_paths(pair_trees)) | {doc_lock}
                     extra = {path for candidate in candidates if isinstance(candidate, WholeTargetTake)
                              for path in candidate.retained if os.path.basename(path) in (*LOCK_NAMES, scratch.STYLE_LOCK_NAME)
                              and path not in checked}
@@ -2126,12 +2724,19 @@ def shrink_floor(
                         if not group_unchanged(group):
                             continue
                         attempted.append(group)
-                        account = reclaim(group, scan, remaining, dry_run)
-                        left -= account.bytes
+                        account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
+                        if isinstance(account, ConfirmedDeletion) and account.removed:
+                            scan.changed_targets.add(root)
+                            scan.changed_targets.update(OUTPUT_ROOTS.get().roots_for(root))
+                        filesystem = FLOOR_FILESYSTEM.get()
+                        credited = (account.device_bytes.get(filesystem.device, 0)
+                                    if isinstance(account, ConfirmedDeletion) and isinstance(filesystem, FilesystemFloor)
+                                    else account.bytes)
+                        left -= credited
                         failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
                         failures += failed
                         if not failed:
-                            taken.append((group, account.bytes))
+                            taken.append((group, credited))
                         if isinstance(group, Group) and group.kind == "orphan":
                             orphaned_bytes += account.bytes
             finally:
@@ -2187,7 +2792,11 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
 
 
 def floor_record_path() -> Path:
-    return tmp_sweep.state_dir() / "floor.json"
+    from scripts.lint import tmp_sweep
+
+    filesystem = FLOOR_FILESYSTEM.get()
+    stem = filesystem.record_stem if isinstance(filesystem, FilesystemFloor) else "floor"
+    return tmp_sweep.state_dir() / f"{stem}.json"
 
 
 def _finite_number(value: object) -> TypeGuard[int | float]:
@@ -2195,6 +2804,8 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
 
 
 def target_deletes_path() -> Path:
+    from scripts.lint import tmp_sweep
+
     return tmp_sweep.state_dir() / tmp_sweep.TARGET_DELETES_NAME
 
 
@@ -2209,16 +2820,18 @@ def read_target_deletes(path: Path, now: float) -> dict[str, float]:
             if _finite_number(at) and now - DAY_SECONDS <= at <= now and os.path.isdir(root)}
 
 
-def record_target_deletes(paths: Sequence[str], *, known_targets: Sequence[str] = ()) -> None:
+def record_target_deletes(paths: Sequence[str], *, known_targets: Sequence[str] = (),
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     roots = {os.path.realpath(root) for root in known_targets}
     for path in paths:
-        directory = Path(path).resolve()
-        if str(directory) in roots:
+        if os.path.realpath(path) in roots:
             continue
-        for ancestor in (directory, *directory.parents):
-            if is_cargo_target(str(ancestor)):
-                roots.add(str(ancestor))
-                break
+        target = enclosing_cargo_target(path, lint_settings=lint_settings)
+        if isinstance(target, EnclosingCargoTarget):
+            roots.add(target.folder)
     if not roots:
         return
     path = target_deletes_path()
@@ -2231,14 +2844,26 @@ def record_target_deletes(paths: Sequence[str], *, known_targets: Sequence[str] 
         write_text_atomic(path, json.dumps(deleted) + "\n")
 
 
-def record_before_delete(paths: Sequence[str], *, known_targets: Sequence[str] = ()) -> bool:
+def record_before_delete(paths: Sequence[str], *, known_targets: Sequence[str] = (),
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> bool:
     """Refuse a deletion whose warm-promise invalidation cannot be saved."""
     try:
-        record_target_deletes(paths, known_targets=known_targets)
+        record_target_deletes(paths, known_targets=known_targets, lint_settings=lint_settings)
     except OSError as error:
         print(f"lint sweep: could not record deletion of {', '.join(paths)}: {error}", file=sys.stderr)
         return False
     return True
+
+
+def floor_record_or_new(previous: NoFloorRecord | FloorRecord, free: int) -> FloorRecord:
+    """Use the saved record, or start a record with this free-space reading."""
+    return previous if isinstance(previous, FloorRecord) else FloorRecord(
+        time.time(), free, 0, NoDeliveredAlert(), NoDeliveredAlert())
+
+
+def _valid_pid(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
@@ -2266,21 +2891,57 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
     held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
     if isinstance(roots, list) and all(isinstance(root, str) for root in cast(list[object], roots)):
         held_roots = KnownHeldRoots(frozenset(cast(list[str], roots)))
-    lock_alert: DeliveredFloorLockAlert | NoFloorLockAlert = NoFloorLockAlert()
+    lock_alert: FloorLockAlertState = NoFloorLockAlert()
     saved_alert = data.get("lock_alert")
     if isinstance(saved_alert, dict):
         saved = cast(dict[str, object], saved_alert)
         pid, started = saved.get("pid"), saved.get("started_at")
-        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _finite_number(started):
-            lock_alert = DeliveredFloorLockAlert(pid, float(started))
-    return FloorRecord(float(measured), int(free), int(caches), history, push_history, held_roots, lock_alert)
+        if _valid_pid(pid):
+            if _finite_number(started):
+                lock_alert = DeliveredFloorLockAlert(pid, float(started))
+            observed = saved.get("first_observed_at")
+            delivered = saved.get("alert_delivered")
+            if _finite_number(observed) and observed >= 0 and isinstance(delivered, bool):
+                lock_alert = (ReportedUnreadableFloorHold(pid, float(observed)) if delivered
+                              else ObservedUnreadableFloorHold(pid, float(observed)))
+    filesystem = data.get("filesystem", "")
+    measured_roots = data.get("measured_roots", [])
+    crossing: PhoneCrossing = AbovePhoneFloor()
+    saved_crossing = data.get("phone_crossing")
+    if saved_crossing in ("under_pending", "under_pushed"):
+        # Old receipts prove session delivery only. The phone still needs its first send.
+        crossing = OpenPhoneCrossing(f"legacy-{float(measured):.9f}",
+                                    CrossingReceipt.ACCEPTED if saved_crossing == "under_pushed"
+                                    else CrossingReceipt.PENDING)
+    elif isinstance(saved_crossing, dict):
+        saved_channels = cast(dict[str, object], saved_crossing)
+        identity = saved_channels.get("identity")
+        if isinstance(identity, str) and identity:
+            try:
+                crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
+                                            CrossingReceipt(saved_channels.get("phone")))
+            except ValueError:
+                crossing = OpenPhoneCrossing(identity)
+    failure: NoFailure | FailurePending | FailureReported = NoFailure()
+    saved_failure = data.get("failure")
+    if saved_failure == "reported":
+        failure = FailureReported()
+    elif isinstance(saved_failure, dict):
+        pending = cast(dict[str, object], saved_failure)
+        status, detail = pending.get("status"), pending.get("detail")
+        if isinstance(status, int) and not isinstance(status, bool) and isinstance(detail, str):
+            failure = FailurePending(FloorFailureEvent(status, detail))
+    return FloorRecord(float(measured), int(free), int(caches), history, push_history, held_roots, lock_alert,
+                       filesystem if isinstance(filesystem, str) else "",
+                       tuple(cast(list[str], measured_roots)) if isinstance(measured_roots, list)
+                       and all(isinstance(root, str) for root in cast(list[object], measured_roots)) else (), crossing, failure)
 
 
 @contextmanager
 def locked_floor_record(path: Path) -> Generator[NoFloorRecord | FloorRecord]:
     """Serialize floor measurements and alert receipts on one stable lock inode."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_name("floor-alert.lock").open("a+") as lock:
+    with path.with_name(path.stem + "-alert.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield read_floor_record(path)
 
@@ -2296,9 +2957,26 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         "build_cache_bytes": record.build_cache_bytes,
         "last_alert_at": alert_at,
         "last_push_at": push_at,
+        "phone_crossing": ({"identity": record.phone_crossing.identity,
+                            "natedev": record.phone_crossing.natedev.value,
+                            "phone": record.phone_crossing.phone.value}
+                           if isinstance(record.phone_crossing, OpenPhoneCrossing) else "above"),
     }
+    if isinstance(record.failure, FailurePending):
+        data["failure"] = {"status": record.failure.event.status, "detail": record.failure.event.detail}
+    elif isinstance(record.failure, FailureReported):
+        data["failure"] = "reported"
+    else:
+        data["failure"] = "none"
+    if record.filesystem:
+        data["filesystem"] = record.filesystem
+        data["measured_roots"] = list(record.measured_roots)
     if isinstance(record.lock_alert, DeliveredFloorLockAlert):
         data["lock_alert"] = asdict(record.lock_alert)
+    elif isinstance(record.lock_alert, (ObservedUnreadableFloorHold, ReportedUnreadableFloorHold)):
+        data["lock_alert"] = {"pid": record.lock_alert.pid,
+                              "first_observed_at": record.lock_alert.first_observed_at,
+                              "alert_delivered": isinstance(record.lock_alert, ReportedUnreadableFloorHold)}
     if isinstance(record.held_roots, KnownHeldRoots):
         data["held_roots"] = sorted(record.held_roots.roots)
     _ = partial.write_text(json.dumps(data) + "\n")
@@ -2306,8 +2984,7 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
 
 
 def read_disk_measurement() -> DiskMeasurement:
-    directory = os.environ.get(BUILDLOG_DIR_ENV) or "~/.local/state/buildlog"
-    path = Path(os.path.expanduser(directory)) / "disk.json"
+    path = store.root() / store.DISK_NAME
     try:
         raw = cast(object, json.loads(path.read_text()))
     except FileNotFoundError:
@@ -2380,10 +3057,14 @@ def movement(amount: int, increase: str, decrease: str) -> str:
     return f"stayed level at {gib(0)}"
 
 
-def alert_path(path: str, limit: int) -> str:
+def home_relative(path: str) -> str:
+    """Replace the home folder prefix with a tilde."""
     home = os.path.expanduser("~")
-    if path == home or path.startswith(home + os.sep):
-        path = "~" + path[len(home):]
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+def alert_path(path: str, limit: int) -> str:
+    path = home_relative(path)
     if len(path) <= limit:
         return path
     leaf = path.rsplit("/", 1)[-1]
@@ -2392,22 +3073,27 @@ def alert_path(path: str, limit: int) -> str:
 
 
 def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
-                           now: float, explain_fall: bool = True, path_limit: int = 256,
-                           previous: NoFloorRecord | FloorRecord = NO_FLOOR_RECORD) -> list[str]:
+                           now: float, explain_fall: bool, path_limit: int,
+                           previous: NoFloorRecord | FloorRecord = NO_FLOOR_RECORD, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[str]:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     if isinstance(measurement, UnavailableDiskMeasurement):
         return [f"buildlog-disk measurement unavailable ({measurement.reason})."]
+    measurement_paths = lint_settings.whole("sweep_measurement_paths")
     age = now - measurement.measured_at.timestamp()
     measured_before_fall = (explain_fall and isinstance(previous, FloorRecord)
                             and measurement.measured_at.timestamp() <= previous.measured_at)
-    stale = f"; stale by {int(age // 60)} minutes" if age > SNAPSHOT_MAX_AGE_SECONDS else ""
+    stale = f"; stale by {int(age // 60)} minutes" if age > lint_settings.number("sweep_snapshot_max_age_seconds") else ""
     if isinstance(measurement.comparison, NoEarlierDiskMeasurement):
         lines = [f"buildlog-disk measured {pacific_time(measurement.measured_at)}{stale}."]
         lines.append("No earlier buildlog-disk measurement to compare; largest directories outside build caches:")
-        ranked = sorted(measurement.directories, key=lambda item: item.bytes, reverse=True)[:3]
+        ranked = sorted(measurement.directories, key=lambda item: item.bytes, reverse=True)[:measurement_paths]
     else:
         lines = [f"buildlog-disk measured {pacific_time(measurement.comparison.measured_at)} to {pacific_time(measurement.measured_at)}{stale}."]
         lines.append("Directories outside build caches that grew most:")
-        ranked = sorted((item for item in measurement.directories if item.growth_bytes > 0), key=lambda item: item.growth_bytes, reverse=True)[:3]
+        ranked = sorted((item for item in measurement.directories if item.growth_bytes > 0), key=lambda item: item.growth_bytes, reverse=True)[:measurement_paths]
         lines.append(f"Measured folders {movement(measurement.outside_cache_growth_bytes, 'grew', 'shrank')} outside build caches.")
         if explain_fall and not measured_before_fall:
             unaccounted = max(0, free_fall - cache_growth)
@@ -2432,35 +3118,57 @@ def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_g
     return lines
 
 
+def fit_alert_text(render: Callable[[int], str], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
+    """Try configured path widths and keep the final complete message."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    widths = tuple(map(int, lint_settings.words("sweep_message_path_widths")))
+    limit = lint_settings.whole("sweep_message_limit")
+    for index, width in enumerate(widths):
+        message = render(width)
+        if len(message) <= limit or index == len(widths) - 1:
+            return message
+    raise conf.Unusable("lint: sweep_message_path_widths needs at least one path width")
+
+
 def floor_alert_text(now: float, removed: int, previous: NoFloorRecord | FloorRecord,
                      free_fall: int, cache_growth: int, reasons: list[str],
-                     measurement: DiskMeasurement) -> str:
+                     measurement: DiskMeasurement, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     comparison = (f"Since the previous sweep at {pacific_time(previous.measured_at)}, free space "
                   + f"{movement(-free_fall, 'rose', 'fell')} while build caches {movement(cache_growth, 'grew', 'shrank')}."
                   if isinstance(previous, FloorRecord) else "No earlier floor sweep to compare.")
-    for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
-        message = "\n".join([
+    def render(path_limit: int) -> str:
+        return "\n".join([
             f"Disk floor sweep at {pacific_time(now)} removed {gib(removed)} of build caches.",
             comparison,
             f"Alert threshold: {'; '.join(reasons)}.",
             *disk_measurement_lines(measurement, free_fall, cache_growth, now,
-                                    isinstance(previous, FloorRecord), path_limit, previous),
+                                    isinstance(previous, FloorRecord), path_limit, previous, lint_settings=lint_settings),
         ])
-        if len(message) <= 1024:
-            return message
-    return message
+    return fit_alert_text(render, lint_settings=lint_settings)
 
 
-def holder_text(holder: FloorHolder, path_limit: int = 256) -> str:
-    """One busy target: its path and size, and what holds it."""
+def holder_text(holder: FloorHolder, path_limit: int) -> str:
+    """Describe one busy target, its size, and its process."""
     who = f"pid {holder.pid}" if holder.pid is not None else "a process"
     return f"{alert_path(holder.path, path_limit)} ({gib(holder.bytes)}): {who} {holder.how}"
 
 
 def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
                             holders: Sequence[FloorHolder], told: frozenset[str], ci_bytes: int,
-                            measurement: DiskMeasurement, failures: int) -> str:
+                            measurement: DiskMeasurement, failures: int, *,
+    protected: Sequence[tuple[str, int]] = (),
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
     """The natedev report when no idle build output is left: what holds the space, and who was told."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     def holder_line(holder: FloorHolder, path_limit: int) -> str:
         if holder.path in told:
             outcome = f"session {holder.session} was told"
@@ -2470,48 +3178,152 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
             outcome = "no session found"
         return f"- {holder_text(holder, path_limit)}; {outcome}"
 
-    if told:
-        closing = ["Each session above was told. The user gets no page while a session can end a use."]
-    elif holders:
-        closing = ["No session above could be told, so the user also gets a page with these paths."]
-    else:
-        closing = ["No target is in use, so the user also gets a page with the largest paths below."]
-    for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
-        message = "\n".join([
+    def render(path_limit: int) -> str:
+        return "\n".join([
             f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No idle build cache is left to remove.",
             *(["These target dirs are in use; the sweep removes their output when that use ends:"] if holders else []),
             *(holder_line(holder, path_limit) for holder in holders),
             f"Not swept: CI's targets ({gib(ci_bytes)}).",
             *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
-            *closing,
-            *disk_measurement_lines(measurement, 0, 0, now, False, path_limit),
+            *protected_folder_lines(protected, path_limit, lint_settings=lint_settings),
+            "No phone alert was attempted for this event.",
+            *disk_measurement_lines(measurement, 0, 0, now, False, path_limit, lint_settings=lint_settings),
         ])
-        if len(message) <= 1024:
-            return message
-    return message
+    return fit_alert_text(render, lint_settings=lint_settings)
 
 
-def holder_message_text(holder: FloorHolder, free: int, floor: int) -> str:
+def holder_message_text(holder: FloorHolder, free: int, floor: int, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
     """The message to the session whose process holds a target the floor needs."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    path_limit = int(lint_settings.words("sweep_message_path_widths")[0])
     return "\n".join([
         f"natedev has {gib(free)} free, and builds need {gib(floor)} free. The disk floor sweep removed all idle build output.",
-        f"{holder_text(holder)}. This process is in your session, so the sweep cannot remove that output.",
+        f"{holder_text(holder, path_limit)}. This process is in your session, so the sweep cannot remove that output.",
         "When the process ends, the next sweep removes the output. If the process is stale, stop it.",
     ])
 
 
-def page_paths(holders: Sequence[FloorHolder], measurement: DiskMeasurement) -> list[str]:
-    """What holds the space, for the page: each busy target, then the largest measured folders
-    outside build caches. A folder that holds another listed folder is left out, so each path is exact."""
-    paths = [f"{holder.path}: frees {gib(holder.bytes)}. Process {holder.pid} uses it now and can fail." if holder.pid is not None
-             else f"{holder.path}: frees {gib(holder.bytes)}. A build uses it now and can fail." for holder in holders]
+def leaf_directories(measurement: AvailableDiskMeasurement) -> list[OutsideCacheDirectory]:
+    """Exclude parent folders when a measured child is available."""
+    names = [item.path for item in measurement.directories]
+    return [item for item in measurement.directories
+            if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
+
+
+def measure_protected_folders(roots: frozenset[str], excluded: frozenset[str]) -> tuple[tuple[str, int], ...]:
+    """Measure protected folders once, excluding nested targets and shared inodes."""
+    seen: set[InodeKey] = set()
+    return tuple((path, directory_blocks(path, seen, excluded)) for path in sorted(roots)
+                 if os.path.isdir(path) and on_floor_filesystem(path))
+
+
+def protected_folder_lines(protected: Sequence[tuple[str, int]], path_limit: int, *,
+                           lint_settings: conf.ConfigRead) -> list[str]:
+    """Render the largest measured folders without disk access."""
+    if not protected:
+        return []
+    largest = sorted(protected, key=lambda item: (-item[1], item[0]))[:lint_settings.whole("sweep_measurement_paths")]
+    return ["These folders have no recorded evidence. The sweep protects them:",
+            *(f"{alert_path(path, path_limit)}: holds {gib(size)}." for path, size in largest)]
+
+
+def folder_choice(path: str, size: int) -> FolderChoice:
+    """Describe measured folders without assuming their contents are build output."""
+    folder = Path(path)
+    name = " ".join(folder.name.split())
+    label = home_relative(str(folder))
+    if name.casefold() in ("trash", ".trash"):
+        return FolderChoice(label, size, FolderChoiceKind.TRASH)
+    if any(part.casefold() == "scratch" for part in folder.parts):
+        return FolderChoice(label, size, FolderChoiceKind.SCRATCH)
+    return FolderChoice(label, size, FolderChoiceKind.OTHER)
+
+
+def folder_choices(measurement: DiskMeasurement, protected: Sequence[tuple[str, int]], shortfall: int, *,
+                   now: float, lint_settings: conf.ConfigRead) -> FolderChoices:
+    """Use current measurements and keep protected folders distinct from holders."""
+    choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
+               for path, size in protected if size > 0]
     if isinstance(measurement, AvailableDiskMeasurement):
-        names = [item.path for item in measurement.directories]
-        leaves = [item for item in measurement.directories
-                  if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
-        paths.extend(f"{item.path}: frees {gib(item.bytes)}."
-                     for item in sorted(leaves, key=lambda item: item.bytes, reverse=True))
-    return paths
+        age = now - measurement.measured_at.timestamp()
+        if 0 <= age <= lint_settings.number("sweep_snapshot_max_age_seconds"):
+            protected_paths = {item[0] for item in protected}
+            choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
+                           if item.bytes > 0 and item.path not in protected_paths)
+    choices.sort(key=lambda item: (-item.bytes, item.label))
+    if not choices:
+        return UNAVAILABLE_FOLDER_CHOICES
+    return (AvailableFolderChoices(tuple(choices)) if choices[0].bytes >= shortfall
+            else InsufficientFolderChoices(tuple(choices)))
+
+
+@cache
+def prepare_push_texts() -> None:
+    """Add the notification module path once per process."""
+
+
+def folder_recommendation(choices: FolderChoices, shortfall: int) -> str:
+    """Describe the largest measured folder for both alert channels."""
+    if isinstance(choices, UnavailableFolderChoices):
+        return "Folder sizes are unknown."
+    largest = choices.choices[0]
+    if isinstance(choices, InsufficientFolderChoices):
+        return (f"The largest folder is {largest.label} at {gib(largest.bytes)}. "
+                f"Deleting it frees only part of the {gib(shortfall)} shortfall.")
+    if largest.kind is FolderChoiceKind.TRASH:
+        action = f"Delete {largest.label}"
+        effect = "this frees"
+    else:
+        action = f"Review {largest.label} first"
+        effect = "deleting it frees"
+    return f"{action} (recommended): {effect} {gib(largest.bytes)}, which covers the {gib(shortfall)} shortfall."
+
+
+def folder_choice_lines(choices: FolderChoices, shortfall: int, *, path_limit: int) -> list[str]:
+    """Render the session choices with shortened folder labels and their effects."""
+    if isinstance(choices, UnavailableFolderChoices):
+        lines = [folder_recommendation(choices, shortfall), "",
+                 "Measure first (recommended): natedev lists folder sizes, then you choose what to delete.", "",
+                 "Delete nothing: the disk stays low and builds can fail."]
+    else:
+        choices = replace(choices, choices=tuple(replace(item, label=alert_path(item.label, path_limit))
+                                                 for item in choices.choices))
+        effects = {
+            FolderChoiceKind.TRASH: "Deleting it removes discarded files.",
+            FolderChoiceKind.SCRATCH: "Deleting it removes temporary work; check for work you still need.",
+            FolderChoiceKind.OTHER: "Deleting it removes its contents; their use is unknown.",
+            FolderChoiceKind.PROTECTED: ("It is protected: no build record shows what made it. "
+                                         "Cleanup never deletes it. Deleting it removes its files."),
+        }
+        lines = [f"{item.label}: holds {gib(item.bytes)}. {effects[item.kind]}" for item in choices.choices]
+        lines.append(folder_recommendation(choices, shortfall))
+        lines.append("Delete nothing: builds can fail when the disk is full.")
+    lines.append("natedev checks your choice before it deletes anything.")
+    return lines
+
+
+def disk_floor_push(free: int, floor: int, choices: FolderChoices, *,
+                    machine: FloorMachine = FloorMachine.NATEDEV) -> RenderedPush:
+    """Render free space, the alert line, and one folder recommendation."""
+    if TYPE_CHECKING:
+        from scripts.notify.push_texts import render
+    else:
+        prepare_push_texts()
+        from scripts.notify.push_texts import render
+    folder_action = ("In the natedev Claude session, reply measure or delete nothing."
+                     if isinstance(choices, UnavailableFolderChoices)
+                     else f"In the natedev Claude session, say which {machine.value} folders to delete.")
+    recommendation = folder_recommendation(choices, max(0, floor - free))
+    if isinstance(choices, UnavailableFolderChoices):
+        recommendation += (" Measure (recommended): natedev lists folder sizes, then you choose. "
+                           "Delete nothing: free space stays low.")
+    elif isinstance(choices, InsufficientFolderChoices):
+        recommendation = recommendation.removesuffix(".") + "; the natedev session lists every folder."
+    return render("sweep.disk_floor", machine=machine.value, free=gib(free), floor=gib(floor), folder_action=folder_action,
+                  recommendation=recommendation)
 
 
 @dataclass(frozen=True)
@@ -2522,89 +3334,98 @@ class NoPhoneAlert:
 NO_PHONE_ALERT = NoPhoneAlert()
 
 
-def disk_floor_push(removed: int, free: int, floor: int, paths: Sequence[str]) -> RenderedPush:
-    """The page sent when nothing else is left: as many of paths, in order, as fit one push."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    if TYPE_CHECKING:
-        from ..notify.push_texts import render
-    else:
-        from push_texts import render
-
-    def page(listed: str) -> RenderedPush:
-        return render("sweep.disk_floor", removed=gib(removed), free=gib(free), floor=gib(floor),
-                      shortfall=gib(max(0, floor - free)), paths=listed)
-
-    for count in range(min(len(paths), PAGE_PATHS), 0, -1):
-        push = page("\n\n".join(paths[:count]))
-        if len(push.message) < PUSH_TEXT_LIMIT:
-            return push
-    return page(paths[0] if paths else NO_PAGE_PATHS)
+def fit_disk_floor_push(free: int, floor: int, choices: FolderChoices, *,
+                        lint_settings: conf.ConfigRead,
+                        machine: FloorMachine = FloorMachine.NATEDEV) -> RenderedPush | NoPhoneAlert:
+    """Use the unavailable text when the recommendation reaches the limit."""
+    limit = lint_settings.whole("sweep_push_text_limit")
+    for candidate in (choices, UNAVAILABLE_FOLDER_CHOICES):
+        rendered = disk_floor_push(free, floor, candidate, machine=machine)
+        if len(rendered.message) < limit:
+            return rendered
+    print("lint sweep: phone text exceeds sweep_push_text_limit", file=sys.stderr)
+    return NO_PHONE_ALERT
 
 
-def session_send_argv(to: str) -> list[str]:
-    """send.py's argv for a disk floor message to the session named to; the text goes on stdin."""
-    return [sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
-            "--to", to, "--from", "disk_floor", "--timeout", "30"]
+def crossing_send_argv(repeat: CrossingSendKey | NoCrossingSend) -> list[str]:
+    """Give each channel its delivery key and repeat window."""
+    return (["--key", repeat.key, "--repeat-minutes", f"{repeat.repeat_minutes:g}"]
+            if isinstance(repeat, CrossingSendKey) else [])
 
 
-def send_holder_message(session: str, message: str) -> bool:
-    """Tell a session that its process holds a target the floor needs; True when send.py delivered
-    the message or queued it (exit 1)."""
+def run_send(command: list[str], label: str, *, input: str | None, timeout: float) -> FloorChannelOutcome:
+    """Run either sender and report delivery, queuing, or failure."""
     try:
-        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=send_budget.seconds(30))
+        result = subprocess.run(command, input=input, text=True, capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
-        return False
-    if result.returncode in (0, 1):
-        print(f"lint sweep: message to {session} {'queued' if result.returncode == 1 else 'delivered'}")
-        return True
-    print(f"lint sweep: message to {session} failed ({result.returncode}): {failure_detail(result)}",
-          file=sys.stderr)
-    return False
+        print(f"lint sweep: {label} failed: {error}", file=sys.stderr)
+        return FloorChannelOutcome.FAILED
+    outcome = {send_result.EXIT["sent"]: FloorChannelOutcome.DELIVERED,
+               send_result.EXIT["queued"]: FloorChannelOutcome.QUEUED}.get(result.returncode, FloorChannelOutcome.FAILED)
+    if outcome.accepted:
+        print(f"lint sweep: {label} {outcome.value}")
+    else:
+        print(f"lint sweep: {label} failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
+    return outcome
 
 
-def send_floor_alert(message: str, channels: FloorAlertChannels, *,
-                     phone: RenderedPush | NoPhoneAlert = NO_PHONE_ALERT) -> bool:
-    scripts = Path(__file__).resolve().parents[1]
-    if not TYPE_CHECKING:
-        # Imported here, so modules that only read sweep's config never load the reviewer.
-        sys.path.insert(0, str(scripts / "notify"))
-        import review
-    commands = [("message", session_send_argv("natedev"))]
-    if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        if TYPE_CHECKING:
-            from ..notify.push_texts import RenderedPush, user_send_argv
-        else:
-            from push_texts import RenderedPush, user_send_argv
-
-        if not isinstance(phone, RenderedPush):
-            raise ValueError("phone channel requires a rendered disk alert")
-        command = user_send_argv(phone)
-        command[1] = str(scripts / "message/send.py")
-        commands.append(("phone", command))
-    delivered = False
-    for channel, command in commands:
-        try:
-            timeout = send_budget.user_seconds(review.user_send_seconds()) if channel == "phone" else send_budget.seconds(30)
-            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
-            if result.returncode == 0 or (channel == "message" and result.returncode == 1):
-                delivered = True
-                state = "queued" if result.returncode == 1 else "delivered"
-                print(f"lint sweep: {channel} alert {state}")
-            else:
-                print(f"lint sweep: {channel} alert failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            print(f"lint sweep: {channel} alert failed: {error}", file=sys.stderr)
-    return delivered
+def send_holder_message(session: str, message: str, *,
+    repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> FloorChannelOutcome:
+    """Send a session message and distinguish delivery, queuing, and failure."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    command = session_send_argv(session, lint_settings=lint_settings) + crossing_send_argv(repeat)
+    return run_send(command, f"message to {session}", input=message,
+                    timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
 
 
-if TYPE_CHECKING:
-    from ..build_hold import build_hold
-    from ..message import sessions
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    import build_hold
-    import sessions
+def disk_floor_channels() -> FloorAlertChannels:
+    """Keep phone delivery disabled until the user records a current approval."""
+    if TYPE_CHECKING:
+        from scripts.notify.push_texts import approval_date
+    else:
+        prepare_push_texts()
+        from scripts.notify.push_texts import approval_date
+    return (FloorAlertChannels.NATEDEV_AND_PHONE if approval_date("sweep.disk_floor")
+            else FloorAlertChannels.NATEDEV)
+
+
+def send_phone_push(phone: RenderedPush, *,
+    repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> FloorChannelOutcome:
+    """Send the phone channel independently of the natedev receipt."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    if TYPE_CHECKING:
+        from scripts.notify.push_texts import user_send_argv
+    else:
+        prepare_push_texts()
+        from scripts.notify.push_texts import user_send_argv
+        from scripts.notify import review
+    command = user_send_argv(phone)
+    command[1] = str(session_send.SEND_SCRIPT)
+    command.extend(crossing_send_argv(repeat))
+    return run_send(command, "phone alert", input=None,
+                    timeout=send_budget.user_seconds(review.user_send_seconds()))
+
+
+def send_floor_alert(message: str, *,
+    repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> FloorChannelOutcome:
+    """Send the natedev message and return its channel outcome."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    filesystem = FLOOR_FILESYSTEM.get()
+    if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
+        message = f"Filesystem {filesystem.key} at {filesystem.probe_path}:\n{message}"
+    return send_holder_message("natedev", message, repeat=repeat, lint_settings=lint_settings)
+
+
+from scripts.message import sessions
 
 
 @dataclass(frozen=True)
@@ -2614,14 +3435,22 @@ class BuildHoldTarget:
     holder: str
 
 
-def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]) -> dict[str, BuildHoldTarget]:
+def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]], *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> dict[str, BuildHoldTarget]:
     """Protect session workspaces and recently written build trees without reading build output."""
+    from scripts.build_hold import build_hold
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     state = build_hold.read_holders(build_hold.holder_directory())
     if isinstance(state, build_hold.NoHolders):
         return {}
     records = sessions.live_sessions()
     own_deletes = read_target_deletes(target_deletes_path(), time.time())
     protected: dict[str, BuildHoldTarget] = {}
+    lookback = lint_settings.number("sweep_holder_lookback_seconds")
+    delete_grace = lint_settings.number("sweep_delete_stamp_grace_seconds")
+    tree_depth = lint_settings.whole("sweep_max_tree_depth")
     for holder in state.holders:
         folders: list[Path] = []
         for record in records:
@@ -2635,16 +3464,22 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
                 folders.append(folder)
         if not folders:
             print(f"lint sweep: {holder.name} holds natedev builds; its working folder was not found")
-        # Allow three minutes for clock differences and filesystem timestamp granularity.
-        changed_since = holder.since.timestamp() - 3 * 60
+        # Allow the configured interval for clock and filesystem differences.
+        changed_since = holder.since.timestamp() - lookback
         for root in targets:
             if root in protected:
                 continue
-            if any(Path(root).resolve().is_relative_to(folder) for folder in folders):
+            index = OUTPUT_ROOTS.get()
+            mapped_hold = any(
+                any(folder == mapping.workspace_root or folder.is_relative_to(mapping.workspace_root)
+                    for folder in folders)
+                for position in index.output_owners.get(Path(root), ())
+                for mapping in (index.workspaces[position],))
+            if mapped_hold or any(Path(root).resolve().is_relative_to(folder) for folder in folders):
                 protected[root] = BuildHoldTarget(holder.name)
                 continue
             if root not in known_trees:
-                known_trees[root] = build_trees(root)
+                known_trees[root] = _build_trees(root, tree_depth, lint_settings=lint_settings)
             own_delete = own_deletes.get(str(Path(root).resolve()), float("-inf"))
             paths = [os.path.join(root, USE_STAMP)]
             for tree in known_trees[root]:
@@ -2654,21 +3489,35 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
                     changed = os.stat(path).st_mtime
                 except OSError:
                     continue
-                # A delete changes its parent directory's mtime; allow two seconds for coarse timestamps.
-                if changed >= changed_since and changed > own_delete + 2:
+                # A delete changes its parent folder's mtime; allow the configured timestamp tolerance.
+                if changed >= changed_since and changed > own_delete + delete_grace:
                     protected[root] = BuildHoldTarget(holder.name)
                     break
     return protected
 
 
+def floor_roots(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> tuple[str, ...]:
+    """Include the standing pool wherever copies configuration places it."""
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    return (*lint_settings.words("sweep_floor_roots"), str(copies.gates_root()))
+
+
 def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, float],
                        tree_targets: dict[str, str]) -> list[record.IdleFloorTarget]:
     """Estimate each target independently of the shortfall and all other takes."""
+    _ = tree_targets
     candidates: dict[str, list[FloorTake]] = {root: [] for root in idle}
-    for group in (*scan.orphans, *scan.groups):
-        candidates[tree_targets[group.build_tree]].append(group)
-    for whole in scan.whole_targets:
-        candidates[whole.target].append(whole)
+    for root in idle:
+        owned = dict(scan.target_links[root])
+        for group in (*scan.orphans, *scan.groups, *scan.whole_targets):
+            inodes: list[InodeKey] = []
+            for key in group.inodes:
+                if owned.get(key, 0):
+                    inodes.append(key)
+                    owned[key] -= 1
+            if inodes:
+                candidates[root].append(replace(group, inodes=inodes))
     rows: list[record.IdleFloorTarget] = []
     for root in sorted(idle, key=lambda root: (target_uses[root], root)):
         counts: dict[InodeKey, int] = {}
@@ -2692,44 +3541,481 @@ def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, f
     return rows
 
 
-def hold_floor(
-    floor: int,
-    dry_run: bool,
-    roots: Sequence[str] = FLOOR_ROOTS,
-    lock: str = "",
+@dataclass(frozen=True)
+class MacFloor:
+    """Only marked output inside the three approved Mac roots can be removed."""
+
+    roots: tuple[str, ...]
+    claims: floor_claims.LockedClaims
+    mirror: Path
+    leased_mirrors: frozenset[Path] = frozenset()
+
+    def allows(self, target: str) -> bool:
+        path = Path(target)
+        real = path.resolve()
+        if path.is_symlink() or not any(real.is_relative_to(Path(root).expanduser().resolve()) for root in self.roots):
+            return False
+        if (path / USE_STAMP).is_file():
+            return True
+        for parent in (path, *path.parents):
+            if not any(parent.resolve().is_relative_to(Path(root).expanduser().resolve()) for root in self.roots):
+                break
+            if (parent / floor_claims.MIRROR_MARK).is_file():
+                return True
+            if isinstance(copy_record.read_record(parent / copy_record.RECORD), copy_record.Registered):
+                return True
+        return False
+
+    def uses(self, targets: Sequence[str]) -> dict[str, TargetUse | LockHeld]:
+        from scripts.lint import tmp_sweep
+
+        result: dict[str, TargetUse | LockHeld] = {}
+        paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
+        for root in targets:
+            if (not self.allows(root) or self.claims.holds(root, self.mirror)
+                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)
+                    or isinstance(paths, tmp_sweep.ProcessUsesUnavailable)):
+                result[root] = LockHeld("Mac claim or process use is busy or unreadable")
+            else:
+                for path, pid, how in paths.paths:
+                    if Path(path).is_relative_to(root):
+                        result[root] = TargetUse(pid, how)
+                        break
+        return result
+
+
+class NatedevFloor(Enum):
+    """Use the existing Linux process and build hold checks."""
+
+    CURRENT = "natedev"
+
+
+class FloorFailureScope(Enum):
+    FILESYSTEM = "filesystem"
+    DISCOVERY = "discovery"
+
+    @property
+    def record_name(self) -> str:
+        return floor_record_path().name if self is FloorFailureScope.FILESYSTEM else "floor-discovery.json"
+
+    @property
+    def label(self) -> str:
+        return "disk floor sweep"
+
+
+@dataclass(frozen=True)
+class WorkspaceFailureScope:
+    roots: tuple[str, ...]
+
+    @property
+    def record_name(self) -> str:
+        identity = hashlib.sha256(json.dumps(self.roots).encode()).hexdigest()
+        return f"workspace-{identity}.json"
+
+    @property
+    def label(self) -> str:
+        return f"workspace sweep for {', '.join(self.roots)}"
+
+
+@dataclass(frozen=True)
+class TemporarySweepFailureScope:
+    """The temporary sweep has an independent failure episode."""
+
+    @property
+    def record_name(self) -> str:
+        return "temporary-sweep.json"
+
+    @property
+    def label(self) -> str:
+        return "temporary sweep"
+
+
+SweepFailureScope = FloorFailureScope | WorkspaceFailureScope | TemporarySweepFailureScope
+
+
+@dataclass(frozen=True)
+class FloorOutcome:
+    assessment: tmp_sweep.SweepAssessment
+    removed: int = 0
+    before: int = 0
+    after: int = 0
+    busy: int = 0
+    protected: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def status(self) -> int:
+        return self.assessment.status
+
+
+def mac_floor_settings(
+    settings: conf.ConfigRead, *, mirror_root: MacMirrorRoot | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> tuple[int, tuple[str, ...]]:
+    """Refuse a missing live floor or a floor below the admission minimum."""
+    if isinstance(mirror_root, UseConfiguredValue):
+        mirror_root = MacMirrorRoot.read(settings)
+    if "sweep_floor_gib" not in settings.values():
+        raise conf.Unusable("mac_test.conf: sweep_floor_gib is missing")
+    floor = settings.number("sweep_floor_gib")
+    if floor < settings.number("free_floor_gib"):
+        raise conf.Unusable("mac_test.conf: sweep_floor_gib must be at least free_floor_gib")
+    roots = settings.words("sweep_floor_roots")
+    approved = (Path("/tmp").resolve(), Path.home() / "rust", mirror_root.local_path())
+    if len(roots) != 3 or {Path(root).expanduser().resolve() for root in roots} != {root.resolve() for root in approved}:
+        raise conf.Unusable(f"mac_test.conf: sweep_floor_roots must name /tmp, ~/rust and ~/{mirror_root.relative}")
+    return int(floor * GIB), roots
+
+
+def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = (), lock: str = "", *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    policy: MacFloor | NatedevFloor = NatedevFloor.CURRENT,
 ) -> int:
-    """Below the floor, take the shortfall from the least used idle targets."""
-    lock = lock or str(tmp_sweep.state_dir() / "floor.lock")
-    if not dry_run:
-        recover_pending_trims()
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    if isinstance(policy, NatedevFloor):
+        return _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock).status
+    output = io.StringIO()
+    with redirect_stdout(output):
+        result = _hold_floor(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock)
+    if dry_run:
+        for line in output.getvalue().splitlines():
+            if "the floor would take" in line:
+                print(line)
+    print(f"lint sweep: removed_bytes={result.removed} free_before_bytes={result.before} "
+          + f"free_after_bytes={result.after} busy_targets_skipped={result.busy} dry_run={str(dry_run).lower()}")
+    return result.status
+
+
+def output_device(path: str) -> int:
+    return os.stat(path).st_dev
+
+
+def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf.ConfigRead) -> list[FilesystemFloor]:
+    origin = lint_settings.origin("sweep_free_floor_percent", float)
+    if not isinstance(origin, conf.UsableLiveValue) or not math.isfinite(origin.value) or not 0 <= origin.value <= 100:
+        raise conf.Unusable("lint.conf: sweep_free_floor_percent must be a live number from 0 to 100")
     home = os.path.expanduser("~")
-    free = free_bytes(home)
-    if free >= floor:
-        return 0
-    guard = None
-    if not dry_run:
-        lock_path = os.path.expanduser(lock)
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        guard = try_lock(lock_path)
-        if guard is None:
-            print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
-            alert_floor_lock(lock_path, free, floor)
-            return 0
+    root_device = output_device(home)
+    devices: dict[int, list[str]] = {root_device: []}
+    probes = {root_device: home}
+    for path in (*targets, *lint_settings.words("sweep_ci_targets")):
+        path = os.path.realpath(os.path.expanduser(path))
+        if not os.path.isdir(path):
+            continue
+        try:
+            device = output_device(path)
+        except FileNotFoundError:
+            continue
+        _ = devices.setdefault(device, [])
+        _ = probes.setdefault(device, path)
+        if path in targets:
+            devices[device].append(path)
+    floors: list[FilesystemFloor] = []
+    for device, device_targets in devices.items():
+        probe = probes[device]
+        if device == root_device:
+            threshold = floor
+        else:
+            usage = os.statvfs(probe)
+            threshold = int(usage.f_blocks * usage.f_frsize * origin.value / 100)
+        floors.append(FilesystemFloor(device, probe, threshold, tuple(device_targets), device == root_device,
+                                      len(devices) == 1))
+    return floors
+
+
+def _hold_floor(floor: int, dry_run: bool, *,
+    lint_settings: conf.ConfigRead, policy: MacFloor | NatedevFloor,
+    roots: Sequence[str] = (), lock: str = "",
+) -> FloorOutcome:
+    from scripts.lint import tmp_sweep
+
+    if isinstance(policy, MacFloor):
+        return _hold_floor_pass(floor, dry_run, lint_settings=lint_settings, policy=policy, roots=roots, lock=lock)
+    planned_at = time.time()
+    token = OUTPUT_ROOTS.set(CargoOutputIndex())
     try:
-        planned_at = time.time()
+        targets, mappings = discover_cargo_outputs(roots or floor_roots(lint_settings=lint_settings),
+                                                   lint_settings=lint_settings)
+        _ = OUTPUT_ROOTS.set(mappings)
+        ci_roots = [Path(path).expanduser().resolve() for path in lint_settings.words("sweep_ci_targets")]
+        excluded_roots = set(ci_roots)
+        for mapping in mappings.workspaces:
+            pair = (mapping.target_directory, mapping.build_directory)
+            if any(root.is_relative_to(ci) for root in pair for ci in ci_roots):
+                excluded_roots.update(pair)
+                for root in pair:
+                    excluded_roots.update(Path(paired) for paired in mappings.roots_for(str(root)))
+        targets = [root for root in targets if not any(Path(root).is_relative_to(excluded)
+                                                      for excluded in excluded_roots)]
+        filesystems = filesystem_floors(floor, targets, lint_settings=lint_settings)
+        if not dry_run:
+            notify_floor_problem(tmp_sweep.CompletedSweepAssessment(0), lint_settings=lint_settings,
+                                 scope=FloorFailureScope.DISCOVERY)
+        results: list[FloorOutcome] = []
+        for filesystem in filesystems:
+            scope = FLOOR_FILESYSTEM.set(filesystem)
+            try:
+                outcome = _hold_floor_pass(filesystem.floor_bytes, dry_run, lint_settings=lint_settings,
+                                          policy=policy, planned_at=planned_at, roots=roots, lock=lock)
+                results.append(outcome)
+            except OSError as error:
+                print(f"lint sweep: filesystem {filesystem.probe_path}: {error}", file=sys.stderr)
+                if not dry_run:
+                    notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
+                                         lint_settings=lint_settings, detail=str(error))
+                results.append(FloorOutcome(tmp_sweep.CompletedSweepAssessment(1)))
+            finally:
+                FLOOR_FILESYSTEM.reset(scope)
+        if not dry_run and mappings.workspaces:
+            save_cargo_output_roots(mappings)
+        return FloorOutcome(tmp_sweep.CompletedSweepAssessment(max(result.status for result in results)),
+                            sum(result.removed for result in results),
+                            sum(result.before for result in results), sum(result.after for result in results),
+                            sum(result.busy for result in results))
+    except (conf.Unusable, OSError) as error:
+        print(f"lint sweep: {error}", file=sys.stderr)
+        if not dry_run:
+            notify_floor_problem(tmp_sweep.CompletedSweepAssessment(2), lint_settings=lint_settings,
+                                 detail=str(error), scope=FloorFailureScope.DISCOVERY)
+        return FloorOutcome(tmp_sweep.CompletedSweepAssessment(2))
+    finally:
+        OUTPUT_ROOTS.reset(token)
+
+
+def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, lint_settings: conf.ConfigRead, detail: str = "",
+                         scope: SweepFailureScope = FloorFailureScope.FILESYSTEM,
+                         machine: FloorMachine = FloorMachine.NATEDEV) -> None:
+    """Finalize delivery and state before an acquired floor lock closes."""
+    from scripts.lint import tmp_sweep
+
+    assessment = outcome.assessment if isinstance(outcome, FloorOutcome) else outcome
+    if isinstance(assessment, tmp_sweep.SkippedSweepAssessment):
+        return
+    after = outcome.after if isinstance(outcome, FloorOutcome) else 0
+    protected = outcome.protected if isinstance(outcome, FloorOutcome) else ()
+    removed = outcome.removed if isinstance(outcome, FloorOutcome) else 0
+    filesystem = FLOOR_FILESYSTEM.get()
+    root_scope = scope is FloorFailureScope.FILESYSTEM and (
+        not isinstance(filesystem, FilesystemFloor) or filesystem.root_device)
+    path = floor_record_path().with_name(scope.record_name)
+    if not root_scope and not assessment.status and not path.exists():
+        return
+    phone_floor = int(lint_settings.number("sweep_phone_floor_gib") * GIB)
+
+    def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
+        current = floor_record_or_new(previous, after)
+        free = after
+        if root_scope:
+            try:
+                # Measure inside the record lock. Older callers cannot reset a newer crossing.
+                free = free_bytes(filesystem.probe_path if isinstance(filesystem, FilesystemFloor)
+                                  else os.path.expanduser("~"))
+                if free > phone_floor:
+                    current = replace(current, phone_crossing=AbovePhoneFloor())
+                elif free < phone_floor and isinstance(current.phone_crossing, AbovePhoneFloor):
+                    current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
+            except OSError as error:
+                print(f"lint sweep: cannot measure the phone floor: {error}", file=sys.stderr)
+        failure = current.failure
+        if assessment.status:
+            if isinstance(failure, NoFailure):
+                failure = FailurePending(FloorFailureEvent(assessment.status, detail))
+        else:
+            failure = NoFailure()
+        current = replace(current, failure=failure)
+        crossing = current.phone_crossing if root_scope else AbovePhoneFloor()
+        natedev_pending = isinstance(crossing, OpenPhoneCrossing) and crossing.natedev is CrossingReceipt.PENDING
+        phone_due = (isinstance(crossing, OpenPhoneCrossing) and crossing.phone is CrossingReceipt.PENDING
+                     and not assessment.status)
+        phone_pending = phone_due and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE
+        crossing_pending = natedev_pending or phone_pending
+        pending_failure = isinstance(failure, FailurePending)
+        if not crossing_pending and not pending_failure:
+            return current
+        shortfall = max(0, phone_floor - free)
+        choices: FolderChoices = UNAVAILABLE_FOLDER_CHOICES
+        if crossing_pending:
+            choices = folder_choices(read_disk_measurement(), protected, shortfall,
+                                     now=time.time(), lint_settings=lint_settings)
+
+        def render(path_limit: int) -> str:
+            lines: list[str] = []
+            if crossing_pending:
+                lines.extend([
+                    f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains."
+                    + (" This is the Mac disk." if machine is FloorMachine.MAC else ""),
+                    f"Cleanup removed {gib(removed)}." if removed else "The cleanup run freed nothing.",
+                    *folder_choice_lines(choices, shortfall, path_limit=path_limit),
+                ])
+            if isinstance(failure, FailurePending):
+                lines.append(f"The {scope.label} failed with status {failure.event.status}. {failure.event.detail}")
+            return "\n".join(lines)
+        message = fit_alert_text(render, lint_settings=lint_settings)
+
+        def save_delivery(delivery: FloorAlertDelivery) -> None:
+            nonlocal current
+            receipt = current.phone_crossing
+            if isinstance(receipt, OpenPhoneCrossing):
+                receipt = replace(receipt,
+                                  natedev=CrossingReceipt.ACCEPTED if delivery.natedev.accepted else receipt.natedev,
+                                  phone=CrossingReceipt.ACCEPTED if delivery.phone.accepted else receipt.phone)
+                current = replace(current, phone_crossing=receipt)
+            if delivery.natedev.accepted and isinstance(current.failure, FailurePending):
+                current = replace(current, failure=FailureReported())
+            _ = save(current)
+
+        # Crossings and sweep failures go only to natedev.
+        # A current text approval permits the crossing's separate phone delivery.
+        identity_saved = save(current) if isinstance(crossing, OpenPhoneCrossing) else False
+        if natedev_pending or pending_failure:
+            repeat: CrossingSendKey | NoCrossingSend = NO_CROSSING_SEND
+            if not pending_failure and isinstance(crossing, OpenPhoneCrossing):
+                repeat = (CrossingSendKey(f"natedev:{crossing.identity}", lint_settings.number("sweep_crossing_repeat_minutes"))
+                          if identity_saved else CrossingSendKey(UNSAVED_CROSSING_KEY,
+                                                                 lint_settings.number("sweep_alert_interval_seconds") / 60))
+            delivery = send_floor_alert(message, repeat=repeat, lint_settings=lint_settings)
+            save_delivery(FloorAlertDelivery(delivery, FloorChannelOutcome.NOT_ATTEMPTED))
+        if phone_pending and identity_saved and isinstance(crossing, OpenPhoneCrossing):
+            phone = fit_disk_floor_push(free, phone_floor, choices, lint_settings=lint_settings, machine=machine)
+            if not isinstance(phone, NoPhoneAlert):
+                result = send_phone_push(phone,
+                                        repeat=CrossingSendKey(f"phone:{crossing.identity}",
+                                                               lint_settings.number("sweep_crossing_repeat_minutes")),
+                                        lint_settings=lint_settings)
+                save_delivery(FloorAlertDelivery(FloorChannelOutcome.NOT_ATTEMPTED, result))
+        return current
+
+    record_lock = ExitStack()
+    last_saved: NoFloorRecord | FloorRecord = NoFloorRecord()
+    def save_record(current: FloorRecord) -> bool:
+        nonlocal last_saved
+        if current == last_saved:
+            return True
+        try:
+            write_floor_record(path, current)
+            last_saved = current
+            return True
+        except OSError as error:
+            print(f"lint sweep: cannot save the notification state: {error}", file=sys.stderr)
+            return False
+
+    def no_record_access(current: FloorRecord) -> bool:
+        del current
+        return False
+
+    try:
+        try:
+            previous = record_lock.enter_context(locked_floor_record(path))
+        except OSError as error:
+            print(f"lint sweep: cannot access the notification record: {error}", file=sys.stderr)
+            _ = finalize(NoFloorRecord(), no_record_access)
+            return
+        last_saved = previous
+        current = finalize(previous, save_record)
+        if (isinstance(previous, NoFloorRecord) and isinstance(current.failure, NoFailure)
+                and isinstance(current.phone_crossing, AbovePhoneFloor)):
+            return
+        _ = save_record(current)
+    finally:
+        try:
+            record_lock.close()
+        except OSError as error:
+            print(f"lint sweep: cannot close the notification record: {error}", file=sys.stderr)
+
+
+def _hold_floor_pass(floor: int, dry_run: bool, *,
+    lint_settings: conf.ConfigRead, policy: MacFloor | NatedevFloor,
+    roots: Sequence[str] = (), lock: str = "",
+    planned_at: float | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> FloorOutcome:
+    """Below the floor, take the shortfall from the least used idle targets."""
+    from scripts.lint import tmp_sweep
+    from scripts.buildlog import record
+
+    guard: int | None = None
+    outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
+    protected: tuple[tuple[str, int], ...] = ()
+    detail = ""
+    mirror_leases = ExitStack()
+    try:
+        if isinstance(planned_at, UseConfiguredValue):
+            planned_at = time.time()
+        roots = policy.roots if isinstance(policy, MacFloor) else roots or floor_roots(lint_settings=lint_settings)
+        filesystem = FLOOR_FILESYSTEM.get()
+        lock = lock or str(floor_record_path().with_suffix(".lock"))
+        if not dry_run and isinstance(policy, NatedevFloor):
+            recover_pending_trims(lint_settings=lint_settings)
+        home = filesystem.probe_path if isinstance(filesystem, FilesystemFloor) else os.path.expanduser("~")
+        free = free_bytes(home)
+        if free >= floor:
+            if dry_run:
+                print(f"lint sweep: {home}: {gib(free)} free, at or above the {gib(floor)} floor; nothing to remove")
+            outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0), before=free, after=free)
+            return outcome
+        if not dry_run:
+            lock_path = str(lock)
+            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+            guard = try_lock(lock_path)
+            if guard is None:
+                print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
+                if isinstance(policy, NatedevFloor):
+                    try:
+                        alert_floor_lock(lock_path, free, floor, lint_settings=lint_settings)
+                    except OSError as error:
+                        print(f"lint sweep: cannot report the floor lock: {error}", file=sys.stderr)
+                outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment(), before=free, after=free)
+                return outcome
         if guard is not None:
-            record_floor_lock(os.path.expanduser(lock), guard, planned_at)
+            record_floor_lock(str(lock), guard, time.time())
         record_path = floor_record_path()
+        try:
+            if guard is not None:
+                with locked_floor_record(record_path) as previous:
+                    current = floor_record_or_new(previous, free)
+                    transition = next_lock_alert(current.lock_alert, NoFloorLockHolder(), LiveSweepProcess(), time.time())
+                    if transition.lock_alert != current.lock_alert:
+                        write_floor_record(record_path, replace(current, lock_alert=transition.lock_alert))
+        except OSError as error:
+            print(f"lint sweep: cannot clear the lock observation: {error}", file=sys.stderr)
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
-        busy: dict[str, TargetUse | LockHeld | BuildHoldTarget] = {}
-        targets = target_dirs(roots)
+        busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
+        paired_roots = OUTPUT_ROOTS.get().roots_for
+        known_trees = {} if isinstance(policy, MacFloor) else dict(OUTPUT_ROOTS.get().known_trees)
+        targets = (sorted({paired for root in filesystem.targets for paired in paired_roots(root)})
+                   if isinstance(filesystem, FilesystemFloor) else
+                   target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees))
+        all_discovered = sorted(set(targets) | {str(Path(path).expanduser().resolve())
+                                 for path in lint_settings.words("sweep_ci_targets") if os.path.isdir(os.path.expanduser(path))})
+        excluded_targets = frozenset(all_discovered)
+        if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
+            print(f"lint sweep: filesystem {filesystem.key} at {filesystem.probe_path}")
+        if isinstance(policy, MacFloor):
+            targets = [target for target in targets if policy.allows(target)]
         owners = TargetOwnerIndex(targets)
-        known_trees: dict[str, list[str]] = {}
-        hold_targets = build_hold_targets(targets, known_trees)
-        uses = process_uses(owners)
-        locked_files = held_cargo_lock_files()
+        hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
+                        if isinstance(policy, NatedevFloor) else {})
+        uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
+        if isinstance(policy, NatedevFloor):
+            busy_mirrors = mirror_leases.enter_context(copies.target_mirror_leases(targets))
+            for root in targets:
+                if any(Path(root).resolve().is_relative_to(mirror) for mirror in busy_mirrors):
+                    uses[root] = LockHeld("remote mirror lease is busy")
+        for root in tuple(hold_targets):
+            for paired in paired_roots(root):
+                if paired in targets:
+                    hold_targets[paired] = hold_targets[root]
+        for root in tuple(uses):
+            for paired in paired_roots(root):
+                if paired in targets:
+                    uses[paired] = uses[root]
+        locked_files = held_cargo_lock_files(lint_settings=lint_settings)
+        tree_depth = lint_settings.whole("sweep_max_tree_depth")
+        no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
+            if root in no_evidence:
+                busy[root] = NoRecordedEvidence(root)
+                print(f"lint sweep: protected {root}: no recorded evidence")
+                continue
             if root not in known_trees and (root in hold_targets or root in uses):
                 known_trees[root] = []
             with scratch.judgment_lock(Path(root)) as idle_copy:
@@ -2744,10 +4030,14 @@ def hold_floor(
                 busy[root] = reason
                 continue
             if root in uses:
-                print(f"lint sweep: pid {uses[root].pid} {uses[root].how}; {root} left alone")
-                busy[root] = uses[root]
+                use = uses[root]
+                if isinstance(use, TargetUse):
+                    print(f"lint sweep: pid {use.pid} {use.how}; {root} left alone")
+                else:
+                    print(f"lint sweep: {use.lock}; {root} left alone")
+                busy[root] = use
                 continue
-            root_trees = known_trees[root] if root in known_trees else build_trees(root)
+            root_trees = known_trees[root] if root in known_trees else _build_trees(root, tree_depth, lint_settings=lint_settings)
             known_trees[root] = root_trees
             blocked = next((path for path in target_lock_paths(root_trees)
                             if file_key(path) in locked_files), "")
@@ -2756,40 +4046,61 @@ def hold_floor(
                 continue
             idle.append(root)
             tree_targets.update({tree: root for tree in root_trees if owners.owner(tree) == TargetOwner(root)})
-        scan = scan_floor_roots(DiscoveredTargetRoots(idle, targets), known_trees)
+        for root in tuple(idle):
+            pair = paired_roots(root)
+            blocked_pair = next((paired for paired in pair if paired in busy), "")
+            if blocked_pair:
+                busy[root] = busy[blocked_pair]
+                idle.remove(root)
+        scan = scan_floor_roots(DiscoveredTargetRoots(idle, all_discovered), known_trees, lint_settings=lint_settings)
         target_groups: dict[str, list[Group]] = {root: [] for root in idle}
+        grouped_roots = {root: paired_roots(root) for root in set(tree_targets.values())}
         for group in scan.groups:
-            target_groups[tree_targets[group.build_tree]].append(group)
+            for root in grouped_roots[tree_targets[group.build_tree]]:
+                if root in target_groups:
+                    target_groups[root].append(group)
         target_uses = {root: target_last_use(root, groups, targets) for root, groups in target_groups.items()}
-        total = sum(scan.blocks.values())
-        # A held target is not walked even for accounting; its bytes stay unmeasured this pass.
-        busy_bytes = {path: 0 if isinstance(use, BuildHoldTarget) else (
-                          directory_blocks(path, excluded=targets) if any(
-                              other != path and other.startswith(path + os.sep) for other in targets)
-                          else directory_blocks(path))
-                      for path, use in busy.items()}
-        held_bytes = sum(busy_bytes.values())
-        ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
-        unchanged_caches = held_bytes + ci_bytes
-        before_caches = total + unchanged_caches
+        total = sum(size for key, size in scan.blocks.items()
+                    if not isinstance(filesystem, FilesystemFloor) or key[0] == filesystem.device)
+        unchanged_caches = 0
+        busy_bytes: dict[str, int] = {}
+        ci_bytes = 0
+        before_caches = total
+        if not dry_run:
+            # Build holds and Mac claims prevent size walks of their output.
+            busy_bytes = {path: 0 for path in busy if on_floor_filesystem(path)}
+            measured = measure_protected_folders(frozenset(
+                path for path, use in busy.items()
+                if not isinstance(policy, MacFloor) and not isinstance(use, BuildHoldTarget)),
+                excluded_targets)
+            busy_bytes.update(measured)
+            protected = tuple((path, size) for path, size in measured if isinstance(busy[path], NoRecordedEvidence))
+            held_bytes = sum(busy_bytes.values())
+            ci_seen: set[InodeKey] = set()
+            ci_bytes = sum(directory_blocks(os.path.expanduser(path), ci_seen)
+                           for path in lint_settings.words("sweep_ci_targets")
+                           if on_floor_filesystem(os.path.expanduser(path)))
+            unchanged_caches = held_bytes + ci_bytes
+            before_caches = total + unchanged_caches
         # The growth check compares this pair with the previous record. The scan takes minutes, so
         # free is read again after it: a target another process deletes during the scan is then out
         # of both figures, not out of before_caches alone. On 2026-10-25 the read from before the
         # scan reported a 122.6 GiB fall while 123 GiB was freed.
         scanned_free = free_bytes(home)
+        protection_reason = ("because they are protected" if any(isinstance(use, NoRecordedEvidence) for use in busy.values())
+                             else "while a build or test run uses them")
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
-            + f" target dirs ({gib(total)}), {len(busy)} left alone while a build or test run uses them"
+            + f" target dirs ({gib(total)}), {len(busy)} left alone {protection_reason}"
         )
-        # The shortfall comes from the read after the scan too: on 2026-10-25 the read from before it
-        # took 6.5 GiB of cache while another process had lifted free from 293.5 to 416 GiB.
         budget = total - max(0, floor - scanned_free)
         left, failures = total, 0
         chosen: list[tuple[FloorTake, int]] = []
         if scanned_free < floor:
             if not dry_run:
                 record.floor_scan(scanned_free, floor, floor_scan_targets(
-                    scan, idle, target_uses, tree_targets), time.time())
+                    scan, [root for root in idle if on_floor_filesystem(root)], target_uses, tree_targets), time.time(),
+                    filesystem=f"{filesystem.key}:{filesystem.probe_path}" if isinstance(filesystem, FilesystemFloor) else "")
             left, failures, chosen = shrink_floor(
                 scan, total, budget, dry_run, tree_targets, known_trees, busy,
                 lambda group: (
@@ -2797,7 +4108,7 @@ def hold_floor(
                     *unit_age(group, planned_at),
                 ),
                 planned_at, owners,
-            )
+             lint_settings=lint_settings, policy=policy if isinstance(policy, MacFloor) else UseConfiguredValue.CURRENT)
         else:
             print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
                   + " nothing taken")
@@ -2812,67 +4123,97 @@ def hold_floor(
                       + f" last used {when(target_uses[root])}")
         after_free = free_bytes(home)
         print(f"lint sweep: {gib(after_free)} free")
-        if not dry_run:
+        if not dry_run and isinstance(policy, NatedevFloor):
             now = time.time()
-            # The record's free is read before its caches and the next sweep's free after its scan,
-            # so a deletion during either walk can only make the computed fall smaller.
-            seen: set[InodeKey] = set()
-            after_caches = sum(directory_blocks(path, seen, targets) if any(
-                other != path and other.startswith(path + os.sep) for other in targets)
-                else directory_blocks(path, seen) for path in idle) + unchanged_caches
-            removed = max(0, before_caches - after_caches)
-            with locked_floor_record(record_path) as previous:
-                history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
-                push_history = previous.push_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
-                push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= ALERT_INTERVAL_SECONDS
-                # (user, 2026-10-05) Only an exhausted sweep still under the floor reaches the phone; other alerts reach natedev alone.
-                # (2026-10-21) It never asks the user to free space by hand. Each session whose process
-                # holds a busy target is told; the user gets a page, with exact paths, only when no
-                # session could be told.
-                if left > budget and after_free < floor and push_due:
-                    holders = floor_holders({root: use for root, use in busy.items()
-                                             if not isinstance(use, BuildHoldTarget)}, busy_bytes)
-                    holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
-                                   for root, use in busy.items() if isinstance(use, BuildHoldTarget))
-                    told = frozenset(holder.path for holder in holders if holder.session is not None
-                                     and send_holder_message(holder.session, holder_message_text(holder, after_free, floor)))
-                    measurement = read_disk_measurement()
-                    message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
-                                                      ci_bytes, measurement, failures)
-                    if told:
-                        delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV)
-                    else:
-                        page = disk_floor_push(removed, after_free, floor, page_paths(holders, measurement))
-                        delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE, phone=page)
-                    if delivered or told:
-                        push_history = DeliveredAlert(time.time())
-                elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
-                    free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
-                    cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
-                    recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
-                    same_held_roots = (isinstance(previous, FloorRecord)
-                                       and isinstance(previous.held_roots, KnownHeldRoots)
-                                       and previous.held_roots.roots == frozenset(hold_targets))
-                    growth_fired = recent and same_held_roots and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
-                    removal_fired = removed > LARGE_REMOVAL_BYTES
-                    if growth_fired or removal_fired:
-                        reasons: list[str] = []
-                        if growth_fired:
-                            reasons.append("free space fell more than 10 GiB beyond build-cache growth")
-                        if removal_fired:
-                            reasons.append("removed more than 32 GiB in one sweep")
-                        message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
-                                                   reasons, read_disk_measurement())
-                        if send_floor_alert(message, FloorAlertChannels.NATEDEV):
-                            history = DeliveredAlert(time.time())
-                write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history, push_history,
-                                                           KnownHeldRoots(frozenset(hold_targets)),
-                                                           previous.lock_alert if isinstance(previous, FloorRecord)
-                                                           else NoFloorLockAlert()))
-        return 1 if failures else 0
+            unchanged = {key for path in idle if path not in scan.changed_targets and on_floor_filesystem(path)
+                         for key in scan.target_links.get(path, {})}
+            after_caches = sum(scan.blocks[key] for key in unchanged) + unchanged_caches
+            after_caches += sum(directory_blocks(path, unchanged, excluded_targets)
+                                for path in idle if path in scan.changed_targets and on_floor_filesystem(path))
+            # This pass did not remove these blocks.
+            externally_removed_keys = {key for root in idle if root not in taken and not os.path.lexists(root)
+                                      for key in scan.target_links.get(root, {})
+                                      if key not in unchanged
+                                      and (not isinstance(filesystem, FilesystemFloor) or key[0] == filesystem.device)}
+            removed = max(0, before_caches - after_caches - sum(scan.blocks[key] for key in externally_removed_keys))
+            try:
+                with locked_floor_record(record_path) as previous:
+                    base = floor_record_or_new(previous, after_free)
+                    history = base.alert_history
+                    push_history = base.push_history
+                    alert_interval = lint_settings.number("sweep_alert_interval_seconds")
+                    push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= alert_interval
+                    if left > budget and after_free < floor and push_due:
+                        holders = floor_holders(busy, busy_bytes, lint_settings=lint_settings)
+                        holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
+                                       for root, use in busy.items() if isinstance(use, BuildHoldTarget))
+                        told = frozenset(holder.path for holder in holders if holder.session is not None
+                                         and send_holder_message(holder.session, holder_message_text(holder, after_free, floor, lint_settings=lint_settings), lint_settings=lint_settings).accepted)
+                        measurement = (read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
+                                       or filesystem.root_device else UnavailableDiskMeasurement("missing"))
+                        message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
+                                                          ci_bytes, measurement, failures, protected=protected,
+                                                          lint_settings=lint_settings)
+                        delivered = send_floor_alert(message, lint_settings=lint_settings)
+                        if delivered.accepted or told:
+                            push_history = DeliveredAlert(time.time())
+                    elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= alert_interval):
+                        free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
+                        cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
+                        recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= lint_settings.number("sweep_growth_window_seconds")
+                        same_held_roots = (isinstance(previous, FloorRecord)
+                                           and isinstance(previous.held_roots, KnownHeldRoots)
+                                           and previous.held_roots.roots == frozenset(hold_targets))
+                        unexplained_fall = lint_settings.whole("sweep_unexplained_fall_bytes")
+                        large_removal = lint_settings.whole("sweep_large_removal_bytes")
+                        same_filesystem = True
+                        if isinstance(filesystem, FilesystemFloor):
+                            same_filesystem = isinstance(previous, FloorRecord) and (
+                                previous.filesystem == filesystem.key and previous.measured_roots == tuple(sorted(idle))
+                                or filesystem.root_device and filesystem.legacy_history_safe and previous.filesystem == "")
+                        growth_fired = recent and same_held_roots and same_filesystem and free_fall - cache_growth > unexplained_fall
+                        removal_fired = removed > large_removal
+                        if growth_fired or removal_fired:
+                            reasons: list[str] = []
+                            if growth_fired:
+                                reasons.append(f"free space fell more than {unexplained_fall / GIB:g} GiB beyond build-cache growth")
+                            if removal_fired:
+                                reasons.append(f"removed more than {large_removal / GIB:g} GiB in one sweep")
+                            message = floor_alert_text(now, removed, previous, free_fall, cache_growth,
+                                                       reasons, read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
+                                                       or filesystem.root_device else UnavailableDiskMeasurement("missing"),
+                                                       lint_settings=lint_settings)
+                            if send_floor_alert(message, lint_settings=lint_settings).accepted:
+                                history = DeliveredAlert(time.time())
+                    write_floor_record(record_path, replace(
+                        base, measured_at=now, free_bytes=after_free, build_cache_bytes=after_caches,
+                        alert_history=history, push_history=push_history,
+                        held_roots=KnownHeldRoots(frozenset(hold_targets)),
+                        filesystem=filesystem.key if isinstance(filesystem, FilesystemFloor) else "",
+                        measured_roots=tuple(sorted(idle))))
+            except OSError as error:
+                print(f"lint sweep: cannot save floor accounting: {error}", file=sys.stderr)
+        outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0 if isinstance(policy, MacFloor) else (1 if failures else 0)),
+                               0 if dry_run else max(0, total - left), free, after_free, len(busy), protected=protected)
+        return outcome
+    except (conf.Unusable, OSError) as error:
+        if isinstance(policy, MacFloor):
+            raise
+        detail = str(error)
+        outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(1))
+        print(f"lint sweep: {error}", file=sys.stderr)
+        return outcome
     finally:
-        if guard is not None:
-            os.close(guard)
+        try:
+            if not dry_run:
+                notify_floor_problem(replace(outcome, protected=protected), lint_settings=lint_settings, detail=detail,
+                                     machine=FloorMachine.MAC if isinstance(policy, MacFloor) else FloorMachine.NATEDEV)
+        finally:
+            try:
+                if guard is not None:
+                    os.close(guard)
+            finally:
+                mirror_leases.close()
 
 
 def size_bytes(raw: str, unit: int) -> int | None:
@@ -2986,10 +4327,12 @@ def budget_bytes(environ: dict[str, str], config: str | conf.ConfigRead, repo: s
     return int(settings_read.number(BUDGET_KEY) * GIB), f"{BUDGET_KEY} in {config}"
 
 
-def doc_index_bytes() -> int | None:
+def doc_index_bytes(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int | None:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     raw = os.environ.get(DOC_INDEX_ENV, "")
     if not raw:
-        return int(DEFAULT_DOC_INDEX_MIB * MIB)
+        return int(lint_settings.number("sweep_doc_index_mib") * MIB)
     return size_bytes(raw, MIB)
 
 
@@ -3032,18 +4375,9 @@ def sweep_removals_path() -> Path:
     return floor_record_path().with_name("removals.jsonl")
 
 
-def parse_sweep_removals(lines: Iterable[str]) -> list[SweepRemoval]:
+def parse_sweep_removals(rows: Iterable[dict[str, object]]) -> list[SweepRemoval]:
     events: list[SweepRemoval] = []
-    for line in lines:
-        if not line.endswith("\n"):
-            continue
-        try:
-            raw = cast(object, json.loads(line))
-        except ValueError:
-            continue
-        if not isinstance(raw, dict):
-            continue
-        row = cast(dict[str, object], raw)
+    for row in rows:
         at, path, cause = row.get("at"), row.get("path"), row.get("cause")
         if (_finite_number(at) and isinstance(path, str) and os.path.isabs(path)
                 and cause in ("budget take", "floor take")):
@@ -3054,6 +4388,8 @@ def parse_sweep_removals(lines: Iterable[str]) -> list[SweepRemoval]:
 def record_sweep_removal(target: str, cause: Literal["budget take", "floor take"],
                          bytes_freed: int, extent: Literal["whole", "partial"], at: float) -> bool:
     """One build-log row per target take, including when stdout is discarded."""
+    from scripts.buildlog import record
+
     try:
         record.sweep_trim(os.path.abspath(target), bytes_freed, extent, cause, at)
     except OSError as error:
@@ -3064,11 +4400,7 @@ def record_sweep_removal(target: str, cause: Literal["budget take", "floor take"
 
 def read_sweep_removals() -> list[SweepRemoval]:
     try:
-        with sweep_removals_path().open(encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            return parse_sweep_removals(handle)
-    except FileNotFoundError:
-        return []
+        return parse_sweep_removals(store.locked_rows(sweep_removals_path()))
     except OSError as error:
         print(f"lint sweep: could not read removals: {error}", file=sys.stderr)
         return []
@@ -3114,11 +4446,15 @@ def parse_sweep_journal(lines: Iterable[str]) -> list[SweepRemoval]:
     return sorted(events, key=lambda event: event.at)
 
 
-def read_sweep_journal(since: float) -> list[SweepRemoval]:
+def read_sweep_journal(since: float, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[SweepRemoval]:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     result = subprocess.run(
         ["journalctl", "--since", f"@{since:.6f}", "--output=json", "--no-pager",
          "--grep=lint sweep:|tmp sweep: deleted"],
-        capture_output=True, text=True, check=True, timeout=120,
+        capture_output=True, text=True, check=True, timeout=lint_settings.number("sweep_history_timeout_seconds"),
     )
     return parse_sweep_journal(result.stdout.splitlines())
 
@@ -3195,17 +4531,32 @@ def clone_kind(folder: str) -> str:
 
 
 def rebuild_causes(steps: Sequence[RebuildStep], events: Sequence[SweepRemoval],
-                   since: float, until: float) -> list[ColdRebuild]:
+                   since: float, until: float, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> list[ColdRebuild]:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    return _rebuild_causes(steps, events, since, until, lint_settings.whole("sweep_cold_crates"))
+
+
+def _rebuild_causes(steps: Sequence[RebuildStep], events: Sequence[SweepRemoval],
+                    since: float, until: float, cold_crates: int) -> list[ColdRebuild]:
     by_folder: dict[str, list[SweepRemoval]] = {}
+    saved = saved_cargo_output_roots()
+    mappings = (*saved.workspaces, *saved.history)
     for event in events:
         # Floor and budget lines name a target; tmp sweep lines name the removed folder.
         folder = event.path if event.cause == "tmp sweep" else str(Path(event.path).parent)
         by_folder.setdefault(folder, []).append(event)
+        for mapping in mappings:
+            if event.cause != "tmp sweep" and any(Path(event.path).is_relative_to(root)
+                    for root in (mapping.target_directory, mapping.build_directory)):
+                by_folder.setdefault(str(mapping.workspace_root), []).append(event)
     previous: dict[str, RebuildStep] = {}
     cold: list[ColdRebuild] = []
     for step in sorted(steps, key=lambda item: item.started_at):
         prior = previous.get(step.workspace)
-        if since <= step.started_at < until and step.crates_compiled >= 50:
+        if since <= step.started_at < until and step.crates_compiled >= cold_crates:
             cause: RebuildCause = "none"
             if prior is not None:
                 candidates = [event for folder in {Path(step.folder), *Path(step.folder).parents,
@@ -3223,13 +4574,15 @@ def rebuild_causes(steps: Sequence[RebuildStep], events: Sequence[SweepRemoval],
 
 
 def rebuilds_main(argv: list[str]) -> int:
+    lint_settings = conf.read("lint")
     if len(argv) != 2 or argv[0] != "--days" or not argv[1].isdigit() or int(argv[1]) <= 0:
         print("usage: sweep.py rebuilds --days N (N must be a positive integer)", file=sys.stderr)
         return 2
     days = int(argv[1])
+    cold_crates = lint_settings.whole("sweep_cold_crates")
     until = time.time()
     since = until - days * DAY_SECONDS
-    root = Path(os.environ.get(BUILDLOG_DIR_ENV) or "~/.local/state/buildlog").expanduser()
+    root = store.root()
     try:
         evidence = read_rebuild_evidence(root)
         steps = evidence.steps
@@ -3238,11 +4591,11 @@ def rebuilds_main(argv: list[str]) -> int:
         journal_since = since
         for step in steps:
             prior = previous.get(step.workspace)
-            if since <= step.started_at < until and step.crates_compiled >= 50 and prior is not None:
+            if since <= step.started_at < until and step.crates_compiled >= cold_crates and prior is not None:
                 journal_since = min(journal_since, prior.ended_at)
             previous[step.workspace] = step
-        events = merge_sweep_removals(read_sweep_journal(journal_since), evidence.trims, read_sweep_removals())
-        cold = rebuild_causes(steps, events, since, until)
+        events = merge_sweep_removals(read_sweep_journal(journal_since, lint_settings=lint_settings), evidence.trims, read_sweep_removals())
+        cold = _rebuild_causes(steps, events, since, until, cold_crates)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"lint sweep: cannot read rebuild evidence: {error}", file=sys.stderr)
         return 2
@@ -3250,7 +4603,7 @@ def rebuilds_main(argv: list[str]) -> int:
     for rebuild in cold:
         key = (clone_kind(rebuild.step.workspace), rebuild.cause)
         totals[key] = totals.get(key, 0.0) + rebuild.step.compile_seconds / 3600
-    print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= 50)")
+    print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= {cold_crates})")
     print("Clone kind | " + " | ".join(REBUILD_CAUSES) + " | total")
     print("--- | " + " | ".join("---:" for _ in range(5)))
     for kind in CLONE_KINDS:
@@ -3266,10 +4619,13 @@ def rebuilds_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    from scripts.lint import tmp_sweep
+
     if argv and argv[0] == "rebuilds":
         return rebuilds_main(argv[1:])
     dry_run = False
     floor_only = False
+    host = ""
     target_dir: str | None = None
     args = iter(argv)
     for arg in args:
@@ -3277,6 +4633,11 @@ def main(argv: list[str]) -> int:
             dry_run = True
         elif arg == FLOOR_ONLY_FLAG:
             floor_only = True
+        elif arg == "--host":
+            host = next(args, "")
+            if host not in ("mac", "natedev"):
+                print("lint sweep: --host must be mac or natedev", file=sys.stderr)
+                return 2
         elif arg == TARGET_DIR_FLAG:
             target_dir = next(args, None)
             if target_dir is None:
@@ -3284,6 +4645,24 @@ def main(argv: list[str]) -> int:
                 return 2
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
+            return 2
+    if host == "mac":
+        if not floor_only:
+            print("lint sweep: --host mac requires --floor-only", file=sys.stderr)
+            return 2
+        try:
+            with conf.diagnostics(report=False):
+                mac_settings = conf.read("mac_test")
+                mirror_root = MacMirrorRoot.read(mac_settings)
+                mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
+                lint_settings = conf.read("lint")
+                timeout = mac_settings.number("probe_timeout_s")
+            with copies.mirror_sweep_leases(mirror_root.local_path()) as protected:
+                with floor_claims.locked_claims(timeout) as claims:
+                    return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
+                                      policy=MacFloor(mac_roots, claims, mirror_root.local_path(), protected))
+        except conf.Unusable as error:
+            print(f"lint sweep: {error}", file=sys.stderr)
             return 2
     config = str(conf.path("lint"))
     try:
@@ -3298,51 +4677,89 @@ def main(argv: list[str]) -> int:
     if floor is None and floor_key is not None:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
-    status = 0 if floor_only else sweep_workspace(target_dir, settings_read, dry_run, recent_minutes)
+    status = 0 if floor_only else sweep_workspace(target_dir, settings_read, dry_run, recent_minutes,
+                                                 lint_settings=settings_read)
     if floor_only:
-        status = tmp_sweep.run_if_due(dry_run) or status
+        status = report_assessment(lambda: tmp_sweep.run_if_due(dry_run, lint_settings=settings_read),
+                                   TemporarySweepFailureScope(), dry_run, settings_read) or status
     if floor is not None:
-        status = hold_floor(floor, dry_run) or status
+        status = hold_floor(floor, dry_run, lint_settings=settings_read) or status
     return status
 
 
-def sweep_workspace(target_dir: str | None, config: str | conf.ConfigRead, dry_run: bool,
-                    recent_minutes: float) -> int:
-    """Sweep target_dir, or the working directory's workspace, to its budget."""
-    budget, source = budget_bytes(dict(os.environ), config, repo_name(os.getcwd()))
-    if budget is None:
-        print(f"lint sweep: {source} must be a non-negative number of GiB", file=sys.stderr)
-        return 2
-    doc_budget = doc_index_bytes()
-    if doc_budget is None:
-        print(f"lint sweep: {DOC_INDEX_ENV} must be a non-negative number of MiB", file=sys.stderr)
-        return 2
-    if target_dir is None:
-        roots = cargo_roots()
-        if not dry_run:
-            for root in roots:
-                try:
-                    Path(root, USE_STAMP).touch()
-                except OSError:
-                    pass
-    else:
-        roots = [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else []
+def report_assessment(run: Callable[[], tmp_sweep.SweepAssessment], scope: SweepFailureScope,
+                      dry_run: bool, lint_settings: conf.ConfigRead) -> int:
+    """Assess one scope and report its failure episode."""
+    from scripts.lint import tmp_sweep
+
+    detail = ""
+    try:
+        assessment = run()
+    except (conf.Unusable, OSError) as error:
+        detail = str(error)
+        print(f"lint sweep: {scope.label}: {error}", file=sys.stderr)
+        assessment = tmp_sweep.CompletedSweepAssessment(1)
+    if not dry_run:
+        notify_floor_problem(assessment, lint_settings=lint_settings, detail=detail, scope=scope)
+    return assessment.status
+
+
+def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
+                    recent_minutes: float, *,
+                    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
+    token = OUTPUT_ROOTS.set(CargoOutputIndex())
+    try:
+        roots = (cargo_roots() if target_dir is None else
+                 [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else [])
+        def assess() -> tmp_sweep.SweepAssessment:
+            if not dry_run and target_dir is None:
+                if OUTPUT_ROOTS.get().workspaces:
+                    save_cargo_output_roots(OUTPUT_ROOTS.get())
+                for root in roots:
+                    try:
+                        Path(root, USE_STAMP).touch()
+                    except OSError:
+                        pass
+            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, lint_settings=lint_settings)
+        return report_assessment(assess, WorkspaceFailureScope(tuple(sorted(roots))), dry_run, lint_settings)
+    finally:
+        OUTPUT_ROOTS.reset(token)
+
+
+def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: bool,
+                    recent_minutes: float, *,
+                    lint_settings: conf.ConfigRead) -> tmp_sweep.SweepAssessment:
+    """Sweep the resolved output roots to their budget."""
+    from scripts.lint import tmp_sweep
+
     if not roots:
         print("lint sweep: no target directory to sweep")
-        return 0
+        return tmp_sweep.SkippedSweepAssessment()
+    budget, source = budget_bytes(dict(os.environ), budget_config, repo_name(os.getcwd()))
+    if budget is None:
+        print(f"lint sweep: {source} must be a non-negative number of GiB", file=sys.stderr)
+        return tmp_sweep.CompletedSweepAssessment(2)
+    doc_budget = doc_index_bytes(lint_settings=lint_settings)
+    if doc_budget is None:
+        print(f"lint sweep: {DOC_INDEX_ENV} must be a non-negative number of MiB", file=sys.stderr)
+        return tmp_sweep.CompletedSweepAssessment(2)
     uses = process_uses(roots)
     if uses:
         root, use = next(iter(uses.items()))
         print(f"lint sweep: pid {use.pid} {use.how}; {root} skipped")
-        return 0
-    trees = [tree for root in roots for tree in build_trees(root)]
-    locks = lock_trees(trees)
+        return tmp_sweep.SkippedSweepAssessment()
+    tree_depth = lint_settings.whole("sweep_max_tree_depth")
+    trees = [tree for root in roots for tree in _build_trees(root, tree_depth, lint_settings=lint_settings)]
+    locks = lock_trees(output_lock_trees(roots, trees))
     if isinstance(locks, TargetLockBusy):
         print(f"lint sweep: a cargo build holds {locks.path}; skipped")
-        return 0
+        return tmp_sweep.SkippedSweepAssessment()
     try:
-        doc_status = prune_doc_index(roots, doc_budget, dry_run)
-        return sweep(roots, trees, budget, source, dry_run, recent_minutes) or doc_status
+        doc_status = prune_doc_index(roots, doc_budget, dry_run, lint_settings=lint_settings)
+        return tmp_sweep.CompletedSweepAssessment(
+            sweep(roots, trees, budget, source, dry_run, recent_minutes, lint_settings=lint_settings) or doc_status)
     finally:
         release(locks.held)
 

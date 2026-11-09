@@ -29,16 +29,19 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
         cargo = self.fixture.bin_directory / "cargo"
         source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 if "fmt" in arguments:
-    record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+    with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["PACKAGE_ROOT"]) / "fmt-state").write_text(record["state"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("new hold")
 ''')
         _ = cargo.write_text(source)
         self.fixture.write_executable(self.fixture.bin_directory / "taplo", '''
-import json
 import os
 from pathlib import Path
-record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.direct.test_verify_step_state import read_step_row
+record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
 (Path(os.environ["PACKAGE_ROOT"]) / "taplo-state").write_text(record["state"])
 ''')
         result = self.run_verify("lint", "sample")

@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** A true count of repair rounds per phase, a study of the phases with the most rounds, and process changes that cut rounds and still deliver the work.
 
-> **Production: sdlc** — unit `fix-rounds-unit`; production doc `docs/plans/sdlc-production.md`
 
 > **Issues:** ~/rust/hanadocs/issues/run command only repairs without a worker.md, ~/rust/hanadocs/issues/route missing criteria after landing.md, ~/rust/hanadocs/issues/route repeated repairs outside kept categories.md, ~/rust/hanadocs/issues/verify phase and activity boundaries.md, ~/rust/hanadocs/issues/preserve accepted behavior in repairs.md
 
@@ -42,7 +41,8 @@ For active process redesigns, as we are currently undergoing with promotions and
 - **Measured facts (2026-10-20, `history.py phases --since 60d --sort fix_passes --status all`):** 2,896 fix passes over 839 phases, but only 1,621 ledger rounds (`finding_batch_dispatched`). Fix time is 41% of all agent time; 188 phases (11%) with ≥4 fix passes hold 75% of fix time. The top record, run `189487ea` phase `6` ("Palette rows highlight the matched letters", rich-text-plan), shows 70 fix passes and 2 ledger rounds over 8 days. Its pass activities name Phases 7 and 14 and merge work, so the record holds work from several phases. A fix-pass count is therefore not a repair-round count, and a `(run, phase)` record is not always one phase.
 - **Test lanes:** `scripts/history/` — `test_*.py` beside the module (none yet; Phase 1 adds `test_rounds.py`); markdown files — none.
 - **Build:** none (Python and markdown).
-- **Test:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` from the worktree root. Then the merge gate from the worktree root: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`.
+- **Test:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` from the worktree root.
+  Then run the targeted test from the worktree root: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .`.
 - **Lint:** `basedpyright scripts/history` from the worktree root; pass is its `0 errors, 0 warnings` line (exit status says nothing).
 - **Invariants:**
   - `/history` reads only; it never writes a run record (`commands/history.md`, repository rule).
@@ -200,40 +200,21 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:** A Python 3.10 interpreter cannot run `findings.py` or `progress_history.py`; `lib/py` skips it. A cache file under the old `python3-3.10` key is not read.
 
-### Phase 7 — Did the changes cut rounds and keep the work  · status: todo
-**Depends on:** Phase 5, Phase 6 (it redefines the `history.py rounds` medians and shares)
-**Blocked by:** for each adopted proposal, 30 completed, non-mixed exposed phases that started after the time Phase 5 records, zero-repair phases included, with exposure as that proposal's **Measure** defines it.
+### Phase 7 — Did the changes cut rounds and keep the work  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `docs/plans/sdlc-fix-rounds-study.md` ends with a before-and-after table per adopted change, a verdict on each, and any revert sent to the user as a question.
+- `docs/plans/sdlc-fix-rounds-study.md` opens with `Changes took effect: 56b8f93be… on main, 2026-10-28T21:26:05-04:00`, the first `~/.claude` main update that contains the Phase 5 checkpoint (C1, from the main reflog).
+- `## Effect` holds the boundary, the window selection, the exposure table, the P4 launch audit, the review rows, the routed-work closure and the questions. Every number names C1 or C2. C2 is a read-only Python command in `### Reproduce C2`; it reads run records through a fixed upper bound (2026-11-09T03:32:17+00:00) and prints a digest of its input.
+- Verdicts: P1, P2, P4 and P5 inconclusive; P3 not ready. Both review windows are under 12 usable rows (9 before, 6 after), the before exposure cohorts and the hand root counts are not rebuilt, and the acceptance audit of routed closures is not complete. No change failed, so no question went to the user.
+- P3 exposure counts distinct started ledger batches before each exposure; the recorded round number overstates it. 18 of 57 completed declarations qualify.
+- By showrunner order (2026-11-08), a proposal under 30 exposed phases is recorded "not ready" and is not judged; the phase does not stop for it.
+- The second count came from a separate read-only Codex thread inside the study worker, not a `test` slot: the Codex launcher could not start a further worker that night.
 
-**Spec:**
-- First add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <Phase 5 checkpoint hash> on main, <YYYY-MM-DDTHH:MM:SS±HH:MM>`, the time that checkpoint reached `~/.claude` main (the first main commit that contains it), with its offset. A bare date reads as local midnight in `rounds.run` and can take in work from before the change. Every window below counts from that time.
-- Before window: the 30 days that end just before the time Phase 5 records. After window: from that time to the run. The windows do not overlap; a phase that started before the time and ended after it is listed apart and not judged.
-- **Fewer rounds:** from `history.py rounds`: median rounds per phase, share of phases with ≥3 rounds, share of fix time those hold, rounds past the hard landing, and rounds by root cause class for the causes each change targets.
-- **Work kept:** follow-up phases written after a landing and how many reached `done` (plan docs under each production's units); merge design-check defects per phase and holds per phase from `review_regime.py report` on rows in each window; findings routed to other units and whether their phases ran.
-- A change passes when its round measure meets the target Phase 4 set and no work-kept measure is worse by more than its stated margin. A change that fails goes to the user as a question through the showrunner: keep, change, or revert, with the numbers and the one recommended.
-- State the sample sizes beside every number. Each window needs at least 20 completed phases, 10 exposed phases and 12 merge design-check rows that are not excluded; a window under any minimum is reported, not judged.
-- Apply `### Evaluation shared by all five questions` and each adopted proposal's **Measure** in `## Proposals` of the study as written: exposure decided before the treated step runs, zero-repair exposed phases kept, the work-kept margins, combined parent-plus-follow-up rounds and agent-seconds, moved seconds apart from saved seconds, closure of each follow-up due in the window, and defects that reach the user or merge. Missing evidence or unfinished due work gives `inconclusive`, never a pass. When adopted changes cannot be separated, each one's attribution is `inconclusive`.
-- When P4 is adopted, its accuracy target is not read from `history.py rounds` alone: `load_phases` drops a launch with no recorded `phase_started`, and the `mixed` check cannot prove each launch's phase. Reconcile launch evidence with phase boundaries and recorded activities, list each missing or wrong association, and count it against the target.
-
-- Proposal statistics come from the explicitly selected exposed rows of each proposal, unreviewed zero-repair exposures included; never from the reviewed-only `_meta` statistics of `history.py rounds`.
-- P4 accuracy judges three records apart: `launch_refused`, UX `launch_checked` and `pass_started.launch_check`, including refusals with no phase instance. A correct refusal of a stale or missing-phase request counts as a success. A false refusal, or a launch associated with the wrong phase, counts against the target. The `test` slot checks one case of each.
-- Routed-work closure: the recount checks an open route, a valid cross-run closure, a closure with a wrong key, and a closure event with no acceptance evidence (commit, test result or review). The last one is `inconclusive`, never closed.
-- Root counts use the Phase 2 study method by hand, one evidence line per round, with the second writer recounting each window on its own; `history.py rounds` gives only the Phase 1 causes.
-- Review rows come from `review_regime.py`'s shared row reader with both window bounds applied in the study's extraction, not from `report`'s fixed regimes; state the boundary field, the excluded rows and each window's sample size. Bound review rows on `merged`. Before any total, sort each `Row` as usable, excluded or insufficient evidence: an absent plan identity, review minutes or repair minutes is not a measured zero, and a required field that is absent blocks a pass instead of making the sample smaller.
-- The readiness count takes phases from `history.py rounds --since <time> --status all --format json --top 100000` with a `check` of `ok`, a start at or after the time, and exposure as each proposal's **Measure** defines it, zero rounds included; open and mixed phases are listed apart and not judged.
 **Files:**
-- `docs/plans/sdlc-fix-rounds-study.md` — `## Effect`.
+- `docs/plans/sdlc-fix-rounds-study.md` — the head line and `## Effect`.
 
-**Workers:** `2 writers`
-- `impl` — `docs/plans/sdlc-fix-rounds-study.md`: the effect tables and verdicts.
-- `test` — opens as `impl`, writes no repository file: recounts on its own the roots, exposure, routing, follow-up closure evidence and each number taken from a command, and sends `impl` each one that differs.
-
-**Constraints from prior phases:** set at Phase 5's checkpoint.
-
-**Acceptance gate:** every number in `## Effect` names the command that produced it and matches a rerun; the test recount agrees with each root, exposure and closure call; each window meets the sample minimums or is marked reported, not judged; each adopted change has a verdict of pass, fail or inconclusive; each failed change's question is sent to the showrunner.
+**Gotchas:** Review rows can be written after their `merged` time, so a C2 rerun can add rows to a window; the run records do not change under the fixed upper bound.
 
 ### Phase 8 — Ad hoc review commands review in the invoking session  · status: done
 
@@ -248,3 +229,213 @@ The user, 2026-11-02 19:4x EST, relayed by the sdlc showrunner, on `/module_revi
 - `scripts/agents/agent_exec.sh` and the phase review path did not change.
 
 **Files:** the three commands; `commands/agent.md`; `config/agents.conf`; `docs/as-built/agent-registry.md`; `docs/direct_footprint_review.md`; `scripts/agents/agent_admin.sh`; `scripts/direct/test_phase_process.py`; `scripts/lib/test_agents_registry.conf`, `scripts/lib/test_agents_registry_fixture.py`; `scripts/whoami/quota_alert_test_support.py` and ten `scripts/whoami/test_*` files.
+
+### Phase 9 — `/showrunner:units` shows only units, with a status column and anomaly lines  · status: done
+
+The user, 2026-11-05, relayed by hana and the sdlc showrunner: "we should show the units for a producer - we shouldn't show anything else but the anomalies sould show because they are not accounted for either in the script (like morty - which should be accounted for and not shown) or if there ar orphan units they are indicators of a bug or an actual orphan and need to be addressed" (allow-banned: user quote). And: "you need to show a status column for a unit as to whether it is paused or active - that should be added to the command also".
+
+#### Work Order
+
+Design from the sdlc showrunner:
+
+1. The table shows only the production's staff units. Every process that `unit_phases.py` cannot place is an anomaly line under the table, on stdout. Today these lines go to stderr from `scripts/production/session_staff.py:665`, above the table. When a run has anomaly lines, the script sends one message per run with those lines through `send.py --to <target>`. The target is `sdlc`, read from a key in `config/production.conf`.
+2. Morty is placed and is not an anomaly. Match its Codex thread with `MORTY_NATIVE_ID` in `config/send.conf`, the value that `send.py` uses for `Authority: morty`. Read the value from that config. Do not copy it. A Codex process that is not Morty stays an anomaly.
+3. The tables get a Status column, `paused` or `active`, in the plain table and the style table. The pause record is one field on the staff row: `paused = {since, by, why}`. No field means active. There is no new store.
+4. One command sets and clears the field, in the existing staff command:
+   - `staff.py pause <unit> --why "<why>"`
+   - `staff.py pause --production <slug> [--except <unit>...] --why "<why>"`
+   - `staff.py resume <unit>`
+   - `staff.py resume --production <slug>`
+5. A pause is a record only. It stops nothing. A rerun of pause or resume succeeds.
+6. Add no other check.
+
+**Files:** `scripts/production/unit_phases.py`, `live_units.py`, `session_staff.py`, `staff_sources.py`, `unit_lookup.py`, `display_cells.py`, `style_units.py`, `staff.py`; `config/production.conf`; `commands/showrunner/units.md`; `docs/as-built/staff-accessors.md`, `docs/as-built/showrunner-automation.md`; and their test files.
+
+**Workers:** `2 writers`
+- `impl` — the source, config and doc files.
+- `test` — the test files, written at the same time, with the callers' existing tests in each edit round.
+
+**Acceptance gate:** on the live sdlc production, `unit_phases.py --production docs/plans/sdlc-production.md` prints a table with a Status column; no Morty line; each other unplaced process as an `anomaly:` line under the table; and one message reaches sdlc with those lines. `staff.py pause` then `resume` on a live unit changes its Status cell and back. Named tests pass for: Morty placed, another Codex process unplaced, one send per run, no send with no lines, a send failure leaves the table and exit code unchanged, and each pause and resume form.
+
+### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: done
+
+From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-retire`. Add no new check.
+
+- `codex_mesh end` stops the run's servers before `staff.retire`, so a retire fault can never leave a server running.
+- `_release_source_servers` and `stop_worker_for_switch` lose their refusals. A release prints one `anomaly:` line for an invalid record or a server that fails to answer, and goes on.
+- One case still refuses, by sdlc ruling: a thread loaded on a server that answers with an unknown stop state. A changed source identity prints one anomaly line, signals nothing and goes on.
+- `staff.retire` is out of scope: hierarchies `9772f7357` deletes its refusals.
+- After this hash and `9772f7357` are on main, retire every astra-reviewer row with no live process and report the count.
+
+Landed on main in 9aa3b5526 (2fc784207), folded into the fix-rounds branch. devtools 8l keeps the staff row at `codex_mesh end`, so end stops the last worker's server and does not call `staff.retire`. The sweep on 2026-11-07 retired all 24 astra-reviewer rows through `staff.py retire`; none had a live process.
+
+### Phase 9s — A fix records its repair round in the Codex launch path  · status: done
+
+From the sdlc showrunner, 2026-11-05. Dropped on 2026-11-06: hash `50bfbdcf6` does not merge.
+
+Devtools 3y `finish_repair` in `scripts/direct/assign.py` resolves the round: `landed` on a clean exit, `abandon --edits-landed` on an error. The fix call in `commands/unit/direct.md` sets `UNIT_RESOLVES_ROUND=1`, so a director passes that prefix on each repair round.
+
+### Phase 9w — The units table prints an anomaly only for a fault someone must act on  · status: done
+
+From the user's C1156 verdict and the sdlc showrunner, 2026-11-06. All 18 anomaly lines in the user's screenshot were false: a test's fake codex with an inherited pane id, three staff workers read as not staff, and one session with no staff row. Remove the process scan from the table, remove the lines for a process with no staff row, stop placing a process under a unit by its pane alone when its id has no staff row, print each process once, and run the test's fake without the pane variables. If another caller uses the lookup that calls a staff worker not staff, fix it; otherwise delete the dead path. The user approved one new check: an --except value that matches no unit of the production refuses the pause, changes nothing, and names the bad value.
+
+### Phase 9v — A production pause keeps each unit named in --except  · status: done
+
+From the sdlc showrunner, 2026-11-06. `staff.py pause --production hana --except fastest-unit` paused every unit, because the exception compares only the row name and id. Resolve each value through the one unit lookup: the name, the -unit form and the id all match. Add a test for each form. One matcher, unit_match, limited to the production's own members. The user approved a refusal for an unmatched value on 2026-11-06; Phase 9w carries it.
+
+### Phase 9u — The units hash merges with the staff-name change on sdlc  · status: done
+
+From the sdlc showrunner, 2026-11-06. Devtools 7u replaced the production slug with the showrunner's staff name. Merge sdlc into this branch. Keep that name, and keep the Status column, pause records and anomaly lines from Phase 9. Add no new check.
+
+### Phase 9t — A commit that exists is not reported as failed  · status: done
+
+From the sdlc showrunner, 2026-11-06, rca 261106-1. Separate hash, on branch `sdlc-fix-rounds-publish`, from sdlc. Add no new check.
+
+`scripts/lib/main_publish.commit` runs `git commit --only`. A stale `.git/MERGE_RR.lock` made git exit nonzero after it wrote the commit, because rerere runs after the commit. `commit` took that as no commit, restored the old file text and said the value was unchanged. HEAD held `SIMPLIFY_LENS=off`, the live file said on, the commit was not pushed, and every main promotion refused. The fix compares HEAD before and after: when HEAD moved, the commit exists, so the new file stays and the push goes on.
+
+### Phase 9x — A push that cannot merge origin/main leaves the checkout as it was  · status: done
+
+From the sdlc showrunner, 2026-11-06: "merge_checkpoint.py at push merged origin/main into sdlc, hit a conflict in 3 files, and left the showrunner checkout mid-merge. It must abort the merge on a conflict, leave the checkout as it was, and print a held line that names the files."
+
+Cause: `push_git` aborts its origin/main merge only when `may_undo` is true. `refresh_pushed_tip` calls it with false, so a conflict leaves the merge in place. The merge is `push_git`'s own step, so `push_git` aborts it on every failure, then holds with the conflicted paths.
+
+The `--from-child` handler in `main` reports a held Stop as it reports a cancelled one: the held line, the files and the recovery message. Held returns 1; cancelled keeps 77.
+
+### Phase 9y — The review trial line counts the findings in the ledger  · status: done
+
+From the sdlc showrunner, 2026-11-06: "unit-board's review trial recorder printed code 4 findings, but its ledger holds 1 (F001)... The count must come from the findings ledger." In this unit the recorder printed code 4 for 9x, whose ledger holds 2, and code 5 for 9w, whose ledger holds 6. Count the code findings from the phase's findings ledger. Add no new check.
+
+`review-trial` reads the selected instance's ledger file through `findings.read_phase_ledger`. The UX and code counts and the UX repair rounds come from that ledger, so a routed or closed finding counts, and a closure reply adds none.
+
+### Phase 9z — The launcher sees the end of a worker that read a passed run  · status: done
+
+From the sdlc showrunner, 2026-11-06. Codex worker merge16 (verify-unit) stopped with no event after it read a passed run, twice (14:59 and 16:35 EST). Its launcher stayed attached for 62 and 19 minutes. An interrupt ended the wait in seconds. Find why the launcher does not see the worker's end, and fix the cause where it lives. Add no new check.
+
+Cause: the worker's turn never ended. Each stall began at an `rm -f` of a run log, which Codex holds for approval under `on-request`. merge16's turns all ran `on-request`: `_start_turn` named `sandboxPolicy` on each turn but no `approvalPolicy`, and the server keeps a thread's last turn policy. The launcher does not answer server requests, so the approval waited until an interrupt. `_start_turn` now names `approvalPolicy: never` on every turn. sdlc kept the fix to `_start_turn`.
+
+### Phase 10 — A relaunch of the same work adds no repair round  · status: done
+
+From the sdlc showrunner, 2026-11-06. In cargo-liner, a worker relaunch after a launcher fault counted as repair rounds: the ledger showed 4 rounds for 1 repair and asked for two extra Astra reviews. direct.md says: "Count one repair round per ledger batch with a started fix pass. Relaunches of that batch add no round." This unit shows the same defect: phase 9x had 2 ledger batches, and its Astra record says repair round 4. Add no new check.
+
+Cause: `findings._repair_round` counted every group from `history/rounds.phase_rounds`. A fix pass with no ledger batch (a gate run sent as a fix, a relaunch with no ledger number, a follow-up) makes its own group, so it added a round. It now counts the distinct ledger batch numbers that the groups hold, less the refunded batches that never land. One batch split across two groups counts once. `phase_rounds` and `history.py rounds` keep the other groups.
+
+### Phase 10a — Branch tests stay green on the merge with sdlc  · status: done
+
+From the sdlc merge gate, 2026-11-07. Hash 2b1b216e7 merged into sdlc a8123acd4 turned two tests red, in the batch and alone. Both pass on a8123acd4 without this branch.
+
+1. `shutdown/test_restart.py` `test_live_rows_scans_codex_once_for_members_and_unassigned_candidates` reads a live Codex id into its anomaly list.
+2. `ask_a_friend/test_end_friend.py` `test_a_staff_retirement_refusal_still_stops_the_consultation_server`: the consultation server survives the retirement refusal.
+
+The branch changes neither folder. The cause is a shared path the branch changes: the Codex process scan in `staff_sources.py` or the retire path. Tests must not read live units.
+
+Cause: neither test failure came from this branch. `test_restart` read the live Astra root, because its fixture patched `unit_runs.run_roots` but not `unit_runs.ASTRA_RUN_ROOT`. Under load, `codex_mesh._reap` returned success while a zombie child app-server was not yet waitable, so end-friend left the consultation server alive. The fixture now patches the Astra root, and only `waitpid` confirms a child exit.
+
+The phase also folds retire-servers `7c0e6596f` (Phase 9r) into this branch. devtools 8l keeps the staff row at `codex_mesh end`, so the merge keeps the last-worker server reap and drops the retire call. The reap now also runs when an end of the last worker fails after it publishes `ended`. `scripts/message/morty_identity.py` holds the `MORTY_NATIVE_ID` rule for `send` and `session_staff`, which breaks the send → roster → session_staff → send import cycle.
+
+### Phase 10b — Git proves that a shrink's code checkpoint merged  · status: done
+
+From the sdlc showrunner, 2026-11-07. `merge_checkpoint.ancestry` holds a shrink unless `merged_checkpoints` finds a `progress_history` checkpoint event for the phase. Today it held two shrinks whose code checkpoint was on sdlc:
+
+1. shutdown resume-codex-by-name: the phase ran on another branch, so its event names another worktree.
+2. herdr 21: the code checkpoint is the top hash, and it has no event.
+
+Git proves the merge. A shrink passes when its parent commit is an ancestor of the merge branch. This path no longer reads events. Add no new check. Add one test for each case.
+
+As built: `ancestry` holds a shrink or as-built commit only when `git rev-list --no-merges <merge_branch>..<commit>^` prints a commit. The literal rule (the parent is an ancestor) holds a shrink for good after a unit-side merge of the merge branch, because that merge commit never reaches the merge branch. `test_shrink_after_criss_cross_merge_scopes_only_its_doc` covers that case. `merged_checkpoints` stays for its other callers.
+
+### Phase 10c — `/unit:direct` loads a core and reads other sections when they apply  · status: done
+
+From the user, through accounts and the sdlc showrunner, 2026-11-07 15:10 EST: "tell sdlc to cut direct.md down to the core so that it loads other instructions as it needs them". A director reads `commands/unit/direct.md` (116 KB, about 29k tokens) again after each compaction. A core of 30-40 KB saves about 20k tokens per cycle.
+
+1. Keep in the core only what every run needs. Move each section that only one mode or one moment needs to its own file under `docs/direct/`. Use the existing `<TagReferenceContract/>` stub pattern: a table row and a stub that names the file and the moment to read it.
+2. Move text; do not copy it. Each rule stays in one place.
+3. The compaction hooks and `<CompactionContract/>` name the core and the stub files that a live moment needs.
+4. herdr edits `direct.md` after this phase lands. herdr moves its later edits into the new layout.
+
+The moved groups:
+
+| New file | Sections | Read when |
+| --- | --- | --- |
+| `repair_rounds.md` | FindingsLedger, PassOwnership, Synthesize, FixDispatch | a review, gate or verification result returns; before each repair dispatch |
+| `early_review.md` | EarlyReviewArm | at each implementation or fix dispatch |
+| `phase_reservation.md` | PhaseReservationContract, RetainPhaseReservation, CoordinatePhaseReservation | at phase start, at checkpoint release, and after compaction with a live reservation |
+| `verification.md` | VerificationContract, VerificationNarration | before a verification run |
+| `ux_review.md` | UXReview, RunApplicationSmokeTest | when a phase has a UX review or an application smoke test |
+| `launch_failure.md` | WorkerLaunchFailure | when a dispatch fails |
+| `authorization.md` | AuthorizationContract | when an action needs user authorization |
+| `held_astra_roles.md` | HeldAstraRoles | when the run holds an Astra role |
+| `standing_plan_refill.md` | StandingPlanRefill | when the plan header carries `**Standing:**` |
+| `berth_decisions.md` | BerthDecisions | when a cargo-berth decision applies |
+| `codex_dispatch_wait.md` | CodexDispatchWait | when the director is Codex |
+| `final_gate_commit.md` (exists) | FinalGate, RunSummary | at the final gate |
+
+As built: the core is 45 KB, not 30-40 KB. The five largest core sections are needed by every run, so they stay. Each moved group has one stub and one `<TagReferenceContract/>` row, so `_contract_revision` and `tag_inventory.py` cover every new file. After compaction, the hooks say to read the core in full, then each stub file whose moment is live.
+
+### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: done
+**Depends on:** Phase 10c
+
+From the sdlc showrunner, 2026-11-07, a defect from builds. When builds merges main, `merge_checkpoint` adds a row for every Change-Review line in the merged commits, with builds as Producer. So rows C1179-C1183 (merge 429d1528) show the builds session, and the user asks builds about sdlc work.
+
+Fix where the rows are made:
+1. A merge adds rows only for its own production's checkpoints.
+2. Each row's Producer is the unit that made the checkpoint.
+3. Each row's Production cell is the fixed staff id of the showrunner whose production made the checkpoint.
+
+The user, through builds and sdlc, 2026-11-07: "shutdown was part of sdlc not natedev - it got renamed but whatever - the fix needs to keep changes in the production that made them based on the id of the showruner for that production". So a merged row's Production cell is the fixed staff id of the showrunner whose production made the checkpoint, not the production that merges it. Example: shutdown's 9e8e10895 (subject natedev-shutdown), rows C1195-C1197, landed in builds; they belong to sdlc.
+
+Add no new check.
+
+As built: `change_review.list_ready` reads only the merges whose subject ends ` into <merge branch>`, so a foreign merge that a fast-forward brings in adds no row. It skips each commit already on the origin merge branch of a production outside this one's scope (`reviewed_merge_refs`); for such a branch that later took in the merge, `_publication_exclusions` skips only the history it had before, so a rescan or a held-step release gives the same rows. The Producer is the unit the checkpoint branch resolves to; the requesting unit's id applies when the branch resolves to it or to no unit. The Production cell is the fixed staff id of the producing unit's showrunner. `foreign_units` is gone. `merge_gate.py --promote-only` locks and scans the promoted main repository, not the working directory it runs from.
+
+### Phase 10e — Two test rules in the direct contract  · status: done
+**Depends on:** Phase 10c (it moves FixDispatch)
+
+From the user, through natest and the sdlc showrunner, 2026-11-07 (the user's words: "do rules 1 and 2"). The suite grew from 263 tests (Oct 1) to 18,879 (Nov 7), with one narrow test for each review finding.
+
+1. A fix adds its case to the existing test of the same behavior (a table row), not a new test method. Add a new test only when no test covers the behavior.
+2. Write or keep a rare-case test (an edge case, a refusal, malformed input, a failure path) only when its defect would show the user a wrong result, damage saved state (a file, Git, a ledger, staff, a config), or lose work (a commit, an edit, a message, a worker result). Every main-path test stays.
+
+Places: the FixDispatch regression-test sentence ("writes, for each testable finding, the regression test that would have caught it"), the test rules line in `write_prompt_contract.md`, and the test worker prompt. Each rule has one place; the other places point to it. This phase is doc-only.
+
+As built: both rules are in `docs/direct/write_prompt_contract.md` item 6, which implementation, fix and test prompts carry verbatim. FixDispatch, the main-read closure check and `<ClosureReview/>` ask for coverage under item 6, not one new regression test for each finding. The test worker paragraph points to item 6.
+
+### Phase 10f — A checkpoint named for its plan without "-plan" gets its Producer  · status: done
+**Depends on:** Phase 10d
+
+From hana's showrunner, through sdlc, 2026-11-07. `change_review.py list-ready` printed `no staff row for unit info-panels; Producer stays empty` for demo's rows. demo's plan is `docs/hana/info-panels-plan.md`, its branch is `tool-based-ui-demo-36`, and it commits `checkpoint(info-panels): …`. The checkpoint aliases hold the plan stem (`info-panels-plan`), not the stem without `-plan`. Hana's main uses both forms for one plan: `info-panels-plan` and `info-panels`, `widget-enhancements-plan` and `widget-enhancements`.
+
+Fix: the checkpoint aliases of a unit also hold its plan stem without a trailing `-plan`. Add no new check.
+
+As built: `_branches_from_units` adds `plan.removesuffix("-plan")` right after the plan stem, so `checkpoint(info-panels)` resolves to demo.
+
+### Phase 10g — A merge made on a local merge-gate branch adds its change rows  · status: done
+
+**Depends on:** Phase 10d.
+
+From hana's showrunner, through sdlc, 2026-11-08 [954e2ae6]. After two main promotions, `change_review.py list-ready --repo ~/rust/hana_catalyst --production hana` added no row. It missed three Change-Review lines in b7c17741de (merged as 5c444e5b40) and one in f75b3adb07 (merged as afdb0012db). hana added them by hand as C294-C297.
+
+Cause: Phase 10d keeps only a merge whose subject ends ` into <merge branch>`. hana's merge branch is `init/catalyst`, but its merge-gate unit merges on a local branch, so every hana merge subject ends ` into tool-based-ui-merge-gate`. All 33 hana merges since 2026-11-06 fail that test.
+
+Fix: skip a merge only when its subject ends ` into <B>`, where `origin/<B>` is the merge branch of a production outside this scan (the refs `reviewed_merge_refs` already gives). Keep every other merge. The rows hana added by hand must not come again. Add no new check.
+
+As built: `list_ready` skips a merge only when its subject ends ` into <B>` for a branch `origin/<B>` in `outside_refs`. A scan of a copy of hana's list without C294-C297 adds those four rows with demo as Producer; with them, it adds none.
+
+### Phase 10h — A merge finishes when the Mac is offline, and the Mac pulls later  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-08 [f15c6428], urgent. `merge_checkpoint.pull_mac_checkout` raises `Stop` when ssh cannot reach the Mac. The builds chain (17 merges) held from 13:43: builds 84 pushed and promoted on natedev, then `promote: failed - mac ~/.claude: connection timed out`, and a rerun failed again.
+
+Fix: when ssh cannot reach the Mac, queue one pull-only Mac pull with the existing `main_publish` queue (the record `/zone` and `/tune` already use), report `promote ok: mac unreachable, pull pending`, and let the merge finish. The next promotion that reaches the Mac pulls once (a fast-forward carries every commit) and clears that record. A Mac that answers but whose pull fails still stops, as now. `tune.py` and the promotion share one queue-and-clear helper in `main_publish`. Add no other check.
+
+As built: `pull_mac_checkout` returns `main_publish.MacPulled` or `MacPullPending`. After its last try, ssh exit 255 with no `rc=` line queues a pull-only record through `main_publish.queue_pull_only`; any other failure still raises `Stop`. A pull clears a pull-only record with `main_publish.clear_pull_only`, and `tune.py` uses the same two helpers. Both promotion paths report `mac unreachable, pull pending: <path>` and go on; `finish_promotion_targets` then skips the zone send and the Mac notice.
+
+### Phase 10i — An as-built commit that deletes its plan passes the scope check  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-08 [be8c1303]. `merge_checkpoint._unit_paths` keeps a path only when its content at the checkpoint differs from every origin merge base. The origin/natedev base ea75bef84 never had `docs/plans/models-pane-thread-link.md`. The models as-built commit cc9634bef deletes that file, so the path is absent at the base and at the commit, and reads as no change. The scope check then drops the plan's deletion and holds a correct as-built commit.
+
+Fix: a path that is absent at an origin merge base did not come from that origin, so that base does not drop it. A path that the base has, and that the commit has with the same content, still came from that origin. Add one row to the existing scope tests in `scripts/production/test_merge_checkpoint.py`: an as-built commit deletes its plan while an origin merge base never had the plan, and the scope check passes. Add no other check.
+
+As built: `_unit_paths` reads, per origin merge ref, the paths the merge base has (`git ls-tree -r`) and the paths the diff to the commit names. It drops only a path that the base has and the diff does not name. A path that the base lacks stays in scope. `test_scope_keeps_deleted_plan_absent_at_an_origin_merge_base` lands an as-built commit that deletes `docs/plans/alpha.md` while the other production's merge base never had it.

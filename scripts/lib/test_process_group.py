@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.lib import process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment
 
 
 def shell_group_kills(line: str) -> bool:
@@ -184,13 +185,15 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(directory)
         scripts = Path(__file__).resolve().parents[1]
-        for name in ("direct/board.sh", "direct/verify.sh", "lib/py", "lib/process_group.py"):
+        for name in ("direct/board.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
+                     "lib/process_start.py", "lib/conf.sh", "lib/conf.py"):
             destination = self.root / "scripts" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(scripts / name, destination)
         home = self.root / "home"
         home.mkdir()
-        self.environment = {**os.environ, "HOME": str(home), "CLAUDE_PYTHON": sys.executable,
+        self.environment = {**os.environ, **config_environment(self.root / "config"),
+                            "HOME": str(home), "CLAUDE_PYTHON": sys.executable,
                             "XDG_CACHE_HOME": str(self.root / "cache"),
                             "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
 

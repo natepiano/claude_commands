@@ -1,16 +1,30 @@
-# Live configuration reader for bash 3.2. No process runs on a valid integer/text read.
-case "${BASH_SOURCE[0]}" in
-    */*) _CONF_READER="${BASH_SOURCE[0]%/*}/conf.py" ;;
-    *) _CONF_READER="./conf.py" ;;
+# Live configuration reader for bash 3.2 and zsh. Valid integer and text reads use builtins.
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    _CONF_SOURCE="${(%):-%x}"
+else
+    _CONF_SOURCE="${BASH_SOURCE[0]}"
+fi
+case "$_CONF_SOURCE" in
+    */*) _CONF_LIB="${_CONF_SOURCE%/*}" ;;
+    *) _CONF_LIB="." ;;
 esac
+unset _CONF_SOURCE
+if [[ -r /proc/sys/kernel/hostname ]]; then
+    IFS= read -r _CONF_HOST < /proc/sys/kernel/hostname
+else
+    _CONF_HOST="$(uname -n)"
+fi
+_CONF_HOST="${_CONF_HOST%%.*}"
 
 conf_value() {
     local file="$1" key="$2" folder="${CONF_DIR:-$HOME/.claude/config}"
-    local host="${HOSTNAME%%.*}" raw line name value previous="" limit=""
+    local raw line name value previous="" limit=""
     local base="" base_limit="" host_value="" host_limit="" base_seen=0 host_seen=0 found=0
     local low high choices choice numeric valid=1
     if [[ -r "$folder/$file.conf" ]]; then
         while IFS= read -r raw || [[ -n "$raw" ]]; do
+            raw="${raw%$'\r'}"
+            if [[ "$raw" == *$'\r'* ]]; then valid=0; break; fi
             line="${raw%%#*}"
             line="${line#"${line%%[![:space:]]*}"}"
             line="${line%"${line##*[![:space:]]}"}"
@@ -19,7 +33,7 @@ conf_value() {
                 value="${line#*=}"; value="${value#"${value%%[![:space:]]*}"}"
                 if [[ "$name" == "$key" && "$base_seen" == 0 ]]; then
                     base="$value"; base_limit="$previous"; base_seen=1
-                elif [[ "$name" == "$key.$host" && "$host_seen" == 0 ]]; then
+                elif [[ "$name" == "$key.$_CONF_HOST" && "$host_seen" == 0 ]]; then
                     host_value="$value"; host_limit="$previous"; host_seen=1
                 fi
             fi
@@ -31,7 +45,7 @@ conf_value() {
     elif [[ "$base_seen" == 1 ]]; then
         value="$base"; limit="$base_limit"; found=1
     fi
-    if [[ "$found" == 0 || -z "$value" ]]; then valid=0
+    if [[ "$valid" == 0 || "$found" == 0 || -z "$value" ]]; then valid=0
     elif [[ "$limit" == '# one of:'* ]]; then
         choices="${limit#\# one of:}"; valid=0
         while :; do
@@ -67,6 +81,6 @@ conf_value() {
         fi
     fi
     if [[ "$valid" == 1 ]]; then printf '%s\n' "$value"
-    else python3 "$_CONF_READER" get "$file" "$key"
+    else "$_CONF_LIB/py" "$_CONF_LIB/conf.py" get "$file" "$key"
     fi
 }

@@ -53,6 +53,19 @@ def copy_folder(path: Path) -> Path | None:
     return None
 
 
+def record_path(folder: Path) -> Path | None:
+    """Find the record for a standing copy or a task clone."""
+    folder = folder.resolve()
+    if copy_folder(folder) == folder:
+        return folder / RECORD
+    if folder.name == "checkout" and folder.parent.parent == root().resolve():
+        path = folder.parent / RECORD
+        record = read_record(path)
+        if isinstance(record, Registered) and record.fields.get("test_hana_clone") is True:
+            return path
+    return None
+
+
 def read_record(path: Path) -> Registered | NotRegistered | UnreadableRecord:
     try:
         raw = cast(object, json.loads(path.read_text(encoding="utf-8")))

@@ -11,30 +11,41 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import working_set
+from scripts.build_targets import working_set
+from scripts.production import session_staff, staff
+from scripts.shutdown import remote
 
 
 class WorkingSetTests(unittest.TestCase):
     root: Path = Path()
     proc: Path = Path()
+    rows: list[staff.StaffRow]
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.rows = []
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.proc = self.root / "proc"
         self.proc.mkdir()
+        _ = self.enterContext(mock.patch.object(remote, "local_machine", return_value="natedev"))
         _ = (self.proc / "meminfo").write_text(
             "MemTotal:       16777216 kB\nMemFree:         1048576 kB\n"
             + "MemAvailable:   6291456 kB\nSwapTotal:      4194304 kB\nSwapFree:       3145728 kB\n"
         )
 
     def process(self, pid: int, argv: list[str], pss_kib: int, swap_kib: int = 0,
-                *, cwd: str = "/home/test/.claude") -> Path:
+                *, cwd: str = "/home/test/.claude", owner: str = "") -> Path:
+        if owner and not any(row.name == owner for row in self.rows):
+            self.rows.append(staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
+                current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", Path(cwd))))
         process = self.proc / str(pid)
         process.mkdir()
         _ = (process / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
@@ -51,7 +62,7 @@ class WorkingSetTests(unittest.TestCase):
         (process / "cwd").symlink_to(cwd)
         return process
 
-    def report(self) -> working_set.WorkingSet:
+    def report(self, staff_error: OSError | None = None) -> working_set.WorkingSet:
         original_open = cast(Callable[..., object], builtins.open)
         original_io_open = cast(Callable[..., object], io.open)
         original_scandir = cast(Callable[..., object], os.scandir)
@@ -75,11 +86,14 @@ class WorkingSetTests(unittest.TestCase):
             check_path(path)
             return original_scandir(path)
 
-        with (mock.patch.object(builtins, "open", side_effect=checked_open),
+        with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(tuple(self.rows)), side_effect=staff_error) as snapshot,
+              mock.patch.object(builtins, "open", side_effect=checked_open),
               mock.patch.object(io, "open", side_effect=checked_io_open),
               mock.patch.object(os, "scandir", side_effect=checked_scandir),
               mock.patch.object(subprocess, "run", side_effect=AssertionError("Report must read the fixture directly"))):
-            return working_set.collect(self.proc)
+            result = working_set.collect(self.proc)
+        snapshot.assert_called_once_with()
+        return result
 
     def test_categories_sum_resident_pss_and_swap_from_each_process(self) -> None:
         cases = [
@@ -114,11 +128,13 @@ class WorkingSetTests(unittest.TestCase):
 
     def test_python_scripts_group_by_path_and_name_the_production_owner(self) -> None:
         script = "/home/test/.claude/scripts/lint/tmp_sweep.py"
-        _ = self.process(201, ["/usr/bin/python3", script, "--dry-run"], 1024, 128)
+        _ = self.process(201, ["/usr/bin/python3", script, "--dry-run"], 1024, 128, owner="resources")
         _ = self.process(202, ["/usr/bin/python3", "-u", "scripts/lint/tmp_sweep.py"], 2048, 256)
-        _ = self.process(203, ["/usr/bin/python3", "/home/test/.claude/scripts/buildlog/record.py"], 512, 64)
-        _ = self.process(204, ["/usr/bin/python3", "/home/test/.claude/scripts/buildlog/mac_idle.py"], 256, 32)
-        _ = self.process(205, ["/usr/bin/python3", "/tmp/unowned.py"], 128, 16)
+        _ = self.process(203, ["/usr/bin/python3", "/home/test/.claude/scripts/buildlog/record.py"], 512, 64,
+                         cwd="/work/report", owner="report")
+        _ = self.process(204, ["/usr/bin/python3", "/home/test/.claude/scripts/buildlog/mac_idle.py"], 256, 32,
+                         cwd="/work/verify", owner="verify")
+        _ = self.process(205, ["/usr/bin/python3", "/tmp/unowned.py"], 128, 16, cwd="/unassigned")
         _ = self.process(206, ["/usr/bin/python3", "/another/checkout/scripts/lint/tmp_sweep.py"], 64, 8)
 
         report = self.report()
@@ -126,11 +142,11 @@ class WorkingSetTests(unittest.TestCase):
         detail = {group.script: (group.owner, group.count, group.pss_kib, group.swap_kib)
                   for group in report.groups if group.script}
         self.assertEqual(detail, {
-            script: ("resources-unit", 2, 3072, 384),
-            "/home/test/.claude/scripts/buildlog/record.py": ("report-unit", 1, 512, 64),
-            "/home/test/.claude/scripts/buildlog/mac_idle.py": ("verify-unit", 1, 256, 32),
+            script: ("resources", 2, 3072, 384),
+            "/home/test/.claude/scripts/buildlog/record.py": ("report", 1, 512, 64),
+            "/home/test/.claude/scripts/buildlog/mac_idle.py": ("verify", 1, 256, 32),
             "/tmp/unowned.py": ("unassigned", 1, 128, 16),
-            "/another/checkout/scripts/lint/tmp_sweep.py": ("resources-unit", 1, 64, 8),
+            "/another/checkout/scripts/lint/tmp_sweep.py": ("resources", 1, 64, 8),
         })
         total = next(group for group in report.groups if group.category == "Python helpers" and not group.script)
         self.assertEqual((total.count, total.pss_kib, total.swap_kib), (6, 4032, 504))
@@ -156,29 +172,83 @@ class WorkingSetTests(unittest.TestCase):
             "scripts/direct/test_verify_doc.py",
         )
         for pid, script in enumerate(scripts, start=501):
-            _ = self.process(pid, ["python3", script], 1024)
+            _ = self.process(pid, ["python3", script], 1024, owner="verify")
         report = self.report()
         owners = {group.script: group.owner for group in report.groups if group.script}
         for script in scripts:
             with self.subTest(script=script):
-                self.assertEqual(owners["/home/test/.claude/" + script], "verify-unit")
+                self.assertEqual(owners["/home/test/.claude/" + script], "verify")
 
     def test_phase_and_role_tests_have_their_production_owners(self) -> None:
         for script, owner in (
-            ("scripts/direct/test_phase_process.py", "phases-unit"),
-            ("scripts/production/test_roles_audit.py", "roles-unit"),
+            ("scripts/direct/test_phase_process.py", "phases"),
+            ("scripts/production/test_roles_audit.py", "roles"),
         ):
             with self.subTest(script=script):
-                self.assertEqual(working_set.owner_for(script), owner)
+                folder = Path("/work") / owner
+                row = staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
+                    current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", folder))
+                resolver = session_staff.RowResolver(staff.StaffSnapshot((row,)))
+                self.assertEqual(working_set.owner_for(str(folder / script), resolver), owner)
+
+    def test_one_script_in_two_current_worktrees_keeps_distinct_owners(self) -> None:
+        script = "/shared/helper.py"
+        for pid, owner in ((801, "first"), (802, "second")):
+            _ = self.process(pid, ["python3", script], 1024, cwd=f"/work/{owner}", owner=owner)
+        _ = self.process(803, ["python3", script], 512, cwd="/work/first-other")
+        self.rows.append(staff.StaffRow(staff.StaffId("retired"), "unit", "retired", staff.STAFF_ROOT,
+            current_session=staff.StaffId("retired-current"), worktree=staff.RemovedWorktree("natedev", Path("/work/first-other"))))
+        groups = {(group.script, group.owner): group.pss_kib for group in self.report().groups if group.script}
+        self.assertEqual(groups, {(script, "first"): 1024, (script, "second"): 1024, (script, "unassigned"): 512})
+
+    def test_folder_ownership_selects_the_nested_unit_and_ignores_other_row_kinds(self) -> None:
+        for pid, owner, folder in ((811, "outer", "/work"), (812, "inner", "/work/inner")):
+            _ = self.process(pid, ["python3", "/shared/helper.py"], 1024, cwd=folder, owner=owner)
+        self.rows.append(staff.StaffRow(staff.StaffId("director"), "showrunner", "director", staff.STAFF_ROOT,
+            current_session=staff.StaffId("director-session"), worktree=staff.PresentWorktree("natedev", Path("/separate"))))
+        resolver = session_staff.RowResolver(staff.StaffSnapshot(tuple(self.rows)))
+        for folder, owner in (("/work/file", "outer"), ("/work/inner/src", "inner"),
+                              ("/separate/src", "unassigned"), ("relative/path", "unassigned")):
+            with self.subTest(folder=folder):
+                self.assertEqual(working_set.owner_for(folder, resolver), owner)
+
+    def test_nested_agent_worktree_keeps_the_outer_unit_owner(self) -> None:
+        self.rows.extend((
+            staff.StaffRow(staff.StaffId("outer-id"), "unit", "outer", staff.STAFF_ROOT,
+                current_session=staff.StaffId("outer-session"),
+                worktree=staff.PresentWorktree("natedev", Path("/work/unit"))),
+            staff.StaffRow(staff.StaffId("nested-id"), "agent", "nested", staff.STAFF_ROOT,
+                current_session=staff.StaffId("nested-session"),
+                worktree=staff.PresentWorktree("natedev", Path("/work/unit/nested"))),
+        ))
+        _ = self.process(815, ["python3", "/shared/helper.py"], 1024, cwd="/work/unit/nested/src")
+        groups = [group for group in self.report().groups if group.script]
+        self.assertEqual([(group.owner, group.pss_kib) for group in groups], [("outer", 1024)])
+
+    def test_unfilled_worktree_reports_one_problem_and_keeps_the_report(self) -> None:
+        self.rows.append(staff.StaffRow(staff.StaffId("pending"), "unit", "pending", staff.STAFF_ROOT,
+                                       current_session=staff.StaffId("pending-session")))
+        _ = self.process(813, ["python3", "/shared/helper.py"], 1024)
+        with redirect_stderr(io.StringIO()) as errors:
+            report = self.report()
+        self.assertEqual(errors.getvalue(), "working-set: pending: the worktree is not recorded\n")
+        self.assertEqual([(group.owner, group.pss_kib) for group in report.groups if group.script], [("unassigned", 1024)])
+
+    def test_unreadable_staff_reports_one_problem_and_keeps_process_memory(self) -> None:
+        _ = self.process(814, ["python3", "/shared/helper.py"], 1024)
+        with redirect_stderr(io.StringIO()) as errors:
+            report = self.report(staff.StaffUnreadable("private staff failure"))
+        self.assertEqual(errors.getvalue(), "working-set: staff is unavailable: private staff failure\n")
+        self.assertEqual([(group.owner, group.pss_kib) for group in report.groups if group.script], [("unassigned", 1024)])
 
     def test_owner_snapshot_loads_ordered_rules_and_rejects_bad_files(self) -> None:
         path = self.root / "owners.json"
         payload = {"generated_on": "2026-10-29", "sources": ["docs/plans/builds-production.md"],
-                   "rules": [{"path": "scripts/a.py", "owner": "a-unit"},
-                             {"path": "scripts/", "owner": "default-unit"}]}
+                   "rules": [{"path": "scripts/a.py", "owner": "a"},
+                             {"path": "scripts/", "owner": "default"}]}
         _ = path.write_text(json.dumps(payload))
         self.assertEqual(working_set.load_owners(path),
-                         (("scripts/a.py", "a-unit"), ("scripts/", "default-unit")))
+                         (("scripts/a.py", "a"), ("scripts/", "default")))
         for content in ("{", "[]", "{}", '{"generated_on": "today", "sources": [], "rules": []}',
                         json.dumps({**payload, "rules": [{"path": "scripts/a.py", "owner": 3}]})):
             with self.subTest(content=content):
@@ -228,11 +298,11 @@ class WorkingSetTests(unittest.TestCase):
 
     def test_node_helpers_render_script_owners_and_memory_from_one_entry_reading(self) -> None:
         _ = self.process(701, ["node", "--redirect-warnings", "/logs/warnings.log",
-                                "/opt/service.js"], 1024, 128)
+                                "/opt/service.js"], 1024, 128, cwd="/unassigned")
         _ = self.process(702, ["nodejs", "--redirect-warnings=/logs/warnings.log",
-                                "/opt/service.js"], 2048, 256)
+                                "/opt/service.js"], 2048, 256, cwd="/unassigned")
         script = "scripts/build_targets/helper.js"
-        _ = self.process(703, ["node", script], 4096, 512)
+        _ = self.process(703, ["node", script], 4096, 512, owner="resources")
         _ = self.process(704, ["python3", script], 512, 64)
 
         with mock.patch.object(working_set, "node_entry", wraps=working_set.node_entry) as entries:

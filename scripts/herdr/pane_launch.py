@@ -15,19 +15,14 @@ from enum import Enum
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
 
-import sessions
-from place import HerdrPlace
-from probe_session import PROBE_ENV
-from scripts.lib import atomic_file
+from scripts.message import sessions
+from scripts.herdr.place import HerdrPlace
+from scripts.lib.probe_session import PROBE_ENV
+from scripts.lib import atomic_file, legacy_identity
 from scripts.production import staff
-
-UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
-MEMBER_MARKS = UNIT_MARKS
-
 
 # The launch environment a resume must give back. Credentials never enter the record.
 KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
-KEPT_PREFIXES = ("SHOWRUNNER_",)
 # Claude flags whose value the resume repeats; every other argument stays out of the record.
 NAME_FLAGS = frozenset({"-n", "--name"})
 MODEL_FLAGS = frozenset({"--model"})
@@ -41,6 +36,8 @@ class PaneLaunch(TypedDict):
     cwd: str
     name: str
     model: str
+    codex_policy: NotRequired[list[str]]
+    plugin_directories: NotRequired[list[str]]
     remote_control: bool
     environment: dict[str, str]
     # False when the launch flags could not be read: a restore refuses it.
@@ -95,6 +92,16 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
             or not all(isinstance(name, str) and isinstance(setting, str)
                        for name, setting in cast(dict[object, object], environment).items())):
         raise ValueError(f"{location}: environment must contain string names and settings")
+    if "plugin_directories" in launch:
+        directories = launch["plugin_directories"]
+        if (not isinstance(directories, list)
+                or not all(isinstance(directory, str) and directory
+                           for directory in cast(list[object], directories))):
+            raise ValueError(f"{location}: plugin_directories must contain nonempty paths")
+    if "codex_policy" in launch:
+        policy = launch["codex_policy"]
+        if not isinstance(policy, list) or not all(isinstance(value, str) for value in cast(list[object], policy)):
+            raise ValueError(f"{location}: codex_policy must contain strings")
     return cast(PaneLaunch, cast(object, launch))
 
 
@@ -138,44 +145,24 @@ class StaffLabelsRead(Enum):
 
 
 class RecordedLabels:
-    """One discovery read: each terminal's launch file is opened at most once."""
+    """Resolve process labels from the staff record without pane records."""
 
     def __init__(self, membership: StaffLabels | StaffLabelsRead = StaffLabelsRead.PENDING) -> None:
-        self.entries: dict[str, dict[str, PaneLaunch]] = {}
         self.membership: StaffLabels | StaffLabelsRead = membership
 
-    def resolve(self, pid: int, environment: Mapping[str, str],
-                pane_place: Callable[[], object]) -> dict[str, str]:
-        # Raw discovery already has these process labels. Ownership projections
-        # pass their staff snapshot explicitly and still require native proof.
-        if isinstance(self.membership, StaffLabelsRead) and all(environment.get(key) for key in UNIT_MARKS):
-            return {key: value for key, value in environment.items() if key != "STAFF_ID"}
+    def resolve(self, pid: int, environment: Mapping[str, str]) -> dict[str, str]:
+        values = legacy_identity.without_legacy_identity(environment)
         record = sessions.read_session(sessions.sessions_dir() / f"{pid}.json")
         if (isinstance(record, sessions.UnreadableSessionRecord) or record["pid"] != pid
                 or not sessions.running_session(record)):
-            return dict(environment)
+            return values
         if self.membership is StaffLabelsRead.PENDING:
-            from scripts.production import staff
             from scripts.production.session_labels import StaffLabels
 
             try:
                 self.membership = StaffLabels.read()
             except (staff.StaffUnreadable, OSError, ValueError):
                 self.membership = StaffLabelsRead.UNAVAILABLE
-        values = dict(environment)
-        place = pane_place()
-        if isinstance(place, HerdrPlace):
-            if place.session not in self.entries:
-                self.entries[place.session] = read(record_directory() / f"{place.session}.json")
-            entries = self.entries[place.session]
-            entry = matching_launch(entries, place, record["sessionId"])
-            if entry is None and not isinstance(self.membership, StaffLabelsRead):
-                owner = self.membership.record.by_current_session(record["sessionId"])
-                if owner is not None:
-                    entry = matching_launch(entries, place, owner.id)
-            if entry is not None:
-                values = {**{key: value for key, value in entry.get("environment", {}).items()
-                             if key in MEMBER_MARKS}, **values}
         if not isinstance(self.membership, StaffLabelsRead):
             values = self.membership.environment(values, record["sessionId"])
         return values
@@ -190,13 +177,22 @@ def locked(path: Path) -> Generator[None]:
         yield
 
 
+def without_staff_labels(entry: PaneLaunch) -> PaneLaunch:
+    """Keep pane observations without saved staff labels."""
+    current = entry.copy()
+    current["environment"] = {key: value for key, value in
+        legacy_identity.without_legacy_identity(entry["environment"]).items()
+        if key not in {"CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}}
+    return current
+
+
 def save(path: Path, entries: dict[str, PaneLaunch]) -> None:
     """Publish one retained launch file through the atomic writer."""
     atomic_file.write_text_atomic(path, json.dumps(entries, indent=2, sort_keys=True) + "\n")
 
 
 def write(path: Path, launch: PaneLaunch) -> None:
-    """Persist a member's fixed reference; keep the supplied launch observations."""
+    """Persist pane observations with the fixed staff reference."""
     try:
         owner = staff.initial_snapshot().by_current_session(launch["session_id"])
     except (staff.StaffUnreadable, OSError, ValueError):
@@ -226,11 +222,6 @@ class UnpublishedResume:
 
 
 UNPUBLISHED_RESUME = UnpublishedResume()
-
-
-@dataclass(frozen=True)
-class NoOriginalLaunch:
-    """The failed start did not replace a retained launch."""
 
 
 @dataclass(frozen=True)
@@ -301,25 +292,25 @@ def retire_launch(path: Path, pane_id: str, original: PaneLaunch, *,
 
 @overload
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
-                   outcome: PreparedAccountMove, *, close: Callable[[str], None]) -> LaunchPublication: ...
+                   outcome: PreparedAccountMove, *, close: Callable[[str], bool]) -> LaunchPublication: ...
 
 
 @overload
-def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt: ResumeAttempt,
-                   outcome: VerifiedResume | FailedResume, *, close: Callable[[str], None]) -> None: ...
+def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
+                   outcome: VerifiedResume | FailedResume, *, close: Callable[[str], bool]) -> None: ...
 
 
-def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt: ResumeAttempt,
+def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                    outcome: VerifiedResume | FailedResume | PreparedAccountMove, *,
-                   close: Callable[[str], None]) -> LaunchPublication | None:
+                   close: Callable[[str], bool]) -> LaunchPublication | None:
     """Keep one proved launch, or retire a failed attempt after confirmed closure.
 
     The close callback must confirm that the selected tab is closed.
     A same-pane resume keeps its pane on success and failure.
     """
-    same_pane = not isinstance(original, NoOriginalLaunch) and original["pane_id"] == attempt.pane_id
+    same_pane = original["pane_id"] == attempt.pane_id
     if isinstance(outcome, PreparedAccountMove):
-        if isinstance(original, NoOriginalLaunch) or not same_pane:
+        if not same_pane:
             raise ValueError("an account move requires its original retained pane")
         with locked(path):
             entries = read_strict(path)
@@ -335,7 +326,8 @@ def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt:
     if isinstance(outcome, FailedResume):
         if same_pane:
             return
-        close(attempt.pane_id)
+        if close(attempt.pane_id) is not True:
+            return
         if not isinstance(attempt.publication, UnpublishedResume):
             retire_launch(path, attempt.pane_id, attempt.publication,
                            replacement=ResumeAttempt(attempt.pane_id, UnpublishedResume()))
@@ -345,22 +337,21 @@ def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt:
             entries = read_strict(path)
             replacement = entries.get(attempt.pane_id)
             if replacement is None:
-                raise ValueError(f"{attempt.pane_id}: replacement launch was not published")
+                raise ValueError(f"{attempt.pane_id}: replacement launch was not published; would delete the only resume record")
             _usable_replacement(path, attempt, replacement, outcome, same_pane=same_pane)
             if same_pane:
                 if replacement.get("ended", False):
                     replacement["ended"] = False
                     save(path, entries)
                 return
-            if isinstance(original, NoOriginalLaunch):
-                raise ValueError("a successful restore requires an original launch")
             if entries.get(original["pane_id"]) != original:
                 raise ValueError(f"{original['pane_id']}: retained launch changed before replacement")
             retained = ResumeAttempt(attempt.pane_id, replacement.copy())
     except (OSError, ValueError):
         finish_restore(path, original, attempt, FailedResume(), close=close)
         raise
-    close(original["pane_id"])
+    if close(original["pane_id"]) is not True:
+        return
     retire_launch(path, original["pane_id"], original, replacement=retained)
 
 
@@ -368,6 +359,7 @@ def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt:
 class ClaudeArguments:
     values: dict[str, str]
     has_prompt: bool
+    plugin_directories: tuple[str, ...] = ()
 
     def value(self, flags: frozenset[str]) -> str:
         return next((value for name, value in reversed(tuple(self.values.items())) if name in flags), "")
@@ -375,17 +367,21 @@ class ClaudeArguments:
 
 # Claude options used by launch commands; all consumers share this parse.
 CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--settings",
-    "--model", "--name", "-n", "--permission-mode", "--session-id"})
+    "--model", "--name", "-n", "--permission-mode", "--session-id", "--plugin-dir"})
 RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 
 def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
     values: dict[str, str] = {}
     prompt = False
+    plugin_directories: list[str] = []
     index = 1
     while index < len(arguments):
         argument = arguments[index]
         index += 1
+        if argument == "--":
+            prompt = prompt or index < len(arguments)
+            break
         option, equals, value = argument.partition("=")
         if option in CLAUDE_VALUE_FLAGS:
             if not equals and index < len(arguments) and not arguments[index].startswith("-"):
@@ -393,9 +389,11 @@ def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
                 index += 1
             _ = values.pop(option, None)
             values[option] = value
-        elif not argument.startswith("-") or argument == "--":
+            if option == "--plugin-dir" and value:
+                plugin_directories.append(value)
+        elif not argument.startswith("-"):
             prompt = True
-    return ClaudeArguments(values, prompt)
+    return ClaudeArguments(values, prompt, tuple(plugin_directories))
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
@@ -403,7 +401,7 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
     config_dir = (environment.get("CODEX_HOME") or str(Path.home() / ".codex") if kind == "codex"
                   else environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"))
     parsed = parse_claude_arguments(arguments)
-    return {
+    entry: PaneLaunch = {
         "kind": kind,
         "pane_id": pane_id,
         "session_id": session_id,
@@ -413,8 +411,21 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
         "model": parsed.value(MODEL_FLAGS),
         "remote_control": any(argument.partition("=")[0] == "--remote-control" for argument in arguments),
         "environment": {key: value for key, value in sorted(environment.items())
-                        if key in KEPT_NAMES or key.startswith(KEPT_PREFIXES)},
+                        if key in KEPT_NAMES},
         "flags_read": bool(arguments),
         "ended": False,
         "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if kind == "codex":
+        policy: list[str] = []
+        options = iter(arguments[1:])
+        for argument in options:
+            if argument == "--":
+                break
+            option, equals, value = argument.partition("=")
+            if option in {"--sandbox", "--ask-for-approval", "-c"}:
+                value = value if equals else next(options, "")
+                if option != "-c" or not value.startswith("projects="):
+                    policy.extend((option, value))
+        entry["codex_policy"] = policy
+    return entry
