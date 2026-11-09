@@ -227,13 +227,15 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
         return events[path]
 
     runs = open_unit_runs(snapshot, read_run=read_run)
-    lines = ["| Unit | Status | Phase | Non-Phase Work | Queued |", "| --- | --- | --- | --- | --- |"]
-    for unit in units:
+    machines = display_cells.machine_column([unit.machine for unit in units])
+    headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Phase", "Non-Phase Work", "Queued")
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(("---",) * len(headers)) + " |"]
+    for index, unit in enumerate(units):
         record = records.get(unit.unit)
         member = unit.member
         other = non_phase_cell(record, runs.get(member.id, NoOpenUnitRun())) if isinstance(member, staff.StaffRow) else display_cells.NONE
         queued = queued_cell(member.id) if isinstance(member, staff.StaffRow) else display_cells.NONE
-        cells = (unit.unit, unit.status, phase_cell(record, read_run=read_run), other, queued)
+        cells = (unit.unit, unit.status, *((machines[index],) if machines else ()), phase_cell(record, read_run=read_run), other, queued)
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
     return "\n".join(lines)
 
