@@ -278,7 +278,7 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_capped_need_uses_the_saved_budget_without_configuration_reads(self) -> None:
         rule = records.ReleaseHeadroom(records.read_memory_config(report=False).release_headroom)
         source = records.RecordedNeed("shape", 10, 14, "full", "", (), records.WidthNotRecorded(),
-            records.ShapeP90(10, records.FailedPeakFloor(16 * GIB, "2026-10-30T01:40:00Z"),
+            records.ShapeRankedPeak(10, 10, records.FailedPeakFloor(16 * GIB, "2026-10-30T01:40:00Z"),
                           rule, records.CappedAtBudget(30 * GIB, 19 * GIB)))
         zone = user_zone()
         with mock.patch.object(records, "read_memory_config", side_effect=AssertionError("live policy")), \
@@ -289,7 +289,7 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertNotIn("21.0 GiB", text)
 
     def test_full_package_estimates_keep_package_and_width_for_every_basis(self) -> None:
-        for basis in (records.BasisNotRecorded(), records.ShapeP90(7), records.ShapeLargest(2),
+        for basis in (records.BasisNotRecorded(), records.ShapeRankedPeak(7, 10), records.ShapeLargest(2),
                       records.ShapeFallback()):
             with self.subTest(basis=basis):
                 self.change_head(test_scope="full", package="hana_widget", filters=[],
@@ -337,7 +337,7 @@ class QueueEvidenceTests(unittest.TestCase):
                     if unreadable:
                         load.rmdir()
                 self.assertIn("host load: unavailable", text.lower())
-                self.assertIn("measured process-memory p90 of 7 runs", text)
+                self.assertIn("measured process-memory estimate from 7 runs", text)
                 self.assertIn("Frees when:", text)
 
     def test_renderers_use_model_inputs_without_load_reads_or_release_search(self) -> None:
@@ -371,7 +371,7 @@ class QueueEvidenceTests(unittest.TestCase):
         facts.assert_called_once_with(reading)
         labels.assert_called_once()
         self.assertEqual(text.count("Frees when:"), 1)
-        self.assertEqual(text.count("measured process-memory p90 of 7 runs"), 1)
+        self.assertEqual(text.count("measured process-memory estimate from 7 runs"), 1)
         self.assertEqual(text.count("Cargo token waits:"), 1)
         self.assertEqual(text.count("Host load: 64.25"), 1)
         self.assertEqual(text.count("#1 of 17"), 1)
@@ -595,7 +595,7 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_need_source_records_explain_sample_window_filter_and_width(self) -> None:
         output = self.output()
-        for word in ("measured", "p90", "7 runs", "14 days", "filtered", "hana_inspectors", "filters: test(one), test(two)", "width: 8"):
+        for word in ("measured", "estimate", "7 runs", "14 days", "filtered", "hana_inspectors", "filters: test(one), test(two)", "width: 8"):
             self.assertIn(word, output)
         details = self.line(output, "Package:")
         self.assertEqual(len(details.partition("filters: ")[2].partition(";")[0].split(", ")), 2)
@@ -612,25 +612,25 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_shape_need_text_names_each_tier_and_its_run_count(self) -> None:
         for basis, words in (
-            (records.ShapeP90(12), ("same-shape", "p90", "12 runs")),
+            (records.ShapeRankedPeak(12, 10), ("same-shape", "highest 10%", "12 runs")),
+            (records.ShapeRankedPeak(20, 50), ("same-shape", "highest 50%", "20 runs")),
             (records.ShapeLargest(3), ("same-shape", "largest", "3 runs")),
             (records.ShapeFallback(), ("same-profile", "fallback")),
         ):
             with self.subTest(basis=basis):
-                source = records.RecordedNeed("shape", 12 if isinstance(basis, records.ShapeP90) else 3,
+                source = records.RecordedNeed("shape", basis.runs if isinstance(basis, records.ShapeRankedPeak) else 3,
                                            14, "full", "", (), records.WidthNotRecorded(), basis)
                 text = queue_evidence.need_text(source, zone=user_zone())
                 for word in (*words, "14 days"):
                     self.assertIn(word, text)
-                if not isinstance(basis, records.ShapeP90):
-                    self.assertNotIn("p90", text)
+                self.assertNotIn("p90", text)
 
     def test_shape_need_text_names_floor_release_factor_and_budget_cap(self) -> None:
         ended_at = "2026-10-29T09:09:52Z"
         floor = records.FailedPeakFloor(gib(15.76), ended_at)
         rule = records.ReleaseHeadroom(records.read_memory_config(report=False).release_headroom)
         for tier in (
-            records.ShapeP90(10, floor, rule, records.CappedAtBudget(gib(24), 21 * GIB)),
+            records.ShapeRankedPeak(10, 10, floor, rule, records.CappedAtBudget(gib(24), 21 * GIB)),
             records.ShapeLargest(2, floor, rule, records.CappedAtBudget(gib(24), 21 * GIB)),
             records.ShapeFallback(records.CappedAtBudget(gib(24), 21 * GIB)),
         ):
@@ -684,7 +684,7 @@ class QueueEvidenceTests(unittest.TestCase):
         need_line = self.line(text, "Need source:")
         self.assertIn("6.0 GiB", text)
         self.assertEqual(head.cause, records.EstimateExpired(expired_at))
-        self.assertIn("p90 of 10", need_line)
+        self.assertIn("measured process-memory estimate from 10 runs", need_line)
         self.assertIn("the estimate expired at", text)
         self.assertIn("the client refreshes it through the admission service", text)
 

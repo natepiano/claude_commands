@@ -5165,6 +5165,25 @@ with patch.object(fcntl, "flock", admission):
             expected,
         )
 
+    def test_review_trial_reports_the_parked_phase_findings_and_review_minutes(self) -> None:
+        self.write_full_config()
+        session = self.start_run("parked-review-trial", 71_000)
+        self.start_numbered_phase(session, "A", 71_010)
+        _ = self.run_findings(
+            session, "open", "--severity", "minor", "--title", "phase A finding",
+            "--caught-by", "worker", "--lens", "contract", at=71_020,
+        )
+        self.start_slot_pass(session, "review", "review", 71_030)
+        self.finish_slot_pass(session, "review", "completed", 71_510)
+        self.team_slot = ""
+        self.start_numbered_phase(session, "B", 71_520)
+        self.assertEqual(self.open_phase_ids(session), ("B", ["A"]))
+        self.assertEqual(
+            self.run_command("review-trial", "--session-dir", str(session), "--phase-id", "A", at=71_530),
+            "review trial: ux 0 findings, code 1 findings, review-worker minutes 8, "
+            + "ux check minutes 0, ux repair minutes 0",
+        )
+
     def test_the_review_writer_preserves_caller_counts_and_phase_identity(self) -> None:
         self.write_full_config()
         session = self.start_run("shared-review-writer", 71_200)
