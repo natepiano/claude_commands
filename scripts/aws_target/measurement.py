@@ -1,7 +1,7 @@
 """Read local AWS measurements and reconcile scheduled charge replies."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -127,7 +127,7 @@ def charge_period_day(_settings: SpendingSettings, now: int) -> date:
 
 
 def read_charges(settings_path: Path, directory: Path, now: int,
-                 fetch: Callable[[int, int], Decimal]) -> ChargeRead | MeasurementUnavailable:
+                 fetch: Callable[[int, int], Sequence[ChargeRead]]) -> ChargeRead | MeasurementUnavailable:
     """Read charges through the ledger's schedule and recovery lock."""
     return ledger.CostLedger(directory).refresh_charges(settings_path, now, fetch)
 

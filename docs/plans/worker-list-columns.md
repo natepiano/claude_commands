@@ -53,7 +53,7 @@ A pane that is not open prints `-` for the account. `list --all` prints `-` for 
 
 **Gotchas:** `list_workers(as_json=False)` replaces the `state` key with the column word, so the key holds the observed class name only in JSON output.
 
-### Phase 2 — Status has no machine word; a Machine column shows only off natedev  · status: todo
+### Phase 2 — Status has no machine word; a Machine column shows only off natedev  · status: done
 
 **Depends on:** Phase 1
 

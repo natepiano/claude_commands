@@ -5,7 +5,21 @@ import json
 from pathlib import Path
 from typing import NamedTuple, cast
 
+from scripts.lib import conf
+
 NONE = "—"
+
+
+def machine_column(machines: list[str]) -> tuple[str, ...]:
+    """Return machine cells only when a row uses a machine other than the configured home machine."""
+    if not any(machines):
+        return ()
+    values = conf.read("build_targets").values()
+    homes = [key.removeprefix("kind.") for key, value in values.items()
+             if key.startswith("kind.") and value == "local"]
+    if len(homes) != 1:
+        raise conf.Unusable("build_targets: expected one home machine with kind=local")
+    return tuple(machine or NONE for machine in machines) if any(machine and machine != homes[0] for machine in machines) else ()
 
 
 class OpenStep(NamedTuple):

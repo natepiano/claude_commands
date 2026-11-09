@@ -86,6 +86,15 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `workers` reads the run owner and that owner's staff workers.
   It displays pane state and the cause of unknown or incomplete evidence.
   Worker posts and launcher writes update the watched run folder and `board.log`.
+- The production tables use `busy`, `idle`, `paused`, or `exited` for the session status.
+  `live_units.LiveUnit` carries the machine from the staff worktree separately.
+  `display_cells.machine_column` adds a Machine column when a row uses a machine other than the configured home machine.
+  `config/build_targets.conf` identifies the home machine with `kind.<machine>=local`.
+  The production tables place Machine after Status.
+  `worker.py list` places the optional machine field after the account field.
+  A worker uses the machine from its parent's worktree.
+  `worker.py list --json` keeps its existing fields.
+  The accounts board does not use a machine name as a session status.
 - Pane workers also use [`worker_runs.py`](../../scripts/direct/worker_runs.py) to read detached runs from their run folder.
   It matches each worker by staff id and selects its newest run by `started_at`.
   A working pane has state `working`.

@@ -249,6 +249,7 @@ class RunningGateJob:
     kind: GateJobKind = GateJobKind.TEST_MODULE
     cpu_seconds: float = 0.0
     memory_stopped: bool = False
+    folder_cleanup: ExitStack = field(default_factory=ExitStack)
 
 
 @dataclass(frozen=True)
@@ -806,6 +807,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     shutil.rmtree(job.log.parent)
+    job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -1167,6 +1169,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
@@ -1233,8 +1236,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         slot = cpu_pool
                     request = pending.popleft()
                     suite, path = request.suite, request.path
-                    root = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary)))
+                    folder_cleanup = ExitStack()
+                    _ = module_folders.callback(folder_cleanup.close)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -1249,6 +1254,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                        job.folder_cleanup = folder_cleanup
                         job.cpu_slot = slot
                         running.append(job)
                         job_started = True
