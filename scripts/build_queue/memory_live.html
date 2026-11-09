@@ -156,9 +156,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 0.75rem; }
 .row-memory { min-width: 0; }
-.cloud-status .track { height: auto; min-height: 18px; overflow: visible; overflow-wrap: anywhere; line-height: 1.3; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
+.cloud-status .amounts { height: auto; min-height: 16px; overflow-wrap: anywhere; }
 .bar-amount { position: absolute; white-space: nowrap; cursor: help; }
 .wrow.room .row-heading { font-size: 0.75rem; gap: 8px; justify-content: space-between; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
@@ -417,9 +417,9 @@ function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
     `<div class="amounts"></div></div>`;
 }
-function cloudStatus(row) {
-  return `<div class="row-memory cloud-status"><div class="track">${esc(row.status)}` +
-    (row.stale ? ` · <span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div><div class="amounts"></div></div>`;
+function cloudStatus(row, tip) {
+  return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
+    (row.stale ? `${row.status ? " · " : ""}<span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div></div>`;
 }
 function progressTip(row) {
   const progress = row.progress;
@@ -436,7 +436,7 @@ function rawTipText(key, d) {
   if (kind === "row") {
     const r = d.walk[+i];
     if (!r) return ["", ""];
-    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status}. Machine: aws. No local memory reservation.`];
+    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Machine: aws. No local memory reservation.${progressTip(r)}`];
     if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
     const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
@@ -756,7 +756,7 @@ function renderWalk(d) {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells("run", r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.machine, r.vcpus, idleCI ? "" : rowUnit(r), r.pid, `row:${i}`);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
-      (r.kind === "cloud" ? cloudStatus(r) : rowMemory(`row:${i}`)) + `</div>`;
+      (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
   cells("", "Next step room", "", "", null, "", null, "room", "room");
   rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
@@ -765,7 +765,7 @@ function renderWalk(d) {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.machine || "", null, w.detail, w.pid, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
-      (w.kind === "cloud" ? cloudStatus(w) : rowMemory(`wait:${i}`)) +
+      (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${d.cap / scale})"></div>`);
@@ -938,14 +938,13 @@ function placeMemoryBars(d) {
   const reserveScale = d.shown_reserved > 0 ? reserved / d.shown_reserved : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const index = Number(row.dataset.run), run = d.walk[index];
-    if (run.kind === "cloud") continue;
-    let bars;
+    let bars = "";
     const amounts = [];
     if (run.ci) {
       bars = box(used, ciWidth, "seg-ci", "ci") + box(keptAt, kept, "hatch", "ci_kept");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
       if (kept > 0) amounts.push({kind: "reserved-amount", left: keptAt, value: d.ci_kept});
-    } else {
+    } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, Math.min(useValue(run) * unit, used - usedAt));
       const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, keptAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.min(Math.max(3, useWidth), end - usedAt) : 0;
@@ -963,8 +962,10 @@ function placeMemoryBars(d) {
       }
     }
     row.querySelector(".track").innerHTML = bars;
-    placeAmounts(row, amounts);
-    if (!recorded(run.used)) row.querySelector(".amounts").textContent = `Use unavailable: ${run.used.reason}`;
+    if (run.kind !== "cloud") {
+      placeAmounts(row, amounts);
+      if (!recorded(run.used)) row.querySelector(".amounts").textContent = `Use unavailable: ${run.used.reason}`;
+    }
   }
   const roomTrack = document.querySelector(".wrow.room .track");
   if (roomTrack) {

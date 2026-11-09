@@ -130,6 +130,7 @@ class ResourceInventory:
     at: int
     resources: tuple[PricedResource, ...]
     source: str
+    builder_removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -348,7 +349,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         observations,
         [PriceSample(instant(r, "at"), money(text(r, "usd_per_hour")), text(r, "source")) for r in rows(row, "prices")],
         [ResourceInventory(instant(r, "at"), tuple(PricedResource(text(p, "name"), money(text(p, "usd_per_month")))
-                                                 for p in rows(r, "resources")), text(r, "source"))
+                                                 for p in rows(r, "resources")), text(r, "source"), r.get("builder_removed") is True)
          for r in rows(row, "inventories")],
         [CostReconciliation(instant(r, "at"), instant(r, "period_start"), instant(r, "period_end"),
                             conf.decimal(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))),
@@ -406,7 +407,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         raise LedgerUnavailable('duplicate gate attempt')
     for inventory in evidence.inventories:
         names = [resource.name for resource in inventory.resources]
-        if not names or len(set(names)) != len(names):
+        if not names and not inventory.builder_removed or len(set(names)) != len(names):
             raise LedgerUnavailable("expected distinct priced resources")
     states: dict[int, str] = {}
     for observation in evidence.observations:
@@ -432,7 +433,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
         "observations": [{"at": r.at, "state": r.state, "source": r.source} for r in state.observations],
         "prices": [{"at": r.at, "usd_per_hour": str(r.usd_per_hour), "source": r.source} for r in state.prices],
         "inventories": [{"at": r.at, "source": r.source,
-                         "resources": [{"name": p.name, "usd_per_month": str(p.usd_per_month)} for p in r.resources]}
+                         "resources": [{"name": p.name, "usd_per_month": str(p.usd_per_month)} for p in r.resources],
+                         **({"builder_removed": True} if r.builder_removed else {})}
                         for r in state.inventories],
         "reconciliations": [{"at": r.at, "period_start": r.period_start, "period_end": r.period_end,
                              "usd": str(r.usd), "source": r.source, "query_usd": str(r.query_usd),
@@ -508,7 +510,8 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     if any(r.at > pricing_end for r in (*inventories, *observations, *prices)) or (require_fresh and any(
             r.at > now for r in state.reconciliations)):
         raise LedgerUnavailable("cost evidence is from the future")
-    if require_fresh and observations and now - observations[-1].at > settings.observation_max_age_seconds:
+    if (require_fresh and observations and observations[-1].state != "terminated"
+            and now - observations[-1].at > settings.observation_max_age_seconds):
         raise LedgerUnavailable("instance state evidence is stale")
     local = datetime.fromtimestamp(now, settings.accounting_zone)
     month_start = int(local.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -524,7 +527,8 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     for index in range(inventory_index, len(inventories)):
         inventory = inventories[index]
         end = inventories[index + 1].at if index + 1 < len(inventories) else pricing_end
-        monthly = max(settings.fixed_usd_per_month, sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
+        monthly = max(Decimal(0) if inventory.builder_removed else settings.fixed_usd_per_month,
+                      sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
         for start, stop in _days(max(inventory.at, window_start), end, settings.accounting_zone):
             intervals.append(ChargedInterval(start, stop, monthly * Decimal(stop - start)
                                              / Decimal(_month_seconds(start, settings.accounting_zone)), inventory.source, "fixed"))
@@ -541,7 +545,8 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         if end <= window_start:
             continue
         confirmed_end = min(end, observation.at + settings.observation_max_age_seconds)
-        fallback(confirmed_end, end)
+        if observation.state != "terminated":
+            fallback(confirmed_end, end)
         if observation.state not in ("running", "pending", "stopping"):
             continue
         begin = max(observation.at, window_start)
@@ -864,7 +869,8 @@ def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, cos
     """Reserve each period's known fixed costs before the first resource allocation."""
     local = datetime.fromtimestamp(costs.at, settings.accounting_zone)
     inventory = max(state.inventories, key=lambda item: item.at)
-    monthly = max(settings.fixed_usd_per_month, sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
+    monthly = max(Decimal(0) if inventory.builder_removed else settings.fixed_usd_per_month,
+                      sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
     day_start, day_end = period_bounds(local.date(), settings.accounting_zone)
     denominator = Decimal(_month_seconds(costs.at, settings.accounting_zone))
     daily_accrued = sum((r.usd for r in costs.intervals if r.kind == "fixed"
@@ -1093,7 +1099,8 @@ class CostLedger:
             self._save(state)
 
     def record_inventory(self, inventory: ResourceInventory) -> None:
-        if not inventory.resources or len({p.name for p in inventory.resources}) != len(inventory.resources):
+        if (not inventory.resources and not inventory.builder_removed
+                or len({p.name for p in inventory.resources}) != len(inventory.resources)):
             raise LedgerUnavailable("expected distinct priced resources")
         with self._locked() as state:
             if any(r.at == inventory.at and r != inventory for r in state.inventories):
