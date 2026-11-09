@@ -16,9 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
+from types import FrameType
 from typing import Literal, cast, final
 from uuid import uuid4
 
@@ -537,6 +539,9 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
 
 
 def main() -> int:
+    def stop_worker(number: int, _frame: FrameType | None) -> None:
+        raise SystemExit(128 + number)
+    _ = signal.signal(signal.SIGTERM, stop_worker)
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('--worker', required=True, type=Path)
     _ = parser.add_argument('--directory', required=True, type=Path)

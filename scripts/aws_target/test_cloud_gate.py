@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import cast, override
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -26,6 +27,7 @@ from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import merge_gate as gate
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class FakeGateAws:
@@ -142,6 +144,42 @@ class CloudGateTests(CostFixture):
         self.assertEqual((self.folder / 'gate.log').read_text(), 'fixture cloud output\n')
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
         self.assertTrue(self.fake.terminated)
+
+    def test_worker_sigterm_during_result_poll_terminates_launched_instance(self) -> None:
+        cloud_gate.save(self.folder / 'deployment.json', self.deployment)
+        script = '''import json, signal, sys
+from pathlib import Path
+from unittest import mock
+from scripts.aws_target import cloud_gate, ledger
+from scripts.aws_target.aws_target import AwsCli
+from scripts.aws_target.test_cloud_gate import FakeGateAws
+
+folder, state, configuration = map(Path, sys.argv[1:4])
+at = float(sys.argv[4])
+fake = FakeGateAws()
+fake.has_result = False
+def execute(arguments, **options):
+    reply = fake(arguments, **options)
+    (folder / 'commands.json').write_text(json.dumps(fake.commands))
+    if 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json'):
+        signal.raise_signal(signal.SIGTERM)
+    return reply
+api = AwsCli('build-scaler', 'fixture-region', 1, execute=execute)
+worker = cloud_gate.GateWorker(api, ledger.CostLedger(state), configuration, folder / 'reservation.cgroup', clock=lambda: at)
+with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+      mock.patch.object(cloud_gate, 'GateWorker', return_value=worker),
+      mock.patch.object(sys, 'argv', ['cloud-gate', '--worker', str(folder), '--directory', str(state),
+                                   '--sidecar', str(folder / 'reservation.cgroup')])):
+    raise SystemExit(cloud_gate.main())
+'''
+        reply = subprocess.run([sys.executable, '-c', script, str(self.folder), str(self.state), str(self.settings), str(self.now)],
+                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        commands = cast(list[list[str]], json.loads((self.folder / 'commands.json').read_text()))
+        terminated = [command[command.index('--instance-ids') + 1] for command in commands if 'terminate-instances' in command]
+        self.assertEqual(terminated, ['i-fixture'], reply.stdout + reply.stderr)
+        self.assertEqual(reply.returncode, 143, reply.stderr)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-fixture'))
 
     def test_each_log_download_publishes_module_progress(self) -> None:
         self.fake.log = ('Runner: 1 modules, whole machine, 32 CPUs\n'
