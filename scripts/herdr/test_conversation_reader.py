@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import io
+import math
 import json
 import os
 import time
+import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, override
@@ -12,9 +14,9 @@ from unittest.mock import call, patch
 
 
 from scripts.herdr import herdr
-from scripts.agents import codex_mesh
-from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import codex_daemon, sessions
 from scripts.production import fake_unit_host
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
@@ -26,7 +28,8 @@ class ConversationReaderTests(StaffTestCase):
     proc: Path = Path()
     identity: str = ""
     launched: str = ""
-    runs: Path = Path()
+    places: dict[int, herdr.HerdrPlace] = {}
+    reports: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -35,28 +38,52 @@ class ConversationReaderTests(StaffTestCase):
         self.proc.mkdir()
         self.identity = fixture_runtime_id("reader-current")
         self.launched = fixture_runtime_id("reader-launch")
-        self.runs = self.root / "runs"
-        self.runs.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.proc)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.proc), "XDG_CONFIG_HOME": str(self.root / "config")})))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="1"))
         _ = self.enterContext(patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()))
-        _ = self.enterContext(patch.object(unit_runs, "run_roots", return_value=(self.runs,)))
         _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
+        self.places = {}
+        self.reports = {}
+        def place(pid: int) -> herdr.HerdrPlace | herdr.NotInHerdr:
+            return self.places.get(pid, herdr.NotInHerdr())
 
-    def codex(self, *, rollout: bool = True, arguments: list[str] | None = None,
+        def pane_row(pane: str) -> herdr.PaneIdentity:
+            return {"pane_id": pane, "workspace_id": "w1", "session_id": self.reports[pane]}
+
+        _ = self.enterContext(patch.object(herdr, "herdr_place_of", side_effect=place))
+        _ = self.enterContext(patch.object(herdr, "herdr_places", side_effect=lambda: self.places.copy()))
+        _ = self.enterContext(patch.object(herdr.Herdr, "pane_row", side_effect=pane_row))
+
+        def pane_result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            del deadline
+            pid = int(arguments[-1].removeprefix("pane-"))
+            argv = (self.proc / str(pid) / "cmdline").read_bytes().decode().strip("\0").split("\0")
+            return {"process_info": {"foreground_processes": [{"pid": pid, "argv": argv}]}}
+
+        _ = self.enterContext(patch.object(herdr.Herdr, "result", side_effect=pane_result))
+
+        fake_unit_host.process(os.environ, 998060, 1, ["herdr", "server"], {})
+        fake_unit_host.process(os.environ, 998061, 998060, ["zsh"], {}, session=998061)
+        write_text_atomic(self.proc / "net/unix",
+            f"0: 2 0 00010000 0001 01 600 {self.root}/config/herdr/sessions/agents/herdr.sock\n")
+        descriptors = self.proc / "998060/fd"
+        descriptors.mkdir()
+        (descriptors / "3").symlink_to("socket:[600]")
+
+    def codex(self, *, pane: bool = True, arguments: list[str] | None = None,
               environment: dict[str, str] | None = None, pid: int = 998071) -> None:
-        fake_unit_host.process(os.environ, pid, 1, arguments or ["codex", "resume", self.launched],
-                               environment or {"CODEX_THREAD_ID": self.launched}, cwd=self.root)
-        descriptors = self.proc / str(pid) / "fd"
-        descriptors.mkdir(exist_ok=True)
-        if rollout:
-            record = self.root / f"rollout-{self.identity}.jsonl"
-            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.identity}}) + "\n")
-            (descriptors / "4").symlink_to(record)
+        argv = arguments or (["codex", "--no-daemon"] if pane else ["codex", "resume", self.launched])
+        fake_unit_host.process(os.environ, pid, 998061, argv,
+                               environment or {"CODEX_THREAD_ID": self.launched}, session=998061, cwd=self.root)
+        write_text_atomic(self.proc / str(pid) / "stat",
+            f"{pid} (codex) S 998061 {pid} 998061 1 {pid} " + "0 " * 13 + "1")
+        if pane and "app-server" not in argv:
+            self.places[pid] = herdr.HerdrPlace("fixture", f"pane-{pid}")
+            self.reports[f"pane-{pid}"] = self.identity
 
     def unreadable_process(self, pid: int) -> None:
-        self.codex(rollout=False, pid=pid)
+        self.codex(pane=False, pid=pid)
         arguments = herdr._process_arguments  # pyright: ignore[reportPrivateUsage]
 
         def read_arguments(path: Path) -> list[str]:
@@ -66,8 +93,12 @@ class ConversationReaderTests(StaffTestCase):
 
         _ = self.enterContext(patch.object(herdr, "_process_arguments", side_effect=read_arguments))
 
+
+
+
+
     def test_current_identity_requires_current_evidence(self) -> None:
-        for evidence in (herdr.RolloutThread(self.identity), herdr.EnvironmentThread(self.identity)):
+        for evidence in (herdr.PaneSessionReport(self.identity), herdr.EnvironmentThread(self.identity)):
             with self.subTest(evidence=evidence):
                 self.assertEqual(herdr.NativeAgentProcess(evidence, "1", {}).current_identity, self.identity)
         launched = herdr.NativeAgentProcess(herdr.LaunchArgument(self.launched), "1", {})
@@ -75,16 +106,21 @@ class ConversationReaderTests(StaffTestCase):
         with self.assertRaisesRegex(ValueError, "launch argument does not prove"):
             _ = launched.current_identity
 
-    def test_codex_open_rollout_proves_current_instead_of_launch(self) -> None:
+    def test_codex_pane_report_proves_current_instead_of_a_foreign_open_rollout(self) -> None:
         self.codex()
+        foreign = self.root / "rollout-foreign.jsonl"
+        _ = foreign.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.launched}}) + "\n")
+        descriptors = self.proc / "998071/fd"
+        descriptors.mkdir()
+        (descriptors / "4").symlink_to(foreign)
         self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.LiveConversation("codex", (998071,)))
         self.assertEqual(herdr.read_conversation(self.launched, "codex"), herdr.StoppedConversation())
         observed = herdr.native_process(998071, "codex")
-        self.assertEqual(observed.identity, herdr.RolloutThread(self.identity))
+        self.assertEqual(observed.identity, herdr.PaneSessionReport(self.identity))
         self.assertEqual(observed.environment["CODEX_THREAD_ID"], self.launched)
 
-    def test_codex_resume_argument_is_unknown_without_a_rollout(self) -> None:
-        self.codex(rollout=False)
+    def test_codex_resume_argument_is_unknown_outside_a_pane(self) -> None:
+        self.codex(pane=False)
         with patch.object(herdr, "_process_display_name", return_value="test-tab"):
             observed = herdr.read_conversation(self.launched, "codex")
         self.assertEqual(observed, herdr.UnknownConversation(
@@ -111,7 +147,7 @@ class ConversationReaderTests(StaffTestCase):
             shared_codex=True))
 
     def test_shared_snapshot_names_unknown_processes_in_note_order(self) -> None:
-        self.codex(rollout=False, pid=998071)
+        self.codex(pane=False, pid=998071)
         self.unreadable_process(998072)
         home = self.root / "account"
         read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"),
@@ -132,7 +168,7 @@ class ConversationReaderTests(StaffTestCase):
     def test_daemon_clients_use_one_read_and_prove_every_loaded_thread(self) -> None:
         home = self.root / "account"
         for pid in (998071, 998072):
-            self.codex(rollout=False, arguments=["codex"], environment={"CODEX_HOME": str(home)}, pid=pid)
+            self.codex(pane=False, arguments=["codex"], environment={"CODEX_HOME": str(home)}, pid=pid)
         read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"), [
             codex_daemon.DaemonSession(identity, "test-client", str(self.root), "idle")
             for identity in (self.identity, self.launched)])
@@ -146,7 +182,7 @@ class ConversationReaderTests(StaffTestCase):
     def test_unreadable_daemon_names_the_account_once_for_multiple_clients(self) -> None:
         home = self.root / "account"
         for pid in (998071, 998072):
-            self.codex(rollout=False, arguments=["codex"], environment={"CODEX_HOME": str(home)}, pid=pid)
+            self.codex(pane=False, arguments=["codex"], environment={"CODEX_HOME": str(home)}, pid=pid)
         read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"),
                                      codex_daemon.DaemonUnreadable("control socket unavailable"))
         with (patch.object(codex_daemon, "read_daemons", return_value=[read]),
@@ -162,52 +198,27 @@ class ConversationReaderTests(StaffTestCase):
 
     def test_readable_empty_daemon_resolves_a_client_without_an_open_rollout(self) -> None:
         home = self.root / "account"
-        self.codex(rollout=False, arguments=["codex"], environment={"CODEX_HOME": str(home)})
+        self.codex(pane=False, arguments=["codex"], environment={"CODEX_HOME": str(home)})
         read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"), [])
         with patch.object(codex_daemon, "read_daemons", return_value=[read]):
             self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.StoppedConversation())
 
-    def test_readable_daemon_does_not_resolve_an_unreadable_rollout(self) -> None:
-        home = self.root / "account"
-        self.codex(rollout=False, arguments=["codex"], environment={"CODEX_HOME": str(home)})
-        read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"), [])
-        with (patch.object(codex_daemon, "read_daemons", return_value=[read]),
-              patch.object(herdr, "codex_rollout_threads", side_effect=PermissionError("rollout unreadable")),
-              patch.object(herdr, "_process_display_name", return_value="test-client")):
-            self.assertEqual(herdr.codex_conversations().unknown, ("test-client (Codex thread unknown)",))
-
     def test_readable_daemon_does_not_resolve_a_client_with_daemon_disabled(self) -> None:
         home = self.root / "account"
-        self.codex(rollout=False, arguments=["codex", "--no-daemon"], environment={"CODEX_HOME": str(home)})
+        self.codex(pane=False, arguments=["codex", "--no-daemon"], environment={"CODEX_HOME": str(home)})
         read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"), [])
         with (patch.object(codex_daemon, "read_daemons", return_value=[read]),
               patch.object(herdr, "_process_display_name", return_value="test-client")):
             self.assertEqual(herdr.codex_conversations().unknown, ("test-client (Codex thread unknown)",))
 
     def test_pid_update_loop_helper_needs_no_conversation_read(self) -> None:
-        self.codex(rollout=False, arguments=["codex", "-c", "key=value", "app-server", "daemon", "pid-update-loop"])
+        self.codex(pane=False, arguments=["codex", "-c", "key=value", "app-server", "daemon", "pid-update-loop"])
         with patch.object(herdr, "native_process") as native:
             self.assertEqual(herdr.codex_conversations(), herdr.CodexConversations({}, ()))
         native.assert_not_called()
 
-    def test_idle_app_server_with_an_empty_run_read_is_proved_stopped(self) -> None:
-        run = self.runs / "test-run"
-        self.codex(rollout=False, arguments=["codex", "app-server"], environment={"UNIT_RUN_DIR": str(run)})
-        with patch.object(codex_mesh, "loaded_threads", return_value=set()) as loaded:
-            snapshot = herdr.codex_conversations()
-        loaded.assert_called_once()
-        self.assertEqual(loaded.call_args.args[0], run)
-        self.assertEqual(snapshot, herdr.CodexConversations({}, ()))
-
-    def test_idle_app_server_with_a_failed_run_read_is_unknown_once(self) -> None:
-        run = self.runs / "test-run"
-        self.codex(rollout=False, arguments=["codex", "app-server"], environment={"UNIT_RUN_DIR": str(run)})
-        with patch.object(codex_mesh, "loaded_threads", side_effect=ValueError("server unavailable")):
-            snapshot = herdr.codex_conversations()
-        self.assertEqual(snapshot.unknown, ("test-run (Codex hosted threads unknown: server unavailable)",))
-
     def test_idle_app_server_without_a_run_remains_unknown(self) -> None:
-        self.codex(rollout=False, arguments=["codex", "app-server"])
+        self.codex(pane=False, arguments=["codex", "app-server"])
         with patch.object(herdr, "_process_display_name", return_value="test-server"):
             snapshot = herdr.codex_conversations()
         self.assertEqual(snapshot.unknown, ("test-server (Codex thread unknown)",))
@@ -222,8 +233,8 @@ class ConversationReaderTests(StaffTestCase):
 
     def test_supplied_snapshot_matches_fresh_live_unknown_and_stopped_reads(self) -> None:
         self.codex()
-        for evidence in (herdr.RolloutThread(self.identity), herdr.LaunchArgument(self.launched),
-                         herdr.RolloutThread("other-thread")):
+        for evidence in (herdr.PaneSessionReport(self.identity), herdr.LaunchArgument(self.launched),
+                         herdr.PaneSessionReport("other-thread")):
             with (self.subTest(evidence=evidence),
                   patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(evidence, "1", {})),
                   patch.object(herdr, "_process_display_name", return_value="test-tab")):
@@ -256,15 +267,6 @@ class ConversationReaderTests(StaffTestCase):
         scan.assert_not_called()
         self.assertEqual(errors.getvalue(), "anomaly: test-tab unknown; not blocking\n")
 
-    def test_snapshot_scan_keeps_the_operation_deadline(self) -> None:
-        run = self.runs / "test-run"
-        run.mkdir()
-        (run / codex_mesh.SERVER_FILE).touch()
-        with (operation_deadline.within(deadline := time.monotonic() + 0.5),
-              patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded):
-            snapshot = herdr.codex_conversations()
-        self.assertEqual(snapshot.live, {self.identity: ()})
-        self.assertLessEqual(cast(float, loaded.call_args.args[1]), deadline + 0.001)
 
     def test_daemon_snapshot_read_runs_inside_the_operation_deadline(self) -> None:
         observed_deadlines: list[float] = []
@@ -317,47 +319,12 @@ class ConversationReaderTests(StaffTestCase):
         with patch.object(sessions, "session_liveness", return_value=sessions.SessionLivenessUnknown("private record unavailable")):
             self.assertEqual(herdr.read_conversation(self.identity), herdr.LiveConversation("codex", (998071,)))
 
-    def test_app_server_loaded_threads_prove_live_without_a_tui(self) -> None:
-        run = self.runs / "test-run"
-        run.mkdir()
-        (run / codex_mesh.SERVER_FILE).touch()
-        with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
-            self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.LiveConversation("codex", ()))
-        loaded.assert_called_once()
-        self.assertEqual(loaded.call_args.args[0], run)
-        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
-
-    def test_idle_astra_app_server_proves_its_thread_live_without_an_unknown_pid(self) -> None:
-        run = unit_runs.ASTRA_RUN_ROOT / "test-review"
-        run.mkdir(parents=True)
-        _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 998071}))
-        self.codex(rollout=False, arguments=["codex", "app-server"],
-                   environment={"CODEX_HOME": str(self.root / "account")})
-        with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
-            snapshot = herdr.codex_conversations()
-        self.assertEqual(herdr.read_conversation(self.identity, "codex", codex=snapshot), herdr.LiveConversation("codex", ()))
-        self.assertEqual(snapshot.unknown, ())
-        loaded.assert_called_once()
-        self.assertEqual(loaded.call_args.args[0], run)
-        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
-
-    def test_failed_app_server_read_is_unknown(self) -> None:
-        run = self.runs / "test-run"
-        run.mkdir()
-        (run / codex_mesh.SERVER_FILE).touch()
-        with patch.object(codex_mesh, "loaded_threads", side_effect=ValueError("loaded threads unavailable")):
-            observed = herdr.read_conversation(self.identity, "codex")
-        self.assertIsInstance(observed, herdr.UnknownConversation)
-        assert isinstance(observed, herdr.UnknownConversation)
-        self.assertIn("test-run", observed.reason)
-        self.assertIn("loaded threads unavailable", observed.reason)
-
     def test_managed_daemon_rollout_alone_does_not_prove_live(self) -> None:
         self.codex(arguments=["codex", "app-server", "--managed-daemon"])
         self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.StoppedConversation())
 
     def test_tab_name_read_failure_uses_registry_then_pid_for_both_runtimes(self) -> None:
-        self.codex(rollout=False)
+        self.codex(pane=False)
         record: sessions.SessionRecord = {"pid": 998071, "sessionId": self.launched, "name": "test-session",
             "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": []}
         for kind in ("claude", "codex"):
@@ -376,3 +343,45 @@ class ConversationReaderTests(StaffTestCase):
                 expected = "pid 998071" if registry_fails else "test-session"
                 self.assertIn(expected, output.getvalue())
                 self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+
+class LoadedThreadsTests(unittest.TestCase):
+    def test_native_clients_are_read_with_all_pages(self) -> None:
+        from scripts.agents.codex_test_support import StubAppServer
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]]:
+            params = request.get("params", {})
+            result: dict[str, object] = {}
+            if request.get("method") == "thread/loaded/list":
+                result = ({"data": ["second"]} if params else {"data": ["first"], "nextCursor": "page2"})
+            return [{"id": request["id"], "result": result}]
+
+        for response in (respond, respond):
+            server = StubAppServer(response)
+            self.addCleanup(server.close)
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+            client = herdr.LoadedThreadRpc(server.port, deadline)
+            self.addCleanup(client.connection.close)
+            self.assertEqual(herdr.loaded_threads(client, deadline), {"first", "second"})
+            self.assertEqual([request["params"] for request in server.requests
+                              if request["method"] == "thread/loaded/list"], [{}, {"cursor": "page2"}])
+
+    def test_a_failed_page_gives_no_partial_result_and_expiry_prevents_a_request(self) -> None:
+        from scripts.agents.codex_test_support import StubAppServer
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]]:
+            if request.get("method") == "thread/loaded/list":
+                return [{"id": request["id"], "error": {"message": "probe failed"}}]
+            return [{"id": request["id"], "result": {}}]
+
+        server = StubAppServer(respond)
+        self.addCleanup(server.close)
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        client = herdr.LoadedThreadRpc(server.port, deadline)
+        self.addCleanup(client.connection.close)
+        with self.assertRaisesRegex(ValueError, "probe failed"):
+            _ = herdr.loaded_threads(client, deadline)
+        requests = list(server.requests)
+        with self.assertRaisesRegex(ValueError, "timed out"):
+            _ = herdr.loaded_threads(client, time.monotonic())
+        self.assertEqual(server.requests, requests)

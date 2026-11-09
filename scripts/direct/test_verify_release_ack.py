@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 import json
 import os
 import subprocess
@@ -15,7 +17,6 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.lint import memory_admit as gate
 from scripts.build_hold import build_hold
 from scripts.direct import test_verify_untested_examples
 from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
@@ -132,7 +133,7 @@ PY
     def release_memory_after_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         _ = admission.occupy_host()
-        admission.free(8 * gate.GIB)
+        admission.free(8 * admission_records.GIB)
         recorded = False
 
         def release_on_wait(reply: wire.Reply) -> wire.Reply:
@@ -140,7 +141,7 @@ PY
             if isinstance(reply, wire.Wait) and not recorded:
                 recorded = True
                 _ = (self.root / "wait-states").write_text(json.dumps(self.entry()) + "\n")
-                admission.free(64 * gate.GIB)
+                admission.free(64 * admission_records.GIB)
             return reply
 
         _ = self.enterContext(mock.patch.object(admission.server, "reply_filter", side_effect=release_on_wait))

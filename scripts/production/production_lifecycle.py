@@ -19,7 +19,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.shutdown import stop_resume
-from scripts.lib import unit_runs
+from scripts.lib import main_publish
 from scripts.herdr import worker_panes
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
@@ -338,8 +338,11 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
             report("promote", "ok", detail)
     if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
-        pull_mac_checkout(promotion.mac.path, source)
-        report("promote", "ok", f"mac {promotion.mac.path} main pulled")
+        outcome = pull_mac_checkout(promotion.mac.path, source)
+        if isinstance(outcome, main_publish.MacPullPending):
+            report("promote", "ok", f"mac unreachable, pull pending: {promotion.mac.path}")
+        else:
+            report("promote", "ok", f"mac {promotion.mac.path} main pulled")
     return tip
 
 
@@ -596,7 +599,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     for item in prepared:
         unit = item.unit
         _ = stop_resume.stop_unit_workers(unit.member.id, record)
-        remaining = worker_panes.observe(unit.member.id, staff.snapshot()) if record.find(kind="worker", parent=unit.member.id) and unit_runs.worker_transport(worker_panes.worker_run(unit.member)) == "herdr" else []
+        remaining = worker_panes.observe(unit.member.id, staff.snapshot()) if record.find(kind="worker", parent=unit.member.id) else []
         if any(isinstance(state, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for state in remaining):
             held = True
             continue

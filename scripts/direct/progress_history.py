@@ -1959,6 +1959,19 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def complete_dispatch(session_dir: Path, slot: str, instance_id: str) -> None:
+    """Record completion in the slot that dispatch owns."""
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = _read_state(session_dir)
+            opened = _open_passes(state).get(slot)
+            if opened is not None and opened.get("instance_id") == instance_id:
+                _ = _close_slot_pass(session_dir, state, slot, "completed", plan_history.now_epoch())
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
     if not _state_path(session_dir).is_file():
@@ -4418,15 +4431,11 @@ def _run_plan_path(state: dict[str, object]) -> Path | None:
 
 
 def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], counted: Path) -> dict[str, object]:
-    """The counts with the run's phase added when the plan has no heading for it.
-
-    Start-phase refuses such a phase, so this only covers a phase opened before that
-    rule. Without it a report reads "19 of 31 done" beside "Phase 32".
-    """
+    """Add a numbered run phase when the plan has no heading for it."""
     phase = _object_dict(state.get("phase"))
     phase_id = _string(phase.get("id")) if phase is not None else ""
     order = counts.get("order")
-    if (phase is None or phase_id in ("", "ad hoc") or not isinstance(order, list)
+    if (phase is None or re.fullmatch(plan_history.PHASE_ID, phase_id) is None or not isinstance(order, list)
             or _run_plan_path(state) != counted or _plan_lists_phase(counted, phase_id)):
         return counts
     finished = _string(phase.get("status")) == "completed"
@@ -4441,19 +4450,20 @@ def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], co
 
 
 def _plan_lists_phase(plan: Path, phase_id: str) -> bool:
-    """Whether a heading names `phase_id` by its number or, as a standing plan writes
-    `### Phase 201 — types-unit-201`, by the first word of its title."""
+    """Return whether a numbered heading names `phase_id`."""
     try:
         phases, _ = plan_history.plan_phase_details(plan)
     except OSError:
         return False
-    return any(phase_id in (phase["id"], *phase["title"].split()[:1]) for phase in phases)
+    return any(phase_id == phase["id"] for phase in phases)
 
 
 def _phase_missing_from_plan(state: dict[str, object], phase_id: str) -> Path | None:
-    """The run's plan when it lists phases and none of them is `phase_id`."""
+    """Return the run's plan when it lacks the requested numbered phase."""
+    if re.fullmatch(plan_history.PHASE_ID, phase_id) is None:
+        return None
     plan = _run_plan_path(state)
-    if plan is None or phase_id == "ad hoc":
+    if plan is None:
         return None
     listed = _count_plan_phases(plan).get("available") is not True or _plan_lists_phase(plan, phase_id)
     return None if listed else plan

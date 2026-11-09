@@ -4018,9 +4018,14 @@ with patch.object(fcntl, "flock", admission):
         session_dir = self.start_run("reopen", 42_000)
         self.start_phase(session_dir, 42_010)
         self.start_slot_pass(session_dir, "impl", "impl", 42_020)
+        first_instance = str(self.pass_slots(session_dir)["impl"]["instance_id"])
         self.start_slot_pass(session_dir, "test", "fix", 42_030)
         peer_instance = self.pass_slots(session_dir)["test"]["instance_id"]
         self.start_slot_pass(session_dir, "impl", "fix", 42_040)
+        replacement = self.pass_slots(session_dir)["impl"]
+        with self.subTest(late_completion=first_instance):
+            progress_history.complete_dispatch(session_dir, "impl", first_instance)
+            self.assertEqual(self.pass_slots(session_dir)["impl"], replacement)
         finished = self.pass_events("reopen", "pass_finished")
         self.assertEqual(len(finished), 1)
         self.assertEqual(finished[0].get("team_slot"), "impl")
@@ -6237,8 +6242,8 @@ with patch.object(fcntl, "flock", admission):
         native = fixture_runtime_id("main-repaired")
         owner = fixture_member("showrunner", name="repair-owner")
         unit = fixture_member("unit", name="repair", parent=owner.id, runtime_id=native)
-        worker = fixture_worker("repair-worker", unit.id)
-        _ = (session_dir / "mesh_roster.json").write_text(json.dumps({worker.name: {"staff_id": worker.id}}))
+        state["owner_staff_id"] = unit.id
+        _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
         self.write_claude_transcript(native, "sonnet-5", "low")
         for identity in self.open_pass_and_activity(session_dir, started_at, native):
             self.assertEqual(
@@ -6452,7 +6457,14 @@ with patch.object(fcntl, "flock", admission):
         ))
         self.assertIsNone(state["phase"])
 
-    def test_start_phase_finds_a_standing_plan_phase_by_its_title_id(self) -> None:
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "final",
+            "--phase-title", "Final gate", at=70_000,
+        )
+        phase = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(phase["id"], "final")
+
+    def test_start_phase_accepts_a_standing_ticket_id_outside_the_numbered_plan(self) -> None:
         session_dir = self.start_run("standing", 0)
         plan_path = self.working_dir / "docs" / "standing.md"
         # style_plan.py next-phase writes the ticket id as the title, not the number.
@@ -6469,6 +6481,7 @@ with patch.object(fcntl, "flock", admission):
         ))
         phase = cast(dict[str, object], state["phase"])
         self.assertEqual(phase["id"], "types-unit-201")
+        self.assertIn("| 0 of 1 done |", self.run_progress(session_dir, 80_000))
 
     def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
         self,

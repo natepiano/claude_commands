@@ -41,14 +41,14 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
-from scripts.lib import atomic_file, conf, file_lock, unit_runs, models_registry  # noqa: E402
+from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 from scripts.whoami import usage_store  # noqa: E402
 from scripts.accounts import refusals  # noqa: E402
-from scripts.accounts import moves, worker_names, role_map  # noqa: E402
+from scripts.accounts import moves, worker_names, role_map, session_state  # noqa: E402
 from scripts.accounts.refusals import (  # noqa: E402
     KnownReset as KnownReset, NoResetKnown as NoResetKnown,
     ReadingWindow as ReadingWindow, NoWindow as NoWindow, FreshReading as FreshReading,
@@ -2752,6 +2752,20 @@ class PaneMoves(Protocol):
     def run_for_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> Path: ...
 
 
+class AccountWorkerActivity(Protocol):
+    @property
+    def row(self) -> staff.StaffRow: ...
+
+
+class AccountPaneReader(Protocol):
+    OpenWorker: type[AccountWorkerActivity]
+
+    def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot
+                        ) -> dict[staff.StaffId, list[AccountWorkerActivity]]: ...
+
+    def worker_state(self, observed: AccountWorkerActivity) -> Literal["idle", "busy", "unknown"]: ...
+
+
 class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause,
                  source_accounts: Mapping[str, str]) -> list[stop_results.MoveResult]: ...
@@ -2850,7 +2864,7 @@ class GroupMoveStarted:
 def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
-    """Resume pane workers on the destination; keep mesh-pinned workers on their existing path."""
+    """Resume workers on the destination in their existing conversations."""
     from scripts.production import staff, session_staff
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
     from scripts.herdr import herdr
@@ -2871,37 +2885,22 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             return f"cannot restart on {target} through assign.sh"
         return ""
 
-    runs_by_worker = session_staff.worker_run_index(record)
-
     if dry_run:
         lines: list[str] = []
         for row in rows:
-            run = pane_moves.run_for_worker(row, record)
             reason = restart_refusal(row.id)
-            preview = (f"would stop; restart on {target} stays pending" if unit_runs.worker_transport(run) == "mesh"
-                       else f"would stop and resume the same conversation on {target} in its worker pane")
+            preview = f"would stop and resume the same conversation on {target} in its worker pane"
             if reason:
                 preview = f"not moved: {reason}"
             lines.append(f"{row.name} ({row.id}): {preview}")
         return GroupMoveDryRun(identities, tuple(lines))
-    release_source = cast(stop_results.ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
     results: list[SessionMoveOutcome] = []
     for row in rows:
         try:
             run = pane_moves.run_for_worker(row, record)
-            if unit_runs.worker_transport(run) != "mesh":
-                reason = restart_refusal(row.id) if row.current_session else ""
-                results.append(SessionMoveRefused(row.id, reason) if reason else
-                               pane_moves.move_worker(row, record, target, why, run))
-                continue
-            with staff.row_operation(row.id):
-                if reason := restart_refusal(row.id):
-                    raise AccountsError(f"{reason}; source remains running")
-                released = release_source(row, lambda: runs_by_worker.get(row.id, ()), record.backends.get(row.id, staff.BACKEND_UNAVAILABLE))
-                if not isinstance(released, stop_results.SourceReleased):
-                    raise AccountsError(released.reason)
-                results.append(stop_results.ResumePending(row.id, target,
-                    "assign.sh cannot carry the staff id and destination account yet"))
+            reason = restart_refusal(row.id) if row.current_session else ""
+            results.append(SessionMoveRefused(row.id, reason) if reason else
+                           pane_moves.move_worker(row, record, target, why, run))
         except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr.HerdrFailure) as error:
             results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
     outcomes = tuple(results)
@@ -4774,7 +4773,6 @@ def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_U
 
 
 # Run folders under unit/, and under delegate/ for a run started before the rename.
-WORKERS_RUN_ROOTS = unit_runs.run_roots()
 
 
 @dataclass(frozen=True)
@@ -4906,7 +4904,14 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             group = role
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
-            counts.setdefault((directory, role), {})[identity] = "busy" if session.get("status") == "busy" else "idle"
+            if role == "workers":
+                state = "busy" if session.get("status") == "busy" else "idle"
+            else:
+                member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
+                state = session_state.classify(
+                    member_row if member_row is not None else session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")))
+            counts.setdefault((directory, role), {})[identity] = state
     # A member without a live session belongs to its selected role account.
     for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner")):
         if member.current_session in live or not local_member(member):
@@ -4916,23 +4921,28 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
-        counts.setdefault((directory, role), {})[str(member.id)] = "exited"
-        session_lines.append(f"session {member.current_session} ({member.name}): {selected}; exited")
-    from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
-
-    continuation_lines: list[str] = []
+        state = session_state.classify(member, session_state.NoLiveSession())
+        counts.setdefault((directory, role), {})[str(member.id)] = state
+        session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
-    for run, name, entry, home in (_worker_status_records(inputs) if include_workers else ()):
-        if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
-            counts.setdefault((Path(home), "workers"), {})[str(run / name)] = (
-                "busy" if entry.get("status") in ("running", "starting") else "idle")
-            observed_workers.update(str(entry.get(key, "")) for key in ("staff_id", "thread_id", "session_id"))
-        if entry.get("continuation_owed") is True:
-            reason = entry.get("continuation_reason")
-            if not isinstance(reason, str):
-                reason = ("waiting for capacity on the selected account" if entry.get("status") == "waiting_capacity"
-                          else "quota refusal; waiting for account recovery or a confirmed move")
-            continuation_lines.append(f"worker {run.name}/{name}: continuation owed — {reason}")
+    if include_workers and (parents := session_staff.pane_parents(membership)):
+        worker_panes = cast(AccountPaneReader, cast(object, import_module("scripts.herdr.worker_panes")))
+
+        for states in worker_panes.observe_parents(parents, membership).values():
+            for state in states:
+                evidence = session_staff.worker_backend(membership, state.row.id)
+                if not isinstance(evidence, session_staff.RecordedWorker):
+                    session_lines.append(f"worker {state.row.name}: {evidence.reason}")
+                    continue
+                status = worker_panes.worker_state(state)
+                if status == "unknown":
+                    reason = cast(object, getattr(state, "reason", "pane status is unknown"))
+                    session_lines.append(f"worker {state.row.name}: {reason}")
+                    continue
+                if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
+                    directory = evidence.backend.codex_home
+                    counts.setdefault((directory, "workers"), {})[state.row.current_session] = status
+                    observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
         and isinstance(membership.backends.get(member.id), staff.CodexBackend) and local_member(member)]
@@ -4946,7 +4956,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
                 counts.setdefault((directory, "workers"), {})[member.current_session] = process.activity
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
-                             tuple(session_lines), tuple(continuation_lines))
+                             tuple(session_lines), ())
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
@@ -5115,55 +5125,6 @@ def _role_session_counts(states: tuple[str, ...], _tool: Literal["claude", "code
     """Treat unknown live activity as idle without changing role membership."""
     busy, paused, exited = (states.count(state) for state in ("busy", "paused", "exited"))
     return RoleSessionCounts(busy, len(states) - busy - paused - exited, paused, exited)
-
-
-def _worker_status_records(inputs: set[Path]) -> list[tuple[Path, str, dict[str, object], str]]:
-    """Read each live mesh once for counts and the detail view's continuation lines."""
-    from scripts.message.unit_labels import read_object
-
-    found: list[tuple[Path, str, dict[str, object], str]] = []
-    for root in WORKERS_RUN_ROOTS:
-        inputs.add(root)
-        for path in sorted(root.glob("*/mesh_roster.json")):
-            inputs.update((path.parent, path, path.parent / "mesh_server.json"))
-            try:
-                raw = read_object(path)
-            except (OSError, ValueError):
-                continue
-            homes: dict[int, str] = {}
-            from scripts.agents import codex_mesh
-            try:
-                records = codex_mesh.run_server_records(path.parent)
-            except (OSError, ValueError) as error:
-                print(f"anomaly: {error}".replace("\n", " "), file=sys.stderr)
-                records = []
-            for record in records:
-                port, home = record.get("port"), record.get("codex_home")
-                if isinstance(port, int) and isinstance(home, str) and _mesh_server_running(record):
-                    homes[port] = home
-            if not homes:
-                continue
-            for name, value in raw.items():
-                if not isinstance(value, dict):
-                    continue
-                entry = cast(dict[str, object], value)
-                port = entry.get("port")
-                home = homes.get(port, "") if isinstance(port, int) else ""
-                found.append((path.parent, name, entry, home))
-    return found
-
-
-def _mesh_server_running(server: dict[str, object]) -> bool:
-    pid = server.get("pid")
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (OSError, OverflowError):
-        return False
-    return True
 
 
 def _workers_status_lines(now: datetime, selected: CodexWorkersAccount, continuation_lines: tuple[str, ...], *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> list[str]:

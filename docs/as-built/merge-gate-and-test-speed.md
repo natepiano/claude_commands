@@ -474,11 +474,12 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   This includes children that the leader waited for.
   Children killed during cleanup after their leader exits do not contribute to this reading.
   At run end, the runner writes the records atomically and retains entries for jobs that did not run.
-  A job killed at the module time limit does not replace or add a record.
+  A job stopped at its time or memory limit does not replace or add a CPU record.
   `GateJobResult.cpu_seconds` retains the reaped CPU time for that job.
 - **Rerun alone.** After all parallel jobs end, each failed test module runs once more, alone.
   Jobs killed at the module time limit and `types` do not run again.
-  If more than `RERUN_LIMIT` (8) modules qualify, none run again; one line reports the count.
+  If more than `RERUN_LIMIT` (8) ordinary failures qualify, those failures do not run again; one line reports the count.
+  Memory stops use their separate retry count even when ordinary failures exceed this limit.
   Each rerun uses the same launch, cleanup, arguments, environment, scope prefix, memory sampling, and time limit.
   A pass replaces the first failure and prints `Rerun alone: <suite>/<module> passed (first run exit N, X s)`.
   The report retains the first output under `--- <suite>/<module> passed on rerun alone; first run exit=N ---`.
@@ -496,9 +497,16 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Each running job retains `max(0, reservation − sampled memory)` as its remaining reservation.
   A new job starts when a CPU slot is free and `latest aggregate + remaining reservations + expected memory ≤ governor_mib`.
   With no job running, the governor always permits one job.
-  Completed jobs update their peak records; jobs killed at the module time limit do not.
+  Completed jobs update their peak records; jobs stopped at the time or memory limit do not.
   Samples do not change reservation sizes during the run.
-  Memory peaks do not kill jobs or fail the gate.
+  A test module above this limit stops, whether it runs alone or beside other jobs.
+  The sample includes resident and swapped memory for the module and its descendants.
+  The type-check job has no memory stop.
+  `memory_stop_reruns` in `config/merge_gate.conf` sets the reruns alone after a memory stop; the default is one.
+  The gate reads this count at use. Memory stops do not count toward the eight ordinary failures that prevent reruns.
+  Another memory stop after the last allowed rerun fails the gate and retains the reason.
+  Each stop sends sdlc a peer message with the gate, module, peak, limit, and next action.
+  A failed send prints one line and does not change the gate result.
   The gate record retains the key `cap_mib` for the governor value in MiB.
 - **Running job limit.** A module starts only when memory admits it and fewer than `max(1, (os.cpu_count() or 2) // 2)` jobs run: half the cores, with a minimum of one. The basedpyright job counts as one. `run_suites` accepts `max_running_jobs` for tests; there is no environment variable or command-line flag. The `Gate tests:` line names the limit once. On 2026-10-28, starting nearly all modules at once raised one-minute load from 71.6 to 339.7 and made every module 3–5 times slower.
 - **Cleanup.** When a job's leader exits, the runner SIGKILLs the job's whole process group, which catches leaked children. On any exit it kills and reaps every running group before the tmpfs dir is removed. It never kills a process outside its own groups.
@@ -608,7 +616,7 @@ The shim resolves relative paths and parent segments without another process or 
 
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
-**Stub app-server shutdown** (`scripts/agents/test_codex_mesh.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
+**Stub app-server shutdown** (`scripts/agents/codex_test_support.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
 
 ### Wait and sync overrides
 
@@ -621,7 +629,6 @@ The shim resolves relative paths and parent segments without another process or 
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
-| `RESIDENT_POLL_SECS`, `REAP_WAIT_SECS`, `REAP_POLL_SECS` | `scripts/agents/codex_mesh.py` | `1.0`, `5.0`, `0.2` | patched as module attributes |
 | `UNIT_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/direct_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
 | `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
@@ -661,7 +668,7 @@ The status line reads assignments from staff rows instead of these environment n
 
 - **Signals.** A test that signals a child restores `SIG_DFL` before exec and waits for a ready marker written after the child installs its handlers (for example `runner-signals-ready`).
 
-- **Fixture cleanup.** A fixture that times out reaps its process group and owned threads (`communicate_launcher`) before restoring the mesh stub or HOME.
+- **Fixture cleanup.** A fixture that times out reaps its process group and owned threads (`communicate_launcher`) before restoring the app-server fixture or HOME.
 
 - **In-process cases are synchronous only.** `invoke_cli` suits scripts that do not mutate containers held in module globals. Cache-holding functions (`_config_digest`) are cleared around each case.
 
@@ -752,7 +759,7 @@ The Bevy upgrade CLI tests (`scripts/bevy_upgrade/test_cli.py`) build one synthe
 
 The unit-transfer tests (`scripts/production/test_transfer_unit.py`) use `transfer_unit_test_support.py` to build one bare origin, two production checkouts, a linked unit worktree and isolated state per class, then restore private copies at the same absolute paths per test. Behavioral calls run the real transfer parser and handlers and fake herdr CLI in-process with process state and import-time paths restored; Git, the shutdown stub, worker conflicts and a CLI launch test use real processes. The paused writer's detached command remains live through transfer and finishes through its input pipe. The former-mark holder now signals readiness and waits for pipe closure instead of sleeping; the one 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs. Original assertions remain, including work-in-progress preservation, journal resumption after checkout moves, worker identity and live-holder refusals.
 
-Launcher claim tests restore a private completed-worker snapshot at its original paths through `implement_launcher_claims_test_support.py`. The snapshot comes from the real Bash launcher once per class; each case and nested recovery scenario receives independent claims, roster, durable identity and history. `test_implement_launcher_claims.py` keeps recovery and refusal coverage, while `test_implement_launcher_probes.py` and `test_implement_launcher_follow_probes.py` separately pin all thirty default one-second probes for new and followed workers. The probe stand-in records requested sleeps immediately; file events hold and release the real mesh child. Real Bash claim locking, launcher liveness, PID ownership, pass records and subprocess exit status remain exercised. The shared launcher fixture and its existing consumers retain their original behavior.
+Launcher claim tests restore a private completed-worker snapshot at its original paths through `implement_launcher_claims_test_support.py`. The snapshot comes from the real Bash launcher once per class; each case and nested recovery scenario receives independent claims, roster, durable identity and history. `test_implement_launcher_claims.py` keeps recovery and refusal coverage, while `test_implement_launcher_probes.py` and `test_implement_launcher_follow_probes.py` separately pin all thirty default one-second probes for new and followed workers. The probe stand-in records requested sleeps immediately; file events hold and release the real worker child. Real Bash claim locking, launcher liveness, PID ownership, pass records and subprocess exit status remain exercised. The shared launcher fixture and its existing consumers retain their original behavior.
 
 Claude launcher integration tests restore independent fixtures at the same absolute paths through `implement_launcher_claude_test_support.py`. `test_implement_launcher_claude.py`, `test_implement_launcher_claude_accounts.py` and `test_implement_launcher_claude_effort.py` cover repair identity, account cutover and registry effort; `test_implement_launcher_claude_panes.py` covers byte-preserving summaries and pane cleanup; `test_implement_launcher_claude_follow.py` covers transcript completion, unreadable listings and delivery failures. The real Bash launcher, account selection, recorder and worker-state tools remain subprocesses. The fake Claude CLI serves repeated listing/log replies with shell builtins and cat; its original Python background-launch implementation still records arguments, environment and UUID identity. Fake busy-to-idle and unreadable-to-readable transitions publish events consumed at the copied agent wrapper’s poll boundary, eliminating delays for state already ready. The shared launcher fixture retains its existing behavior.
 

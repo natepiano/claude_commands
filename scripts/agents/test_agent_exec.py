@@ -343,12 +343,12 @@ class ClaudeLauncherTests(unittest.TestCase):
     def test_shell_fixture_cannot_use_the_parent_session_state(self) -> None:
         parent = self.home / "parent-session"
         parent.mkdir()
-        paths = (parent / "mesh_roster.json", parent / "staff.json", parent / "impl_worker_impl.json")
+        paths = (parent / "progress_history_state.json", parent / "staff.json", parent / "impl_worker_impl.json")
         for path in paths:
             _ = path.write_text('{"parent": "must remain unchanged"}\n')
         before = {path.name: path.read_bytes() for path in paths}
         environment = {**self.environment, "UNIT_RUN_DIR": str(parent),
-            "PLAN_DELEGATE_BOARD_DIR": str(parent), "MESH_SESSION_DIR": str(parent),
+            "PLAN_DELEGATE_BOARD_DIR": str(parent), "UNIT_RUN_ROOT": str(parent),
             "STAFF_FILE": str(paths[1]), "STAFF_ID": "parent-worker",
             "WORKER_STAFF_ID": "parent-worker", "CODEX_THREAD_ID": "parent-thread",
             "CLAUDE_CODE_SESSION_ID": "parent-session", "ROSTER_RUN_ROOT": str(parent),
@@ -358,30 +358,6 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir()}, before)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("agent_exec tests passed", result.stdout)
-
-    def test_berth_fixer_account_selection_reaches_here_and_existing_window_launches(self) -> None:
-        worktree = self.home / "rust/berth-fix"
-        worktree.mkdir(parents=True)
-        ghostty = self.home / "bin/ghostty"
-        _ = ghostty.write_text(f"#!{sys.executable}\nimport os, sys\n"
-                               + "args = sys.argv[sys.argv.index('-e') + 1:]\n"
-                               + "env = {key: value for key, value in os.environ.items() if not key.startswith('CLAUDE')}\n"
-                               + "os.execvpe(args[0], args, env)\n")
-        ghostty.chmod(0o755)
-        for caller, expected in (("claude1", "claude1"), ("", "claude3"), ("legacy", "")):
-            environment = dict(self.environment)
-            if caller == "legacy":
-                _ = (self.home / ".claude.json").write_text(json.dumps({
-                    "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
-            elif caller:
-                environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
-            for arguments in (["--here"], []):
-                with self.subTest(caller=caller, arguments=arguments):
-                    result = subprocess.run(["bash", str(SCRIPTS / "berth_fix/launch.sh"), *arguments],
-                                            capture_output=True, text=True, check=True, env=environment, cwd=self.home)
-                    self.assertEqual(json.loads(result.stdout.splitlines()[0]), {
-                        "config": str(accounts.account_dir(expected)) if expected else "",
-                        "memory": str(self.home / ".claude") if expected else "", "token": ""})
 
 
 if __name__ == "__main__":

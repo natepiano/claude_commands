@@ -20,7 +20,6 @@ A pane worker's proved quota refusal marks its pass refused and keeps it open fo
 The move preserves its native conversation, pane, and terminal.
 The launcher reads the transcript before another submission.
 
-Only an existing run pinned to `mesh` uses the retained stopped-command notice.
 Its exited worker command tells the director the exact command to rerun on Claude.
 The launcher supplies `--stopped <session id> <worker> <command>` only after that command exits.
 Unknown directors receive no message; a waiting follow keeps its continuation.
@@ -39,7 +38,6 @@ The workers role changes through `swap workers`.
 A pane move stops a live agent, then resumes its conversation in the same pane.
 An active or refused pass receives one resume message; an idle worker receives no text.
 The log says `workers moved from <old> to <new>: <old> refused (<window> limit until <reset>)`.
-Only an existing mesh-pinned run uses the retained waiting follow and its held messages.
 That follow starts `Continue where you stopped.` before held messages when the new home becomes available or its wait ends.
 An exited command leaves its rerun to the director.
 
@@ -52,7 +50,6 @@ Codex move advice names its account and says `workers move to <picked> when Code
 Codex five-hour markers belong to a home's signed-in account and suppress repeated log lines during a low spell. Cleanup still retires queued Codex relays and escalation holds from older versions when the account changes, including when the selected account has no usage window. Unknown identity leaves that state alone. Claude notices continue independently.
 
 A proved turn refusal carries the account that served the native conversation.
-Only an existing run pinned to `mesh` uses the retained serving-server account after server retirement.
 An unknown refusing identity opens no fallback.
 A release failure or failed reviewer preparation command is not a provider refusal.
 Fallback state distinguishes no fallback, an account-owned fallback, and a legacy fallback with an unknown owner.
@@ -62,7 +59,6 @@ Entries share the time, tool, subject, and stable move id.
 A workers role write records `requested`; a proved destination resume records success for that worker.
 Pane moves record the request, confirmation, or failure by worker staff id and move id.
 The request includes the retained terminal.
-Only an existing run pinned to `mesh` uses `codex_mesh.py` to record its resumed worker confirmation.
 Failures, waits, wait completion, no room, and renewed room have separate entries.
 Readers skip malformed lines, including during duplicate confirmation checks.
 Requests omit an unknown `reset`; waits carry a known reset.

@@ -13,7 +13,6 @@ from unittest import mock
 from scripts.message import process_table
 
 
-MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/direct/../agents/codex_mesh.py"
 
 
 class ProcessTableTests(unittest.TestCase):
@@ -64,13 +63,7 @@ class ProcessTableTests(unittest.TestCase):
             30: process_table.Process(30, 10, "sleep", ""),
         })
 
-    def test_a_mesh_turn_and_a_plain_exec_are_agents(self) -> None:
-        self.assertTrue(process_table.is_codex_agent(
-            process_table.Process(1, 0, "python3", f"{MESH} start --name a"),
-        ))
-        self.assertTrue(process_table.is_codex_agent(
-            process_table.Process(1, 0, "python3", f"{MESH} follow --to a"),
-        ))
+    def test_codex_exec_is_an_agent(self) -> None:
         self.assertTrue(process_table.is_codex_agent(
             process_table.Process(1, 0, "codex", "codex exec --json"),
         ))
@@ -78,8 +71,6 @@ class ProcessTableTests(unittest.TestCase):
     def test_servers_wrappers_and_claude_workers_are_not_agents(self) -> None:
         for command, arguments in (
             ("codex", "codex app-server --listen ws://127.0.0.1:1"),
-            ("zsh", f"zsh -c {MESH} start --name a"),
-            ("python3", f"{MESH} can-follow --session-dir d"),
             ("bash", "bash /home/u/.claude/scripts/agents/agent_bg.sh a"),
         ):
             with self.subTest(arguments=arguments):

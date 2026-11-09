@@ -13,6 +13,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.direct import step_record
+from scripts.direct.step_selection import Pinned
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS
 from scripts.direct.verify_mac_offload_test_support import VERIFY
 from scripts.lib.shell_test_support import shell_functions
@@ -35,7 +36,7 @@ def read_step_row(call_id: str) -> dict[str, object]:
             location = {"kind": "natedev_only", "reason": reason}
     return dict(kind=record.kind, state=record.state.value, selected_target=record.selected_target,
                 updated=record.updated, runs_on=location, eligible_targets=list(record.eligible_targets),
-                pinned_target=record.selection.target if isinstance(record.selection, step_record.Pinned) else "",
+                pinned_target=record.selection.target if isinstance(record.selection, Pinned) else "",
                 package=step_record.package_name(record.package))
 
 

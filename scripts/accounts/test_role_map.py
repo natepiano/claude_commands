@@ -20,10 +20,6 @@ from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
-from scripts.agents import codex_mesh
-from scripts.direct import assign_gate
-from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
@@ -752,27 +748,6 @@ class RoleMapTests(unittest.TestCase):
                     f"accounts: workers is on codex1, which is {state} on this machine; {step}\n"))
                 launch.assert_not_called()
 
-    def test_mesh_launch_refuses_the_mapped_missing_account_with_one_line_before_starting_a_server(self) -> None:
-        self.seed(self.server_home, groups={})
-        run = self.home / "scratch-run"
-        run.mkdir()
-        prompt = run / "prompt.txt"
-        _ = prompt.write_text("Scratch worker task")
-        output, error = io.StringIO(), io.StringIO()
-        with (isolated_staff_file(self.home / "staff.json", {}),
-              patch.object(role_map, "ssh_role_map", side_effect=self.remote),
-              patch.object(codex_mesh, "_start_server") as start,
-              patch.object(assign_gate, "called_by_assign", return_value=True),
-              redirect_stdout(output), redirect_stderr(error)):
-            owner = unit_membership("fixture", "scratch")
-            _ = staff.set_worktree(owner.id, staff.PresentWorktree("mac", run), expected=owner.worktree)
-            with patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}):
-                code = codex_mesh.main(["start", "--session-dir", str(run), "--name", "scratch-test",
-                    "--role", "test", "--prompt-file", str(prompt),
-                    "--summary-file", str(run / "summary.txt"), "--log-file", str(run / "mesh.log")])
-        self.assertEqual((code, output.getvalue(), error.getvalue()), (1, "",
-            "accounts: workers is on codex1, which is not set up on this machine; run accounts.py setup codex1\n"))
-        start.assert_not_called()
 
     def test_status_keeps_its_table_and_prints_the_same_missing_setup_and_login_refusals(self) -> None:
         self.seed(self.server_home, groups={"units": "claude2", "showrunners": "claude2"})

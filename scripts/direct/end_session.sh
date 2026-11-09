@@ -36,7 +36,6 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # repo needs >= 3.12.
 PY="${BASH_SOURCE[0]%/*}/../lib/py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MESH="${SCRIPT_DIR}/../agents/codex_mesh.py"
 
 DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
 if [[ -z "${DIRECTOR_SESSION_ID}" ]]; then
@@ -54,7 +53,7 @@ else
   fi
 fi
 
-# The marker holds the session directory, which is where the mesh files live.
+# The marker holds the run folder.
 SESSION_DIR=""
 if [[ -f "${MARKER}" ]]; then
   SESSION_DIR="$(head -n 1 "${MARKER}")"
@@ -89,11 +88,6 @@ if (( ${#RUNS[@]} > 0 )); then
     "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}" || exit 1
   done
   "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
-  for run in "${RUNS[@]}"; do
-    if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" ]]; then
-      "$PY" "${MESH}" stop --pause --session-dir "${run}" || true
-    fi
-  done
   "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}" || true
   # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
 fi

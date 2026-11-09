@@ -529,6 +529,21 @@ class MainPublishTests(PublicationTestCase):
         self.assertIn("example.amount=3", result.stdout)
         self.assertIn("approved change", result.stdout)
         self.assertIn("Mac asleep", result.stdout)
+        with self.subTest(queue="zone notice"):
+            main_publish.queue_pull_only("example.amount", "still asleep")
+            waiting = main_publish.PendingMacPull(change.label, change.text, change.since, "still asleep")
+            self.assertEqual(main_publish.read_queue(), waiting)
+            main_publish.clear_pull_only()
+            self.assertEqual(main_publish.read_queue(), waiting)
+        with self.subTest(queue="pull only"):
+            queue_path.unlink()
+            main_publish.queue_pull_only("example.amount", "Mac asleep")
+            pending = main_publish.read_queue()
+            self.assertIsInstance(pending, main_publish.PendingMacPull)
+            assert isinstance(pending, main_publish.PendingMacPull)
+            self.assertEqual((pending.label, pending.text, pending.reason), ("example.amount", "", "Mac asleep"))
+            main_publish.clear_pull_only()
+            self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
 
 
 if __name__ == "__main__":

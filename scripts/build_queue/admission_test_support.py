@@ -1,6 +1,9 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
+from scripts.build_queue import step_estimator
+from scripts.lib import test_phase
+
 from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
@@ -33,9 +36,9 @@ from scripts.lib import build_folders
 from scripts.lib.socket_test_support import short_socket_directory
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
-GIB = gate.GIB
-DEFAULT_WIDTH = gate.RequestedTestWidth(8)
-DEFAULT_CALL = gate.CallRecord("call-1")
+GIB = records.GIB
+DEFAULT_WIDTH = records.RequestedTestWidth(8)
+DEFAULT_CALL = test_phase.CallRecord("call-1")
 FIXTURE_POLICY = admission_policy_fixture()
 
 
@@ -211,7 +214,7 @@ class TestProcesses:
     def spawn(self, used: int = GIB) -> wire.Owner:
         child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
-        start = gate.process_start_time(child.pid)
+        start = records.process_start_time(child.pid)
         if start is None:
             raise RuntimeError("child has no process start time")
         self.starts[child.pid] = start
@@ -228,13 +231,13 @@ class TestProcesses:
         return gate.process_table(self.path)
 
     def owner_start(self, pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
-        start = self.fixture_owners[pid] if pid in self.fixture_owners else gate.process_start_time(pid)
+        start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
 
-    def lifetime(self, row: gate.Reservation, owner_live: bool) -> gate.StepLifetime:
+    def lifetime(self, row: records.Reservation, owner_live: bool) -> gate.StepLifetime:
         return gate.reservation_lifetime(row, owner_live)
 
     def kill(self, owner: wire.Owner) -> None:
@@ -256,24 +259,24 @@ class PrivateReadings:
         self.host_path: Path = root / "meminfo"
         self.counts: Counter[str] = Counter()
 
-    def host(self) -> gate.HostMemory | gate.ReadingUnavailable:
+    def host(self) -> records.HostMemory | records.ReadingUnavailable:
         self.counts["host"] += 1
         try:
             return gate.read_meminfo(self.host_path)
         except Exception as error:
-            return gate.ReadingUnavailable(str(error))
+            return records.ReadingUnavailable(str(error))
 
-    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
+    def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         self.counts["pressure"] += 1
         return gate.read_pressure(host, policy=policy)
 
-    def compilers(self) -> list[gate.StepMemory]:
+    def compilers(self) -> list[records.StepMemory]:
         self.counts["compilers"] += 1
         return gate.sccache_memory()
 
-    def reservation(self, path: Path, row: gate.Reservation, now: datetime,
+    def reservation(self, path: Path, row: records.Reservation, now: datetime,
                     processes: dict[int, gate.ProcessIdentity], proc: Path,
-                    policy: gate.AdmissionPolicy) -> gate.StepMemory:
+                    policy: records.AdmissionPolicy) -> records.StepMemory:
         self.counts[f"reservation:{row['pid']}"] += 1
         return gate.reservation_memory(path, row, now, processes, proc, policy)
 
@@ -511,24 +514,24 @@ class AdmissionFixture(ExitStack):
             with mock.patch.object(self.server, "epoll", events):
                 self.server.run_once(0)
 
-    def build_history_generation(self) -> gate.BuildHistoryGeneration:
+    def build_history_generation(self) -> records.BuildHistoryGeneration:
         with self.loop_turn():
             reply, = self.server.handle_request(wire.BuildHistoryRequest())
         assert isinstance(reply, wire.BuildHistoryReply)
-        return gate.BuildHistoryGeneration(reply.generation)
+        return records.BuildHistoryGeneration(reply.generation)
 
     def request(self, *, need: int = 8 * GIB, owner: wire.Owner | None = None,
                 episode: str = "", since: float | None = None, age: float = 0,
-                width: gate.TestWidth = DEFAULT_WIDTH,
-                call: gate.Call = DEFAULT_CALL, step: str = "nextest",
+                width: records.TestWidth = DEFAULT_WIDTH,
+                call: records.Call = DEFAULT_CALL, step: str = "nextest",
                 run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
         from scripts.build_queue.admission_client import LOADED_ADMISSION_CODE_VERSION
 
         owner = owner or self.proc.spawn()
-        generation: gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration = gate.NoBuildHistoryGeneration()
+        generation: records.BuildHistoryGeneration | records.NoBuildHistoryGeneration = records.NoBuildHistoryGeneration()
         if step == "build":
             generation = self.build_history_generation()
-        profile = gate.StepProfile("fixture", step, "tree", gate.ExpectedPeak(need, "measured", 5),
+        profile = records.StepProfile("fixture", step, "tree", records.ExpectedPeak(need, "measured", 5),
             estimated_at=self.clock.now() - age, build_history_generation=generation)
         return wire.AdmitRequest(episode or f"episode-{owner.pid}", owner, ("cargo", step),
             str(self.root), self.clock.now() if since is None else since, "",
@@ -623,13 +626,13 @@ class AdmissionFixture(ExitStack):
         """Move the fake clock to the next permitted new start."""
         with self.loop_turn():
             spacing = self.server.spacing
-            if isinstance(spacing, gate.NextStartAt) and spacing.at > self.clock.now():
+            if isinstance(spacing, records.NextStartAt) and spacing.at > self.clock.now():
                 self.clock.advance(spacing.at - self.clock.now())
 
     def advance_idle_spacing(self) -> None:
         """Skip start spacing without changing the clock when no caller remains live."""
         if self.skip_idle_spacing and not self.server.caller_live(self.scenery_reservations):
-            self.server.spacing = gate.ReadyToStart()
+            self.server.spacing = records.ReadyToStart()
 
     def free(self, available: int) -> None:
         _ = fake_memory_readings(self.root, available_kib=available // 1024,
@@ -638,12 +641,12 @@ class AdmissionFixture(ExitStack):
     def compiler(self, used: int) -> None:
         path = self.root / "builds.slice/sccache.service/memory.stat"
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(f"anon {used}\ninactive_file 0\n")
+        _ = path.write_text(f"anon {used}\nshmem 0\ninactive_file 0\n")
         _ = (path.parent / "memory.current").write_text(str(used))
 
     def history(self) -> list[dict[str, object]]:
         path = self.state_dir / "anon_peaks.jsonl"
-        return list(gate.anonymous_history_rows(path))
+        return list(step_estimator.anonymous_history_rows(path))
 
 
     def state_text(self) -> str:
@@ -674,7 +677,7 @@ class AdmissionFixture(ExitStack):
         if not line.isdigit():
             raise unittest.SkipTest("user systemd refused the transient scope")
         pid = int(line)
-        start = gate.process_start_time(pid)
+        start = records.process_start_time(pid)
         if start is None:
             raise RuntimeError("scope shell exited before the test")
         query = subprocess.run(["systemctl", "--user", "show", "--property=ControlGroup", "--value", unit],
@@ -781,41 +784,41 @@ def reply_bytes(reply: wire.Reply) -> bytes:
     return wire.encode_reply(reply).encode()
 
 
-def queue_decision(available: int, total: int | gate.UnknownHostTotal, need: int,
-                   running: list[gate.StepMemory], pressure: gate.Pressure = gate.NO_PRESSURE_HOLD,
-                   *, policy: gate.AdmissionPolicy = FIXTURE_POLICY) -> gate.AdmissionDecision:
+def queue_decision(available: int, total: int | records.UnknownHostTotal, need: int,
+                   running: list[records.StepMemory], pressure: records.Pressure = records.NO_PRESSURE_HOLD,
+                   *, policy: records.AdmissionPolicy = FIXTURE_POLICY) -> records.AdmissionDecision:
     """Check a queued request while a held slot prevents the alone exception."""
-    steps: list[gate.RunningStep] = []
-    reservations: list[gate.Reservation] = []
+    steps: list[records.RunningStep] = []
+    reservations: list[records.Reservation] = []
     for index, memory in enumerate(running, 1):
-        promise = (memory.bytes if isinstance(memory, gate.PromisedMemory) else
-                   memory.promise.bytes if isinstance(memory, gate.MeasuredMemory)
-                   and not isinstance(memory.promise, gate.NoPromise) else 0)
-        step = gate.RunningStep(str(index), "fixture", "check", "/fixture", promise, memory, pid=index)
+        promise = (memory.bytes if isinstance(memory, records.PromisedMemory) else
+                   memory.promise.bytes if isinstance(memory, records.MeasuredMemory)
+                   and not isinstance(memory.promise, records.NoPromise) else 0)
+        step = records.RunningStep(str(index), "fixture", "check", "/fixture", promise, memory, pid=index)
         steps.append(step)
         if gate.running_has_reservation(step):
             reservations.append(fixture_reservation(index, promise))
     slots = () if reservations else (blocking_slot(NOW),)
-    row: gate.Waiter = {"pid": 1000, "start_time": "1000", "need": need, "since": NOW}
-    inputs = gate.QueueInputs([(Path("1000.waiting"), row)], tuple(steps), tuple(reservations),
-        gate.HostMemory(available, total), pressure, gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW, slots=slots)
+    row: records.Waiter = {"pid": 1000, "start_time": "1000", "need": need, "since": NOW}
+    inputs = records.QueueInputs([(Path("1000.waiting"), row)], tuple(steps), tuple(reservations),
+        records.HostMemory(available, total), pressure, records.ReadyToStart(), records.NoHeadAdmissionOverride(), NOW, slots=slots)
     return gate.admission_pass(inputs, NOW, policy).rows[0].decision
 
 
-def wait_reply(reason: gate.WaitReason, position: int = 1, head: str = "head",
+def wait_reply(reason: records.WaitReason, position: int = 1, head: str = "head",
                text: str = "free memory") -> wire.Wait:
     """Build a held reply with the same decision fields as a real pass."""
-    peak = gate.ExpectedPeak(8 * GIB, "fallback", 0)
+    peak = records.ExpectedPeak(8 * GIB, "fallback", 0)
     decision = queue_decision(0, 60 * GIB, peak.bytes, [], policy=admission_policy_fixture())
-    snapshot = gate.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
+    snapshot = records.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
                                          admission_policy_fixture(), ())
     return wire.Wait(reason, position, head, text, snapshot)
 
 
-def snapshot_with_head_cause(snapshot: gate.AdmissionWaitSnapshot,
-                             cause: gate.HeadCause) -> gate.AdmissionWaitSnapshot:
+def snapshot_with_head_cause(snapshot: records.AdmissionWaitSnapshot,
+                             cause: records.HeadCause) -> records.AdmissionWaitSnapshot:
     """Supply the cause that a real admission pass captures."""
-    status = gate.HeadAdmissionStatus(snapshot.decision, snapshot.peak.bytes,
+    status = records.HeadAdmissionStatus(snapshot.decision, snapshot.peak.bytes,
                                       snapshot.available, cause=cause)
     return replace(snapshot, head_reason=status)
 
