@@ -208,11 +208,18 @@ def remote_path(path: PurePosixPath) -> str:
     return shlex.quote(text)
 
 
+def mac_pull_command(mac: PurePosixPath, source: Path) -> str:
+    """Fetch main without shared fetch state and merge its advertised tip."""
+    url = f"natedev:{shlex.quote(str(source))}"
+    return (f"cd {remote_path(mac)} && tip=$(git ls-remote {url} refs/heads/main | cut -f1) "
+            f"&& git fetch -q --no-write-fetch-head {url} main "
+            "&& git merge -q --ff-only \"$tip\"; printf 'rc=%s\\n' \"$?\"")
+
+
 def pull_mac(checkout: Path, *, ssh_program: str, mac: PurePosixPath = DEFAULT_MAC_CHECKOUT,
              time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> MacPulled | MacPullFailed:
     """Return the completed Mac pull or its failure reason."""
-    done = ssh(f'cd {remote_path(mac)} && git pull -q --ff-only natedev:{shlex.quote(str(checkout))} main; '
-               + "printf 'rc=%s\\n' \"$?\"", ssh_program=ssh_program, time_limit=time_limit)
+    done = ssh(mac_pull_command(mac, checkout), ssh_program=ssh_program, time_limit=time_limit)
     if isinstance(done, str):
         return MacPullFailed(done)
     match = re.search(r"(?:^|\n)rc=(\d+)", done.stdout)
