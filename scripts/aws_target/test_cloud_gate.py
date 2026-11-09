@@ -184,6 +184,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(reply.returncode, 143, reply.stderr)
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
                          ledger.GateTerminated(int(self.now), 'i-fixture'))
+        self.assertEqual(cloud_gate.read(self.folder / 'outcome.json'), {
+            'status': 'fallback', 'reason': 'The worker stopped, so its instance was terminated'})
 
     def test_each_log_download_publishes_module_progress(self) -> None:
         self.fake.log = ('Runner: 1 modules, whole machine, 32 CPUs\n'

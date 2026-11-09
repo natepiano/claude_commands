@@ -31,6 +31,11 @@ progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earl
 
 ### The record
 
+`build` uses the owner's staff folder when no working directory is supplied.
+A failed staff read remains an error in the result.
+The reader never substitutes the caller's current directory.
+Phase notes store the unit's fixed staff id in `unit:`.
+
 ```python
 build_plan(plan_path: Path) -> PhaseRecord      # raises NoPlan
 build(session_dir: Path) -> PhaseRecord         # raises NoState, NoPlan
@@ -136,7 +141,10 @@ A plan outside a production writes no note.
 - **Publication.** The writer checks ownership under the folder lock. Identical content keeps the existing bytes, inode, and modification time. Changed content uses a temporary file with mode `0o644`. The writer replaces an owned target with `os.replace`. A first write uses `os.link` and refuses a target that appears during publication. A foreign target remains unchanged. The writer does not add a Git exclusion. Existing installations must remove the old `showrunners/` entry from the vault’s `info/exclude`. The existing `agent-notes` vault part includes live phase notes only when its own generated notes already need a content commit. Selection uses the writer’s `phase_note_ownership` parser. Deleted notes use their content from `HEAD` for this check. It includes only owned live-note deletions. It leaves unrelated changes alone. Phase notes alone cause no commit. The existing ten-minute `hanadocs-push` job pushes these commits. No new job or schedule is required.
 - **Archive.** `_archive_note(candidate, vault_root, name)` moves an owned note to `<vault>/archive/<showrunner folder>/<showrunner name>/<name>.md`. Here, `<vault>` is the parent of the live-note root. Live-note scans and commits do not include archive files. The move uses `os.link` then `unlink`. An existing target remains unchanged. A repeated archive uses `<stem>-2.md`, then `<stem>-3.md`. An operating system error raises `Refusal` with the path and cause. A failed unlink removes the new link first. The writer removes an empty source folder after the move.
 - **`archive`.** Archives every owned note whose `production` is the showrunner staff name, live or retired unit alike; hand-written notes and other productions' notes stay. It prints one archived path per line and exits 0 also when nothing moved; a vault root whose parent does not exist archives nothing. `production_lifecycle.py wrap` runs it.
-- **Moves and `prune`.** After the write, every other `*.md` under `<vault root>/*/` with the same ownership is removed, with its folder when that leaves it empty; a renamed unit session or showrunner moves the note by this rule. `prune` archives every owned note under `<vault root>/*/` whose `production` is the showrunner staff name and whose `unit` is not a live Units row, removing each folder it leaves empty.
+- **Moves and pruning.** After a write, the writer removes other notes with the same ownership.
+  It removes a folder when that removal leaves it empty.
+  `prune` resolves ownership through staff and archives notes whose unit is no longer live in that production.
+  Fixed unit ids preserve ownership through a rename.
 
 ### Recorder side
 
@@ -212,7 +220,8 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - `show --production-doc` reads neither `--zone` nor `--json`. It turns only an unreadable plan into `unavailable`; an unreadable production doc fails the whole call.
 - An `eta` call reads a typed time in the user's zone setting, never the machine's zone or the process `TZ` (2026-10-12). `HH:MM` means today only; a later-day ETA needs the full date. `eta.md` and `eta_breakdown.md` call the recorder installed under `~/.claude`, so a recorder change reaches them only once it is on main.
 - `scripts/production/showrunners.py` reads its two directories once, at import. A test that runs `refresh` in a subprocess sets them in the child's environment; a test that calls `phase_table.main()` in process patches the module constants. `scripts/production/fake_showrunner.py` (`write_timer`, `write_session`) supplies the running showrunner a note needs.
-- `add_unit.py` imports its siblings by bare name, so `phase_table.py` puts `scripts/production` on `sys.path` before its `scripts.production` imports. The form type-checks with no ignore and runs from any working directory.
+- `phase_table.py` imports production helpers through their `scripts.production` package names.
+  Entry scripts use the [shared package bootstrap](merge-gate-and-test-speed.md#python-package-imports).
 - A vault on a file system without hard links refuses a note's first write with one line. A showrunner name of `.` or `..`, or one holding `/` or NUL, is refused.
 - `production_lifecycle.py wrap` archives every generated note owned by the production before marking its doc wrapped, so another production can reuse the session name and publish a fresh note.
 - The archive sits outside `showrunners/`. Live-note scans use `vault_root.glob("*/*.md")` and do not include archive files.

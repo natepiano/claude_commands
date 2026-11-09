@@ -2,11 +2,6 @@
 
 ## Items to consider
 
-- [ ] **Read the mesh queue grace from configuration**
-  - Target: `scripts/agents/codex_mesh.py` (`QUEUE_GRACE_SECS`, `queue_grace_secs()`), `config/models.conf`.
-  - Why needed: the production grace is still a code literal, against the user's no-hard-coded-config rule (2026-10-31). Keep the showrunner's 2026-10-31 timing decision.
-  - Completion condition: `queue_grace_secs()` reads `conf.read("models").number("queue_grace_secs")` at use. `# range: 0..` sits directly above the key under `[codex_mesh.options]`. No code copy of `3.0` remains. `CODEX_MESH_QUEUE_GRACE_SECS` stays the test override. `CONF_DIR` tests cover configured values, valid-history recovery, and refusal without usable history. Land the unchanged configuration value before the consumer.
-  - Revealed by: Phase 6b; target corrected by the Phase 3t architect review (the registry moved to `config/models.conf`).
 - [ ] **A simplify lens test leaves no child process alive**
   - Target: `scripts/direct/test_simplify_lens.py`
   - Why needed: an `agent_exec` child of this test stayed alive for 8 hours after the test ended.

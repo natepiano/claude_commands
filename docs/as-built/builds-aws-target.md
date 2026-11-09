@@ -67,7 +67,10 @@ An interruption marker reports the instance generation.
 
 ### Cost ledger and spending guard: `scripts/aws_target/`
 
-- `config.py` reads the spending settings into `SpendingSettings`. Only a usable live limit permits spend. A committed value that `conf` recovers never permits spend (`conf.value_origin`: `UsableLiveValue`, `RecoveredValue`, `UnavailableValue`).
+- `config.py` reads the spending settings into `SpendingSettings`.
+  Only a usable live limit permits spend.
+  `ConfigRead.origin` returns `UsableLiveValue`, `RecoveredValue`, or `UnavailableValue`.
+  A recovered value never permits spend.
 - `ledger.CostLedger` is a locked, atomic JSON ledger. It records instance-state observations, price samples, charged intervals, compute requests, reconciliations and limit events. Times are integers and money is `Decimal`. Intervals split at day and month boundaries in the accounting zone. A corrupt ledger keeps its evidence and refuses new spend.
 - The estimate uses Spot price history, `fallback_usd_per_hour` when no sample exists, and the fixed costs (retained and root storage, IPv4, gp3 performance, Cost Explorer reads). Fixed costs continue while the instance is stopped.
 - `spending_guard` returns `SpendingAllowed`, `SpendingRefused` or `SpendingUnavailable`. It refuses when the estimate plus `limit_reserve_usd` reaches either cap. Each decision is written through `ledger._decision_record`. Readers decode that record and never compute the decision again.

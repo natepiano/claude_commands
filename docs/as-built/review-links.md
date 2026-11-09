@@ -547,6 +547,21 @@ Give the link only if the result is `200`. To see the page title too, run `curl 
 
 ## Configuration
 
+### Code changes
+
+`ReviewLinksServer.service_actions` checks loaded checkout modules through `loaded_module_stamps`.
+`code_check_seconds` in `config/review_links.conf` sets the interval, initially five seconds.
+Each stamp holds `st_mtime_ns` and `st_size`.
+An unreadable file, a file modified at or after process start, or a changed stamp raises `CodeChanged`.
+The server prints the changed path, closes its socket, and calls `os.execv(sys.executable, sys.orig_argv)`.
+The replacement keeps the pid and environment.
+A failed replacement exits for the service manager to restart.
+An active verdict delivery postpones the code check without replacing the saved stamps.
+The next check can therefore detect the same change.
+No merge-time restart command is needed.
+
+### Settings
+
 The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when each operation starts.
 `server_port` selects the server port and the port in published URLs.
 `tailscale_timeout_seconds` limits address commands.
