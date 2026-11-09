@@ -427,6 +427,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS claude_message ON turns (machine, turn_key)
     WHERE family = 'claude';
 CREATE INDEX IF NOT EXISTS turns_at ON turns (at);
 CREATE INDEX IF NOT EXISTS turns_agent_at ON turns (machine, family, parent_id, agent_id, at);
+CREATE INDEX IF NOT EXISTS turns_director_cost ON turns (at, machine, agent_id, model, input, cache_read, cache_write_5m, cache_write_1h, output)
+    WHERE role = 'director';
 CREATE TABLE IF NOT EXISTS compactions (
     machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
     agent_id TEXT NOT NULL, at TEXT NOT NULL,
