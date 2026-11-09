@@ -24,7 +24,7 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 
 from scripts.style import style_sync
-from scripts.style.add_style import NoStyleProduction
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.style import style_ledger
@@ -32,8 +32,9 @@ from scripts.style import style_rules
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners, staff
-from scripts.production.staff_test_support import recorded_showrunner
-from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
+from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
+from scripts.style.style_config import StyleUnitAssignment
 from scripts.message import send_budget, session_send
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -179,11 +180,26 @@ class StyleSyncTests(unittest.TestCase):
     def production(self, branch: str = "main") -> None:
         _ = self.git("worktree", "add", "-q", "--detach", str(self.style))
         self.doc.parent.mkdir(parents=True)
-        _ = self.doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** {branch}\n")
+        _ = self.doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** {branch}\n" +
+                                f"- **Merge branch:** style/main\n- **Showrunner checkout:** {self.style}\n")
+        write_style_units(self.doc)
         owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
         assert isinstance(owner.doc, staff.LiveDoc)
         owner.doc.path.unlink()
         _ = recorded_showrunner(owner.name, self.doc)
+
+    def direct_production(self) -> None:
+        self.doc = self.repo / ".git/style-production.md"
+        _ = self.doc.write_text(
+            f"# Production\n- **Kind:** product\n- **Merge branch:** main\n- **Showrunner checkout:** {self.repo}\n")
+        assignments = (StyleUnitAssignment("names", ("names", "values")),
+                       StyleUnitAssignment("types", ("types", "modules")))
+        write_style_units(self.doc, assignments)
+        owner = recorded_showrunner("sample-style", self.doc)
+        for assignment in assignments:
+            worktree = self.root / f"direct-{assignment.unit}"
+            _ = self.git("worktree", "add", "-qb", f"unit-{assignment.unit}", str(worktree))
+            _ = fixture_unit_location(owner, assignment.unit, worktree)
 
     def notice(self, repo: Path | None = None) -> tuple[int, str]:
         output = io.StringIO()
@@ -309,6 +325,70 @@ class StyleSyncTests(unittest.TestCase):
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(ledger.synced_commit(), self.tip)
             self.assertIsInstance(ledger.tip_seen(tip), style_ledger.UnseenTip)
+
+    def test_direct_own_tree_comparison_uses_the_unit_branch_and_records_main(self) -> None:
+        self.direct_production()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(self.tip, "main")
+        _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
+        _ = self.git("commit", "-qam", "Change main")
+        tip = self.git("rev-parse", "HEAD")
+        arguments = ["own-handoff", "--repo", str(self.repo), "--tip", tip,
+                     "--style-branch", "main", "--unit", "names"]
+        self.assertEqual(style_sync.main(arguments), 1)
+        with style_ledger.open_ledger(self.repo) as ledger:
+            self.assertEqual(ledger.synced_commit(), self.tip)
+            self.assertIsInstance(ledger.tip_seen(tip), style_ledger.UnseenTip)
+        _ = style_sync.git(self.root / "direct-names", "merge", "--no-ff", "-qm", "Sync main", "main")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(style_sync.main(arguments), 0)
+        with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(ledger.synced_commit(), tip)
+            self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
+
+    def test_processed_tip_does_not_skip_a_second_direct_units_main_merge(self) -> None:
+        self.direct_production()
+        _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
+        _ = self.git("commit", "-qam", "Change main")
+        tip = self.git("rev-parse", "HEAD")
+        _ = style_sync.git(self.root / "direct-names", "merge", "--no-ff", "-qm", "Sync main", "main")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(tip, "main")
+            ledger.tip_done(tip)
+        arguments = ["own-handoff", "--repo", str(self.repo), "--tip", tip,
+                     "--style-branch", "main", "--unit", "types"]
+        self.assertEqual(style_sync.main(arguments), 1)
+        self.assertEqual(self.git("rev-parse", "unit-types"), self.tip)
+        _ = style_sync.git(self.root / "direct-types", "merge", "--no-ff", "-qm", "Sync main", "main")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(style_sync.main(arguments), 0)
+        self.assertNotEqual(self.git("rev-parse", "unit-types"), tip)
+        self.assertEqual(self.git("merge-base", "unit-types", tip), tip)
+
+    def test_direct_startup_reconciles_main_without_parent_lookup_or_handoff_replay(self) -> None:
+        self.direct_production()
+        with (mock.patch.object(style_sync, "runner_value") as lookup,
+              mock.patch.object(style_sync, "replay_handoffs") as replay,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(style_sync.main([
+                "resume", "--repo", str(self.repo), "--production", "names",
+                "--branch-point", "unused", "--style-branch", "unused",
+            ]), 0)
+        lookup.assert_not_called()
+        replay.assert_not_called()
+        with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(ledger.synced_commit(), self.tip)
+            self.assertEqual(connection.execute("SELECT branch_point FROM reconciliation").fetchone(), ("main",))
+            self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
+
+    def test_direct_route_refuses_handoff_without_creating_a_record(self) -> None:
+        self.direct_production()
+        with mock.patch.object(style_sync, "runner_value") as lookup, redirect_stderr(io.StringIO()):
+            self.assertEqual(style_sync.main([
+                "send-handoff", "--repo", str(self.repo), "--production", "names", "--checkpoint", self.tip,
+            ]), 2)
+        lookup.assert_not_called()
+        self.assertEqual(self.handoff_rows(), [])
 
     def test_unavailable_wait_owner_does_not_block_a_later_healthy_wait(self) -> None:
         self.production()
@@ -445,6 +525,32 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.recorded_wakes(), [])
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
 
+    def test_configured_direct_route_wakes_waiters_without_a_style_showrunner(self) -> None:
+        self.direct_production()
+        self.waiting_units("names", "types")
+        self.wake_sender()
+        self.assertIsInstance(standing_style_production(self.repo), NoStyleProduction)
+        style_sync.wake_waiters(self.repo, "3001")
+        self.assertEqual([arguments[1] for arguments in self.recorded_wakes()],
+                         ["session:fake-names", "session:fake-types"])
+        self.assertEqual(self.remaining_waiters(), [])
+
+    def test_main_move_notifies_only_configured_direct_units(self) -> None:
+        self.direct_production()
+        self.wake_roster(("names", "types", "modules"))
+        self.handoff_sender("SENT: fixture", 0)
+        with mock.patch.object(style_sync, "runner_value") as lookup:
+            self.assertEqual(self.notice(), (0, ""))
+        lookup.assert_not_called()
+        notices = self.handoff_notices()
+        self.assertEqual([notice[1] for notice in notices], ["session:fake-names", "session:fake-types"])
+        self.assertEqual([notice[notice.index("--key") + 1] for notice in notices],
+                         ["style-sync:names", "style-sync:types"])
+        self.assertTrue(all(f"From style_sync: branch point main moved to {self.tip[:7]}; sync." in notice
+                            for notice in notices))
+        style_sync.notify(self.repo, "another", self.tip)
+        self.assertEqual(self.handoff_notices(), notices)
+
     def test_director_without_an_address_does_not_block_other_waiters(self) -> None:
         self.production()
         self.checkpoint_for_wake()
@@ -548,7 +654,7 @@ class StyleSyncTests(unittest.TestCase):
                     self.assertIn("style_sync: notify: send.py:", output)
 
     def test_notify_lookup_refusal_prints_one_prefix_and_keeps_the_merge_successful(self) -> None:
-        with mock.patch.object(style_sync, "standing_style_production",
+        with mock.patch.object(style_sync, "sync_productions",
                                side_effect=ValueError("style_sync: invalid production")):
             self.assertEqual(self.notice(), (0, "style_sync: notify: invalid production\n"))
         self.assertFalse((self.root / "sent.json").exists())
