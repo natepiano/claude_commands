@@ -44,8 +44,9 @@ from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
-from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted
-from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, ci_step
+from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted, caller_admission
+from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
+from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
 from scripts.lint import nextest_budget as budget
 from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
 from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, commit_config_fixture
@@ -4868,6 +4869,51 @@ class ProcessMemoryTests(unittest.TestCase):
                 self.assertIsInstance(result.rows[0].blocker, gate.NoSingleBlocker)
 
 
+class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
+    def test_detached_verify_cargo_and_lint_steps_ask_the_private_queue(self) -> None:
+        _ = self.package("sample")
+        cargo = self.root / "stubs/cargo"
+        source = cargo.read_text().replace('"check --workspace")', '"check --workspace"|"clippy --workspace")')
+        _ = cargo.write_text(source)
+        git = self.root / "stubs/git"
+        source = git.read_text().replace('    *" ls-tree "*) : ;;',
+            '    *" ls-files "*) printf "Cargo.toml\\0" ;;\n    *" ls-tree "*) : ;;')
+        _ = git.write_text(source)
+        reader = self.root / "lint-config.sh"
+        _ = reader.write_text('lint_config_enabled() { [[ "$1" == check || "$1" == clippy ]]; }\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        taplo = self.root / "stubs/taplo"
+        _ = taplo.write_text("#!/bin/sh\nexit 0\n")
+        taplo.chmod(0o755)
+        self.environment.update({"UNIT_DETACHED_RUN": "1", "BUILDLOG_OFF": "0",
+            "TEST_METADATA": json.dumps(workspace_metadata(self.root))})
+        _ = self.environment.pop("BUILDLOG_RUN", None)
+        _ = write_config_fixture(self.root / "build_targets.conf",
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        admission = caller_admission(self, self.root, self.environment)
+        grants: list[tuple[str, wire.RunIdentity | wire.NoRun]] = []
+
+        def capture(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.Admitted):
+                record, = (record for record in admission.server.reservations.values()
+                    if record.reservation_id == reply.reservation)
+                grants.append((record.step, record.run))
+            return reply
+
+        admission.server.reply_filter = capture
+        for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
+            with self.subTest(command=command):
+                grants.clear()
+                result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
+                    env=self.environment, start_new_session=True, capture_output=True, text=True,
+                    check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([grant[0] for grant in grants], [step])
+                for name, run in grants:
+                    self.assertIsInstance(run, wire.RunIdentity, name)
+                self.assertEqual(admission.caller_reservations(), {})
+
+
 class ShellTests(unittest.TestCase):
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
 
@@ -6156,6 +6202,18 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertEqual(reading.swap_bytes, GIB)
         (scope / "memory.stat").unlink()
         self.assertEqual(gate.unowned_slice_memory([], {}, self.proc), ())
+
+
+    def test_detached_slice_excludes_its_scopes_without_hiding_a_build_sibling(self) -> None:
+        builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+        detached = builds / "builds-detached.slice"
+        write_scope(detached, current=4 * GIB, anonymous=4 * GIB)
+        write_scope(detached / "python.scope", members=(123,), current=3 * GIB, anonymous=3 * GIB)
+        write_scope(detached / "python.scope/child.scope", current=GIB, anonymous=GIB)
+        sibling = builds / "build.scope"
+        write_scope(sibling, current=2 * GIB, anonymous=2 * GIB)
+        readings = gate.unowned_slice_memory([], gate.process_table(self.proc), self.proc)
+        self.assertEqual([(reading.cgroup, reading.bytes) for reading in readings], [(str(sibling), 2 * GIB)])
 
 
     def test_unreadable_or_invalid_ci_stat_records_a_diagnostic(self) -> None:

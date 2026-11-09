@@ -510,6 +510,7 @@ def read_audit_processes(
         if isinstance(selection, FullBuildAudit):
             try:
                 in_build_scope = any("/builds.slice/" in line
+                                     and "/builds.slice/builds-detached.slice/" not in line
                                      for line in (directory / "cgroup").read_text(errors="replace").splitlines())
             except OSError:
                 pass

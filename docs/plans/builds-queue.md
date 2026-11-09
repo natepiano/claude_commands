@@ -1372,7 +1372,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
 
-### Phase 23 — Detached Python runs have their own group and count in Other  · status: todo
+### Phase 23 — Detached Python runs have their own group and count in Other  · status: done
 
 **Depends on:** none. The detached runs live in `scripts/agents/detached_runs.py` and `config/detached_runs.conf`. Source: user, 2026-11-06.
 
@@ -1382,17 +1382,21 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Spec:**
 
-1. **User rulings.** "i think the workers detached python tests will almost never be that heavyh weight so it's good that they don't count against the build queue". "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc."
+1. **User rulings.** "i think the workers detached python tests will almost never be that heavyh weight so it's good that they don't count against the build queue". "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc." The user approved the group name `builds-detached.slice` on 2026-11-06.
 2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the `--slice=builds.slice` argument in `detached_runs.py`. The limits of `builds.slice` still hold it.
-3. **Reader.** The scope reader in `memory_admit.py` (line 2648 today) treats the child group as part of the one builds total, and it makes no row for that group. A reserved cargo step inside it counts once, as a build.
-4. **Page.** `memory_feed.py` makes no row for the group (line 419 today in the session prototype; `scripts/build_page/` after the build page moves). Its memory reads as Other.
+3. **Reader.** The scope reader `unowned_slice_memory` in `memory_admit.py` treats the child group as part of the one builds total, and it makes no row for that group. A reserved cargo step inside it counts once, as a build.
+4. **Page.** `scripts/build_queue/memory_feed.py` makes no row for the group. Its memory reads as Other.
 5. **Trace rule.** Remove only the rule that shows a detached process group as a run because its processes trace to a live run. Keep the service's registered run identity (`admission_service.py:910`), the held-run rows (`queue_view.py:272`) and the card that a person selects by owner (`queue_card.py:217`).
 6. **Proof.** Tests: a Python process in the group reads as Other and has no row; a reserved cargo descendant counts once; a cargo and a lint step inside a detached `verify.sh` ask the queue; a held run keeps its row.
 
 **Files:**
 - `scripts/agents/detached_runs.py`
+- `scripts/agents/test_detached_runs.py`
 - `scripts/lint/memory_admit.py`
 - `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/memory_feed.py`
+- `scripts/build_queue/test_memory_feed.py`
+- `scripts/build_queue/scope_activity.py`
 - `scripts/build_queue/test_queue_view.py`
 - `docs/as-built/build-memory-admission.md`
 
@@ -1419,13 +1423,14 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** a row for runs outside the queue in `/build:queue`.
 
-### Phase 23 — Detached Python runs show under Other  · status: todo
+### Phase 23a — Queue boundary imports stay small, if a prototype shows a real gain  · status: todo
 
-**Depends on:** none. The config is `config/detached_runs.conf` (user-approved, 2026-11-06).
+**Depends on:** Phase 23.
 
-1. **The ask (user, 2026-11-06).** "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc." The user approved the group name `builds-detached.slice`.
-2. **Outline.** Detached Python test runs start in `builds-detached.slice`, not `builds.slice`. They do not ask the queue (10v does not land). The memory page shows their memory in the Other group; `/build:queue` does not show them.
-3. The Work Order follows at phase start, after herdr's Phase 18 is on builds.
+1. **The ask (builds, 2026-11-09, from natest's measurement).** The queue boundary pulls in admission imports at 46 test starts. The ceiling is 18.7 CPU seconds for each whole gate. "Prototype separating them, measure, keep it only if the gain is real."
+2. **Source.** Item 2 of the phase 114 follow-up proposals: separate the queue boundary interface from admission imports that ordinary style commands do not use. The next measurement targets are `queue_place` and `admission_records`.
+3. **Order of work.** Measure a disposable prototype first. 18.7 CPU seconds is a ceiling, not a gain. Keep the change only if the measured gain is real; otherwise close the phase with the measurement.
+4. **Coordination.** The style side goes through devtools. The Work Order follows at phase start.
 
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
 **Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`). 18c also changes `linux_runner.py`, and 10g changes the offload path. The second to land resolves; the director names the merge owner before the work runs in parallel (architect review of 18, 2026-11-06).

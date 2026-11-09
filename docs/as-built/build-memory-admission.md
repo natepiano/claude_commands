@@ -142,6 +142,7 @@ Not in this repo; listed because the code here reads it.
 | Piece | Setting |
 | --- | --- |
 | `builds.slice` (user slice, `modules/linux/development.nix`) | `MemoryMax=44G`, no `MemoryHigh`, `MemorySwapMax=4G`, `CPUWeight=20` against `app.slice`'s 100, so the sessions and their panes get the CPU first. CI's `hana.slice` sits at 5 against `user.slice`'s 100 (`modules/linux/hana-runners.nix`). Holds every recorded step's scope (`run-*.scope`), the `sccache.service` user service, and the `buildlog` unit (nightly Rust trial, `OOMScoreAdjust=200`). |
+| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. Direct cargo calls take the hold check and enter a new scope in `builds.slice`. Reserved cargo and lint steps still ask the queue. Their memory counts once as build memory through their reservations. |
 | `sccache.service` | Runs the server in the foreground with `SCCACHE_NO_DAEMON=1` and `SCCACHE_START_SERVER=1` on `ExecStart` only; takes the port from an already running server on start; `RestartSec=5`. Every compile handed to sccache therefore runs inside `builds.slice`. `OOMScoreAdjust=500`, so its compiles rank with the build steps. |
 | `hana-ci.slice` | `MemoryMax=18G` only, `MemorySwapMax=2G`, no `MemoryHigh`. Runners `OOMPolicy=continue`. |
 | CI slot pool | `/dev/steve-ci`, 14 slots, separate from the sessions' `/dev/steve` (31 slots). Runners: `CARGO_MAKEFLAGS=--jobserver-auth=fifo:/dev/steve-ci`, `BindPaths=-/dev/steve-ci`, `DeviceAllow` `char-rtc r` and `/dev/steve-ci rw`, ordered after `steve-ci.service`. No `CARGO_BUILD_JOBS`. |
@@ -767,7 +768,17 @@ The next cut-over imports the polling checker's current priority because the ret
 
 ### Cargo wrapper (natedev only)
 
-`scripts/build_hold/cargo` puts building cargo commands from shells, scripts and TUIs in a `builds.slice` scope. This includes `cargo mend`, which builds the workspace. It finds the first other cargo on PATH, keeps its arguments and exit status, and passes non-building commands such as `metadata`, `fmt` and `tree` through at once. A call already in `builds.slice` skips the hold check and a second scope. Other building calls check `hold_applies.py` when the hold directory has an entry: an applicable hold refuses the command; unreadable state prints a note and allows it. An empty hold directory starts no Python. Without a user bus or `systemd-run`, cargo runs directly.
+`scripts/build_hold/cargo` puts building cargo commands from shells, scripts and TUIs in a `builds.slice` scope.
+This includes `cargo mend`, which builds the workspace.
+The wrapper uses the first other cargo on PATH and keeps its arguments and exit status.
+Non-building commands such as `metadata`, `fmt` and `tree` run immediately.
+A call already in `builds.slice` skips the hold check and a second scope, unless it runs under `builds-detached.slice`.
+A call under `builds-detached.slice` follows the same hold and scope path as a call from a shell.
+These building calls check `hold_applies.py` when the hold directory has an entry.
+An applicable hold refuses the command.
+Unreadable state prints a note and allows the command.
+An empty hold directory starts no Python.
+Without a user bus or `systemd-run`, cargo runs directly.
 
 Install on natedev from the repo root with `scripts/build_hold/install_cargo_wrapper.sh`. It links `~/.local/bin/cargo` to the wrapper and refuses to replace another file. `~/.local/bin` must precede `~/.cargo/bin` on PATH. On macOS, the installer makes no link and the wrapper calls cargo directly. Tests use `BUILD_HOLD_DIR`, `CARGO_WRAPPER_CGROUP_FILE` and `XDG_RUNTIME_DIR` to select temporary state.
 

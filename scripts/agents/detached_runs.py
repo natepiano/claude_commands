@@ -61,12 +61,11 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR as DETACHED_RUNS_DIR, DETACHED_RUN_START_GRACE_SECS
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-# On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
-# places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
-# Worker cargo builds ran at the panes' weight in herdr-agents.service (2026-10-20). The scope
-# writes the marker just before the command starts; a marker missing after the scope exits proves
-# the scope never ran it (no user manager, a systemd that rejects an option), so the command runs
-# plainly. BUILDLOG_SCOPE=0 turns the scope off, as it does for invoke.sh.
+# On natedev the command runs in builds-detached.slice, a child of builds.slice.
+# The parent slice's memory limit and CPU weight also apply to the detached command.
+# The scope writes the marker before the command starts.
+# A missing marker after the scope exits proves that the command did not start there.
+# The command then runs without a scope. BUILDLOG_SCOPE=0 disables the scope, as it does for invoke.sh.
 SCOPE_SCRIPT = ': > "$0" || exit 125; exec "$@"'
 
 
@@ -540,13 +539,13 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
 
 
 def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
-    """The argv that runs a command in a builds.slice scope, or nothing where no scope is possible."""
+    """Start the command in builds-detached.slice when a scope is available."""
     runtime = environment.get("XDG_RUNTIME_DIR", "")
     if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-            "--slice=builds.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+            "--slice=builds-detached.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:

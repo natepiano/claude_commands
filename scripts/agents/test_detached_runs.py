@@ -613,7 +613,7 @@ sys.exit(1)
                 prefix = detached_runs.scope_prefix(marker, on)
                 self.assertEqual(detached_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
         self.assertEqual(prefix[:2], ["systemd-run", "--user"])
-        self.assertIn("--slice=builds.slice", prefix)
+        self.assertIn("--slice=builds-detached.slice", prefix)
         self.assertEqual(prefix[-4:], ["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(marker)])
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])

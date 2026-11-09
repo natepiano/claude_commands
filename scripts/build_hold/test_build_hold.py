@@ -2498,12 +2498,15 @@ class BuildAuditTests(IsolatedBuildHoldTest):
 
     def test_build_scope_marks_admission_without_memory_reservation(self) -> None:
         directory = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "verified"})
-        _ = (directory / "cgroup").write_text("0::/user.slice/user-1000.slice/builds.slice/run-123.scope\n")
-        build, = self.builds()
-        self.assertEqual(build.classification, "admitted")
-        _ = (directory / "cgroup").write_text("0::/user.slice/not-builds.slice/run-123.scope\n")
-        build, = self.builds()
-        self.assertEqual(build.classification, "other_session")
+        for cgroup, classification in (
+            ("0::/user.slice/user-1000.slice/builds.slice/run-123.scope\n", "admitted"),
+            ("0::/user.slice/not-builds.slice/run-123.scope\n", "other_session"),
+            ("0::/user.slice/user-1000.slice/builds.slice/builds-detached.slice/run-123.scope\n", "other_session"),
+        ):
+            with self.subTest(cgroup=cgroup):
+                _ = (directory / "cgroup").write_text(cgroup)
+                build, = self.builds()
+                self.assertEqual(build.classification, classification)
 
     def test_two_passes_record_once_per_build_per_hold_and_new_pid_lifetime(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "holder"})
