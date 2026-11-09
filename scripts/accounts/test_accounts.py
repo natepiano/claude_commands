@@ -601,7 +601,9 @@ class AccountsTests(unittest.TestCase):
         )
         def live_directory(pid: int) -> account.ConfiguredClaudeFolder:
             identity = next(owner["sessionId"] for owner in owners if owner["pid"] == pid)
-            return account.ConfiguredClaudeFolder(Path(launches[identity]["config_dir"]))
+            entry = launches[identity]
+            assert "config_dir" in entry
+            return account.ConfiguredClaudeFolder(Path(entry["config_dir"]))
 
         retained_bytes = (records / "fixture.json").read_bytes()
         for runner_label, expected in cases:
@@ -7192,6 +7194,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         return row
 
     def dispatch(self, row: staff.StaffRow, role: str = "impl", status: str = "active") -> None:
+        if role in staff.WORKER_ROLES:
+            _ = staff.set_worker_role(row.id, staff.KnownWorkerRole(role))
         atomic_file.write_text_atomic(self.run_dir / "progress_history_state.json", json.dumps({
             "owner_session": self.owner.current_session, "history_file": str(self.run_dir / "history.jsonl"),
             "pass": {row.name: {"worker_name": row.name, "team_slot": row.name, "kind": role,
@@ -7472,6 +7476,17 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.requests[0][2]["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
         self.assertFalse(any(command[:2] == ("agent", "prompt") for command in self.world.commands))
+
+    def test_worker_move_uses_the_known_row_role_without_history(self) -> None:
+        from scripts.direct import progress_history
+
+        row = self.worker()
+        _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
+        with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
+              patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatch("saved-pass", ("assign.sh",)))):
+            result = self.move("claude2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.world.requests[-1][2]["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
 
     def test_rollback_and_destination_use_the_latest_dispatch_role(self) -> None:
         from scripts.herdr import worker_panes

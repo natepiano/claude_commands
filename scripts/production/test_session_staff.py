@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from dataclasses import replace
 import os
+from typing import cast
 import json
 from io import StringIO
 from unittest import mock
@@ -36,12 +37,12 @@ class StatusDiscoveryTests(StaffTestCase):
         fixture = self.row_production()
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
                                    {"CODEX_HOME": str(self.root / ".codex2")}, ["codex"], kind="codex")
-        launch["environment"] = {"CODEX_HOME": launch["config_dir"],
+        launch["environment"] = {"CODEX_HOME": str(cast(staff.SessionHome, pane_launch.config_home(launch)).path),
                                  "CODEX_THREAD_ID": fixture.unit.current_session, "STAFF_ID": fixture.unit.id}
         names = LaunchNames(staff.snapshot())
         before = self.staff_state()
         self.assertEqual(names.environment(launch), {
-            "CODEX_HOME": launch["config_dir"], "CODEX_THREAD_ID": fixture.unit.current_session,
+            "CODEX_HOME": str(cast(staff.SessionHome, pane_launch.config_home(launch)).path), "CODEX_THREAD_ID": fixture.unit.current_session,
         })
         self.assertEqual(self.staff_state(), before)
 

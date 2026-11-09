@@ -152,6 +152,12 @@ Titles use the current staff placement and assignment role.
 ### Staff identity and admission
 
 A worker has one fixed staff id, name, parent and worktree.
+Its `role` records its last dispatch. Its `home` records the absolute account folder.
+`KnownWorkerRole | WorkerRoleUnknown` and `SessionHome | HomeUnknown` represent these values.
+Missing keys mean unknown. Serialization omits missing values.
+An invalid value remains unknown and retains its raw JSON value.
+`progress_history.begin_dispatch` uses `staff.set_worker_role`.
+Pane publication uses `staff.set_home`.
 `current_session` selects its Claude session or Codex thread.
 A family change preserves the fixed staff id.
 The [staff design](staff-accessors.md#staff-identity-and-backends) defines the row fields and backend evidence.
@@ -164,7 +170,10 @@ Only successful publication permits successful dispatch.
 A publication failure runs the caller's cleanup callback and reports the native id.
 The Claude coordinator tries to stop an unpublished session.
 A failed stop reports `cleanup unproved`.
-Native pane startup retains an unpublished pane for recovery.
+A failed pane admission closes only the new pane that this call created.
+For an existing pane, the launcher quits its own agent and keeps the shell.
+Both paths compare the current terminal and process with the identities saved after launch.
+A replacement process remains open. Cleanup prints one anomaly with the pane id.
 
 A new slot takes the parent/name lock before the row lock.
 An existing slot takes the row lock.
@@ -218,7 +227,7 @@ An accepted retry prints `unchanged`.
 The launcher retains its original prompt identity and its dispatch record.
 `review.sh` has no pending dispatch check and does not restore a saved extract.
 
-### Legacy mesh coordinator and friends
+### Claude coordinator and friends
 
 `assign.py.execute_herdr` sends normal assignments through `worker.py` and native worker panes.
 The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.
@@ -431,13 +440,9 @@ An ended identity cannot reopen.
 
 A design role uses `worker.py` operations.
 `worker.py list --json` gives each worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
-It computes three fields at read time and stores none of them:
-
-1. `work`: `idle`, `busy` or `unknown`, from `worker_panes.worker_state` for the current manager.
-2. `account`: the account label from `member_account.resume_account` for the current manager.
-3. `home`: the account's absolute home path.
-
-With unavailable backend evidence, `account` contains `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
+The staff row supplies `role` and `home`. The `home` folder name supplies the account label.
+`work` is `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
+An unknown role uses `WorkerRoleUnavailable`. An unknown home uses `AccountUnavailable` and omits `home`.
 `worker.py list --json --all` reads workers for every manager and adds each parent's name as `manager`.
 It needs no caller row and makes no process, pane, or thread read.
 Its `state` uses the saved dispatch status or staff hold.
@@ -446,7 +451,7 @@ History lookup resolves fixed manager ids through the staff record, even after a
 History lookup reads the last 64 KiB of each file, plus one byte to skip a leading partial line.
 History-only dispatches outside this window use the same unknown fields as missing dispatches.
 It skips invalid lines and decodes only wanted worker events.
-Stored account history resolves only the unit group and reads its history once.
+Listing reads no role map or account history. Missing dispatch history does not change the staff role or home.
 Per-manager listing keeps its live observations.
 
 History lookup resolves fixed manager ids through staff, even after a session change.
@@ -529,6 +534,11 @@ The [session roster](session-roster.md) shows open roles through their current s
 `worker_lock` holds the parent's named creation lock until the new worker has a fixed staff id.
 `WorkerLockHold.bind` locks that fixed id before creation serialization ends.
 A competing dispatch returns `Kept` when the lock is held.
+`worker.py dispatch` holds this lock from pass creation through prompt submission.
+It releases the lock before the completion hook ends the pass.
+`worker_dispatch_state` keeps an active pass with a saved submission held during this gap.
+A transcript that ends with the dispatch DONE line proves completion before the hook records the pass end.
+An active pass without a saved submission, a held worker lock, or a live detached run is stale.
 `scripts/production/staff.py` owns `slot_operation` and `row_operation`.
 These locks protect native identity publication and family changes.
 Inherited child processes share the staff lock through its file descriptor.

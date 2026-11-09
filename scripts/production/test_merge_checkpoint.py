@@ -759,9 +759,56 @@ class MacPromotionPathTests(unittest.TestCase):
                         if text:
                             self.assertEqual((pending.label, pending.since), (waiting.label, waiting.since))
                     elif text:
+                        waiting = main_publish.PendingMacPull(waiting.label, waiting.text, waiting.since, waiting.reason, ())
                         self.assertEqual(pending, waiting)
                     else:
                         self.assertIsInstance(pending, main_publish.NoPendingMacPull)
+
+        from scripts.lib import zone
+
+        for text in ("", "Zone changed"):
+            with self.subTest(custom_checkout=True, text=text), tempfile.TemporaryDirectory() as folder:
+                state = Path(folder)
+                ssh = state / "ssh"
+                _ = ssh.write_text(f"#!{sys.executable}\n" + '''import json
+from pathlib import Path
+import sys
+state = Path(__file__).parent
+with (state / "ssh.log").open("a") as output:
+    output.write(json.dumps(sys.argv[1:]) + "\\n")
+if (state / "offline").exists():
+    print("Mac asleep", file=sys.stderr)
+    raise SystemExit(255)
+print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
+''')
+                ssh.chmod(0o755)
+                _ = (state / "merge_checkpoint.conf").write_text(
+                    "# whole: 1..\nMAC_PULL_TRIES=1\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                offline = state / "offline"
+                offline.touch()
+                targets = ((PurePosixPath("~/custom checkout"), state / "first-source"),
+                           (PurePosixPath("/Users/fixture/second checkout"), state / "second-source"))
+                with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
+                                                  "ZONE_SSH": str(ssh),
+                                                  "PATH": folder + os.pathsep + os.environ["PATH"]}):
+                    if text:
+                        main_publish.queue(main_publish.PendingMacPull("zone", text, "2026-11-08", "offline"))
+                    for mac, source in targets:
+                        self.assertIsInstance(merge_checkpoint.pull_mac_checkout(mac, source), main_publish.MacPullPending)
+                    offline.unlink()
+                    self.assertIsInstance(merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state),
+                                          main_publish.MacPulled)
+                    self.assertIsInstance(main_publish.read_queue(), main_publish.PendingMacPull)
+                    before_drain = len((state / "ssh.log").read_text().splitlines())
+                    _ = zone.drain(state, pulled=None)
+                    commands = [cast(list[str], json.loads(line))[-1]
+                                for line in (state / "ssh.log").read_text().splitlines()[before_drain:]]
+                    for mac, source in targets:
+                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && git pull" in command
+                                            and f"natedev:{source} main" in command for command in commands), commands)
+                    if text:
+                        self.assertTrue(any("broadcast.py" in command and text in command for command in commands), commands)
+                    self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
 
 
 if __name__ == "__main__":
