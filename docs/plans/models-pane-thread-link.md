@@ -88,8 +88,29 @@ In `worker.py` `_dispatch_turn`, a `DispatchEvidenceUnknown` in the wait loop af
 
 **Gotchas:** `codex_trust.trust_arguments` puts `-C <root> -c projects={<root>={trust_level="trusted"}}` before every Codex resume, and the record of a restored process is read from that full argv. A recorded `projects` pair would come after the new one and win after a folder move, so the record leaves it out.
 
-### Phase 5 — One way to read a Codex thread  · status: todo
+### Phase 5 — One way to read a Codex thread  · status: done
 
 **Depends on:** Phase 3.
 
-**Spec:** Written at phase start. Source: sdlc asked models to remove the other rollout-file thread reads so one way remains: `staff_sources.py` `CodexProcessThreads.thread`, `assign.py` `herdr.codex_transcript`, the `RolloutProofPhase.STABLE` read in `herdr.native_process`, and the app-server multi-thread scan in `herdr.py`.
+#### As-built
+
+A Codex process's thread comes from its `resume <id>` argument or from the `SessionStart` report on its herdr pane, through `_codex_launch_identity(pid, reported)`. No code reads a thread from an open rollout file.
+
+- `herdr.native_process(pid, kind, reported: str | PaneNotRead = PANE_NOT_READ)` reads no rollout. A Codex call with no `reported` finds the process's pane place and calls `codex_pane_process(pid, place)`, which reads that pane's report and keeps the `UnreportedResume` conversion. The pane read is in this one place, not at each caller.
+- `codex_conversations` is `@observation_snapshot()`, so process places are read once per scan. An `app-server` stays resolved by `loaded_threads`, a daemon-attached TUI by its daemon read, and any other Codex with no identity gives `Codex thread unknown`.
+- `worker_panes._start_locked` has no launch-proof wrapper.
+- `staff_sources.CodexProcessThreads.thread` reads the resume argument, then the pane report, then the inherited `CODEX_THREAD_ID`, then the terminal title lookup. A process outside herdr, a pane whose foreground is not that Codex, and a failed herdr read give the `CODEX_THREAD_ID` value.
+- `assign.execute_consultation` waits for `client.native_session(pane, "codex", ...)` until `herdr.PROGRAM_TIMEOUT_SECONDS`, reads `CODEX_HOME` from `herdr.process_environment(pid)`, and finds the transcript with `worker_admission.codex_transcript_source(thread_id, home)`, the helper `transcript_source` also uses.
+
+**Files:**
+- `scripts/herdr/herdr.py` — `native_process`, `codex_pane_process`, `codex_conversations`.
+- `scripts/herdr/worker_panes.py` — `_start_locked`.
+- `scripts/production/staff_sources.py` — `CodexProcessThreads.thread`.
+- `scripts/direct/assign.py` — `execute_consultation`.
+- `scripts/production/worker_admission.py` — `codex_transcript_source`.
+- `scripts/production/test_staff_sources.py` — `test_resume_argument_overrides_an_inherited_thread_and_does_not_block_the_old_thread` rows: resume, non-foreground, failed herdr read.
+- `scripts/herdr/test_herdr.py`, `scripts/herdr/test_worker_panes.py`, `scripts/shutdown/test_pane_record.py` and the other fixture modules — identity through a pane report or a resume argument; `PaneWorld.launch` writes the process `environ` file.
+
+**Gotchas:** A child Codex inherits its parent's `CODEX_THREAD_ID`, so that value must never come before the resume argument or the pane report. A test fixture that gives identity only through an open rollout descriptor now fails with `Codex launch identity is unavailable`.
+
+**Ruled out:** Reading the thread from an open rollout file — two Codex processes can hold one rollout, and a new pane read another worker's thread (w16:p94).

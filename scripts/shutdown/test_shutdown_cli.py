@@ -2666,7 +2666,7 @@ class UnitRenameSessionsTests(UnitRenameFixture):
                            pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
             del timeout, pane_row
             session = row.current_session if pane == "w1:p1" else "unrelated-session"
-            identity = herdr.RolloutThread(session) if kind == "codex" else herdr.EnvironmentThread(session)
+            identity = herdr.PaneSessionReport(session) if kind == "codex" else herdr.EnvironmentThread(session)
             return herdr.NativeAgentProcess(identity, "fixture-generation", {})
 
         with (mock.patch.object(herdr.Herdr, "panes", return_value=panes),

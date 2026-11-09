@@ -164,7 +164,7 @@ class PaneWorld(herdr.Herdr):
 
     def activate(self, identity: str, pane: str, family: Literal["claude", "codex"]) -> None:
         pid = 998600 + len(self.processes)
-        native = herdr.EnvironmentThread(identity) if family == "claude" else herdr.RolloutThread(identity)
+        native = herdr.EnvironmentThread(identity) if family == "claude" else herdr.PaneSessionReport(identity)
         environment = {"UNIT_RUN_DIR": run} if (run := os.environ.get("UNIT_RUN_DIR")) else {}
         self.processes[pid] = herdr.NativeAgentProcess(native, "fixture-generation", environment)
         self.foreground[pane] = pid, family, [family, "--resume" if family == "claude" else "resume", identity]
@@ -274,6 +274,8 @@ class PaneWorld(herdr.Herdr):
         process_root = self.process_root / str(pid)
         process_root.mkdir(parents=True, exist_ok=True)
         write_text_atomic(process_root / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
+        write_text_atomic(process_root / "environ",
+                          "\0".join(f"{key}={value}" for key, value in self.processes[pid].environment.items()) + "\0")
         self.foreground[pane] = pid, family, [kind, *agent_arguments]
         if kind == "codex" and "resume" not in agent_arguments:
             process = self.processes[pid]
@@ -284,14 +286,6 @@ class PaneWorld(herdr.Herdr):
             source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
             if not source.read_text():
                 write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
-            rollout = source.with_name(f"rollout-fixture-{identity}.jsonl")
-            rollout.unlink(missing_ok=True)
-            rollout.symlink_to(source)
-            descriptors = process_root / "fd"
-            descriptors.mkdir(exist_ok=True)
-            descriptor = descriptors / "3"
-            descriptor.unlink(missing_ok=True)
-            descriptor.symlink_to(rollout)
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
