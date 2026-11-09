@@ -479,7 +479,7 @@ def _origin_merge_refs(request: MergeRequest) -> list[str]:
 
 
 def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
-    """Keep paths whose checkpoint content differs from every origin merge base."""
+    """Keep paths absent at an origin merge base or changed from every base that contains them."""
     if not paths:
         return ()
     own = set(paths)
@@ -490,11 +490,14 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
                 continue
             changed = git(request.production.checkout, "diff", "--name-only", "--no-renames", "-z",
                           base.stdout.strip(), request.commit, "--", *paths)
-            if changed.returncode:
+            present = git(request.production.checkout, "ls-tree", "--name-only", "-r", "-z",
+                          base.stdout.strip(), "--", *paths)
+            if changed.returncode or present.returncode:
                 continue
         except OSError:
             continue
-        own.intersection_update(changed.stdout.split("\0"))
+        unchanged = set(present.stdout.split("\0")) - set(changed.stdout.split("\0"))
+        own.difference_update(unchanged)
     return tuple(path for path in paths if path in own)
 
 
