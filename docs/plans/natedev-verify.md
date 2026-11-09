@@ -1299,7 +1299,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The inherited `verify()` helper (`verify_examples_test_support.py`) reads `Cargo.toml` before it starts Bash, so a no-manifest case calls Bash directly.
 - No config names a per-repository unit gate; the doc names the `~/.claude` gate.
 
-### Phase 41z — A stop before the Mac runner starts holds under load  · status: todo
+### Phase 41z — A stop before the Mac runner starts holds under load  · status: done
 
 **Depends on:** none. Runs after 41x.
 
