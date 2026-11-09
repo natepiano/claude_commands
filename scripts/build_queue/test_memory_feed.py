@@ -28,7 +28,7 @@ from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
-from scripts.lib.build_steps import RECORDED_STEP_NAMES
+from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture
@@ -323,8 +323,9 @@ class MemoryFeedTests(unittest.TestCase):
             reads[path] += 1
             return original(path)
 
+        names = read_step_names()
         with mock.patch.object(Path, "read_text", new=read):
-            swap = memory_feed.read_swap((queued, queued), {}, 6)
+            swap = memory_feed.read_swap((queued, queued), {}, 6, names)
         assert isinstance(swap, memory_feed.SwapReading)
         rows = {row["name"]: row for row in swap.rows}
         self.assertEqual(rows["agent sessions (2)"]["bytes"], 10 * admission_records.GIB)
@@ -332,7 +333,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(rows["desktop session"]["bytes"], 2 * admission_records.GIB)
         self.assertEqual(rows["system services"]["bytes"], 2 * admission_records.GIB)
         self.assertEqual(rows["hana CI"]["bytes"], admission_records.GIB)
-        self.assertEqual(rows[queue_lines.step_text(queued, RECORDED_STEP_NAMES)]["bytes"], admission_records.GIB)
+        self.assertEqual(rows[queue_lines.step_text(queued, read_step_names())]["bytes"], admission_records.GIB)
         self.assertEqual(rows["not in a group"]["bytes"], admission_records.GIB)
         self.assertEqual(rows["not attributed"]["bytes"], admission_records.GIB)
         self.assertEqual(rows["Total"]["bytes"], swap.used)
@@ -344,7 +345,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_swap_keeps_the_unattributed_bytes_without_rounding_them_away(self) -> None:
         self.host_swap(2 ** 20, 2 ** 20)
         _ = self.cgroup("system.slice", 2 ** 20 - 7)
-        swap = memory_feed.read_swap((), {}, 6)
+        swap = memory_feed.read_swap((), {}, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         residual = next(row for row in swap.rows if row["kind"] == "unattributed")
         self.assertEqual(residual["bytes"], 7)
@@ -354,7 +355,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_swap_exposes_a_signed_counter_difference_without_changing_owner_values(self) -> None:
         self.host_swap(2 ** 20, 2 ** 20)
         _ = self.cgroup("system.slice", 2 ** 20 + 7)
-        swap = memory_feed.read_swap((), {}, 6)
+        swap = memory_feed.read_swap((), {}, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap.rows[0]["bytes"], 2 ** 20 + 7)
         residual = next(row for row in swap.rows if row["kind"] == "unattributed")
@@ -368,7 +369,7 @@ class MemoryFeedTests(unittest.TestCase):
         step = admission_records.RunningStep("", "hana-ci.slice", "service", str(path), 0,
             admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner="hana-ci.slice",
                                     pid=admission_records.PidNotRecorded(), job_state=IdleService()), pid=admission_records.PidNotRecorded())
-        swap = memory_feed.read_swap((step,), {}, 6)
+        swap = memory_feed.read_swap((step,), {}, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap.rows[0]["name"], "hana CI")
         self.assertEqual(swap.rows[0]["bytes"], admission_records.GIB)
@@ -383,7 +384,7 @@ class MemoryFeedTests(unittest.TestCase):
             steps.append(admission_records.RunningStep(owner, owner, "between steps", str(path), 0,
                 admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner=owner, pid=admission_records.PidNotRecorded()),
                 pid=admission_records.PidNotRecorded()))
-        swap = memory_feed.read_swap(steps, labels, 6)
+        swap = memory_feed.read_swap(steps, labels, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual({row["name"] for row in swap.rows if row["kind"] == "owner"}, set(labels))
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
@@ -651,24 +652,29 @@ class MemoryFeedTests(unittest.TestCase):
                         self.assertNotIn(field, row)
 
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
-        for project, folder in (("known-project", "/fixture"), ("", "/fixture"),
-                                ("", "/absolute/repository")):
-            with self.subTest(project=project, folder=folder):
+        for raw_step, project, folder, expected in (
+            ("nextest", "known-project", "/fixture", "known-project nextest"),
+            ("nextest", "", "/fixture", "nextest"),
+            ("nextest", "", "/absolute/repository", "nextest"),
+            ("merge-gate", "", "/fixture", "merge gate"),
+        ):
+            with self.subTest(step=raw_step, project=project, folder=folder):
                 reading = reservation_reading(project=project)
-                step = replace(reading.view.running[0], folder=folder)
+                step = replace(reading.view.running[0], step=raw_step, folder=folder)
                 explanation_step = replace(reading.explanation.running[0], step=step)
                 reading = replace(reading, view=replace(reading.view, running=(step,)),
                     explanation=replace(reading.explanation, running=(explanation_step,)))
                 reading = with_wait_reason(reading, admission_records.StartSpacingWait(110))
-                waiter = replace(reading.view.waiting[0], project=project, folder=folder)
+                waiter = replace(reading.view.waiting[0], step=raw_step, project=project, folder=folder)
                 reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(memory_feed, "read_step_names", wraps=read_step_names) as names_read):
                     page = memory_feed.reading()
+                names_read.assert_called_once_with()
                 self.assertEqual(page["walk"][0]["name"],
-                    queue_lines.step_text(reading.view.running[0], RECORDED_STEP_NAMES))
+                    queue_lines.step_text(reading.view.running[0], read_step_names()))
                 self.assertEqual(page["waiters"][0]["name"],
-                    queue_lines.step_text(waiter, RECORDED_STEP_NAMES))
-                expected = "known-project nextest" if project else "nextest"
+                    queue_lines.step_text(waiter, read_step_names()))
                 self.assertEqual(page["walk"][0]["name"], expected)
                 self.assertEqual(page["waiters"][0]["name"], expected)
                 self.assertNotIn(folder, page["walk"][0]["name"])
