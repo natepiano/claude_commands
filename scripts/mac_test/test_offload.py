@@ -433,20 +433,25 @@ class OffloadSettingsTests(unittest.TestCase):
                 _ = offload.ssh_target_state_directory(target)
 
     def test_explicit_settings_path_controls_every_offload_field(self) -> None:
-        settings = self.root / "other-mac.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
-            + "unreachable_backoff_s=4\nfree_floor_gib=5\nmac_budget_gib=6\n"
-            + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\n", template="mac_test")
-        config = offload.read_config(settings)
-        self.assertTrue(config.enabled)
-        self.assertEqual(config.host, "other-mac")
-        self.assertEqual(config.connect_timeout_s, 2.0)
-        self.assertEqual(config.probe_timeout_s, 3.0)
-        self.assertEqual(config.unreachable_backoff_s, 4.0)
-        self.assertEqual(config.free_floor_gib, 5.0)
-        self.assertEqual(config.default_target_budget_gib, "6")
-        self.assertEqual(config.values["mac_budget_gib.hana"], "7")
-        self.assertEqual(config.values["linux_only.hana"], "local-package")
+        _ = write_config_fixture(self.settings, "mirror_busy_backoff_s=37\n", template="mac_test")
+        for filename, budget_key in (("other-mac.conf", "mac_budget_gib"),
+                                     ("aws_target.conf", "target_budget_gib")):
+            with self.subTest(settings=filename):
+                settings = self.root / filename
+                _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
+                    + f"unreachable_backoff_s=4\nfree_floor_gib=5\n{budget_key}=6\n"
+                    + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\nmirror_busy_backoff_s=91\n", template="mac_test")
+                config = offload.read_config(settings)
+                self.assertTrue(config.enabled)
+                self.assertEqual(config.host, "other-mac")
+                self.assertEqual(config.connect_timeout_s, 2.0)
+                self.assertEqual(config.probe_timeout_s, 3.0)
+                self.assertEqual(config.unreachable_backoff_s, 4.0)
+                self.assertEqual(config.free_floor_gib, 5.0)
+                self.assertEqual(config.default_target_budget_gib, "6")
+                self.assertEqual(config.values["mac_budget_gib.hana"], "7")
+                self.assertEqual(config.values["linux_only.hana"], "local-package")
+                self.assertEqual(config.mirror_busy_backoff_s, 37)
 
     def test_sender_normalizes_multiline_tool_versions_before_parity(self) -> None:
         versions = {"rustc": " rustc fixture \n", "nextest":

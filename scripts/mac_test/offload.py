@@ -1031,7 +1031,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
     config = conf.read(settings)
     values = config.values()
-    values["mirror_busy_backoff_s"] = str(config.number("mirror_busy_backoff_s"))
+    values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     return OffloadConfig(
         enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
                  else config.text("offload") == "on"),
