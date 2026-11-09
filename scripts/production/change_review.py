@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Read checkpoint trailers and write change review rows.
+"""Read unit commit trailers and write change review rows.
 
 A visible trailer has three fields and an optional fourth field: after <step>.
 An invisible change uses Change-Review: none — <reason>.
@@ -171,7 +171,7 @@ def entries(message: str) -> list[Entry]:
 
 
 def checkpoint_changes(message: str) -> tuple[str, ...]:
-    """The visible change names in a checkpoint message."""
+    """The visible change names in a unit commit message."""
     return tuple(item.change for item in entries(message) if isinstance(item, Visible))
 
 
@@ -296,15 +296,15 @@ def missing(commits: list[Commit]) -> list[str]:
 
 
 def _checkpoint_entries(commits: list[Commit]) -> Iterable[tuple[Commit, Visible]]:
+    """Read visible lines from the unit commits in a checkpoint."""
     for commit in reversed(commits):
-        if commit.subject.startswith("checkpoint("):
-            for item in entries(commit.message):
-                if isinstance(item, Visible):
-                    yield commit, item
+        for item in entries(commit.message):
+            if isinstance(item, Visible):
+                yield commit, item
 
 
 def visible(commits: list[Commit]) -> list[Visible]:
-    """Read each visible change from checkpoint commits."""
+    """Read each visible change from the unit commits."""
     return [item for _, item in _checkpoint_entries(commits)]
 
 
@@ -1026,12 +1026,12 @@ def _owner_of(commit: Commit, branches: dict[str, UnitSource]) -> Path | None:
 
 @dataclass(frozen=True)
 class UnresolvedSource:
-    """The checkpoint has no matching unit source."""
+    """The unit commit has no matching unit source."""
 
 
 @dataclass(frozen=True)
 class PublicationChange:
-    """One checkpoint change with its unit and fixed producer identity."""
+    """A change from a unit commit, with its unit and fixed producer identity."""
 
     item: Visible
     source: UnitSource | UnresolvedSource
