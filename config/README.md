@@ -283,7 +283,7 @@ The controller reads the instance ID from `deployment.json`.
 A build or final uses AWS only when a flag pins the command.
 An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
+`monthly_limit_usd` and `daily_limit_usd` are the user's spending limits. `aws_target.conf` holds each value on one line.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
@@ -308,6 +308,7 @@ This window captures delayed charges and later changes from AWS.
 
 Both the controller and the gate worker use one Cost Explorer reader.
 It requests daily `UnblendedCost` for the account, grouped by `USAGE_TYPE`, and reads every page.
+It excludes `Credit` and `Refund` records, so the amounts show usage before credits.
 It uses no tag filter and needs no tag activation or deployment change.
 `cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` still supply the deployment tags.
 The reader saves each day's account total, usage rows, provisional flag, and read time in `charges/<day>.json`.

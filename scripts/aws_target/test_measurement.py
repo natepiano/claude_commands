@@ -391,7 +391,7 @@ class MeasurementTests(MeasurementFixture):
         self.assertEqual(arguments[arguments.index('--time-period') + 1], 'Start=2026-01-09,End=2026-01-16')
         self.assertIn('ce', arguments)
         self.assertIn('get-cost-and-usage', arguments)
-        self.assertNotIn('--filter', arguments)
+        self.assertEqual(arguments[arguments.index('--filter') + 1], aws_target.USAGE_ONLY)
         self.assertIn('--no-paginate', arguments)
         self.assertEqual(arguments[arguments.index('--group-by') + 1], 'Type=DIMENSION,Key=USAGE_TYPE')
         _ = measurement.read_measurement(self.settings, self.state, NOW + 86401)
