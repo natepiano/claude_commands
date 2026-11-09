@@ -142,6 +142,12 @@ class CostReconciliation:
 
 
 @dataclass(frozen=True)
+class UsageTypeCost:
+    usage_type: str
+    usd: Decimal
+
+
+@dataclass(frozen=True)
 class ChargeRead:
     day: str
     at: int
@@ -150,6 +156,9 @@ class ChargeRead:
     actual_usd: Decimal
     estimated_usd: Decimal
     query_usd: Decimal
+    usage_types: tuple[UsageTypeCost, ...] = ()
+    provisional: bool = True
+    account_bill: bool = True
 
     @property
     def difference_usd(self) -> Decimal:
@@ -624,8 +633,11 @@ def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval]
 def read_charge(path: Path) -> ChargeRead:
     row = mapping(cast(object, json.loads(path.read_text())))
     reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
-                         instant(row, 'period_end'), money(text(row, 'actual_usd')),
-                         money(text(row, 'estimated_usd')), money(text(row, 'query_usd')))
+                         instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
+                         money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
+                         tuple(UsageTypeCost(text(item, 'usage_type'), conf.decimal(text(item, 'usd')))
+                               for item in rows(row, 'usage_types')) if 'usage_types' in row else (),
+                         row.get('provisional', True) is True, 'usage_types' in row)
     if reading.period_end <= reading.period_start or reading.period_end > reading.at:
         raise LedgerUnavailable('invalid charge reconciliation')
     return reading
@@ -634,7 +646,9 @@ def read_charge(path: Path) -> ChargeRead:
 def charge_record(reading: ChargeRead) -> dict[str, object]:
     return {'day': reading.day, 'at': reading.at, 'period_start': reading.period_start,
             'period_end': reading.period_end, 'actual_usd': str(reading.actual_usd),
-            'estimated_usd': str(reading.estimated_usd), 'query_usd': str(reading.query_usd)}
+            'estimated_usd': str(reading.estimated_usd), 'query_usd': str(reading.query_usd),
+            **({'usage_types': [{'usage_type': item.usage_type, 'usd': str(item.usd)} for item in reading.usage_types],
+                'provisional': reading.provisional} if reading.account_bill else {})}
 
 
 def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, costs: CostEstimate) -> tuple[Decimal, Decimal]:
@@ -859,12 +873,17 @@ class CostLedger:
     def _reconcile_charge(self, state: LedgerEvidence, reading: ChargeRead) -> None:
         key = (reading.period_start, reading.period_end, 'Cost Explorer')
         established: dict[str, Decimal] = {}
+        query_usd = reading.query_usd
         for saved in state.reconciliations:
             if (saved.period_start, saved.period_end, saved.source) == key:
+                if saved.at != reading.at:
+                    query_usd += saved.query_usd
+                else:
+                    query_usd = saved.query_usd
                 for day in saved.established_days:
                     established[day.day] = max(established.get(day.day, Decimal(0)), day.usd)
         reconciliation = CostReconciliation(reading.at, reading.period_start, reading.period_end,
-                                             reading.actual_usd, 'Cost Explorer', reading.query_usd,
+                                             reading.actual_usd, 'Cost Explorer', query_usd,
                                              tuple(EstablishedDayCost(day, usd) for day, usd in sorted(established.items())))
         if reconciliation in state.reconciliations and state.charge_refresh_at >= reading.at:
             return
@@ -875,36 +894,50 @@ class CostLedger:
         self._save(state)
 
     def refresh_charges(self, settings_path: Path, now: int,
-                        fetch: Callable[[int, int], Decimal], *, gate_workload: bool = False) -> ChargeRead | MeasurementUnavailable:
-        """Recover the newest saved reply before another scheduled query."""
+                        fetch: Callable[[int, int], Sequence[ChargeRead]], *, gate_workload: bool = False) -> ChargeRead | MeasurementUnavailable:
+        """Refresh recent account bills through the shared schedule and recovery lock."""
         configuration = conf.read(settings_path)
         if not gate_workload and not offload_enabled(configuration):
             return MeasurementUnavailable('disabled')
         settings = read_settings(configuration)
         day = charge_period_day(now)
         start, end = period_bounds(day, ZoneInfo('UTC'))
+        start -= (settings.cost_explorer_lookback_days - 1) * 86400
         with self._locked() as state:
             newest = max((self.directory / 'charges').glob('*.json'), default=None)
             if newest is not None:
                 previous = read_charge(newest)
-                self._reconcile_charge(state, previous)
-                if (previous.period_start, previous.period_end) == (start, end):
-                    return previous
-            if state.charge_refresh_at and now < state.charge_refresh_at + settings.cost_explorer_interval_seconds:
-                return MeasurementUnavailable('charge read is not due')
-            estimated = Decimal(0)
-            if not gate_workload or not state.inventories or any(inventory.at <= end for inventory in state.inventories):
-                costs = costs_from_evidence(state, settings, end,
-                                            window=datetime.fromtimestamp(start, settings.accounting_zone).date())
-                estimated = period_cost(costs.intervals, start, end)
-            actual = fetch(start, end)
-            if not actual.is_finite() or actual < 0:
-                raise ValueError('Cost Explorer reply must contain finite nonnegative USD')
-            reading = ChargeRead(day.isoformat(), now, start, end, actual, estimated, settings.cost_explorer_read_usd)
-            path = self.directory / 'charges' / f'{day.isoformat()}.json'
-            write_text_atomic(path, json.dumps(charge_record(reading), sort_keys=True) + '\n')
-            self._reconcile_charge(state, reading)
-            return reading
+                if previous.account_bill:
+                    # Recover every day from the last query before applying its schedule.
+                    complete = True
+                    for offset in range(settings.cost_explorer_lookback_days):
+                        saved_day = date.fromisoformat(previous.day) - timedelta(days=offset)
+                        path = self.directory / 'charges' / f'{saved_day.isoformat()}.json'
+                        if path.exists():
+                            reading = read_charge(path)
+                            if reading.account_bill and reading.at == previous.at:
+                                self._reconcile_charge(state, reading)
+                            else:
+                                complete = False
+                        else:
+                            complete = False
+                    if complete and now < previous.at + settings.cost_explorer_interval_seconds:
+                        return previous
+            readings = fetch(start, end)
+            saved: list[ChargeRead] = []
+            for reading in readings:
+                estimated = Decimal(0)
+                if state.inventories and any(inventory.at <= reading.period_end for inventory in state.inventories):
+                    costs = costs_from_evidence(state, settings, reading.period_end,
+                                                window=datetime.fromtimestamp(reading.period_start, settings.accounting_zone).date())
+                    estimated = period_cost(costs.intervals, reading.period_start, reading.period_end)
+                reading = replace(reading, at=now, estimated_usd=estimated)
+                path = self.directory / 'charges' / f'{reading.day}.json'
+                write_text_atomic(path, json.dumps(charge_record(reading), sort_keys=True) + '\n')
+                saved.append(reading)
+            for reading in saved:
+                self._reconcile_charge(state, reading)
+            return saved[-1]
 
     def _save_estimate(self, state: LedgerEvidence, costs: CostEstimate) -> None:
         established = {r: r for r in costs.established_reconciliations}
