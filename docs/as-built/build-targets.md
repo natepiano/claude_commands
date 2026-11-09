@@ -180,7 +180,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:queue [<position\|session\|folder>]` | `build_queue.py` | A free/taken budget bar and one waiting row per step, with showrunner, unit, minutes waited and a size bar on the budget scale. `▸` marks the asking session. Row 1 shows `↑` for backfill, `↑ ≤N.N` for strict-window room or `⊘` when no room remains, its recorded window countdown and host holds. A selector opens step cards with each step’s admission checks. `queue_read()` uses the lock-free snapshot or a 0.5 s bounded lock; stale readings keep their time and an amber header, and unavailable readings show `queue busy; try again`. Bump is off and nothing can move a waiting step. |
-| Build costs | `buildlog costs [--days N]` | Phase time and ranked costs by machine. Use the `buildlog` CLI for detailed records. |
+| Build page | `buildlog charts [--days 7\|30] [--no-open]` | Prints the shared build page link, the same link as `/build:page`. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
 Each command shows its script's output unchanged; each script answers in about a second. There are no stubs at the old names `/builds`, `/build_hold` or `/mac_test`.

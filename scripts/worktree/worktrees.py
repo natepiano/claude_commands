@@ -198,6 +198,10 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         if head.returncode or head.stdout.strip() != expected:
             reason = head.stderr.strip() or f"HEAD is {head.stdout.strip() or 'detached'}; expected {expected}"
             return Kept(path, reason)
+    if has_branch(repo, record.branch) and not git(
+            repo, "rev-list", "-n", "1", f"{record.base}..refs/heads/{record.branch}").stdout.strip():
+        # A tree with no commit of its own can be in use before its first commit.
+        return Kept(path, "no commit of its own")
     result = landed(record)
     if isinstance(result, NotLanded):
         detail = "\n".join((*result.commits, *result.paths))
