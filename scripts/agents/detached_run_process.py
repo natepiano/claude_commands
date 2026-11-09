@@ -1,5 +1,6 @@
 """Read process arguments and identify detached run supervisors."""
 
+from collections.abc import Sequence
 from pathlib import Path
 import subprocess
 
@@ -15,12 +16,16 @@ def process_args(pid: int) -> list[str]:
     return shown.stdout.split()
 
 
-def supervises(pid: int, record_path: Path) -> bool:
-    """Whether pid is the `supervise` process of this record, so a reused pid does not match."""
-    if pid <= 0:
+def runs_command(pid: int, command: Sequence[str]) -> bool:
+    """Match the program name and its arguments against the current process command."""
+    if pid <= 0 or not command:
         return False
     parts = process_args(pid)
-    if "supervise" not in parts or not any(part.endswith("detached_runs.py") for part in parts):
-        return False
-    expected = record_path.resolve()
-    return any(Path(part).resolve() == expected for part in parts if part)
+    return any(Path(part).name == Path(command[0]).name
+               and parts[index + 1:index + len(command)] == list(command[1:])
+               for index, part in enumerate(parts) if part)
+
+
+def supervises(pid: int, record_path: Path) -> bool:
+    """Match the supervisor command and its record to exclude reused process IDs."""
+    return runs_command(pid, ["detached_runs.py", "supervise", str(record_path.resolve())])

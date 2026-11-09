@@ -3838,12 +3838,12 @@ with patch.object(fcntl, "flock", admission):
                 self.start_phase(session, 41_010)
                 command = ["bash", "review.sh", "prompt with spaces", "--phase", "3"]
                 self.start_slot_pass(session, "review", "review", 41_020, "gpt-called", 0,
-                                     "--launcher-command", json.dumps(command), worker_name="review2")
-                path = session / "progress_history_state.json"
-                before = (path.read_bytes(), path.stat().st_mtime_ns)
+                                     "--launcher-command", json.dumps(command), "--launcher-pid", "4321", worker_name="review2")
                 active = self.pass_slots(session)["review"]
-                self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", worker_name="review2")
-                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                self.assertEqual(active.get("launcher_pid"), 4321)
+                self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", 0,
+                                     "--launcher-pid", "4322", worker_name="review2")
+                active["launcher_pid"] = 4322
                 self.assertEqual(self.pass_slots(session)["review"], active)
                 self.assertEqual(len(self.pass_events(name, "pass_started")), 1)
                 self.assertEqual(self.pass_events(name, "pass_finished"), [])
@@ -3928,6 +3928,7 @@ with patch.object(fcntl, "flock", admission):
                 worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
+            self.assertEqual(self.pass_slots(session)["impl2"].get("launcher_pid"), os.getpid())
             path = session / "progress_history_state.json"
             before = (path.read_bytes(), path.stat().st_mtime_ns)
             resumed = progress_history.begin_dispatch(

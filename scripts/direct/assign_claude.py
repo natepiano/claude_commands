@@ -241,6 +241,7 @@ def _run(launch: ClaudeLaunch) -> int:
             "--fix-pass", str(launch.fix_pass), "--activity", launch.role, "--called-task", task,
             "--worker-name", name, "--called-family", "claude", "--called-model", launch.model,
             "--called-effort", launch.effort or "unset", "--launcher-command", json.dumps(launch.command),
+            "--launcher-pid", str(os.getpid()),
             *phase_options, *worker_options], check=False)
         if started.returncode:
             print(f"ERROR: unable to record the {launch.role} pass start.", file=sys.stderr)

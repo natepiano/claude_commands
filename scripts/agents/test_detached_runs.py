@@ -555,6 +555,14 @@ sys.exit(1)
         _ = another.write_text(path.read_text())
         self.assertFalse(detached_run_process.supervises(original["pid"], another))
         self.assertFalse(detached_run_process.supervises(os.getpid(), path))
+        command = ["assign.py", "impl", "prompt with spaces"]
+        for arguments, matches in ((["python", "/fixture/assign.py", *command[1:]], True),
+                                   ([], False),
+                                   (["python", "/fixture/other.py", *command[1:]], False),
+                                   (["python", "/fixture/assign.py", "review", command[2]], False)):
+            with self.subTest(arguments=arguments):
+                with patch.object(detached_run_process, "process_args", return_value=arguments):
+                    self.assertEqual(detached_run_process.runs_command(4321, command), matches)
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])

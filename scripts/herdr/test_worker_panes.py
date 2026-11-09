@@ -35,6 +35,7 @@ from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.direct import progress_history
+from scripts.agents import detached_run_process
 
 
 @final
@@ -1706,8 +1707,28 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(opened, worker_panes.OpenWorker)
         self.dispatch(opened.row, "impl")
         path = self.root / "run/progress_history_state.json"
-        before = path.read_bytes()
-        self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+        command = ["bash", "/fixture/assign.sh", "impl", "prompt with spaces", "--to", opened.row.name]
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        passed = cast(dict[str, dict[str, object]], state["pass"])[opened.row.name]
+        passed["launcher_command"] = command
+        for pid, arguments, held in ((4321, ["python", "/fixture/assign.py", *command[2:]], True),
+                                     (4321, [], False),
+                                     (4321, ["python", "/fixture/other.py", *command[2:]], False),
+                                     (4321, ["python", "/fixture/assign.py", "review", *command[3:]], False),
+                                     (0, [], False)):
+            with self.subTest(pid=pid, arguments=arguments):
+                passed["launcher_pid"] = pid
+                write_text_atomic(path, json.dumps(state))
+                before = path.read_bytes()
+                with patch.object(detached_run_process, "process_args", return_value=arguments):
+                    result = worker_panes.worker_dispatch_state(opened.row, self.root / "run")
+                    if held:
+                        self.assertEqual(result, worker_panes.DispatchHoldsWorker("launcher is live"))
+                        self.assertEqual(worker_panes.can_close(opened), worker_panes.Kept("launcher is live"))
+                    else:
+                        self.assertEqual(result, worker_panes.ReleasedWorkerPass.STALE_ACTIVE)
+                        self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+                self.assertEqual(path.read_bytes(), before)
         self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name)), worker_panes.Closed)
         self.assertEqual(path.read_bytes(), before)
 

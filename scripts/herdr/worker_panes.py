@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Literal, cast, final
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.production import staff, worker_admission
-from scripts.agents import worker_lifecycle
+from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
@@ -651,6 +651,14 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
             if isinstance(_completed_turn(row, dispatch), CloseAllowed):
                 return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
             return DispatchHoldsWorker("submitted pass awaits completion")
+        pid, command = passed.get("launcher_pid"), passed.get("launcher_command")
+        if isinstance(pid, int) and isinstance(command, list):
+            parts = cast(list[object], command)
+            if len(parts) > 1 and all(isinstance(part, str) for part in parts):
+                saved = cast(list[str], parts)
+                launcher = [str(Path(saved[1]).with_suffix(".py")), *saved[2:]]
+                if detached_run_process.runs_command(pid, launcher):
+                    return DispatchHoldsWorker("launcher is live")
         return ReleasedWorkerPass.STALE_ACTIVE
     if status in ("", "error", "refused"):
         return ReleasedWorkerPass.NO_PROMPT_DELIVERED

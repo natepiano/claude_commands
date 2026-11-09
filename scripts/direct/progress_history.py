@@ -1881,6 +1881,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     # the current phase's.
     phase, launch_check = _checked_launch(args, state, session_dir)
     launcher_command = _launcher_arguments(_optional_arg(args, "launcher_command"))
+    launcher_pid = _arg_integer(args, "launcher_pid", os.getppid())
     dispatch_fields: dict[str, object] = {
         "kind": pass_kind,
         "fix_pass": fix_pass,
@@ -1895,8 +1896,12 @@ def _start_pass(args: argparse.Namespace) -> None:
                             dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
                             allow_stage_two=bool(getattr(args, "dispatch_owned", False)))
     if active is not None and isinstance(match, MatchedDispatch):
+        changed = active.get("launcher_pid") != launcher_pid
+        active["launcher_pid"] = launcher_pid
         if launcher_command and not active.get("launcher_command"):
             active["launcher_command"] = launcher_command
+            changed = True
+        if changed:
             _write_state(session_dir, state)
         return
     now = plan_history.now_epoch()
@@ -1913,6 +1918,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         "worker_name": _optional_arg(args, "worker_name"),
         "worker_id": _optional_arg(args, "worker_id"),
         "launcher_command": launcher_command,
+        "launcher_pid": launcher_pid,
         "called_agent": called_agent,
         "team_slot": team_slot,
         "phase": _phase_stamp(phase),
@@ -1997,7 +2003,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
     args = argparse.Namespace(
-        session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role,
+        session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role, launcher_pid=os.getpid(),
         worker_name=worker_name, worker_id=worker_id, launcher_command=json.dumps(launcher_command) if launcher_command else "",
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family="unknown", called_model="unknown", called_effort="unset",
@@ -6883,6 +6889,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_pass.add_argument("--session-dir", required=True)
     _ = start_pass.add_argument("--pass-kind", choices=staff.WORKER_ROLES, required=True)
     _ = start_pass.add_argument("--launcher-command", default="", help="JSON list of launcher arguments for recovery")
+    _ = start_pass.add_argument("--launcher-pid", type=int, default=os.getppid())
     _ = start_pass.add_argument("--fix-pass", type=int, default=0)
     _ = start_pass.add_argument("--activity", required=True)
     _ = start_pass.add_argument("--called-task", required=True)
