@@ -1901,31 +1901,10 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Approved:** builds showrunner, 2026-11-08 (change review C1267 returned: "`tmp_sweep.py --plan <file>` still keeps 535 entries with "Not a directory". Each one is a plain file in /tmp/claude/scratch, such as msg136.txt or wo.json, that the sweep reads as a folder for .scratch.json. Fix it where it lives, and add a test row.").
 
-#### Work Order
-
-**Goal:** a plain file directly in the scratch task root (`/tmp/claude/scratch`) is not a task folder. The sweep judges it like any other entry with no task record, by its idle age, and never keeps it with "Not a directory".
-
-**Measured (builds, 2026-11-08):** on natedev, `tmp_sweep.py --plan <file>` keeps 535 entries with "Not a directory", for example `msg136.txt` and `wo.json` in `/tmp/claude/scratch`. The scratch branch of the sweep's limit reads `<entry>/.scratch.json` through `scratch.task_of()` (`scripts/lib/scratch.py:743`) and `copy_record.read_record()` (`scripts/lib/copy_record.py`). For a plain file that read raises `NotADirectoryError`, which `read_record` turns into `UnreadableRecord`.
-
-**Spec:**
-1. Find where the "Not a directory" keep comes from, and fix it where it lives. A plain file (not a folder, not a symlink to one) in the scratch task root has no task record: it reads as `NotRegistered`, not `UnreadableRecord`. A folder whose `.scratch.json` cannot be read keeps its current unreadable result.
-2. The sweep then gives that plain file the same idle limit as other entries with no task record. Change no idle limit and no other root's rule.
-3. Add a test row in `scripts/lint/test_tmp_sweep.py` that fails before the fix: a plain file in a tempdir scratch root, older than the idle limit, is planned for removal and is not kept with "Not a directory". A second row: a plain file newer than the idle limit is kept as recent, not as unreadable.
-   The hand-cleanup plan (`--plan <file>`) keeps its end-evidence rule: a plain scratch file with no record stays with "no recorded end permits hand cleanup", never with "Not a directory" (director ruling, 2026-11-08). Add a row for that plan path.
-4. Correct `docs/as-built/` text that describes the scratch root rule if it does not match.
-
-**Files:**
-- `scripts/lib/scratch.py`
-- `scripts/lib/copy_record.py`
-- `scripts/lint/tmp_sweep.py`
-- `scripts/lint/test_tmp_sweep.py`
-- `scripts/lib/test_scratch.py`
-
-**Workers:** 1 writer + 1 tester.
-- writer: the fix in `scripts/lib/scratch.py`, `scripts/lib/copy_record.py` or `scripts/lint/tmp_sweep.py`, wherever the cause is, and any as-built text.
-- tester: the failing rows in `scripts/lint/test_tmp_sweep.py`, and in `scripts/lib/test_scratch.py` if the fix is in `scratch.py` or `copy_record.py`.
-
-**Acceptance gate:** the new rows fail before the fix and pass after; `test_tmp_sweep.py`, `test_scratch.py` and the targeted test pass; basedpyright reports 0 errors and 0 warnings on the changed Python files. Tests use tempdir roots only and never read or change the real `/tmp`. The checkpoint's Change-Review line gives the plan file argument: `tmp_sweep.py --plan <file>`.
+#### As-built
+- `scratch.task_of` (`scripts/lib/scratch.py`) reads a plain file in the scratch root as `NotRegistered`. It tests with `os.path.isfile`, which returns False on a permission error; `Path.is_file` raises `PermissionError` on Python 3.13. A folder whose record cannot be read still reads as `UnreadableRecord` and stays.
+- The automatic tmp sweep keeps a recent plain file (`RECENT`) and removes an old one by the existing idle limit. A hand cleanup plan (`tmp_sweep.py --plan`) keeps a plain file with reason `NO_END` ("no recorded end permits hand cleanup"). No row says "Not a directory".
+- Rows: `test_scratch` (plain file and folder read `NotRegistered`; a parent without search permission reads `UnreadableRecord`); `test_tmp_sweep` `ScratchRootTests` and `HandCleanupTests --plan`. `docs/as-built/build-memory-admission.md` states the plain-file rule.
 
 ### Phase 86 — Mac rebuild works over ssh through a local sshd hop  · status: todo
 **Depends on:** none. Repository: nixos (worktree `/home/natepiano/worktrees/nixos-mac-ssh-rebuild`, branch `resources-mac-ssh-rebuild`, from nixos main `590edd7`). The showrunner pushes nixos main; this unit never does.
