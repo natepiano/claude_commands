@@ -2219,3 +2219,27 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Ruled out:**
 - The import closure in place of the same-folder rule: replay selects more modules (596 against 426 on one 39-file run).
+
+
+### Phase 112 — A targeted test skips folder neighbors that do not name the changed file  · status: done
+
+#### As-built
+
+- In `select_affected` in `scripts/production/affected_modules.py`, a changed non-test Python file selects a test module of its folder only when that module's text holds the file's stem as a whole word. Imports, strings and comments each count. Removed files count.
+- The selector reads the text only for a module in such a folder that no earlier rule selected. A read or decode error gives the existing graph-error result.
+- The other module rules, the base choice and the fact cache are unchanged.
+- Replay of 19 landings on `builds`: mean 91 to 68 modules, mean 768 to 590 CPU s, median 77 to 64 CPU s. With no folder rule at all the mean is 67 modules and 581 CPU s.
+
+**Files:**
+- `scripts/production/affected_modules.py` — the folder rule
+- `scripts/production/test_affected_modules.py` — the changed rows and the new rows
+- `scripts/production/test_targeted_test.py` — the fixture's folder neighbor names the changed file
+- `docs/as-built/merge-gate-and-test-speed.md` — the fourth rule
+
+**Gotchas:**
+- A test that reaches a changed sibling only through a helper, and does not name it, is not selected. The merge gate still runs it.
+- The transitive config rule now holds most of the targeted cost: two `config/lint.conf` edits ran 580 modules each, 86% of the replay's CPU. A question to the user about it is open.
+
+**Ruled out:**
+- A measured per-module file map: the name check keeps nearly the same gain with much less work.
+- Config selection by changed key: replay gain is small (590 to 569 CPU s), because `scripts/lint/sweep.py` alone reaches 477 test modules by imports.
