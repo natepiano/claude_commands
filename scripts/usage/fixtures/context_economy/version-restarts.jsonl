@@ -1,0 +1,9 @@
+{"type":"file-history-snapshot","snapshot":{"messageId":"first"}}
+{"type":"user","timestamp":"2026-11-01T09:40:00Z","version":"2.1.296","message":{"content":"First request."}}
+{"type":"attachment","timestamp":"2026-11-01T09:50:00Z","version":"2.1.296","attachment":{"type":"hook_success","hookEvent":"SessionStart","hookName":"SessionStart:startup","toolUseID":"startup"}}
+{"type":"user","timestamp":"2026-11-01T10:01:00Z","version":"2.1.316","message":{"content":"Continue."}}
+{"type":"progress","timestamp":"2026-11-01T10:02:00Z","version":"2.1.316","data":{"message":"The command runs."}}
+{"type":"assistant","timestamp":"2026-11-01T10:03:00Z","version":"2.1.317","requestId":"restart-request","message":{"id":"restart-message","model":"fixture-model","usage":{"input_tokens":6,"output_tokens":2}}}
+{"type":"user","timestamp":"2026-11-01T10:04:00Z","version":"2.1.318","message":{"content":"Continue."}}
+{"type":"progress","timestamp":"2026-11-01T10:05:00Z","version":"2.1.319","data":{"message":"The next command runs."}}
+{"type":"progress","timestamp":"2026-11-01T10:06:00Z","version":"2.1.319","data":{"message":"No restart."}}

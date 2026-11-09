@@ -13,8 +13,8 @@
   - Completion condition: the test module ends with no child process left; a test checks the process tree after the module ends.
   - Revealed by: Phase 3t (sdlc [3129d2dd] placed it next).
 - [ ] **One pane scan for rename displays**
-  - Target: `scripts/production/rename.py` (`repair_displays`), `scripts/herdr/herdr.py` (`Herdr.retitle_row`, `Herdr.scan_row_panes`)
-  - Why needed: `repair_displays` and `retitle_row` have separate implementations that match panes to native sessions.
+  - Target: `scripts/shutdown/shutdown.py` (`rename_repair_displays`), `scripts/herdr/herdr.py` (`Herdr.retitle_row`, `Herdr.scan_row_panes`).
+  - Why needed: `rename_repair_displays` and `retitle_row` use separate implementations to match panes to native sessions.
   - Completion condition: both functions use one pane-scan implementation. Keep session-record updates, pane titles, tab labels, workspace labels, native-session proof and anomaly output. Test these behaviors through rename.
   - Revealed by: herdr-unit (sdlc [16a2cfa0] placed it next, after 3t).
 - [ ] **Carry the planned port and responsibilities into unit launch**

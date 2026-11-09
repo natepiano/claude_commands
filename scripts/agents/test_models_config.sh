@@ -801,7 +801,7 @@ write_test_registry "$TEST_DIR/tierset.conf" --replace-provided-sections \
     kept.codex/check=gpt-test:high \
     kept.claude/work=opus:max \
     kept.claude/check=opus:max \
-    'kept.options/codex_mesh=1    # another launch flag' \
+    'kept.options/other_flag=1    # another launch flag' \
     'kept.options/codex_service_tier=flex    # tuned' \
     bare.codex/work=gpt-test:high \
     bare.claude/work=opus:max \
@@ -836,7 +836,7 @@ assert_registry_matches "$expected" || fail "function tier changed rows other th
 sed '/^codex_service_tier=flex/d' "$before" > "$expected"
 agents_set_service_tier inherit kept
 assert_registry_matches "$expected" || fail "inherit removed more than the tier key"
-[[ "$(_models_registry_get kept.options codex_mesh)" == "1" ]] || fail "inherit dropped another launch flag"
+[[ "$(_models_registry_get kept.options other_flag)" == "1" ]] || fail "inherit dropped another launch flag"
 
 # A row key beats its function's key; inherit on the row falls back to it.
 write_fixture "$TEST_DIR/tierset.conf"

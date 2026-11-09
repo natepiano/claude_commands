@@ -28,7 +28,6 @@ if __name__ == "__main__":
     bootstrap = argparse.ArgumentParser(add_help=False)
     _ = bootstrap.add_argument("--code-root", type=Path, default=Path(__file__).resolve().parents[2])
     installed, _remaining = bootstrap.parse_known_args(namespace=installed)
-    sys.path.insert(0, str(installed.code_root))
 
 from scripts.build_queue import admission_code
 
@@ -608,7 +607,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 name, detail = row["name"], row["detail"]
             if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
-                group = "Codex servers" if program in ("codex", "codex-real", "mesh_runs.py") else "worker background runs"
+                group = "Codex servers" if program in ("codex", "codex-real", "detached_runs.py") else "worker background runs"
                 row["detail"] = " · ".join(part for part in (detail, program) if part)
                 groups.setdefault(group, []).append(row)
             else:

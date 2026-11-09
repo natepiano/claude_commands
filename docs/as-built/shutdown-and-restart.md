@@ -44,6 +44,14 @@ It takes no watcher lock and sends no message.
 Stall-watch retires the saved prompt keys on its next pass, even after launch deletion.
 A cancellation error prints a separate warning and does not change the stop result.
 Workers keep their threads.
+Staff membership selects worker children for stop and restart.
+These operations do not read a transport pin.
+
+`release_source(row, backend)` uses the current native conversation evidence.
+A confirmed exit or `NotRunning` gives `SourceReleased`.
+An unresolved staff reference gives `SourceUnresolved`.
+Unknown process evidence or an unproved stop gives `SourceReleaseUnknown`.
+A family switch preserves its source when release remains unproved.
 
 `agents resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
 The short form is `resume NAME`, through `scripts/shutdown/resume`.
@@ -138,7 +146,8 @@ A session move selects only worker rows whose staff `parent` names the moved row
 Owning a run does not select every worker in that run.
 The fixed staff ID identifies each child once, even when several runs name it.
 
-`inventory.worker_resumes` returns `WorkerResume` values from `resume_message.py`.
+`inventory.worker_resumes` returns `WorkerResume` results from `resume_message.py`.
+`Resumable` and `Idle` carry `ClaudeChildResume` values.
 Each child has one result:
 
 | Result | Evidence | Message |
@@ -147,20 +156,26 @@ Each child has one result:
 | `Idle` | The child's readable turn was not live | `idle` and `nothing to run now` |
 | `Unavailable` | The run, worker record, or last assignment is unavailable | One `anomaly:` line with the child and reason |
 
-The reader takes one assignment-log snapshot and finds each child's newest run with a real worker record.
-A Codex roster record takes precedence over a slot record for the same worker in one run.
-A Claude worker uses its `impl_worker_<slot>.json` record and the matching status file.
+The reader selects staff members under the moved parent.
+It reads each member's backend and current native session.
+A Claude child uses its `impl_worker_<slot>.json` record and the matching status file.
 The status reader searches the run root and `phases/*`; it does not search `tmp/**`.
-A readable non-live roster status, including `capacity_exhausted`, gives `Idle`.
+A readable status other than `implementing`, including `capacity_exhausted`, gives `Idle`.
 An unavailable child does not hide another child's result.
 
 `session_staff.worker_run_entries(snapshot, rows)` returns real `(run, entry)` pairs.
 `worker_run_index(snapshot)` also includes owner-marker runs without a worker record.
-Source release uses those marker runs to find loaded threads.
+Source release uses native process evidence and does not scan those runs.
 Both readers share one scan and report unreadable evidence as anomalies.
 `unit_runs.run_folders` preserves root and name order, removes duplicate resolved paths, and skips each root's `active` marker folder.
 An unreadable root does not prevent reads of other roots.
 
+Pane worker resumes use `PaneWorkerResume` with a fixed staff id and an active dispatch id.
+The director receives `Worker <staff id>: busy dispatch <dispatch id>` for each active direct child.
+The message names idle children separately.
+It keeps the account move source and destination.
+Restart and pane restore select each worker's current staff parent directly.
+Closed idle workers stay closed until their next assignment.
 Pane worker resume uses the dispatch record and transcript to select one step.
 An idle worker receives a continuation prompt when its transcript contains the open dispatch.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
@@ -194,7 +209,8 @@ An unconfirmed stop checks only its target's current identity and process genera
 A live target stays running. An unreadable target stays on the restart list.
 A missing rollout file or changed generation alone does not prove exit.
 Restart launches after a failed stop only when it proves absence or a different process running another conversation.
-The run index passes through every stop helper and through worker restore.
+Worker restore uses the shared run index.
+The stop helpers use the shared Codex snapshot.
 Action checks still prove the target process before a signal.
 Independent rows stop and start in parallel.
 Each restore line starts with the staff name, including worker restore results.
@@ -265,7 +281,8 @@ The launch then returns its failure result without a process start.
 A composer with a draft waits until the deadline without changes to the draft.
 
 Worker restore shares the command's run index and Codex snapshot through stopped-worker startup.
-Restore and stop use `worker_panes.worker_run` for the same run selection and fallback.
+Restore uses `worker_panes.worker_run` for run selection and fallback.
+Stop selects workers from their current staff parent.
 
 An unconfirmed worker stop needs targeted proof of process absence before restart can launch that worker.
 Live or unknown evidence leaves the worker pending.

@@ -50,8 +50,8 @@ class PaneWorkerResume:
     turn: BusyPass | UnsubmittedAssignment | IdleWorker
 
 
-class PausedSeat(TypedDict):
-    """A worker reference and the launcher that continues its task."""
+class ClaudeChildResume(TypedDict):
+    """A Claude child keeps its launcher command and assignment."""
 
     run_dir: str
     seat: str
@@ -62,11 +62,11 @@ class PausedSeat(TypedDict):
 
 
 class Resumable(NamedTuple):
-    seat: PausedSeat
+    seat: ClaudeChildResume
 
 
 class Idle(NamedTuple):
-    seat: PausedSeat
+    seat: ClaudeChildResume
 
 
 class Unavailable(NamedTuple):
@@ -128,13 +128,11 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
                     lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
                                  + f"Your next dispatch with --to {seat['seat']} resumes it.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
-    elif why and not workers.panes:
-        lines.append("Codex workers keep their existing threads. Use assign.sh --to <worker> to resume a paused worker.")
     text = ("\n" if workers.results or workers.panes else " ").join(lines)
     return script_prompt(text)
 
 
-def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
+def resume_worker_command(seat: ClaudeChildResume, cwd: str) -> str:
     """Build an assignment command for the worker's existing thread."""
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
     if seat["turn_live"] and seat["launcher_command"]:
@@ -152,7 +150,7 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     return _assignment_command(seat, cwd, prompt, list(options.items()))
 
 
-def _assignment_command(seat: PausedSeat, cwd: str, prompt: str, options: list[tuple[str, str]]) -> str:
+def _assignment_command(seat: ClaudeChildResume, cwd: str, prompt: str, options: list[tuple[str, str]]) -> str:
     """Supply the current folder, prompt, and authorized phase paths."""
     values = dict(options)
     role = values["--role"]
@@ -166,7 +164,7 @@ def _assignment_command(seat: PausedSeat, cwd: str, prompt: str, options: list[t
         seat["run_dir"], seat["seat"], role,
         [*refreshed.items(), *((option, value) for option, value in options if option not in refreshed)])
 
-def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
+def _resume_task(seat: ClaudeChildResume, cwd: str, prompt: str) -> str:
     """Convert a saved launcher command into an assignment command."""
     command = seat["launcher_command"]
     index = next((i for i, value in enumerate(command) if Path(value).name in assign_gate.WORKER_LAUNCHERS), -1)
@@ -179,7 +177,7 @@ def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:
         if position + 1 >= len(command):
             raise ValueError("the saved command has an incomplete option")
         option, value = command[position:position + 2]
-        if launcher in assign_gate.ASSIGN_LAUNCHERS or option not in {"--pool", "--lease", "--slot", "--mesh-label"}:
+        if launcher in assign_gate.ASSIGN_LAUNCHERS or option not in {"--pool", "--lease", "--slot"}:
             options.append((option, value))
         position += 2
     if launcher not in assign_gate.ASSIGN_LAUNCHERS:

@@ -64,7 +64,6 @@ import sys
 
 entry = Path(sys.argv[1])
 watched = [Path(name).resolve() for name in sys.argv[2:]]
-sys.path[0] = str(entry.parent)
 sys.argv = [str(entry), "--help"]
 try:
     runpy.run_path(str(entry), run_name="__main__")

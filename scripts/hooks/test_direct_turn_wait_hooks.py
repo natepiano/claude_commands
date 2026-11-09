@@ -16,6 +16,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -138,6 +139,23 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
 
 
 class DirectorTurnWaitHookTests(unittest.TestCase):
+    def test_historical_worker_address_alias_matches_its_thread_and_not_its_name(self) -> None:
+        with director_wait_fixture() as fixture:
+            runs = fixture.root / "unit-runs"
+            worker_run = runs / "supplier-run"
+            worker_run.mkdir(parents=True)
+            parent, = staff.local_snapshot().find(kind="unit")
+            worker = fixture_worker("supplier-fix", parent.id,
+                                    backend=staff.CodexBackend(fixture.root / "codex"))
+            write_text_atomic(worker_run / "mesh_roster.json", json.dumps({"supplier-fix": {"staff_id": worker.id}}))
+            fixture.environment["UNIT_RUN_ROOT"] = str(runs)
+            supplier = "worker:supplier-run/supplier-fix"
+            fixture.call(STOP, {"last_assistant_message": "blocked: waiting on " + supplier}, 1010)
+            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:another-thread", name=supplier)}, 1020)
+            self.assertEqual(len(fixture.wait_events()), 1)
+            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address=f"codex:{worker.current_session}")}, 1040)
+            self.assertEqual(fixture.wait_events()[-1]["event_type"], "wait_finished")
+
     def test_final_decision_and_gate_lines_start_one_user_wait_and_allow_the_stop(self) -> None:
         for final_line in ("decision: approve the checkpoint", "— gate: phase ready"):
             with self.subTest(final_line=final_line), director_wait_fixture() as fixture:
@@ -325,23 +343,6 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             fixture.call(STOP, {"last_assistant_message": "blocked: waiting on the showrunner"}, 1010)
             fixture.call(PROMPT, {"prompt": fixture.message("Merged", address="uds:/relay/socket", name="expected-showrunner")}, 1020)
             self.assertEqual(len(fixture.wait_events()), 1)
-
-    def test_worker_address_alias_matches_its_roster_thread_and_not_its_name(self) -> None:
-        with director_wait_fixture() as fixture:
-            runs = fixture.root / "unit-runs"
-            worker_run = runs / "supplier-run"
-            worker_run.mkdir(parents=True)
-            parent, = staff.local_snapshot().find(kind="unit")
-            worker = fixture_worker("supplier-fix", parent.id,
-                                    backend=staff.CodexBackend(fixture.root / "codex"))
-            _ = (worker_run / "mesh_roster.json").write_text(json.dumps({"supplier-fix": {"staff_id": worker.id}}))
-            fixture.environment["UNIT_RUN_ROOT"] = str(runs)
-            supplier = "worker:supplier-run/supplier-fix"
-            fixture.call(STOP, {"last_assistant_message": "blocked: waiting on " + supplier}, 1010)
-            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:another-thread", name=supplier)}, 1020)
-            self.assertEqual(len(fixture.wait_events()), 1)
-            fixture.call(PROMPT, {"prompt": fixture.message("Ready", address=f"codex:{worker.current_session}")}, 1040)
-            self.assertEqual(fixture.wait_events()[-1]["event_type"], "wait_finished")
 
     def test_unnamed_supplier_remains_unresolved_and_different_supplier_replaces_wait(self) -> None:
         with director_wait_fixture() as fixture:

@@ -32,7 +32,6 @@ NAMES_A_ZONE = {
 MACHINE_ZONE = re.compile(r"\.astimezone\(\)")
 # The scripts that may use the machine's zone, each because the time there is stored or compared, never shown.
 USES_THE_MACHINE_ZONE = {
-    "agents/codex_mesh.py": "log stamps written with their offset",
     "hooks/banned_words_lib.py": "a log stamp written with its offset",
     "notify/pushover.py": "a log stamp written with its offset",
     "notify/review.py": "a log stamp written with its offset",
