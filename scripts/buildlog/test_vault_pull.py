@@ -23,7 +23,7 @@ from scripts.lib import conf
 from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
 from scripts.buildlog.test_index import point_root_at
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 
 
 QUESTION_STAND_IN = '''import json, pathlib, sys
@@ -56,7 +56,7 @@ exec "$VAULT_TEST_GIT" "$@"
 GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
     "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_NOSYSTEM": "1",
 }
 
 
@@ -96,7 +96,9 @@ class VaultPullTests(unittest.TestCase):
         github = cls.template / "github.git"
         local = cls.template / "natedev"
         mac = cls.template / "mac"
-        with mock.patch.dict(os.environ, GIT_IDENTITY):
+        with mock.patch.dict(os.environ, {
+            **GIT_IDENTITY, "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(cls.template)),
+        }):
             _ = cls.command(["git", "init", "--bare", "--initial-branch=main", str(github)])
             _ = cls.command(["git", "init", "--initial-branch=main", str(local)])
             _ = (local / "shared.md").write_text("base\n")
@@ -116,6 +118,7 @@ class VaultPullTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "BUILDLOG_PEER": "fixture-mac",
             **GIT_IDENTITY,
+            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.folder)),
         }))
         for name, destination in (("github.git", self.github), ("natedev", self.local), ("mac", self.mac)):
             _ = shutil.copytree(self.template / name, destination)

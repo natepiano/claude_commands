@@ -274,6 +274,7 @@ class CloudWorkRow(TypedDict):
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
+    progress: RowProgress | NoProgress
     stale: bool
     late_age: str
 
@@ -532,6 +533,13 @@ def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress 
         return {"kind": "RowProgress", "phase": phase, "done": counter.done,
                 "total": counter.total, "percent": counter.percent, "unit": unit}
     return {"kind": "NoProgress", "reason": reason}
+
+
+def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
+    if isinstance(counter, progress.NoCounter):
+        return {"kind": "NoProgress", "reason": counter.reason}
+    return {"kind": "RowProgress", "phase": "testing", "done": counter.done,
+            "total": counter.total, "percent": counter.percent, "unit": "modules"}
 
 
 def run_keep_text(hold: admission_records.RunKeepAside, steps: Sequence[admission_records.RunningStep]) -> str:
@@ -882,7 +890,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "showrunner": identity.showrunner, "unit": identity.unit, "pid": cloud.owner.pid,
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
-                "state": information.state, "status": plain([queue_view.cloud_status(cloud, information)]),
+                "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
+                "progress": cloud_row_progress(cloud.counter),
                 "stale": isinstance(information.update, queue_view.CloudUpdateLate)
                          and not isinstance(cloud.wait, wire.CloudSlotWait),
                 "late_age": queue_view.cloud_update_age(information.update.seconds)

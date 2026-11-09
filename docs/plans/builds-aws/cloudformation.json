@@ -474,6 +474,7 @@
     },
     "InstanceRole": {
       "Type": "AWS::IAM::Role",
+      "Condition": "Compute",
       "Properties": {
         "Tags": [
           {
@@ -506,6 +507,7 @@
     },
     "InstanceProfile": {
       "Type": "AWS::IAM::InstanceProfile",
+      "Condition": "Compute",
       "Properties": {
         "Roles": [
           {
@@ -516,6 +518,7 @@
     },
     "SecurityGroup": {
       "Type": "AWS::EC2::SecurityGroup",
+      "Condition": "Compute",
       "Properties": {
         "GroupDescription": "Tailscale UDP only; no inbound TCP",
         "VpcId": {
