@@ -1710,3 +1710,8 @@ It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
 `record.py` stores `test_build_key` only when source stays unchanged during nextest.
 Rows without a key cannot prove a fresh build.
 The broader `BUILDLOG_TREE` field cannot replace this key.
+
+The merge gate and style lint own private folders through `build_folders.temporary_build_folder`.
+The contexts remove these folders after success or an exception.
+Style review keeps its input folder for the review worker and finish command.
+Session TMPDIRs and unit session folders remain for later session commands.

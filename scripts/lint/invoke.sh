@@ -16,6 +16,7 @@
 
 BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+    # Later session commands use this inherited TMPDIR after this command exits.
     "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable --path "$TMPDIR" >/dev/null || return
 fi
 # verify.sh needs the temporary parent before it loads the environment.
@@ -493,6 +494,7 @@ sweep_after_step() {
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= SWEEP_EVERY_S )) || return 0
     if [[ ! -d "$dir" ]]; then
+        # Later lint processes reuse the sweep time stored in this folder.
         "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable \
             --parent "$parent" --name "$name" >/dev/null || return 0
     fi
