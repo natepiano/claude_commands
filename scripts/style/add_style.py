@@ -9,7 +9,6 @@ except FileNotFoundError:
 
 import argparse
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -157,8 +156,8 @@ def _style_production(repo_dir: Path, *, include_direct: bool) -> StandingStyleP
         if optional_field(lines, "Kind") == FieldPresent("style"):
             branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
             return StandingStyleProduction(repository, row.name, checkout, doc, branch_point)
-        if include_direct and any(re.fullmatch(r"#{1,6}\s+Style units\s*#*\s*", line) for line in lines):
-            config = style_config.read_config(doc, unit_branch="")
+        if include_direct and style_config.has_style_units(lines):
+            config = style_config.read_config(doc)
             return StandingStyleProduction(repository, row.name, checkout, doc, config.route.branch_point)
     return NoStyleProduction(repository, f"{repository.name}-style")
 
@@ -412,7 +411,7 @@ def main(argv: list[str]) -> int:
             _ = _git(style.repository, "worktree", "add", str(style.checkout), style.merge_branch)
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
-        config = style_config.read_config(style.doc, unit_branch="")
+        config = style_config.read_config(style.doc)
         for assignment in config.assignments:
             _write_missing(style.checkout / PLAN_DIRECTORY / f"{assignment.unit}-unit.md", _plan_text(style, assignment, catalog))
         if isinstance(pilot, PilotUnits):

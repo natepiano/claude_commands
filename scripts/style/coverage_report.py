@@ -66,7 +66,7 @@ def git(repo: Path, *arguments: str) -> str:
 def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
     standing = configured_style_production(ledger.repo)
     if not isinstance(standing, NoStyleProduction):
-        config = style_config.read_config(standing.doc, unit_branch="")
+        config = style_config.read_config(standing.doc)
         return StyleProduction(standing.name, config.route.branch_point,
                                tuple(assignment.unit for assignment in config.assignments))
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()

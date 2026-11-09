@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-from scripts.production import staff
+from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 from scripts.style import style_config
 from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, style_staff_fixture, write_style_units
@@ -56,7 +56,7 @@ class StyleConfigTests(unittest.TestCase):
             f"- **Showrunner checkout:** {self.repo}\n- **Branch point:** refs/heads/product/main\n" + table)
 
     def read(self) -> StyleRepositoryConfig:
-        return style_config.read_config(self.doc, unit_branch="cargo-liner-style")
+        return style_config.read_config(self.doc)
 
     def test_configuration_table(self) -> None:
         all_families = "names, values, types, modules"
@@ -104,6 +104,25 @@ class StyleConfigTests(unittest.TestCase):
                         for family in assignment.families:
                             self.assertEqual(config.owner(family), assignment)
 
+    def test_heading_helper_matches_the_configuration_reader(self) -> None:
+        headings = (
+            ("# Style units", True), ("## Style units", True), ("###### Style units ###  ", True),
+            ("###\tStyle units\t", True), ("Style units", False), ("####### Style units", False),
+            ("## Style units extra", False), (" ## Style units", False), ("## style units", False),
+        )
+        for heading, present in headings:
+            with self.subTest(heading=heading):
+                self.document()
+                write_style_units(self.doc)
+                text = self.doc.read_text().replace("## Style units", heading)
+                _ = self.doc.write_text(text)
+                self.assertEqual(style_config.has_style_units(text.splitlines()), present)
+                if present:
+                    self.assertEqual(self.read().assignments, DEFAULT_STYLE_ASSIGNMENTS)
+                else:
+                    with self.assertRaisesRegex(StyleConfigError, "production doc lacks Style units section"):
+                        _ = self.read()
+
     def test_routes_and_unit_lookup(self) -> None:
         for kind in ("style", "product", ""):
             with self.subTest(kind=kind):
@@ -124,9 +143,9 @@ class StyleConfigTests(unittest.TestCase):
                     self.assertIsInstance(route, ParentUnitRoute)
                     assert isinstance(route, ParentUnitRoute)
                     self.assertEqual(route.branch_point, "integration/main")
-                    self.assertEqual(route.unit_branch, "cargo-liner-style")
-                self.assertEqual(style_config.config_for_unit(unit, record), config)
-                self.assertEqual(style_config.config_for_unit(str(unit.id), record), config)
+                with mock.patch.object(session_staff.RowResolver, "unit_branch", side_effect=AssertionError("no branch read")):
+                    self.assertEqual(style_config.config_for_unit(unit, record), config)
+                    self.assertEqual(style_config.config_for_unit(str(unit.id), record), config)
 
     def test_document_reads_once_without_cache(self) -> None:
         self.document()
@@ -145,7 +164,7 @@ class StyleConfigTests(unittest.TestCase):
         combined = (StyleUnitAssignment("cargo-liner-style", ("names", "values", "types", "modules")),)
         for assignments in (DEFAULT_STYLE_ASSIGNMENTS, combined):
             with self.subTest(assignments=assignments), style_staff_fixture(self.root, self.repo, assignments):
-                config = style_config.read_config(self.repo / ".git/style-production.md", unit_branch="cargo-liner-style")
+                config = style_config.read_config(self.repo / ".git/style-production.md")
                 self.assertEqual(config.assignments, assignments)
                 parent = recorded_showrunner("sample-style", self.repo / ".git/style-production.md")
                 for assignment in assignments:

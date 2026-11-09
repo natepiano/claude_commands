@@ -290,7 +290,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
     paths = ledger_paths
     resolver = session_staff.RowResolver(staff.snapshot())
     holders = {row.name: row for row in unit_lookup.doc_units(doc, resolver.record)}
-    config = style_config.read_config(doc, unit_branch="")
+    config = style_config.read_config(doc)
     decisions: dict[Path, DecisionFamily | DecisionFileMissing] = {}
     snapshots: dict[Path, LedgerSnapshot] = {}
     with ThreadPoolExecutor(max_workers=1) as reads:

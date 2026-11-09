@@ -97,7 +97,7 @@ def unit_plan_settings(text: str, repo: Path) -> UnitPlanSettings:
 
 def family_plan_settings(doc: Path, repo: Path, *, unit: str = "") -> Mapping[rules.Family, UnitPlanSettings]:
     """Parse selection settings only for the units whose queue is requested."""
-    owned = style_config.read_config(doc, unit_branch="").assignment(unit).families if unit else FAMILIES
+    owned = style_config.read_config(doc).assignment(unit).families if unit else FAMILIES
     return {family: unit_plan_settings(text, repo) if isinstance(text, str)
             else UnitPlanSettings(AllCrates(), frozenset())
             for family, text in family_plan_texts(doc).items()
@@ -3354,7 +3354,7 @@ def main(argv: list[str]) -> int:
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
                 settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
-                config = style_config.read_config(doc, unit_branch="")
+                config = style_config.read_config(doc)
                 cells = tuple(ledger.cells())
                 for row in unit_worktrees(doc):
                     if args.unit and args.unit != row.unit:

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast, get_args
 
-from scripts.production import production_doc, session_staff, staff
+from scripts.production import production_doc, staff
 from scripts.style import rules
 
 
@@ -36,7 +37,6 @@ class ParentUnitRoute:
     branch_point: str
     doc: Path
     checkout: Path
-    unit_branch: str
 
 
 @dataclass(frozen=True)
@@ -56,9 +56,17 @@ class StyleRepositoryConfig:
         raise StyleConfigError(f"{unit}: no style assignment")
 
 
+_STYLE_UNITS_HEADING = re.compile(r"(#{1,6})\s+Style units\s*#*\s*")
+
+
+def has_style_units(lines: Iterable[str]) -> bool:
+    """Return whether the document lines contain a Style units heading."""
+    return any(_STYLE_UNITS_HEADING.fullmatch(line) for line in lines)
+
+
 def _assignments(lines: list[str]) -> tuple[StyleUnitAssignment, ...]:
     section = next(((index, len(match[1])) for index, line in enumerate(lines)
-                    if (match := re.fullmatch(r"(#{1,6})\s+Style units\s*#*\s*", line))), None)
+                    if (match := _STYLE_UNITS_HEADING.fullmatch(line))), None)
     if section is None:
         raise StyleConfigError("production doc lacks Style units section")
     start, level = section
@@ -103,7 +111,7 @@ def _assignments(lines: list[str]) -> tuple[StyleUnitAssignment, ...]:
     return tuple(assignments)
 
 
-def read_config(doc: Path, *, unit_branch: str) -> StyleRepositoryConfig:
+def read_config(doc: Path) -> StyleRepositoryConfig:
     """Read the document once and select its merge route."""
     try:
         lines = doc.read_text(encoding="utf-8").splitlines()
@@ -114,7 +122,7 @@ def read_config(doc: Path, *, unit_branch: str) -> StyleRepositoryConfig:
             branch_point = production_doc.production_field(lines, "Branch point").removeprefix("refs/heads/")
             route = StyleShowrunnerRoute(receiving_branch, branch_point, doc, checkout)
         else:
-            route = ParentUnitRoute(receiving_branch, receiving_branch, doc, checkout, unit_branch)
+            route = ParentUnitRoute(receiving_branch, receiving_branch, doc, checkout)
         return StyleRepositoryConfig(assignments, route)
     except (OSError, UnicodeError, production_doc.Refusal) as error:
         raise StyleConfigError(f"{doc}: {error}") from error
@@ -129,9 +137,6 @@ def config_for_unit(unit: str | staff.StaffRow, record: staff.StaffSnapshot) -> 
     parent = record.parent_of(row)
     if parent is None or parent.kind != "showrunner" or not isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)):
         raise StyleConfigError(f"{row.name}: no parent production document")
-    branch = session_staff.RowResolver(record, rows=(row,)).unit_branch(row)
-    if not isinstance(branch, session_staff.Branch):
-        raise StyleConfigError(f"{row.name}: {branch.reason}")
-    config = read_config(parent.doc.path, unit_branch=branch.name)
+    config = read_config(parent.doc.path)
     _ = config.assignment(row.name)
     return config

@@ -299,7 +299,7 @@ def family_units(doc: Path) -> dict[rules.Family, staff.StaffId]:
         rows = unit_lookup.doc_units(doc, record)
     except staff.StaffUnreadable as error:
         raise style_ledger.LedgerError(str(error)) from error
-    config = style_config.read_config(doc, unit_branch="")
+    config = style_config.read_config(doc)
     units: dict[rules.Family, staff.StaffId] = {}
     for row in rows:
         if isinstance(row.worktree, staff.RemovedWorktree):

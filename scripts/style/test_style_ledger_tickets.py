@@ -3306,21 +3306,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             self.assertEqual(connection.execute("SELECT * FROM processed_tips").fetchone(),
                              (self.initial_tip, "2026-10-27", "linted"))
 
-    def test_direct_reconcile_preserves_handoffs_and_explicit_merge_remains_available(self) -> None:
-        ledger = self.ledger()
-        ledger.set_tip(self.initial_tip, "main")
-        document = self.repo / ".git/style-production.md"
-        _ = document.write_text(document.read_text().replace("**Kind:** style", "**Kind:** product"))
-        ledger.handoff_add(self.initial_tip)
-        ledger.handoff_send(self.initial_tip, "parent")
-        before = ledger.pending_handoffs()
-        with mock.patch.object(ledger, "pending_handoffs", side_effect=AssertionError("direct route reads handoffs")):
-            changes = ledger.reconcile("main", "main")
-        self.assertFalse(any(change.startswith("hand-off ") for change in changes))
-        self.assertEqual(ledger.pending_handoffs(), before)
-        ledger.handoff_merged(self.initial_tip)
-        self.assertEqual(ledger.pending_handoffs(), ())
-
     def test_handoffs_require_ancestry_and_keep_sent_items_pending(self) -> None:
         self.set_tip(self.initial_tip)
         _ = self.git("checkout", "-q", "-b", "style/main")

@@ -381,14 +381,16 @@ class StyleSyncTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT branch_point FROM reconciliation").fetchone(), ("main",))
             self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
 
-    def test_direct_route_refuses_handoff_without_creating_a_record(self) -> None:
+    def test_send_handoff_uses_the_existing_path_without_route_discovery(self) -> None:
         self.direct_production()
-        with mock.patch.object(style_sync, "runner_value") as lookup, redirect_stderr(io.StringIO()):
+        with (mock.patch.object(style_sync, "runner_value", return_value="") as lookup,
+              mock.patch.object(style_sync, "sync_productions", side_effect=AssertionError("no route discovery")),
+              redirect_stdout(io.StringIO())):
             self.assertEqual(style_sync.main([
                 "send-handoff", "--repo", str(self.repo), "--production", "names", "--checkpoint", self.tip,
-            ]), 2)
-        lookup.assert_not_called()
-        self.assertEqual(self.handoff_rows(), [])
+            ]), 0)
+        lookup.assert_called_once_with("parent", "names")
+        self.assertEqual(self.handoff_rows()[0][:3], (self.tip, "pending", ""))
 
     def test_unavailable_wait_owner_does_not_block_a_later_healthy_wait(self) -> None:
         self.production()

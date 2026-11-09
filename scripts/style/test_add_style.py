@@ -327,7 +327,7 @@ class AddStyleTests(unittest.TestCase):
 
         launched = cast(BootstrapAtLaunch, json.loads(snapshot.read_text()))
         self.assertEqual(launched["production"], self.doc.read_text())
-        config = style_config.read_config(self.doc, unit_branch="")
+        config = style_config.read_config(self.doc)
         self.assertEqual(config.assignments, tuple(style_config.StyleUnitAssignment(
             f"sample-style-{family}", (family,), 1) for family in add_style.FAMILIES))
         self.assertEqual(production_field(launched["production"].splitlines(), "Pilot units"),

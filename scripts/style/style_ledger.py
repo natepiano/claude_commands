@@ -3744,7 +3744,7 @@ class Ledger:
         parent = self.staff_resolver().record.parent_of(row)
         if parent is None or not isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)):
             raise style_config.StyleConfigError(f"{row.name}: no parent production document")
-        return style_config.read_config(parent.doc.path, unit_branch="").assignment(row.name).open_tickets
+        return style_config.read_config(parent.doc.path).assignment(row.name).open_tickets
 
     def _ticket_merge_predecessors(self, ticket: TicketRecord) -> tuple[str, ...]:
         """Return waiting checkpoints that the ticket's checkpoint contains."""
@@ -6857,28 +6857,14 @@ class Ledger:
             changes.append(f"style branch {style_branch}")
         with self._connection:
             _ = self._connection.execute("INSERT INTO reconciliation VALUES (1,?) ON CONFLICT(id) DO UPDATE SET branch_point=excluded.branch_point", (branch_point,))
-        trees = tuple(Path(line.removeprefix("worktree ")) for line in
-                      _git(self.repo, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree "))
-        direct = False
-        for row in self.staff_resolver().record.find(kind="showrunner"):
-            if not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) or not row.doc.path.is_file():
-                continue
-            if not any(row.doc.path.is_relative_to(tree) for tree in trees):
-                continue
-            if not any(re.fullmatch(r"#{1,6}\s+Style units\s*#*\s*", line) for line in row.doc.path.read_text().splitlines()):
-                continue
-            if isinstance(style_config.read_config(row.doc.path, unit_branch="").route, style_config.ParentUnitRoute):
-                direct = True
-                break
-        if not direct:
-            with self.git_operation(f"reconcile {style_branch}"):
-                for handoff in self.pending_handoffs():
-                    checkpoint = handoff["checkpoint"]
-                    if self._is_ancestor(checkpoint, branch_tip):
-                        with self._connection:
-                            _ = self._connection.execute("UPDATE handoffs SET state='merged',merge_commit=?,updated_at=? WHERE checkpoint=?",
-                                                         (self._first_merge(checkpoint, branch_point), _now(), checkpoint))
-                        changes.append(f"hand-off {checkpoint}: {handoff['state']} -> merged")
+        with self.git_operation(f"reconcile {style_branch}"):
+            for handoff in self.pending_handoffs():
+                checkpoint = handoff["checkpoint"]
+                if self._is_ancestor(checkpoint, branch_tip):
+                    with self._connection:
+                        _ = self._connection.execute("UPDATE handoffs SET state='merged',merge_commit=?,updated_at=? WHERE checkpoint=?",
+                                                     (self._first_merge(checkpoint, branch_point), _now(), checkpoint))
+                    changes.append(f"hand-off {checkpoint}: {handoff['state']} -> merged")
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute(
             "SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') "
             + "ORDER BY state,unit,length(id),id",

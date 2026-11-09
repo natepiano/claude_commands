@@ -308,8 +308,8 @@ def main(arguments: list[str]) -> int:
                 listing = sessions.result()
                 units = listing.units
             configured: set[str] = set()
-            if not style and re.search(r"(?m)^#{1,6}\s+Style units\s*#*\s*$", doc.read_text()):
-                configured = {assignment.unit for assignment in style_config.read_config(doc, unit_branch="").assignments}
+            if not style and style_config.has_style_units(doc.read_text().splitlines()):
+                configured = {assignment.unit for assignment in style_config.read_config(doc).assignments}
             ticket_units = [unit for unit in units if style or unit.unit in configured]
             product_units = [unit for unit in units if unit not in ticket_units]
             paths = style_ledger_paths(doc, ticket_units) if ticket_units else {}

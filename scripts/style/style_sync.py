@@ -29,7 +29,7 @@ from scripts.lib import process_group
 
 from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
-from scripts.production import staff
+from scripts.production import session_staff, staff
 from scripts.copies import copies
 from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners
@@ -76,6 +76,13 @@ class ConfiguredStyleProduction:
 
 
 @dataclass(frozen=True)
+class DirectUnitSync:
+    """A direct sync uses the parent route and the unit's current branch."""
+    route: style_config.ParentUnitRoute
+    branch: session_staff.Branch
+
+
+@dataclass(frozen=True)
 class NoDirectRoute:
     """The repository has no configured direct style unit."""
 
@@ -91,15 +98,15 @@ def sync_productions(repo: Path) -> tuple[ConfiguredStyleProduction, ...]:
         if not any(row.doc.path.is_relative_to(tree) for tree in trees):
             continue
         lines = row.doc.path.read_text().splitlines()
-        if not any(re.fullmatch(r"#{1,6}\s+Style units\s*#*\s*", line) for line in lines):
+        if not style_config.has_style_units(lines):
             continue
-        config = style_config.read_config(row.doc.path, unit_branch="")
+        config = style_config.read_config(row.doc.path)
         productions.append(ConfiguredStyleProduction(row.name, config))
     return tuple(productions)
 
 
-def direct_route(repo: Path, unit: str = "") -> style_config.ParentUnitRoute | NoDirectRoute:
-    """Resolve the direct unit through the shared configuration reader."""
+def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
+    """Resolve the parent route and the unit branch for a direct sync."""
     productions = tuple(production for production in sync_productions(repo)
                         if isinstance(production.config.route, style_config.ParentUnitRoute))
     if not productions:
@@ -111,9 +118,14 @@ def direct_route(repo: Path, unit: str = "") -> style_config.ParentUnitRoute | N
         unit = assignments[0].unit
     if unit not in {assignment.unit for assignment in assignments}:
         raise Refusal(f"{unit}: no direct style assignment in this repository")
-    route = style_config.config_for_unit(unit, staff.snapshot()).route
+    record = staff.snapshot()
+    route = style_config.config_for_unit(unit, record).route
     assert isinstance(route, style_config.ParentUnitRoute)
-    return route
+    row = next(row for row in record.find(kind="unit") if row.name == unit)
+    branch = session_staff.RowResolver(record, rows=(row,)).unit_branch(row)
+    if not isinstance(branch, session_staff.Branch):
+        raise style_config.StyleConfigError(f"{row.name}: {branch.reason}")
+    return DirectUnitSync(route, branch)
 
 
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
@@ -208,10 +220,10 @@ def git(repo: Path, *arguments: str) -> str:
 def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
     """Compare the tip with the unit branch or the style branch."""
     tip = git(repo, "rev-parse", "--verify", f"{tip}^{{commit}}")
-    route = direct_route(repo, unit)
-    comparison_branch = route.unit_branch if isinstance(route, style_config.ParentUnitRoute) else style_branch
-    if isinstance(route, style_config.ParentUnitRoute):
-        style_branch = route.receiving_branch
+    sync = direct_route(repo, unit)
+    comparison_branch = sync.branch.name if isinstance(sync, DirectUnitSync) else style_branch
+    if isinstance(sync, DirectUnitSync):
+        style_branch = sync.route.receiving_branch
     style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
     comparison_branch = "refs/heads/" + comparison_branch.removeprefix("refs/heads/")
     tree = git(repo, "rev-parse", "--verify", f"{tip}^{{tree}}")
@@ -623,8 +635,6 @@ def resume(repo: Path, name: str, branch_point: str, style_branch: str) -> int:
 
 
 def send_handoff(repo: Path, name: str, checkpoint: str) -> int:
-    if any(isinstance(production.config.route, style_config.ParentUnitRoute) for production in sync_productions(repo)):
-        raise Refusal("direct style units use normal unit checkpoints")
     with style_ledger.open_ledger(repo) as ledger:
         checkpoint = git(repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
         ledger.handoff_add(checkpoint)

@@ -72,7 +72,7 @@ def unit_plan_path(unit: str, worktree: Path) -> Path:
 def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
     """Read each style unit's own standing plan copy."""
     texts: dict[rules.Family, str | MissingUnitPlan] = {}
-    config = style_config.read_config(doc, unit_branch="")
+    config = style_config.read_config(doc)
     worktrees = {row.unit: row.worktree for row in unit_worktrees(doc)}
     for assignment in config.assignments:
         if assignment.unit not in worktrees:
