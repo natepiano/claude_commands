@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.direct import progress_history
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, scratch
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, worker, worker_admission
 
@@ -189,6 +189,10 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
     progress_history.complete_dispatch(run, str(passed.get("team_slot", row.name)), instance,
                                        status="completed" if outcome == TurnOutcome.DONE else "error")
     details = list(completion.details)
+    try:
+        _ = scratch.end(scratch.worker_task(row.id))
+    except Exception as error:
+        details.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
     try:
         if not completion.pane_closed:
             with redirect_stderr(io.StringIO()) as diagnostics:

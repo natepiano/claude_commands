@@ -17,11 +17,12 @@ from unittest.mock import patch
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
-from scripts.lib import atomic_file, process_start
+from scripts.lib import atomic_file, process_start, scratch
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff, test_worker, worker
+from scripts.production.staff_test_support import fixture_worker
 
 
 class NativeHookEntryTests(unittest.TestCase):
@@ -108,6 +109,7 @@ class TurnEndTests(unittest.TestCase):
                  for close in ("closed", "setup", "outside")]
         cases.extend((family, "closed", transcript) for family in ("codex", "claude")
                      for transcript in ("no final reply", "older reply"))
+        cases.append(("codex", "scratch", "current"))
         for family, close, transcript in cases:
             with self.subTest(family=family, close=close, transcript=transcript):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
@@ -116,6 +118,16 @@ class TurnEndTests(unittest.TestCase):
                 self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
+                kept_folders: list[Path] = []
+                if close == "scratch":
+                    peer = fixture_worker("scratch-peer", self.case.fixture.parent.id)
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}):
+                        folder = scratch.new_worker()
+                        atomic_file.write_text_atomic(folder / "trial.txt", "worker output")
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": str(peer.current_session)}):
+                        kept = scratch.new_worker()
+                        atomic_file.write_text_atomic(kept / "peer.txt", "peer output")
+                        kept_folders.append(kept)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
@@ -145,6 +157,9 @@ class TurnEndTests(unittest.TestCase):
                 self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
                 self.assertIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
                 self.assertNotIn(pane, self.case.fixture.world.locations)
+                if close == "scratch":
+                    self.assertEqual(list(Path(os.environ["TMPDIR"]).iterdir()), kept_folders)
+                    self.assertEqual((kept_folders[0] / "peer.txt").read_text(), "peer output")
                 self.assertEqual(staff.by_id(row.id), row)
                 log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))

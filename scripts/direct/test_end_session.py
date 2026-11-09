@@ -17,6 +17,7 @@ from scripts.copies import copies
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib import unit_runs
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
@@ -53,6 +54,7 @@ class EndSessionTests(unittest.TestCase):
         active_root.mkdir()
         self.marker = active_root / session_id
         _ = self.marker.write_text(f"{self.session_dir}\n", encoding="utf-8")
+        _ = (self.session_dir / unit_runs.ACTIVE_MARKER_FILE).write_text(f"{self.marker}\n")
         self.calls = self.root / "calls"
         self.runs = self.root / "runs"
         self.runs.mkdir()
@@ -63,6 +65,8 @@ class EndSessionTests(unittest.TestCase):
         (scripts / "lib").mkdir()
         (scripts / "copies").mkdir()
         (scripts / "copies/copies.py").symlink_to(Path(copies.__file__))
+        (scripts / "astra").mkdir()
+        (scripts / "astra/design_roles.py").symlink_to(END_SESSION.parent.parent / "astra/design_roles.py")
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
@@ -77,7 +81,9 @@ class EndSessionTests(unittest.TestCase):
             + " printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
             + f" exec {sys.executable} \"$@\";; */unit_runs.py)"
             + f" exec {sys.executable} \"$@\";; */copies.py)"
-            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;; esac\n"
+            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;;"
+            + " */design_roles.py) printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
+            + f" exec {sys.executable} \"$@\";; esac\n"
             + "printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\"\n",
             encoding="utf-8",
         )
@@ -103,6 +109,7 @@ class EndSessionTests(unittest.TestCase):
             "UNIT_RUN_ROOT": str(self.runs),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+            "DESIGN_ROLES_STATE": str(self.root / "designs"),
             "SCRATCH_ROOT": str(self.root / "tracked-scratch"),
             "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
@@ -180,7 +187,29 @@ class EndSessionTests(unittest.TestCase):
                                     runtime_id=fixture_runtime_id(director))
         _ = (run / "progress_history_state.json").write_text(
             json.dumps({"owner_staff_id": parent.id}), encoding="utf-8")
+        _ = (run / unit_runs.ACTIVE_MARKER_FILE).write_text(f"{self.marker}\n")
         return run
+
+    def test_failed_role_cleanup_still_ends_only_its_runs_mark(self) -> None:
+        directory = self.root / "designs" / "20000000-0000-4000-8000-000000000001"
+        directory.mkdir(parents=True)
+        _ = (directory / "design.json").write_text(json.dumps({
+            "binding": {"run_directory": str(self.session_dir)},
+            "schema": 1,
+            "placement": {"design_id": directory.name},
+            "roles": [],
+        }))
+        side = self.make_run("run-side", self.session_id)
+        _ = (self.marker.parent / "other-director").write_text("keep another run\n")
+        result = self.run_end(self.environment())
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("design_roles.py unbind-run", result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn(f"unbind-run {side}", calls)
+        self.assertIn("remove_workers.py", calls)
+        self.assertIn("remove_run_scratch.py", calls)
+        self.assertEqual({path.name: path.read_text() for path in self.marker.parent.iterdir()},
+                         {"other-director": "keep another run\n"})
 
     def test_every_run_the_director_holds_is_cleaned_and_no_other(self) -> None:
         marked = self.make_run("run-marked", self.session_id)
