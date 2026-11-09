@@ -189,7 +189,18 @@ After its configured retries, promotion queues SSH exit 255 without a remote `rc
 An answering Mac whose pull fails still fails promotion.
 `zone.py drain --pulled <path>` skips only the target already pulled by promotion.
 It pulls the other pending targets before it sends the notice.
+`main_publish.mac_pull_command(mac, source)` builds the remote command for `main_publish.pull_mac` and `merge_checkpoint.pull_mac_checkout`.
 `main_publish.remote_path` supplies the shared remote path quoting.
+The command is:
+
+```sh
+cd <remote_path(mac)> && tip=$(git ls-remote <url> refs/heads/main | cut -f1) && git fetch -q --no-write-fetch-head <url> main && git merge -q --ff-only "$tip"; printf 'rc=%s\n' "$?"
+```
+
+Here, `<url>` is `natedev:<shlex-quoted source>`.
+The fetch writes no `FETCH_HEAD` or shared ref.
+Concurrent commands can race only during the final merge.
+After one command succeeds, an existing retry completes the other command.
 
 `change_review.review_commits` serves the count and row writers.
 It retains every checkpoint and any other unit commit without a descendant checkpoint in the same set.

@@ -279,6 +279,7 @@ Each local Promote checkout must exist before the command pushes.
      Local promotion fast-forwards each main checkout to the pushed tip.
      It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
      Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
+     The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
      It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
