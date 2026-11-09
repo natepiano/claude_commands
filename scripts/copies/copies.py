@@ -34,6 +34,12 @@ from uuid import UUID
 
 
 from scripts.lib import build_folders, conf, copy_record, file_lock, scratch
+from scripts.lib.copy_record import (
+    AllRepositories as AllRepositories,
+    SelectedRepository as SelectedRepository,
+    RepositoryScope as RepositoryScope,
+    ALL_REPOSITORIES as ALL_REPOSITORIES,
+)
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -162,22 +168,6 @@ def list_owner_name(owner: CopyOwner, staff_names: ListStaffNames) -> OwnerDispl
 
 def _owner_display_text(owner: OwnerDisplay) -> str:
     return owner.name if isinstance(owner, (CurrentStaffOwnerName, RoleOwnerName)) else "unavailable"
-
-
-@dataclass(frozen=True)
-class AllRepositories:
-    """Remove copies from every repository."""
-
-
-@dataclass(frozen=True)
-class SelectedRepository:
-    """Remove copies from one repository identity."""
-
-    name: str
-
-
-RepositoryScope = AllRepositories | SelectedRepository
-ALL_REPOSITORIES = AllRepositories()
 
 
 def repository_scope(repo: object) -> RepositoryScope:

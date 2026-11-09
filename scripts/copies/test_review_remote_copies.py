@@ -682,7 +682,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         with (
             mock.patch.object(offload, "mac_step_eligibility", return_value=offload.KnownRepository("repository")),
             mock.patch.object(offload, "trusted_linux_source", return_value=True),
-            mock.patch.object(offload, "configured_ssh_target", return_value=target),
+            mock.patch.object(target_config, "configured_ssh_target", return_value=target),
             mock.patch.object(offload, "remote_mirror", side_effect=mirror_path),
             mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope("repository", "key")),
             mock.patch.object(mac_test, "start_claim_watcher"),

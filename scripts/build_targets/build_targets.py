@@ -773,11 +773,11 @@ def command_release_wait(pid: int) -> int:
 
         if not target_config.ssh_target_state_directory(target.name).exists():
             continue
-        from scripts.mac_test import mac_test
+        from scripts.mac_test import claim_state
 
-        paths = mac_test.state_paths(target.name)
-        with mac_test.locked(paths.lock):
-            for claim in mac_test.read_claims(paths):
+        paths = claim_state.state_paths(target.name)
+        with claim_state.locked(paths.lock):
+            for claim in claim_state.read_claims(paths):
                 if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                         and "remote_host" not in claim.record):
                     claim.path.unlink(missing_ok=True)
