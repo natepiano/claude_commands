@@ -2149,3 +2149,80 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 - `scripts/lint/tmp_sweep.py` — mode only.
 
 **Gotchas:** the small-fix path refuses this file because it imports `scripts/production/staff.py`.
+
+### Phase 97 — A build target command repeats no work at start  · status: done
+
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("next phase, start now ... `scripts/build_targets/build_targets.py` does 118 ms of work per start outside its import. Profile it and remove repeated work. Send the ETA, and the before/after per-start time with the hash.").
+
+#### Work Order
+
+**Goal:** Each `build_targets.py` start that `verify.sh` makes does no work twice and loads only what its command needs.
+
+**Measured:** natest's whole-gate report (`/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/rank113/whole_gate_report.md`, 2026-11-09) counts 786 starts at 149 ms each: 31 ms of import and 118 ms of work. The verify unit measured 199 ms of CPU for the same call. `verify.sh` starts `eligible` on every step (line 2289, and line 699 for each probe mark) and `release-wait` when the step ends (line 2543). `register-local`, `wait-local` and `interrupt-local` run only when a hold exists or a wait is stopped.
+
+**Spec:**
+
+1. **Profile.** Before any edit, profile the real entry, `python3 scripts/build_targets/build_targets.py <command>`, for `eligible` and `release-wait`. Count an import made inside a command function as work. Use a private state folder and config, as `test_build_targets.py` does with `CONF_DIR`, `BUILDLOG_DIR`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `MAC_TEST_STATE_DIR` and `MAC_IDLE_STATE_DIR`. Do not read or write the real hold or queue state. Write the costs, largest first, to `profile.md` in the phase's run folder.
+2. **Before numbers.** Before any edit, start each of the two commands 50 times with the same private state. Record the median CPU time (user plus system of the child) and the median wall time, in ms.
+3. **Remove.** Remove each repeated cost that the profile shows: a file read or parsed more than once in one start, a module loaded on a path that does not use it, and a process started for an answer that the start already holds. Keep each repeated result in memory for one start only.
+4. **Same behavior.** Keep every output line, exit code, refusal and hold decision the same. Add no guard, refusal, check, config key or cache file.
+5. **After numbers.** Repeat the measurement of item 2 on the changed code. State both sets of numbers in the final reply.
+6. **Proof.** A test starts the real entry in a child process with private state and records file opens with `sys.addaudithook` and loaded modules from `sys.modules`. For `eligible` and `release-wait`, the test shows that `build_targets.conf` opens once and that each module this phase removes from that path is not loaded. Assert no times.
+7. **Other units' files.** In this unit's files, remove each load that the two paths do not need. The profile also named costs in other units' files: `mac_test.py` (62 ms on `release-wait`), `offload.py` (48 ms), `copies.py` (24 ms) and `ledger.py` (13 ms). Agree each small change with its owner first: verify for the first three, aws for `ledger.py` (builds showrunner, 2026-11-09). Verify Phase 42c and aws are editing those files now.
+
+**Files:**
+- `scripts/build_targets/build_targets.py`
+- `scripts/build_targets/target_config.py`
+- `scripts/build_targets/targets.py`
+- `scripts/lint/sweep.py`
+- `scripts/build_targets/test_build_targets.py`
+- `docs/as-built/build-targets.md` — only when this change makes a statement in it wrong.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the production files and the as-built doc. It does Spec items 1 to 5 and 7.
+- `test` owns `test_build_targets.py` and each test file of a moved name. It does Spec item 6 and runs the existing `scripts/build_targets` test modules.
+
+**State:** none.
+
+**Gate:** the targeted test; `scripts/build_targets/test_build_targets.py`, `test_targets.py`, `test_ssh_eligibility.py`, `test_aws_status.py` and `test_working_set.py` pass; `basedpyright` reports 0/0/0 on each changed file; the median CPU and wall time per start of `eligible` and `release-wait`, in ms over 50 starts, are lower after the change than before it. Observed on the real entry with private state.
+
+### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: todo
+
+**Depends on:** verify's Phase 42c on `builds` (verify tells resources when it lands), and Phase 97. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("agree the change with its owner first"). verify-unit, 2026-11-09: "agree to all three rows, and you write them after 42c lands."
+
+#### Work Order
+
+**Goal:** `eligible` and `release-wait` with Mac state present load no `sweep`, `copies` or whole `mac_test` module.
+
+**Measured:** Phase 97's profile, as upper bounds that overlap: the `sweep` import 32 ms on `eligible`, the `copies` import 24 ms on `eligible` and 27 ms on `release-wait`, and the `mac_test` import 62 ms on `release-wait`.
+
+**Spec:**
+
+1. **Git path helpers.** Move `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir` and `local_origin_git_dir` from `scripts/lint/sweep.py` to `scripts/buildlog/repository.py`. Remove the `sweep` import from `offload.repository_identity`.
+2. **Repository scope types.** Move `AllRepositories`, `SelectedRepository`, `RepositoryScope` and `ALL_REPOSITORIES` from `scripts/copies/copies.py` to `scripts/lib/copy_record.py`. Import `copies` in `offload.py` only where copying occurs.
+3. **Claim reader.** Move the claim reader that `build_targets.command_release_wait` needs, with its state paths, lock and record types, from `scripts/mac_test/mac_test.py` to a module with few imports. Keep the decoder and the lock behavior. Build on the claim reads as 42c leaves them.
+4. **Move only.** Each change only moves code. Each moved name has one home and no copy. Add no guard, check or config key.
+5. **Numbers.** Report the median CPU and wall ms per start over 50 starts, before and after, for `eligible` and `release-wait`, with the Mac state folder present.
+6. **Owner read.** Send verify the diff before the checkpoint.
+
+**Files:**
+- `scripts/lint/sweep.py`
+- `scripts/buildlog/repository.py`
+- `scripts/mac_test/offload.py`
+- `scripts/copies/copies.py`
+- `scripts/lib/copy_record.py`
+- `scripts/mac_test/mac_test.py`
+- `scripts/build_targets/build_targets.py`
+- `scripts/build_targets/test_build_targets.py`
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the production files.
+- `test` owns `test_build_targets.py` and each test file that names a moved item.
+
+**State:** none.
+
+**Gate:** the targeted test; `basedpyright` 0/0/0 on each changed file; the module rows of `test_build_targets.py` show the three modules absent on the named paths; the median CPU per start falls on the real entry with the Mac state folder present; verify has read the diff.
