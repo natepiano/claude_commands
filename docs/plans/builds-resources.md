@@ -208,7 +208,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Measured:**
 1. `AdmissionServer` owns admission transitions. `persist()` saves the service state and drains the lifecycle outbox.
 2. `StateIntents` saves finalization intent. `export_priority()` mutates state without constructing `AdmissionServer`.
-3. `admission_client.step_request()` calls `memory_admit.step_estimate()` before it connects to the service.
+3. `admission_client.step_request()` calls `step_estimator.step_estimate()` before it connects to the service.
 4. Hold recovery can change release records during an imported call. A CLI guard alone does not cover that call.
 
 **Spec:**
@@ -232,11 +232,14 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
+   `read_cycle()` (`build_hold.py:978`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:967`) returns `Path | None`, for the same no-current-cycle state.
+   Return the existing `NoCycle` (`build_hold.py:84`) from both in place of `None`. Add no second type for this state.
+   Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
 5. Route callers through the installed copy.
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and `retire_unit.py` use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/shutdown/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
    Update the two caller-plan examples to name the installed merge gate with `--checkout <tree>`.
 6. Keep repository and step fields separate in service snapshots and queue queries.
@@ -273,8 +276,10 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
-- `scripts/message/top_level.py`, `scripts/production/retire_unit.py` — installed hold writer routing.
-- `scripts/message/test_top_level.py`, `scripts/production/test_retire_unit.py` — caller tests.
+- `scripts/message/top_level.py`, `scripts/shutdown/shutdown.py` — installed hold writer routing.
+- `scripts/message/test_top_level.py`, `scripts/shutdown/test_shutdown_cli.py` — caller tests.
+- `scripts/production/dailies_render.py` — `NoCycle` from `read_cycle()` in the hold lines.
+- `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py` — hold line tests.
 - `docs/plans/builds-production.md`, `docs/plans/build-followups-worker-seats.md` — installed merge-gate examples.
 - `docs/as-built/build-memory-admission.md` — installed-copy rule and separate row fields.
 
@@ -1858,6 +1863,13 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Change the script's room check from four targets to one. Also change its schedule: today it keeps `target-A`, `target-B` and both control targets until the final cleanup (`reproduce.sh` lines 190-204), about 355 GiB. Record each build's result, then remove that private target before the next case or control starts.
 - The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
 - Keep sccache and the hana test mirror. Run no gc command on the Mac.
+- New evidence, 2026-11-09 (Phase 92 retrospective): a Mac hana link failed at 11:56 UTC with the same signature, undefined `.llvm.<hash>` symbols in `libhana_conduit`.
+  - The Mac build log shows the builds in series under the mirror lease, with no overlap.
+  - The log shows no floor take between the last good link (11:53 UTC) and the failure. So the floor sweep and a two-build overlap are ruled out as causes.
+  - hana sets `[profile.dev.package.hana_conduit] opt-level = 3` and `[profile.dev.package."*"] opt-level = 3`. The earlier failures (hana_diegetic, hana_catalyst) were also workspace members above opt-level 0. Incremental compilation plus local ThinLTO promotes `.llvm.<hash>` names in such members.
+  - Separate the package profile settings in hana's `Cargo.toml` from the effective profile of the generated instance the Mac builds. Read the instance's real profile before you name a cause.
+  - builds approved one `cargo clean -p hana_conduit` in the Mac mirror. It finished at 12:08 UTC on 2026-11-09. That approval is used; it permits no other cleanup.
+- The reproduction hold and the start approval stay: start no reproduction case until builds approves its start.
 
 **Files:**
 - `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
@@ -1954,23 +1966,36 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Spec:**
 
 1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
-2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:78`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:68`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+   The readers of the room's `ci_keep_aside` lose their CI keep-aside text: `scripts/build_queue/queue_evidence.py` (lines 118 and 223-224) and `scripts/build_queue/memory_feed.py` (lines 499 and 764).
+   The key also leaves the test fixture `scripts/lint/fixtures/build_admission.conf` (line 17).
 3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
-4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove the tests of the mixed rule only with an approved assertion change.
+4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove or change the tests of the mixed rule only with an approved assertion change. Three modules hold such tests:
+   - `scripts/lint/test_memory_admit.py`.
+   - `scripts/build_queue/test_queue_evidence.py`: `test_release_advice_retains_the_running_ci_keep_aside` (line 481) expects the running CI margin to keep the head held and the room to fall from 15 GiB to 8 GiB.
+   - `scripts/build_queue/test_queue_view.py`: `test_running_ci_names_its_keep_aside_in_the_view_and_card` (line 608) expects `CI keep-aside 7.0 GiB` in the view and the card.
 
 **Files:**
 - `config/build_admission.conf`
 - `scripts/build_queue/admission_records.py`
 - `scripts/lint/memory_admit.py`
 - `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/test_queue_evidence.py`
+- `scripts/build_queue/queue_evidence.py`
+- `scripts/build_queue/memory_feed.py`
+- `scripts/build_queue/test_queue_view.py`
+- `scripts/lint/fixtures/build_admission.conf`
 - `docs/as-built/build-memory-admission.md`
 
-**Workers:** `1 writer`
-- `impl` — the deletion and its tests.
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `config/build_admission.conf`, `admission_records.py`, `memory_admit.py`, `queue_evidence.py`, `memory_feed.py` and the as-built doc.
+- `test` owns `test_memory_admit.py`, `test_queue_evidence.py`, `test_queue_view.py` and `scripts/lint/fixtures/build_admission.conf`.
 
-**Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
+**Gate:** the targeted test; `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py` and `scripts/build_queue/test_queue_view.py` pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
 
-**Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
+**Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
+
+Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:5990`).
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
@@ -2009,3 +2034,58 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - Tailscale control can list the Mac as online for minutes after it sleeps; an ssh timeout with `online=yes` is the sign.
 
 **Ruled out:** a kernel panic and restart (uptime 21 days); memory pressure as the cause (the pmset log names clamshell sleep for each drop); a nextest concurrency change.
+
+### Phase 91 — The floor alert sends once for each crossing of the line  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("top priority, a Mac disk defect from natedev. Fix it at the source as a phase."). Order change, builds, 2026-11-09: "Fix the repeat first and send that checkpoint alone: one alert for each crossing of the line, with a margin before it alerts again. Put the margin in config as a new key."
+
+#### As-built
+- `notify_floor_problem` (`scripts/lint/sweep.py`) rearms the phone-floor crossing (`AbovePhoneFloor`) only when free space is above the alert line plus `sweep_phone_rearm_gib`; a reading at that line or inside the margin does not rearm. The rule is the same for natedev and the Mac. Readings 200,140,130,151,140 send one alert; 200,140,160,140 send two.
+- Crossing deliveries (natedev message and phone push) go only while free space is below the alert line. A pending receipt above the line stays pending and sends at the next reading below it.
+- `save_delivery` accepts the natedev crossing receipt only when the delivered message held crossing text; a failure-only message leaves the receipt pending.
+- `config/lint.conf` holds `sweep_phone_rearm_gib=5` (range `0..`). `docs/as-built/build-memory-admission.md` states the rearm rule.
+- Rows in `scripts/lint/test_sweep.py`: `test_crossing_sends_both_channels_once_and_rearms_only_above_the_line`, `test_phone_floor_crossing_sends_once_until_free_space_rises`, `test_crossing_retries_only_the_channel_without_a_receipt`, `test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key`.
+
+**Gotchas:** a failure-only notification must not consume the crossing receipt, or the next real crossing sends nothing.
+
+### Phase 92 — The Mac floor sweep trims the mirror targets, and its alert names folder sizes  · status: done
+**Depends on:** Phase 91 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 (the Mac disk defect, items 1 and 2; order change: after the repeat fix).
+
+#### As-built
+- The floor sweep trims the Mac mirror targets by design: it removes only the shortfall, least recently used first, and never a target a live build holds. On 2026-11-09 both mirror targets held live nextest runs at each scan; later trims took them.
+- `LockedClaims.holds` (`scripts/mac_test/floor_claims.py`) skips a claimed mirror path that does not exist, so a missing unrelated mirror no longer protects a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal (`scripts/copies/copies.py`) keeps its own lease exemption and still checks sibling leases.
+- While a crossing delivery is pending, the Mac measures each direct folder child of its floor roots (`mac_folder_measurement`, `CurrentMacFolders` in `scripts/lint/sweep.py`). `mac_folder_reclaimable_bytes` counts the blocks that deleting that folder alone frees: an inode counts once only when all its hard links are inside the folder; symlinks are not followed. The alert lists the folders by size and recommends the largest; protected folders keep their labels. No natedev disk snapshot is needed.
+- `notify_floor_problem` takes the machine name from its floor policy; it has no `machine` parameter.
+- `docs/as-built/build-memory-admission.md` states the claim and folder-measurement rules.
+
+**Files:**
+- `scripts/lint/sweep.py` — the Mac folder measurement and the folder choices.
+- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `LockedClaims.holds`.
+- `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — rows in `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall` (Mac rows) and `test_no_proc_mac_sweep_takes_only_the_oldest_shortfall` (mirror row).
+- `docs/as-built/build-memory-admission.md` — the changed rules.
+
+**Gotchas:** a recommended Mac folder can contain a held target; the folder measurement does not yet know the held paths.
+
+**Ruled out:** a trim defect in the floor sweep for the mirror targets (the targets were busy at each scan); raw block counts for folder sizes (hard links outside the folder free nothing).
+
+### Phase 93 — The floor alert never recommends a folder that holds output a build is using  · status: done
+**Depends on:** Phase 92 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-09 ("Your open nit is a wrong result: the alert can recommend a folder that holds output a build holds. Fix it now as phase 93. The recommendation must leave out held output, or name a different folder.").
+
+#### As-built
+- A non-dry floor pass computes the held paths when it notifies, in the `finally` of `_hold_floor_pass` (`scripts/lint/sweep.py`), from the final `busy` map. A held path is a target with a `busy` reason other than `NoRecordedEvidence`, a no-evidence target with an entry in `uses` or `hold_targets`, a `.claude-busy` judgment lock or a held cargo lock, and each paired root (`OUTPUT_ROOTS.get().roots_for`) of these. A live use that `shrink_floor` finds after the first scan is held.
+- `notify_floor_problem` receives them as `FloorOutcome.held_targets`. No caller reads held paths from the outcome that `_hold_floor` returns.
+- `folder_choices(..., held_targets=...)` marks a choice that is, contains or is inside a held path as `FolderChoiceKind.HELD_OUTPUT`. It compares resolved paths (`Path(label).expanduser().resolve()`, `is_relative_to` both ways). Held wins over `PROTECTED`. This applies to the Mac measurement and the natedev disk measurement.
+- A held folder line reads `<label>: holds <size>. A build is using output inside it; deleting it can break that build.`
+- Classification starts at the largest non-held choice: `AvailableFolderChoices` when it covers the shortfall, else `InsufficientFolderChoices`. When every choice is held, `HeldOnlyFolderChoices` gives the recommendation `Every measured folder holds output a build is using. The sweep frees it when the build ends.` and the phone action `In the natedev Claude session, reply delete nothing.`
+- `docs/as-built/build-memory-admission.md` states the held-output rule and the late-use rule.
+
+**Files:**
+- `scripts/lint/sweep.py` — `FolderChoiceKind.HELD_OUTPUT`, `HeldOnlyFolderChoices`, `FloorOutcome.held_targets`, held paths in `_hold_floor_pass`.
+- `scripts/lint/test_sweep.py` — held-next (Mac and natedev), held-insufficient and held-only rows in `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall`; `test_protected_folder_is_not_a_floor_holder_in_a_low_space_pass` and `test_floor_rechecks_busy_mark_after_its_scan` read the `FloorOutcome` that `notify_floor_problem` receives.
+
+**Gotchas:** held paths taken at the first scan miss a live use that `shrink_floor` finds later; compute them from the final `busy` map. The no-evidence branch walks `_build_trees` only when a cargo lock is held.

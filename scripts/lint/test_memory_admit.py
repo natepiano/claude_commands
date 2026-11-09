@@ -12,11 +12,13 @@ from scripts.lint.memory_test_support import admission_configuration_fixture, ad
 
 import fcntl
 import io
+import inspect
 import json
 import math
 import os
 import re
 import sqlite3
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,7 +31,7 @@ from dataclasses import replace
 from functools import cached_property
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO, Literal, cast, override
+from typing import BinaryIO, ClassVar, Literal, cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -46,7 +48,7 @@ from scripts.build_queue.admission_test_support import queue_decision, Admission
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, ci_step
 from scripts.lint import nextest_budget as budget
 from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
-from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
+from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, commit_config_fixture
 from scripts.buildlog import store
 from scripts.buildlog import record as buildlog_record
 from scripts.buildlog import index as file_marks
@@ -286,10 +288,10 @@ class BuildBudgetTests(unittest.TestCase):
         self.assertEqual(admission_records.read_memory_config().running_pass_seconds, 5)
         for raw in ("", "abc", "-5", "nan"):
             with self.subTest(raw=raw):
-                _ = write_config_fault(self.config, f"[memory]\nrunning_pass_seconds={raw}\n")
+                write_memory_config(self.config, running_pass_seconds=raw)
                 self.assertEqual(admission_records.read_memory_config().running_pass_seconds, 5)
         for seconds in (3, 7.5):
-            _ = write_config_fault(self.config, f"[memory]\nrunning_pass_seconds={seconds}\n")
+            write_memory_config(self.config, running_pass_seconds=str(seconds))
             self.assertEqual(admission_records.read_memory_config().running_pass_seconds, seconds)
 
     def test_service_intervals_use_positive_finite_config_and_read_each_use(self) -> None:
@@ -307,23 +309,23 @@ class BuildBudgetTests(unittest.TestCase):
         )
         for key, reader, fallback in readers:
             with self.subTest(key=key):
-                _ = write_config_fault(self.config, "[memory]\n")
+                write_memory_config(self.config, **{key: None})
                 self.assertEqual(reader(), fallback)
                 for raw in ("abc", "-5", "nan", "inf", "0"):
-                    _ = write_config_fault(self.config, f"[memory]\n{key}={raw}\n")
+                    write_memory_config(self.config, **{key: raw})
                     self.assertEqual(reader(), fallback)
                 for seconds in (3, 7.5):
-                    _ = write_config_fault(self.config, f"[memory]\n{key}={seconds}\n")
+                    write_memory_config(self.config, **{key: str(seconds)})
                     self.assertEqual(reader(), seconds)
 
     def test_request_size_limit_uses_positive_integer_config_at_each_use(self) -> None:
         self.assertEqual(admission_records.read_memory_config().request_max_bytes, 1048576)
         for raw in ("", "abc", "-5", "nan", "inf", "0", "1.5"):
             with self.subTest(raw=raw):
-                _ = write_config_fault(self.config, f"[memory]\nrequest_max_bytes={raw}\n")
+                write_memory_config(self.config, request_max_bytes=raw)
                 self.assertEqual(admission_records.read_memory_config().request_max_bytes, 1048576)
         for size in (70000, 2097152):
-            _ = write_config_fault(self.config, f"[memory]\nrequest_max_bytes={size}\n")
+            write_memory_config(self.config, request_max_bytes=str(size))
             self.assertEqual(admission_records.read_memory_config().request_max_bytes, size)
 
 
@@ -1682,6 +1684,19 @@ class RepositoryHistoryTests(unittest.TestCase):
     root: Path = Path()
     admission: Path = Path()
     host: str = "test-host"
+    repository_seed: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temporary.cleanup)
+        cls.repository_seed = Path(temporary.name)
+        for arguments in (("init", "-q"), ("config", "user.email", "test@example.org"),
+                          ("config", "user.name", "Test"), ("config", "commit.gpgSign", "false"),
+                          ("config", "core.hooksPath", "/dev/null")):
+            _ = subprocess.run(["git", "-C", str(cls.repository_seed), *arguments], check=True, capture_output=True)
 
     @override
     def setUp(self) -> None:
@@ -1692,11 +1707,7 @@ class RepositoryHistoryTests(unittest.TestCase):
 
     def checkout(self, folder: str, remote: str = "", content: str = "first") -> Path:
         directory = self.root / folder
-        directory.mkdir(parents=True)
-        for arguments in (("init", "-q"), ("config", "user.email", "test@example.org"),
-                          ("config", "user.name", "Test"), ("config", "commit.gpgSign", "false"),
-                          ("config", "core.hooksPath", "/dev/null")):
-            _ = subprocess.run(["git", "-C", str(directory), *arguments], check=True, capture_output=True)
+        _ = shutil.copytree(self.repository_seed, directory)
         _ = (directory / "source").write_text(content)
         _ = subprocess.run(["git", "-C", str(directory), "add", "source"], check=True, capture_output=True)
         _ = subprocess.run(["git", "-C", str(directory), "commit", "-qm", "first"], check=True, capture_output=True)
@@ -5005,6 +5016,7 @@ class ShellTests(unittest.TestCase):
         config = self.admission.root / "config.sh"
         _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
         for _ in range(2):
+            self.admission.allow_next_start()
             result = self.shell('source "$TEST_INVOKE"; sweep_after_step() { :; }; run_once true',
                 TEST_INVOKE=str(INVOKE), BUILDLOG_OFF="1", BUILDLOG_SCOPE="0", LINT_CONFIG_READER=str(config))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -5117,6 +5129,10 @@ class ShellTests(unittest.TestCase):
 
 def queue_leave_client_main(argv: list[str]) -> int:
     """Advance the client clock at its first held answer."""
+    import time
+    from unittest.mock import patch
+    from scripts.build_queue import admission_client as client, admission_records
+
     class HeldWaitClock:
         def __init__(self) -> None:
             self.offset: float = 0.0
@@ -5189,6 +5205,11 @@ class QueueLeaveTests(unittest.TestCase):
             + "row, = client.view().explanation.reservations\n"
             + "width = row['test_threads']\nassert isinstance(width, RequestedTestWidth)\n"
             + "print(json.dumps({'test_threads': width.threads}))\n")
+        queue_client = self.root / "queue-client.py"
+        _ = queue_client.write_text("from __future__ import annotations\nimport sys\n"
+                                    + inspect.getsource(queue_leave_client_main)
+                                    + "\nsys.exit(queue_leave_client_main(sys.argv[1:]))\n")
+        self.environment["TEST_QUEUE_CLIENT"] = str(queue_client)
         self.environment["TEST_CAPTURE_WIDTH"] = str(capture)
         self.environment["TEST_PY"] = str(Path(__file__).resolve().parents[1] / "lib/py")
         self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
@@ -5217,8 +5238,7 @@ class QueueLeaveTests(unittest.TestCase):
         self.admission.server.reply_filter = advance_memory
         command = ('source "$1"; buildlog_memory_python() { '
                    + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then shift; '
-                   + '"$TEST_PY" -c \'import sys; from scripts.lint.test_memory_admit import queue_leave_client_main; '
-                   + 'sys.exit(queue_leave_client_main(sys.argv[1:]))\' "$@"; else "$TEST_PY" "$@"; fi; }; '
+                   + '"$TEST_PY" "$TEST_QUEUE_CLIENT" "$@"; else "$TEST_PY" "$@"; fi; }; '
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
         result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],

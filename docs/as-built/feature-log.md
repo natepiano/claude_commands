@@ -151,6 +151,7 @@ Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A no
 | `add` | new-note flags, or `--review ROW` alone | one live note | `added: <path>` or `unchanged: <path>` |
 | `supersede` | new-note flags and `--old TITLE` (repeatable, at least one), optional `--split`, or `--review ROW` alone | the replacement; each old note becomes `superseded` and gains the replacement in `replaced_by` | `added:` or `unchanged:`, then `superseded: <old> → <new>` per old note it changes |
 | `propose` | `--review ROW`, new-note flags, optional `--old TITLE` | every `add`/`supersede` check runs; no note; the proposal is saved | `proposed: <ROW> (<verb> <title>)` |
+| `land` | `--review ROW`, optional `--if-proposed` | the proposal lands with the verb it records, `add` or `supersede` | the `add`/`supersede --review` lines |
 | `drop` | `--review ROW --verdict TEXT` | an open proposal closes without a note | `dropped: <ROW>` or `unchanged: <ROW>` |
 | `amend` | `--project --title`, any of `--summary --behavior --see --area --kind --crate --evidence`; with `--backfill` also `--link` with `--completed`, `--release crate@version` or `crate@Unreleased`, `--separate-result` | the note corrected in place | `amended: <path> (<fields>)` or `unchanged: <path>` |
 | `live` | `--project`, optional `--crate --area --kind --grep` | live notes, newest `completed_date` first | `<completed> <kind> <title> — <summary> [<crates>] (<area>) <link>` |
@@ -275,6 +276,16 @@ A call is off host when the verb is not `project-of`, the short host name is not
 | `changelog` | arguments checked locally; one forwarded read, `changelog --crate X --version V --selection`, through `forwarded_reader`, returning `ChangelogSelection(section, titles)` or `ForwardFailed(exit, stderr)`; render, compare and save happen locally |
 | `release` | contents read and checked locally; `release --crate X --version V --contents-stdin` forwarded through `release_forwarder` with the contents JSON on stdin |
 | every other verb | `ssh natedev "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py " + shlex.join(argv)` through `ssh_runner` |
+
+`_off_host` is the one off-host rule. `main` and the review library functions call it.
+
+The change page calls three library functions in its own process. They print nothing.
+
+- `project_of(path: str) -> str | None` is the `project-of` lookup. It always runs locally.
+- `land_review(row, if_proposed=False, *, verb="recorded") -> list[str]` lands a proposal. `verb="recorded"` uses the proposal's verb; the `land` command uses it.
+- `drop_review(row, verdict, if_proposed=False) -> list[str]` drops a proposal.
+
+Both review functions return the output lines and raise `FeatureLogError` on a refusal. With `if_proposed`, an absent proposal returns `skipped: no proposal for <row>`. Off host, they forward the matching command by ssh, capture its output, and raise `FeatureLogError` with the remote stderr on a nonzero exit. `FeatureLogError.diagnostic` gives the text with one `feature_log: ` prefix, local or remote.
 
 ### Close-out paths
 

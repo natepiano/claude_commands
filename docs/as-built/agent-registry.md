@@ -121,6 +121,16 @@ Model, effort, and service tier for one submission come from the same configurat
 Explicit dispatch overrides retain their precedence.
 The [progress recorder](unit-progress-history.md#configuration-digest) uses the inherited exact text for telemetry.
 
+### Python launch settings
+
+`models_registry.launch_settings(section, key) -> LaunchSettings` gives Python callers the shell resolver's result.
+It builds a `LaunchModelConfiguration` in Python from `_snapshot`, so an inherited `MODELS_LAUNCH_CONFIGURATION` decides the result.
+It starts one `bash`, which sources `models_config.sh` and reads `configuration_shell` output from stdin.
+Bash loads that table with `_models_table_load` and runs the real `agents_resolve`. No Python registry process starts.
+The child environment sets `MODELS_CONFIG_TIER_ONLY=1`, so this path never synchronizes the Codex catalog.
+The result is four lines: family, model, effort, and service tier.
+A resolver failure or bad output raises `ValueError`. A missing registry raises `OSError` before bash starts.
+
 ### Agent environment boundary
 
 Operation snapshots reach helpers, but they never reach an agent or an app-server.
@@ -169,7 +179,9 @@ Sourcing the file defines functions without reading or synchronizing the registr
 `models_launch_configuration` obtains and exports the launch snapshot.
 `models_registry_edit` gives an editor one scoped base.
 `_models_registry_scope --launch|--edit` holds the parsed arrays for that scope.
-`models_registry_store` evaluates the configuration returned by the publication writer.
+`_models_table_load <assignments>` is the one table loader. It evaluates the assignments and marks the table as loaded for `MODELS_CONFIG_FILE`.
+`_models_registry_parse`, `models_registry_store` and the Python launch-settings reader call it.
+`models_registry_store` loads the configuration returned by the publication writer.
 
 | Function | Result or change |
 |---|---|
@@ -313,6 +325,7 @@ Invalid argument counts print usage and return 1.
 | `progress_history.py` | Reads the [configuration digest](unit-progress-history.md#configuration-digest) without publication. |
 | `add_unit.py` | Resolves `production.director` and requires Claude. |
 | `side_pane.py` | Resolves `ask_a_friend.consultation` in the caller's family. |
+| `worker_panes.launch_policy`, `assign.pane_policy` | Call `launch_settings`. Each catches `OSError` and `ValueError` and refuses the invalid role configuration. |
 
 [Long-lived workers](long-lived-workers.md) owns worker launch, handoff, and recovery behavior.
 [Unit progress history](unit-progress-history.md) owns recorder events and progress reports.
@@ -335,6 +348,9 @@ Invalid argument counts print usage and return 1.
 ## Gotchas
 
 - An unexported `MODELS_CONFIG_FILE` still selects the Bash reader's registry.
+- `launch_settings` passes the table on stdin, never as an argument. The table holds the registry text about twice, and Linux limits one argument to 128 KiB.
+- `read -r -d ""` returns 1 at end of input, so it is not chained with `&&`. Bash 3.2 on macOS cannot use `source /dev/stdin`.
+- Table text is plain assignments, never `declare`. So `_models_table_load` sets the caller's locals in `_models_registry_scope` through dynamic scope.
 - An inherited launch or edit snapshot suppresses catalog synchronization for that operation.
 - A telemetry read never synchronizes or publishes the registry.
 - A failed synchronization warns and uses the current registry. It does not stop the launch.

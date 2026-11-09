@@ -105,7 +105,12 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Binds later work:** `read_usage` in `phase_process.py` sums input and all cache classes into one number and drops the model, so weighted tokens need a different read. `phase_boundaries` selects phases by finish time, and `measure_director_tokens` stops at phase end. Phase boundaries and fix time come from `scripts/history/rounds.py`: an open phase is a named state; fix time is worker time, apart from wall-time shares; a mixed phase is reported apart. `direct.md` costs about 41k tokens as a Read. `phase_process.py` has director tokens per phase, but no compactions per phase and no context size after reload.
 
-**Gotchas:** closure reviews are not in rounds.py, so the closure pass row stays a review pass. A ledger-only round has zero fix time and adds to the round count only. A repair round with `cause == "merge"` counts under fix, not under the merge row. Inserted phases are about 2% of gaps.
+**Gotchas:** closure reviews remain review passes.
+A dispatch without an eligible fix pass adds no repair round.
+Started passes with one ledger batch count once across relaunches.
+Legacy passes without a ledger number group by overlap.
+A repair with `cause == "merge"` counts under fix, not under the merge row.
+The saved baseline reports inserted phases as about 2% of gaps.
 
 **Ruled out:** a retrospective before sample for cheap A — a phase's start time does not prove which contract it read; the full A targets (10% tokens, 10 s) — the measured cut does not reach them.
 

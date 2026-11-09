@@ -172,11 +172,45 @@ Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
 A repeated saved launcher reads the transcript and returns without another submission.
 For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
+Each completion notice ends its first line with `; pass <dispatch instance id>`.
+An explicit rerun repeats the saved completion text with the same pass id.
 This rule also applies to a completed managed Astra review.
 The saved completion preserves the reason and pane for a close anomaly.
 A successful completed rerun sets its status file to `done` after it sends the notice.
+Each notice names the worker and uses its native identity, including reruns from the director.
+The saved completion supplies the sender identity for a retired managed Astra reviewer.
+The sender identity remains the same after a session change and retirement.
+Turn and run events send one notice when the outcome, reply, or run ids change.
+An unchanged outcome, reply, and run ids send no notice.
+Waiting notices add `; runs <run ids>` to the first line.
+The run ids include received results that still await a worker reply.
+An empty turn reply writes no reply file and adds no `; reply <path>` text.
+Run events retain the last worker reply while a result awaits a reply.
+`reap_orphans` retries a pending completion only after its supervisor is gone.
+A live run reports `waiting on runs`, including when an earlier result awaits a reply.
+A turn without DONE sends one `no DONE` notice when no pending work explains it.
+The notice includes the worker's last reply and leaves the pass active.
+Named adversary and contract reviews record `done` through the same hook.
+The hook also saves an assigned style review result.
+Each ignored event appends one JSON line to `$XDG_STATE_HOME/herdr/turn-end-ignored.jsonl`.
+The default path is `~/.local/state/herdr/turn-end-ignored.jsonl`.
+Each line records the time, exit reason, event kind, thread id, and worker name when known.
+This diagnostic changes no outcome and sends no notice.
+A refused launcher retry retains the existing pass and its run, including a run with one worker.
+A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+The review trial uses the latest completion duration for each pass.
 The hook follows the worker's link to its existing pass state, including runs outside the run root.
 Exit 0 means submitted. The turn hook records completion and sends the director its reply path.
+
+Pane starts record the account folder in the staff row's `home` through `staff.set_home`.
+Account moves and restarts use the same pane publication call.
+A pane launch retains `config_dir` only when the session has no staff row.
+`pane_launch.config_home` reads a staffed session's `home` or the unstaffed launch's `config_dir`.
+`stop_resume.py` uses this reader for retained accounts.
+The launch environment carries the selected target account until the start hook publishes its home.
+`add_unit.ensure_staff_unit` calls `pane_launch.staff_admitted` after unit admission.
+Worker pane admission and `staff_sources.ensure_staff_showrunner` use the same completion call.
+These calls complete a pane publication that preceded its staff row.
 
 ### Matching a running session to its staff row
 
@@ -260,7 +294,7 @@ The command waits for the showrunner's registration before it attaches the child
   - A legacy tmux host restarts into `SharedHerdrTab`, with no window step.
   - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
 - **`_herdr_launch` steps.**
-  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
+  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account uses the home from `pane_launch.config_home`.
   2. Write Claude folder trust in the target account before starting Claude. A failed write prints one anomaly and prevents the start.
   3. Call `restore_server(name, 90_000, session_kind=...)`.
   4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
@@ -325,7 +359,7 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
-- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. The matching final reply proves completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
+- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
 The turn hook closes a completed pane after DONE.

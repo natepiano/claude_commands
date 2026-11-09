@@ -52,24 +52,26 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
             'arguments = sys.argv[1:]', observe + '\narguments = sys.argv[1:]', 1))
 
     def test_result_values_distinguish_unset_empty_and_changed_values_in_saved_passes(self) -> None:
+        arguments = ("test", "sample", "--filter", "result_values", "--local", "Linux test")
+        values = {"NO_COLOR": "1", "CLICOLOR": "1"}
+        first = self.verify(*arguments, extra=values)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(len(self.local_runs()), 1)
+        self.clear_observations()
+        repeat = self.verify(*arguments, extra=values)
+        self.assertEqual(repeat.returncode, 0, repeat.stdout + repeat.stderr)
+        self.assertIn("PASS (recorded)", repeat.stdout)
+        self.assertEqual(self.local_runs(), [])
         for name in ("NO_COLOR", "CLICOLOR"):
             with self.subTest(name=name):
-                arguments = ("test", "sample", "--filter", name, "--local", "Linux test")
                 self.clear_observations()
-                first = self.verify(*arguments, extra={name: "1"})
-                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-                self.assertEqual(len(self.local_runs()), 1)
-                self.clear_observations()
-                repeat = self.verify(*arguments, extra={name: "1"})
-                self.assertEqual(repeat.returncode, 0, repeat.stdout + repeat.stderr)
-                self.assertIn("PASS (recorded)", repeat.stdout)
-                self.assertEqual(self.local_runs(), [])
-                self.clear_observations()
-                empty = self.verify(*arguments, extra={name: ""})
+                values[name] = ""
+                empty = self.verify(*arguments, extra=values)
                 self.assertEqual(empty.returncode, 0, empty.stdout + empty.stderr)
                 self.assertEqual(len(self.local_runs()), 1)
                 self.clear_observations()
-                absent = self.verify(*arguments)
+                del values[name]
+                absent = self.verify(*arguments, extra=values)
                 self.assertEqual(absent.returncode, 0, absent.stdout + absent.stderr)
                 self.assertEqual(len(self.local_runs()), 1)
 

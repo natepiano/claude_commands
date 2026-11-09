@@ -555,6 +555,34 @@ sys.exit(1)
         _ = another.write_text(path.read_text())
         self.assertFalse(detached_run_process.supervises(original["pid"], another))
         self.assertFalse(detached_run_process.supervises(os.getpid(), path))
+        alias = self.root / "record-alias.json"
+        alias.symlink_to(path)
+        for recorded in (alias, Path(os.path.relpath(path))):
+            with self.subTest(recorded=recorded):
+                with patch.object(detached_run_process, "process_args",
+                                  return_value=["python", "detached_runs.py", "supervise", str(recorded)]):
+                    self.assertTrue(detached_run_process.supervises(4321, path))
+        command = ["assign.py", "impl", "prompt with spaces"]
+        for arguments, matches in ((["python", "/fixture/assign.py", *command[1:]], True),
+                                   ([], False),
+                                   (["python", "/fixture/other.py", *command[1:]], False),
+                                   (["python", "/fixture/assign.py", "review", command[2]], False)):
+            with self.subTest(arguments=arguments):
+                with patch.object(detached_run_process, "process_args", return_value=arguments):
+                    self.assertEqual(detached_run_process.runs_command(4321, command), matches)
+        for argument in ("prompt with spaces", "prompt  with  spaces"):
+            with self.subTest(argument=argument):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python /fixture/assign.py impl {argument}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
+        record = self.root / "run folder/r1.json"
+        for tail, matches in (("", True), (" backup.json", False)):
+            with self.subTest(tail=tail):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python detached_runs.py supervise {record}{tail}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertEqual(detached_run_process.supervises(4321, record), matches)
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])
@@ -890,6 +918,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertEqual(active.instance_id, dispatch_id)
                 if completed:
                     agent = test_worker.DispatchAgent(self.fixture)
+                    agent.pane_commands(self)
                     line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
                     reply = self.fixture.root / "finished-reply.txt"
                     progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
@@ -903,6 +932,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertTrue(reply.read_text().endswith(f"DONE {dispatch_id}\n"))
                     self.assertEqual(len(agent.notices), 1)
                     self.assertIn("phase 40: done", agent.notices[0])
+                    self.assertIn(f"; pass {dispatch_id}", agent.notices[0])
                     self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_native_caller_ignores_inherited_session_and_run(self) -> None:
@@ -967,6 +997,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(errors.getvalue().count("anomaly:"), 1)
             self.assertIn("director unavailable", errors.getvalue())
+            with patch.object(detached_run_process, "supervises", return_value=True) as supervises:
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                self.assertEqual(len(calls), 2)
+                supervises.assert_called_once_with(DEAD_PID, Path(records[0]["log"]).with_suffix(".json"))
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
             self.assertEqual(len(calls), 3)
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])

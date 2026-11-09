@@ -1881,6 +1881,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     # the current phase's.
     phase, launch_check = _checked_launch(args, state, session_dir)
     launcher_command = _launcher_arguments(_optional_arg(args, "launcher_command"))
+    launcher_pid = _arg_integer(args, "launcher_pid", os.getppid())
     dispatch_fields: dict[str, object] = {
         "kind": pass_kind,
         "fix_pass": fix_pass,
@@ -1895,8 +1896,12 @@ def _start_pass(args: argparse.Namespace) -> None:
                             dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
                             allow_stage_two=bool(getattr(args, "dispatch_owned", False)))
     if active is not None and isinstance(match, MatchedDispatch):
+        changed = active.get("launcher_pid") != launcher_pid
+        active["launcher_pid"] = launcher_pid
         if launcher_command and not active.get("launcher_command"):
             active["launcher_command"] = launcher_command
+            changed = True
+        if changed:
             _write_state(session_dir, state)
         return
     now = plan_history.now_epoch()
@@ -1913,6 +1918,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         "worker_name": _optional_arg(args, "worker_name"),
         "worker_id": _optional_arg(args, "worker_id"),
         "launcher_command": launcher_command,
+        "launcher_pid": launcher_pid,
         "called_agent": called_agent,
         "team_slot": team_slot,
         "phase": _phase_stamp(phase),
@@ -1921,6 +1927,17 @@ def _start_pass(args: argparse.Namespace) -> None:
     slots = _pass_slots(state)
     slots[team_slot] = current_pass
     _write_state(session_dir, state)
+    worker_id = staff.StaffId(_optional_arg(args, "worker_id"))
+    if worker_id and pass_kind in staff.WORKER_ROLES:
+        role = staff.KnownWorkerRole(pass_kind)
+        try:
+            row = staff.initial_snapshot().by_id(worker_id)
+            if row is None:
+                print(f"anomaly: {worker_id}: worker role has no staff row", file=sys.stderr)
+            elif row.role != role:
+                _ = staff.set_worker_role(worker_id, role)
+        except (staff.StaffUnreadable, staff.StaffNotFound) as error:
+            print(f"anomaly: {worker_id}: {error}", file=sys.stderr)
     event = _event(state, "pass_started", now, current_pass)
     event["launch_check"] = launch_check
     event["config_digest"] = _config_digest()
@@ -1986,7 +2003,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
     args = argparse.Namespace(
-        session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role,
+        session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role, launcher_pid=os.getpid(),
         worker_name=worker_name, worker_id=worker_id, launcher_command=json.dumps(launcher_command) if launcher_command else "",
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family="unknown", called_model="unknown", called_effort="unset",
@@ -2005,13 +2022,16 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
-    """Record one terminal outcome for the exact dispatch in its slot."""
+    """Record completion for the exact dispatch, including DONE after a launcher error."""
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             state = _read_state(session_dir)
-            opened = _open_passes(state).get(slot)
+            opened = _pass_slots(state).get(slot)
             if opened is not None and opened.get("instance_id") == instance_id:
+                if opened.get("status") == "error" and status == "completed":
+                    # Close the corrected pass through the existing recorder event.
+                    opened["status"] = "active"
                 _ = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -2095,6 +2115,7 @@ class HookCompletion:
     role_released: bool = False
     finished: bool = False
     recording_done: bool = False
+    sender_native_id: str = ""
 
 
 class NoHookCompletion(Enum):
@@ -2109,7 +2130,8 @@ def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookComplet
     return HookCompletion(_string(fields.get("outcome")), _string(fields.get("reply_file")),
         tuple(str(item) for item in cast(list[object], details)) if isinstance(details, list) else (),
         fields.get("actions_done") is True, fields.get("pane_closed") is True,
-        fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True)
+        fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True,
+        _string(fields.get("sender_native_id")))
 
 
 def save_hook_completion(run: Path, instance_id: str, completion: HookCompletion) -> None:
@@ -2290,9 +2312,11 @@ def _disarm_review(args: argparse.Namespace) -> None:
     )
 
 
-def _load_events(event_types: Collection[str] = ()) -> tuple[list[dict[str, object]], int]:
+def load_events(event_types: Collection[str] = (), *,
+                record: staff.StaffSnapshot | None = None) -> tuple[list[dict[str, object]], int]:
     events: list[dict[str, object]] = []
-    record = staff.initial_snapshot()
+    if record is None:
+        record = staff.initial_snapshot()
     ignored = 0
     runs_dir = plan_history.history_root() / "runs"
     wanted = re.compile(r'"event_type"\s*:\s*"(?:' + "|".join(map(re.escape, event_types)) + r')"')
@@ -2322,7 +2346,7 @@ def _load_events(event_types: Collection[str] = ()) -> tuple[list[dict[str, obje
 def events_for_worktrees(worktrees: tuple[Path, ...], event_types: frozenset[str]) -> list[dict[str, object]]:
     """Read selected records once for the units' current staff worktrees."""
     directories = {str(worktree.resolve()) for worktree in worktrees}
-    return sorted((event for event in _load_events(event_types)[0] if event.get("working_dir") in directories),
+    return sorted((event for event in load_events(event_types)[0] if event.get("working_dir") in directories),
                   key=lambda event: _number(event.get("timestamp_epoch")))
 
 
@@ -2665,7 +2689,7 @@ def _calibrate(args: argparse.Namespace) -> None:
     if not 0 <= candidate <= 100:
         raise SystemExit("--candidate-percent must be between 0 and 100")
     cap_stage = _arg_string(args, "cap_stage")
-    events, ignored = _load_events()
+    events, ignored = load_events()
     scopes = _calibration_scopes(_calibration_samples(events), state, cap_stage)
     scope, samples = _matching_scope(scopes, candidate)
     bias, support = _smoothed_bias(scopes, candidate)
@@ -2932,9 +2956,8 @@ def _run_events(state: dict[str, object], *,
                 ) -> list[dict[str, object]]:
     """Every event this run recorded, oldest first.
 
-    Scoped to the one run rather than `_load_events`' whole history: the stage
-    table describes the phase in front of the reader, and reading every past run
-    to build it would grow with the machine's history instead of the phase.
+    Read only this run for its phase table.
+    The read cost depends on this run's history.
     """
     history_file = _string(state.get("history_file"))
     if not history_file:
@@ -5829,7 +5852,7 @@ def resolve_checkpoint(commit: str, working_dir: Path, phase_id: str) -> (
     ResolvedCheckpointPhase | UnresolvedWaitAttribution
 ):
     """Match a full checkpoint, including finished instances, across durable runs."""
-    events, ignored = _load_events()
+    events, ignored = load_events()
     phases = [event for event in events if event.get("event_type") == "phase_started"
               and _string(event.get("working_dir"))
               and Path(_string(event.get("working_dir"))).resolve() == working_dir.resolve()
@@ -6340,7 +6363,7 @@ def _read_waits(args: argparse.Namespace) -> None:
             candidate.get("run_id") in run_ids for candidate in
             _attribution_candidates(wait)))
     else:
-        events, ignored = _load_events()
+        events, ignored = load_events()
         events.extend(_external_wait_events())
     without_id = [event for event in events
                   if event.get("event_type") in ("wait_started", "wait_finished", "wait_unclosed", "wait_not_recorded")
@@ -6663,10 +6686,15 @@ def _review_trial(args: argparse.Namespace) -> None:
     review_seconds = 0
     ux_check_seconds = 0
     fix_passes: list[dict[str, object]] = []
-    for event in _run_events(state):
+    events = _run_events(state)
+    finished_passes = {_string(event.get("pass_instance_id")): event for event in events
+                       if event.get("event_type") == "pass_finished"}
+    for event in events:
         if _string(event.get("phase_instance_id")) != instance_id:
             continue
         event_type = _string(event.get("event_type"))
+        if event_type == "pass_finished" and event is not finished_passes[_string(event.get("pass_instance_id"))]:
+            continue
         if event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
             review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
@@ -6702,7 +6730,7 @@ def _review_trial(args: argparse.Namespace) -> None:
 
 
 def _aggregate(args: argparse.Namespace) -> None:
-    events, ignored = _load_events()
+    events, ignored = load_events()
     samples = _calibration_samples(events)
     requested_percent = _arg_integer(args, "percent", -1)
     grouped: dict[tuple[int, str], list[CalibrationSample]] = defaultdict(list)
@@ -6862,6 +6890,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_pass.add_argument("--session-dir", required=True)
     _ = start_pass.add_argument("--pass-kind", choices=staff.WORKER_ROLES, required=True)
     _ = start_pass.add_argument("--launcher-command", default="", help="JSON list of launcher arguments for recovery")
+    _ = start_pass.add_argument("--launcher-pid", type=int, default=os.getppid())
     _ = start_pass.add_argument("--fix-pass", type=int, default=0)
     _ = start_pass.add_argument("--activity", required=True)
     _ = start_pass.add_argument("--called-task", required=True)

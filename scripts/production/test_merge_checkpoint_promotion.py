@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 from unittest import mock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import final
 from scripts.production.cli_fixture import production_paths
 from scripts.shutdown import pane_record
@@ -458,7 +458,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             self.assertEqual(source, self.promote)
             check_lock("mac")
 
-        def zone() -> None:
+        def zone(mac: PurePosixPath) -> None:
+            self.assertEqual(mac, self.root / "mac-installed")
             check_lock("zone")
 
         with mock.patch.object(merge_checkpoint, "into", side_effect=announce), \
@@ -499,7 +500,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
         self.assertEqual(self.git("show", "main:fast-fix.txt", cwd=self.origin), "keep this fast fix")
-        self.assertEqual(self.events("checkpoint-test"), test_events)
+        self.assertEqual(self.events("checkpoint-test"), [*test_events, []])
 
     def test_checkpoint_retry_integrates_main_fix_before_finishing_promotion(self) -> None:
         self.assert_interrupted_promotion_keeps_new_main_fix(handoff=False)
