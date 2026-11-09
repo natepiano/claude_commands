@@ -976,3 +976,9 @@ The merge gate owns module folders through `temporary_build_folder` contexts.
 The contexts remove folders after success or an exception.
 Style lint uses the same context and keeps its standing Cargo target.
 Style review keeps its input folder because the review worker reads it after preparation exits.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

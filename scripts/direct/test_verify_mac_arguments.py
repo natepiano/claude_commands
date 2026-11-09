@@ -121,7 +121,7 @@ raise SystemExit(offload.write_result(result, destination))
 @final
 class NextestArgumentTests(unittest.TestCase):
     def test_only_plain_package_runs_allow_no_tests_on_both_machines(self) -> None:
-        functions = shell_functions(VERIFY, "read_metadata", "set_gate_metadata", "load_metadata",
+        functions = shell_functions(VERIFY, "verify_helper", "read_metadata", "set_gate_metadata", "load_metadata",
                                     "require_member", "qualify_features", "merge_dev_features",
                                     "take_features", "take_test_targets", "compose_nextest_args")
         with tempfile.TemporaryDirectory() as directory:

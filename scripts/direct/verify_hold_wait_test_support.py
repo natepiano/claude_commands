@@ -296,7 +296,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         script = self.fixture.root / "unblocked-step.sh"
         _ = script.write_text('set -eo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
-            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+            + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
 PY=$CLAUDE_PYTHON
