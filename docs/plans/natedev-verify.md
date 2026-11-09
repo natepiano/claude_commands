@@ -1301,30 +1301,25 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41z — A stop before the Mac runner starts holds under load  · status: done
 
-**Depends on:** none. Runs after 41x.
+#### As-built
 
-#### Work Order
-
-**Source:** verify-unit, 2026-11-09, the targeted test after the builds merge at e85fd02a6. `direct/test_verify_mac_signal_boundaries.py` failed 2 of 5 tests on its first run, then passed alone. `test_signal_before_runner_start_removes_result_without_local_work` and `test_check_stop_before_delayed_tee_opens_leaves_no_temp_log` both failed at `self.assertFalse((self.runner_state / "runner-started").exists())` (line 101): the Mac runner started after the test sent SIGTERM. The merge did not change this module or `verify.sh`. Builds routed it to this unit.
-
-**Goal:** a TERM that reaches `verify.sh` before the Mac runner command stops `verify.sh` before that command runs, on every run under load.
-
-**Spec:**
-1. **Reproduce.** Run `test_verify_mac_signal_boundaries.py` repeatedly under CPU load until the failure shows. One way to make the load is several copies of the module at once, each through `scripts/test_times/module_run.py`, inside one detached run with `timeout` (at most 15 minutes). The cloud gate runs up to 16 test modules at once.
-2. **Cause.** Name why the runner starts after the TERM: the test's ordering (`send_signal`, then the `continue-runner` release), the `before_mac_runner` DEBUG trap, or the TERM handling in `verify.sh` before the `"$MAC_RUNNER"` call. Put the evidence in the summary. One window to check first: `verify.sh` starts the runner subshell with `&`, then sets `MAC_RUNNER_PID=$!` (line 2112). `forward_mac_runner_signal` (line 1985) kills the child only when `MAC_RUNNER_PID` is set. A TERM between the start and that assignment stops the parent and leaves the paused subshell, which runs the runner when released.
-3. **Fix the cause where it lives.** When the defect is in `verify.sh`, a TERM that arrives before the runner command stops `verify.sh` before that command runs. When the defect is in the test, the test waits for an event that proves `verify.sh` holds the TERM before it releases the runner. Add no retry, no sleep, and do not raise a time limit.
-4. **Proof.** Under the load from item 1, the module passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show. The signal tests cover a TERM that arrives before the parent sets `MAC_RUNNER_PID` and one that arrives after it. A handshake that waits until after the assignment covers only the second case.
+- `find_mac_runner_pid` sets the caller's `runner_pid` from `MAC_RUNNER_PID`. In the launch window, between the fork and `MAC_RUNNER_PID=$!`, it takes `$!` when `MAC_RUNNER_LAUNCHING=1` and `$!` differs from `MAC_RUNNER_PRIOR_JOB`. It runs without a subshell, which would lose the job state.
+- `forward_mac_runner_signal` (INT, TERM, HUP) and `cancel_tree_run` (USR2) both use it, so a stop at any point from the fork on stops the runner. `verify.sh` then exits 128 plus the signal, or 77, with no Mac run left.
+- INT goes to the runner as TERM. Bash starts an `&` child with INT ignored, so a forwarded INT is lost until `offload.py` installs its own handlers. `verify.sh` still exits 130.
+- The signal boundary table has TERM and INT rows before and after the PID assignment. Under load, the module passes 20 runs in a row.
 
 **Files:**
-- `scripts/direct/test_verify_mac_signal_boundaries.py` — the signal boundary tests.
-- `scripts/direct/verify.sh` — the TERM handling before the Mac runner call, if the cause is there.
+- `scripts/direct/verify.sh` — `find_mac_runner_pid`, the launch globals, the two handlers.
+- `scripts/direct/test_verify_mac_signal_boundaries.py` — the boundary rows.
+- `scripts/direct/test_verify_mac_signals.py` — a ready runner receives TERM for INT.
+- `scripts/direct/verify_mac_offload_test_support.py` — `call_mac_functions` extracts `find_mac_runner_pid` and sets both launch globals.
 
-**Workers:** 1 writer — `impl` owns every file above.
+**Gotchas:**
+- A terminal interrupt reaches the runner twice: INT from the process group and TERM from the forward. `offload.py` treats both the same except for its exit code.
 
-**Acceptance gate:**
-- `test_verify_mac_signal_boundaries.py` passes with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on each changed Python file.
-- When `verify.sh` changes: `bash -n scripts/direct/verify.sh` passes, `shellcheck scripts/direct/verify.sh` shows no new finding, and `test_verify_verbs.py` and `test_verify_mac_only.py` pass.
-- The director runs the targeted test.
+**Ruled out:**
+- `set -m` around the fork: the runner moves to a background process group, and a terminal read stops it with SIGTTIN.
+- `trap - INT` in the runner subshell alone: an INT between the fork and that line is still lost.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 
