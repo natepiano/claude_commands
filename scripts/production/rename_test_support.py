@@ -248,6 +248,7 @@ class FolderMoveFixture(StaffTestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
+        _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
