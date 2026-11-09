@@ -830,7 +830,7 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - The static import walk does not see Python source in string literals. Search the scripts that tests write at run time for the old path.
 - A new caller that reads a moved name through `memory_admit` fails basedpyright with an unknown attribute.
 
-### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: todo
+### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: done
 **Depends on:** queue-unit's Phase 36 (swap by owner) on builds, because both change `memory_feed.py` and `memory_live.html`. Merge builds before the start. This phase was queue-unit's Phase 35.
 
 From the user (via aws-unit, 2026-11-08): "each row is work and it needs to reflect that work", "design approved - we need to make sure it's reflected in the build page also". From the builds showrunner (not the user), 2026-11-08: start after queue's Phase 36 lands on builds.
