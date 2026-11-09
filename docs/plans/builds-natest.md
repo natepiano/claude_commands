@@ -2103,51 +2103,29 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - Queueing HTTP worker-thread CLI calls onto the main thread: it removes the process boundary that the HTTP path needs.
 
 ### Phase 106 — The memory admission tests use half their CPU  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** next items, items 2 and 6a. On 2026-11-09 05:51 EST (`show.py top`), the next eligible modules were `direct/test_verify_routing_rule.py` (40.8 CPU s per gate), `direct/test_assign_claude_records.py` (37.5) and `lint/test_memory_admit.py` (37.0). The profile on a copy of `befc1a04a` (`module_cost.py --tests 10 --commands 10`) measured 26.9, 24.8 and 30.3 CPU s. Only `lint/test_memory_admit.py` is above the 30 CPU s stop line: 30.3 CPU s, 11168 processes, 11025 execs and 49.0 wall s. Its measured child cost: `git` 10639 starts and 6.0 CPU s, `python3 -c` 32 starts and 9.7 CPU s, `admission_client.py` 16 starts and 2.8 CPU s. The slowest test is `BuildBudgetTests.test_service_intervals_use_positive_finite_config_and_read_each_use` (7.3 CPU s). Three tests wait more than they compute: `QueueLeaveTests.test_declining_hook_and_no_hook_wait_alike` (2.9 CPU s, 6.9 wall s), `QueueLeaveTests.test_a_run_waiting_for_memory_claims_its_share_only_once_admitted` (2.0 CPU s, 3.0 wall s) and `ShellTests.test_invoke_twice_with_temporary_home` (0.8 CPU s, 5.8 wall s).
-
-**Goal:** `scripts/lint/test_memory_admit.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
-2. Find what starts each `git` process and each `python3 -c` process: production code or the test fixture. Remove a start that only the fixture makes. Share a repository or a fake that many tests make the same way.
-3. Find why the config interval test costs 7.3 CPU s for 80 config reads. Cut the fixture part of that cost.
-4. Run a real entry in process through `scripts/production/cli_fixture.py` `invoke_cli` where the test does not assert on the process boundary, as Phase 103 did. Keep a real process for each behavior that only a process proves: an interrupt between steps, an exit code across a process, any cwd or environment that the entry reads at start, a shell function under test.
-5. Cut a fixed wait in a test only where an event or a shorter config value proves the same behavior.
-6. Write a behavior map with a row for each assertion before you change a test. Group rows by test class and helper where the assertions are the same.
-7. Do not change `scripts/lint/memory_admit.py`, files in `scripts/build_queue/` or `scripts/buildlog/`, `scripts/lint/build_hold.py` or other production files. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-8. Change `scripts/lint/memory_test_support.py` only for a shared fixture cut. Many test modules import it, and each importer must pass.
-9. Add no guard, refusal or check (user rule, 2026-11-05).
+- The config fault tests write a complete config with `write_memory_config` and change only the selected key; a missing key passes `None`. The real reader still recovers the committed value of that key through Git.
+- `RepositoryHistoryTests.setUpClass` builds one initialized seed repository (`repository_seed`); `checkout()` copies it with `shutil.copytree` for each test.
+- The queue client runs from a generated `queue-client.py` file (`TEST_QUEUE_CLIENT`), built from the source of `queue_leave_client_main`. The real client, shell and socket boundaries stay.
+- `ShellTests.test_invoke_twice_with_temporary_home` calls `allow_next_start()` before each shell run.
+- All 375 tests and 1194 assertions are kept. Processes: 11100 -> 1614.
+- Same-load pairs against `8cd6189b8`: `/tmp` with a warm bytecode cache 19.5 -> 10.2 CPU s (47.8% less); `/dev/shm` with no bytecode writes 26.7 -> 10.1 CPU s (62.1% less).
 
 **Files:**
-- `scripts/lint/test_memory_admit.py`
-- `scripts/lint/memory_test_support.py`
+- `scripts/lint/test_memory_admit.py` — memory admission tests; direct config writes, seed repository copy, generated queue client
+- `docs/plans/builds-natest-next.md` — Floors row for the memory admission tests
 
-**Workers:** 1 writer; one test module and its support file
-- `impl` — `test_memory_admit.py`, hub: `memory_test_support.py`
+**Gotchas:**
+- `write_config_fault` stays in `memory_test_support.py`: `mac_test/test_offload.py` and `buildlog/test_parse.py` use it.
+- The warm-cache floor is the real admission client start at each shell boundary.
 
-**Constraints from prior phases:**
-- Phase 89, Phase 97, Phase 100, Phase 103, Phase 104 and Phase 105: an in-process call of a real entry through `invoke_cli` cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
-- Phase 103: a process start costs more with no bytecode writes, so start cuts gain more there. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
-- `invoke_cli` restores signal handlers (`cli_fixture.py:133`), and Python allows that only on the main thread. It also changes the process cwd, environment and streams. Call `invoke_cli` only for sequential calls on the main thread. Keep a real process for each call made from another thread. A change to the shared helper goes to the director as a proposal.
-- Phase 105: a call that a test routes in process from a worker thread was a review blocker. Check the thread of each routed call.
-- `build_hold.py` stays frozen. Next item 11 lists this module for the Rule 2 cleanup; this speed phase holds it, so remove no test here.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `~/.local/state/build-targets`, `/tmp/claude`. State the filesystem basis of each pair.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion. No assertion is removed.
-- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed files pass, and every module that imports a changed helper passes.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
-- Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.
+**Ruled out:**
+- A source-stamp path change in the queue client: about 0.5 CPU s (3%) of gain, with a path-equivalence risk across platforms (showrunner, 2026-11-09).
 
 ### Phase 107 — The change page tests drop the processes kept at the floor  · status: todo
 **Depends on:** none
-**Blocked by:** merge — `origin/builds` carries `~/.claude` main `e2232ced0` (devtools `52256c239`, the change page in-process calls)
 
 #### Work Order
 
@@ -2166,9 +2144,10 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Files:**
 - `scripts/review_links/test_change_page.py`
+- `docs/plans/builds-natest-next.md` — the Floors row only
 
 **Workers:** 1 writer; one test file
-- `impl` — `test_change_page.py`
+- `impl` — `test_change_page.py`, the Floors row
 
 **Constraints from prior phases:**
 - Phase 105: `test_change_page.py` copies one seed repository per test. Its `run` side effect sends main-thread test-owned CLI calls through `invoke_cli`, and calls from other threads, `@process_boundary` cases and other commands through the real process. 7 `@process_boundary` tests, 139 tests and 829 assertions.
