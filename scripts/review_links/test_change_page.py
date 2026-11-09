@@ -5,6 +5,7 @@ import fcntl
 import os
 import re
 import json
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -17,7 +18,9 @@ from datetime import date
 from http.client import HTTPConnection
 from html.parser import HTMLParser
 from io import StringIO
+from functools import cache
 from pathlib import Path
+from types import ModuleType
 from typing import Literal, cast, override
 from collections.abc import Callable, Generator
 from unittest.mock import patch
@@ -25,7 +28,9 @@ from urllib.parse import urlencode, urljoin, urlsplit
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import change_routing, change_review, footer_counts, next_item, showrunners, staff, unrouted_alert
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve
@@ -127,6 +132,30 @@ class BrowserForms(HTMLParser):
 SEND_MESSAGE = change_page.send_message
 
 
+@cache
+def repository_seed() -> Path:
+    """Copy private Git files from one merged fixture repository."""
+    temporary = tempfile.TemporaryDirectory(prefix="change-page-seed-")
+    unittest.addModuleCleanup(repository_seed.cache_clear)
+    unittest.addModuleCleanup(temporary.cleanup)
+    repo = Path(temporary.name)
+    item = change_review.Visible("Numbered moves", "Run moves list", "Each group starts at 1")
+    commands = [
+        ["init", "-b", "main"],
+        ["config", "user.name", "Review test"],
+        ["config", "user.email", "review@example.invalid"],
+        ["commit", "--allow-empty", "-m", "initial"],
+        ["checkout", "-b", "feature"],
+        ["commit", "--allow-empty", "-m",
+         f"checkpoint(feature): numbered moves\n\nChange-Review: {item.change} | {item.check} | {item.see}"],
+        ["checkout", "main"],
+        ["merge", "--no-ff", "feature", "-m", "merge numbered moves"],
+    ]
+    for arguments in commands:
+        _ = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=True)
+    return repo
+
+
 class ReviewTextTests(unittest.TestCase):
     def test_text_without_list_lines_keeps_all_whitespace_in_one_block(self) -> None:
         text = '\n First <line> \r\n\r Second & line\u2028Third\n'
@@ -174,6 +203,14 @@ class ChangePageTests(unittest.TestCase):
         super().__init__(methodName)
         self.raw_messages = []
         self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+
+    def command(self, module: ModuleType, main: Callable[[list[str]], int],
+                arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        if process_boundary_for_case(self):
+            return subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"),
+                                   str(module.__file__), *arguments],
+                                  capture_output=True, text=True, check=False)
+        return invoke_cli(module, lambda: main(arguments), arguments, dict(os.environ), Path.cwd())
 
     def test_both_pages_show_lists_in_the_question_answer_and_check(self) -> None:
         item = change_review.Visible('Numbered moves', 'Steps\n- Click <one>\n- Click two\n\nFinish', 'Result')
@@ -263,6 +300,9 @@ class ChangePageTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="change-page-test-")))
+        cache_home = self.temporary / "cache"
+        seed_interpreter_cache(cache_home)
+        self.enterContext(patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home), "CLAUDE_PYTHON": ""}))
         self.root = self.temporary / "snapshots"
         configuration = self.temporary / "config"
         configuration.mkdir()
@@ -273,7 +313,7 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
         self.repo = self.temporary / "repo"
-        self.repo.mkdir()
+        _ = shutil.copytree(repository_seed(), self.repo)
         self.enterContext(patch.dict(os.environ, {
             "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
             "NEXT_STATE_DIR": str(self.temporary / "next"),
@@ -288,16 +328,7 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=self.temporary))
         _ = self.enterContext(patch("scripts.production.change_review.lists_directory", return_value=self.temporary))
         _ = fixture_member("showrunner", name="demo")
-        _ = self.git("init", "-b", "main")
-        _ = self.git("config", "user.name", "Review test")
-        _ = self.git("config", "user.email", "review@example.invalid")
-        _ = self.git("commit", "--allow-empty", "-m", "initial")
-        _ = self.git("checkout", "-b", "feature")
         item = change_review.Visible("Numbered moves", "Run moves list", "Each group starts at 1")
-        _ = self.git("commit", "--allow-empty", "-m",
-                     f"checkpoint(feature): numbered moves\n\nChange-Review: {item.change} | {item.check} | {item.see}")
-        _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "feature", "-m", "merge numbered moves")
         merged = self.git("rev-parse", "HEAD")
         # A production file is configuration: neither a recipient nor a checkout
         # comes from the submitted form.
@@ -317,6 +348,22 @@ class ChangePageTests(unittest.TestCase):
             date(2026, 11, 1), merged, self.production, producers=[self.unit.id] * 3, record=staff.snapshot())
         for row, kind in (("C1", "See in action"), ("C2", "See in action"), ("C3", "Read only")):
             _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        entries = {str(module.__file__): (module, main) for module, main in
+                   ((change_review, change_review.main), (feature_log, feature_log.main))}
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            # invoke_cli changes process state, so a call from an HTTP worker thread keeps its real process.
+            if (process_boundary_for_case(self) or threading.current_thread() is not threading.main_thread()
+                    or len(command) < 2 or command[1] not in entries):
+                return run_process(command, **options)
+            module, main = entries[command[1]]
+            result = self.command(module, main, command[2:])
+            if options.get("check"):
+                result.check_returncode()
+            return result
+
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
         self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
         self.page = change_page.page_at(self.root, self.page_path)
         self.messages = []
@@ -368,6 +415,7 @@ class ChangePageTests(unittest.TestCase):
                         "Send question again", "Send validation request again", "data-resend", 'value="retry"'):
             self.assertNotIn(removed, content)
 
+    @process_boundary
     def test_recovery_does_not_erase_a_live_request_before_its_verdict_saves(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         began, release = threading.Event(), threading.Event()
@@ -1028,9 +1076,9 @@ class ChangePageTests(unittest.TestCase):
         if not question_id:
             question = change_page.DeliveryStatus(self.root).slots(self.page, row).question
             question_id = question.question_id if not isinstance(question, change_page.NoQuestion) else "unknown"
-        return subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), change_page.__file__, "answer-question", "--production", "page-owner",
-                               "--list", str(self.review_list), "--row", row, "--question", question_id, "--text", text],
-                              capture_output=True, text=True, check=False)
+        return self.command(change_page, change_page.main,
+                            ["answer-question", "--production", "page-owner", "--list", str(self.review_list),
+                             "--row", row, "--question", question_id, "--text", text])
 
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
         other = self.temporary / "change-review - another.md"
@@ -1565,6 +1613,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
         self.assertEqual(next(row["Verdict"] for row in change_review.review_rows(self.review_list) if row["#"] == "C1"), "works")
 
+    @process_boundary
     def test_answer_question_refuses_missing_questions_and_changes_nothing_on_an_identical_rerun(self) -> None:
         result = self.answer_question("There is no question.")
         self.assertEqual(result.returncode, 1)
@@ -2060,12 +2109,12 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn('<p class="kind">Read only</p>', reloaded)
         self.assertIn("Saved: works", reloaded)
 
+    @process_boundary
     def test_command_publishes_one_row_and_a_batch_through_the_same_path(self) -> None:
         for rows in (["C1"], ["C1", "C2", "C3"]):
             with self.subTest(rows=rows):
-                result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), change_page.__file__, "--production", "page-owner",
-                                         "--list", str(self.review_list), *rows],
-                                        capture_output=True, text=True, check=False)
+                result = self.command(change_page, change_page.main,
+                                      ["--production", "page-owner", "--list", str(self.review_list), *rows])
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
                 path = urlsplit(result.stdout.strip()).path
                 reply = self.request(path, {})
@@ -2087,8 +2136,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(len(self.messages), 0)
 
     def feature_command(self, *arguments: str) -> None:
-        result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), feature_log.__file__, *arguments],
-                                capture_output=True, text=True, check=False)
+        result = self.command(feature_log, feature_log.main, list(arguments))
         self.assertEqual((result.returncode, result.stderr), (0, ""))
 
     def note_arguments(self, project: str, title: str) -> list[str]:
@@ -2101,6 +2149,7 @@ class ChangePageTests(unittest.TestCase):
         path = feature_log.state_dir() / "proposals" / f"{review}.json"
         return cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
 
+    @process_boundary
     def test_a_feature_log_project_saves_when_the_writer_skips_an_absent_proposal(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
         with patch.object(subprocess, "run", wraps=subprocess.run) as commands:
@@ -2447,6 +2496,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertTrue(status.path(self.page, "C1").exists())
         self.assertEqual(self.request("/" + status.path(self.page, "C1").name, {}).status, 404)
 
+    @process_boundary
     def test_an_interruption_after_the_verdict_preserves_a_pending_message_for_server_recovery(self) -> None:
         run = subprocess.run
 
@@ -2477,6 +2527,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
         self.assertNotIn("Saved:", reply.body)
 
+    @process_boundary
     def test_a_failed_or_interrupted_verdict_write_preserves_validation_ownership_and_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         self.assertEqual(self.request(self.page_path, self.answer(outcome="validate", feedback="Keep these words")).status, 303)
@@ -2506,6 +2557,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertNotIn("Saved:", body)
                 self.assert_no_delivery_controls(body)
 
+    @process_boundary
     def test_an_interruption_after_saving_selects_the_verdict_slot_and_keeps_validation_feedback(self) -> None:
         words = "Check the small text"
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):

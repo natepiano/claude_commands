@@ -205,6 +205,8 @@ Method (side A and side B 1 already ran this way; keep it):
 3. Side A builds into `dylib_ab/target-a`, side B into `dylib_ab/target-b`, through `CARGO_TARGET_DIR`. Cold means an empty target folder; compiler and download caches stay.
 4. Run each verify.sh call with `--local`, `--no-cache` and the measurement reason, on natedev only.
 5. Record wall, build, test, wait and load per run. Exclude an interrupted run.
+6. Each incremental run alternates adding and removing one comment in `crates/hana/src/environment/constants.rs`, a leaf module of the hana binary. Both sides use the same edit sequence; side B starts from the original file.
+7. The completed runs, the clone path and the run receipts are in `report-unit-dylib-ab.md` at the worktree root. Read it first and run only the missing runs.
 
 Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
@@ -831,59 +833,25 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - A new caller that reads a moved name through `memory_admit` fails basedpyright with an unknown attribute.
 
 ### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: done
-**Depends on:** queue-unit's Phase 36 (swap by owner) on builds, because both change `memory_feed.py` and `memory_live.html`. Merge builds before the start. This phase was queue-unit's Phase 35.
 
-From the user (via aws-unit, 2026-11-08): "each row is work and it needs to reflect that work", "design approved - we need to make sure it's reflected in the build page also". From the builds showrunner (not the user), 2026-11-08: start after queue's Phase 36 lands on builds.
+#### As-built
 
-Approved layout:
-
-```
-  # showrunner   unit       step           min machine vCPU pid         GiB: kept/use; need
-run hana         merge-gate hana nextest     2 natedev   32 pid 361734  ░░ 13.3 / 0.1
-run sdlc         agents     merge-gate       4 aws       32 pid 1084018 running · 312 of 737 modules · 1 failed
-run builds       queue      targeted test    1 aws       16 pid 1631041 setup · 0 of 130 modules
-  1 sdlc         devtools   merge-gate       2                pid 1676409 ██ 4.6
-cloud            natest     targeted test    0                pid 1868327 waits for a cloud slot: 9 of 9 in use
-Head: free 25.5 GiB; reserve 3.0 GiB; need 4.6 GiB · cloud 2 of 9 slots
-```
-
-#### Work Order
-
-**Goal:** A cloud gate is a normal row of the queue table, in the text view and on the build page, and the separate Cloud section and card go.
-
-**Spec:**
-- Each cloud gate is a row of the main table, sorted with the other running and waiting rows.
-- The machine column shows `aws` for a cloud gate. natedev and the Mac rows do not change.
-- A new vCPU column after machine, on every running row, shows the CPU count of the machine that runs the work. Cloud: `CloudProgress.size_vcpus`. Local counts come from the system or config, not a literal.
-- The last column: a local row keeps its memory bar. A cloud row shows its state (requesting, setup, running, uploading), modules done of total, and failed modules when any. After 3 missed progress pushes it adds "no update for <age>" in red. A cloud row has no memory reservation.
-- A cloud gate that waits for a slot has `cloud` in the # column, and its last column is the slot wait text.
-- The head line adds "cloud N of 9 slots"; the slot count comes from config.
-- `memory_live.html` shows the same rows and columns; the Cloud card goes. The text view loses its Cloud section (`queue_view.cloud_lines`).
-- Data: `admission_protocol` `CloudRow` / `CloudPlace`, `cloud_progress.CloudProgress(state, size_vcpus, failed_modules, updated_at)`, and the modules counter on the same sidecar. No aws-side change.
+- Cloud gates are rows in the one queue table (`append_cloud_row` in `queue_view.py`), with no separate Cloud group. The Head line gives the cloud slot count, for example `cloud 1 of 1 slots`.
+- A running cloud row shows machine `aws`, its vCPU count and its progress text in the memory column. A waiting row, local or cloud, leaves the machine and vCPU cells blank. A running local row shows `os.cpu_count()` in the vCPU column.
+- A late running cloud row shows a red ` · no update for <age>`. `CloudUpdateLate.seconds` holds the age, and `cloud_update_age` formats it for the text view, the step card and the feed field `late_age`.
+- The build page shows the same rows in the feed order, with `#` and `vCPU` columns. `CloudWorkRow` in `memory_feed.py` has `machine: Literal["aws", ""]`, `late_age` and `stale`. CI rows stay last on the page, as before.
+- The step card keeps its Cloud lines.
 
 **Files:**
-- `scripts/build_queue/queue_view.py` — cloud rows in the table; no `cloud_lines` section.
-- `scripts/build_queue/memory_feed.py` — cloud rows and the vCPU column in the feed.
-- `scripts/build_queue/memory_live.html` — the rows and columns; no `renderCloud` card.
-- `scripts/build_queue/memory_page_proof.mjs` — the browser proof.
-- `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_memory_feed.py` — row tests.
-- `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/*.txt` — the reviewed view and card text. The cloud step card (`queue_card.py` calls `cloud_lines` with a selected row) stays.
+- `scripts/build_queue/queue_view.py` — cloud rows, the vCPU column, `CloudUpdateLate`, `cloud_update_age`.
+- `scripts/build_queue/memory_feed.py` — the `CloudWorkRow` fields for the page.
+- `scripts/build_queue/memory_live.html` — cloud rows and the vCPU column on the page.
+- `scripts/build_queue/test_queue_view.py`, `test_queue_card.py`, `test_memory_feed.py`, `test_build_queue.py`, `memory_page_proof.mjs`, `golden/*.txt` — tests and goldens.
+- `docs/as-built/build-memory-admission.md` — the queue table section.
 
-**Workers:** `1 writer + 1 tester`
-- writer — `queue_view.py`, `memory_feed.py`, `memory_live.html`.
-- tester — the Python tests, the golden files and `memory_page_proof.mjs`.
-
-The vCPU count of a local row is the host's `os.cpu_count()`, read at use: the queue's running rows all run on this host.
-
-**State:** none.
-
-**Constraints from prior phases:** Read `admission_protocol` `CloudRow`/`CloudPlace` and `cloud_progress.CloudProgress` as they are; aws-unit owns them. Tunables live in config and are read at use.
-
-**Acceptance gate:**
-- Tests show a running cloud row, a waiting cloud row with `cloud` in the # column, a stale cloud row with "no update for <age>", the vCPU column, and the head line slot count, in the text view and in the feed.
-- The browser proof shows the same rows on the page and no Cloud card.
-- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
-- The checkpoint notice goes to aws-unit too; aws checks it with a live cloud gate.
+**Gotchas:**
+- A test that renders a vCPU column patches `os.cpu_count` to 17 (`QueueViewFixtureTests`, `QueueTests.setUp`). The real count differs per machine.
+- Format an age once, from seconds. Text that is formatted and then parsed back fails at `updated_at=0`.
 
 ### Phase 40 — /build:queue retires when the build page covers it · status: todo
 **Depends on:** Phase 39; queue-unit's Phase 10m. This phase was queue-unit's Phase 10n.
@@ -895,7 +863,9 @@ From the user (C959, 2026-11-04, through builds): "we are moving to the new buil
 **Goal:** The `/build:queue` view goes once the build page shows each thing it shows; its controls stay.
 
 **Spec:**
-- List what `/build:queue` shows and confirm the page shows each item, the queue 10m wait states included. Then remove the view routes and the view code that only they use.
+- List what `/build:queue` shows and confirm the page shows each item, the queue 10m wait states included. Then remove the plain-text view route and the view code that only it uses.
+- The unit-board queue pane runs `build_queue.py --json --columns <n> --you <session> [selector]` (`mods/unit-board/hooks/register.tsx:326`). Keep that `--json` route and its selector card output unchanged; only the plain-text output (`plain(lines)`, `build_queue.py:167`) goes.
+- The page does not show the Mac idle alert yet. `build_queue.py:163` prints `mac_idle_alert.alert_line(state_dir() / "alert.json", ...)` as a red first line (Mac idle, unreachable, unreadable watch). Add it to the feed (`memory_feed.py`) and show it as a red line at the top of the page (`memory_live.html`) before the text route goes.
 - `build_queue.py` keeps the `bump`, `clear` and `admit-head` controls: the page does not have them, and they stay until the user approves a replacement (architect review of queue 18, 2026-11-06).
 - Keep each formatter that a current caller uses: the queue card uses `queue_view` formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`; `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code. Keep `queue_lines.step_text`: the card and the build page use it.
 - The queue card and the unit-board queue pane stay unless the user says otherwise.
@@ -904,18 +874,22 @@ From the user (C959, 2026-11-04, through builds): "we are moving to the new buil
 - `commands/build/queue.md` — the controls only.
 - `scripts/build_queue/build_queue.py` — no view routes.
 - `scripts/build_queue/queue_view.py` — no code that only the view routes used.
-- `scripts/build_queue/test_build_queue.py` — tests for the removed routes go.
+- `scripts/build_queue/memory_feed.py` — the Mac idle alert text in the feed.
+- `scripts/build_queue/memory_live.html` — the alert as a red line at the top.
+- `scripts/build_queue/test_build_queue.py` — tests for the removed plain-text route go; the `--json` route tests stay.
+- `scripts/build_queue/test_memory_feed.py`, `scripts/build_queue/memory_page_proof.mjs` — the alert in the feed and on the page.
 
 **Workers:** `1 writer + 1 tester`
-- writer — `commands/build/queue.md`, `build_queue.py` and the view code that only it uses.
-- tester — `test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
+- writer — `commands/build/queue.md`, `build_queue.py`, `memory_feed.py`, `memory_live.html` and the view code that only the text route uses.
+- tester — `test_build_queue.py`, `test_memory_feed.py`, `test_queue_view.py`, `test_queue_card.py`, `memory_page_proof.mjs`, the golden files only the text route reads, and the suites of the shared formatters.
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 39 put cloud rows in the main table; the page and the text view show the same rows.
+**Constraints from prior phases:** Phase 39 put cloud rows in the main table; the page and the text view show the same rows. `memory_feed.py` calls the cloud helpers in `queue_view.py` (`cloud_update_age` and the cloud row code), and card and feed tests import support from `test_queue_view.py`: keep both. Every test that renders a golden with a vCPU column patches `os.cpu_count` to 17 (`QueueViewFixtureTests`, `QueueTests.setUp`).
 
 **Acceptance gate:**
-- The summary lists each `/build:queue` item and where the page shows it.
+- The summary lists each `/build:queue` item and where the page shows it, the cloud rows, the Head cloud slot count, the red late age and the Mac idle alert included.
+- The unit-board queue pane tests (`mods/unit-board/tests/queue.test.ts`) pass with no change to them.
 - No caller of the removed code remains (LSP `findReferences` or `rg`).
 - The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
 
