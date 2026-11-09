@@ -1,9 +1,10 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from scripts.build_queue.admission_test_support import caller_admission
 
-from scripts.lint import memory_admit as gate
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading
@@ -374,13 +375,13 @@ esac
         with admission.loop_turn():
             waiting, = admission.server.waiters.values()
             need = waiting.row["need"]
-            waiting.row["need"] = 60 * gate.GIB
-            admission.free(48 * gate.GIB)
+            waiting.row["need"] = 60 * admission_records.GIB
+            admission.free(48 * admission_records.GIB)
 
         def resume() -> None:
             with admission.loop_turn():
                 waiting.row["need"] = need
-                admission.free(48 * gate.GIB)
+                admission.free(48 * admission_records.GIB)
 
         self.addCleanup(resume)
         return resume

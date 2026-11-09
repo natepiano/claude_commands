@@ -833,40 +833,21 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 **Ruled out:**
 - A change to `INDEX_SPILL_PAGES`: a value change needs the user's approval (builds showrunner, 2026-11-08).
 
-### Phase 38 — Each moved admission name has one import path · status: todo
-**Depends on:** queue-unit's Phase 10o and resources 0dfe65382 (both on this branch); nothing in this plan. This phase was queue-unit's Phase 21 (builds-queue.md).
+### Phase 38 — Each moved admission name has one import path · status: done
 
-From the builds showrunner (not the user), 2026-11-08: "queue has too much work. You get three of its phases … Phase 21: each moved admission name has one import path. … Order 21 freely." The design call is the builds showrunner's, 2026-11-06: "The owner of a move switches every caller, and the old path goes."
+#### As-built
 
-#### Work Order
-
-**Goal:** A name that queue Phase 10o moved has one import path, its defining module. No caller reads it through `memory_admit`.
-
-**Spec:**
-- Phase 10o left about 230 names re-exported from `scripts/lint/memory_admit.py` (`from x import A as A`), so one name has two import paths. Each caller that reads a moved name through `memory_admit` imports it from its defining module: `scripts/build_queue/admission_records.py`, `scripts/build_queue/step_estimator.py`, `scripts/build_queue/system_clock.py` or `scripts/lib/test_phase.py`.
-- Find the callers with a static walk on this phase's merged tree (a one-off script in the phase folder, not in the repo). A walk on `136497f98` found 39 files; other units' landings change the list. Each caller file the walk lists is in this phase's scope; the director adds it to the phase `files` list before dispatch.
-- A `mock.patch` target on a moved name names the defining module. A patch that changes a name the code reads through another module keeps its effect; the tests prove it.
-- In `memory_admit.py`, each `A as A` re-export goes. `memory_admit` imports only the names it uses.
-- `scripts/buildlog/mac_idle.py` is frozen except for this one import change (builds ruling, 2026-11-06). The checkpoint notice names it on its also-touches line.
-- Replies, wire shapes, stored records, config keys and printed text do not change. No assertion changes. Add no new import test: a new check goes to the user first.
+`scripts/lint/memory_admit.py` re-exports none of the 227 admission names that moved to `scripts/build_queue`. Each caller imports a name from its defining module (`admission_records`, `step_estimator` and the other `build_queue` modules). This includes the Python source that tests write at run time.
+- Code behavior and test assertions are unchanged. `memory_admit.py release` loads the same 24 modules.
+- `scripts/buildlog/mac_idle.py` (verify-unit) changes only its type import and annotations.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — no re-exports.
-- `scripts/buildlog/mac_idle.py` — one import line.
+- `scripts/lint/memory_admit.py` — no re-exports; it imports only the names it uses.
+- `scripts/build_queue/*`, `scripts/aws_target/{aws_target,cloud_gate,control_test_support}.py`, `scripts/production/merge_gate.py` and its tests, `scripts/hooks/test_brp_launch_gate.py`, `scripts/mac_test/loopback_proof.py`, `scripts/buildlog/{mac_idle,width_trial,test_memory_window}.py`, `scripts/direct/test_verify_{build_key,release_ack,token_reservation,wait_holder}.py`, `scripts/direct/verify_token_wait_test_support.py`, `scripts/lint/{memory_test_support,test_memory_admit}.py` — callers on the one path.
 
-**Workers:** `1 writer + 1 tester`
-- writer — production callers and `memory_admit.py`.
-- tester — test files and test support, patch targets, and the walk.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 33: every import uses the repo root (`from scripts.buildlog import y`); a patch string names the root form; a library module adds no `sys.path` line. After a merge of builds or main, run `scripts/lint/package_imports.py bootstrap` and the import-group check on changed files.
-
-**Acceptance gate:**
-- The one-off walk prints no caller of a moved name through `memory_admit`; the checkpoint notice carries that result.
-- The client start measurement stays: `memory_admit.py release` loads no module it did not load before.
-- The unit's targeted test passes, and `basedpyright` reports 0 errors, 0 warnings, 0 notes on each changed file and each caller module.
-- Change-Review: none — no behavior changes.
+**Gotchas:**
+- The static import walk does not see Python source in string literals. Search the scripts that tests write at run time for the old path.
+- A new caller that reads a moved name through `memory_admit` fails basedpyright with an unknown attribute.
 
 ### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: todo
 **Depends on:** queue-unit's Phase 36 (swap by owner) on builds, because both change `memory_feed.py` and `memory_live.html`. Merge builds before the start. This phase was queue-unit's Phase 35.
@@ -955,48 +936,21 @@ From the user (C959, 2026-11-04, through builds): "we are moving to the new buil
 - The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
 
 ### Phase 41 — The vault sync keeps the Mac main ref and files its stop question · status: done
-**Depends on:** nothing in this plan. Files: `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`, `config/build_targets.conf`; no other phase touches them.
 
-From the builds showrunner (not the user), 2026-11-08: "C1272 (Mac vault syncs both ways) landed on my validation. One live defect to look at: the 11:00 EST buildlog vault run stopped with 'unknown command error ... cannot lock ref refs/remotes/mac/main' ... Find the cause ... and whether the stop filed a question on natedev's list ... Send me the cause, and a phase if a fix is needed."
+#### As-built
 
-From the builds showrunner (not the user), 2026-11-08: "go on Phase 41. The full refspec fixes the cause, and the question production from config is right (a new key needs no go). Add a change row only when the fix is live and the user can check it."
-
-Cause, measured 2026-11-08 on git 2.54.0 in a scratch pair of repositories:
-- The global git config sets `fetch.prune true`. `vault_pull.py:228` fetches `main:refs/remotes/mac/main` from a URL. With a short source name, prune counts the destination ref as stale. Each second fetch deletes `refs/remotes/mac/main`.
-- When the Mac main moved, that fetch fails: `cannot lock ref ... unable to resolve reference ... (unable to update local ref)`. This is the 11:00 stop.
-- When the Mac main did not move, the fetch exits 0 and leaves the ref deleted. The next `merge-base` on the ref then fails.
-- So every second hourly run stops. It is not a race. Runs: 09:58 created the ref, 11:00 stopped, 12:02 created it again.
-- The full source name `refs/heads/main:refs/remotes/mac/main` updates the ref on each of four runs, with prune on.
-
-Question list, measured 2026-11-08:
-- The 11:00 stop filed no question; nothing needs clearing. The 12:02 run printed no "question was not withdrawn", so the ask had failed.
-- `vault_pull.py` passes `--production ~/.claude/docs/plans/natedev-production.md`. The natedev showrunner's staff row names the doc in `worktrees/claude-natedev-trunk`, so `update_registration.py` answers "no showrunner staff row". No vault stop has reached the list since that move.
-- `update_registration.py questions --production natedev` works: the flag takes the production name.
-
-#### Work Order
-
-**Goal:** Each hourly vault run keeps `refs/remotes/mac/main`, and a vault stop puts its question on natedev's list.
-
-**Spec:**
-- The Mac fetch uses the full source name: `refs/heads/main:refs/remotes/mac/main`.
-- A vault question names its production by name, read from `config/build_targets.conf` key `vault.question_production` (value `natedev`) at use. The hard-coded production doc path goes.
-- Replies, printed text, stored state and the question text do not change.
+- The hourly vault sync fetches `refs/heads/main:refs/remotes/mac/main`. With the global `fetch.prune true`, the full source name keeps the ref on each run.
+- A vault stop question passes `--production` with the name from `config/build_targets.conf` key `vault.question_production` (`natedev`), read at use.
+- Replies, printed text, stored state and the question text are unchanged.
 
 **Files:**
 - `scripts/buildlog/vault_pull.py` — the fetch refspec; the production name from config.
-- `scripts/buildlog/test_vault_pull.py` — rows in the existing tests.
-- `config/build_targets.conf` — `vault.question_production`.
+- `scripts/buildlog/test_vault_pull.py` — two syncs in a row with `fetch.prune true`, with and without a new Mac commit; the registration reads the config value at use.
+- `config/build_targets.conf` — `vault.question_production=natedev`.
 
-**Workers:** `1 writer`
-- writer — all three files. The tests are small and live beside the change.
+**Gotchas:**
+- A URL fetch into a fixed remote-tracking ref with a short source name (`main:refs/remotes/mac/main`) lets prune delete that ref on each second fetch. When the source moved, that fetch fails with `cannot lock ref`.
+- `update_registration.py --production` takes the production name. A production doc path fails with "no showrunner staff row" when the staff row names another copy of the doc.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 33: every import uses the repo root. Tunables live in config and are read at use.
-
-**Acceptance gate:**
-- A test runs two syncs in a row with `fetch.prune=true` set on the test repositories, once with a new Mac commit and once with none. Both keep `refs/remotes/mac/main`. Each case fails on the old refspec.
-- The existing registration test reads `--production natedev` from config.
-- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
-- The first two hourly runs after the merge each print `synced` or `current`.
-- Change-Review: none — the vault sync already recovers each second hour; the user sees no new behavior.
+**Ruled out:**
+- A catch or default for a deleted `vault.question_production` key: the key ships in the same commit as the code that reads it.

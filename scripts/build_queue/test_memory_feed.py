@@ -1,6 +1,8 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 import json
 import os
 from dataclasses import replace
@@ -31,9 +33,9 @@ class FeedStopped(Exception):
     """The fixture stops the feed after its recorded cycles."""
 
 
-def captured_reading(*, running: tuple[gate.RunningStep, ...] = ()) -> gate.QueueRead:
-    inputs = gate.QueueInputs([], running, (), gate.HostMemory(30 * gate.GIB, 60 * gate.GIB),
-        gate.NO_PRESSURE_HOLD, gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), 200_000)
+def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ()) -> admission_records.QueueRead:
+    inputs = admission_records.QueueInputs([], running, (), admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB),
+        admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), 200_000)
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
@@ -53,27 +55,27 @@ def report_fixture(*, empty: bool = False) -> charts.PageData:
         charts.TopCosts(end - timedelta(days=3), end, 3, rows))
 
 
-def reservation_reading(*, project: str = "fixture-project") -> gate.QueueRead:
+def reservation_reading(*, project: str = "fixture-project") -> admission_records.QueueRead:
     reservation = memory_tests.ProgressKeepAsideTests.reservation("nextest")
-    memory = gate.MeasuredMemory(2 * gate.GIB, anonymous=gate.AnonymousRunUse(gate.GIB))
+    memory = admission_records.MeasuredMemory(2 * admission_records.GIB, anonymous=admission_records.AnonymousRunUse(admission_records.GIB))
     inputs = memory_tests.ProgressKeepAsideTests.inputs((reservation,), (memory,))
     inputs = replace(inputs, running=(replace(inputs.running[0], project=project),))
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
-def with_wait_reason(reading: gate.QueueRead, reason: gate.WaitReason) -> gate.QueueRead:
-    waiter = gate.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", 10,
-                              gate.GIB, reason, project="fixture-project")
+def with_wait_reason(reading: admission_records.QueueRead, reason: admission_records.WaitReason) -> admission_records.QueueRead:
+    waiter = admission_records.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", 10,
+                              admission_records.GIB, reason, project="fixture-project")
     return replace(reading, view=replace(reading.view, waiting=(waiter,)))
 
 
-def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProcess, ...] = ()) -> gate.RunningStep:
+def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProcess, ...] = ()) -> admission_records.RunningStep:
     started_at = 200_000 - minutes * 60
     activity = ScopeProcesses(len(members) or 1, "fixture", "fixture", "/fixture", "python3", started_at,
                               True, NoLiveBuildRun(), members=members)
-    memory = gate.UnownedSliceMemory(gate.GIB // 4 if small else gate.GIB,
+    memory = admission_records.UnownedSliceMemory(admission_records.GIB // 4 if small else admission_records.GIB,
         owner=f"leftover-{minutes}", activity=activity, pid=minutes)
-    return gate.RunningStep("fixture", "fixture", f"leftover-{minutes}", "/fixture", 0,
+    return admission_records.RunningStep("fixture", "fixture", f"leftover-{minutes}", "/fixture", 0,
                             memory, pid=minutes, started_at=started_at)
 
 
@@ -137,7 +139,7 @@ class MemoryFeedTests(unittest.TestCase):
                     _ = memory_feed.read_configuration(conf.read(self.configuration))
 
     def test_start_publishes_the_page_before_the_first_queue_reading(self) -> None:
-        def view() -> gate.QueueRead:
+        def view() -> admission_records.QueueRead:
             self.assertEqual((self.output / "memory_live.html").read_text(), self.expected_page())
             return captured_reading()
 
@@ -224,7 +226,7 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(time, "monotonic", side_effect=[0.0, 100.0, 301.0]),
               mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped])):
-            def view() -> gate.QueueRead:
+            def view() -> admission_records.QueueRead:
                 report_calls_per_cycle.append(provider.call_count)
                 return captured_reading()
 
@@ -292,9 +294,9 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_each_wait_state_keeps_its_reason_and_the_other_readings(self) -> None:
         reasons = (
-            (gate.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (gate.StartSpacingWait(200_010), "start spacing"),
-            (gate.BehindHead("first", 1, "head-session"), "behind"),
+            (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
+            (admission_records.StartSpacingWait(200_010), "start spacing"),
+            (admission_records.BehindHead("first", 1, "head-session"), "behind"),
         )
         for reason, expected in reasons:
             with self.subTest(reason=reason):
@@ -373,7 +375,7 @@ class MemoryFeedTests(unittest.TestCase):
                 explanation_step = replace(reading.explanation.running[0], step=step)
                 reading = replace(reading, view=replace(reading.view, running=(step,)),
                     explanation=replace(reading.explanation, running=(explanation_step,)))
-                reading = with_wait_reason(reading, gate.StartSpacingWait(110))
+                reading = with_wait_reason(reading, admission_records.StartSpacingWait(110))
                 waiter = replace(reading.view.waiting[0], project=project, folder=folder)
                 reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
                 with mock.patch.object(admission_client, "view", return_value=reading):
@@ -401,14 +403,14 @@ class MemoryFeedTests(unittest.TestCase):
     def test_the_leftover_list_uses_the_queue_rule_and_keeps_all_scope_members(self) -> None:
         ended = leftover_step(45)
         memory = ended.measured
-        assert isinstance(memory, gate.UnownedSliceMemory)
+        assert isinstance(memory, admission_records.UnownedSliceMemory)
         activity = memory.activity
         assert isinstance(activity, ScopeProcesses)
         ended = replace(ended, measured=replace(memory, activity=replace(activity, count=2,
             members=(ScopeProcess(45, "python3"), ScopeProcess(46, "helper")))))
         live = replace(ended, pid=60, measured=replace(memory,
             activity=replace(activity, run=LiveBuildRun(60, "live", 199_000))))
-        compiler = replace(ended, pid=70, measured=gate.CompilerServiceMemory(gate.GIB, pid=70))
+        compiler = replace(ended, pid=70, measured=admission_records.CompilerServiceMemory(admission_records.GIB, pid=70))
         service = replace(ended, pid=80, measured=replace(memory, job_state=IdleService()))
         reading = captured_reading(running=(ended, live, compiler, service))
         with (mock.patch.object(queue_view, "leftover_processes", wraps=queue_view.leftover_processes) as shared_rule,
@@ -423,15 +425,15 @@ class MemoryFeedTests(unittest.TestCase):
     def test_an_unavailable_cap_keeps_rows_room_and_reason(self) -> None:
         reading = reservation_reading()
         room = reading.explanation.room
-        assert isinstance(room, gate.MemoryRoom)
-        missing_run = replace(room.runs[0].memory, use=gate.RunUseUnavailable("private memory.stat is missing"))
-        for cap in (gate.CapUnavailable(()), gate.CapUnavailable((missing_run,))):
+        assert isinstance(room, admission_records.MemoryRoom)
+        missing_run = replace(room.runs[0].memory, use=admission_records.RunUseUnavailable("private memory.stat is missing"))
+        for cap in (admission_records.CapUnavailable(()), admission_records.CapUnavailable((missing_run,))):
             with self.subTest(cap=cap):
                 changed = replace(reading, explanation=replace(reading.explanation, room=replace(room, cap=cap)))
                 with mock.patch.object(admission_client, "view", return_value=changed):
                     page = memory_feed.reading()
-                self.assertIsInstance(page["cap"], gate.CapUnavailable)
-                self.assertEqual(page["room"], room.room / gate.GIB)
+                self.assertIsInstance(page["cap"], admission_records.CapUnavailable)
+                self.assertEqual(page["room"], room.room / admission_records.GIB)
                 self.assertTrue(page["walk"])
                 self.assertIn("unavailable", page["cap_text"])
                 if cap.runs:
@@ -440,10 +442,10 @@ class MemoryFeedTests(unittest.TestCase):
     def test_an_unavailable_run_use_keeps_its_named_reason(self) -> None:
         reading = reservation_reading()
         room = reading.explanation.room
-        assert isinstance(room, gate.MemoryRoom)
-        missing = gate.RunUseUnavailable("private memory.stat is missing")
+        assert isinstance(room, admission_records.MemoryRoom)
+        missing = admission_records.RunUseUnavailable("private memory.stat is missing")
         run = replace(room.runs[0], memory=replace(room.runs[0].memory, use=missing))
-        room = replace(room, runs=(run,), cap=gate.CapUnavailable((run.memory,)))
+        room = replace(room, runs=(run,), cap=admission_records.CapUnavailable((run.memory,)))
         reading = replace(reading, explanation=replace(reading.explanation, room=room))
         with mock.patch.object(admission_client, "view", return_value=reading):
             page = memory_feed.reading()
@@ -484,7 +486,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):
             payload = memory_feed.reading()
-        payload["cap"] = gate.CapUnavailable(())
+        payload["cap"] = admission_records.CapUnavailable(())
         page = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
         self.assertEqual(page["cap"], {"kind": "CapUnavailable", "runs": []})
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
@@ -506,29 +508,29 @@ def write_browser_fixture(folder: Path) -> None:
         inputs = base.explanation.decided_from
         live = leftover_step(30)
         memory = live.measured
-        assert isinstance(memory, gate.UnownedSliceMemory)
+        assert isinstance(memory, admission_records.UnownedSliceMemory)
         activity = memory.activity
         assert isinstance(activity, ScopeProcesses)
         live = replace(live, pid=70, measured=replace(memory,
             activity=replace(activity, run=LiveBuildRun(70, "live", 199_000))))
-        compiler = replace(live, pid=80, measured=gate.CompilerServiceMemory(gate.GIB, pid=80))
+        compiler = replace(live, pid=80, measured=admission_records.CompilerServiceMemory(admission_records.GIB, pid=80))
         inputs = replace(inputs, now=200_000, running=(*inputs.running, leftover_step(45,
             members=(ScopeProcess(45, "python3"), ScopeProcess(46, "helper"))),
             leftover_step(19 * 60, small=True), leftover_step(2 * 24 * 60, small=True), live, compiler))
         base = gate.queue_read_from(inputs, admission_policy_fixture())
-        readings: dict[str, gate.QueueRead] = {"good": base}
+        readings: dict[str, admission_records.QueueRead] = {"good": base}
         for name, reason in (
-            ("pressure", gate.PressureUnavailable("cannot read /private/proc/pressure/memory")),
-            ("spacing", gate.StartSpacingWait(110)),
-            ("head", gate.BehindHead("first", 1, "head-session")),
+            ("pressure", admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory")),
+            ("spacing", admission_records.StartSpacingWait(110)),
+            ("head", admission_records.BehindHead("first", 1, "head-session")),
         ):
             readings[name] = with_wait_reason(base, reason)
         room = base.explanation.room
-        assert isinstance(room, gate.MemoryRoom)
-        missing = replace(room.runs[0].memory, use=gate.RunUseUnavailable("private memory.stat is missing"))
-        for name, cap in (("old_cap", gate.CapUnavailable(())), ("missing_cap", gate.CapUnavailable((missing,)))):
+        assert isinstance(room, admission_records.MemoryRoom)
+        missing = replace(room.runs[0].memory, use=admission_records.RunUseUnavailable("private memory.stat is missing"))
+        for name, cap in (("old_cap", admission_records.CapUnavailable(())), ("missing_cap", admission_records.CapUnavailable((missing,)))):
             readings[name] = replace(base, explanation=replace(base.explanation, room=replace(room, cap=cap)))
-        missing_room = replace(room, cap=gate.CapUnavailable((missing,)),
+        missing_room = replace(room, cap=admission_records.CapUnavailable((missing,)),
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}

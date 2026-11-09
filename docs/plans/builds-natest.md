@@ -1943,39 +1943,93 @@ Each stop sends sdlc one message through `session_send.send_argv`, after the res
 ### Phase 96 — A changed config file selects the tests that read it  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** builds showrunner order, 2026-11-08 15:3x EST: "A config file change selects no test module… Fix it in affected_modules.py… One way only; no hard-coded map." Design sent in one line and approved as sent. The notice must give the selection time of a full-tree parse with a cold cache and with a warm cache.
+A changed `config/<name>.conf` selects every test module whose transitive import closure reaches a source that reads `<name>`. There is no hand map. Full-tree selection takes 22.98 s with an empty fact cache and 0.39 s with a warm cache.
 
-**Goal:** a commit that changes `config/<name>.conf` makes the targeted test and the merge gate select every test module whose import closure reaches a source that reads `<name>`, with no hand map.
-
-**Spec:**
-1. In `scripts/production/affected_modules.py`, extend `SourceFacts` with the config names a source reads, found from the AST: a call `conf.<fn>("<name>")` on a name bound to the conf module (`import conf`, `from scripts.lib import conf`, `import scripts.lib.conf as …`), or a call to a function imported from `scripts.lib.conf`, whose first argument is a string literal. Strip a `.conf` suffix and any folder from the literal. Bump `EXTRACTOR_VERSION`.
-2. A source that names `<name>.conf` in a string token also reads `<name>` (the existing `PATH_TOKEN` facts give these).
-3. Parse every tracked `.py` source, not only test modules. Keep the blob-keyed fact cache, and retain the facts of every parsed blob, so a warm cache parses only changed blobs.
-4. Build the transitive import closure of each test module from the existing import resolution (`module_dependencies`, bare modules, relative imports). A changed `config/<name>.conf` selects a test module when the module or any source in its closure reads `<name>`.
-5. Keep every other selection rule unchanged: a changed `.py` file still selects only through direct imports, tokens and the same folder.
-6. `test_configuration_names_without_complete_paths_select_no_modules` checks the old behavior that this order replaces. Change its expected value to the selection of `test_limits.py`, and rename it for the new behavior. Change no other assertion.
-7. Add test rows in `test_affected_modules.py` with temporary repositories only: a reader two imports away from the test; a `from scripts.lib.conf import read` reader; a `<name>.conf` path token; an unrelated config change that selects nothing; a warm cache that parses no unchanged blob. Each row fails without the change.
-8. Measure the selection time on a full copy of this repository: one run with an empty fact cache and one with a warm cache. Report both in the summary.
-9. Add no guard, refusal or check (user rule, 2026-11-05).
+- A source reads `<name>` through an AST call `conf.<fn>("<name>")` on the conf module (`import conf`, `from scripts.lib import conf`, `import scripts.lib.conf [as x]`), through a call to a function imported from `scripts.lib.conf` with a string-literal first argument, or through a `<name>.conf` path token. The read is the literal's file name with `.conf` removed.
+- `SourceFacts` carries `config_reads` and `syntax` (`ValidPython` | `InvalidPython(message)`). `SourceGraph(imports, tokens, config_reads)` is the parsed graph; `transitive_config_reads` carries reads back through importers. `EXTRACTOR_VERSION` is 6.
+- Every tracked source is parsed and its facts are cached by blob (`source_blobs`), so a warm cache parses only changed blobs.
+- A changed `.py` file still selects only through direct imports, tokens and the same folder.
 
 **Files:**
-- `scripts/production/affected_modules.py`
-- `scripts/production/test_affected_modules.py`
+- `scripts/production/affected_modules.py` — selection, fact extraction and the blob fact cache
+- `scripts/production/test_affected_modules.py` — selection tests, with rows for a two-hop reader, a function import, a path token, an unrelated config and a warm cache
 
-**Workers:** 1 writer; the module and its test file do not split
-- `impl` — `affected_modules.py`, `test_affected_modules.py`
+**Gotchas:**
+- A syntax error in a non-test source does not raise. Only an invalid test module raises `SyntaxError`.
+- `config/postmaster.conf` selects 574 of 738 modules: 572 reach `send_budget.py` and 570 reach `codex_mesh.py` (for example `test_add_unit.py` -> `accounts.py` -> `codex_mesh.py` -> `send_budget.py`). Only the targeted test widens; merge gates run all modules.
+
+**Ruled out:**
+- A narrower closure: the wide selection follows the approved design.
+
+### Phase 97 — The remote copies review test uses half its CPU again  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the backlog rank rule (next items, item 2). On 2026-11-08 22:48 EST, `copies/test_review_remote_copies.py` is the highest module by median CPU that no phase holds and that has no floor: 65.9 CPU s per gate, 29 tests. Phase 69 cut it from 350.0 to 120.2 CPU s in `/dev/shm` pairs and reached its target with no floor.
+
+**Goal:** `scripts/copies/test_review_remote_copies.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:**
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Start with the slowest test: `RemoteEntryTests.test_repeated_receive_keeps_registered_owner_after_each_recovery_interruption` (16.1 s in the last gate).
+3. Write a behavior map with a row for each assertion before you change a test.
+4. Read the importers of a changed fixture before you change it. Every importer stays green.
+5. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/copies/test_review_remote_copies.py`
+- `scripts/copies/remote_test_support.py`
+
+**Workers:** 1 writer; one test file and its fixture do not split
+- `impl` — `test_review_remote_copies.py`, hub: `remote_test_support.py`
 
 **Constraints from prior phases:**
-- `select_affected` is called by `merge_gate.py` and `aws_target/cloud_gate.py`; `test_targeted_test.py` and `test_merge_gate_ledger.py` import its types. Every importer stays green.
-- Example chain: `config/postmaster.conf` → `scripts/message/send_budget.py` (`conf.read("postmaster")`) → its importers → `buildlog/test_rust_release.py`.
+- Phase 69: each test class copies one immutable Git seed with `ImmutableGitSeed.copy_to`. `warm_claim_servers()` runs a warm fork `ClaimServer` over the real `floor_claims` source and entry points. `seed_interpreter_cache` replaces repeated interpreter probes. The threaded cancellation test keeps fresh subprocesses, and the real slot shell stays.
+- Phase 69: warm fork children keep the `module_run` command name until an exec, so a command table credits their CPU to it. Attribute CPU by test, not only by command name.
+- `remote_test_support.py` is also imported by `scripts/production/test_tidy_wrapped.py` and `scripts/shutdown/test_shutdown_cli.py`.
+- Phase 69 pairs ran on `/dev/shm`. State the filesystem basis of each pair.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- The new rows in `test_affected_modules.py` pass and fail without the change.
-- A changed `config/postmaster.conf` on a copy of this repository selects `buildlog/test_rust_release.py`.
-- Cold-cache and warm-cache selection times on the full tree, in the checkpoint notice.
-- `test_affected_modules.py`, `test_targeted_test.py`, `test_merge_gate_ledger.py`, `aws_target/test_cloud_gate.py` pass.
+- The behavior map has a row for each assertion. No assertion is removed.
+- CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed file and every importer of a changed fixture pass.
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 98 — The merge gate resources test never waits out its hang guard  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** builds showrunner order, 2026-11-08 23:xx EST, ranked after Phase 97. `production/test_merge_gate_suites_resources.py` took 617.75 s, 618.31 s and 625 s on three of 29 cloud gates that day; in 25 other gates it took 17-26 s. Each case passed. The extra 600 s equals `TEST_HANG_GUARD_SECS` (`scripts/lib/test_hang_guard.py`), and the box CPU was idle.
+
+**Goal:** no test in `scripts/production/test_merge_gate_suites_resources.py` waits out its hang guard; the cause of the long wait is found and fixed where it lives.
+
+**Spec:**
+1. The gate record names the slow test: `MergeGateResourcesTests.test_stop_during_a_blocking_read_returns_every_owned_slot`, 600.022 s in the last run (`show.py top`). Confirm it, and check the `waiting` / `released` waits near lines 140-200 as well.
+2. Reproduce the long wait before you change code. Run the test many times, alone and under CPU load, and record how often it waits.
+3. Find the cause. One lead to test, not a fact: the stop thread calls `os.kill(os.getpid(), signal.SIGTERM)` while the main thread blocks in `os.read`. If the kernel gives the signal to a thread other than the main thread, the main thread's read is not interrupted.
+4. Fix the cause where it lives. A defect in `scripts/production/merge_gate.py` is fixed there; send the director its evidence first, because another unit owns that file.
+5. Keep every assertion. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/production/test_merge_gate_suites_resources.py`
+- `scripts/production/merge_gate.py`
+
+**Workers:** 1 writer; the test and its cause do not split
+- `impl` — `test_merge_gate_suites_resources.py`, `merge_gate.py`
+
+**Constraints from prior phases:**
+- `TEST_HANG_GUARD_SECS` is 600 s; a test that waits on it still passes, so the gate reports no failure.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The repeat count and the long-wait count before and after the fix, alone and under load, in the checkpoint notice. After the fix, no run waits on the hang guard.
+- `test_merge_gate_suites_resources.py` and every importer of a changed file pass.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.build_queue import admission_protocol as wire
 from scripts.lint import memory_admit as gate
@@ -183,8 +185,8 @@ class BrpLaunchGateTests(unittest.TestCase):
             busy = only_admitted(self.admission.server.handle_request(
                 self.admission.request(run=self.admission.run_owner())))
             self.admission.allow_next_start()
-        self.admission.free(4 * gate.GIB)
-        self.admission.compiler(8 * gate.GIB)
+        self.admission.free(4 * admission_records.GIB)
+        self.admission.compiler(8 * admission_records.GIB)
         self.environment.update(BUILDLOG_MEM_WAIT_LIMIT_S="0",
             BUILDLOG_MEM_WAIT_SINCE=str(self.admission.clock.now() - admission_policy_fixture().timing.estimate_refresh_seconds - 1))
         result = self.run_hook()
@@ -253,7 +255,7 @@ class BrpLaunchGateTests(unittest.TestCase):
         def free_after_wait(reply: wire.Reply) -> wire.Reply:
             if isinstance(reply, wire.Wait):
                 _ = states.write_text(str(self.entry()["state"]) + "\n")
-                self.admission.free(60 * gate.GIB)
+                self.admission.free(60 * admission_records.GIB)
             return reply
 
         self.admission.server.reply_filter = free_after_wait

@@ -1,6 +1,8 @@
 """Caller fixtures skip idle spacing without changing time or live caller admission."""
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
+
 from dataclasses import replace
 import tempfile
 import time
@@ -20,7 +22,7 @@ def released_spacing(fixture: AdmissionFixture) -> float:
         fixture.request(need=GIB, owner=fixture.fixture_owner(1001, "first"))))
     fixture.release(grant)
     spacing = fixture.server.spacing
-    assert isinstance(spacing, gate.NextStartAt)
+    assert isinstance(spacing, admission_records.NextStartAt)
     return spacing.at
 
 
@@ -41,9 +43,9 @@ class CallerAdmissionClockTests(unittest.TestCase):
     def assert_spacing_wait(self, reply: wire.Reply, deadline: float) -> None:
         self.assertIsInstance(reply, wire.Wait)
         assert isinstance(reply, wire.Wait)
-        self.assertIsInstance(reply.reason, gate.HeadAdmissionStatus)
-        assert isinstance(reply.reason, gate.HeadAdmissionStatus)
-        self.assertEqual(reply.reason.cause, gate.StartSpacingWait(deadline))
+        self.assertIsInstance(reply.reason, admission_records.HeadAdmissionStatus)
+        assert isinstance(reply.reason, admission_records.HeadAdmissionStatus)
+        self.assertEqual(reply.reason.cause, admission_records.StartSpacingWait(deadline))
 
     def test_idle_admit_skips_spacing_without_moving_the_clock(self) -> None:
         fixture = self.fixture()
@@ -55,7 +57,7 @@ class CallerAdmissionClockTests(unittest.TestCase):
             reply, = fixture.server.handle_request(request)
             self.assertIsInstance(reply, wire.Admitted)
             self.assertEqual(fixture.clock.now(), before)
-            self.assertEqual(fixture.server.spacing, gate.NextStartAt(deadline))
+            self.assertEqual(fixture.server.spacing, admission_records.NextStartAt(deadline))
             self.assertEqual(service.read_state(fixture.state_dir).spacing, fixture.server.spacing)
 
     def test_idle_launch_skips_spacing_without_moving_the_clock(self) -> None:
@@ -69,7 +71,7 @@ class CallerAdmissionClockTests(unittest.TestCase):
             reply, = fixture.server.handle_request(launch)
             self.assertIsInstance(reply, wire.LaunchAdmitted)
             self.assertEqual(fixture.clock.now(), before)
-            self.assertEqual(fixture.server.spacing, gate.NextStartAt(deadline))
+            self.assertEqual(fixture.server.spacing, admission_records.NextStartAt(deadline))
 
     def test_a_live_reservation_keeps_the_spacing(self) -> None:
         fixture = self.fixture()
@@ -77,7 +79,7 @@ class CallerAdmissionClockTests(unittest.TestCase):
             first = fixture.request(need=GIB, owner=fixture.fixture_owner(1001, "first"))
             _ = only_admitted(fixture.server.handle_request(first))
             spacing = fixture.server.spacing
-            assert isinstance(spacing, gate.NextStartAt)
+            assert isinstance(spacing, admission_records.NextStartAt)
             second = fixture.request(need=GIB, owner=fixture.fixture_owner(1002, "second"))
             reply, = fixture.server.handle_request(second)
             self.assert_spacing_wait(reply, spacing.at)
@@ -92,11 +94,11 @@ class CallerAdmissionClockTests(unittest.TestCase):
             first = fixture.request(need=GIB, owner=fixture.fixture_owner(1001, "first"))
             self.assertIsInstance(fixture.server.handle_request(first)[0], wire.Wait)
             deadline = fixture.clock.now() + 60
-            fixture.server.spacing = gate.NextStartAt(deadline)
+            fixture.server.spacing = admission_records.NextStartAt(deadline)
             second = fixture.request(need=GIB, owner=fixture.fixture_owner(1002, "second"))
             self.assertIsInstance(fixture.server.handle_request(second)[0], wire.Wait)
             self.assertLess(fixture.clock.now(), deadline)
-            self.assertEqual(fixture.server.spacing, gate.NextStartAt(deadline))
+            self.assertEqual(fixture.server.spacing, admission_records.NextStartAt(deadline))
             self.assertIn(first.episode, fixture.server.waiters)
             self.assertIn(second.episode, fixture.server.waiters)
 
@@ -113,7 +115,7 @@ class CallerAdmissionClockTests(unittest.TestCase):
             self.assertTrue(gate.slot_in_force(slot, fixture.clock.now()))
             self.assertFalse(fixture.caller_reservations())
             spacing = fixture.server.spacing
-            assert isinstance(spacing, gate.NextStartAt)
+            assert isinstance(spacing, admission_records.NextStartAt)
             reply, = fixture.server.handle_request(fixture.request(
                 need=GIB, owner=fixture.fixture_owner(1002, "second")))
             self.assert_spacing_wait(reply, spacing.at)
@@ -125,7 +127,7 @@ class CallerAdmissionClockTests(unittest.TestCase):
         with fixture.loop_turn():
             scenery = fixture.occupy_host()
             before = fixture.clock.now()
-            fixture.server.spacing = gate.NextStartAt(before + 60)
+            fixture.server.spacing = admission_records.NextStartAt(before + 60)
             reply = only_admitted(fixture.server.handle_request(fixture.request(
                 need=GIB, owner=fixture.fixture_owner(1001, "first"))))
             self.assertEqual(fixture.clock.now(), before)
@@ -182,13 +184,13 @@ class CallerAdmissionClockTests(unittest.TestCase):
                                   profile=replace(request.profile, estimated_at=time.time()))
                 grant = only_admitted(fixture.server.handle_request(request))
                 fixture.release(grant)
-                self.assertEqual(fixture.server.spacing, gate.NextStartAt(started + 5))
+                self.assertEqual(fixture.server.spacing, admission_records.NextStartAt(started + 5))
                 self.assertEqual(service.read_state(fixture.state_dir).spacing, fixture.server.spacing)
             self.assertLess(fixture.clock.now() - started, time.monotonic() - real_started + 5)
             fixture.advance_idle_spacing()
-            self.assertEqual(fixture.server.spacing, gate.ReadyToStart())
+            self.assertEqual(fixture.server.spacing, admission_records.ReadyToStart())
             _ = fixture.run_pass()
-            self.assertEqual(service.read_state(fixture.state_dir).spacing, gate.ReadyToStart())
+            self.assertEqual(service.read_state(fixture.state_dir).spacing, admission_records.ReadyToStart())
 
     def test_reusing_a_caller_keeps_the_opt_out_in_both_orders(self) -> None:
         for first_skip in (True, False):
