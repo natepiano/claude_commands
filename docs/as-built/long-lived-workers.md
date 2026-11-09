@@ -69,6 +69,8 @@ Its slot is `NewWorkerSlot` or `ExistingWorkerSlot(row)`.
 Only publication permits dispatch success.
 `assign.py` completes admission before it records the implementation pass.
 A publication failure cleans up the backend that this attempt created and reports its native id.
+For pane workers, a failed admission closes only a new pane that this call created.
+For an existing pane, the launcher quits its own agent and keeps the shell.
 
 A new slot takes the parent/name lock before it takes the row lock.
 An existing slot takes the row lock.

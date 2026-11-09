@@ -236,7 +236,7 @@ def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCo
     if isinstance(result, worker_panes.IncompleteStart):
         print(f"{name.value}: incomplete startup: {result.reason}", file=sys.stderr)
     elif isinstance(result, worker_panes.UnpublishedWorker):
-        print(f"{name.value}: publication failed: {result.cause}; pane {result.pane} retained", file=sys.stderr)
+        print(f"{name.value}: publication failed: {result.cause}; {worker_panes.unpublished_cleanup_text(result)}", file=sys.stderr)
     # The shared scan already reports unknown and structural evidence.
     return ExitCode.UNCERTAIN
 

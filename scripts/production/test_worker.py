@@ -1384,14 +1384,33 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(self.agent.waited, [])
                 self.assertEqual(len(self.agent.submitted), 2 if closed else 1)
 
-    def test_incomplete_start_keeps_its_pane_and_records_no_pass(self) -> None:
+    def test_unpublished_start_closes_its_pane_and_records_no_pass(self) -> None:
         self.fixture.world.outcome = herdr.PromptNotSubmitted("startup hook failed")
         self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(len(self.fixture.world.launches), 1)
         self.assertEqual(json.loads((self.run_dir / "progress_history_state.json").read_text())["pass"], {})
 
-    def test_publication_failure_retains_the_backend_without_delivery(self) -> None:
+    def test_publication_failure_reports_that_its_new_pane_was_closed(self) -> None:
+        with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
+        self.assertIn("pane w1:p1 closed", errors.getvalue())
+        self.assertNotIn("retained", errors.getvalue())
+        self.assertEqual(self.fixture.world.closed, [("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(self.agent.submitted, [])
+
+    def test_publication_failure_reports_that_its_new_pane_close_failed(self) -> None:
+        with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
+              patch.object(self.fixture.world, "close_pane", return_value=False),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
+        self.assertIn("pane w1:p1 close failed", errors.getvalue())
+        self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
+        self.assertIn("w1:p1", self.fixture.world.locations)
+        self.assertEqual(self.agent.submitted, [])
+
+    def test_publication_failure_closes_the_backend_without_delivery(self) -> None:
         publish = staff.ensure_worker
         def failed(identity: staff.StaffId, name: str, parent: staff.StaffId) -> staff.StaffRow:
             del identity, name, parent
@@ -1403,7 +1422,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), 1)
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.fixture.parent.id), [])
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
-        self.assertEqual(len(self.fixture.world.launches), 1)
+        self.assertEqual(len(self.fixture.world.launches), 2)
         self.assertEqual(len(self.agent.submitted), 1)
 
     def test_admission_failure_has_the_exact_worker_refusal(self) -> None:
@@ -1433,10 +1452,11 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         self.fixture.dispatch(opened.row, "impl")
         before = self.fixture.staff_state()
-        with redirect_stderr(io.StringIO()) as errors:
+        with (patch("scripts.agents.mesh_runs.live_runs", return_value=[object()]),
+              redirect_stderr(io.StringIO()) as errors):
             code = self.dispatch(role="review")
         self.assertEqual(int(code), 2)
-        self.assertEqual(errors.getvalue(), "role change blocked by active work: active dispatch has another role\n")
+        self.assertEqual(errors.getvalue(), "role change blocked by active work: a detached run is live\n")
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(self.fixture.staff_state(), before)
 

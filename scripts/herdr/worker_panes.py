@@ -8,6 +8,7 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ import sys
 import time
 from threading import Event
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from functools import partial
@@ -130,10 +131,19 @@ class IncompleteStart:
     reason: str
 
 
+class UnpublishedCleanup(Enum):
+    NOT_STARTED = "pane {pane} retained; this call did not start it"
+    PANE_CLOSED = "pane {pane} closed"
+    PANE_CLOSE_FAILED = "pane {pane} close failed"
+    AGENT_STOPPED = "agent stopped; existing pane {pane} retained at its shell"
+    AGENT_STOP_FAILED = "agent stop failed; existing pane {pane} retained"
+
+
 @dataclass(frozen=True)
 class UnpublishedWorker:
     pane: str
     cause: str
+    cleanup: UnpublishedCleanup = UnpublishedCleanup.NOT_STARTED
 
 
 class StartRefusal(Enum):
@@ -569,9 +579,30 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
     return CloseAllowed()
 
 
-def _idle_checks(row: staff.StaffRow, run: Path,
-                 lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE, *,
-                 closing_turn: bool = False) -> CloseAllowed | Kept:
+@dataclass(frozen=True)
+class DispatchHoldsWorker:
+    blocker: str
+
+
+@dataclass(frozen=True)
+class CompletedWorkerPass:
+    dispatch_id: str
+
+
+class ReleasedWorkerPass(Enum):
+    NO_PROMPT_DELIVERED = "no prompt was delivered"
+    ENDED = "the pass ended"
+    STALE_ACTIVE = "the launcher ended without finishing the pass"
+
+
+WorkerDispatchState = DispatchHoldsWorker | CompletedWorkerPass | ReleasedWorkerPass
+
+
+def worker_dispatch_state(row: staff.StaffRow, run: Path,
+                          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> WorkerDispatchState:
+    """Classify the pass through its status, dispatch locks, and detached runs."""
+    from scripts.direct import progress_history
+
     if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
         path = _worker_lock_path(row.id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -579,7 +610,7 @@ def _idle_checks(row: staff.StaffRow, run: Path,
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return Kept("dispatch lock is held")
+                return DispatchHoldsWorker("dispatch lock is held")
     legacy = (*run.glob("dispatch.lock"), *(run / "phases").glob("*/dispatch.lock"))
     if legacy and unit_runs.worker_transport(run) == "mesh":
         for path in legacy:
@@ -587,14 +618,34 @@ def _idle_checks(row: staff.StaffRow, run: Path,
                 try:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
-                    return Kept("dispatch lock is held")
-    passed = worker_pass(row, run)
-    if not closing_turn and passed.get("status") in ("active", "refused"):
-        return Kept("launcher has not recorded a completed pass")
+                    return DispatchHoldsWorker("dispatch lock is held")
     live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.mesh_runs").live_runs)
     if live_runs(run / "mesh_runs", row.name):
-        return Kept("a detached run is live")
-    return CloseAllowed()
+        return DispatchHoldsWorker("a detached run is live")
+    passed = worker_pass(row, run)
+    if passed:
+        status, dispatch = passed.get("status"), passed.get("instance_id")
+    else:
+        latest = progress_history.last_dispatch(row.id)
+        if (not isinstance(latest, progress_history.RecordedDispatch)
+                or latest.status is progress_history.DispatchDetailNotRecorded.UNRECORDED):
+            return ReleasedWorkerPass.NO_PROMPT_DELIVERED
+        status, dispatch = latest.status, latest.instance_id
+    if status == "completed":
+        return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
+    if status == "active":
+        return ReleasedWorkerPass.STALE_ACTIVE
+    if status in ("", "error", "refused"):
+        return ReleasedWorkerPass.NO_PROMPT_DELIVERED
+    if status in ("canceled", "interrupted"):
+        return ReleasedWorkerPass.ENDED
+    return DispatchHoldsWorker("launcher has not recorded a completed pass")
+
+
+def _idle_checks(row: staff.StaffRow, run: Path,
+                 lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+    state = worker_dispatch_state(row, run, lock)
+    return Kept(state.blocker) if isinstance(state, DispatchHoldsWorker) else CloseAllowed()
 
 
 def stage_two_completion_id(dispatch_id: str) -> str:
@@ -605,8 +656,6 @@ def stage_two_completion_id(dispatch_id: str) -> str:
 def can_close(worker: OpenWorker | StoppedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
               lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
-    from scripts.direct import progress_history
-
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
@@ -616,19 +665,12 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
         return _idle_checks(worker.row, directory, lock)
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
-    passed = worker_pass(worker.row, directory)
-    if passed:
-        status, dispatch = passed.get("status"), passed.get("instance_id")
-    else:
-        latest = progress_history.last_dispatch(worker.row.id)
-        status, dispatch = ((latest.status, latest.instance_id)
-                            if isinstance(latest, progress_history.RecordedDispatch) else ("", ""))
-    if status not in ("canceled", "interrupted", "completed", "active"):
-        return Kept("launcher has not recorded a completed pass")
-    completion = CloseAllowed() if status in ("canceled", "interrupted") else _completed_turn(worker.row, dispatch)
-    if isinstance(completion, Kept):
-        return completion
-    return _idle_checks(worker.row, directory, lock, closing_turn=status == "active")
+    state = worker_dispatch_state(worker.row, directory, lock)
+    if isinstance(state, DispatchHoldsWorker):
+        return Kept(state.blocker)
+    if isinstance(state, CompletedWorkerPass):
+        return _completed_turn(worker.row, state.dispatch_id)
+    return CloseAllowed()
 
 
 def launch_policy(role: WorkerRole) -> LaunchPolicy:
@@ -802,7 +844,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
         return AdmissionRefused("only a unit or showrunner can admit a worker")
     existing = worker_admission.find_worker(record, parent, name.value)
     run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
-    if existing is not None and worker_pass(existing, run).get("status") not in ("active", "refused"):
+    if existing is not None and not isinstance(worker_dispatch_state(existing, run, lock), DispatchHoldsWorker):
         run = worker_run(owner, record=record, scanned=runs)
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
@@ -840,19 +882,58 @@ def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
             continue
         remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
         if isinstance(client.wait_turn_end(pane, remaining_ms), herdr.WaitTimedOut):
-            raise herdr.HerdrFailure("first turn timed out; pane retained")
+            raise herdr.HerdrFailure("first turn timed out")
         return session
-    raise herdr.HerdrFailure(f"{failure}; pane retained")
+    raise herdr.HerdrFailure(failure)
 
 
 def _codex_start_session(client: herdr.Herdr, pane: str, *,
                          pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> str:
     row = client.pane_row(pane) if isinstance(pane_row, herdr.PaneNotRead) else pane_row
     if isinstance(row, herdr.NoPane):
-        raise herdr.HerdrFailure("Codex pane is missing; pane retained")
+        raise herdr.HerdrFailure("Codex pane is missing")
     if row.get("session_id"):
         return client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=row)
     return first_turn_session(client, pane, str(row.get("terminal_id", "")))
+
+
+
+def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
+    return result.cleanup.value.format(pane=result.pane)
+
+
+def _unpublished_start(client: herdr.Herdr, destination: herdr.SplitPane | herdr.ExistingPane,
+                       launched: herdr.AgentLaunched, kind: str, cause: str,
+                       native: herdr.ReportedAgentSession | herdr.NoReportedAgentSession,
+                       timeout: float) -> UnpublishedWorker | IncompleteStart:
+    existing = isinstance(destination, herdr.ExistingPane)
+    outcome = UnpublishedCleanup.AGENT_STOP_FAILED if existing else UnpublishedCleanup.PANE_CLOSE_FAILED
+    failure = "closure was not confirmed"
+    with redirect_stderr(io.StringIO()) as errors:
+        try:
+            if isinstance(native, herdr.ReportedAgentSession):
+                admitted = staff.initial_snapshot().by_current_session(native.session_id)
+                if admitted is not None:
+                    return IncompleteStart(admitted, launched.pane, cause)
+            if isinstance(destination, herdr.ExistingPane):
+                target = native.session_id if isinstance(native, herdr.ReportedAgentSession) else ""
+                client.quit_agent(launched.pane, destination.terminal, target, timeout)
+                outcome = UnpublishedCleanup.AGENT_STOPPED
+            else:
+                observed = client.startup_processes(launched.pane, kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+                process = (observed.activity.identities[0]
+                           if isinstance(observed.activity, herdr.AgentProcessPresent) and observed.activity.identities else "")
+                # The close guard accepts a process identity before a session id exists.
+                close_pane = cast(Callable[..., bool], client.close_pane)
+                if close_pane(launched.pane, target=process):
+                    outcome = UnpublishedCleanup.PANE_CLOSED
+        except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = str(error)
+    if outcome in (UnpublishedCleanup.PANE_CLOSE_FAILED, UnpublishedCleanup.AGENT_STOP_FAILED):
+        detail = " ".join((errors.getvalue() or failure).split())
+        action = "agent stop" if existing else "pane close"
+        print(f"anomaly: {launched.pane}: {action} failed: {detail}", file=sys.stderr)
+    return UnpublishedWorker(launched.pane, cause, outcome)
 
 
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
@@ -914,10 +995,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 return _uncertain(row, "retained launch proof is incomplete")
     if isinstance(current, OpenWorker):
         passed = worker_pass(current.row, allowed.run)
-        if passed.get("status") in ("active", "refused") and passed.get("kind") != role:
-            if (passed.get("status") != "active" or not current.status.idle
-                    or isinstance(_completed_turn(current.row, passed.get("instance_id")), Kept)):
-                return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "active dispatch has another role")
+        dispatch = worker_dispatch_state(current.row, worker_run(current.row, record=record), lock)
+        if passed.get("kind") != role and isinstance(dispatch, DispatchHoldsWorker):
+            return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, dispatch.blocker)
         matches = _live_policy(current, policy, client, same_role=passed.get("kind") == role)
         if isinstance(matches, UncertainWorker):
             return matches
@@ -963,7 +1043,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     if isinstance(destination, (StartRefused, UncertainWorker)):
         return destination
-    prepared = herdr.WorkerPaneEnvironment(prepared.directory, prepared.env, prepared.unset_environment)
     if isinstance(destination, herdr.ExistingPane):
         panes = client.panes()
         if sum(pane.get("terminal_id") == destination.terminal for pane in panes) != 1:
@@ -972,6 +1051,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return _uncertain(row or owner, "terminal moved before start")
         if not isinstance(client.pane_activity(destination.pane), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
+    else:
+        prepared = herdr.WorkerPaneEnvironment(prepared.directory, prepared.env, prepared.unset_environment)
     try:
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
         launched = launch(client.session, destination, prepared, policy.settings.kind,
@@ -979,13 +1060,16 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
+    launch_identity: herdr.ReportedAgentSession | herdr.NoReportedAgentSession = herdr.NoReportedAgentSession()
     try:
         if row is None and policy.settings.kind == "codex":
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-                return UnpublishedWorker(launched.pane, launched.outcome.reason)
+                return _unpublished_start(client, destination, launched, policy.settings.kind,
+                                          launched.outcome.reason, launch_identity, start_seconds)
             identity = _codex_start_session(client, launched.pane)
         else:
             identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        launch_identity = herdr.ReportedAgentSession(identity)
         if row is not None and identity != row.current_session:
             return _uncertain(row, "launch proves another native session; pane retained")
         if row is None:
@@ -993,7 +1077,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             lock.bind(row)
     except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return (_uncertain(row, f"launch proof is incomplete: {error}") if row is not None
-                else UnpublishedWorker(launched.pane, str(error)))
+                else _unpublished_start(client, destination, launched, policy.settings.kind,
+                                        str(error), launch_identity, start_seconds))
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason)
     fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
@@ -1080,8 +1165,7 @@ def close(parent: StaffId, name: WorkerName, *,
                 _layout(parent, evidence)
                 return Closed()
             owner = record.parent_of(row)
-            closable = (_idle_checks(row, run.directory if isinstance(run, DispatchRun) else worker_run(row, record=record), held,
-                                     closing_turn=interrupt or recovered)
+            closable = (_idle_checks(row, run.directory if isinstance(run, DispatchRun) else worker_run(row, record=record), held)
                         if (interrupt or recovered or isinstance(observed, ProcessUnknownWorker)) and owner is not None
                         else can_close(observed, run=run, lock=held) if isinstance(observed, (OpenWorker, StoppedWorker))
                         else Kept("worker parent is unavailable"))
@@ -1152,7 +1236,7 @@ def _result(result: WorkerStart | Closed | Kept) -> ExitCode:
         return ExitCode.KEPT
     if isinstance(result, (UncertainWorker, ProcessUnknownWorker, IncompleteStart, UnpublishedWorker)):
         if isinstance(result, UnpublishedWorker):
-            print(f"{result.pane}: {result.cause}; retain the pane and retry", file=sys.stderr)
+            print(f"{result.cause}; {unpublished_cleanup_text(result)}", file=sys.stderr)
         elif isinstance(result, IncompleteStart):
             print(f"{result.row.name}: {result.reason}; retain the pane and retry", file=sys.stderr)
         return ExitCode.UNCERTAIN

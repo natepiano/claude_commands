@@ -218,6 +218,16 @@ class PaneWorld(herdr.Herdr):
         return herdr.PaneRunning((process[1],))
 
     @override
+    def startup_processes(self, pane: str, kind: str, timeout: float) -> herdr.PaneStartupObservation:
+        del kind, timeout
+        if pane not in self.locations:
+            raise herdr.HerdrFailure("fixture pane is absent", "pane_not_found")
+        process = self.foreground.get(pane)
+        activity = (herdr.AgentProcessPresent((herdr.AgentProcessIdentity(process[0], 1),))
+                    if process is not None else herdr.PaneAtShell())
+        return herdr.PaneStartupObservation(herdr.PaneShell(991000), activity)
+
+    @override
     def native_pane_process(self, pane: str, kind: str, timeout: float, *,
                             pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
         del timeout, pane_row
@@ -877,7 +887,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.closed, [(opened.pane, opened.terminal)])
         self.assertEqual(set(self.world.locations), {"w1:p0"})
 
-    def test_a_newer_error_pass_keeps_a_worker_with_an_older_completed_pass(self) -> None:
+    def test_a_newer_error_pass_allows_an_idle_worker_to_close(self) -> None:
         opened = self.start()
         assert isinstance(opened, worker_panes.OpenWorker)
         completed = self.recorded_dispatch(opened.row, "completed", at=10)
@@ -888,9 +898,9 @@ class WorkerPaneTests(StaffTestCase):
         self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=23)
         self.assertEqual(worker_panes.worker_pass(opened.row, self.root / "run"), {})
         closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
-        self.assertEqual(closed, worker_panes.Kept("launcher has not recorded a completed pass"))
-        self.assertEqual(self.world.stops, [])
-        self.assertEqual(self.world.closed, [])
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertEqual(self.world.closed, [(opened.pane, opened.terminal)])
 
     def test_a_completed_pass_in_an_explicit_run_outside_the_run_roots_allows_closure(self) -> None:
         row = self.worker()
@@ -1370,28 +1380,31 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(len(self.prompts()), 1)
 
-    def test_codex_start_interrupted_after_the_first_turn_publishes_without_another_turn(self) -> None:
+    def test_failed_publication_closes_the_pane_before_a_new_first_turn(self) -> None:
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("publication interrupted")):
             result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        failed_pane = result.pane
         prompts = self.prompts()
-        terminal = self.world.locations["w1:p1"]["terminal_id"]
+        self.assertEqual(self.world.closed, [(failed_pane, "terminal-" + failed_pane)])
         result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
-        self.assertEqual((result.pane, result.terminal), ("w1:p1", terminal))
-        self.assertEqual(self.prompts(), prompts)
-        self.assertEqual(len(self.world.launches), 1)
+        self.assertNotEqual(result.pane, failed_pane)
+        self.assertEqual(self.prompts()[:len(prompts)], prompts)
+        self.assertEqual(len(self.prompts()), len(prompts) + 1)
+        self.assertEqual(len(self.world.launches), 2)
 
-    def test_first_turn_timeout_retains_the_unpublished_codex_pane(self) -> None:
+    def test_first_turn_timeout_closes_the_unpublished_codex_pane(self) -> None:
         self.world.first_turn_timeout = True
         result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.UnpublishedWorker)
         assert isinstance(result, worker_panes.UnpublishedWorker)
         self.assertIn("timed out", result.cause)
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
-        self.assertEqual(set(self.world.locations), {"w1:p0", result.pane})
-        self.assertEqual(self.world.closed, [])
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
+        self.assertEqual(self.world.closed, [(result.pane, "terminal-" + result.pane)])
 
     def test_first_turn_reads_its_text_and_wait_limit_from_configuration(self) -> None:
         path = self.root / "conf/direct.conf"
@@ -1464,7 +1477,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.prompts(), [])
         self.assertEqual(self.world.requests[0][1][:3], ["resume", row.current_session, "--no-daemon"])
 
-    def test_fresh_codex_not_ready_keeps_the_pane_without_a_first_turn(self) -> None:
+    def test_fresh_codex_not_ready_closes_the_pane_without_a_first_turn(self) -> None:
         self.world.outcome = herdr.PromptNotSubmitted("agent_not_ready")
         result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.UnpublishedWorker)
@@ -1472,7 +1485,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(result.cause, "agent_not_ready")
         self.assertEqual(self.prompts(), [])
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
-        self.assertEqual(set(self.world.locations), {"w1:p0", result.pane})
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
 
     def test_report_after_done_publishes_before_the_first_turn_deadline(self) -> None:
         self.world.report_reads_before_publish = 2
@@ -1483,16 +1496,16 @@ class WorkerPaneTests(StaffTestCase):
                          cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
         self.assertEqual(len(self.prompts()), 1)
 
-    def test_missing_report_at_the_first_turn_deadline_keeps_the_pane_unpublished(self) -> None:
+    def test_missing_report_at_the_first_turn_deadline_closes_the_unpublished_pane(self) -> None:
         path = self.root / "conf/direct.conf"
         write_text_atomic(path, path.read_text().replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=1"))
         self.world.report_reads_before_publish = 1000000
         result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.UnpublishedWorker)
         assert isinstance(result, worker_panes.UnpublishedWorker)
-        self.assertIn("pane retained", result.cause)
+        self.assertEqual(result.cleanup, worker_panes.UnpublishedCleanup.PANE_CLOSED)
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
-        self.assertEqual(set(self.world.locations), {"w1:p0", result.pane})
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
 
     def test_unreadable_activity_during_recovery_returns_unknown_without_input(self) -> None:
         self.world.interrupt = "agent"
@@ -1513,6 +1526,172 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIn("pane is missing", result.cause)
         self.assertEqual(self.prompts(), [])
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+
+    def test_refused_new_worker_closes_only_the_pane_it_started(self) -> None:
+        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")):
+            result = self.start("TEST-refused")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertEqual(self.world.closed, [(result.pane, "terminal-" + result.pane)])
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
+        self.assertEqual(set(self.world.foreground), {"w1:p0"})
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+
+    def test_new_worker_without_a_submitted_prompt_closes_its_pane(self) -> None:
+        self.world.outcome = herdr.PromptNotSubmitted("TEST prompt not submitted")
+        result = self.start("TEST-no-prompt")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertEqual(self.world.closed, [(result.pane, "terminal-" + result.pane)])
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
+        self.assertEqual(set(self.world.foreground), {"w1:p0"})
+
+    def test_failed_unpublished_close_reports_one_anomaly(self) -> None:
+        for failure in (False, OSError("TEST close failed\nsecond line")):
+            with self.subTest(failure=failure):
+                with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
+                      patch.object(self.world, "close_pane", side_effect=failure if isinstance(failure, OSError) else None,
+                                   return_value=False), redirect_stderr(io.StringIO()) as errors):
+                    result = self.start("TEST-close-" + str(isinstance(failure, OSError)))
+                self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+                assert isinstance(result, worker_panes.UnpublishedWorker)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1, errors.getvalue())
+                self.assertIn("anomaly:", errors.getvalue())
+                self.assertIn(result.pane, errors.getvalue())
+                self.assertIn(result.pane, self.world.locations)
+
+    def test_failed_recovery_admission_keeps_the_pane_this_call_did_not_start(self) -> None:
+        self.world.interrupt = "agent"
+        _ = self.start("TEST-recovery")
+        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")):
+            result = self.start("TEST-recovery")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertIn(result.pane, self.world.locations)
+        self.assertIn(result.pane, self.world.foreground)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(len(self.world.launches), 1)
+
+    def test_failed_admission_quits_the_agent_started_in_an_existing_pane(self) -> None:
+        identity = staff.native_id(fixture_runtime_id("TEST-existing-shell"))
+        row = staff.StaffRow(identity, "worker", "TEST-existing", staff.ReportsTo(self.parent.id), current_session=identity)
+        self.world.add(row, "w1:p1", live=False, label=worker_panes.agent_name(self.parent, row.name))
+        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")):
+            result = self.start(row.name)
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        self.assertIn("w1:p1", self.world.locations)
+        self.assertNotIn("w1:p1", self.world.foreground)
+        self.assertEqual(self.world.closed, [])
+        self.assertIsInstance(self.world.pane_activity("w1:p1"), herdr.PaneAtShell)
+
+    def test_idle_workers_without_delivered_dispatches_can_close(self) -> None:
+        for index, status in enumerate(("", "error", "refused"), start=1):
+            with self.subTest(status=status):
+                row = self.worker("TEST-failed-" + str(index))
+                pane = "w1:p" + str(index)
+                self.world.add(row, pane)
+                if status:
+                    self.dispatch(row, "impl")
+                    path = self.root / "run/progress_history_state.json"
+                    state = cast(dict[str, object], json.loads(path.read_text()))
+                    passed = cast(dict[str, dict[str, object]], state["pass"])
+                    passed[row.name]["status"] = status
+                    write_text_atomic(path, json.dumps(state))
+                result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+                self.assertIsInstance(result, worker_panes.Closed)
+                self.assertNotIn(pane, self.world.locations)
+                self.assertNotIn(pane, self.world.foreground)
+
+    def test_stale_active_pass_allows_close_without_rewriting_the_pass(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.dispatch(opened.row, "impl")
+        path = self.root / "run/progress_history_state.json"
+        before = path.read_bytes()
+        self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name)), worker_panes.Closed)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_stale_active_pass_allows_a_role_change_without_rewriting_the_pass(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.dispatch(opened.row, "impl")
+        path = self.root / "run/progress_history_state.json"
+        before = path.read_bytes()
+        changed = self.start(role="review")
+        self.assertIsInstance(changed, worker_panes.OpenWorker)
+        self.assertEqual(len(self.world.launches), 2)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_role_only_history_does_not_hold_the_worker(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        history = progress_history.RecordedDispatch("impl", missing, missing, missing)
+        with patch.object(progress_history, "last_dispatch", return_value=history):
+            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+            self.assertIsInstance(self.start(role="review"), worker_panes.OpenWorker)
+
+    def test_stale_active_pass_allows_a_stopped_pane_to_close(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        self.dispatch(row, "impl")
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.StoppedWorker)
+        self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Closed)
+
+    def test_launcher_can_close_its_own_completed_turn_while_it_holds_the_lock(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.dispatch(opened.row, "impl")
+        self.reply_to_dispatch(opened.row, "dispatch-" + opened.row.name)
+        name = staff.WorkerName.parse(opened.row.name)
+        with worker_panes.worker_lock(self.parent.id, name) as hold:
+            assert isinstance(hold, worker_panes.WorkerLockHold)
+            self.assertIsInstance(worker_panes.can_close(opened, lock=hold), worker_panes.CloseAllowed)
+            self.assertIsInstance(worker_panes.close(self.parent.id, name, lock=hold), worker_panes.Closed)
+
+    def test_active_pass_with_a_live_launcher_blocks_close_and_role_change(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.dispatch(opened.row, "impl")
+        path = staff.record_path().parent / "locks" / f"{opened.row.id}.lock"
+        write_text_atomic(path, "")
+        script = "import fcntl,sys; f=open(sys.argv[1]); fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); sys.stdin.read()"
+        with subprocess.Popen([sys.executable, "-c", script, str(path)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True) as launcher:
+            assert launcher.stdout is not None
+            self.assertEqual(launcher.stdout.readline(), "held\n")
+            try:
+                self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
+                self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name)), worker_panes.Kept)
+                changed = self.start(role="review")
+                self.assertIsInstance(changed, worker_panes.StartRefused)
+                assert isinstance(changed, worker_panes.StartRefused)
+                self.assertEqual(changed.reason, worker_panes.StartRefusal.BUSY_ROLE_CHANGE)
+                self.assertEqual((len(self.world.launches), self.world.stops), (1, []))
+            finally:
+                _ = launcher.communicate("release")
+
+    def test_active_pass_with_a_live_detached_run_blocks_close(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.dispatch(opened.row, "impl")
+        with patch("scripts.agents.mesh_runs.live_runs", return_value=[object()]):
+            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
+            self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name)), worker_panes.Kept)
+        self.assertEqual(self.world.closed, [])
+
+    def test_idle_worker_with_a_live_active_dispatch_cannot_close(self) -> None:
+        row = self.worker("TEST-active")
+        self.world.add(row, "w1:p1")
+        self.dispatch(row, "impl")
+        with worker_panes.worker_lock(self.parent.id, staff.WorkerName.parse(row.name)):
+            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+        self.assertIsInstance(result, worker_panes.Kept)
+        self.assertEqual(self.world.closed, [])
+        self.assertIn("w1:p1", self.world.foreground)
 
     def test_worker_name_does_not_select_the_dispatch_role(self) -> None:
         result = self.start("impl2", "review")
@@ -1584,7 +1763,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertIn(result.pane, self.world.locations)
 
-    def test_failed_publication_retains_one_backend_and_publishes_once_on_rerun(self) -> None:
+    def test_failed_publication_closes_its_backend_and_retries_once(self) -> None:
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("fixture publication failure")):
             failed = self.start()
         self.assertIsInstance(failed, worker_panes.UnpublishedWorker)
@@ -1592,7 +1771,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         repeated = self.start()
         self.assertIsInstance(repeated, worker_panes.OpenWorker)
-        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(len(self.world.launches), 2)
         self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.parent.id)), 1)
 
     def test_start_rerun_after_split_reuses_the_labelled_shell(self) -> None:
@@ -1685,11 +1864,12 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(result, worker_panes.OpenWorker)
         self.dispatch(result.row, "impl")
         before = self.staff_state()
-        changed = self.start(role="review")
+        with worker_panes.worker_lock(self.parent.id, staff.WorkerName.parse(result.row.name)):
+            changed = self.start(role="review")
         self.assertIsInstance(changed, worker_panes.StartRefused)
         assert isinstance(changed, worker_panes.StartRefused)
         self.assertEqual(changed.reason, worker_panes.StartRefusal.BUSY_ROLE_CHANGE)
-        self.assertIn("active", changed.detail)
+        self.assertIn("lock", changed.detail)
         self.assertEqual(self.staff_state(), before)
         self.assertEqual((len(self.world.launches), self.world.stops), (1, []))
 
@@ -1908,32 +2088,34 @@ class WorkerPaneTests(StaffTestCase):
     def test_busy_worker_close_keeps_the_agent_and_names_the_blocker(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1")
+        self.world.locations["w1:p1"]["agent_status"] = "working"
         before = self.staff_state()
         with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
             code, _, errors = self.command("close", row.name)
         self.assertEqual(code, worker_panes.ExitCode.KEPT)
-        self.assertIn("completed pass", errors)
+        self.assertIn("working", errors)
         self.assertEqual(self.staff_state(), before)
         self.assertEqual((self.world.closed, self.world.stops), ([], []))
 
-    def test_refused_pass_keeps_a_stopped_worker_and_prevents_a_role_change(self) -> None:
+    def test_refused_pass_allows_a_stopped_close_and_a_role_change(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1", live=False)
         self.dispatch(row, "impl")
         path = self.root / "run/progress_history_state.json"
-        _ = path.write_text(path.read_text().replace('"active"', '"refused"'))
+        write_text_atomic(path, path.read_text().replace('"active"', '"refused"'))
         observed = self.observation(row)
         assert isinstance(observed, worker_panes.StoppedWorker)
         result = worker_panes.can_close(observed)
-        self.assertIsInstance(result, worker_panes.Kept)
-        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Kept)
-        self.assertEqual(self.world.closed, [])
+        self.assertIsInstance(result, worker_panes.CloseAllowed)
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Closed)
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
         self.world.add(row, "w1:p1")
+        pid, kind, _arguments = self.world.foreground["w1:p1"]
+        policy = worker_panes.launch_policy("impl")
+        self.world.foreground["w1:p1"] = pid, kind, [kind, *worker_panes.launch_arguments(policy, row.current_session, self.root)]
         changed = self.start(row.name, role="review")
-        self.assertIsInstance(changed, worker_panes.StartRefused)
-        assert isinstance(changed, worker_panes.StartRefused)
-        self.assertEqual(changed.reason, worker_panes.StartRefusal.BUSY_ROLE_CHANGE)
-        self.assertEqual(self.world.launches, [])
+        self.assertIsInstance(changed, worker_panes.OpenWorker)
+        self.assertEqual(len(self.world.launches), 1)
 
     def test_close_rerun_after_agent_stop_closes_only_that_terminal_once(self) -> None:
         row = self.worker()
