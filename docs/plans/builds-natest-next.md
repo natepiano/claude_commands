@@ -7,7 +7,7 @@ The phase backlog of natest-unit. At each phase end, rank modules by median CPU 
 Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed phases confirm their targets at dispatch.
 
 1. Phases 65, 64, 66, 55, 63, 70 and 71 are complete, and they form one tip.
-2. Phases 69 and 44 are complete. The 2026-11-08 22:48 EST ranking puts `copies/test_review_remote_copies.py` at 65.9 CPU s, the highest module that no phase holds and that has no floor. Phase 97 takes it. Profile its commands and the CPU of each test before you select changes.
+2. Phases 69, 44 and 97 are complete. Phase 97: `copies/test_review_remote_copies.py`, 45.8 to 21.7 CPU s in pairs. The 2026-11-08 23:20 EST ranking puts `direct/test_assign_claude.py` at 49.3 CPU s, the highest module that no phase holds and that has no floor. Phase 99 takes it. Profile its commands and the CPU of each test before you select changes.
 3. Phase 67 follows Phase 82: lint judgment and the parser cases, previously 231 CPU s. Its required functions already exist on origin/builds. The four SSH target files, previously 146.1 CPU s, still wait for verify's remaining import and function changes (Phase 66 floor).
 4. Phase 63 is complete. Phase 70 reports the token order hang; its cause stays open. Read the call output and queue files at its next recurrence.
 5. Phase 72 complete; the lifecycle writer and the first admission stack stay unproved. Phase 73 makes no code change: verify-unit owns the surviving token-renewal delay, and the Mac case needs no edit because queue lacked Phase 63's marker wait.

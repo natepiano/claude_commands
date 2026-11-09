@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 from typing import Literal, cast
@@ -18,6 +20,9 @@ from scripts.lib import conf
 from scripts.usage import collect
 from scripts.usage.rollouts import parse_timestamp
 from scripts.usage.usage_report import open_read_store
+
+
+_CLI_VERSION = re.compile(rb'"version"\s*:\s*"([^"\\]*)"')
 
 
 @dataclass(frozen=True)
@@ -135,8 +140,17 @@ def _compaction(record: dict[str, object], at: datetime) -> CompactionEvent:
 
 
 def _read_transcript(path: Path, since: datetime, until: datetime, history: _SessionRecords) -> None:
+    previous_version = b""
     with path.open("rb") as source:
         for number, line in enumerate(source):
+            version_match = _CLI_VERSION.search(line)
+            version_changed = version_match is not None and version_match[1] != previous_version
+            first_timestamp = isinstance(history.first_record_at, SessionBeginningUnknown) and b'"timestamp"' in line
+            if not (first_timestamp or version_changed
+                    or b'"usage"' in line and b'"assistant"' in line
+                    or b'"compact_boundary"' in line
+                    or b'"SessionStart"' in line and b'"hook_success"' in line):
+                continue
             try:
                 record = _object(cast(object, json.loads(line)))
             except (ValueError, UnicodeError):
@@ -144,9 +158,14 @@ def _read_transcript(path: Path, since: datetime, until: datetime, history: _Ses
             at = parse_timestamp(record.get("timestamp"))
             if at is None:
                 continue
-            if isinstance(history.first_record_at, SessionBeginningUnknown) or at < history.first_record_at:
+            if isinstance(history.first_record_at, SessionBeginningUnknown):
                 history.first_record_at = at
+            version = _version(record)
+            restart = bool(version and previous_version and version.encode() != previous_version)
+            if version:
+                previous_version = version.encode()
             kind = record.get("type")
+            explicit_start = False
             if kind == "attachment":
                 attachment = _object(record.get("attachment"))
                 name = attachment.get("hookName")
@@ -154,11 +173,16 @@ def _read_transcript(path: Path, since: datetime, until: datetime, history: _Ses
                         and name in ("SessionStart:startup", "SessionStart:resume")):
                     source_name = "startup" if name == "SessionStart:startup" else "resume"
                     hook = str(attachment.get("toolUseID", record.get("toolUseID", (path, number))))
-                    history.starts[hook] = history.starts.get(hook, Start(at, source_name, _version(record)))
+                    if hook not in history.starts:
+                        history.starts[hook] = Start(at, source_name, version)
+                        explicit_start = True
+            if restart and not explicit_start:
+                history.starts[f"version:{path}:{number}"] = Start(at, "resume", version)
             if not since <= at < until:
                 continue
             message = _object(record.get("message"))
-            if kind == "assistant" and isinstance(message.get("usage"), dict):
+            if (kind == "assistant" and message.get("model") != "<synthetic>"
+                    and isinstance(message.get("usage"), dict)):
                 key = (_text(message.get("id")), _text(record.get("requestId")))
                 history.requests[key] = _request(record, at)
             elif kind == "system" and record.get("subtype") == "compact_boundary":
@@ -179,12 +203,13 @@ def read_claude(projects_root: Path, since: datetime, until: datetime, machine: 
         _read_transcript(path, since, until, history)
     sessions: list[Session] = []
     for (session_id, agent_id), history in histories.items():
-        starts = sorted((start for start in history.starts.values() if since <= start.at < until),
-                        key=lambda start: start.at)
-        if history.requests or history.compactions or starts:
+        starts = sorted((start for start in history.starts.values() if start.at < until), key=lambda start: start.at)
+        earlier = [start for start in starts if start.at < since]
+        in_window = [start for start in starts if start.at >= since]
+        if history.requests or history.compactions or in_window:
             sessions.append(Session(machine, "claude", session_id, agent_id,
                 sorted(history.requests.values(), key=lambda request: request.at),
-                sorted(history.compactions, key=lambda event: event.at), starts, history.first_record_at))
+                sorted(history.compactions, key=lambda event: event.at), [*earlier[-1:], *in_window], history.first_record_at))
     return sessions
 
 
@@ -193,43 +218,62 @@ def configured_checkout() -> Path:
     return Path(os.environ.get("CONTEXT_ECONOMY_CHECKOUT") or Path.home() / ".claude")
 
 
-class _TrackedFileMissing(Enum):
-    ABSENT = "tracked file absent at this commit"
+def _tracked_blobs(checkout: Path, commits: Sequence[str], paths: Sequence[str]) -> dict[tuple[str, str], bytes]:
+    """Resolve tracked files in two Git processes and read each unique blob once."""
+    names = [(commit, path) for commit in dict.fromkeys(commits) for path in paths]
+    if not names:
+        return {}
+    checked = subprocess.run(["git", "-C", str(checkout), "cat-file", "--batch-check"],
+        input="".join(f"{commit}:{path}\n" for commit, path in names).encode(), capture_output=True, check=True)
+    hashes: dict[tuple[str, str], bytes] = {}
+    for name, line in zip(names, checked.stdout.splitlines()):
+        fields = line.split()
+        if len(fields) == 3 and fields[1] == b"blob":
+            hashes[name] = fields[0]
+    result = subprocess.run(["git", "-C", str(checkout), "cat-file", "--batch"],
+        input=b"".join(digest + b"\n" for digest in dict.fromkeys(hashes.values())), capture_output=True, check=True)
+    contents: dict[bytes, bytes] = {}
+    source = io.BytesIO(result.stdout)
+    for header in iter(source.readline, b""):
+        fields = header.split()
+        contents[fields[0]] = source.read(int(fields[2]))
+        _ = source.read(1)
+    return {name: contents[digest] for name, digest in hashes.items()}
 
 
-def _git_blob(checkout: Path, commit: str, path: str) -> bytes | _TrackedFileMissing:
-    result = subprocess.run(["git", "-C", str(checkout), "show", f"{commit}:{path}"],
-                            capture_output=True, check=False)
-    return result.stdout if result.returncode == 0 else _TrackedFileMissing.ABSENT
-
-
-def _settings_at(checkout: Path, commit: str, at: datetime,
-                 keys: tuple[str, ...], files: tuple[str, ...]) -> SettingsSet:
-    content = _git_blob(checkout, commit, "settings.json")
-    settings = _object(cast(object, json.loads(content))) if isinstance(content, bytes) else {}
+def _settings_values(commit: str, blobs: dict[tuple[str, str], bytes],
+                     keys: tuple[str, ...], files: tuple[str, ...]) -> dict[str, object]:
+    content = blobs.get((commit, "settings.json"), b"{}")
+    settings = _object(cast(object, json.loads(content)))
     values: dict[str, object] = {key: settings.get(key) for key in keys}
     for path in files:
-        content = _git_blob(checkout, commit, path)
+        content = blobs.get((commit, path), b"")
         values[path] = ({"bytes": len(content), "sha": hashlib.sha256(content).hexdigest()[:12]}
-                        if isinstance(content, bytes) else None)
-    return SettingsSet(at, commit, values)
+                        if (commit, path) in blobs else None)
+    return values
 
 
 def settings_timeline(checkout: Path, since: datetime, until: datetime) -> list[SettingsSet]:
-    """Include the settings in force at the window's start and each tracked change."""
+    """Use HEAD reflog times for the settings in force and each tracked change."""
     settings = conf.read("context_economy")
     keys, files = settings.words("settings_keys"), settings.words("files")
-    result = subprocess.run(["git", "-C", str(checkout), "log", "--first-parent", "--format=%H%x00%cI",
-                             "main", "--", "settings.json", *files],
+    result = subprocess.run(["git", "-C", str(checkout), "log", "-g", "--format=%H%x00%gD",
+                             "--date=iso-strict", "HEAD"],
                             capture_output=True, text=True, check=True)
     since, until = _utc(since), _utc(until)
-    changed: list[SettingsSet] = []
+    moves: list[tuple[str, datetime]] = []
     for line in reversed(result.stdout.splitlines()):
-        commit, stamp = line.split("\0", 1)
-        at = _utc(datetime.fromisoformat(stamp))
-        if at >= until:
-            continue
-        current = _settings_at(checkout, commit, at, keys, files)
+        commit, selector = line.split("\0", 1)
+        at = _utc(datetime.fromisoformat(selector.partition("@{")[2].removesuffix("}")))
+        if at < until:
+            moves.append((commit, at))
+    blobs = _tracked_blobs(checkout, [move[0] for move in moves], ("settings.json", *files))
+    known: dict[str, dict[str, object]] = {}
+    changed: list[SettingsSet] = []
+    for commit, at in moves:
+        if commit not in known:
+            known[commit] = _settings_values(commit, blobs, keys, files)
+        current = SettingsSet(at, commit, known[commit])
         if not changed or current.values != changed[-1].values:
             changed.append(current)
     baseline = [entry for entry in changed if entry.at <= since]

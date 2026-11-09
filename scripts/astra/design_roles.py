@@ -32,6 +32,7 @@ from uuid import UUID, uuid4
 
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
+from scripts.direct import recorder_state
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, worker_admission
 
@@ -587,7 +588,7 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         state = worker_lifecycle.read_worker_state(run / 'progress_history_state.json')
         if not state:
             _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design.repository])
-        if not state.get('phase'):
+        if phase not in recorder_state.open_phase_ids(state):
             _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
                                '--phase-title', 'Held Astra review'])
     name = _instance(design, role).name
@@ -596,8 +597,17 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
         '--session-dir', str(run), '--parent', str(parent.id), '--to', name,
         '--phase', phase, '--prompt', str(prompt), '--summary', str(reply)])
+    refusal = result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained'
+    if isinstance(design.binding, DesignUnbound):
+        try:
+            _recorder_command(['finish-phase', '--session-dir', str(run), '--phase-id', phase,
+                               '--status', 'error' if result.returncode else 'completed'])
+        except RoleRefused as error:
+            if result.returncode:
+                raise RoleRefused(refusal) from error
+            raise
     if result.returncode:
-        raise RoleRefused(result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained')
+        raise RoleRefused(refusal)
 
 
 def _assign_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -950,6 +960,10 @@ def _finish_end(design: HeldDesign, role: Role) -> None:
         _census_projection().release(lifecycle.staff_id)
     directory = design_directory(design.placement.design_id)
     with _lock(directory):
+        if isinstance(design.binding, DesignUnbound):
+            state = worker_lifecycle.read_worker_state(directory / 'progress_history_state.json')
+            if state.get('status') == 'active':
+                _recorder_command(['finish-run', '--session-dir', str(directory), '--status', 'completed'])
         transition = directory / 'transition.json'
         pending = _read(transition) if transition.exists() else {}
         if pending.get('reason') == 'explicit end' and pending.get('role') == role:

@@ -1237,41 +1237,58 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:** a process or lease generation check for the holder — pid reuse inside one run's lease-to-register window only changes list output.
 
-### Phase 41w — Two helper starts in the verify wait tests load less  · status: todo
+### Phase 41w — Two helper starts in the verify wait tests load less  · status: done
 
-**Depends on:** none. Runs after 41u.
+#### As-built
+
+- `scripts/direct/step_selection.py` holds `Routed`, `Pinned`, `TargetSelection` and `ROUTED`. It imports only `dataclasses`.
+- `build_targets.py` imports the selection types from `step_selection`. A `build_targets.py` start does not load `step_record`, `boot_identity` or `process_start`.
+- `step_record.py` re-exports the selection types (`X as X`) after its `__main__` fast path, for `scripts/aws_target/aws_target.py` and `test_control.py`. Each type has one definition.
+- `unit_config.parse_port_cell` imports `cell_value` locally. A `progress_history.py` start does not load `production_doc`, `showrunners` or `session_send`.
+- `test_verify_wait_holder.py` under machine load: median 83.6 CPU s before, 58.4 after (three runs each, wide spread). Median per start: `build_targets.py` 12.5 to 8.7 CPU s; `progress_history.py` 21.1 to 15.5 CPU s.
+
+**Files:**
+- `scripts/direct/step_selection.py` — the target selection types.
+- `scripts/direct/step_record.py` — re-exports the selection types.
+- `scripts/build_targets/build_targets.py` — imports the selection types from `step_selection`.
+- `scripts/production/unit_config.py` — the local `cell_value` import in `parse_port_cell`.
+- `scripts/direct/test_verify_routing_rule.py`, `scripts/direct/test_step_record.py`, `scripts/direct/test_verify_step_state.py` — import the selection types from `step_selection`.
+
+**Gotchas:** `step_selection.py` loads on every `build_targets.py` start; an import added there costs every start.
+
+**Ruled out:** removing the `step_record` re-exports — `aws_target.py` and `test_control.py` import the types from there.
+
+### Phase 41y — No process outlives the hold event tests under load  · status: todo
+
+**Depends on:** none. Runs after 41w.
 
 #### Work Order
 
-**Source:** builds, 2026-11-08, from natest's measurement on scratch copies (natest run `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/95/behavior_map.md`, sections "Target prototype" and "Recorder prototype"). The showrunner gives the user the before and after numbers.
+**Source:** builds, 2026-11-08. `direct/test_verify_hold_events.py` `test_local_admission_without_inotify_polls_until_release` failed on its first run with "a fixture cleanup failed; a process may have outlived the test", then passed alone. Two cloud-gate cases on 2026-11-08: phase-tables 11f3e4 (15:33) and build-report 857554.
 
-**Goal:** `test_verify_wait_holder.py` uses less CPU per run, with every target decision and recorder result unchanged.
+**Goal:** the hold event tests leave no process behind under load, and a cleanup failure names each process that outlived the test.
 
 **Spec:**
-1. **Target selection.** Move `Routed`, `Pinned`, `TargetSelection` and `ROUTED` (`step_record.py:273-283`) to a new small module `scripts/direct/step_selection.py`. `step_record.py` and `build_targets.py` (`build_targets.py:148`) import them from there, so a `build_targets.py` start no longer loads the full step recorder. Measured on a scratch copy: 2.4 CPU s less per run of `test_verify_wait_holder.py`.
-2. **Recorder import.** Move the `cell_value` import (`unit_config.py:22`) from module scope into `unit_config.parse_port_cell` (`unit_config.py:75`), its only use in that file. A recorder start then does not load the production document and showrunner modules. Measured on a scratch copy: 1.6 CPU s less per run.
-3. **Callers.** Tests that name these types (`test_verify_routing_rule.py:24`, `test_step_record.py`, `test_verify_step_state.py`) import them from `step_selection.py`. Keep one definition of each type.
-4. **Measure.** The director runs `~/.claude/scripts/lib/py scripts/test_times/module_cost.py --tree <tree> --tests 40 --commands 10 direct/test_verify_wait_holder.py` three times on the phase-start tree and three times on the final tree, and reports the median CPU s of each.
+1. **Message.** `VerifyHoldWaitFixture.fixture_cleanups` (`verify_hold_wait_test_support.py:322`) asserts that `self.fixture.doCleanups()` returns true. That call drops the inner failure, so the report loses the survivor list from `assert_nothing_outlives` (`verify_mac_offload_test_support.py:1119`). Make the outer failure carry the inner failure text: each survivor with its command line.
+2. **Reproduce.** Run `test_verify_hold_events.py` repeatedly under CPU load until the failure shows. Name the process that outlives the test, the code that starts it, and why it is still alive after the marker wait. Put the evidence in the summary.
+3. **Fix the cause where it lives.** Change the code that leaves the process behind. If the process detaches by design, the fixture waits for its exit event, as it does for lint recorders. Add no retry, and do not raise a time limit.
+4. **Proof.** Under the load from item 2, the module passes 20 runs in a row on the final tree. Before the fix, the same load gives at least one failure, or the summary says why the failure did not show.
 
 **Files:**
-- `scripts/direct/step_selection.py` — the new selection types module.
-- `scripts/direct/step_record.py` — imports the selection types.
-- `scripts/build_targets/build_targets.py` — imports the selection types (owned by another unit; the checkpoint notice names it).
-- `scripts/production/unit_config.py` — the local `cell_value` import (owned by another unit; the checkpoint notice names it).
-- `scripts/direct/test_verify_routing_rule.py`, `scripts/direct/test_step_record.py`, `scripts/direct/test_verify_step_state.py` — import changes only.
+- `scripts/direct/verify_hold_wait_test_support.py` — the cleanup message.
+- `scripts/direct/verify_mac_offload_test_support.py` — the outlive check, if the fix is a fixture wait.
 
-**Constraints from prior phases:**
-- Phase 41p: each `build_targets.py` subcommand imports only what it uses. Keep that form.
+The file that starts the surviving process is not known yet. Item 2 names it; the director adds it to the file set, and the checkpoint notice names its owner.
 
-**Workers:** 1 writer — `impl` owns every file above. The work is import moves; no test lane.
+**Workers:** 1 writer — `impl` owns every file above.
 
 **Acceptance gate:**
-- `test_verify_wait_holder.py`, `test_step_record.py`, `test_verify_routing_rule.py`, `test_verify_step_state.py`, `test_build_targets.py` and `test_unit_config.py` pass with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed files.
-- The director runs the targeted test and the before and after measurement of Spec item 4.
+- `test_verify_hold_events.py` and the other `verify_hold_wait_test_support.py` users pass with no assertion changed; `basedpyright` reports 0 errors and 0 warnings on the changed files.
+- The director runs the targeted test.
 
 ### Phase 41x — The final gate runs the repository's own gate in a repository with no Cargo  · status: todo
 
-**Depends on:** none. Runs after 41w.
+**Depends on:** none. Runs after 41y.
 
 #### Work Order
 
