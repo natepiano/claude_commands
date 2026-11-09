@@ -26,7 +26,8 @@ from typing import TypedDict, Unpack, cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_evidence, head_facts, build_queue, queue_card, queue_view
-from scripts.build_queue.queue_lines import Line, plain
+from scripts.build_queue.queue_lines import Line, QueueLines, plain
+from scripts.build_queue.test_queue_view import queue_json_text
 from scripts.build_queue.queue_fixture import write_process, write_scope, fixture_queue_read, ci_step
 from scripts.build_queue.queue_fixture import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
@@ -191,11 +192,11 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def output(self, selector: str = "1") -> str:
         output, errors = io.StringIO(), io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_queue.py", "--columns", "400", selector]):
+        with redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_queue.py", "--json", "--columns", "400", selector]):
             result = build_queue.main()
         self.assertEqual(result, 0, errors.getvalue())
         self.assertEqual(errors.getvalue(), "")
-        return output.getvalue()
+        return queue_json_text(cast(QueueLines, json.loads(output.getvalue()))) + "\n"
 
     def line(self, output: str, prefix: str) -> str:
         return next(line.strip().removeprefix("✓ ").removeprefix("✗ ") for line in output.splitlines()
@@ -699,7 +700,7 @@ class QueueEvidenceTests(unittest.TestCase):
             with admission.serving(), \
                  mock.patch.object(gate, "queue_read", side_effect=client.view), \
                  mock.patch.object(records, "_warned_configuration_diagnostics", set[records.ConfigurationDiagnostic]()), \
-                 mock.patch("sys.argv", ["build_queue.py", "--columns", "400", "1"]), \
+                 mock.patch("sys.argv", ["build_queue.py", "--json", "--columns", "400", "1"]), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(build_queue.main(), 0)
                 self.assertEqual(build_queue.main(), 0)
@@ -893,7 +894,7 @@ class QueueEvidenceTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 output, errors = io.StringIO(), io.StringIO()
                 with mock.patch.object(gate, "queue_read", side_effect=error), \
-                     redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_queue.py", "--columns", "400", "1"]):
+                     redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_queue.py", "--json", "--columns", "400", "1"]):
                     result = build_queue.main()
                 self.assertEqual(result, 2)
                 self.assertEqual(output.getvalue() + errors.getvalue(),

@@ -43,7 +43,7 @@ The next check handles an unusable cloud setting like other unusable settings.
 The API supplies `progress_profile.publish_counter` for the route to write module counts.
 The service removes the progress files when the reservation ends.
 
-The queue view and the build page show each cloud gate in the main table.
+The queue pane and the build page show each cloud gate in the main table.
 A running row shows machine `aws` and its vCPU count.
 The last column shows the state, module count, and failed modules.
 A waiting row shows `cloud` in the # column and its slot wait text.
@@ -233,15 +233,24 @@ The pass uses that policy for readings, decisions, and explanations. Its stored 
 Queries project the stored `PassResult` through `queue_read_from_pass`. A release marks the stored result stale; the next query computes its evidence once without granting a step.
 `queue_read()` supplies one `QueueRead` for the complete queue page.
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
-`/build:queue <position|session|folder>` shows the full queue, one blank line, and the selected cards.
-`mine` uses the same layout. The page resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
+`/build:page` shows the running and waiting steps, memory use, wait reasons, priority, and cloud slot counts.
+The page and the queue pane show the same saved Mac idle alert first, in red.
+The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
+An empty value hides the alert on the page.
+The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
+The unit-board queue pane keeps `build_queue.py --json` and its selected cards.
+A position, session, folder, or `mine` selects cards in the pane.
+The pane resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
+A view request without `--json` exits 3 with `build queue: the queue view is on the build page; run /build:page`.
+The controls `bump`, `clear`, and `admit-head` remain available.
 `queue_evidence.py` formats the recorded need, run keep-aside, room calculation, head cause, and release advice.
 The card uses the reply's policy and limits. It reads no current admission configuration to reinterpret the reply.
 The evidence includes host RAM, optional load, run needs, swap-backed use, held slots, keep-asides, room, and start spacing.
 It also includes estimate history, shape tiers, failed-peak floors, factors, recorded limits, package, filters, width, and completed CPU-token waits.
 A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`. Start spacing has its own deadline.
 Admission and release calculations remain in `memory_admit.py`. An expired estimate requires a client refresh through the service.
-The page prints priority and unowned memory once in the queue view. It prints shared evidence once below the selected cards.
+The pane prints priority and unowned memory once in the queue view.
+It prints shared evidence once below the selected cards.
 `build_why.py` and its command are removed. There is no alias.
 The pane keeps the last successful page after a failed refresh.
 A failed first query shows `Build queue could not be read.`
@@ -1212,7 +1221,11 @@ The message names the Mac when its disk is low.
 A current `sweep.disk_floor` text approval also permits one phone push per episode.
 The push names the machine and recommends one measured folder, or asks for measurements when folder sizes are unavailable.
 Each channel keeps its own receipt; a failed channel can retry without repeating the accepted delivery.
-A reading above the alert line rearms both channels. Equality does not rearm them.
+A reading above the alert line plus `sweep_phone_rearm_gib` rearms both channels.
+Equality with that boundary does not rearm them.
+`config/lint.conf` sets the margin to 5 GiB beside `sweep_phone_floor_gib`.
+With the 150 GiB alert line, free space must exceed 155 GiB before a later crossing can send another alert.
+The same rule applies to natedev and the Mac.
 While text approval is stale, the natedev message still sends and the phone receipt stays pending.
 The phone channel can send that pending episode after the showrunner records the new approval.
 

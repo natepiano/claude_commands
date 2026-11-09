@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -94,6 +95,22 @@ def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> N
     _write_atomic(path, data, mode=mode)
 
 
+def _default_permissions(path: Path) -> int:
+    """Read kernel-selected permissions from an empty sibling without changing the process umask."""
+    while True:
+        probe = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        try:
+            descriptor = os.open(probe, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        break
+    try:
+        probe.unlink()
+        return os.fstat(descriptor).st_mode & 0o777
+    finally:
+        os.close(descriptor)
+
+
 def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
                   new_file_mode: int | None = None) -> None:
     """Own the single replacement boundary for text and binary evidence."""
@@ -107,9 +124,7 @@ def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
             elif new_file_mode is not None:
                 temporary.chmod(new_file_mode)
             else:
-                mask = os.umask(0)
-                _ = os.umask(mask)
-                temporary.chmod(0o666 & ~mask)
+                temporary.chmod(_default_permissions(path))
             os.replace(temporary, path)
             replaced = True
             sync_folder(path.parent)

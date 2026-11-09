@@ -2064,39 +2064,83 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `invoke_cli` ignores the `timeout` argument of the routed `phase_table.py` calls.
 - Fewer child starts save more CPU with no bytecode writes than with a warm cache. State the bytecode condition with each measurement.
 
-### Phase 104 — The AWS box tests use half their CPU  · status: todo
+### Phase 104 — The AWS box tests use half their CPU  · status: done
+
+#### As-built
+
+- `test_box.py` runs the fake aws and ssh tools in process. setUp replaces `aws_target.subprocess` with a namespace whose `run` is `run_tool`, except for cases marked `@process_boundary`.
+- `run_tool` resolves the tool with `shutil.which`. A tool in the test's own `bin` folder runs the compiled fake source (`FAKE_CODE`) through `invoke_cli`; any other tool runs through the real `subprocess.run`. It sets `result.args` and calls `check_returncode` when `check` is set.
+- `@process_boundary` keeps a real process for stdin and exit-status cases, such as the SSM stdin key test and the refusal stderr test.
+- All 61 test bodies and 337 assertions are kept. 46 moved cases fail when the production function under test is broken. `test_deploy.py` passes.
+- CPU in worker pairs on tmpfs with no bytecode writes: 136.1 -> 9.2 s pair median (93.2% less); 98.4 -> 8.7 s sequential; processes 1296 -> 150; execs 1297 -> 151. Pairs on `/tmp` with a warm bytecode cache: 24.3 -> 3.2 s CPU (86.8% less), 24.5 -> 3.4 s wall.
+
+**Files:**
+- `scripts/aws_target/test_box.py` — box command tests; fake tools run in process
+
+**Gotchas:**
+- `invoke_cli` restores signal handlers and changes the process cwd, environment and streams. Call it only for sequential calls on the main thread.
+
+### Phase 105 — The change page tests use half their CPU  · status: done
+
+#### As-built
+
+- `test_change_page.py` builds one seed Git repository and copies it for each test.
+- setUp patches `subprocess.run` with a `run` side effect. A main-thread call of a test-owned CLI entry runs in process through `invoke_cli`. A call from any other thread, from a `@process_boundary` case, or for another command runs through the real process.
+- `serve.py` answers HTTP calls on worker threads, so CLI calls made inside an HTTP request keep their real `change_page.py`, `change_review.py` and `feature_log.py` processes.
+- 7 `@process_boundary` tests keep a real process. All 139 tests and 829 assertions are kept.
+- `module_cost` on a copy of `befc1a04a`: 30.7 -> 25.7 CPU s; processes 3040 -> 1001. `change_review.py` keeps 55 starts and 13.4 CPU s from HTTP-thread calls.
+- Same-load pairs against `befc1a04a`: `/tmp` with a warm bytecode cache 23.5 -> 17.7 CPU s (24.6% less); `/dev/shm` with no bytecode writes 36.9 -> 18.0 CPU s (51.2% less).
+
+**Files:**
+- `scripts/review_links/test_change_page.py` — change page tests; seed repository copy and main-thread in-process CLI calls
+- `docs/plans/builds-natest-next.md` — Floors row for the change page tests
+
+**Gotchas:**
+- `invoke_cli` changes process state. Use it only on the main thread; a call from an HTTP worker thread keeps a real process.
+- The warm-cache floor is `change_page.py` starting `change_review.py` and `feature_log.py` as child processes. An in-process call in production removes about 10 CPU s; sdlc owns that change.
+
+**Ruled out:**
+- Queueing HTTP worker-thread CLI calls onto the main thread: it removes the process boundary that the HTTP path needs.
+
+### Phase 106 — The memory admission tests use half their CPU  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Source:** next items, items 2 and 6a. On 2026-11-09 04:40 EST (`show.py top`), `aws_target/test_box.py` is the top eligible module: 43.3 CPU s per gate, 61 tests. The profile on a copy of `ab2db04d7` (`module_cost.py --tests 10 --commands 10`) measured 37.7 CPU s, 1296 processes and 41.8 wall s. The supervisor holds 1.9 CPU s. Almost all other CPU is in the fake tools: each test writes a Python shim for `aws`, `ssh`, `git`, `nix`, `tailscale`, `systemctl`, `bash`, `rustc`, `cargo`, `cargo-nextest` and `cargo-mend` into its own `bin` folder, and each call starts a new interpreter (for example 73, 68 and 67 `aws` starts in single tests, about 20 ms of CPU each).
+**Source:** next items, items 2 and 6a. On 2026-11-09 05:51 EST (`show.py top`), the next eligible modules were `direct/test_verify_routing_rule.py` (40.8 CPU s per gate), `direct/test_assign_claude_records.py` (37.5) and `lint/test_memory_admit.py` (37.0). The profile on a copy of `befc1a04a` (`module_cost.py --tests 10 --commands 10`) measured 26.9, 24.8 and 30.3 CPU s. Only `lint/test_memory_admit.py` is above the 30 CPU s stop line: 30.3 CPU s, 11168 processes, 11025 execs and 49.0 wall s. Its measured child cost: `git` 10639 starts and 6.0 CPU s, `python3 -c` 32 starts and 9.7 CPU s, `admission_client.py` 16 starts and 2.8 CPU s. The slowest test is `BuildBudgetTests.test_service_intervals_use_positive_finite_config_and_read_each_use` (7.3 CPU s). Three tests wait more than they compute: `QueueLeaveTests.test_declining_hook_and_no_hook_wait_alike` (2.9 CPU s, 6.9 wall s), `QueueLeaveTests.test_a_run_waiting_for_memory_claims_its_share_only_once_admitted` (2.0 CPU s, 3.0 wall s) and `ShellTests.test_invoke_twice_with_temporary_home` (0.8 CPU s, 5.8 wall s).
 
-**Goal:** `scripts/aws_target/test_box.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+**Goal:** `scripts/lint/test_memory_admit.py` uses half its current CPU, or a measured floor shows why it cannot, with every checked behavior kept.
 
 **Spec:**
-1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each fake tool start per test.
-2. Start with the slowest tests in the profile: `test_up_records_all_box_stages_and_resumes_after_configuration_failure` (4.5 CPU s), `test_checks_compare_plain_environment_versions_without_another_repository` (3.6) and `test_stopped_setup_rechecks_changed_system_and_local_versions` (2.7).
-3. Cut the cost of the fake tool starts. Options, in order: run the fake in process where `box.py` reaches the tool through a replaceable runner (for example `aws_target.py`'s run function), and keep a real process for each behavior that only a process proves (the `box.py` `Popen` path with stdin, an exit code, an environment the tool reads); make each shim start cheaper (fewer imports, `-S`/`-I`); share one `bin` folder for the module.
-4. `scripts/aws_target/test_deploy.py` imports `FAKE`, `SYSTEM`, `FakeMonotonicClock`, `FakeTailnet` and `write_aws_claim` from this module. It stays green, and its fake keeps the same behavior.
-5. Write a behavior map with a row for each assertion before you change a test. For each check that moves in process, show on a tempdir copy that breaking the function under test fails the new test.
-6. Do not change `scripts/aws_target/box.py`, `aws_target.py` or other production files. aws-unit owns them. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+1. Follow the Speed method. Measure CPU with `module_cost.py --tests 10 --commands 10` first. Name each test's CPU, and each real process that it starts.
+2. Find what starts each `git` process and each `python3 -c` process: production code or the test fixture. Remove a start that only the fixture makes. Share a repository or a fake that many tests make the same way.
+3. Find why the config interval test costs 7.3 CPU s for 80 config reads. Cut the fixture part of that cost.
+4. Run a real entry in process through `scripts/production/cli_fixture.py` `invoke_cli` where the test does not assert on the process boundary, as Phase 103 did. Keep a real process for each behavior that only a process proves: an interrupt between steps, an exit code across a process, any cwd or environment that the entry reads at start, a shell function under test.
+5. Cut a fixed wait in a test only where an event or a shorter config value proves the same behavior.
+6. Write a behavior map with a row for each assertion before you change a test. Group rows by test class and helper where the assertions are the same.
+7. Do not change `scripts/lint/memory_admit.py`, files in `scripts/build_queue/` or `scripts/buildlog/`, `scripts/lint/build_hold.py` or other production files. If only a production change can cut a cost, write the floor and send the director an architecture proposal with its measured gain.
+8. Change `scripts/lint/memory_test_support.py` only for a shared fixture cut. Many test modules import it, and each importer must pass.
+9. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
-- `scripts/aws_target/test_box.py`
+- `scripts/lint/test_memory_admit.py`
+- `scripts/lint/memory_test_support.py`
 
-**Workers:** 1 writer; one test file
-- `impl` — `test_box.py`
+**Workers:** 1 writer; one test module and its support file
+- `impl` — `test_memory_admit.py`, hub: `memory_test_support.py`
 
 **Constraints from prior phases:**
-- Phase 97 and Phase 100: an in-process call of a real entry cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
-- Phase 103 is done. A process start costs more with no bytecode writes, so start cuts gain more there: 57.6% less CPU in worker pairs with no bytecode writes, 31% less in director pairs on `/tmp` with a warm bytecode cache. The notice reports both conditions.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. State the filesystem basis of each pair.
+- Phase 89, Phase 97, Phase 100, Phase 103, Phase 104 and Phase 105: an in-process call of a real entry through `invoke_cli` cut CPU and kept the code path. Tests that assert on a process boundary kept a real process.
+- Phase 103: a process start costs more with no bytecode writes, so start cuts gain more there. Report pairs with no bytecode writes and on `/tmp` with a warm bytecode cache.
+- `invoke_cli` restores signal handlers (`cli_fixture.py:133`), and Python allows that only on the main thread. It also changes the process cwd, environment and streams. Call `invoke_cli` only for sequential calls on the main thread. Keep a real process for each call made from another thread. A change to the shared helper goes to the director as a proposal.
+- Phase 105: a call that a test routes in process from a worker thread was a review blocker. Check the thread of each routed call.
+- `build_hold.py` stays frozen. Next item 11 lists this module for the Rule 2 cleanup; this speed phase holds it, so remove no test here.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `~/.local/state/build-targets`, `/tmp/claude`. State the filesystem basis of each pair.
 
 **Acceptance gate:**
 - The behavior map has a row for each assertion. No assertion is removed.
 - CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed file and `test_deploy.py` pass.
+- The changed files pass, and every module that imports a changed helper passes.
 - the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 - Floors: a floor claim adds a row to the next-items Floors table with its revision, roots, cache state, limiting operation, owner and revisit condition.

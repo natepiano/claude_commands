@@ -294,33 +294,38 @@ An unknown production is refused before the verdict saves.
 
 The server follows `CloseChangeReview` in `commands/showrunner/produce.md` before it saves a new verdict.
 It selects projects through `ProjectSpec.closes_by_change_review` in `scripts/feature_log/feature_log.py`.
-The existing `feature_log.py project-of` command identifies the owning production's repository from its origin.
+`feature_log.project_of` identifies the owning production's repository from its origin.
 There is no second project policy list.
 Projects outside that policy skip the feature-log operation.
 A row with no proposal also skips the operation and saves the user's answer.
-The server passes `--if-proposed` to `add`, `supersede`, and `drop`.
+The server calls `feature_log.land_review` and `feature_log.drop_review` with `if_proposed=True`.
 The writer checks proposal absence under its existing lock on the host that owns the feature log.
-On the Mac, the existing CLI forwards the operation and flag to natedev through SSH.
-An absent proposal prints `skipped: no proposal for <row>` and exits 0.
-Malformed proposals, incompatible states, and SSH failures remain errors.
+On the Mac, each function forwards the matching `feature_log.py` command to natedev through SSH and captures its output.
+An absent proposal returns `skipped: no proposal for <row>` and is not an error.
+Malformed proposals, incompatible states, and SSH failures raise `FeatureLogError`.
 The server makes no separate proposal lookup.
 A Hana list uses a bare review ID, such as `C27`.
 Other lists use their filename's showrunner name, such as `natedev/C27`.
-A landing answer runs `feature_log.py add --review`.
-If the writer reports that the proposal requires `supersede`, the server runs that operation instead.
-A returning answer runs `feature_log.py drop --review` with the saved verdict.
-An operation failure keeps the row open and sends the showrunner the row ID and failure.
+A landing answer calls `land_review`, which lands the proposal with the verb that the proposal records (`add` or `supersede`).
+A returning answer calls `drop_review` with the saved verdict.
+An operation failure keeps the row open and sends the showrunner the row ID and the `FeatureLogError.diagnostic` text.
 The server does not repeat the feature-log operation for a saved answer.
 
-The server then runs `change_review.py verdict` with paths from the configured list and production records.
-It passes the user's words with `--verdict=<text>`, so text that starts with a dash remains valid.
-That command remains the only answer writer.
+The server then calls `change_review.save_verdict` with paths from the configured list and production records.
+It returns `VerdictSaved` with the output lines, or `VerdictRefused` with the refusal text.
+`save_verdict` is the only answer writer, for the page and for the `change_review.py verdict` command.
 It retains its lock, conflict checks, scratch cleanup, and list commit behavior.
 Classified rows retain Kind, How to check, and Production in Reviewed.
 Older rows without Kind retain their existing Reviewed table behavior.
 An identical saved answer changes nothing and sends nothing; a different saved answer is refused.
 
-The all-list page returns JSON with status 200 after `change_review.py verdict` writes the answer.
+The feature-log and verdict calls run in the server process on the request's HTTP worker thread.
+They start no child Python process.
+They change no cwd, environment, `sys.argv`, stream or process umask, so other request threads are safe beside them.
+Each call takes its own `flock` on a new open file.
+`end_row_scratch` can still start `folder_audit.py` as a child process when a row's Cargo checkout has a build folder outside it.
+
+The all-list page returns JSON with status 200 after `change_review.save_verdict` writes the answer.
 Older selected-row pages retain their 303 response.
 The feature-log operation still runs before the verdict.
 The request thread flushes the response before it runs the existing `scripts/message/send.py` sender.
@@ -559,6 +564,7 @@ A failed replacement exits for the service manager to restart.
 An active verdict delivery postpones the code check without replacing the saved stamps.
 The next check can therefore detect the same change.
 No merge-time restart command is needed.
+The verdict code in `change_review`, `feature_log` and `atomic_file` is loaded into the server, so a change to it also replaces the server process.
 
 ### Settings
 
