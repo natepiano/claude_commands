@@ -23,7 +23,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_code, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
@@ -431,30 +431,57 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("TOP_COST_RECENT_DAYS", text)
         self.assertTrue(page["walk"])
 
+    def test_installed_feed_sources_and_startup_files_change_the_fixed_version(self) -> None:
+        installed = self.root / "installed"
+        for relative in memory_feed.FEED_CODE_PATHS:
+            target = installed / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_text("fixture\n")
+        cases = (
+            ("scripts/build_queue/memory_feed.py", True),
+            ("scripts/buildlog/charts.py", True),
+            ("scripts/buildlog/holds.py", True),
+            ("scripts/build_queue/memory_live.html", True),
+            ("config/memory_feed.conf", True),
+            ("config/build_steps.conf", False),
+            ("scripts/unrelated.py", False),
+        )
+        before = memory_feed.installed_feed_code_version(installed)
+        for relative, changes_version in cases:
+            with self.subTest(path=relative):
+                target = installed / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                previous = target.read_text() if target.exists() else ""
+                _ = target.write_text("changed fixture\n")
+                self.assertEqual(memory_feed.installed_feed_code_version(installed) != before, changes_version)
+                _ = target.write_text(previous)
+        (installed / "scripts/build_queue/memory_feed.py").unlink()
+        self.assertEqual(memory_feed.installed_feed_code_version(installed), "")
+
     def test_an_installed_schema_change_requires_a_restart_before_the_next_read(self) -> None:
         installed = self.root / "installed"
         source = installed / "scripts" / "build_queue" / "admission_records.py"
-        for relative in admission_code.ADMISSION_CODE_PATHS:
-            target = installed / "scripts" / relative
+        for relative in memory_feed.FEED_CODE_PATHS:
+            target = installed / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             _ = target.write_text("fixture\n")
         _ = source.write_text("schema = 'before'\n")
-        before = memory_feed.installed_code_version(installed)
+        before = memory_feed.installed_feed_code_version(installed)
 
         def install_schema(seconds: float) -> None:
             self.assertEqual(seconds, 0.125)
             _ = source.write_text("schema = 'after'\n")
-            self.assertNotEqual(memory_feed.installed_code_version(installed), before)
+            self.assertNotEqual(memory_feed.installed_feed_code_version(installed), before)
 
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as view,
-              mock.patch.object(memory_feed, "LOADED_ADMISSION_CODE_VERSION", before),
+              mock.patch.object(memory_feed, "LOADED_FEED_CODE_VERSION", before),
               mock.patch.object(time, "sleep", side_effect=install_schema)):
             self.assertEqual(memory_feed.main(["--code-root", str(installed)]), 1)
         view.assert_called_once_with()
-        self.assertNotEqual(memory_feed.installed_code_version(installed), before)
+        self.assertNotEqual(memory_feed.installed_feed_code_version(installed), before)
         changed = replace(captured_reading(), explanation=replace(captured_reading().explanation, now=200_001))
         with (mock.patch.object(admission_client, "view", return_value=changed) as restarted,
-              mock.patch.object(memory_feed, "LOADED_ADMISSION_CODE_VERSION", memory_feed.installed_code_version(installed))):
+              mock.patch.object(memory_feed, "LOADED_FEED_CODE_VERSION", memory_feed.installed_feed_code_version(installed))):
             self.assertEqual(memory_feed.main(["--once", "--code-root", str(installed)]), 0)
         restarted.assert_called_once_with()
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
@@ -476,63 +503,69 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertGreater(page["room"], 0)
 
     def test_a_schema_install_during_import_restarts_a_fresh_interpreter(self) -> None:
-        installed = self.root / "installed"
-        source = Path(memory_feed.__file__).resolve().parents[1]
-        _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        probe = textwrap.dedent("""
-            import builtins
-            import json
-            import sys
-            from pathlib import Path
-            from unittest import mock
+        cases = (("scripts.build_queue", "snapshot_codec", "codec"), ("scripts.buildlog", "charts", "charts"))
+        for package, module, alias in cases:
+            with self.subTest(module=module):
+                installed = self.root / "installed" / module
+                source = Path(memory_feed.__file__).resolve().parents[1]
+                _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                (installed / "config").mkdir()
+                _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
+                probe = textwrap.dedent("""
+                    import builtins
+                    import json
+                    import sys
+                    from pathlib import Path
+                    from unittest import mock
 
-            root = Path(sys.argv[1])
-            source = root / 'scripts/build_queue/snapshot_codec.py'
-            original_import = builtins.__import__
-            changed = False
-            def install_during_import(name, globals=None, locals=None, fromlist=(), level=0):
-                global changed
-                result = original_import(name, globals, locals, fromlist, level)
-                if name == 'scripts.build_queue' and 'snapshot_codec' in fromlist and not changed:
-                    changed = True
-                    source.write_text(source.read_text() + '\\nfrom dataclasses import dataclass\\n'
-                        '@dataclass(frozen=True)\\nclass InstalledSchemaRevision:\\n    revision: str\\n')
-                return result
-            builtins.__import__ = install_during_import
-            from scripts.build_queue import memory_feed
-            builtins.__import__ = original_import
-            assert changed
-            assert not hasattr(memory_feed.codec, 'InstalledSchemaRevision')
-            with mock.patch.object(memory_feed.admission_client, 'view',
-                    side_effect=AssertionError('The old decoder must not read the queue')):
-                status = memory_feed.main(['--once', '--code-root', str(root)])
-            print(json.dumps({'status': status, 'changed':
-                memory_feed.LOADED_ADMISSION_CODE_VERSION != memory_feed.installed_code_version(root)}))
-            sys.exit(status)
-        """)
-        result = subprocess.run([sys.executable, "-c", probe, str(installed)], cwd=installed,
-            env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(json.loads(result.stdout), {"status": 1, "changed": True})
-        restarted = textwrap.dedent("""
-            import sys
-            from unittest import mock
-            from scripts.build_queue import memory_feed
-            decoded = memory_feed.codec.parse_snapshot_value(
-                {'kind': 'InstalledSchemaRevision', 'revision': 'after'}, memory_feed.codec.InstalledSchemaRevision)
-            with (mock.patch.object(memory_feed, 'report_reading',
-                    return_value=memory_feed.charts.IndexUnavailable('private report fixture')),
-                  mock.patch.object(memory_feed, 'reading', return_value={
-                    'ok': True, 'read_at': 200001, 'decoder_revision': decoded.revision})):
-                sys.exit(memory_feed.main(['--once', '--code-root', sys.argv[1]]))
-        """)
-        result = subprocess.run([sys.executable, "-c", restarted, str(installed)], cwd=installed,
-            env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
-        self.assertEqual(page["decoder_revision"], "after")
+                    root = Path(sys.argv[1])
+                    source = root / sys.argv[2].replace('.', '/') / (sys.argv[3] + '.py')
+                    original_import = builtins.__import__
+                    changed = False
+                    def install_during_import(name, globals=None, locals=None, fromlist=(), level=0):
+                        global changed
+                        result = original_import(name, globals, locals, fromlist, level)
+                        if name == sys.argv[2] and sys.argv[3] in fromlist and not changed:
+                            changed = True
+                            source.write_text(source.read_text() + '\\nfrom dataclasses import dataclass\\n'
+                                '@dataclass(frozen=True)\\nclass InstalledSchemaRevision:\\n    revision: str\\n')
+                        return result
+                    builtins.__import__ = install_during_import
+                    from scripts.build_queue import memory_feed
+                    builtins.__import__ = original_import
+                    assert changed
+                    assert not hasattr(getattr(memory_feed, sys.argv[4]), 'InstalledSchemaRevision')
+                    with mock.patch.object(memory_feed.admission_client, 'view',
+                            side_effect=AssertionError('The old decoder must not read the queue')):
+                        status = memory_feed.main(['--once', '--code-root', str(root)])
+                    print(json.dumps({'status': status, 'changed':
+                        memory_feed.LOADED_FEED_CODE_VERSION != memory_feed.installed_feed_code_version(root)}))
+                    sys.exit(status)
+                """)
+                result = subprocess.run([sys.executable, "-c", probe, str(installed), package, module, alias], cwd=installed,
+                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"status": 1, "changed": True})
+                restarted = textwrap.dedent("""
+                    import sys
+                    from unittest import mock
+                    from scripts.build_queue import memory_feed
+                    decoded = memory_feed.codec.parse_snapshot_value(
+                        {'kind': 'InstalledSchemaRevision', 'revision': 'after'},
+                        getattr(memory_feed, sys.argv[2]).InstalledSchemaRevision)
+                    with (mock.patch.object(memory_feed, 'report_reading',
+                            return_value=memory_feed.charts.IndexUnavailable('private report fixture')),
+                          mock.patch.object(memory_feed, 'reading', return_value={
+                            'ok': True, 'read_at': 200001, 'decoder_revision': decoded.revision})):
+                        sys.exit(memory_feed.main(['--once', '--code-root', sys.argv[1]]))
+                """)
+                result = subprocess.run([sys.executable, "-c", restarted, str(installed), alias], cwd=installed,
+                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+                self.assertEqual(page["decoder_revision"], "after")
 
     def test_queue_priority_reaches_the_feed_and_clears_when_removed(self) -> None:
         base = captured_reading()
