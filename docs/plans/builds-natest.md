@@ -1940,7 +1940,7 @@ Each stop sends sdlc one message through `session_send.send_argv`, after the res
 - Direct calls for routing cases: no narrow production function exists, and a fixture must not copy the routing decision.
 - The remaining cost is verify-unit's: `step_selection.py` imports (2.4 CPU s measured), a lazy `cell_value` import (1.6 CPU s measured), and a routing boundary (up to 15.0 CPU s estimated).
 
-### Phase 96 — A changed config file selects the tests that read it  · status: todo
+### Phase 96 — A changed config file selects the tests that read it  · status: done
 **Depends on:** none
 
 #### Work Order
