@@ -172,9 +172,24 @@ Idle workers and blocked Claude workers use `agent prompt`.
 The command refuses workers held by another parent.
 A repeated saved launcher reads the transcript and returns without another submission.
 For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
+Each completion notice ends its first line with `; pass <dispatch instance id>`.
+An explicit rerun repeats the saved completion text with the same pass id.
 This rule also applies to a completed managed Astra review.
 The saved completion preserves the reason and pane for a close anomaly.
 A successful completed rerun sets its status file to `done` after it sends the notice.
+Each notice names the worker and uses its native identity, including reruns from the director.
+The saved completion supplies the sender identity for a retired managed Astra reviewer.
+The sender identity remains the same after a session change and retirement.
+Turn and run events send one notice when the outcome, reply, or run ids change.
+An unchanged outcome, reply, and run ids send no notice.
+Waiting notices add `; runs <run ids>` to the first line.
+The run ids include received results that still await a worker reply.
+An empty turn reply writes no reply file and adds no `; reply <path>` text.
+Run events retain the last worker reply while a result awaits a reply.
+A live run reports `waiting on runs`, including when an earlier result awaits a reply.
+A refused launcher retry retains the existing pass and its run, including a run with one worker.
+A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+The review trial uses the latest completion duration for each pass.
 The hook follows the worker's link to its existing pass state, including runs outside the run root.
 Exit 0 means submitted. The turn hook records completion and sends the director its reply path.
 

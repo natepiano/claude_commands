@@ -3462,39 +3462,67 @@ An identical rerun of a completed dispatch sends the saved completion notice aga
 
 **Ruled out:** a wait or retry for the first-launch identity — the cause was the hook process in the foreground group.
 
-### Phase 34b — A turn end while a final run is live  · status: todo
+### Phase 34b — A turn end while a final run is live  · status: done
 
-**Depends on:** Phase 34a. sdlc [03851fa8] and [429a1166], 2026-11-09.
+#### As-built
 
-1. **Exit-3 recovery cannot record a finished pass.** fastest-unit Phase 52: the worker wrote `DONE f82a956c` in its pane, and lint and tests passed. The launcher exited 3: the worker ended a turn while its detached final run was live. The documented exit-3 recovery then failed twice with exit 2: first `last turn does not end with the dispatch DONE line`, then `launcher has not recorded a completed pass` (`worker_panes._idle_checks`; the pass is recorded as `error`). Fix it where it lives.
-2. **Each turn end sends a new identical notice.** fix-rounds Phase 10l: the turn-end hook sent `phase 10l: waiting on run reply; reply .../claude-build-followups-sdlc-fix-rounds-study_reply_turn.txt` three times to one session, 03:44 to 03:52 EST; the send repeat guard held the third copy. Send one notice per pass state.
-3. **WAITING_ON_REPLY with an empty reply while a final run is live.** In the same pass, `reply_turn.txt` held 1 byte while gate run 20261109T034623 was live; the final reply ended with DONE and the status is `done`. Evidence: `/tmp/claude/unit/e325ab73-1e3b-4649-88f2-c29cf0dda72f/phases/10l/`.
-4. **A rerun notice names the director as sender.** Phase 34a's `turn_end.repeat_completion_notice` runs in the director's process, so send.py names the director's session as the sender. sdlc [b44cd730], 2026-11-09.
+A worker's later DONE completes a pass that the launcher recorded as `error`. `progress_history.complete_dispatch` finds the pass with `_pass_slots`; a `completed` result on an `error` pass reopens it to `active` and closes it through the normal recorder event. `assign.execute_herdr` records `error` on exit 1 or 2 only when the run holds a new pass instance. `assign.end_failed_launch` ends the run only when no pass is active, refused or completed. Cause (fastest Phase 52): exit 3 recorded the pass as `error`, and the close checks then refused the DONE turn.
+
+The hook sends one notice per pass state. `turn_end._send_notice` stamps `sha256(outcome, reply, run ids)` in `passed["hook_notice"]` and sends nothing for a matching stamp. Each notice's first line names the pass: `<worker>: phase <id>: <outcome>; reply <path>; pass <dispatch id>`. A waiting notice adds `; runs <run ids>` from `DispatchWaitingForRuns.runs` or `DispatchAwaitingReply.runs`. Cause (sdlc [6614b653], [8442f21b]): separate passes and separate runs sent identical text, and the send repeat guard held the third copy.
+
+An empty turn reply writes no `_reply_turn` file, and the notice leaves out `; reply <path>`. Run events use the last worker reply (`DispatchAwaitingReply.last_reply`), not `event.reply`. Cause of the 1-byte file: an empty `event.reply` plus the newline that `worker.save_reply` adds.
+
+The hook sends in process: `send.send` with `ForwardedSender(<worker stamp>)` and `ShownSender(<worker name>)`; only `sent` and `skipped` count as delivered. `_finish_completion` saves the worker's `sender_native_id` in `HookCompletion`. `repeat_completion_notice` reads it, so a rerun from the director names the worker, also after a session change and retirement. `_review_trial` counts the latest `pass_finished` duration once per pass.
+
+Live proof (2026-11-09 05:10-05:14 EST, one new Codex worker, two passes with a 20 s detached run each): each pass sent `waiting on runs`, `waiting on run reply` and `done`, each with its pass and run ids. An identical rerun repeated one done notice. All notices came from the worker's native identity; the guard held none.
+
+**Files:**
+- `scripts/herdr/turn_end.py` — `_send_notice` (in-process send, pass and run ids, stamp), `_finish_completion` (sender stamp), `handle` (reply source, empty reply).
+- `scripts/production/worker.py` — `DispatchAwaitingReply.runs`.
+- `scripts/direct/progress_history.py` — `complete_dispatch` error correction, `HookCompletion.sender_native_id`, `_review_trial`.
+- `scripts/direct/assign.py` — `execute_herdr` new-instance error, `end_failed_launch` pass statuses.
+- Tests: `scripts/herdr/test_turn_end.py`, `scripts/production/test_worker.py` (`DispatchAgent.pane_commands` patches `send._send`), `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_progress_history.py`, `scripts/agents/test_detached_runs.py` (completed-owner row).
+- Docs: `docs/as-built/long-lived-workers.md`, `docs/as-built/herdr-adoption.md`.
+
+**Binds later work:** a test that runs the hook captures notices with `test_worker.DispatchAgent.pane_commands`, which patches `send._send`; a `subprocess.run` patch no longer sees them. A reader of notice text expects `; pass <id>` and, for waits, `; runs <ids>`.
+
+**Gotchas:** inside one pass, a wait with an unchanged outcome, reply and run ids sends nothing. Until this code is on main, the live hook still sends the old text, so the repeat guard can still hold done notices.
+
+### Phase 34c — Worker-pane anomalies from the builds report  · status: todo
+
+**Depends on:** Phase 34b (same hook and close code). sdlc [c2b76faf], 2026-11-09, from the builds showrunner's report.
+
+1. **A turn end with no DONE sends no message.** A `recorder` worker ended its turn without the DONE reply. No turn-hook message reached the director; the director read the result from the transcript. A turn end with no DONE must send the director one message.
+2. **A worker close exits 8 with the pane still open.** The `worker_panes.py` close of `recorder` exited 8: `worker stop has no fresh shell or closed-pane proof` (`scripts/shutdown/stop_resume.py:239`). The pane is still open.
+3. **A review DONE sends no turn-hook message.** sdlc [7b64ed16], from models Phase 1. Reviewers `models-review2` (adversary) and `models-review3` (contract) printed DONE in their panes at 04:44 to 04:45 EST. No turn-hook message reached the models director. Their status files still read `running`, and the style state reads `Error`. Check the `review.sh` pass path through `turn_end`. The models director read the results from the panes.
+4. **The completion hook's staff lookup fails.** sdlc [3e629889]. A models worker finished its turn, and the hook did not wake the models director. The hook run log reads `staff worktree is unavailable` (`session_staff.py:259` or `unit_lookup.py:272`). Models worktree: `/home/natepiano/worktrees/models`. Find why the lookup fails for this worker, and fix it at the cause.
+
+Evidence (sdlc [335976f2]): `/tmp/claude/unit/ed9c66cd-d74e-480c-9cca-766bc9f0702c/phases/42/`. `recorder_status` reads `running` after the 04:06 turn end, `recorder_reply_turn.txt` is 1 byte, and `recorder_agent.log` holds the launch. The 1-byte turn reply is the Phase 34b item 3 shape; check item 1 against the 34b fix first. Ask the builds showrunner for the close exit-8 output.
 
 #### Work Order
 
-**Goal:** A turn end during a live final run records the finished pass, and each pass state sends one notice from the worker.
+**Goal:** Every worker turn end reaches its director once, and a worker close removes the pane or names why.
 
 **Spec:**
 
-1. Item 1: find where exit 3 and the two exit-2 refusals come from. Evidence: `/tmp/claude/unit/e700519d-30f7-47eb-94c7-97082b8f7750/phases/52/` (`pane_reply.txt`, `status.txt`, the impl2 status and log). Fix the cause where it lives, so the worker's later `DONE` turn completes the pass and the pane can close.
-2. Item 2: the hook sends a notice only when the pass state changes. A turn end with the same outcome and the same reply sends nothing.
-3. Item 3: find why the turn reply was 1 byte and the outcome `WAITING_ON_REPLY` while a run was live. Fix the cause, so the outcome is `WAITING_ON_RUNS` with the real reply.
-4. Item 4: a rerun notice names the worker as its sender, the same as the hook's notice.
+1. Item 1: replay the `recorder` evidence against the Phase 34b hook. If a no-DONE turn end still sends nothing, find the cause and fix it, so the director gets one `no DONE` notice.
+2. Item 2: find why the close of `recorder` exited 8 at `stop_resume.py:239` with the pane open. Fix the cause where it lives, so a close of a stopped worker removes its pane. Ask the director for the builds exit-8 output if the evidence folder does not show it.
+3. Item 3: follow a `review.sh` pass from the reviewer's DONE through `turn_end.handle`. Find where it stops, and fix it, so the review status reads `done` and the director gets one notice.
+4. Item 4: find why the staff lookup reads `staff worktree is unavailable` for the models worker (`session_staff.py:259`, `unit_lookup.py:271`). Fix it at the cause, so the hook wakes the director.
 5. Update `docs/as-built/long-lived-workers.md` and `docs/as-built/herdr-adoption.md` where they state the changed behavior.
 6. Add no check, refusal, validation, retry or wait that this list does not name.
 
 **Files:**
 
-- `scripts/herdr/turn_end.py`, `scripts/herdr/test_turn_end.py` — notice once per pass state, sender, run-live outcome.
-- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — close checks for a pass that ends after a live run.
-- `scripts/production/worker.py`, `scripts/production/test_worker.py` — receipt and rerun path.
-- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — pass status after exit 3.
-- `scripts/direct/assign.py`, `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/test_assign_launcher.py` — exit-3 path and Astra rerun.
-- `scripts/agents/detached_runs.py`, `scripts/agents/test_detached_runs.py` — run-finished delivery, only if the cause is there.
+- `scripts/herdr/turn_end.py`, `scripts/herdr/test_turn_end.py` — no-DONE notice, review pass path.
+- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — the close.
+- `scripts/shutdown/stop_resume.py`, `scripts/shutdown/test_stop_resume.py` — the close proof, only if the cause is there.
+- `scripts/direct/review.sh`, `scripts/direct/assign.py`, `scripts/direct/test_assign_launcher_review.py` — the review pass path.
+- `scripts/production/session_staff.py`, `scripts/production/test_session_staff.py`, `scripts/production/unit_lookup.py`, `scripts/production/test_unit_lookup.py` — the staff lookup.
+- `scripts/production/worker.py`, `scripts/production/test_worker.py` — receipt, only if the cause is there.
 - `docs/as-built/long-lived-workers.md`, `docs/as-built/herdr-adoption.md` — the changed behavior.
 
-**Workers:** `1 writer` — `hook34`, which holds the Phase 34 and 34a design.
+**Workers:** `1 writer` — `hook34`, which holds the Phase 34, 34a and 34b design.
 
 **State:** none new.
 

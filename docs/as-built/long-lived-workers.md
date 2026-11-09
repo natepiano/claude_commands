@@ -36,7 +36,8 @@ The native hook starts one separate handler process and returns.
 The handler runs once outside the terminal session.
 The pass retains its id, launcher arguments, reply path, and completion actions.
 The director ends its turn after the assigned synchronous review.
-The turn hook sends the director the worker, phase, outcome, and reply path.
+The turn hook sends the director the worker, phase, outcome, and pass id.
+The notice includes the reply path when the reply has text.
 The director reads that reply when the message resumes it.
 
 `scripts/herdr/turn_end.py` serves both families.
@@ -57,6 +58,16 @@ This rule also applies to a completed managed Astra review.
 The saved completion includes the reason and pane for a close anomaly.
 A successful completed rerun sets its status file to `done` after it sends the notice.
 Native duplicate hook events still send no second message.
+Each completion notice ends its first line with `; pass <dispatch instance id>`.
+An explicit rerun repeats the saved completion text with the same pass id.
+Each notice uses the worker's native identity and name, including a notice from the director's rerun.
+The saved completion supplies the sender identity for a retired managed Astra reviewer.
+The sender identity remains the same after a session change and retirement.
+Turn and run events send no notice when the outcome, reply, and run ids match the last notice.
+A changed outcome, reply, or run id sends one notice.
+Waiting notices add `; runs <run ids>` to the first line.
+The run ids include received results that still await a worker reply.
+An empty turn reply writes no reply file and adds no `; reply <path>` text.
 
 A new Codex worker has no resume argument.
 Its pane session report supplies the first native identity.
@@ -66,6 +77,8 @@ Every other foreground process prevents the pane report from proving a sole Code
 `worker.dispatch_receipt` owns the completion rule.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
 A pending run reply or friend reply keeps the pass active without another prompt.
+Run events preserve the last worker reply while a result awaits a reply.
+A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A worker puts its question in its reply and ends the turn.
 The turn hook sends that reply to the director.
 An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
@@ -73,6 +86,9 @@ A turn without DONE reports `no DONE` when no pending work explains it.
 The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
+A refused launcher retry retains the existing pass and its run, including a run with one worker.
+A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+The review trial uses the latest completion duration for each pass.
 A close anomaly retains the completed outcome and reaches the director in the hook message.
 A held reviewer role remains held after submission. Completion ends that reviewer and releases the role.
 
