@@ -44,11 +44,12 @@
 
 `scripts/usage/context_economy_read.py` reads one time window at run time and writes nothing.
 - `read_claude(projects_root, since, until, machine) -> list[Session]` reads `*/*.jsonl` and `*/*/subagents/*.jsonl` with modification time at or after `since`, and keeps records with `since <= timestamp < until`. Requests are deduplicated by (`message.id`, `requestId`); the last record gives the usage. It returns only sessions with requests, compactions or starts in the window.
-- `Request(at, model, cli_version, input, cache_read, cache_write_5m, cache_write_1h, output)`; `context` is the sum of input and the three cache fields.
+- `Request(at, model, cli_version, input, cache_read, cache_write_5m, cache_write_1h, output)`; `context` is the sum of input and the three cache fields. Records with model `<synthetic>` are not requests: they have zero usage and no `requestId`.
 - `CompactionEvent(at, trigger, pre_tokens, post_tokens, kind)`; `kind` is `precomputed`, `normal` or `unknown`.
-- `Start(at, source, cli_version)`: one per `toolUseID` at its first hook record over the whole file, kept only inside the window. `startup` and `resume` only.
+- `Start(at, source, cli_version)`: one per `toolUseID` at its first hook record over the whole file. A change of the record `version` with no hook record adds a `resume` start: a restart does not always write a hook record. `starts` holds the starts inside the window and the latest start before `since`. `startup` and `resume` only.
 - `Session(machine, family, session_id, agent_id, requests, compactions, starts, first_record_at)`; `first_record_at: datetime | SessionBeginningUnknown` is the first record of the file, also before `since`.
-- `configured_checkout()` gives `CONTEXT_ECONOMY_CHECKOUT`, else `~/.claude`. `settings_timeline(checkout, since, until) -> list[SettingsSet]` reads `git log --first-parent main`, keeps a commit only when the tracked values change, and adds the set in force at `since`. A tracked file is `{"bytes", "sha": sha256[:12]}`.
+- The reader parses only the lines that can hold a request, a compaction, a start, a version change or the first timestamp.
+- `configured_checkout()` gives `CONTEXT_ECONOMY_CHECKOUT`, else `~/.claude`. `settings_timeline(checkout, since, until) -> list[SettingsSet]` reads the checkout's HEAD reflog (`git log -g HEAD`), keeps an entry only when the tracked values change, and adds the set in force at `since`. The reflog time is when the live files changed; `main` moves by fast-forward, so commit times are wrong. Blobs come from two `git cat-file` batch calls. A tracked file is `{"bytes", "sha": sha256[:12]}`.
 - `settings_for(at, timeline) -> SettingsSet | SettingsUnknown` gives the latest set at or before `at`; on equal times the later timeline entry wins. `label(current, previous)` gives `key=<json>` for each changed value, joined by `, `.
 - `role_of(store, machine, family, session_id, agent_id) -> str` opens the ledger read-only, maps the identity through `collect.identity_columns`, and gives `unknown` when no row matches or the store is missing.
 
@@ -63,7 +64,7 @@
 - The ledger stores a main Claude session with `parent_id = ''`.
 - `~/.claude/scripts/lib/py -m` imports the main checkout; test a worktree with `python3 -m unittest` or the worktree's `scripts/lib/py`.
 
-### Phase 2 — The report, saved results and comparisons  · status: todo
+### Phase 2 — The report, saved results and comparisons  · status: done
 **Depends on:** Phase 1
 
 #### Work Order
@@ -99,7 +100,7 @@
 **Constraints from prior phases:** Phase 1 gives `scripts/usage/context_economy_read.py` and `config/context_economy.conf` (keys `settings_keys`, `files`, `min_requests`, `active_gap_seconds`, read with `conf.read("context_economy")`).
 - `read_claude(projects_root, since, until, machine) -> list[Session]`. `Session` has `machine`, `family`, `session_id`, `agent_id`, `requests`, `compactions`, `starts` and `first_record_at: datetime | SessionBeginningUnknown`.
 - `Request` has `at`, `model`, `cli_version`, the token fields and a `context` property. `CompactionEvent` has `at`, `trigger`, `pre_tokens`, `post_tokens` and `kind` (`precomputed|normal|unknown`). `Start` has `at`, `source` (`startup|resume`) and `cli_version`.
-- `read_claude` keeps only starts inside the window. No reader function assigns settings to a request. This phase applies Spec item 2: a request takes the settings of its session's latest start at or before it. A request before any start in the window takes `settings_for(first_record_at, timeline)`, or `SettingsUnknown` when `first_record_at` is `SessionBeginningUnknown`.
+- `read_claude` keeps the starts inside the window and the latest start before `since`. No reader function assigns settings to a request. This phase applies Spec item 2: a request takes the settings of its session's latest start at or before it. A request before any start in the window takes `settings_for(first_record_at, timeline)`, or `SettingsUnknown` when `first_record_at` is `SessionBeginningUnknown`.
 - `settings_timeline(checkout, since, until) -> list[SettingsSet]`; get the checkout from `configured_checkout()`. `settings_for(at, timeline) -> SettingsSet | SettingsUnknown`. `label(current, previous) -> str`.
 - `role_of(store, machine, family, session_id, agent_id) -> str` opens the ledger read-only and returns `unknown` when no row matches.
 - Run the worktree tests with `python3 -m unittest`. `~/.claude/scripts/lib/py -m` imports the main checkout, not the worktree.
