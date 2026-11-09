@@ -264,13 +264,13 @@ class VerifyHoldWaitFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        VerifyHoldTools.setUpClass()
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
+        VerifyHoldTools.setUpClass()
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
         self.addCleanup(self.fixture_cleanups)
+        self.fixture.setUp()
         root = self.fixture.root
         pressure = root / "memory-pressure"
         write_pressure_reading(pressure)

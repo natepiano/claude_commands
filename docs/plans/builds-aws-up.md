@@ -72,10 +72,24 @@ Jobs use natedev and the Mac while AWS routing stays closed.
 4. **Gate trial evidence.** Done 2026-11-07 at dac70bfcf. All 18,630 tests pass on each size. Median test time: 16 vCPU 491 s, 32 vCPU 299 s, 64 vCPU 303 s. The cheapest size within the 420 s target is 32 vCPU, at about $0.04 a gate. 64 vCPU is no faster: the slowest modules set a floor near 300 s. Request to ready takes about 52 s; teardown takes about 27 s. AWS refused one box at 8 running Spot boxes (an instance-count limit).
 5. **Cloud gate route.** Merge gates and targeted tests both run on 32-vCPU Spot boxes. Up to 9 run at once; later gates wait in the build queue. When no 32-vCPU Spot box is free in any zone, the gate uses 16 vCPU. Spot only, no on-demand. Watch the $20 daily cap. User, 2026-11-07. natedev runs gates only when AWS is down or the cap is reached (director call; the user may change it). Nine at once needs a higher Spot instance-count limit: the user asks AWS. Design: docs/plans/merge-gate-instances.md, with these user changes. One `deploy.py up` adds the scoped grants, gate bucket, launch template and expiry function.
 6. **Queue tracking and progress.** The build queue holds each cloud gate as an entry that takes no natedev memory and holds one cloud slot. The box pushes its log every 5 s. The queue shows modules done of the total, in the HTML page and in `/build:queue`. The queue unit owns the displays; this unit supplies the data. User, 2026-11-07.
-7. **Prepared gate image.** A saved image holds the tools, so a box skips the 48 s setup. The image depends only on the package list and the nixpkgs revision. A changed input builds a new image; a code change never does. Names: the feature is the cloud gate (user, 2026-11-07: "cloud gate - i like it"). The machines, their image and their NixOS setup are `cloud-claude-gate` (user, 2026-11-07: "the machines should be called cloud-claude-gate"). The trial then measures setup again. User, 2026-11-07.
+7. **Prepared gate image.** The image holds the configured packages at the host nixpkgs revision.
+   Run `scripts/lib/py scripts/aws_target/deploy.py gate-image --approve-resources` at the terminal.
+   Without approval, the command prints its plan and needs no credentials.
+   It prepares one temporary `cloud-claude-gate` box through the common image code.
+   It terminates the box after success, failure, interruption, or the time limit.
+   It replaces older gate images and snapshots only after the new image becomes available.
+   The command updates only GateImage in the live stack and records the new launch template version.
+   The next gate uses the image; its source bundle still supplies every code change.
+   Only changed packages or a changed nixpkgs revision require a new image.
+   Without matching saved tools, the gate uses the existing tool fetch.
+   The boot stage names remain unchanged for the next trial.
+   Expected saving: median 24 seconds, with a measured range of 18 to 119 seconds.
+   `gate_image_timeout_s` bounds preparation; `gate_image_snapshot_usd_per_gib_month` prices the snapshot estimate.
+   The command prints the size in GiB and the monthly snapshot estimate.
+   `down` removes the gate image and its snapshot while retaining the separate builder image.
 8. **Capacity record.** Record slots in use, queue waits, capacity refusals, 16-vCPU fallbacks and Spot interruptions. The record decides two things later: whether to ask AWS for more Spot capacity, and whether Spot stays. User, 2026-11-07: stay on Spot; measure first.
 
-Order: the route comes first, because the user wants gates on these boxes as soon as possible (2026-11-07). The image saves only 48 s, so it follows.
+Order: the route comes first, because the user wants gates on these boxes as soon as possible (2026-11-07). The image saves a median of 24 seconds, so it follows.
 
 Rule for phases 5 to 8: every setting (sizes, slot count, log push interval, fallback order) is in config, never in code. User, 2026-11-07.
 
