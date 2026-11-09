@@ -213,12 +213,12 @@ Each local Promote checkout must exist before the command pushes.
   `start_gate` starts `bump_gate.py --record <step record>` before promotion.
   The checkpoint does not wait for its result.
   `copies.standing` supplies a checkout of the recorded pushed tip.
-  `run_checkpoint_test_steps` supplies the shared test, flake, and retry rules.
+  `checkpoint_gate.run_checkpoint_test_steps` supplies the shared test, flake, and retry rules.
   The production checkout retains flake notes, and `bump-gate.log` retains output.
   The record holds the test plan, tip, runner pid and start, result, detail, and successful recipients.
   A live runner prevents another launch; unknown liveness holds the gate.
   A dead runner without a result permits another launch.
-  Completion and delivery compare the current tip, pid, and process start under `record_lock`.
+  Completion and delivery compare the current tip, pid, and process start under `checkpoint_gate.record_lock`.
   A replaced runner cannot publish a result or deliver a notice.
   Red results reach the unit and showrunner; green results reach the showrunner.
   Delivery resolves current sessions from the recorded fixed owner and unit ids.
@@ -693,7 +693,12 @@ Saved progress state uses the fixed staff reference instead of a copied session 
 
 ### Waits, renames and alerts: `waiting.py`
 
-Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so a bad doc fails as one line. A unit is named by its Unit value, or by its session's name now. `units_from_doc` reads `unit_lookup.doc_units` and the lookup, so `search` and `agenda` pass over a retired unit, and `named_unit` (`scratch-test`, `eta-request`) refuses one as `unknown unit <name>`.
+Each subcommand takes `--production`.
+`main` catches `checkpoint_gate.Stop` and reports a bad doc on one line.
+A unit uses its Unit value or its current session name.
+`units_from_doc` reads `unit_lookup.doc_units` and the lookup.
+`search` and `agenda` skip retired units.
+`named_unit` (`scratch-test`, `eta-request`) refuses a retired unit as `unknown unit <name>`.
 
 - `scratch-test <unit> --tests "<command>" --state-dir <dir>`: a detached temporary worktree at the unit's branch tip, `merge --no-commit --no-ff <merge branch>`, then `sh -c <tests>` into `<state-dir>/scratch-test-<unit>-<YYYYmmdd-HHMMSS-ffffff>.log`. `ScratchGreen(log) | ScratchRed(last 4 lines, log) | ScratchConflict`; the verdict prints first; the worktree and merge state are always removed; nothing is committed or pushed. A red never says `blocked`; a conflict is a `failed` line, not a red. The log path feeds `ci_points.py notice lift`.
 - `waits`: `cargo-berth board --json` overlaps (an `unconfigured` envelope reads `berth not configured`) and the LOG's `block: <waiting> on <unit> (code|files: …), clears ~HH:MM` / `block cleared: …` pairs as `WaitOpen(since) | WaitCleared`. Each open wait prints its age and `act now` at 60 minutes open or 30 minutes past its clear time. A `block:` or `block cleared:` line whose waiting unit is in `retired_units` is dropped; a live unit's wait on a retired unit stays.

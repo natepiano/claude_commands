@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 from scripts.shutdown import remote
 
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
@@ -45,7 +47,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
             production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
-            steps = merge_checkpoint.test_steps(production, ("scripts/aws_target/proof_crate/src/lib.rs",), ())
+            steps = checkpoint_gate.test_steps(production, ("scripts/aws_target/proof_crate/src/lib.rs",), ())
             self.assertEqual(len(steps), 1)
             self.assertEqual(steps[0].label, "package aws-routing-proof")
             self.assertEqual(steps[0].command[-2:], ["test", "aws-routing-proof"])
@@ -59,7 +61,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
             production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
-            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            steps = checkpoint_gate.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(len(steps), 2)
             self.assertEqual(steps[1].label, "example aws-routing-proof/demo")
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
@@ -71,7 +73,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
             production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
-            steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
+            steps = checkpoint_gate.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(steps, [])
 
     def test_package_commands_and_retries_use_the_package_folder(self) -> None:
@@ -100,7 +102,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     log = checkout / "test.log"
                     merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)
                     with mock.patch.dict(os.environ, {"MERGE_CHECKPOINT_VERIFY": str(verify)}):
-                        _ = merge_checkpoint.run_checkpoint_test_steps(
+                        _ = checkpoint_gate.run_checkpoint_test_steps(
                             production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log)
                     output = log.read_text()
                     self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
@@ -680,7 +682,7 @@ class TestPassedTests(unittest.TestCase):
 
     def judge(self, status: int, stdout: str, stderr: str = "") -> bool:
         result = subprocess.CompletedProcess(["basedpyright"], status, stdout, stderr)
-        return merge_checkpoint.test_passed(result)
+        return checkpoint_gate.test_passed(result)
 
     def test_clean_basedpyright_requires_status_zero(self) -> None:
         self.assertTrue(self.judge(0, "0 errors, 0 warnings, 0 notes\n", self.VENV))
@@ -692,8 +694,8 @@ class TestPassedTests(unittest.TestCase):
 
     def test_other_commands_pass_only_on_status_zero(self) -> None:
         result = subprocess.CompletedProcess(["python3"], 3, "0 errors, 0 warnings, 0 notes\n", "")
-        self.assertFalse(merge_checkpoint.test_passed(result))
-        self.assertTrue(merge_checkpoint.test_passed(subprocess.CompletedProcess(["python3"], 0, "", "")))
+        self.assertFalse(checkpoint_gate.test_passed(result))
+        self.assertTrue(checkpoint_gate.test_passed(subprocess.CompletedProcess(["python3"], 0, "", "")))
 
 
 @final
@@ -720,8 +722,8 @@ class MacPromotionPathTests(unittest.TestCase):
 
     def test_mac_pull_queues_only_connection_failures_and_preserves_zone_notices(self) -> None:
         cases = (("offline", 255, "", "", main_publish.MacPullPending),
-                 ("remote failure", 0, "rc=1\n", "", merge_checkpoint.Stop),
-                 ("remote exit 255", 255, "rc=1\n", "", merge_checkpoint.Stop),
+                 ("remote failure", 0, "rc=1\n", "", checkpoint_gate.Stop),
+                 ("remote exit 255", 255, "rc=1\n", "", checkpoint_gate.Stop),
                  ("pulled", 0, "rc=0\n", "", main_publish.MacPulled),
                  ("pulled with zone", 0, "rc=0\n", "Zone changed", main_publish.MacPulled),
                  ("offline with zone", 255, "", "Zone changed", main_publish.MacPullPending))
@@ -742,8 +744,8 @@ class MacPromotionPathTests(unittest.TestCase):
                     waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
                     if text or expected is not main_publish.MacPullPending:
                         main_publish.queue(waiting)
-                    if expected is merge_checkpoint.Stop:
-                        with self.assertRaises(merge_checkpoint.Stop):
+                    if expected is checkpoint_gate.Stop:
+                        with self.assertRaises(checkpoint_gate.Stop):
                             _ = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state)
                         self.assertEqual(main_publish.read_queue(), waiting)
                         continue

@@ -1,6 +1,8 @@
 """A killed checkpoint resumes unfinished work using its own merge evidence."""
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 import argparse
 import json
 from collections.abc import Callable
@@ -247,7 +249,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         expected_log = self.log.read_text().split(": ", 1)[1]
         self.restore_case(snapshot)
         if failed_promotion:
-            with patch.object(merge_checkpoint, "promote", side_effect=merge_checkpoint.Stop(
+            with patch.object(merge_checkpoint, "promote", side_effect=checkpoint_gate.Stop(
                     "promote", "failed", "injected failure", "retry promotion")):
                 failed = self.run_handoff(checkpoint)
             self.assertNotEqual(failed.returncode, 0)
