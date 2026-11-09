@@ -771,25 +771,16 @@ Acceptance: the targeted test, the package import bootstrap and basedpyright are
 
 ### Phase 31 — A bare worker name reaches only the sender's own unit's worker  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `send.py --to <bare worker name>` from a worker or a unit director reaches the worker of that name in the sender's own unit, and fails as ambiguous when the sender's unit has no such worker and other units do. It never picks another unit's worker.
+`send.py --to <bare worker name>` resolves the name among the workers of the sender's own unit. The sender's unit is the sender itself for a unit director, and its parent director for a worker. When only other units' workers match, the send refuses with `ambiguous staff row for '<name>'` and lists each full path; nothing is delivered. A bare name that matches a unit or a showrunner keeps its earlier behavior. A full path matches only its exact canonical path (`<production>/<unit>/<worker>`, or `worker:<unit>/<worker>` under the sender's showrunner).
 
-**Spec:**
-- Defect (builds showrunner, 2026-11-09): worker `impl2` of builds' `report` unit ran `send.py --to test2`. The message reached `sdlc/hierarchies/test2`, not `builds/report/test2`. Staff holds three workers named `test2`: under `report`, `panes` and `hierarchies`.
-- Find the path that picked `hierarchies/test2`. Start at `send.resolve_staff_recipient` (`scripts/message/send.py:2109`) and the roster lookup that runs before it (`resolve_recipient`, about line 2259, and the observed roster match). Name the cause in the summary.
-- Rule for a bare worker name: resolve it among the workers of the sender's own unit first. The sender's unit is the sender itself when it is a unit director, and the sender's parent director when the sender is a worker. If that unit has no worker of that name, never select another unit's worker by the bare name: when only other units' workers match, fail as ambiguous with the existing ambiguity message, and list the full paths. A bare name that matches a non-worker row (a unit or a showrunner) keeps its current behavior. A full path (`<unit>/<worker>`, `<production>/<unit>/<worker>`, `worker:<unit>/<worker>`) keeps its current behavior.
-- One resolution rule for all callers. Do not copy the rule into a second place. Repair it where the defect lives.
-- Add rows to the existing send tests. Do not add a new test file. Cover: a worker sender with a same-unit match and a second unit's row of the same name; a unit director sender; a worker sender whose unit has no such worker while one other unit does (fails, no delivery), and while two other units do (ambiguous); and a full path that still reaches another unit's worker.
-- Tests use fixture staff and fixture rosters only. No live unit, pane or session.
+The earlier cause: `resolve_staff_recipient` matched a bare name globally over staff, so a single match in another unit was delivered.
 
 **Files:**
-- `scripts/message/send.py` — bare worker name resolution.
-- `scripts/message/test_send*.py` — rows added to the existing tests that cover recipient resolution.
+- `scripts/message/send.py` — `resolve_staff_recipient` holds the own-unit rule; `_sender_staff_row` gives the sender's staff row (or `NoStaffSender`) to this rule and to the short `worker:` path.
+- `scripts/message/test_send.py` — rows in `test_parent_showrunner_path_uses_staff_current_session` and the pane worker delivery tests.
 
-**Workers:** 1 writer; the fix and its test rows touch one module and its tests, so nothing splits.
-- `impl` — `scripts/message/send.py` and its existing test files.
+**Gotchas:** a match on the last parts of a path makes an exact full path ambiguous when a longer path ends with the same parts; keep canonical-only matching.
 
-**State:** none.
-
-**Acceptance gate:** the send tests pass; the targeted test is green; basedpyright reports 0 on `scripts/message`.
+**Ruled out:** a `<unit>/<worker>` form without the production name.
