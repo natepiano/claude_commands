@@ -1123,7 +1123,9 @@ def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
 
 
 # Only the bootstrap is a separate program; all reading uses this module.
-REMOTE_BOOTSTRAP = """
+def bootstrap_program(call: str) -> str:
+    """Load the supplied reader modules and run the caller's final statement."""
+    return """
 import json, sys, types
 request = json.load(sys.stdin)
 for name in ('scripts', 'scripts.lib', 'scripts.usage'):
@@ -1136,8 +1138,10 @@ for name, source in request['modules'].items():
     module.__package__ = name.rpartition('.')[0]
     sys.modules[name] = module
     exec(compile(source, module.__file__, 'exec'), module.__dict__)
-sys.modules['scripts.usage.collect'].read_mac(request['cursors'])
-"""
+""" + call + "\n"
+
+
+REMOTE_BOOTSTRAP = bootstrap_program("sys.modules['scripts.usage.collect'].read_mac(request['cursors'])")
 
 
 def emit_remote(record: dict[str, object]) -> None:
