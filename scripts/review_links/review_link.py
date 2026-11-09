@@ -50,6 +50,18 @@ def link_host() -> str:
     return str(ipaddress.IPv4Address(result.stdout.strip()))
 
 
+def snapshot_url(root: Path, path: Path, *,
+                 host: str | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                 port: int | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> str:
+    """Return the review URL for a path under the selected root."""
+    relative = path.relative_to(root).as_posix()
+    if isinstance(port, conf.UseConfiguredValue):
+        port = conf.read("review_links").whole("server_port")
+    if isinstance(host, conf.UseConfiguredValue):
+        host = link_host()
+    return f"http://{host}:{port}/{quote(relative)}"
+
+
 def render_markdown(source: str, title: str) -> str:
     """Keep an escaped, readable copy visible until Markdown rendering succeeds."""
     metadata = ""
@@ -181,7 +193,7 @@ def snapshot_at(root: Path, files: list[Path], name: str = "review", *, new: boo
             if not reuse:
                 shutil.rmtree(folder)
             raise
-    return [f"http://{host}:{port}/{quote((folder / output).relative_to(root).as_posix())}"
+    return [snapshot_url(root, folder / output, host=host, port=port)
             for output in destinations]
 
 

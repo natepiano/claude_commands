@@ -133,6 +133,10 @@ td small { color: var(--ink-3); }
 h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .swaprows { display: grid; grid-template-columns: minmax(0, max-content) max-content minmax(0, 1fr); gap: 2px 8px; }
 .swaprows .row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: baseline; padding: 3px 0; border-radius: 6px; cursor: help; font-size: 0.88rem; }
+.swaprows .row.smaller .name { overflow: visible; white-space: normal; }
+.swaprows .row.smaller summary { padding: 0; }
+.swap-members { white-space: normal; overflow-wrap: anywhere; color: var(--ink-2); }
+.swaprows .row.total { border-top: 1px solid var(--line); margin-top: 4px; font-weight: 600; }
 .swaprows .row:hover { background: var(--free); }
 .swaprows .row .name { max-width: min(20rem, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .swaprows .row small { color: var(--ink-2); font-size: inherit; min-width: 0; overflow-wrap: anywhere; }
@@ -399,7 +403,7 @@ function rowUnit(row) {
   return row.ci ? visibleDetail(row) : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
 }
 function rowOwner(row, waiting = false) {
-  if (!waiting && (!row.queued || row.name === "between steps")) {
+  if (!waiting && (!row.queued || row.between_steps)) {
     return visibleDetail(row);
   }
   const owner = publicText(row.showrunner || "");
@@ -423,7 +427,7 @@ function rawTipText(key, d) {
   const [kind, i] = key.split(":");
   if (kind === "swap") {
     const r = d.swap_by[+i];
-    return r ? [`${r.name} · ${f1(r.swap)} GiB in swap`, `${r.detail}. Pages of this group that the system moved to disk. The queue does not count swap as build memory.`] : ["", ""];
+    return r ? [`${r.name} · ${f1(r.swap)} GiB in swap`, `${r.bytes} B. ${r.detail}. Pages of this group that the system moved to disk. The queue does not count swap as build memory.`] : ["", ""];
   }
   if (kind === "row") {
     const r = d.walk[+i];
@@ -568,7 +572,18 @@ function renderCloud(d) {
   $("cloud-rows").innerHTML = rows.map(text => `<div class="cloud-row">${esc(text)}</div>`).join("");
 }
 
+function swapAmount(bytes) {
+  const amount = Math.abs(bytes);
+  if (amount >= 1024 ** 3) return `${f1(bytes / 1024 ** 3)} GiB`;
+  if (amount >= 1024 ** 2) return `${f1(bytes / 1024 ** 2)} MiB`;
+  if (amount >= 1024) return `${f1(bytes / 1024)} KiB`;
+  return `${bytes} B`;
+}
+const swapView = new Map();
 function renderSwap(d) {
+  for (const details of document.querySelectorAll("#swaprows details")) {
+    swapView.set(details.dataset.ownerKey, details.open);
+  }
   const lv = level(d);
   $("pill").className = `pill ${lv}`;
   $("pill-t").textContent = ({ ok: "no memory pressure", warn: "memory pressure near limit", hold: "pressure: queue holds", neutral: "stall not recorded" })[lv];
@@ -585,14 +600,11 @@ function renderSwap(d) {
     $(`limit-${k}`).textContent = `Queue holds at ${lim}%`;
   }
   placeLimitLabels();
-  const sorted = d.swap_by.map((row, index) => ({row, index}))
-    .filter(({row}) => Math.round(row.swap * 1024) > 0)
-    .sort((a, b) => b.row.swap - a.row.swap);
-  const visible = sorted.slice(0, d.swap_rows);
-  const rest = sorted.slice(visible.length);
-  $("swaprows").innerHTML = visible
-    .map(({row: r, index: i}) => `<div class="row" data-tip="swap:${i}"><span class="name">${esc(publicText(r.name))}</span><span class="v">${memoryAmount(r.swap)}</span><small>${esc(visibleDetail(r))}</small></div>`).join("") +
-    (rest.length ? `<div class="row"><span class="name">${rest.length} smaller groups</span><span class="v">${memoryAmount(rest.reduce((sum, item) => sum + item.row.swap, 0))}</span></div>` : "");
+  $("swaprows").innerHTML = d.swap_by.map((row, index) =>
+    `<div class="row ${row.kind}" data-tip="swap:${index}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller" ? `<details data-owner-key="${esc(row.kind)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.detail.split("; ").map(part => `<div>${esc(part)}</div>`).join("")}</div></details>` : esc(row.name)}</span><span class="v">${swapAmount(row.bytes)}</span><small>${row.kind === "smaller" ? "" : esc(visibleDetail(row))}</small></div>`).join("");
+  for (const details of document.querySelectorAll("#swaprows details")) {
+    details.open = swapView.get(details.dataset.ownerKey) === true;
+  }
 }
 
 function renderLeftovers(d) {
