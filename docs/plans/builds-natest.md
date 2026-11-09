@@ -2160,40 +2160,23 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - Cases in one driver share `sys.modules`. `hook_dispatch._execute` loads each hook as a fresh module, so hook globals do not carry; keep HOME, PATH and cwd the same for all cases of one driver.
 
 ### Phase 109 — The sender guard folder goes when its test module ends  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the showrunner, 2026-11-09 (user rule of 2026-11-09: our processes clean up after themselves, as `tempfile` does). Report `/tmp/claude/leftover_sources_2026-11-09.md`, section "builds", item 2. `scripts/message/session_send_test_support.py:31` makes `tempfile.mkdtemp(prefix="sender-guard-")` and removes it only at `atexit`. A process that ends without `atexit` leaves the folder.
-
-**Goal:** each `sender-guard-` folder is removed when the test module that made it ends, and the runner still reports a module that started the real `send.py`.
-
-**Spec:**
-1. In `forbid_real_sender()`, make the folder with `tempfile.TemporaryDirectory`, or with the test's own cleanup (`unittest.addModuleCleanup` or `unittest.enterModuleContext`), so the folder goes when its module ends. Remove the `atexit` registration.
-2. `scripts/test_times/module_run.py` reads the marker after the suite ends (`marker.path.is_file()`). After this phase the folder can be gone at that time. Keep the result: record whether the marker file exists before the folder is removed, as a value in the `session_send_test_support` module state, and let `module_run.py` read that value. The record is never a file: it must not become a new leftover (the showrunner, 2026-11-09). A module that started the real `send.py` still exits 1 with `<pattern>: started the real scripts/message/send.py`.
-3. When `TEST_SENDER_GUARD` comes from a parent process, `forbid_real_sender()` makes no folder and removes nothing. The parent owns that path.
-4. When the module cleanup removes the folder, restore `TEST_SENDER_GUARD` to its value before the install and reset `refusal_marker`. A later module in the same process (`python3 -m unittest discover`) then makes its own folder.
-5. Keep the cleared-environment behavior: a second `forbid_real_sender()` call in the same module keeps the installed marker (`test_module_run.py`, mode `cleared_environment`).
-6. Add no check or scan. Add no signal handlers (the showrunner, 2026-11-09; user rule, 2026-11-05).
-7. Add assertions to existing tests only (user rules 1 and 2, 2026-11-07): the existing runner fixture tests in `test_module_run.py` assert that no `sender-guard-` folder stays in the fixture's temporary folder after the module ends.
+- `forbid_real_sender()` makes the `sender-guard-` folder with `unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="sender-guard-"))`, so the folder goes when its module ends. No `atexit` registration and no signal handler exist.
+- A module cleanup records the result in the in-memory `real_sender_started` value, restores `TEST_SENDER_GUARD` to its value before the install and resets `refusal_marker`. A later module in the same process makes its own folder. The record is never a file.
+- `real_sender_was_started()` returns `real_sender_started` or the existence of the installed marker file. `module_run.py` calls it, and a module that started the real sender exits 1 with `<pattern>: started the real scripts/message/send.py`.
+- A `TEST_SENDER_GUARD` value from a parent process makes no folder, and the module cleanup keeps that value.
 
 **Files:**
-- `scripts/message/session_send_test_support.py` — the folder lives for the module; the outcome record
-- `scripts/test_times/module_run.py` — reads the outcome record in place of the marker file
-- `scripts/test_times/test_module_run.py` — assertions that the folder is gone
-- `scripts/message/test_session_send.py` — only if a probe needs a change
+- `scripts/message/session_send_test_support.py` — guard install, module cleanup, outcome record
+- `scripts/test_times/module_run.py` — reads the outcome through `real_sender_was_started()`
+- `scripts/test_times/test_module_run.py` — `setup_exit` row; cleanup and no-folder assertions in the runner fixtures
+- `scripts/message/test_session_send.py` — `GUARD_PROBE` asserts the marker reset and the kept inherited value
 
-**Workers:** 1 writer; the files are one change
-- `impl` — all four files
+**Gotchas:**
+- Module cleanups run in reverse order. The record step registers after the folder context, so it runs before the folder goes.
+- A `SystemExit` in `setUpModule` ends the module before its cleanups run. The marker file still exists at that time, so `real_sender_was_started()` reads both sources.
 
-**Constraints from prior phases:**
-- Phase 26: `send.py` `main()` starts with the guard. It writes the marker file that `TEST_SENDER_GUARD` names and returns 1. Do not change `send.py`.
-- Phase 26: three modules call `forbid_real_sender()` in `setUpModule`: `build_queue/test_admission_service.py`, `buildlog/test_disk.py` and `message/test_session_send.py`. The `GUARD_PROBE` in `test_session_send.py` calls it at import time.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `test_module_run.py`, `test_session_send.py`, `test_admission_service.py` and `test_disk.py` pass.
-- A run of each of the three caller modules leaves no `sender-guard-` folder in its `TMPDIR`.
-- The `cleared_environment` runner test still fails its module with the `started the real scripts/message/send.py` line.
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- A guard for a test that runs a second in-process `unittest` runner: no test does this, and module cleanups are process-wide in `unittest`.
