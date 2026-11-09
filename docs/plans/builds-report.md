@@ -527,7 +527,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 **Ruled out:** a per-kill `cached_property` (under 1 ms per report).
 
-### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
+### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: done
 **Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`); queue-unit's Phase 34 (`/build:page`: `commands/build/page.md` runs `scripts/build_queue/memory_feed.py link`, which prints the page URL from `output_folder` in `config/memory_feed.conf`). From the builds showrunner (not the user), 2026-11-08: "queue owns the page link command and builds it after its Phase 33. The name still waits on the user." From the user (via the builds showrunner), 2026-11-08: "use /build:page that is fine". The builds showrunner added: start Phase 26 now with that name, and merge queue's Phase 34 when it lands on builds.
 
 From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
