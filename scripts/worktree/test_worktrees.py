@@ -264,13 +264,14 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual((tree / "code.txt").read_text(), "unlanded work\n")
 
     def test_dirty_and_staff_held_trees_preserve_all_items(self) -> None:
-        for reason in ("dirty", "staff-held", "switched", "detached"):
+        for reason in ("dirty", "staff-held", "switched", "detached", "no-commit"):
             with self.subTest(reason=reason):
                 tree = self.trees / reason
                 self.make(tree, reason)
-                _ = self.commit(tree, f"{reason}.txt", "landed work\n")
-                self.publish(tree, reason)
-                self.land(reason)
+                if reason != "no-commit":
+                    _ = self.commit(tree, f"{reason}.txt", "landed work\n")
+                    self.publish(tree, reason)
+                    self.land(reason)
                 if reason == "dirty":
                     _ = (tree / "code.txt").write_text("uncommitted work\n")
                 elif reason == "staff-held":
@@ -286,7 +287,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 elif reason == "switched":
                     _ = self.git(tree, "checkout", "-b", "replacement-branch")
                     _ = self.commit(tree, f"{reason}-work.txt", "unlanded replacement work\n")
-                else:
+                elif reason == "detached":
                     _ = self.git(tree, "checkout", "--detach")
                     _ = self.commit(tree, f"{reason}-work.txt", "unlanded replacement work\n")
                 before = self.repository_state()
@@ -299,7 +300,10 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 self.assertTrue(selected["detail"], results)
                 self.assertEqual(self.repository_state(), before)
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
-                self.assertEqual((tree / f"{reason}.txt").read_text(), "landed work\n")
+                if reason == "no-commit":
+                    self.assertEqual(selected["detail"], "no commit of its own")
+                else:
+                    self.assertEqual((tree / f"{reason}.txt").read_text(), "landed work\n")
                 if reason == "dirty":
                     self.assertEqual((tree / "code.txt").read_text(), "uncommitted work\n")
                 elif reason in ("switched", "detached"):

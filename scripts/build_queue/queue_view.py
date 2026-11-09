@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field, replace
 from functools import cache, cached_property
 import os
 from pathlib import Path
@@ -361,6 +361,94 @@ def cloud_matches(row: wire.CloudRow, selector: str, labels: Mapping[str, UnitLa
                         identity.folder, Path(identity.folder).name, label.session if label else "")
 
 
+@dataclass(frozen=True)
+class CloudUpdateCurrent:
+    pass
+
+
+@dataclass(frozen=True)
+class CloudUpdateLate:
+    seconds: float
+
+
+@dataclass(frozen=True)
+class CloudWork:
+    state: str
+    modules: str
+    vcpus: int | UnknownCpuCount
+    failed_modules: int
+    update: CloudUpdateCurrent | CloudUpdateLate
+
+
+def cloud_work(row: wire.CloudRow, now: float, stale_pushes: int,
+               interval: CloudPushInterval | CloudPushIntervalUnavailable) -> CloudWork:
+    progress = row.progress
+    state = (row.wait.text if isinstance(row.wait, wire.CloudSlotWait) else progress.state
+             if isinstance(progress, cloud_progress.CloudProgress) else "progress " + progress.reason)
+    modules = (f"{row.counter.done} of {row.counter.total} modules"
+               if isinstance(row.counter, progress_profile.ProgressCounter) else "modules unknown")
+    update: CloudUpdateCurrent | CloudUpdateLate = CloudUpdateCurrent()
+    if (isinstance(progress, cloud_progress.CloudProgress) and isinstance(interval, CloudPushInterval)
+            and now - progress.updated_at >= stale_pushes * interval.seconds):
+        update = CloudUpdateLate(now - progress.updated_at)
+    return CloudWork(state, modules,
+                     progress.size_vcpus if isinstance(progress, cloud_progress.CloudProgress) else UnknownCpuCount(),
+                     progress.failed_modules if isinstance(progress, cloud_progress.CloudProgress) else 0, update)
+
+
+def cloud_update_age(seconds: float) -> str:
+    for divisor, unit in ((86400, "d"), (3600, "h"), (60, "min")):
+        if seconds >= divisor:
+            return f"{int(seconds // divisor)} {unit}"
+    return f"{int(seconds)} s"
+
+
+def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
+    if isinstance(row.wait, wire.CloudSlotWait):
+        return (Span(work.state),)
+    text = work.state + " · " + work.modules
+    if work.failed_modules:
+        noun = "module" if work.failed_modules == 1 else "modules"
+        text += f" · {work.failed_modules} failed {noun}"
+    return (Span(text),)
+
+
+def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:
+    identity = row.identity
+    label = model.cloud_labels.get(identity.session_id, UnitLabels(identity.name))
+    return replace(label, unit=gate.queue_unit(identity.unit, identity.session_id, model.cloud_labels) or "—")
+
+
+@dataclass(frozen=True)
+class WaitingBuild:
+    position: int
+    step: admission_records.WaitingStep
+
+
+def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow]:
+    """Insert cloud waits by arrival time without changing the local queue order."""
+    rows: list[WaitingBuild | wire.CloudRow] = [WaitingBuild(index, step)
+        for index, step in enumerate(model.reading.view.waiting, 1)]
+    for cloud in sorted((row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)),
+                        key=lambda row: row.since):
+        position = next((index for index, row in enumerate(rows)
+                         if (row.step.since if isinstance(row, WaitingBuild) else row.since) > cloud.since), len(rows))
+        rows.insert(position, cloud)
+    return rows
+
+
+def head_text(model: QueueModel) -> str:
+    head = model.reading.explanation.head
+    text = ""
+    if isinstance(head, admission_records.HeadExplanation) and head.decision.state == "hold":
+        text = (f"free {head.free.available / admission_records.GIB:.1f} GiB; "
+                + f"reserve {head.free.reserve / admission_records.GIB:.1f} GiB; need {head.free.need / admission_records.GIB:.1f} GiB")
+    if isinstance(model.reading, wire.CloudQueueRead):
+        used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in cloud_rows(model))
+        text += (" · " if text else "") + f"cloud {used} of {model.reading.cloud_slots} slots"
+    return "Head: " + text if text else ""
+
+
 def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...] = ()) -> list[Line]:
     reading = model.reading
     all_rows = cloud_rows(model)
@@ -371,29 +459,21 @@ def cloud_lines(model: QueueModel, columns: int, rows: tuple[wire.CloudRow, ...]
     interval = cloud_push_interval()
     now = reading.explanation.now
     for row in rows or all_rows:
-        identity, progress = row.identity, row.progress
-        unit = gate.queue_unit(identity.unit, identity.session_id, model.cloud_labels) or "—"
+        identity = row.identity
+        work = cloud_work(row, now, reading.cloud_gate_stale_pushes, interval)
+        unit = cloud_step_labels(row, model).unit
         if isinstance(row.wait, wire.CloudSlotWait):
             state = "waiting; " + row.wait.text
-        elif isinstance(progress, cloud_progress.CloudProgress):
-            state = progress.state
         else:
-            state = "progress " + progress.reason
-        counter = row.counter
-        modules = (f"{counter.done} of {counter.total} modules"
-                   if isinstance(counter, progress_profile.ProgressCounter) else "modules unknown")
-        size = f"{progress.size_vcpus} vCPUs" if isinstance(progress, cloud_progress.CloudProgress) else "vCPUs unknown"
+            state = work.state
+        size = f"{work.vcpus} vCPUs" if isinstance(work.vcpus, int) else "vCPUs unknown"
         elapsed = leftover_age(age(row.started_at or row.since, now))
-        text = f"{field(unit)} · {field(model.names.shown(identity.step))} · {state} · {modules} · {size} · elapsed {elapsed}"
-        if isinstance(progress, cloud_progress.CloudProgress):
-            if progress.failed_modules:
-                noun = "module" if progress.failed_modules == 1 else "modules"
-                text += f" · {progress.failed_modules} failed {noun}"
-            if isinstance(interval, CloudPushInterval):
-                stale_after = reading.cloud_gate_stale_pushes * interval.seconds
-                if now - progress.updated_at >= stale_after:
-                    update_age = started_ago(progress.updated_at, now).removeprefix("started ").removesuffix(" ago")
-                    text += f" · no update for {update_age}"
+        text = f"{field(unit)} · {field(model.names.shown(identity.step))} · {state} · {work.modules} · {size} · elapsed {elapsed}"
+        if work.failed_modules:
+            noun = "module" if work.failed_modules == 1 else "modules"
+            text += f" · {work.failed_modules} failed {noun}"
+        if isinstance(work.update, CloudUpdateLate):
+            text += f" · no update for {cloud_update_age(work.update.seconds)}"
         lines.extend(wrap((Span("   " + text),), columns, indent=3))
     return lines
 
@@ -407,6 +487,12 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     cap = cap_bytes / admission_records.GIB
     waiting = model.reading.view.waiting
     running = running_builds(model)
+    cloud = cloud_rows(model)
+    interval = cloud_push_interval() if cloud else CloudPushIntervalUnavailable("no cloud rows")
+    stale_pushes = model.reading.cloud_gate_stale_pushes if isinstance(model.reading, wire.CloudQueueRead) else 0
+    work = {row.owner: cloud_work(row, explanation.now, stale_pushes, interval) for row in cloud}
+    local_cpus = os.cpu_count()
+    cpus = str(local_cpus) if local_cpus is not None else "—"
     bumped_unit = "" if isinstance(explanation.priority, admission_records.NoQueuePriority) else explanation.priority["unit"]
 
     def names(step: admission_records.WaitingStep | admission_records.RunningStep) -> tuple[str, str, bool]:
@@ -418,7 +504,13 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
 
     waiting_names = [names(step) for step in waiting]
     running_names = [names(row.step) for row in running]
-    all_names = [*waiting_names, *running_names]
+    cloud_names: dict[wire.Owner, tuple[str, str, bool]] = {}
+    for row in cloud:
+        identity = cloud_step_labels(row, model)
+        show = field(identity.showrunner) or "—"
+        unit = field(identity.unit).removeprefix(show + "-") or "—"
+        cloud_names[row.owner] = show, unit, False
+    all_names = [*waiting_names, *running_names, *cloud_names.values()]
     bars = [size_bar(step.need / admission_records.GIB, cap) for step in waiting]
     status = head_status(model)
     waiting_status = [
@@ -426,15 +518,20 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         if isinstance(step.reason, admission_records.ReadingUnavailable) else
         status if isinstance(head, admission_records.HeadExplanation) and same_waiter(head.waiter, step) else ()
         for step in waiting]
-    place_width = max(3, len(str(len(waiting))))
+    place_width = max(5 if any(isinstance(row.wait, wire.CloudSlotWait) for row in cloud) else 3, len(str(len(waiting))))
     minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
-                        max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0))
+                        max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0),
+                        max((len(str(age(row.started_at or row.since, explanation.now))) for row in cloud), default=0))
     step_width = max(7, min(max(13, columns // 3), max(
         max((terminal_width(queue_lines.step_text(row.step, model.names)) for row in running), default=7),
-        max((terminal_width(queue_lines.step_text(step, model.names)) for step in waiting), default=7))))
+        max((terminal_width(queue_lines.step_text(step, model.names)) for step in waiting), default=7),
+        max((terminal_width(field(model.names.shown(row.identity.step))) for row in cloud), default=7))))
     pids = [queue_evidence.step_pid_text(step) for step in waiting]
     running_pids = [queue_evidence.step_pid_text(row.step) for row in running]
-    pid_width = max((len(text) for text in [*pids, *running_pids]), default=5)
+    pid_width = max((len(text) for text in [*pids, *running_pids, *(f"pid {row.owner.pid}" for row in cloud)]), default=5)
+    machine = field(store.host_name()) if running else ""
+    machine_width = max(len("machine"), terminal_width(machine)) if running or cloud else 0
+    vcpu_width = max(4, len(cpus), max((len(str(item.vcpus)) for item in work.values() if isinstance(item.vcpus, int)), default=0))
     # Reserve the text widths before the pid takes cells from the bars.
     fixed = place_width + step_width + minutes_width + 5
     show_width, unit_width = 12, 7
@@ -454,24 +551,17 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             show_width -= 1
         if show_width + unit_width > name_room and unit_width > 7:
             unit_width -= 1
-    machine = field(store.host_name()) if running else ""
-    machine_width = max(len("machine"), terminal_width(machine)) if machine else 0
     names_fit = all(terminal_width(show) <= show_width and terminal_width(unit) <= unit_width
                     for show, unit, _ in all_names)
-    if not names_fit or show_width + unit_width + machine_width + 1 > name_room:
+    if not cloud and (not names_fit or show_width + unit_width + machine_width + 1 > name_room):
         machine_width = 0
     machine_cells = machine_width + 1 if machine_width else 0
-    bar_column = fixed + show_width + unit_width + pid_width + 1 + machine_cells
+    bar_column = fixed + show_width + unit_width + pid_width + 1 + machine_cells + vcpu_width + 1
     running_text = [
         (f" {row.kept / admission_records.GIB:.1f} / {row.used / admission_records.GIB:.1f}" if row.measured
          else f" {row.kept / admission_records.GIB:.1f} / —")
         + (f"; {row.swap_bytes / admission_records.GIB:.1f} GiB swapped" if row.swap_bytes else "")
         for row in running]
-    number_width = max(
-        max((terminal_width(text) for text in running_text), default=0),
-        max((len(f" {step.need / admission_records.GIB:.1f}") + terminal_width(plain([suffix]))
-             for step, suffix in zip(waiting, waiting_status)), default=0))
-    bar_width = max(0, columns - bar_column - number_width)
     cap_label = f"cap {cap:.1f}" if isinstance(room, admission_records.MemoryRoom) and isinstance(room.cap, int) else "cap unavailable"
     memory_bar = cap_bar(room, max(1, columns - bar_column), colour=colour)
     cap_cell = next((index for index, span in enumerate(memory_bar) if span.text == "│"), 0)
@@ -490,7 +580,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         return (Span(pad_left(place, place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
                      + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", step_width) + " "
                      + pad_left("min", minutes_width) + " "
-                     + (pad_right("machine", machine_width) + " " if machine_width else "") + pad_right("pid", pid_width) + " " + memory, "inactive"),)
+                     + (pad_right("machine", machine_width) + " " if machine_width else "")
+                     + pad_left("vCPU", vcpu_width) + " " + pad_right("pid", pid_width) + " " + memory, "inactive"),)
 
     @cache
     def column(text: str, width: int) -> str:
@@ -519,7 +610,34 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
 
     lines.extend(wrap((Span(queue_evidence.room_text(explanation.room), "inactive"),), columns))
     lines.append(heading())
-    for index, (row, pair, text) in enumerate(zip(running, running_names, running_text)):
+
+    def append_cloud_row(row: wire.CloudRow) -> None:
+        information = work[row.owner]
+        running_cloud = isinstance(row.wait, admission_records.ReadyForAdmission)
+        cpu_text = str(information.vcpus) if running_cloud and isinstance(information.vcpus, int) else "—" if running_cloud else ""
+        status = cloud_status(row, information)
+        if running_cloud and isinstance(information.update, CloudUpdateLate):
+            status = (*status, Span(f" · no update for {cloud_update_age(information.update.seconds)}", "error"))
+        append_row((*identity_columns("run" if running_cloud else "cloud", model.names.shown(row.identity.step),
+                                     cloud_names[row.owner], str(age(row.started_at or row.since, explanation.now)),
+                                     "▸" if (you and row.identity.session_id == you
+                                             or selector and cloud_matches(row, selector, model.cloud_labels)) else " "),
+                    Span(column("aws" if running_cloud else "", machine_width), "inactive"),
+                    Span(pad_left(cpu_text, vcpu_width) + " ", "inactive"),
+                    Span(column(f"pid {row.owner.pid}", pid_width), "inactive"), *status))
+
+    running_rows: list[RunningBuild | wire.CloudRow] = [*running,
+        *(row for row in cloud if isinstance(row.wait, admission_records.ReadyForAdmission))]
+    if cloud:
+        running_rows.sort(key=lambda row: row.started_at if isinstance(row, RunningBuild) else row.started_at or row.since)
+    running_positions = {id(row): index for index, row in enumerate(running)}
+    for row in running_rows:
+        if isinstance(row, wire.CloudRow):
+            append_cloud_row(row)
+            continue
+        index = running_positions[id(row)]
+        pair, text = running_names[index], running_text[index]
+        bar_width = max(1, columns - bar_column - terminal_width(text))
         used = row.used / admission_records.GIB
         held_end = used + row.kept / admission_records.GIB
         bar = running_bar(min(used, bar_width), min(held_end, bar_width), cap)
@@ -528,19 +646,28 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
                                         "▸" if (you and row.step.session_id == you
                                                 or selector and running_matches_selector(row.step, selector, model.labels)) else " "),
                       *((Span(column(machine, machine_width), "inactive"),) if machine_width else ()),
+                      Span(pad_left(cpus, vcpu_width) + " ", "inactive"),
                       Span(column(running_pids[index], pid_width), "inactive"),
                       *bar, Span(text)))
-    for index, (step, pair, bar, suffix) in enumerate(zip(waiting, waiting_names, bars, waiting_status)):
+    for entry in waiting_builds(model):
+        if isinstance(entry, wire.CloudRow):
+            append_cloud_row(entry)
+            continue
+        index, step = entry.position - 1, entry.step
+        pair, bar, suffix = waiting_names[index], bars[index], waiting_status[index]
+        amount = f" {step.need / admission_records.GIB:.1f}"
+        bar_width = max(0, columns - bar_column - terminal_width(amount) - terminal_width(plain([suffix])))
         row = (*identity_columns(str(index + 1), queue_lines.step_text(step, model.names), pair, str(age(step.since, explanation.now)),
                                 "▸" if you and step.session_id == you else " "),
                *((Span(" " * machine_cells),) if machine_width else ()),
-               Span(column(pids[index], pid_width), "inactive"), Span(bar[:bar_width], "warning"), Span(f" {step.need / admission_records.GIB:.1f}", "warning" if isinstance(head, admission_records.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
+               Span(" " * (vcpu_width + 1)),
+               Span(column(pids[index], pid_width), "inactive"), Span(bar[:bar_width], "warning"), Span(amount, "warning" if isinstance(head, admission_records.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
         append_row((*row, *suffix))
     if isinstance(head, admission_records.TokenWaitersOnly):
         lines.extend([(), (Span("All waiting steps are waiting for the cargo token."),)])
-    if isinstance(head, admission_records.HeadExplanation) and head.decision.state == "hold":
-        lines.append((Span(f"Head: free {head.free.available / admission_records.GIB:.1f} GiB; "
-            + f"reserve {head.free.reserve / admission_records.GIB:.1f} GiB; need {head.free.need / admission_records.GIB:.1f} GiB"),))
+    summary = head_text(model)
+    if summary:
+        lines.append((Span(summary),))
     if isinstance(head, admission_records.HeadExplanation) and isinstance(head.cause, (admission_records.PressureUnavailable, admission_records.ReadingUnavailable)):
         append_row((Span("Head: " + head.cause.reason, "error"),))
     services = [step.measured for step in model.reading.view.running
@@ -567,7 +694,4 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
                               + (f"; {memory.swap_bytes / admission_records.GIB:.1f} GiB swapped" if memory.swap_bytes else "")),))
             for member in activity.members[1:]:
                 lines.append((Span(f"   pid {member.pid} · {field(member.program)} · {owner}"),))
-    cloud = cloud_lines(model, columns)
-    if cloud:
-        lines.extend([(), *cloud])
     return [clip(line, columns) for line in lines]

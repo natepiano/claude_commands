@@ -12,14 +12,13 @@ import json
 import subprocess
 import sys
 from contextlib import redirect_stderr
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
 from scripts.direct import progress_history
 from scripts.lib import atomic_file
-from scripts.lib.process_failure import failure_detail
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, worker, worker_admission
 
@@ -86,20 +85,6 @@ def _friend_pending(client: herdr.Herdr, state: worker_panes.WorkerPane | worker
     return False
 
 
-def _notify(worker_name: str, parent: staff.StaffRow, phase: str, outcome: TurnOutcome,
-            path: Path, details: str) -> None:
-    backend = staff.backend(parent)
-    address = ("codex:" if isinstance(backend, staff.CodexBackend) else "session:") + str(parent.current_session)
-    scripts = Path(__file__).resolve().parents[1]
-    message = f"{worker_name}: phase {phase}: {outcome.value}; reply {path}"
-    if details:
-        message += "\n" + details
-    result = subprocess.run([str(scripts / "lib/py"), str(scripts / "message/send.py"),
-        "--to", address, "--from", worker_name, "--text", message], text=True, capture_output=True, check=False)
-    if result.returncode:
-        raise ValueError(failure_detail(result))
-
-
 def _kept_pane_anomaly(row: staff.StaffRow, state: worker_panes.WorkerPane | worker_panes.WorkerNotObserved,
                        reason: str) -> str:
     """Keep the close reason and pane in the director's one result message."""
@@ -112,13 +97,36 @@ def _kept_pane_anomaly(row: staff.StaffRow, state: worker_panes.WorkerPane | wor
 
 
 def _send_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed: dict[str, object],
-                 instance: str, outcome: TurnOutcome, path: Path, reply: str, details: str) -> None:
-    stamp = hashlib.sha256((outcome.value + "\n" + reply).encode()).hexdigest()
+                 instance: str, outcome: TurnOutcome, path: Path, reply: str, details: str,
+                 runs: tuple[str, ...] = ()) -> None:
+    from scripts.message import send
+
+    stamp = hashlib.sha256("\n".join((outcome.value, reply, *runs)).encode()).hexdigest()
     if passed.get("hook_notice") == stamp:
         return
     phase = passed.get("phase", {})
     phase_id = str(cast(dict[str, object], phase).get("id", "")) if isinstance(phase, dict) else ""
-    _notify(worker_name, parent, phase_id, outcome, path, details)
+    address = ("codex:" if isinstance(staff.backend(parent), staff.CodexBackend) else "session:") + str(parent.current_session)
+    message = f"{worker_name}: phase {phase_id}: {outcome.value}"
+    if reply:
+        message += f"; reply {path}"
+    message += f"; pass {instance}"
+    if runs:
+        message += "; runs " + ", ".join(runs)
+    if details:
+        message += "\n" + details
+    completion = progress_history.hook_completion(passed)
+    if isinstance(completion, progress_history.HookCompletion) and completion.sender_native_id:
+        sender = send.read_sender_stamp(completion.sender_native_id)
+    else:
+        member = staff.snapshot().by_id(staff.StaffId(str(passed.get("worker_id", ""))))
+        identity = str(member.current_session) if member is not None else str(passed.get("worker_id", ""))
+        sender = (send.ClaudeSender(identity) if member is not None and isinstance(staff.backend(member), staff.ClaudeBackend)
+                  else send.CodexSender(identity))
+    options = send.parse(["--to", address, "--from", worker_name, "--text", message])
+    result = send.send(options._replace(sender_origin=send.ForwardedSender(sender), shown_sender=send.ShownSender(worker_name)))
+    if result.outcome not in ("sent", "skipped"):
+        raise ValueError(result.detail)
     progress_history.record_dispatch_notice(run, instance, stamp)
 
 
@@ -162,7 +170,14 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
                        completion: progress_history.HookCompletion, state: worker_panes.WorkerPane,
                        hold: worker_panes.WorkerLockHold) -> TurnOutcome:
     from scripts.direct import assign
+    from scripts.message import send
     path = Path(completion.reply_file)
+    if not completion.sender_native_id:
+        sender = (send.ClaudeSender(str(row.current_session)) if isinstance(staff.backend(row), staff.ClaudeBackend)
+                  else send.CodexSender(str(row.current_session)))
+        completion = replace(completion, sender_native_id=send.sender_native_id(sender))
+        progress_history.save_hook_completion(run, instance, completion)
+    passed = {**passed, "hook_completion": asdict(completion)}
     if not completion.actions_done:
         result = assign.complete_herdr(run, row, passed, delivery.actions, path,
                                       completed=completion.outcome == TurnOutcome.DONE)
@@ -239,7 +254,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         active = progress_history.active_dispatch(row.id, run)
         if not isinstance(active, progress_history.ActiveDispatch) and not (
                 isinstance(completion, progress_history.HookCompletion) or
-                passed.get("status") in ("completed", "error") and not passed.get("hook_notice")):
+                passed.get("status") in ("completed", "error")):
             return TurnOutcome.IGNORED
         instance = active.instance_id if isinstance(active, progress_history.ActiveDispatch) else str(passed.get("instance_id", ""))
         delivery = progress_history.dispatch_delivery(passed)
@@ -262,8 +277,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
             return TurnOutcome.SUBMITTED if event.kind == EventKind.STAGE_READY else TurnOutcome.IGNORED
         anomalies = receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ()
         turn_reply = receipt.reply if isinstance(receipt, worker.DispatchWaitingForRuns) else receipt
-        reply = ((turn_reply.last_reply if event.kind == EventKind.TURN_END else event.reply)
-                 if isinstance(turn_reply, worker.DispatchAwaitingReply) else turn_reply.reply)
+        reply = turn_reply.last_reply if isinstance(turn_reply, worker.DispatchAwaitingReply) else turn_reply.reply
         if event.kind == EventKind.TURN_END and (not reply or reply != event.reply):
             return TurnOutcome.IGNORED
         if isinstance(receipt, worker.DispatchComplete):
@@ -291,13 +305,15 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         path = Path(delivery.reply_file)
         if outcome != TurnOutcome.DONE:
             path = path.with_name(path.stem + "_turn" + path.suffix)
-        worker.save_reply(path, reply)
+        if reply:
+            worker.save_reply(path, reply)
         if outcome == TurnOutcome.DONE or outcome == TurnOutcome.NO_DONE and delivery.actions.end_worker:
             completion = progress_history.HookCompletion(outcome, str(path), anomalies)
             progress_history.save_hook_completion(run, instance, completion)
             return _finish_completion(row, parent, run, passed, instance, delivery, completion, state, hold)
         details = "\n".join(anomalies) or reply
-        _send_notice(row.name, parent, run, passed, instance, outcome, path, reply, details)
+        runs = receipt.runs if isinstance(receipt, worker.DispatchWaitingForRuns) else ()
+        _send_notice(row.name, parent, run, passed, instance, outcome, path, reply, details, runs)
         return outcome
 
 

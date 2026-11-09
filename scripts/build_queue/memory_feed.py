@@ -208,6 +208,7 @@ class RowProgress(TypedDict):
 
 class RunRow(TypedDict):
     machine: NotRequired[str]
+    vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     age: NotRequired[str]
     between_steps: NotRequired[bool]
     name: str
@@ -260,6 +261,30 @@ class WaitRow(TypedDict):
     since: float
     reason: str
     fits: bool
+
+
+class CloudWorkRow(TypedDict):
+    kind: Literal["cloud"]
+    name: str
+    showrunner: str
+    unit: str
+    pid: int
+    detail: str
+    machine: Literal["aws", ""]
+    vcpus: int | queue_view.UnknownCpuCount
+    state: str
+    status: str
+    stale: bool
+    late_age: str
+
+
+class CloudRunRow(CloudWorkRow):
+    started_at: float
+
+
+class CloudWaitRow(CloudWorkRow):
+    since: float
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -328,11 +353,10 @@ class MemoryPage(TypedDict):
     pressure: str
     swap_used: float
     swap_total: float
-    walk: list[RunRow]
-    waiters: list[WaitRow]
+    walk: list[RunRow | CloudRunRow]
+    waiters: list[WaitRow | CloudWaitRow]
     swap_by: list[SwapRow]
-    cloud: list[str]
-    cloud_heading: str
+    head_text: str
     cloud_slots_used: int
     cloud_slots: int
     psi: PressureValues
@@ -817,8 +841,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                          for row in sorted(members, key=lambda row: gib(row["used"]), reverse=True)
                          if isinstance(row["used"], float)]})
     machine = host_name()
+    vcpus = os.cpu_count()
     for row in walk:
         row["machine"] = machine
+        row["vcpus"] = vcpus if vcpus is not None else queue_view.UnknownCpuCount()
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -834,21 +860,39 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room})
-    cloud: list[str] = []
-    cloud_heading = ""
+    work_rows: list[RunRow | CloudRunRow] = list(walk)
+    waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
+    model = queue_view.QueueModel(
+        parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
+        queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=RECORDED_STEP_NAMES)
     cloud_slots_used = 0
     cloud_slots = 0
     if isinstance(parsed, wire.CloudQueueRead):
         cloud_slots = parsed.cloud_slots
-        model = queue_view.QueueModel(
-            parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
-            queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=RECORDED_STEP_NAMES)
         rows = queue_view.cloud_rows(model)
         cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in rows)
-        lines = queue_view.cloud_lines(model, 1_000_000)
-        if lines:
-            cloud_heading = plain(lines[:1])
-            cloud = [plain([line]).strip() for line in lines[1:]]
+        interval = queue_view.cloud_push_interval()
+        cloud_waiters: dict[wire.Owner, CloudWaitRow] = {}
+        for cloud in rows:
+            information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
+            identity = queue_view.cloud_step_labels(cloud, model)
+            values: CloudWorkRow = {"kind": "cloud", "name": model.names.shown(cloud.identity.step),
+                "showrunner": identity.showrunner, "unit": identity.unit, "pid": cloud.owner.pid,
+                "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
+                "vcpus": information.vcpus,
+                "state": information.state, "status": plain([queue_view.cloud_status(cloud, information)]),
+                "stale": isinstance(information.update, queue_view.CloudUpdateLate)
+                         and not isinstance(cloud.wait, wire.CloudSlotWait),
+                "late_age": queue_view.cloud_update_age(information.update.seconds)
+                    if isinstance(information.update, queue_view.CloudUpdateLate)
+                    and not isinstance(cloud.wait, wire.CloudSlotWait) else ""}
+            if isinstance(cloud.wait, wire.CloudSlotWait):
+                cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text}
+            else:
+                work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
+        work_rows.sort(key=lambda row: row["started_at"])
+        waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
+                        for entry in queue_view.waiting_builds(model)]
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     swap = read_swap(parsed.view.running, labels, configuration.swap_rows)
@@ -870,11 +914,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "shown_ci_kept": max(0.0, min(ci_kept, gib(captured.available) - safety - reserved)),
         "shown_safety": min(safety, used + gib(captured.available)),
         "shown_reserved": max(0.0, min(reserved, gib(captured.available) - safety)),
-        "waiting": len(waiters), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
+        "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
         "pressure": pressure_label,
         "swap_used": gib(swap.used), "swap_total": gib(swap.total),
-        "walk": walk, "waiters": waiters, "swap_by": swap.rows, "psi": pressure_values,
-        "cloud": cloud, "cloud_heading": cloud_heading,
+        "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
+        "head_text": queue_view.head_text(model),
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},
         "report": report_reading(configuration.history_days) if isinstance(report, ReportNotRead) else report,

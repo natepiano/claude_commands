@@ -2005,13 +2005,16 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
-    """Record one terminal outcome for the exact dispatch in its slot."""
+    """Record completion for the exact dispatch, including DONE after a launcher error."""
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             state = _read_state(session_dir)
-            opened = _open_passes(state).get(slot)
+            opened = _pass_slots(state).get(slot)
             if opened is not None and opened.get("instance_id") == instance_id:
+                if opened.get("status") == "error" and status == "completed":
+                    # Close the corrected pass through the existing recorder event.
+                    opened["status"] = "active"
                 _ = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -2095,6 +2098,7 @@ class HookCompletion:
     role_released: bool = False
     finished: bool = False
     recording_done: bool = False
+    sender_native_id: str = ""
 
 
 class NoHookCompletion(Enum):
@@ -2109,7 +2113,8 @@ def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookComplet
     return HookCompletion(_string(fields.get("outcome")), _string(fields.get("reply_file")),
         tuple(str(item) for item in cast(list[object], details)) if isinstance(details, list) else (),
         fields.get("actions_done") is True, fields.get("pane_closed") is True,
-        fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True)
+        fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True,
+        _string(fields.get("sender_native_id")))
 
 
 def save_hook_completion(run: Path, instance_id: str, completion: HookCompletion) -> None:
@@ -6663,10 +6668,15 @@ def _review_trial(args: argparse.Namespace) -> None:
     review_seconds = 0
     ux_check_seconds = 0
     fix_passes: list[dict[str, object]] = []
-    for event in _run_events(state):
+    events = _run_events(state)
+    finished_passes = {_string(event.get("pass_instance_id")): event for event in events
+                       if event.get("event_type") == "pass_finished"}
+    for event in events:
         if _string(event.get("phase_instance_id")) != instance_id:
             continue
         event_type = _string(event.get("event_type"))
+        if event_type == "pass_finished" and event is not finished_passes[_string(event.get("pass_instance_id"))]:
+            continue
         if event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
             review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":

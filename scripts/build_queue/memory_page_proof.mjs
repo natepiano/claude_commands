@@ -248,7 +248,7 @@ try {
         };
         return metrics;
       })()`);
-      assert.deepEqual(proof.headings, ['Step','Duration','Machine','Unit','Pid']);
+      assert.deepEqual(proof.headings, ['#','Step','Duration','Machine','vCPU','Unit','Pid']);
       assert.equal(proof.machine, 'fixture');
       assert.match(proof.room, /GiB/);
       for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
@@ -280,7 +280,7 @@ try {
       assert.equal(proof.reservedAmount,proof.dimColor);
       assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
       assert.ok(proof.amountHeader.includes('Used · reserved'), 'The memory amounts have no header.');
-      assert.ok(proof.scroll <= proof.client, 'The page overflows.');
+      assert.ok(proof.scroll <= proof.client, 'The page overflows. '+JSON.stringify({theme,width,scroll:proof.scroll,client:proof.client}));
       const roomLegend=proof.values.find(row=>row.label==='Next step room');
       assert.ok(Math.abs(roomLegend.labelBox.top-roomLegend.value.top)<2, 'The room value uses a second line.');
       assert.ok(roomLegend.value.left-roomLegend.labelBox.right<80, 'The legend value is too far from its label.');
@@ -374,6 +374,60 @@ try {
         const unit=document.querySelector('#history-unit');unit.value='daily';
         unit.dispatchEvent(new Event('change'));
       })()`);
+
+      for(const [name,lateAge,modules,failed] of [
+        ['cloud','2 min','7 of 12 modules','1 failed module'],
+        ['cloud_zero','2 d','123456 of 999999 modules','123456 failed modules']]) {
+      await show(readings[name]);
+      const cloudRow=readings[name].walk.find(row=>row.kind==='cloud');
+      assert.equal(cloudRow.late_age,lateAge);
+      assert.ok(!cloudRow.status.includes('no update for'),'The feed mixes the state and late age.');
+      const cloudProof=await evaluate(`(() => {
+        const table=document.querySelector('.walk-table');
+        const rows=[...table.querySelectorAll('tbody tr')];
+        const running=rows.find(row=>row.textContent.includes('700001'));
+        const waiting=rows.find(row=>row.textContent.includes('700002'));
+        const details=row=>row?document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]'):null;
+        const runningDetails=details(running),waitingDetails=details(waiting);
+        const cloudText=(running?.textContent || '')+' '+(runningDetails?.textContent || '');
+        const stale=[...(runningDetails?.querySelectorAll('*') || [])].find(element=>
+          element.childElementCount===0 && element.textContent.includes('no update for'));
+        return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+          running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
+          machine:running?.querySelector('.machine')?.textContent,
+          place:waiting?.querySelector('.place')?.textContent,
+          waitingMachine:waiting?.querySelector('.machine')?.textContent,
+          waitingVcpus:waiting?.querySelector('.vcpus')?.textContent,
+          vcpus:running?.querySelector('.vcpus')?.textContent,
+          cloudCard:!!document.querySelector('#cloud'),
+          statusInTable:!!running && !!waiting,
+          cloudMemory:!!runningDetails?.querySelector('.row-progress,.reserved-amount,.used-amount,.b'),
+          localMemory:!!document.querySelector('.wrow .track .seg-used'),
+          staleColor:stale?getComputedStyle(stale).color:null,
+          errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
+            document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
+          slots:document.querySelector('#walk').closest('.card').textContent,
+          scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+      })()`);
+      assert.deepEqual(cloudProof.headings,['#','Step','Duration','Machine','vCPU','Unit','Pid']);
+      assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
+      assert.equal(cloudProof.machine,'aws');
+      assert.equal(cloudProof.vcpus,'32');
+      for(const value of ['running',modules,failed,'no update for '+cloudRow.late_age])
+        assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
+      assert.equal(cloudProof.place,'cloud');
+      assert.equal(cloudProof.waitingMachine,'');
+      assert.equal(cloudProof.waitingVcpus,'');
+      assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
+      assert.match(cloudProof.slots,/cloud 1 of 1 slots/);
+      assert.ok(!cloudProof.cloudCard,'The page retains a separate Cloud card.');
+      assert.ok(!cloudProof.cloudMemory,'Cloud work has a memory reservation.');
+      assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
+      assert.equal(cloudProof.staleColor,cloudProof.errorColor,'The stale age is not red.');
+      assert.ok(cloudProof.scroll<=cloudProof.client,'Cloud rows overflow the page.');
+      proof[name]=cloudProof;
+      }
+      await show(base);
 
       const positions=()=>evaluate(`(() => {
         const row=document.querySelector('.walk-table tr[data-tip^="row:"]');

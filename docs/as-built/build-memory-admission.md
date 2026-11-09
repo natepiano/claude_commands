@@ -43,14 +43,19 @@ The next check handles an unusable cloud setting like other unusable settings.
 The API supplies `progress_profile.publish_counter` for the route to write module counts.
 The service removes the progress files when the reservation ends.
 
-The queue view and card show cloud rows under `Cloud`, with used slots and total slots.
-Each row shows the unit, step, state, module counts, vCPUs, and elapsed time.
+The queue view and the build page show each cloud gate in the main table.
+A running row shows machine `aws` and its vCPU count.
+The last column shows the state, module count, and failed modules.
+A waiting row shows `cloud` in the # column and its slot wait text.
+Its machine and vCPU cells stay blank.
+The Head line shows `cloud N of M slots`.
+The selected cloud step card keeps its `Cloud` lines.
 Missing progress and module counts have explicit display states.
-Waiting rows show their cloud slot wait.
 `cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
 The queue reading carries the checked threshold to the display.
 The display reads the push interval from `conf.read("cloud_gate").number("log_push_s")`.
-An older update shows `no update for <age>`.
+An older update shows `no update for <age>` in red.
+The display uses one age formatter for the table, the card, and the feed.
 `CloudPushIntervalUnavailable` names an unavailable push interval.
 The display omits the stale age when the push interval is unavailable.
 
