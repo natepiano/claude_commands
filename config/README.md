@@ -308,6 +308,7 @@ This window captures delayed charges and later changes from AWS.
 
 Both the controller and the gate worker use one Cost Explorer reader.
 It requests daily `UnblendedCost` for the account, grouped by `USAGE_TYPE`, and reads every page.
+It excludes `Credit` and `Refund` records, so the amounts show usage before credits.
 It uses no tag filter and needs no tag activation or deployment change.
 `cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` still supply the deployment tags.
 The reader saves each day's account total, usage rows, provisional flag, and read time in `charges/<day>.json`.

@@ -341,7 +341,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                                                  for p in rows(r, "resources")), text(r, "source"))
          for r in rows(row, "inventories")],
         [CostReconciliation(instant(r, "at"), instant(r, "period_start"), instant(r, "period_end"),
-                            money(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))),
+                            conf.decimal(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))),
                             tuple(EstablishedDayCost(date.fromisoformat(text(d, "day")).isoformat(), money(text(d, "usd")))
                                   for d in rows(r, "established_days")) if "established_days" in r else ())
          for r in rows(row, "reconciliations")],
@@ -637,7 +637,7 @@ def read_charge(path: Path) -> ChargeRead:
                          money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
                          tuple(UsageTypeCost(text(item, 'usage_type'), conf.decimal(text(item, 'usd')))
                                for item in rows(row, 'usage_types')) if 'usage_types' in row else (),
-                         row.get('provisional', True) is True, 'usage_types' in row)
+                         row.get('provisional', True) is True, row.get('excludes_credits') is True)
     if reading.period_end <= reading.period_start or reading.period_end > reading.at:
         raise LedgerUnavailable('invalid charge reconciliation')
     return reading
@@ -648,7 +648,7 @@ def charge_record(reading: ChargeRead) -> dict[str, object]:
             'period_end': reading.period_end, 'actual_usd': str(reading.actual_usd),
             'estimated_usd': str(reading.estimated_usd), 'query_usd': str(reading.query_usd),
             **({'usage_types': [{'usage_type': item.usage_type, 'usd': str(item.usd)} for item in reading.usage_types],
-                'provisional': reading.provisional} if reading.account_bill else {})}
+                'provisional': reading.provisional, 'excludes_credits': True} if reading.account_bill else {})}
 
 
 def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, costs: CostEstimate) -> tuple[Decimal, Decimal]:
