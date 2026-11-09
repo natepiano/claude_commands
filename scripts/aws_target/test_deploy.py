@@ -275,7 +275,8 @@ elif operation == 'get-cost-and-usage':
         following = first + datetime.timedelta(days=1)
         days.append({'TimePeriod': {'Start': first.date().isoformat(), 'End': following.date().isoformat()},
                      'Estimated': False, 'Total': {}, 'Groups': [{'Keys': ['USE2-SpotUsage:m7a.4xlarge'],
-                         'Metrics': {'UnblendedCost': {'Amount': '0.1', 'Unit': 'USD'}}}]})
+                         'Metrics': {'UnblendedCost': {'Amount': '0.1', 'Unit': 'USD'},
+                                     'UsageQuantity': {'Amount': '1', 'Unit': 'Hrs'}}}]})
         first = following
     reply({'ResultsByTime': days})
 else:

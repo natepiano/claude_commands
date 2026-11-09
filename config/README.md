@@ -285,9 +285,33 @@ An empty `ci_repo` disables GitHub calls.
 
 `monthly_limit_usd` and `daily_limit_usd` are the user's spending limits. `aws_target.conf` holds each value on one line.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
-The spending reserve is $3. The maximum drain time is 60 minutes.
+The spending reserve and maximum drain time come from `limit_reserve_usd` and `drain_max_minutes`.
 Each repository budget stays within the 32 GiB build budget.
 The fixed and hourly costs are estimates from the design's queue replay.
+
+Cloud gates use `~/.claude/config/aws_target.conf` for the account money check, regardless of the checkout's `CONF_DIR`.
+The route passes this path to the installed worker through `--settings`.
+The worker uses this path for billing reads and ledger reservations.
+The ledger guard also accepts this explicit path.
+`AWS_TARGET_CONFIG` supplies an explicit account config path for fixtures.
+Tests can also pass their own file through `--settings` or the `GateWorker` constructor.
+Reports use the same account config path for money calculations.
+The older builder's SSH eligibility guard retains its target settings.
+
+The installed account file supplies these settings:
+
+- Limits: `daily_limit_usd`, `monthly_limit_usd`, `limit_reserve_usd`, `limit_action`, and `accounting_zone`.
+- Estimates: `fallback_usd_per_hour`, `fixed_usd_per_month`, `retained_storage_usd_per_month`, `root_storage_usd_per_month`, and `ipv4_usd_per_month`.
+- Other estimates: `gp3_iops_usd_per_month`, `gp3_throughput_usd_per_month`, `instance_type`, `spot_max_usd_per_hour`, and `box_minimum_seconds`.
+- Evidence: `price_refresh_seconds`, `price_max_age_seconds`, `observation_max_age_seconds`, `cost_explorer_interval_seconds`, `cost_explorer_lookback_days`, and `cost_explorer_read_usd`.
+- Notices: `notification_recipient`, `notification_timeout_s`, and `notification_retry_s`.
+- AWS access and tags: `credentials_profile`, `region`, `cost_explorer_tag_key`, and `cost_explorer_tag_value`.
+
+The checkout retains its source, module selection, build settings, and settings from `cloud_gate.conf`.
+These include `instance_types`, `clone_url`, `lifetime_minutes`, `module_time_limit_s`, `spot_max_usd_per_hour`, and `attempt_allowance_usd`.
+They also include `log_push_s`, `result_poll_s`, `launch_reply_tries`, `api_timeout_s`, `termination_timeout_s`, and `credential_file`.
+The gate records its own bid and allowance in each reservation.
+The installed account limits decide whether that reservation fits.
 
 The spending guard requires usable live spending settings through `ConfigRead.origin`.
 A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
@@ -307,16 +331,41 @@ This window captures delayed charges and later changes from AWS.
 `cost_explorer_read_usd=0.01` prices each API page.
 
 Both the controller and the gate worker use one Cost Explorer reader.
-It requests daily `UnblendedCost` for the account, grouped by `USAGE_TYPE`, and reads every page.
+It requests daily `UnblendedCost` and `UsageQuantity` for the account, grouped by `USAGE_TYPE`, and reads every page.
 It excludes `Credit` and `Refund` records, so the amounts show usage before credits.
 It uses no tag filter and needs no tag activation or deployment change.
 `cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` still supply the deployment tags.
-The reader saves each day's account total, usage rows, provisional flag, and read time in `charges/<day>.json`.
+The reader saves each day's account total, usage costs, usage quantities, units, provisional flag, and read time in `charges/<day>.json`.
+The saved `excludes_credits` mark identifies usage bills.
 A later scheduled read replaces those values, including zero amounts.
 An old saved format requires an immediate read, regardless of the previous schedule.
 An empty daily reply is an error for both callers.
-The ledger retains the conservative spending estimate and adds each page fee once.
+The gate cap uses the account amount for each completed UTC day whose bill rounds to at least one cent.
+For an unbilled day, each box uses the newest positive billed Spot rate for its instance type.
+The rate equals the type's daily Spot cost divided by its daily Spot hours.
+The newest day for one type can differ from the newest day for another type.
+A type without a positive billed Spot rate uses its saved `spot_max_usd_per_hour` bid.
+The cap records each box's instance type, applied rate, and rate source.
+`box_minimum_seconds` applies the minimum once per box, including boxes that cross UTC midnight.
+The older builder's complete running intervals receive the same minimum before the code allocates their cost across days.
+The cap reserves open boxes through their expiry and prices finished boxes through their recorded termination.
+The cap replaces each attempt's flat allowance with the newest billed day's non-Spot cost, once per UTC day.
+Bills remain UTC records.
+The daily and monthly cap windows use `accounting_zone`.
+The cap allocates timed compute costs and daily bill amounts to those windows.
+Daily usage also sums spend intervals within the local day bounds, including query fees.
+When no bill exists, the cap retains the configured attempt allowances and resource costs.
+The cap reads the daily limit, monthly limit, and reserve from `aws_target.conf`.
+The ledger adds each Cost Explorer page fee once.
+Existing boxes use their saved start and end times and the instance types in `cloud-gate-launches.jsonl`.
+A box without a saved instance type retains its bid rate.
+No migration is required.
 Reports use the saved AWS bill and label provisional days.
+Reports show today's spend, daily limit, successful launch count, and spend groups with amounts and percentage shares.
+Historical reports omit today's estimated spend.
+The groups are gate compute at 32 CPU, compute at 16 CPU, storage, public IPv4, data transfer, and other.
+Compute at 16 CPU includes gates and the older builder.
+Unbilled days use the label `estimated from the newest bill` when a bill exists.
 Spot compute includes the older Spot builder when it uses the same instance type.
 The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
 Reports read local evidence without an AWS call or a coordination file.
