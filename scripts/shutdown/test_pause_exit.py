@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import os
+import io
+import sys
 import subprocess
 import time
 from functools import cached_property
+from contextlib import redirect_stdout
 from typing import cast, final, override
 from unittest import mock
 
@@ -14,7 +17,9 @@ from scripts.production import live_units, staff, unit_lookup, worker
 from scripts.lib.resume_message import BusyPass, NoOwnPass
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member
-from scripts.shutdown import pane_record, restart_support, shutdown, stop_resume
+from scripts.shutdown import pane_record, restart_support, shutdown, stop_resume, remote
+from scripts.shutdown.stop_resume import stop as stop_session
+from scripts.shutdown.stop_results import StopResult
 
 
 @final
@@ -25,6 +30,10 @@ class PauseExitTests(StaffTestCase):
         _ = self.child, self.stop_workers, self.stop_director, self.start, self.send
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=str(self.owner.current_session)))
         _ = self.enterContext(mock.patch.object(stop_resume, "_pane_environment", return_value=([], {})))
+        def tab(session: str) -> herdr.TabSession | stop_resume.SessionNotFound:
+            return (herdr.TabSession("w1:p1", self.unit.name, "w1", self.unit.current_session)
+                    if session == self.unit.name else stop_resume.SessionNotFound(session))
+        _ = self.enterContext(mock.patch.object(stop_resume, "_tab_of", side_effect=tab))
         _ = self.enterContext(mock.patch.object(accounts, "launch_shell_environment", return_value=dict(os.environ)))
         _ = self.enterContext(mock.patch.object(accounts, "prepare_claude_launch",
             return_value=accounts.PreparedAccount({}, frozenset())))
@@ -95,6 +104,14 @@ class PauseExitTests(StaffTestCase):
         self.stop_director.assert_not_called()
         self.start.assert_not_called()
         self.assertEqual(staff.snapshot(), before)
+        missing = "session:TEST-missing-session"
+        with (mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(missing)),
+              mock.patch.object(stop_resume, "_record_launches"),
+              mock.patch.object(stop_resume, "stop", wraps=stop_session)):
+            preview = self.agents("stop", missing, "--dry-run")
+            result = self.agents("stop", missing)
+        self.assertEqual((preview.returncode, preview.stdout), (result.returncode, result.stdout))
+        self.assertEqual((preview.returncode, preview.stdout), (2, f"{missing}: no session on this machine\n"))
 
     def test_stop_by_name_stops_the_workers_listed_by_its_dry_run(self) -> None:
         stopped: list[str] = []
@@ -152,16 +169,79 @@ class PauseExitTests(StaffTestCase):
         self.assertEqual(self.current(), exited)
 
     def test_exit_stops_workers_and_director_and_the_board_shows_exited(self) -> None:
-        result = self.agents("exit", self.unit.name, "--why", "maintenance")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        exited = cast(dict[str, object], self.current().to_json()["exited"])
-        self.assertEqual((exited["by"], exited["why"]), (self.owner.name, "maintenance"))
-        self.assertTrue(exited["since"])
-        self.stop_workers.assert_called_once()
-        self.stop_director.assert_called_once()
-        self.assertEqual(staff.by_id(self.child.id), self.child)
-        every = unit_lookup.LabeledProductions({}, {self.owner.name: (self.unit.name,)})
-        self.assertEqual(live_units.units_in(self.owner.name, every)[0].status, "exited")
+        for machine in (remote.local_machine(), "mac"):
+            row = self.current()
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(machine, self.root), expected=row.worktree)
+            for already_exited in (False, True):
+                for failure in ("", "stop failed", "not found", "unreachable", "unreadable"):
+                    with self.subTest(machine=machine, failure=failure, already_exited=already_exited):
+                        _ = staff.resume(str(self.unit.id))
+                        if already_exited:
+                            self.save_exit()
+                        original = self.current()
+                        self.stop_workers.reset_mock()
+                        self.stop_director.reset_mock()
+                        alive = True
+                        def stop(identity: str, *, deadline: float) -> StopResult:
+                            nonlocal alive
+                            del deadline
+                            if already_exited:
+                                self.assertEqual(self.current().exited, original.exited)
+                            else:
+                                self.assertNotIn("exited", self.current().to_json())
+                            self.assertEqual(remote.local_machine(), machine)
+                            if failure == "stop failed":
+                                return stop_resume.StopFailed(identity, "fixture stop failed")
+                            if failure == "not found":
+                                return stop_resume.SessionNotFound(identity)
+                            alive = False
+                            return stop_resume.Stopped(identity, 123)
+                        def ssh(args: list[str], stdin: str = "", limit: remote.RemoteCallLimit = remote.STANDARD_TIME_LIMIT) -> tuple[int, str]:
+                            del limit
+                            if failure == "unreachable":
+                                return 255, ""
+                            if failure == "unreadable":
+                                return 0, "not a stop result"
+                            output = io.StringIO()
+                            with (mock.patch.object(sys, "stdin", io.StringIO(stdin)),
+                                  mock.patch.object(shutdown, "local_machine", return_value="mac"),
+                                  mock.patch.object(remote, "local_machine", return_value="mac"),
+                                  mock.patch.object(shutdown, "other_machine", return_value="natedev"),
+                                  redirect_stdout(output),
+                                  mock.patch("sys.stderr", io.StringIO())):
+                                code = shutdown.main(args)
+                            return code, output.getvalue()
+                        self.stop_director.side_effect = stop
+                        with mock.patch.object(shutdown, "run_remote", side_effect=ssh):
+                            result = self.agents("exit", self.unit.name, "--why", "maintenance")
+                        if failure in ("stop failed", "not found") or (machine == "mac" and failure in ("unreachable", "unreadable")):
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertNotIn(": exited", result.stdout)
+                            if already_exited:
+                                self.assertEqual(self.current().exited, original.exited)
+                            else:
+                                self.assertNotIn("exited", self.current().to_json())
+                            if failure == "stop failed":
+                                self.assertIn("fixture stop failed", result.stdout + result.stderr)
+                            self.assertTrue(alive)
+                            self.stop_director.reset_mock()
+                            self.stop_workers.reset_mock()
+                            with mock.patch.object(shutdown, "run_remote", side_effect=ssh):
+                                # The rerun uses the same retained staff identity.
+                                failure = ""
+                                result = self.agents("exit", self.unit.name, "--why", "maintenance")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertFalse(alive)
+                        if already_exited:
+                            self.assertEqual(self.current().exited, original.exited)
+                        exited = cast(dict[str, object], self.current().to_json()["exited"])
+                        self.assertEqual((exited["by"], exited["why"]), (self.owner.name, "maintenance"))
+                        self.assertTrue(exited["since"])
+                        self.stop_workers.assert_called_once()
+                        self.stop_director.assert_called_once()
+                        self.assertEqual(staff.by_id(self.child.id), self.child)
+                        every = unit_lookup.LabeledProductions({}, {self.owner.name: (self.unit.name,)})
+                        self.assertEqual(live_units.units_in(self.owner.name, every)[0].status, "exited")
 
     def test_finish_step_waits_for_the_current_worker_task_before_stopping(self) -> None:
         for command in ("pause", "exit"):

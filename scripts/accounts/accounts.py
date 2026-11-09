@@ -3035,7 +3035,7 @@ def move(session: str, target: str, *, dry_run: bool, why: str = "", alerts: Mov
 
 
 def move(session: str, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
-    """Move one local owner after the quota check."""
+    """Skip an owner on the target; check quota before moving another owner."""
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
@@ -3044,14 +3044,24 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
     else:
         inventory = import_module("scripts.shutdown.inventory")
     try:
-        now = datetime.now(timezone.utc)
-        checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
-        if isinstance(checked, MoveRefused):
-            return checked
-        live = inventory.listing()
+        refuse_default(target)
+        try:
+            live = inventory.listing()
+        except (inventory.InvalidInventory, OSError, ValueError):
+            checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
+            if isinstance(checked, MoveRefused):
+                return checked
+            raise
         matches = [item for item in live if item.session_id == session]
         if not matches:
             matches = [item for item in live if item.name == session]
+        if len(matches) == 1 and session_account_label(matches[0]) == target:
+            owner = matches[0]
+            line = f"{owner.name}: already on {target}"
+            return MoveDryRun(owner.session_id, (line,)) if dry_run else MoveStarted(owner.session_id, target, line + "\n", "", 0)
+        checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
+        if isinstance(checked, MoveRefused):
+            return checked
         if not matches:
             if dry_run:
                 return MoveDryRun(session, (f"{session}: would resume on {target} if its saved tab is local",))

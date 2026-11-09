@@ -704,6 +704,20 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 
 The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
 
+### Phase 40 — The admission client starts with only the wire format  · status: done
+
+**Depends on:** none.
+
+1. **The measurement (builds and natest, 2026-11-09).** One whole gate starts `scripts/build_queue/admission_client.py` 910 times, at 142 ms of CPU per start and 129 CPU seconds in all. `admission_protocol` and `admission_records` take 58 ms of its 87 ms warm import. Report: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/rank113/whole_gate_report.md`.
+2. **Fix.** The client path that a `verify.sh` run takes imports only the wire format. The target is about 60 ms less per start. Code that needs the record types, such as reading the queue view, imports them when it runs.
+3. **Unchanged.** The command line, the bytes on the socket, exit codes and printed text.
+4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, warm, on the same command.
+5. **Proof.** A test that the client path starts without loading the record types, and fails without the fix. The existing tests of the changed modules pass.
+6. **The feed restarts itself (builds and natedev, 2026-11-09).** `installed_code_version` in `memory_feed.py` hashes only the admission sources, so an install that changes the feed's own modules leaves the old feed running. The fingerprint now also covers each Python module the feed loaded under the install root, and each other file it reads once at start. An install that changes one of those files makes the feed exit, and systemd starts the new code. A listed file with a modification time after the feed's import started also makes the feed exit. A row in the existing fingerprint test proves it and fails without the fix.
+
+**Workers:** 2 writers and testers, one for the client and one for the feed. **Gate:** targeted test, basedpyright 0/0/0, adversary review, the measured times.
+**Change-Review:** none — verify runs start faster, and nothing visible changes.
+
 ### Phase 39 — The build page shows step names from the config  · status: done
 
 1. **The defect (builds, 2026-11-09; change review C1285 returned).** The build page shows `merge-gate`, not `merge gate`. `scripts/build_queue/memory_feed.py` passes `RECORDED_STEP_NAMES`, an empty map, at five places: `step_text` for swap holds, held rows, running rows and waiters, and `names=` on the `QueueModel`.
@@ -1343,7 +1357,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 ### Phase 23 — Detached Python runs have their own group and count in Other  · status: todo
 
-**Depends on:** Phase 18 of the herdr worker-panes plan on GitHub builds. That phase renames `scripts/agents/mesh_runs.py` and its config. Source: user, 2026-11-06.
+**Depends on:** none. The detached runs live in `scripts/agents/detached_runs.py` and `config/detached_runs.conf`. Source: user, 2026-11-06.
 
 #### Work Order
 
@@ -1352,14 +1366,14 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Spec:**
 
 1. **User rulings.** "i think the workers detached python tests will almost never be that heavyh weight so it's good that they don't count against the build queue". "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc."
-2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the line that is `mesh_runs.py:647` today. The limits of `builds.slice` still hold it.
+2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the `--slice=builds.slice` argument in `detached_runs.py`. The limits of `builds.slice` still hold it.
 3. **Reader.** The scope reader in `memory_admit.py` (line 2648 today) treats the child group as part of the one builds total, and it makes no row for that group. A reserved cargo step inside it counts once, as a build.
 4. **Page.** `memory_feed.py` makes no row for the group (line 419 today in the session prototype; `scripts/build_page/` after the build page moves). Its memory reads as Other.
 5. **Trace rule.** Remove only the rule that shows a detached process group as a run because its processes trace to a live run. Keep the service's registered run identity (`admission_service.py:910`), the held-run rows (`queue_view.py:272`) and the card that a person selects by owner (`queue_card.py:217`).
 6. **Proof.** Tests: a Python process in the group reads as Other and has no row; a reserved cargo descendant counts once; a cargo and a lint step inside a detached `verify.sh` ask the queue; a held run keeps its row.
 
 **Files:**
-- `scripts/agents/mesh_runs.py` — renamed by the herdr phase; use the new name.
+- `scripts/agents/detached_runs.py`
 - `scripts/lint/memory_admit.py`
 - `scripts/lint/test_memory_admit.py`
 - `scripts/build_queue/test_queue_view.py`
@@ -1390,7 +1404,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 ### Phase 23 — Detached Python runs show under Other  · status: todo
 
-**Depends on:** herdr-unit Phase 18, which renames `config/mesh_runs.conf` to `config/detached_runs.conf` (user-approved, 2026-11-06).
+**Depends on:** none. The config is `config/detached_runs.conf` (user-approved, 2026-11-06).
 
 1. **The ask (user, 2026-11-06).** "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc." The user approved the group name `builds-detached.slice`.
 2. **Outline.** Detached Python test runs start in `builds-detached.slice`, not `builds.slice`. They do not ask the queue (10v does not land). The memory page shows their memory in the Other group; `/build:queue` does not show them.

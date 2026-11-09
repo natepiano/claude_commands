@@ -935,3 +935,18 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 **Files:**
 - `scripts/buildlog/vault_pull.py` — the sync and its question rule.
 - `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
+
+### Phase 45 — Copy watch test processes end by themselves · status: done
+
+#### As-built
+
+- Every helper process that `test_copy_watch.py` starts arms `signal.alarm` at the test hang guard as its first action: the step stub, the runner stub, the parent wrapper, its delayed child and the live-pid child.
+- The fixture passes `TEST_HANG_GUARD_SECS` from `test_hang_guard` in each process environment.
+- A suite that is killed before `tearDown` leaves no helper for longer than the guard. The real watcher did not change and ends when its parent is gone.
+- No new test. A one-second trial showed the step stub and the runner stub in hold mode end with SIGALRM.
+
+**Files:**
+- `scripts/mac_test/test_copy_watch.py` — the fixture processes and their time limit.
+
+**Gotchas:**
+- A forked child does not inherit a pending alarm, so each process arms its own. An alarm does stay across `exec`.

@@ -2070,6 +2070,19 @@ class AccountsTests(unittest.TestCase):
             moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand",
                                           source_accounts={owner.session_id: "claude1"} if live else {})
 
+        self.login_directory("claude1", "move@example.invalid")
+        stored_room("move@example.invalid", 0, datetime.now(timezone.utc) + timedelta(days=1))
+        for dry_run in (False, True):
+            with (self.subTest(dry_run=dry_run),
+                  patch.object(inventory, "listing", return_value=[owner]) as listing,
+                  patch.object(accounts, "check_move_target", wraps=accounts.check_move_target) as checked,
+                  patch.object(stop_resume, "move_sessions") as moved):
+                result = self.run_cli("move", owner.name, "claude1", *(["--dry-run"] if dry_run else []))
+                self.assertEqual(result, (0, "fixture session: already on claude1\n", ""))
+                listing.assert_called_once_with()
+                checked.assert_not_called()
+                moved.assert_not_called()
+
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
 

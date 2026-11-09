@@ -235,6 +235,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    `read_cycle()` (`build_hold.py:978`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:967`) returns `Path | None`, for the same no-current-cycle state.
    Return the existing `NoCycle` (`build_hold.py:84`) from both in place of `None`. Add no second type for this state.
    Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
+   Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
+   Replace each one with `assert isinstance(cycle, build_hold.HoldCycle)`. This change keeps the assertion's intent.
 5. Route callers through the installed copy.
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
@@ -273,6 +275,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — caller tests.
 - `scripts/build_hold/override_guard.py`, `scripts/build_hold/build_hold.py` — shared guard and hold mutation boundary.
 - `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
+- `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_build_targets.py`, `scripts/direct/test_verify_mac_lifecycle.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py` — `read_cycle()` callers that narrow to `HoldCycle`.
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
@@ -306,6 +309,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   4. `test_release_recovers_recipient_notices_from_a_damaged_referenced_cycle`.
   5. `test_status_names_unreadable_pending_records_and_cycles_without_hiding_them`.
 - Every changed module and caller passes its tests. Basedpyright reports `0 errors, 0 warnings, 0 notes` for those modules.
+- No `read_cycle()` caller checks its result with `is not None` or `is None`, in source or in tests.
 - After installation, query the service and inspect its saved state. Repository and step fields remain separate.
   A checkout mutation attempt refuses before state changes. A private-state attempt still works.
 - Name queue-unit files as `also touches`, tested against `origin/builds-queue`.
@@ -1859,8 +1863,16 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Constraints from prior phases:**
 - Rounds 1-9 are in `phases/81/mac_link_report.md` in the run folder `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297`. Read it before any new step.
-- builds approved one controlled reproduction on 2026-11-08. The script is `/tmp/claude/scratch/until-2026-11-09T2200Z-resources-p81-repro/reproduce.sh`.
-- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Change the script's room check from four targets to one. Also change its schedule: today it keeps `target-A`, `target-B` and both control targets until the final cleanup (`reproduce.sh` lines 190-204), about 355 GiB. Record each build's result, then remove that private target before the next case or control starts.
+- builds approved one controlled reproduction on 2026-11-08. Its first script no longer exists, because its scratch folder ended. Before the first case, write a new script at `phases/81/reproduce.sh` in the run folder.
+- The script takes the normal Mac claim before its first remote command. At every exit it removes its private folder and releases the claim. `ssh mac` exits 0 on a failure, so the script prints one result line for each step.
+- The script runs this procedure on the Mac, in the private folder `~/.local/state/mac-test/repro81`:
+  1. Use Rust 1.99.0 on arm64 macOS. Keep the measured opt-level, codegen-units, incremental and shared-generics settings.
+  2. Use one small library and one integration-test crate. Start from the `HairlineFade`/`CascadeCombine` resource path.
+  3. Build in series, with no offload, no cleanup, no source copy during a build and no second compiler.
+  4. Sequential case: build one revision, change only the generic body or the caller, and rebuild with the completed incremental history. Its control builds the same changed revision in a new empty target.
+  5. Interrupted case: interrupt an intermediate compile, and then finish the build. Its control runs the same intermediate compile with no interrupt.
+  6. Reduce the source while the same promoted-symbol failure stays.
+- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Before the source copy, the script reads the deployed `sweep_floor_gib` and requires `free - (source_size + debug_size) >= floor`. Record each build's result, then remove that private target before the next case or control starts.
 - The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
 - Keep sccache and the hana test mirror. Run no gc command on the Mac.
 - New evidence, 2026-11-09 (Phase 92 retrospective): a Mac hana link failed at 11:56 UTC with the same signature, undefined `.llvm.<hash>` symbols in `libhana_conduit`.
@@ -1878,7 +1890,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - `docs/as-built/build-memory-admission.md` — the changed rule.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` owns the report, the source files and the as-built doc, and runs the final suites.
+- `impl` owns the report, the reproduction script, the source files and the as-built doc, and runs the final suites.
 - `test` owns the test files.
 
 **Acceptance gate:**
@@ -1995,7 +2007,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
 
-Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:5990`).
+Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6010`).
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
@@ -2056,14 +2068,14 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 #### As-built
 - The floor sweep trims the Mac mirror targets by design: it removes only the shortfall, least recently used first, and never a target a live build holds. On 2026-11-09 both mirror targets held live nextest runs at each scan; later trims took them.
-- `LockedClaims.holds` (`scripts/mac_test/floor_claims.py`) skips a claimed mirror path that does not exist, so a missing unrelated mirror no longer protects a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal (`scripts/copies/copies.py`) keeps its own lease exemption and still checks sibling leases.
+- `ClaimSnapshot.holds` (`scripts/mac_test/floor_claims.py`) skips missing claimed mirror paths. A missing unrelated mirror does not protect a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal keeps its own lease exemption and checks sibling leases.
 - While a crossing delivery is pending, the Mac measures each direct folder child of its floor roots (`mac_folder_measurement`, `CurrentMacFolders` in `scripts/lint/sweep.py`). `mac_folder_reclaimable_bytes` counts the blocks that deleting that folder alone frees: an inode counts once only when all its hard links are inside the folder; symlinks are not followed. The alert lists the folders by size and recommends the largest; protected folders keep their labels. No natedev disk snapshot is needed.
 - `notify_floor_problem` takes the machine name from its floor policy; it has no `machine` parameter.
 - `docs/as-built/build-memory-admission.md` states the claim and folder-measurement rules.
 
 **Files:**
 - `scripts/lint/sweep.py` — the Mac folder measurement and the folder choices.
-- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `LockedClaims.holds`.
+- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `ClaimSnapshot.holds`.
 - `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — rows in `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall` (Mac rows) and `test_no_proc_mac_sweep_takes_only_the_oldest_shortfall` (mirror row).
 - `docs/as-built/build-memory-admission.md` — the changed rules.
 
@@ -2115,7 +2127,6 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 **Ruled out:**
 - A deploy repair for the crossing record: the older and current formats read the same crossing, and the 147.7 GiB alert followed a real rise to 155.23 GiB.
-- A fallback for one folder path longer than the message limit.
 
 ### Phase 95 — Each test folder goes when its test ends  · status: done
 
@@ -2130,26 +2141,12 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 **Ruled out:** a check, a scan or a signal handler for leftover folders.
 
 ### Phase 96 — The hand cleanup command runs when typed by its path  · status: done
-**Depends on:** none in code. Merge `origin/builds` first.
 
-**Approved:** builds, 2026-11-09: "Its row command fails with exit 126 because scripts/lint/tmp_sweep.py is mode 100644. Make the documented command work."
+#### As-built
 
-#### Work Order
-
-**Goal:** `~/.claude/scripts/lint/tmp_sweep.py --plan <new-plan.json>` runs when typed by its path.
-
-**Defect:** `scripts/lint/tmp_sweep.py` has a `#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py` line but file mode 100644, so the shell exits 126. The small-fix path refuses this file because it imports `scripts/production/staff.py`.
-
-**Spec:**
-1. Set the git mode of `scripts/lint/tmp_sweep.py` to 100755.
-2. Change no file text. Add no check.
+`scripts/lint/tmp_sweep.py` has git mode 100755, so `~/.claude/scripts/lint/tmp_sweep.py --plan <new-plan.json>` runs when typed by its path.
 
 **Files:**
-- `scripts/lint/tmp_sweep.py`
+- `scripts/lint/tmp_sweep.py` — mode only.
 
-**Workers:** `1 writer` — the director sets the one mode bit. No test lane: no file text changes.
-
-**Acceptance gate:**
-- `git ls-files -s scripts/lint/tmp_sweep.py` shows 100755.
-- The script started by its path with one unknown argument prints its usage line and exits 2. That path starts no sweep.
-- `scripts/lint/test_tmp_sweep.py` passes through the targeted test.
+**Gotchas:** the small-fix path refuses this file because it imports `scripts/production/staff.py`.
