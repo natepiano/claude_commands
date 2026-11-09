@@ -301,7 +301,7 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(herdr.RolloutThread(replacement), "replacement-generation", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(replacement), "replacement-generation", {})
 
         with (mock.patch.object(session_pane, "Herdr", return_value=client),
               mock.patch.object(client, "run", side_effect=transport),
@@ -343,7 +343,7 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(herdr.RolloutThread(observed), "private-generation", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(observed), "private-generation", {})
 
         def send(verb: str, target: str) -> None:
             if verb == "type":

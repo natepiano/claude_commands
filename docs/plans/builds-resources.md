@@ -1852,6 +1852,13 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 3. Add a test that fails without the fix and passes with it.
 4. Update the as-built doc that describes the changed tooling.
 
+**Constraints from prior phases:**
+- Rounds 1-9 are in `phases/81/mac_link_report.md` in the run folder `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297`. Read it before any new step.
+- builds approved one controlled reproduction on 2026-11-08. The script is `/tmp/claude/scratch/until-2026-11-09T2200Z-resources-p81-repro/reproduce.sh`.
+- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Change the script's room check from four targets to one. Also change its schedule: today it keeps `target-A`, `target-B` and both control targets until the final cleanup (`reproduce.sh` lines 190-204), about 355 GiB. Record each build's result, then remove that private target before the next case or control starts.
+- The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
+- Keep sccache and the hana test mirror. Run no gc command on the Mac.
+
 **Files:**
 - `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
 - `scripts/mac_test/floor_claims.py` — the floor claims, when the cause is there.
@@ -1885,3 +1892,101 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - earlyoom stopped hana `b2f5eb9641`'s gate nextest at 11:19:14, 11:19:28 and 11:19:51 UTC on 2026-11-08, with about 1.2 GiB available and no free swap. hana's nextest stayed inside its claim (8.6 GiB anonymous peak against 12.1 GiB).
 - A herdr merge gate that ran at the same time had a 4 GiB claim and a 26.4 GiB anonymous peak. Its first attempts of `test_verify_mac_memory_handoff.py` (27.0 GiB) and `test_verify_mac_local_release.py` (9.4 GiB) ran away; their retries passed at about 250 MiB. The builds slice also held up to 27 GiB of shmem that no reservation counts.
 - Routed by builds: the runaway modules to verify; the fixed 4 GiB merge-gate claim (`scripts/build_queue/step_estimator.py:244`) and the shmem question to queue; the merge_gate governor that lets one oversized module run alone (`scripts/production/merge_gate.py:291`) to sdlc.
+
+### Phase 84 — Admission counts tmpfs memory in the builds slice  · status: done
+**Approved:** builds showrunner, 2026-11-08 ("Phase 84: admission counts tmpfs memory ... Add the slice's memory.stat shmem to the used memory that admission reads, with a test row that fails without it.").
+
+#### As-built
+- Memory admission counts swap-backed memory as used memory. `slice_working_set()` in `scripts/lint/memory_admit.py` reads `memory.stat` `anon + shmem`; `process_memory` reads `/proc/<pid>/status` `RssAnon + RssShmem`. A missing or negative field makes the reading unavailable ("swap-backed memory unavailable").
+- `buildlog_sample_anon` in `scripts/lint/invoke.sh` records `anon + shmem` for the peak, the phase peak and the near-peak, so a step's measured need has the same basis.
+- A registered CI scope's reading enters the cap once: `unowned_slice_memory` and the service's unowned path subtract each registered scope's whole reading and leave its pids out of the process subtraction (`owned_scope_roots`).
+- `AnonymousRunUse` and `ProcessAnonymousUse` (`scripts/build_queue/admission_records.py`) keep their names: `snapshot_codec` uses the class name as the record kind, so a rename breaks saved snapshots and protocol replies. `sum_anonymous_use` is now `sum_swap_backed_use`.
+- Rows: 1 GiB anon + 27 GiB shmem reads 28 GiB; CI shmem counted once; a process with RssShmem. `docs/as-built/build-memory-admission.md` states the basis.
+
+### Phase 85 — The tmp sweep judges plain files in the scratch root by age  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08 (change review C1267 returned: "`tmp_sweep.py --plan <file>` still keeps 535 entries with "Not a directory". Each one is a plain file in /tmp/claude/scratch, such as msg136.txt or wo.json, that the sweep reads as a folder for .scratch.json. Fix it where it lives, and add a test row.").
+
+#### As-built
+- `scratch.task_of` (`scripts/lib/scratch.py`) reads a plain file in the scratch root as `NotRegistered`. It tests with `os.path.isfile`, which returns False on a permission error; `Path.is_file` raises `PermissionError` on Python 3.13. A folder whose record cannot be read still reads as `UnreadableRecord` and stays.
+- The automatic tmp sweep keeps a recent plain file (`RECENT`) and removes an old one by the existing idle limit. A hand cleanup plan (`tmp_sweep.py --plan`) keeps a plain file with reason `NO_END` ("no recorded end permits hand cleanup"). No row says "Not a directory".
+- Rows: `test_scratch` (plain file and folder read `NotRegistered`; a parent without search permission reads `UnreadableRecord`); `test_tmp_sweep` `ScratchRootTests` and `HandCleanupTests --plan`. `docs/as-built/build-memory-admission.md` states the plain-file rule.
+
+### Phase 86 — Mac rebuild works over ssh through a local sshd hop  · status: done
+**Depends on:** none. Repository: nixos (worktree `/home/natepiano/worktrees/nixos-mac-ssh-rebuild`, branch `resources-mac-ssh-rebuild`, from nixos main `590edd7`). The showrunner pushes nixos main; this unit never does.
+
+**Approved:** builds showrunner, 2026-11-08, for the user: "i want to be able to rebuild over ssh - i made the configuration changes to settings that it suggested but it still does not work". Design: natedev.
+
+#### As-built
+- nixos `0da1eefd4` on branch `resources-mac-ssh-rebuild`; on nixos main as `7e9331f` (showrunner merge).
+- `modules/common/rebuild.nix`: on Darwin, when `SSH_CONNECTION` shows a non-loopback server address, `rebuild` runs itself again with `/usr/bin/ssh -t` to `natemccoy@127.0.0.1`, with the same arguments, and returns that exit status. The hop uses the hop key only (`IdentityAgent=none`, `IdentitiesOnly=yes`, no password), `UserKnownHostsFile=/etc/ssh/rebuild_known_hosts` and `StrictHostKeyChecking=yes`. `UNAME` is set on Linux only.
+- `modules/darwin/ssh.nix`: the `users` activation makes `~/.ssh/id_ed25519_rebuild_localhost` when missing (no passphrase) and writes `/etc/ssh/rebuild_authorized_keys.d/natemccoy` (root-owned) with `from="127.0.0.1,::1"`. nix-darwin's key options read keys at evaluation, so sshd reads this runtime file. The drop-in `/etc/ssh/sshd_config.d/000-rebuild-localhost.conf` sets `AllowUsers natemccoy@127.0.0.1 natemccoy@::1`, no password or keyboard-interactive login, and that `AuthorizedKeysFile`. `postActivation` writes the trust file from `/etc/ssh/ssh_host_*_key.pub`, after nix-darwin's openssh stage makes host keys. With no host key, activation prints one line: run `rebuild` once in the Mac's own Terminal after Remote Login is on.
+- `modules/darwin/tailscale.nix`, `modules/linux/ssh.nix`: Remote Login is on for the loopback hop only.
+- User steps: Remote Login on with "Allow full disk access for remote users"; first `rebuild` in the Mac's Terminal; then `ssh -t mac rebuild`. The live hop result comes from natedev through the showrunner.
+
+### Phase 87 — The Mac floor alert reaches the user's phone  · status: done
+**Depends on:** none. Merge `origin/builds` first.
+
+**Approved:** builds showrunner, 2026-11-08: "Did the Mac floor job send that push? If not, find why and fix it in Phase 85 or a new phase. If it did, tell me its time. Find what besides the 110 GiB hana target holds the other Mac space, from a read-only size list, and send me the top five folders."
+
+**Approved:** builds showrunner, 2026-11-08: "Phase 87 go, after the Phase 85 checkpoint: the Mac floor uses the same crossing path, with a natedev message."
+
+**User answer (via builds, 2026-11-08), to "approve the Mac low-disk phone push text?":** "1." builds: "Change the existing sweep.disk_floor text so that the machine name is a value ({machine}), and use it for natedev and the Mac. Add no sweep.disk_floor_mac. Title: "{machine} disk is low; {machine} tests can fail". The body and action are your proposed words, with {machine} in place of "Mac". The natedev push keeps its meaning. Your Phase 87 sends the phone push for the Mac. Put the changed catalog entry in the checkpoint notice."
+
+#### As-built
+- The Mac floor pass (`sweep.py --floor-only --host mac`, launchd `org.nixos.disk-floor`) and natedev use one phone-floor crossing path. A non-dry pass under `MacFloor` calls `notify_floor_problem` with `FloorMachine.MAC`; before, only `NatedevFloor` reached it. Each machine keeps its crossing state and receipts in its own `floor.json`.
+- `FloorMachine` (`NATEDEV = "natedev"`, `MAC = "Mac"`) fills `{machine}` in the one `sweep.disk_floor` text: title "{machine} disk is low; {machine} tests can fail". `disk_floor_push` and `fit_disk_floor_push` take `machine`. The natedev session message adds "This is the Mac disk." for the Mac.
+- `send_floor_alert()` sends the session message (exit 0 or 1 accepted); `send_phone_push()` sends the phone push (only exit 0 accepted). Each channel keeps its own receipt. A reading above the alert line rearms both; equality does not.
+- natedev cache size, growth and removal reports stay outside the Mac path.
+- Rows: `test_sweep.py` Mac crossing row. `push_texts_reviewed.json` holds the user's approval of the changed text. `docs/as-built/build-memory-admission.md` states the shared path.
+
+**Gotchas:** a changed push text needs a new approval record before a phone push sends. While approval is stale, the natedev message still sends and the phone receipt stays pending.
+
+### Phase 88 — The hana CI margin key goes after the runner activation  · status: todo
+
+**Depends on:** queue's 10d, natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
+
+#### Work Order
+
+**Goal:** A registered CI job is charged only through its reservation. The fixed CI margin is gone.
+
+**Spec:**
+
+1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
+2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:78`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
+4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove the tests of the mixed rule only with an approved assertion change.
+
+**Files:**
+- `config/build_admission.conf`
+- `scripts/build_queue/admission_records.py`
+- `scripts/lint/memory_admit.py`
+- `scripts/lint/test_memory_admit.py`
+- `docs/as-built/build-memory-admission.md`
+
+**Workers:** `1 writer`
+- `impl` — the deletion and its tests.
+
+**Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** none — the queue view shows the same rows; the room rises only when an unregistered job caused the margin. Registered jobs take no margin today (`test_memory_admit.py:5809`).
+
+### Phase 89 — The Mac folder audit reads process use and acts  · status: done
+
+#### As-built
+
+- The Mac folder audit (`org.nixos.folder-audit`) kept every due folder as `maker unknown: no /proc or lsof to show which processes use it` because the old launchd job PATH had no `/usr/sbin`. The job could not start `lsof`, so `folder_audit.process_uses()` returned `ProcessUsesUnavailable`.
+- The Python fallback is correct: `process_uses()` (`scripts/lint/folder_audit.py:325`) calls `tmp_sweep.lsof_paths()` when `/proc` is missing, and `test_lsof_fallback_keeps_used_folders_and_judges_unused_folders` covers it. No Python or test changed.
+- Nixos `efdf8bf` adds `/usr/sbin` after `/usr/bin:/bin` to `jobPath` (`modules/darwin/nate-backend.nix:40`). The loaded job has that PATH. Its plist change time is 2026-11-08 11:04:48 EST. The job has `RunAtLoad=false` and an 86400-second interval, and had zero runs at inspection.
+- The as-built records the cause, the loaded PATH and the closed Phase 44 gap: the old standing `~/rust/hana_catalyst_mac` clone had no lifetime after the runner moved to scratch clones; its 85.8 GiB target was removed on 2026-11-08 with builds' approval. Folder creators register lifetimes; `~/.cache` stays outside every cleanup root.
+- The first audit run after the PATH change goes to builds as a note (removed count, NO_PROC rows). A run that still removes nothing becomes a new phase.
+
+**Files:**
+- `docs/as-built/build-memory-admission.md` — the Mac audit PATH cause, the loaded job PATH and the Phase 44 gap.
+
+**Gotchas:**
+- An ssh shell finds `/usr/sbin/lsof`; a launchd job uses its own explicit PATH. Test a command lookup in the job environment, not over ssh.
+- The plist file time is not the launchd load time; `launchctl print` shows no load time.
+
+**Ruled out:** a Python change or a new test row for the Mac case — the existing fallback test covers the `lsof` path.

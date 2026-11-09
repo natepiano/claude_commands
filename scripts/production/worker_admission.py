@@ -198,19 +198,28 @@ def member(run: Path, name: str, record: staff.StaffSnapshot | None = None) -> s
     return find_worker(record, owner.id, name)
 
 
+def codex_transcript_source(thread_id: str, home: Path) -> Path:
+    """Find the newest transcript for the named Codex thread and account."""
+    paths = [path for folder in ("sessions", "archived_sessions")
+             for path in (home / folder).rglob(f"*{thread_id}.jsonl")]
+    if not paths:
+        raise ValueError("no source transcript found")
+    return max(paths, key=lambda path: path.stat().st_mtime)
+
+
 def transcript_source(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
     if isinstance(backend, staff.CodexBackend):
-        paths = [path for folder in ("sessions", "archived_sessions")
-                 for path in (backend.codex_home / folder).rglob(f"*{row.current_session}.jsonl")]
-    else:
-        from scripts.message import sessions
-        paths = sessions.transcript_locations(row.current_session)
+        return codex_transcript_source(row.current_session, backend.codex_home)
+    from scripts.message import sessions
+    paths = sessions.transcript_locations(row.current_session)
     if not paths:
         raise ValueError("no source transcript found")
     return max(paths, key=lambda path: path.stat().st_mtime)
 
 
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
+    if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
+        return ""
     raw = fields.get("message", fields.get("payload", {}))
     if not isinstance(raw, dict):
         return ""

@@ -426,3 +426,25 @@ From hana's showrunner, through sdlc, 2026-11-07. `change_review.py list-ready` 
 Fix: the checkpoint aliases of a unit also hold its plan stem without a trailing `-plan`. Add no new check.
 
 As built: `_branches_from_units` adds `plan.removesuffix("-plan")` right after the plan stem, so `checkpoint(info-panels)` resolves to demo.
+
+### Phase 10g — A merge made on a local merge-gate branch adds its change rows  · status: done
+
+**Depends on:** Phase 10d.
+
+From hana's showrunner, through sdlc, 2026-11-08 [954e2ae6]. After two main promotions, `change_review.py list-ready --repo ~/rust/hana_catalyst --production hana` added no row. It missed three Change-Review lines in b7c17741de (merged as 5c444e5b40) and one in f75b3adb07 (merged as afdb0012db). hana added them by hand as C294-C297.
+
+Cause: Phase 10d keeps only a merge whose subject ends ` into <merge branch>`. hana's merge branch is `init/catalyst`, but its merge-gate unit merges on a local branch, so every hana merge subject ends ` into tool-based-ui-merge-gate`. All 33 hana merges since 2026-11-06 fail that test.
+
+Fix: skip a merge only when its subject ends ` into <B>`, where `origin/<B>` is the merge branch of a production outside this scan (the refs `reviewed_merge_refs` already gives). Keep every other merge. The rows hana added by hand must not come again. Add no new check.
+
+As built: `list_ready` skips a merge only when its subject ends ` into <B>` for a branch `origin/<B>` in `outside_refs`. A scan of a copy of hana's list without C294-C297 adds those four rows with demo as Producer; with them, it adds none.
+
+### Phase 10h — A merge finishes when the Mac is offline, and the Mac pulls later  · status: done
+
+**Depends on:** none.
+
+From the sdlc showrunner, 2026-11-08 [f15c6428], urgent. `merge_checkpoint.pull_mac_checkout` raises `Stop` when ssh cannot reach the Mac. The builds chain (17 merges) held from 13:43: builds 84 pushed and promoted on natedev, then `promote: failed - mac ~/.claude: connection timed out`, and a rerun failed again.
+
+Fix: when ssh cannot reach the Mac, queue one pull-only Mac pull with the existing `main_publish` queue (the record `/zone` and `/tune` already use), report `promote ok: mac unreachable, pull pending`, and let the merge finish. The next promotion that reaches the Mac pulls once (a fast-forward carries every commit) and clears that record. A Mac that answers but whose pull fails still stops, as now. `tune.py` and the promotion share one queue-and-clear helper in `main_publish`. Add no other check.
+
+As built: `pull_mac_checkout` returns `main_publish.MacPulled` or `MacPullPending`. After its last try, ssh exit 255 with no `rc=` line queues a pull-only record through `main_publish.queue_pull_only`; any other failure still raises `Stop`. A pull clears a pull-only record with `main_publish.clear_pull_only`, and `tune.py` uses the same two helpers. Both promotion paths report `mac unreachable, pull pending: <path>` and go on; `finish_promotion_targets` then skips the zone send and the Mac notice.

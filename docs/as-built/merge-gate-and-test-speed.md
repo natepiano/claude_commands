@@ -53,8 +53,7 @@ The trial and route share `scripts/aws_target/gate_box.py`.
 The boot script downloads the guest program before Python starts.
 Production also downloads the request that contains the module list.
 User data contains the download links instead of the program or module paths.
-Production uses the instance role and S3 inside the tools shell.
-The trial uses signed HTTPS links for its program and source bundle.
+Production and trial use curl with signed HTTPS links for every box transfer.
 The guest performs no type check and installs no basedpyright package.
 An explicit type request and the nightly checker remain local.
 
@@ -98,7 +97,7 @@ The existing Rust foundation stack must exist first.
 The command adds the gate bucket, role, profile, security group, launch template, scaler policy, expiry Lambda, schedule, and log group.
 It preserves Rust parameters and refuses a change set that changes a Rust resource.
 It records a priced shared resource entry before creation.
-It saves the image, template version, public subnets, nixpkgs revision, and artifact role prefix locally.
+It saves the image, template version, public subnets, and nixpkgs revision locally.
 This phase prepares tools at boot. A prepared image belongs to plan phase 7.
 
 | Scaler grant | Scope |
@@ -109,11 +108,11 @@ This phase prepares tools at boot. A prepared image belongs to plan phase 7.
 | `ec2:TerminateInstances` | This deployment's gate ownership and workload tags. |
 | `ec2:DescribeInstances` | Regional describe scope. |
 | `ce:GetCostAndUsage` | Combined cost query; AWS requires wildcard resource scope. |
-| `s3:PutObject` | Gate source and request prefixes. |
-| `s3:GetObject` | Gate artifact prefix. |
+| `s3:PutObject` | Gate source, request, and artifact prefixes. |
+| `s3:GetObject` | Gate artifact, source, and request prefixes. |
 
 The guest reads source and request objects.
-Its writes use only `artifacts/${aws:userid}/*`, which contains its role and instance identity.
+The scaler signs box uploads under `artifacts/<attempt>/`; the guest role has no S3 grants.
 The expiry role terminates only gate-tagged instances and writes only its function logs.
 The gate bucket blocks public access, requires HTTPS, encrypts objects, and removes old artifacts.
 
@@ -475,11 +474,12 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   This includes children that the leader waited for.
   Children killed during cleanup after their leader exits do not contribute to this reading.
   At run end, the runner writes the records atomically and retains entries for jobs that did not run.
-  A job killed at the module time limit does not replace or add a record.
+  A job stopped at its time or memory limit does not replace or add a CPU record.
   `GateJobResult.cpu_seconds` retains the reaped CPU time for that job.
 - **Rerun alone.** After all parallel jobs end, each failed test module runs once more, alone.
   Jobs killed at the module time limit and `types` do not run again.
-  If more than `RERUN_LIMIT` (8) modules qualify, none run again; one line reports the count.
+  If more than `RERUN_LIMIT` (8) ordinary failures qualify, those failures do not run again; one line reports the count.
+  Memory stops use their separate retry count even when ordinary failures exceed this limit.
   Each rerun uses the same launch, cleanup, arguments, environment, scope prefix, memory sampling, and time limit.
   A pass replaces the first failure and prints `Rerun alone: <suite>/<module> passed (first run exit N, X s)`.
   The report retains the first output under `--- <suite>/<module> passed on rerun alone; first run exit=N ---`.
@@ -497,9 +497,16 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Each running job retains `max(0, reservation − sampled memory)` as its remaining reservation.
   A new job starts when a CPU slot is free and `latest aggregate + remaining reservations + expected memory ≤ governor_mib`.
   With no job running, the governor always permits one job.
-  Completed jobs update their peak records; jobs killed at the module time limit do not.
+  Completed jobs update their peak records; jobs stopped at the time or memory limit do not.
   Samples do not change reservation sizes during the run.
-  Memory peaks do not kill jobs or fail the gate.
+  A test module above this limit stops, whether it runs alone or beside other jobs.
+  The sample includes resident and swapped memory for the module and its descendants.
+  The type-check job has no memory stop.
+  `memory_stop_reruns` in `config/merge_gate.conf` sets the reruns alone after a memory stop; the default is one.
+  The gate reads this count at use. Memory stops do not count toward the eight ordinary failures that prevent reruns.
+  Another memory stop after the last allowed rerun fails the gate and retains the reason.
+  Each stop sends sdlc a peer message with the gate, module, peak, limit, and next action.
+  A failed send prints one line and does not change the gate result.
   The gate record retains the key `cap_mib` for the governor value in MiB.
 - **Running job limit.** A module starts only when memory admits it and fewer than `max(1, (os.cpu_count() or 2) // 2)` jobs run: half the cores, with a minimum of one. The basedpyright job counts as one. `run_suites` accepts `max_running_jobs` for tests; there is no environment variable or command-line flag. The `Gate tests:` line names the limit once. On 2026-10-28, starting nearly all modules at once raised one-minute load from 71.6 to 339.7 and made every module 3–5 times slower.
 - **Cleanup.** When a job's leader exits, the runner SIGKILLs the job's whole process group, which catches leaked children. On any exit it kills and reaps every running group before the tmpfs dir is removed. It never kills a process outside its own groups.
