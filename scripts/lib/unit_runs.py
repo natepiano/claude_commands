@@ -33,8 +33,6 @@ from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, NamedTuple, cast
 
-from scripts.lib.atomic_file import write_text_atomic
-
 if TYPE_CHECKING:
     from scripts.production import staff
 
@@ -140,6 +138,8 @@ def marker_lock(path: Path) -> Generator[None]:
 
 def activate(run: Path, session_id: str, active_override: str | Path | None = None) -> None:
     """Write the current marker and remove the former marker."""
+    from scripts.lib.atomic_file import write_text_atomic  # The Mac usage reader ships this module without atomic_file.
+
     current, *former = active_dirs(active_override)
     current.mkdir(parents=True, exist_ok=True)
     path = current / session_id
