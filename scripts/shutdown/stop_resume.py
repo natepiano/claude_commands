@@ -296,31 +296,36 @@ def stop_grace_seconds() -> float:
     return float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))
 
 
+def stop_target(session: str) -> str | SessionNotFound | StopFailed:
+    """Resolve the same local target for a stop and its preview."""
+    try:
+        try:
+            record = staff.initial_snapshot()
+        except (OSError, ValueError) as error:
+            print(f"{session}: staff anomaly: {error}", file=sys.stderr)
+            record = staff.StaffSnapshot(())
+        member = record.by_member_reference(session)
+        if member is not None:
+            return member.current_session
+        tab = _tab_of(session)
+        return tab.session_id if isinstance(tab, herdr.TabSession) and tab.session_id else SessionNotFound(session)
+    except (OSError, ValueError, herdr.HerdrFailure) as error:
+        return StopFailed(session, str(error))
+
+
 def _stop(session: str, kind: str = "", *,
           codex: herdr.CodexConversations | None = None) -> StopResult:
     """Signal only the process that proves the current conversation."""
     identity = session
     last_signal = ""
     signal_pid = 0
-    tab: herdr.TabSession | SessionNotFound = SessionNotFound(session)
     try:
-        from scripts.production import staff
-
         settings = conf.read("shutdown")
         stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("KILL_GRACE_SECONDS"))
-        try:
-            member = staff.initial_snapshot().by_member_reference(session)
-        except (OSError, ValueError) as error:
-            print(f"{session}: staff anomaly: {error}", file=sys.stderr)
-            member = None
-        if member is not None:
-            identity = member.current_session
-        else:
-            tab = _tab_of(session)
-            if isinstance(tab, herdr.TabSession) and tab.session_id:
-                identity = tab.session_id
-            else:
-                return SessionNotFound(session)
+        target = stop_target(session)
+        if isinstance(target, (SessionNotFound, StopFailed)):
+            return target
+        identity = target
         if not kind:
             try:
                 publication = pane_record.publication_for_session(identity)
