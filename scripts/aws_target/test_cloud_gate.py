@@ -155,6 +155,16 @@ class CloudGateTests(CostFixture):
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
         self.assertTrue(self.fake.terminated)
 
+    def test_saved_image_changes_only_the_launch_image(self) -> None:
+        self.assertEqual(self.execute()['status'], 'complete')
+        official = self.fake.launches[-1]
+        self.deployment['image'] = 'ami-saved-gate'
+        (self.folder / 'launch.json').unlink()
+        self.assertEqual(self.execute()['status'], 'complete')
+        saved = self.fake.launches[-1]
+        self.assertEqual(saved['ImageId'], 'ami-saved-gate')
+        self.assertEqual({key: value for key, value in saved.items() if key != 'ImageId'}, official)
+
     def test_poll_read_timeout_retries_and_completes(self) -> None:
         self.fake.read_timeouts = 1
         self.assertEqual(self.execute()['status'], 'complete')
