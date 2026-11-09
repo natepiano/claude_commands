@@ -48,7 +48,7 @@ from scripts.notify import push_texts  # noqa: E402
 from scripts.message import rca  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 
-from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr import herdr, worker_panes  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator
@@ -129,6 +129,16 @@ class PaneInspection(NamedTuple):
     name: str
     unit: unit_lookup.LabeledSession
     row: staff.StaffRow
+
+
+class PaneWorkersUnread(NamedTuple):
+    """The cycle has not needed worker activity yet."""
+
+
+class BusyPaneWorkerParents(NamedTuple):
+    """The directors with busy pane workers in this cycle."""
+
+    ids: frozenset[staff.StaffId]
 
 
 class PromptWait(TypedDict):
@@ -334,6 +344,20 @@ def work_running(pid: int, rows: list[Process], session_id: str = "") -> bool:
         if process_session(row.pid) == session_id:
             return True
     return False
+
+
+def read_busy_pane_worker_parents(parents: tuple[staff.StaffRow, ...], record: staff.StaffSnapshot) -> BusyPaneWorkerParents:
+    """Read worker activity for all directors once per cycle."""
+    if not any(record.find(kind="worker", parent=parent.id) for parent in parents):
+        return BusyPaneWorkerParents(frozenset())
+    try:
+        observations = worker_panes.observe_parents(parents, record)
+    except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError) as error:
+        print(f"stall-watch: pane workers: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        return BusyPaneWorkerParents(frozenset())
+    return BusyPaneWorkerParents(frozenset(
+        parent for parent, workers in observations.items()
+        if any(worker_panes.worker_state(observed) == "busy" for observed in workers)))
 
 
 def latest_transcript_activity(session_id: str) -> float:
@@ -1245,6 +1269,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
                 continue
     runs = unit_lookup.HeldRunLookup(record=record)
+    pane_worker_parents = tuple(item.row for item in work)
+    busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
     for production_name, configured, zone, peers, name, unit, row in inspection_order(work):
@@ -1362,6 +1388,10 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 report.decision = "waiting"
                 continue
             running_work = work_running(pid, rows, session_id)
+            if not running_work:
+                if isinstance(busy_pane_workers, PaneWorkersUnread):
+                    busy_pane_workers = read_busy_pane_worker_parents(pane_worker_parents, record)
+                running_work = row.id in busy_pane_workers.ids
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
