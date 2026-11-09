@@ -12,6 +12,10 @@ from typing import NamedTuple
 
 from scripts.production import session_staff, showrunners, staff
 from scripts.production import unit_lookup
+from scripts.accounts import session_state
+from scripts.message import sessions
+from scripts.shutdown import remote
+from scripts.herdr import herdr
 
 
 class LiveUnit(NamedTuple):
@@ -19,6 +23,11 @@ class LiveUnit(NamedTuple):
     # None when no observed herdr session has the unit identity.
     session: unit_lookup.LabeledSession | None
     status: str = "active"
+    member: staff.StaffRow | session_state.UnrecordedStaff = session_state.UnrecordedStaff()
+
+    @property
+    def staff_status(self) -> session_state.StaffState:
+        return session_state.staff_state(self.member)
 
     @property
     def name(self) -> str:
@@ -55,8 +64,28 @@ def units_of(production_name: str) -> list[LiveUnit]:
 
 
 def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...]) -> list[LiveUnit]:
-    statuses = {row.name: "exited" if isinstance(row.exited, staff.Exited) else "paused" if isinstance(row.paused, staff.Paused) else "active" for row in rows}
-    return [unit._replace(status=statuses.get(unit.unit, "active")) for unit in units]
+    members = {row.name: row for row in rows}
+    activities = {session["sessionId"]: session_state.LiveActivity(session.get("status", ""))
+                  for session in sessions.running_sessions()}
+    result: list[LiveUnit] = []
+    for unit in units:
+        row = members.get(unit.unit)
+        activity = activities.get(row.current_session, session_state.NoLiveSession()) if row is not None else session_state.NoLiveSession()
+        if isinstance(activity, session_state.NoLiveSession) and unit.session is not None:
+            observed = unit.session
+            if (isinstance(observed.claude, unit_lookup.LiveClaude)
+                    or (isinstance(observed.process, unit_lookup.ObservedProcess)
+                        and observed.process.pid > 0
+                        and (herdr.is_codex_process([observed.process.command])
+                             or herdr.is_claude_process([observed.process.command])))):
+                activity = session_state.LiveActivity("idle")
+        member = row if row is not None else session_state.UnrecordedStaff()
+        state: str = session_state.classify(member, activity)
+        if (row is not None and isinstance(row.worktree, staff.PresentWorktree)
+                and row.worktree.machine != remote.local_machine() and session_state.staff_state(row) == "active"):
+            state = f"on {row.worktree.machine}"
+        result.append(unit._replace(status=state, member=member))
+    return result
 
 
 def units_in(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:

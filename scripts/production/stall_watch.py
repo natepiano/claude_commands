@@ -125,7 +125,7 @@ class PaneInspection(NamedTuple):
     production_name: str
     configured: showrunners.Showrunner
     zone: ZoneInfo
-    members: tuple[str, ...]
+    peers: tuple[str, ...]
     name: str
     unit: unit_lookup.LabeledSession
     row: staff.StaffRow
@@ -1205,13 +1205,15 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     runners = showrunners.ShowrunnerDiscovery()
     record = staff.StaffSnapshot(())
     work: list[PaneInspection] = []
-    members_by_parent: dict[staff.ReportsTo | staff.StaffRoot, tuple[str, ...]] = {}
     try:
         record = staff.snapshot()
         sessions = unit_lookup.every_labeled_session(record=record)
     except (OSError, UnicodeError) as error:
         print(f"stall-watch: units: their run state is unknown: {error}", file=sys.stderr)
     else:
+        showrunner_names = tuple(member.name for member in record.find(kind="showrunner")
+                                 if not isinstance(member.worktree, staff.RemovedWorktree))
+        sibling_names_by_parent: dict[staff.ReportsTo | staff.StaffRoot, dict[staff.StaffId, str]] = {}
         runners = showrunners.registered_showrunners(deadline=inspection_deadline, membership=record)
         for configured in runners:
             # A showrunner that is not running has no one to tell: its units are not watched.
@@ -1230,18 +1232,22 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                     if isinstance(unit.identity, session_staff.NoSession):
                         raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
                     row = unit_lookup.unit_row(name, record, reference=unit.identity)
-                    if row.parent not in members_by_parent:
-                        members_by_parent[row.parent] = tuple(member.name
-                            for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
-                            if not isinstance(member.worktree, staff.RemovedWorktree))
-                    work.append(PaneInspection(production_name, configured, zone, members_by_parent[row.parent], name, unit, row))
+                    if row.parent not in sibling_names_by_parent:
+                        sibling_names_by_parent[row.parent] = {
+                            member.id: member.name for member in record.rows
+                            if member.kind == "unit" and member.parent == row.parent
+                            and not isinstance(member.worktree, staff.RemovedWorktree)}
+                    peers = (*showrunner_names,
+                             *(sibling_name for sibling_id, sibling_name in sibling_names_by_parent[row.parent].items()
+                               if sibling_id != row.id), configured["session"], production_name)
+                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, row))
             except (OSError, UnicodeError, ValueError) as error:
                 print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
                 continue
     runs = unit_lookup.HeldRunLookup(record=record)
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
-    for production_name, configured, zone, members, name, unit, row in inspection_order(work):
+    for production_name, configured, zone, peers, name, unit, row in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
@@ -1338,8 +1344,6 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             # assistant text is authoritative when it supplies a turn-end status.
             turn = transcript_turn_end(session_id) or (turns[-1] if turns else None)
             last = turn.group("status").strip() if turn else "none on screen"
-            peers = (*(member for member in members if member != row.name),
-                     configured["session"], production_name)
             own_names = (name, unit.unit, claude.name, labels.get(unit.place.pane, ""), f"session:{session_id}")
             try:
                 deferred = bool(turn) and status_defers_bump(last, peers, own_names)

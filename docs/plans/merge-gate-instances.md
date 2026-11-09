@@ -220,14 +220,17 @@ The guest sets an absolute systemd shutdown deadline.
 One EventBridge schedule invokes an expiry Lambda each minute.
 The function terminates only expired instances with this deployment's gate tags.
 Normal completion requests termination and waits for confirmed termination.
-An uncertain launch or termination keeps its cost reservation.
+A launch timeout permits local fallback.
+An unconfirmed termination keeps charging until the expiry cleanup confirms termination.
+An AWS launch refusal releases its cost reservation before local fallback.
 An AWS outage can delay termination and its final charge.
 
 | Event | Result |
 | --- | --- |
 | Complete result and final log | Validate the result and import its measurements. |
-| Guest death, deadline, or Spot interruption without a final result | Return red. |
-| Lost launch reply | Recover the saved request before any new launch. |
+| Guest death, deadline, or Spot interruption without a final result | Use natedev. |
+| Upload or launch timeout | Release the cloud slot and use natedev. |
+| AWS launch refusal | Record the refusal and use natedev after capacity retries. |
 | Natedev death | Recover the saved attempt; the guest and Lambda retain their deadlines. |
 | No capacity at either size | Use the existing local runner. |
 
@@ -237,19 +240,29 @@ A quota does not guarantee free capacity in any zone.
 
 ## Exact tree delivery
 
-The gate bucket holds source bundles, request manifests, results, and logs.
-Instances use HTTPS and temporary role credentials. They need no SSH or Tailscale connection.
+The gate bucket holds source bundles, guest programs, request manifests, results, and logs.
+The boot script downloads the guest program before Python starts.
+Production also downloads the request that contains the module list.
+User data carries neither the program nor the module paths.
+Production and trial use curl with signed HTTPS links for every box transfer.
+Instances use HTTPS links signed on natedev. They need no SSH or Tailscale connection.
 Each public subnet has an internet gateway route. The gate security group has no inbound rule.
 
 1. Record the clean checkout's commit and tree on natedev.
 2. Select targeted modules on natedev with the existing affected-module rules.
-3. Export a Git bundle with HEAD, `origin/main`, and the current branch history.
-4. Upload the bundle under its content digest.
-5. Save the request with its selected paths, source identity, and absolute expiry.
-6. Launch the instance with that request and the recorded deployment settings.
-7. Clone the bundle and verify the exact tree before tests.
+3. Bundle HEAD and the branch ref with `--not refs/remotes/origin/main`.
+4. Upload that bundle only when HEAD has commits outside `origin/main`.
+5. Save the selected paths, tested commit, tree, natedev `origin/main` hash, clone URL, and expiry in the request.
+6. Upload the guest program beside the request.
+7. Launch the instance with download links and the recorded deployment settings.
+8. Download the program and request before Python starts.
+9. Clone the public HTTPS repository from `clone_url` in `cloud_gate.conf`.
+10. Fetch the optional bundle and check out the requested commit.
+11. Set `origin/main` to natedev's recorded hash and verify the exact tree.
 
-The guest imports the bundle's `origin/main` reference and sets the public origin URL.
+The guest uses natedev's `origin/main` hash even when GitHub main has advanced.
+The incremental bundle contains only commits outside that reference.
+The guest sets the recorded origin URL after the clone.
 The bundle contains no local Git configuration, hooks, credential helper, or untracked file.
 The guest runs the module launcher from the tested tree.
 The local route compares the returned attempt, commit, tree, module list, verdict, and host before completion.
@@ -285,7 +298,8 @@ The guest pushes its log every five seconds by default.
 The final log must arrive before a result can complete the gate.
 The result contains final jobs, first failures, isolated reruns, timeouts, CPU use, memory peaks, and an explicit `gate_run` record.
 The route validates the attempt, commit, tree, modules, host, and verdict.
-Partial logs cannot complete a gate. A dead instance without a final result is red.
+Partial logs cannot complete a gate.
+A dead instance without a final result permits local fallback.
 A remote test failure remains red and never starts a local retry.
 
 The route imports the explicit buildlog record once by its identity under the real remote host.
@@ -333,7 +347,7 @@ Measure a cold full gate, a repeated full gate, and an affected gate to quantify
 
 The route tries every configured zone at the preferred size before the smaller size.
 Both sizes use Spot. The route never requests On-Demand capacity.
-An interruption without a valid final result produces a red attempt.
+An interruption without a valid final result permits local fallback.
 The saved log and cost evidence remain available for a later retry.
 Only capacity refusal at both sizes permits capacity fallback to natedev.
 
@@ -423,7 +437,7 @@ The gate route never starts the Rust box or enables Rust offload.
 Sessions make no AWS call.
 The route starts a user systemd service with the scaler credential file and profile `build-scaler`.
 The service removes inherited AWS key, profile, and config overrides.
-The credential file stays on natedev. The guest receives only temporary instance-role credentials.
+The credential file stays on natedev. The guest receives only signed object URLs.
 The user alone runs `deploy.py` with administrator access.
 
 | Added scaler grant | Scope |
@@ -434,14 +448,13 @@ The user alone runs `deploy.py` with administrator access.
 | `ec2:TerminateInstances` | Instances with this deployment's gate ownership and workload tags. |
 | `ec2:DescribeInstances` | Regional describe scope, required by EC2. |
 | `ce:GetCostAndUsage` | The combined cost query; AWS requires wildcard resource scope. |
-| `s3:PutObject` | The gate bucket's `source/*` and `requests/*` prefixes. |
-| `s3:GetObject` | The gate bucket's `artifacts/*` prefix. |
+| `s3:PutObject` | The gate bucket's `source/*`, `requests/*`, and `artifacts/*` prefixes. |
+| `s3:GetObject` | The gate bucket's `artifacts/*`, `source/*`, and `requests/*` prefixes. |
 
 Launch requests require attempt and expiry tags on instances and volumes.
 The route pins the deployed launch-template version.
-The guest role reads only source and request objects.
-It writes only `artifacts/${aws:userid}/*`, where an instance session uses `<role-id>:<instance-id>`.
-See [IAM policy variables](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html).
+The guest role and profile remain attached to the launch template but have no S3 grants.
+The scaler signs log, result, and boot-error PUT links under `artifacts/<attempt>/`.
 Workers receive no launch permission, scaler key, or Git credential.
 
 The expiry role can describe instances and terminate only this deployment's gate instances.
@@ -477,7 +490,7 @@ No image build or queue display ships in this route phase.
 
 ## Fallback and separation from Rust
 
-The local runner remains available for four conditions:
+The local runner handles cloud setup and infrastructure failures:
 
 1. AWS is down.
 2. The image or deployed stack is absent.
@@ -485,8 +498,8 @@ The local runner remains available for four conditions:
 4. Both configured sizes lack Spot capacity in every deployed zone.
 
 A remote test failure never permits local fallback.
-Access denial, invalid results, lost logs, and dead instances produce red results.
-An uncertain launch remains recoverable with its existing reservation.
+Access denial, invalid results, lost logs, and dead instances permit local fallback.
+A launch timeout releases its reservation when no instance identity is known.
 The route never increases a cap or requests On-Demand capacity.
 
 The workloads share deployment administration, scoped credentials, configuration, and accounting.
@@ -770,3 +783,16 @@ The cloud state records the phase, vCPU count, failed module count, and update t
 The phases are `requesting`, `setup`, `running`, and `uploading`.
 The route releases cloud admission before local fallback requests memory.
 The route requests no local memory for a cloud gate.
+
+## Launch refusal measurements
+
+The AWS state folder retains `cloud-gate-launches.jsonl`.
+Each launch call appends its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Capacity refusals first try the remaining zones and sizes.
+Every cloud setup or infrastructure failure permits local fallback.
+Only a real remote test failure remains red.
+The route releases its cost reservation and cloud slot before local admission.
+A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
+Fallback prints `Cloud gate uses natedev: <reason>`.
+These lines contain no account, instance, or subnet identifier.
+Upload errors, timeouts, missing results, and invalid results also permit local fallback.

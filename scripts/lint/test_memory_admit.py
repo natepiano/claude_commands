@@ -3724,7 +3724,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         scope.mkdir(parents=True)
         _ = (scope / "cgroup.procs").write_text("100\n")
         _ = (scope / "memory.current").write_text(str(3 * GIB))
-        _ = (scope / "memory.stat").write_text(f"anon {2 * GIB}\ninactive_file {GIB}\n")
+        _ = (scope / "memory.stat").write_text(f"anon {2 * GIB}\nshmem 0\ninactive_file {GIB}\n")
         _ = (scope / "memory.swap.current").write_text(str(7 * GIB))
         row = gate.read_reservation(path)
         reading = gate.step_memory(row, gate.process_table(self.root / "proc"), self.root / "proc")
@@ -3782,17 +3782,18 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
     def test_sampler_replaces_peak_without_changing_open_snapshot(self) -> None:
         scope = self.root / "scope"
         scope.mkdir()
-        _ = (scope / "memory.stat").write_text(f"anon {13 * GIB}\n")
         sidecar = self.root / "scope-path"
         _ = sidecar.write_text(str(scope) + "\n")
         maximum = self.root / "sample.max"
-        _ = maximum.write_text(str(12 * GIB) + "\n")
-        with maximum.open() as before:
-            result = sample_anon_once(sidecar, maximum)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(int(maximum.read_text()), 13 * GIB)
-            self.assertEqual(int(before.read()), 12 * GIB)
-
+        for anon, shared, peak in ((13, 0, 13), (1, 14, 15)):
+            with self.subTest(anon=anon, shared=shared):
+                _ = (scope / "memory.stat").write_text(f"anon {anon * GIB}\nshmem {shared * GIB}\n")
+                _ = maximum.write_text(str(12 * GIB) + "\n")
+                with maximum.open() as before:
+                    result = sample_anon_once(sidecar, maximum)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(int(maximum.read_text()), peak * GIB)
+                    self.assertEqual(int(before.read()), 12 * GIB)
 
     def test_caught_live_cgroup_refusal_still_records_the_read(self) -> None:
         record = self.root / "caught-reads.jsonl"
@@ -3831,7 +3832,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         service = self.builds / "sccache.service"
         service.mkdir(parents=True)
         stat = service / "memory.stat"
-        _ = stat.write_text(f"anon {6 * GIB}\nfile {90 * GIB}\ninactive_file {90 * GIB}\n")
+        _ = stat.write_text(f"anon {6 * GIB}\nshmem 0\nfile {90 * GIB}\ninactive_file {90 * GIB}\n")
         _ = (service / "memory.current").write_text(str(96 * GIB))
         result = self.admit_at()
         self.assertEqual((result.decision.state, result.decision.charged), ("admit", 12 * GIB))
@@ -3848,7 +3849,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
     def test_sccache_is_charged_but_does_not_prevent_running_alone(self) -> None:
         service = self.builds / "sccache.service"
         service.mkdir(parents=True)
-        _ = (service / "memory.stat").write_text("anon 1048576\ninactive_file 0\n")
+        _ = (service / "memory.stat").write_text("anon 1048576\nshmem 0\ninactive_file 0\n")
         _ = (service / "memory.current").write_text("1048576")
         result = self.pass_for(400, need=22, free=60)
         self.assertEqual((result.decision.state, result.decision.charged), ("admit", 0))
@@ -4546,37 +4547,51 @@ class ProcessRunUseTests(unittest.TestCase):
 
     def test_unscoped_run_uses_only_its_tree_anonymous_memory_for_the_cap_and_keep_aside(self) -> None:
         _ = self.reservation("holder", 100)
-        inputs = self.captured()
-        reading = inputs.running[0].measured
-        assert isinstance(reading, gate.MeasuredMemory)
-        self.assertEqual((reading.bytes, reading.swap_bytes), (6 * GIB, 3 * GIB // 2))
-        self.assertEqual(reading.anonymous, gate.AnonymousRunUse(3 * GIB))
-        self.assertEqual(reading.anonymous_source, gate.ProcessSource((
-            gate.ProcessAnonymousUse(100, gate.AnonymousRunUse(2 * GIB)),
-            gate.ProcessAnonymousUse(101, gate.AnonymousRunUse(GIB)))))
-        room = self.room()
-        self.assertEqual(room.used, 3 * GIB)
-        self.assertEqual(room.kept, 3 * GIB)
-        self.assertEqual(room.cap, room.available + 3 * GIB - room.safety)
-        self.assertEqual(room.room, room.available - room.safety - 3 * GIB)
+        for shared, resident, used, kept in ((0, 6, 3, 3), (3, 9, 6, 0)):
+            with self.subTest(shared=shared):
+                status = self.fixture.proc.path / "100/status"
+                _ = status.write_text(
+                    f"VmRSS: {(4 + shared) * GIB // 1024} kB\nRssAnon: {2 * GIB // 1024} kB\n"
+                    + f"RssShmem: {shared * GIB // 1024} kB\nVmSwap: {GIB // 1024} kB\n")
+                inputs = self.captured()
+                reading = inputs.running[0].measured
+                assert isinstance(reading, gate.MeasuredMemory)
+                self.assertEqual((reading.bytes, reading.swap_bytes), (resident * GIB, 3 * GIB // 2))
+                self.assertEqual(reading.anonymous, gate.AnonymousRunUse(used * GIB))
+                self.assertEqual(reading.anonymous_source, gate.ProcessSource((
+                    gate.ProcessAnonymousUse(100, gate.AnonymousRunUse((2 + shared) * GIB)),
+                    gate.ProcessAnonymousUse(101, gate.AnonymousRunUse(GIB)))))
+                room = self.room()
+                self.assertEqual(room.used, used * GIB)
+                self.assertEqual(room.kept, kept * GIB)
+                self.assertEqual(room.cap, room.available + used * GIB - room.safety)
+                self.assertEqual(room.room, room.available - room.safety - kept * GIB)
 
     def test_scoped_run_uses_memory_stat_instead_of_process_anonymous_memory(self) -> None:
         scope = self.scope()
         _ = (self.fixture.proc.path / "100/status").write_text("VmRSS: 4194304 kB\nVmSwap: 1048576 kB\n")
         _ = self.reservation("scoped", 100, scope=str(scope))
-        reading = self.captured().running[0].measured
-        assert isinstance(reading, gate.MeasuredMemory)
-        self.assertEqual(reading.anonymous_source, gate.ScopeSource(scope, frozenset({100, 101})))
-        room = self.room()
-        self.assertEqual(room.used, 5 * GIB)
-        self.assertEqual(room.kept, GIB)
-        self.assertEqual(room.cap, room.available + 5 * GIB - room.safety)
+        cases = ((5, 0, 10, 5, 1), (1, 27, 30, 28, 0))
+        for anon, shmem, current, used, kept in cases:
+            with self.subTest(anon=anon, shmem=shmem):
+                _ = (scope / "memory.current").write_text(str(current * GIB))
+                _ = (scope / "memory.stat").write_text(
+                    f"anon {anon * GIB}\nshmem {shmem * GIB}\ninactive_file 0\n")
+                reading = self.captured().running[0].measured
+                assert isinstance(reading, gate.MeasuredMemory)
+                self.assertEqual(reading.anonymous_source, gate.ScopeSource(scope, frozenset({100, 101})))
+                self.assertEqual(reading.anonymous, gate.AnonymousRunUse(used * GIB))
+                self.assertEqual((reading.bytes, reading.swap_bytes), (current * GIB, 3 * GIB))
+                room = self.room()
+                self.assertEqual(room.used, used * GIB)
+                self.assertEqual(room.kept, kept * GIB)
+                self.assertEqual(room.cap, room.available + used * GIB - room.safety)
 
     def test_missing_or_invalid_process_anonymous_memory_keeps_the_run_unavailable(self) -> None:
         _ = self.reservation("holder", 100)
         status = self.fixture.proc.path / "101/status"
         for content in ("VmRSS: 2097152 kB\nVmSwap: 524288 kB\n",
-                        "VmRSS: 2097152 kB\nRssAnon: invalid kB\n", "VmRSS: 2097152 kB\nRssAnon: -1 kB\n"):
+                        "VmRSS: 2097152 kB\nRssAnon: invalid kB\nRssShmem: 0 kB\n", "VmRSS: 2097152 kB\nRssAnon: -1 kB\nRssShmem: 0 kB\n"):
             with self.subTest(status=content):
                 status.unlink(missing_ok=True)
                 _ = status.write_text(content)
@@ -4783,7 +4798,7 @@ class ProcessMemoryTests(unittest.TestCase):
                 fields = [state, str(parent), *(["0"] * 17), start]
                 _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
                 _ = (path / "status").write_text(
-                    f"VmRSS: {resident} kB\nRssAnon: {resident // 2} kB\nVmSwap: {swap} kB\n")
+                    f"VmRSS: {resident} kB\nRssAnon: {resident // 2} kB\nRssShmem: 0 kB\nVmSwap: {swap} kB\n")
             processes = gate.process_table(proc)
             self.assertEqual(gate.tree_memory(100, "start", processes, proc),
                              gate.MeasuredMemory(60 * 1024, swap_bytes=9 * 1024,
@@ -5952,37 +5967,53 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (self.ci / "cgroup.procs").write_text("123\n234\n")
 
     def test_registered_and_unregistered_jobs_each_enter_the_cap_once(self) -> None:
-        for pid, parent, used, program in (
-                (234, 1, 0, "Runner.Worker"), (235, 234, 2 * GIB, "cargo"),
-                (345, 1, 0, "Runner.Worker"), (346, 345, 4 * GIB, "cargo")):
-            write_process(self.proc, pid, used, parent=parent)
-            _ = (self.proc / str(pid) / "comm").write_text(program + "\n")
-        _ = (self.ci / "cgroup.procs").write_text("123\n234\n235\n345\n346\n")
-        _ = (self.ci / "memory.current").write_text(str(6 * GIB))
-        _ = (self.ci / "memory.stat").write_text(f"anon {6 * GIB}\ninactive_file 0\n")
-        processes = gate.process_table(self.proc)
-        policy = records.read_memory_config().policy
-        for registered, margin, registered_use, unregistered_use in (
-                ((), 7, 0, 6), ((235,), 7, 2, 4), ((235, 346), 0, 6, 0)):
-            with self.subTest(registered=registered):
-                reservations = [fixture_reservation(pid, 8 * GIB) for pid in registered]
-                runs = [gate.RunningStep(str(pid), "CI", "build", str(self.root), 8 * GIB,
-                            gate.process_memory(gate.process_tree({pid: str(pid)}, processes), self.proc), pid=pid)
-                        for pid in registered]
-                readings = gate.unowned_slice_memory(reservations, processes, self.proc,
-                    ci_memory_slice=records.read_memory_config().ci_memory_slice)
-                runs.extend(gate.RunningStep("CI slice", "CI", "service", str(self.ci), 0, reading,
-                    pid=reading.pid) for reading in readings)
-                inputs = gate.QueueInputs([], tuple(runs), tuple(reservations), gate.HostMemory(20 * GIB, 64 * GIB),
-                    gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW_EPOCH)
-                room = gate.inputs_room(inputs, policy)
-                self.assertIsInstance(room, records.MemoryRoom)
-                if isinstance(room, records.MemoryRoom):
-                    self.assertEqual(room.ci_keep_aside.bytes, margin * GIB)
-                    self.assertEqual(room.used, registered_use * GIB)
-                    self.assertEqual(room.ci_use, unregistered_use * GIB)
-                    self.assertEqual(room.cap, 23 * GIB)
-                    self.assertEqual(room.kept, (8 * len(registered) - registered_use + margin) * GIB)
+        for shared in (0, 2):
+            for pid, parent, used, program in (
+                    (234, 1, 0, "Runner.Worker"), (235, 234, 2 * GIB, "cargo"),
+                    (345, 1, 0, "Runner.Worker"), (346, 345, 4 * GIB, "cargo")):
+                write_process(self.proc, pid, used, parent=parent)
+                _ = (self.proc / str(pid) / "comm").write_text(program + "\n")
+            _ = (self.ci / "cgroup.procs").write_text("123\n234\n235\n345\n346\n")
+            _ = (self.ci / "memory.current").write_text(str(6 * GIB))
+            _ = (self.ci / "memory.stat").write_text(
+                f"anon {(6 - shared) * GIB}\nshmem {shared * GIB}\ninactive_file 0\n")
+            processes = gate.process_table(self.proc)
+            policy = records.read_memory_config().policy
+            for registered, margin, registered_use, unregistered_use in (
+                    ((), 7, 0, 6), ((235,), 7, 2, 4), ((235, 346), 0, 6, 0)):
+                with self.subTest(registered=registered, shared=shared):
+                    reservations = [fixture_reservation(pid, 8 * GIB) for pid in registered]
+                    runs: list[gate.RunningStep] = []
+                    for row, pid in zip(reservations, registered, strict=True):
+                        source: set[int] | gate.PopulatedStepScope = gate.process_tree({pid: str(pid)}, processes)
+                        if shared:
+                            scope = self.ci / f"job-{pid}.scope"
+                            scope.mkdir(exist_ok=True)
+                            _ = (scope / "memory.current").write_text(str((2 if pid == 235 else 4) * GIB))
+                            _ = (scope / "memory.stat").write_text(
+                                f"anon {(0 if pid == 235 else 4) * GIB}\n"
+                                + f"shmem {(2 if pid == 235 else 0) * GIB}\ninactive_file 0\n")
+                            _ = (scope / "cgroup.procs").write_text(str(pid))
+                            sidecar = self.root / f"scope-{pid}"
+                            _ = sidecar.write_text(str(scope))
+                            row["sidecar"] = str(sidecar)
+                            source = gate.PopulatedStepScope(scope)
+                        runs.append(gate.RunningStep(str(pid), "CI", "build", str(self.root), 8 * GIB,
+                            gate.process_memory(source, self.proc), pid=pid))
+                    readings = gate.unowned_slice_memory(reservations, processes, self.proc,
+                        ci_memory_slice=records.read_memory_config().ci_memory_slice)
+                    runs.extend(gate.RunningStep("CI slice", "CI", "service", str(self.ci), 0, reading,
+                        pid=reading.pid) for reading in readings)
+                    inputs = gate.QueueInputs([], tuple(runs), tuple(reservations), gate.HostMemory(20 * GIB, 64 * GIB),
+                        gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW_EPOCH)
+                    room = gate.inputs_room(inputs, policy)
+                    self.assertIsInstance(room, records.MemoryRoom)
+                    if isinstance(room, records.MemoryRoom):
+                        self.assertEqual(room.ci_keep_aside.bytes, margin * GIB)
+                        self.assertEqual(room.used, registered_use * GIB)
+                        self.assertEqual(room.ci_use, unregistered_use * GIB)
+                        self.assertEqual(room.cap, 23 * GIB)
+                        self.assertEqual(room.kept, (8 * len(registered) - registered_use + margin) * GIB)
 
     def queue_with_ci(self, reading: gate.StepMemory, available: int = 20 * GIB) -> gate.QueueRead:
         config = gate.read_memory_config()
@@ -6064,7 +6095,7 @@ class CiSliceMemoryTests(unittest.TestCase):
 
     def test_idle_ci_excludes_inactive_file_cache_and_records_swap_separately(self) -> None:
         _ = (self.ci / "memory.current").write_text(str(10 * GIB))
-        _ = (self.ci / "memory.stat").write_text(f"anon 1024\nfile {9 * GIB}\ninactive_file {8 * GIB}\n")
+        _ = (self.ci / "memory.stat").write_text(f"anon 1024\nshmem 0\nfile {9 * GIB}\ninactive_file {8 * GIB}\n")
         _ = (self.ci / "memory.swap.current").write_text(str(GIB))
         reading = self.reading()
         self.assertEqual(reading.bytes, 2 * GIB)
@@ -6089,7 +6120,7 @@ class CiSliceMemoryTests(unittest.TestCase):
     def test_unreadable_or_invalid_ci_stat_records_a_diagnostic(self) -> None:
         self.start_ci_job()
         stat = self.ci / "memory.stat"
-        for content in (None, "anon 1024\n", "inactive_file invalid\n"):
+        for content in (None, "anon 1024\nshmem 0\n", "inactive_file invalid\n"):
             with self.subTest(content=content):
                 stat.unlink(missing_ok=True)
                 if content is not None:

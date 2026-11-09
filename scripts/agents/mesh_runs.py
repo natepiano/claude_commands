@@ -377,18 +377,20 @@ def command_start(args: argparse.Namespace) -> int:
         return 2
     session_dir = str(getattr(args, "session_dir", "") or "")
     name = str(getattr(args, "to", "") or "")
-    if bool(session_dir) != bool(name):
-        print("mesh_runs: --session-dir and --to go together", file=sys.stderr)
-        return 2
+    caller = caller_from_environment(dict(os.environ))
     reference = ""
-    if not session_dir:
-        caller = caller_from_environment(dict(os.environ))
-        if isinstance(caller, NotMeshWorker):
-            return NOT_A_MESH_WORKER
+    if isinstance(caller, (PaneCaller, MeshCaller)):
+        if name and name != caller.name:
+            print(f"mesh_runs: --to {name} ignored; run belongs to worker {caller.name}", file=sys.stderr)
         session_dir, name = caller.session_dir, caller.name
         if isinstance(caller, PaneCaller):
             reference = caller.staff_id
     else:
+        if bool(session_dir) != bool(name):
+            print("mesh_runs: --session-dir and --to go together", file=sys.stderr)
+            return 2
+        if not session_dir:
+            return NOT_A_MESH_WORKER
         name = seat_name(session_dir, name)
     label = str(getattr(args, "label", "") or "") or " ".join(command)
     done_file = str(getattr(args, "done_message_file", "") or "")

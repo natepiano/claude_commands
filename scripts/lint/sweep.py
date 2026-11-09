@@ -837,6 +837,13 @@ class FloorAlertChannels(Enum):
     NATEDEV_AND_PHONE = "natedev_and_phone"
 
 
+class FloorMachine(Enum):
+    """The machine whose disk crossed the alert line."""
+
+    NATEDEV = "natedev"
+    MAC = "Mac"
+
+
 class FloorChannelOutcome(Enum):
     NOT_ATTEMPTED = "not_attempted"
     DELIVERED = "delivered"
@@ -3298,7 +3305,8 @@ def folder_choice_lines(choices: FolderChoices, shortfall: int, *, path_limit: i
     return lines
 
 
-def disk_floor_push(free: int, floor: int, choices: FolderChoices) -> RenderedPush:
+def disk_floor_push(free: int, floor: int, choices: FolderChoices, *,
+                    machine: FloorMachine = FloorMachine.NATEDEV) -> RenderedPush:
     """Render free space, the alert line, and one folder recommendation."""
     if TYPE_CHECKING:
         from scripts.notify.push_texts import render
@@ -3307,14 +3315,14 @@ def disk_floor_push(free: int, floor: int, choices: FolderChoices) -> RenderedPu
         from scripts.notify.push_texts import render
     folder_action = ("In the natedev Claude session, reply measure or delete nothing."
                      if isinstance(choices, UnavailableFolderChoices)
-                     else "In the natedev Claude session, say which folders to delete.")
+                     else f"In the natedev Claude session, say which {machine.value} folders to delete.")
     recommendation = folder_recommendation(choices, max(0, floor - free))
     if isinstance(choices, UnavailableFolderChoices):
         recommendation += (" Measure (recommended): natedev lists folder sizes, then you choose. "
                            "Delete nothing: free space stays low.")
     elif isinstance(choices, InsufficientFolderChoices):
         recommendation = recommendation.removesuffix(".") + "; the natedev session lists every folder."
-    return render("sweep.disk_floor", free=gib(free), floor=gib(floor), folder_action=folder_action,
+    return render("sweep.disk_floor", machine=machine.value, free=gib(free), floor=gib(floor), folder_action=folder_action,
                   recommendation=recommendation)
 
 
@@ -3327,11 +3335,12 @@ NO_PHONE_ALERT = NoPhoneAlert()
 
 
 def fit_disk_floor_push(free: int, floor: int, choices: FolderChoices, *,
-                        lint_settings: conf.ConfigRead) -> RenderedPush | NoPhoneAlert:
+                        lint_settings: conf.ConfigRead,
+                        machine: FloorMachine = FloorMachine.NATEDEV) -> RenderedPush | NoPhoneAlert:
     """Use the unavailable text when the recommendation reaches the limit."""
     limit = lint_settings.whole("sweep_push_text_limit")
     for candidate in (choices, UNAVAILABLE_FOLDER_CHOICES):
-        rendered = disk_floor_push(free, floor, candidate)
+        rendered = disk_floor_push(free, floor, candidate, machine=machine)
         if len(rendered.message) < limit:
             return rendered
     print("lint sweep: phone text exceeds sweep_push_text_limit", file=sys.stderr)
@@ -3773,7 +3782,8 @@ def _hold_floor(floor: int, dry_run: bool, *,
 
 
 def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, lint_settings: conf.ConfigRead, detail: str = "",
-                         scope: SweepFailureScope = FloorFailureScope.FILESYSTEM) -> None:
+                         scope: SweepFailureScope = FloorFailureScope.FILESYSTEM,
+                         machine: FloorMachine = FloorMachine.NATEDEV) -> None:
     """Finalize delivery and state before an acquired floor lock closes."""
     from scripts.lint import tmp_sweep
 
@@ -3831,7 +3841,8 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             lines: list[str] = []
             if crossing_pending:
                 lines.extend([
-                    f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains.",
+                    f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains."
+                    + (" This is the Mac disk." if machine is FloorMachine.MAC else ""),
                     f"Cleanup removed {gib(removed)}." if removed else "The cleanup run freed nothing.",
                     *folder_choice_lines(choices, shortfall, path_limit=path_limit),
                 ])
@@ -3864,7 +3875,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             delivery = send_floor_alert(message, repeat=repeat, lint_settings=lint_settings)
             save_delivery(FloorAlertDelivery(delivery, FloorChannelOutcome.NOT_ATTEMPTED))
         if phone_pending and identity_saved and isinstance(crossing, OpenPhoneCrossing):
-            phone = fit_disk_floor_push(free, phone_floor, choices, lint_settings=lint_settings)
+            phone = fit_disk_floor_push(free, phone_floor, choices, lint_settings=lint_settings, machine=machine)
             if not isinstance(phone, NoPhoneAlert):
                 result = send_phone_push(phone,
                                         repeat=CrossingSendKey(f"phone:{crossing.identity}",
@@ -4194,8 +4205,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         return outcome
     finally:
         try:
-            if not dry_run and isinstance(policy, NatedevFloor):
-                notify_floor_problem(replace(outcome, protected=protected), lint_settings=lint_settings, detail=detail)
+            if not dry_run:
+                notify_floor_problem(replace(outcome, protected=protected), lint_settings=lint_settings, detail=detail,
+                                     machine=FloorMachine.MAC if isinstance(policy, MacFloor) else FloorMachine.NATEDEV)
         finally:
             try:
                 if guard is not None:

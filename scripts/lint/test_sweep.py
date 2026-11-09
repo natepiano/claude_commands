@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint import sweep, tmp_sweep
 from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
-from scripts.message import session_send
+from scripts.message import send_budget, session_send
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputRoots
@@ -3536,7 +3536,8 @@ class FloorTests(SweepCase):
                 yield
 
     def hold(self, base: Path, floor: int, free: list[int], dry_run: bool = False,
-             scanned: int | None = None, *, recorded: bool) -> tuple[int, str]:
+             scanned: int | None = None, *, recorded: bool,
+             policy: sweep.MacFloor | sweep.NatedevFloor = sweep.NatedevFloor.CURRENT) -> tuple[int, str]:
         """Use the fixture capacity before the scan, after the scan, and after removal."""
         if recorded:
             paired = sweep.OUTPUT_ROOTS.get().workspaces
@@ -3553,7 +3554,7 @@ class FloorTests(SweepCase):
                                  f"sweep_floor_roots={base}\n")
         with (self.free_space(free, scanned),
               mock.patch.object(tmp_sweep, "state_dir", return_value=base), redirect_stdout(output)):
-            status = sweep.hold_floor(floor, dry_run)
+            status = sweep.hold_floor(floor, dry_run, policy=policy)
         return status, output.getvalue()
 
     def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None,
@@ -3972,14 +3973,16 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             ("unavailable", sweep.UNAVAILABLE_FOLDER_CHOICES,
              "Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low."),
         ):
-            with self.subTest(state=state):
-                push = sweep.disk_floor_push(140 * GIB, 150 * GIB, choices)
-                self.assertEqual(push.title, "natedev disk is low; builds can fail")
-                self.assertEqual(push.body, "natedev has 140.0 GiB free, below the 150.0 GiB alert line, so builds can fail. " + expected)
-                assert isinstance(push.action, ActionRequired)
-                self.assertEqual(push.action.text,
-                    "In the natedev Claude session, reply measure or delete nothing." if state == "unavailable"
-                    else "In the natedev Claude session, say which folders to delete.")
+            for machine in sweep.FloorMachine:
+                with self.subTest(state=state, machine=machine):
+                    push = sweep.disk_floor_push(140 * GIB, 150 * GIB, choices, machine=machine)
+                    self.assertEqual(push.title, f"{machine.value} disk is low; {machine.value} tests can fail")
+                    self.assertEqual(push.body, f"{machine.value} has 140.0 GiB free, below the 150.0 GiB alert line, "
+                                     + f"so {machine.value} test builds can fail. " + expected)
+                    assert isinstance(push.action, ActionRequired)
+                    self.assertEqual(push.action.text,
+                        "In the natedev Claude session, reply measure or delete nothing." if state == "unavailable"
+                        else f"In the natedev Claude session, say which {machine.value} folders to delete.")
 
     def test_crossing_session_keeps_trash_and_scratch_effects(self) -> None:
         for folder, effect, recommendation in (
@@ -4051,7 +4054,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             text = phone_text(delivery.attempts)
             self.assertIn(recommendation, text)
             self.assertNotIn("/tmp/claude/small/target", text)
-            self.assertIn("In the natedev Claude session, say which folders to delete.", text)
+            self.assertIn("In the natedev Claude session, say which natedev folders to delete.", text)
             message = delivery.attempts[0].text
             lines = [
                 "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
@@ -4079,7 +4082,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                               "Deleting it frees only part of the 150.0 GiB shortfall; the natedev session lists every folder.")
             text = phone_text(delivery.attempts)
             self.assertIn(recommendation, text)
-            self.assertIn("In the natedev Claude session, say which folders to delete.", text)
+            self.assertIn("In the natedev Claude session, say which natedev folders to delete.", text)
             self.assertNotIn("/tmp/claude/small/target", text)
             message = delivery.attempts[0].text
             session_fact = ("The largest folder is /tmp/claude/largest at 60.0 GiB. "
@@ -4135,7 +4138,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             recommendation = ("Review /private/protected first (recommended): deleting it frees 27.0 GiB, "
                               "which covers the 10.0 GiB shortfall.")
             self.assertIn(recommendation, phone_text(delivery.attempts))
-            self.assertIn("In the natedev Claude session, say which folders to delete.", phone_text(delivery.attempts))
+            self.assertIn("In the natedev Claude session, say which natedev folders to delete.", phone_text(delivery.attempts))
             message = delivery.attempts[0].text
             self.assertIn("It is protected", message)
             self.assertIn("The cleanup run freed nothing.", message)
@@ -4240,17 +4243,28 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 ("/private/larger", "/private/smaller")}, {"/private/larger": 27 * GIB, "/private/smaller": 20 * GIB}), [])
 
     def test_phone_floor_crossing_sends_once_until_free_space_rises(self) -> None:
-        with self.crossing_delivery({}) as delivery:
-            base = delivery.base
-            send = cast(mock.Mock, sweep.send_floor_alert)
-            for free, expected in ((200, 0), (140, 1), (130, 1), (151, 1), (140, 2)):
-                self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB], recorded=True)[0], 0)
-                messages = phone_calls(send)
-                self.assertEqual(len(messages), expected)
-                for call in messages:
-                    self.assertIn("Free disk space fell", call)
-                self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
-            self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
+        for machine in ("natedev", "Mac"):
+            with (self.subTest(machine=machine), self.crossing_delivery({}) as delivery,
+                  mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([]))):
+                base = delivery.base
+                policy = (sweep.MacFloor((str(base),), floor_claims.LockedClaims(frozenset()), base / "mirror")
+                          if machine == "Mac" else sweep.NatedevFloor.CURRENT)
+                send = cast(mock.Mock, sweep.send_floor_alert)
+                for free, expected in ((200, 0), (140, 1), (130, 1), (151, 1), (140, 2)):
+                    self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
+                                               recorded=True, policy=policy)[0], 0)
+                    messages = phone_calls(send)
+                    self.assertEqual(len(messages), expected)
+                    for call in messages:
+                        self.assertIn("Free disk space fell", call)
+                    self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
+                self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
+                text = phone_text(delivery.attempts)
+                self.assertIn(f"{machine} disk is low; {machine} tests can fail", text)
+                self.assertIn(f"{machine} has 140.0 GiB free", text)
+                self.assertIn(f"so {machine} test builds can fail", text)
+                if machine == "Mac":
+                    self.assertIn("This is the Mac disk.", messages[-1])
 
     def test_phone_floor_crossing_retries_a_failed_delivery(self) -> None:
         with self.crossing_delivery({"natedev": [3, 0], "user": [3, 0]}) as delivery:
@@ -4795,7 +4809,9 @@ raise SystemExit(int(os.environ[variable]))
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
             self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),
                              sweep.FloorChannelOutcome.DELIVERED)
-        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [170, 345])
+            expected_timeouts = [send_budget.seconds(conf.read("lint").number("sweep_sender_timeout_seconds")),
+                                 send_budget.user_seconds(review.user_send_seconds())]
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], expected_timeouts)
         self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
@@ -6410,6 +6426,9 @@ class MacFloorTests(SweepCase):
         output = io.StringIO()
         with (mock.patch.object(sweep, "free_bytes", return_value=GIB - shortfall),
               mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([])),
+              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+              mock.patch.object(sweep, "send_phone_push", return_value=sweep.FloorChannelOutcome.DELIVERED),
+              mock.patch.object(sweep, "read_disk_measurement", return_value=sweep.UnavailableDiskMeasurement("missing")),
               redirect_stdout(output)):
             self.assertEqual(sweep.hold_floor(GIB, dry_run, policy=policy), 0)
         return output.getvalue()
