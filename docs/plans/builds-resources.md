@@ -2024,7 +2024,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Gotchas:** a failure-only notification must not consume the crossing receipt, or the next real crossing sends nothing.
 
-### Phase 92 — The Mac floor sweep trims the mirror targets, and its alert names folder sizes  · status: todo
+### Phase 92 — The Mac floor sweep trims the mirror targets, and its alert names folder sizes  · status: done
 **Depends on:** Phase 91 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
 
 **Approved:** builds showrunner, 2026-11-09 (the Mac disk defect, items 1 and 2; order change: after the repeat fix).
