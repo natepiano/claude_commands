@@ -23,33 +23,22 @@
 ### Phase 1 — A launch reads the registry once, in Python  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** builds natest phase 89 architecture proposal (`/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/89/current/architecture_proposal.md`). One same-load pair: `test_assign_launcher.py` 64.3 to 54.7 CPU s (14.9% less), all 63 tests pass.
-
-**Goal:** `models_registry.launch_settings(section, key)` starts one `bash` process and no Python registry process. The resolver output stays the same for every caller.
-
-**Spec:**
-1. In `launch_settings`, build the launch configuration in Python with `_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path())`. A `MODELS_LAUNCH_CONFIGURATION` that the caller inherits still wins, as now. Do not sync the Codex catalog; the current call sets `MODELS_CONFIG_TIER_ONLY=1`, which skips it.
-2. Pass `configuration_shell(configuration)` to the `bash -c` command. The shell evaluates it and sets `_models_table_file` to `MODELS_CONFIG_FILE`, so `_models_registry_read` uses the table and `_models_registry_parse` never runs. Then the shell calls the real `agents_resolve`.
-3. Keep `agents_resolve`, its validation and its error text. There is one resolver: do not copy any resolver logic into Python.
-4. Keep `MODELS_CONFIG_TIER_ONLY=1` in the child environment and the four-line output contract.
-5. If the shell resolver needs a helper to load a given table, add it to `models_config.sh` beside `_models_registry_scope` and use the same table variables.
-6. Read every caller of `launch_settings` (`worker_panes.launch_policy`, `assign.pane_policy`) and every test that patches or calls it. Each one keeps its result.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+- `launch_settings(section, key)` builds `LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))` in Python. It starts one `bash`, which sources `models_config.sh`, reads `configuration_shell(configuration)` from stdin, loads it with `_models_table_load`, and runs the real `agents_resolve`. No Python registry process starts.
+- An inherited `MODELS_LAUNCH_CONFIGURATION` decides the result, not the file on disk. The child keeps `MODELS_CONFIG_TIER_ONLY=1`, so the Codex catalog sync never runs from this path, and the four-line output contract is unchanged.
+- `_models_table_load <assignments>` in `models_config.sh` is the one table loader: it evaluates the assignments and sets `_models_table_file="$MODELS_CONFIG_FILE"`. `models_registry_store`, `_models_registry_parse` and `launch_settings` all call it.
+- A missing registry raises `OSError` in Python before bash starts. `worker_panes.launch_policy` and `assign.pane_policy` catch `OSError` and `ValueError` and refuse with an invalid role configuration, as before.
+- One same-load pair of `test_assign_launcher.py`: 68.3 to 62.1 CPU s (9.1% less).
 
 **Files:**
-- `scripts/lib/models_registry.py`
-- `scripts/agents/models_config.sh`
-- `scripts/lib/test_models_registry.py`
+- `scripts/lib/models_registry.py` — `launch_settings`.
+- `scripts/agents/models_config.sh` — `_models_table_load`.
+- `scripts/lib/test_models_registry.py` — inherited-configuration rows; `test_launch_settings_starts_no_python_registry_process`, with a sitecustomize probe and a 70,000-character registry row.
 
-**Workers:** 1 writer; one function and its tests do not split.
-- `impl` — `models_registry.py`, `models_config.sh`, `test_models_registry.py`
+**Gotchas:**
+- The table goes to bash on stdin, never as an argument. It holds the registry text about twice, and Linux limits one argument to 128 KiB.
+- `read -r -d ""` returns 1 at end of input, so it is not chained with `&&`. `source /dev/stdin` is not used, because Bash 3.2 on macOS fails with it.
+- The table text is plain assignments, never `declare`, so `_models_table_load` sets the caller's locals in `_models_registry_scope` through dynamic scope.
 
-**Acceptance gate:**
-- The existing `launch_settings` tests pass unchanged: shell parity for every family, section, key and tier; a registry change affects the next launch; invalid rows raise `ValueError`.
-- A new test row: an inherited `MODELS_LAUNCH_CONFIGURATION` decides the result, not the file on disk.
-- A new test row: one `launch_settings` call starts no `models_registry.py` process.
-- `scripts/lib/test_models_registry.py`, `scripts/agents/test_models_config.sh`, `scripts/herdr/test_worker_panes.py`, `scripts/direct/test_assign_launcher.py` and `scripts/direct/test_assign_launcher_review.py` pass.
-- CPU s for `test_assign_launcher.py` before and after, from one same-load pair, in the checkpoint notice.
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** resolver logic in Python — `agents_resolve` stays the one resolver.
