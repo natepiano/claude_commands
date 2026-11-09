@@ -7,6 +7,8 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections.abc import Callable
+from importlib import import_module
 import json
 import os
 import re
@@ -668,6 +670,11 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                                                prompt=prompt, launcher_command=command)
     if (isinstance(matched, progress_history.MatchedDispatch)
             and progress_history.dispatch_completed(run, args.new_worker, matched.instance_id)):
+        parent = worker_admission.parent(staff.snapshot(), run=run)
+        passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(args.new_worker))
+        repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
+                      import_module("scripts.herdr.turn_end").repeat_completion_notice)
+        repeat(matched.worker_name, parent, run, passed)
         return staff_worker.DispatchSubmission.SUBMITTED
     for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",

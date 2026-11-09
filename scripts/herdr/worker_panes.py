@@ -512,9 +512,14 @@ def worker_labelled_pane(panes: Sequence[Mapping[str, object]], tab: str,
 def worker_run(member: staff.StaffRow, *,
                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
                scanned: dict[str, list[str]] | None = None) -> Path:
-    """Use the worker's newest state pass, with the parent's run as the default."""
+    """Use the recorded dispatch state before searching the parent's held runs."""
     parent = member
     if member.kind == "worker":
+        from scripts.direct import progress_history
+
+        dispatched = progress_history.recorded_dispatch_run(member.id)
+        if isinstance(dispatched, progress_history.RecordedDispatchRun):
+            return dispatched.directory
         record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
         parent = record.parent_of(member) or member
     runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record, scanned=scanned)

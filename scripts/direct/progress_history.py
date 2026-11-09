@@ -1946,6 +1946,39 @@ def _launcher_arguments(text: str) -> list[str]:
     return cast(list[str], value)
 
 
+@dataclass(frozen=True)
+class RecordedDispatchRun:
+    directory: Path
+
+
+class DispatchRunNotRecorded(Enum):
+    MISSING = "the worker has no dispatch state link"
+
+
+def _dispatch_state_link(worker_id: staff.StaffId) -> Path:
+    return staff.record_path().parent / "dispatches" / str(worker_id)
+
+
+def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | DispatchRunNotRecorded:
+    """Find the existing pass state without searching the run root."""
+    try:
+        path = _dispatch_state_link(worker_id).resolve(strict=True)
+    except FileNotFoundError:
+        return DispatchRunNotRecorded.MISSING
+    return RecordedDispatchRun(path.parent)
+
+
+def _link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
+    link = _dispatch_state_link(worker_id)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.with_name(f".{worker_id}.{uuid.uuid4().hex}")
+    try:
+        temporary.symlink_to(_state_path(session_dir).resolve())
+        _ = temporary.replace(link)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                    worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
@@ -1964,6 +1997,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             _start_pass(args)
+            _link_dispatch_state(worker_id, session_dir)
             return _string(_pass_slots(_read_state(session_dir))[slot]["instance_id"])
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
