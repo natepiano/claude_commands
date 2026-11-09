@@ -6,16 +6,20 @@ description: Read agent message rules and delivery.
 
 ## Sending
 
-- **Agents** holding `SendMessage` call it directly. **Scripts** run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py` (usage in its docstring): it delivers by session name, keeps what does not arrive under the recipient's session id, so a rename loses nothing (`send.py pending` prints and clears what is kept for your own session, whatever it is called now), reaches a Codex worker by its `worker:` address or worker name, and the Mac with `--machine mac`.
+- **A Claude peer on this machine: `SendMessage`.** Use it for every ListAgents row on this machine, on any account. It returns a delivery result.
+- **A held message is not delivered.** A session in a different permission mode holds a message for its user's approval, and a `[Cross-session delivery notice]` says so. Count a held or refused message as not delivered. Send it again with `send.py` and read the outcome line.
+- **Everything else: `send.py`.** Use `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py` (usage in its docstring) for a peer on the other machine, a Codex worker, morty and every script or hook. A `Remote Control` row is on another machine. Do not use `SendMessage` for it: Remote Control gives no delivery report.
+  `send.py` delivers by session name and keeps what does not arrive under the recipient's session id, so a rename loses nothing (`send.py pending` prints and clears what is kept for your own session, whatever it is called now). It reaches a Codex worker by its `worker:` address or worker name.
+  For the other machine pass `--machine` (`mac` from natedev, `natedev` from the Mac). A name resolves on this machine first, so a same-name local session gets the message without `--machine`.
   For Claude recipients, `send.py` tries the running postmaster session first and relays otherwise.
 - **The first line stands alone.** It is the recipient's preview and the inbox log entry. If it would open mid-thought or with a bare name, open with `Message from <your name>: <gist>`.
 - **Carry the context.** The recipient shares no memory with you: name the repo, worktree, branch, paths, commit or test. No tokens or secrets.
-- **Address by ListAgents name.** Its first line, `This session is <name>`, is you; never send to it. Two live rows with one name: append the row's ` [ref]`. A ref does not cross machines; to tell sessions apart there, ask each for `hostname` and `pwd`.
+- **Address by ListAgents name.** Its first line, `This session is <name>`, is you; never send to it. A name that is not in your latest ListAgents fails: call ListAgents once and send again. Two live rows with one name: append the row's ` [ref]`. A ref does not cross machines; to tell sessions apart there, ask each for `hostname` and `pwd`.
 - Never poll ListAgents or send "have you answered?". A reply arrives as a `<cross-session-message>` and resumes your turn; answer its wrapper's `from`, except `postmaster` (see Receiving). A relay sender (`quota_alert`, a showrunner timer) cannot be answered.
 
 ## Finding sessions
 
-- For Claude sessions, use ListAgents and SendMessage.
+- For Claude sessions on this machine, use ListAgents and SendMessage.
 - For staff workers, unit-director and showrunner relationships, or the other machine, run `~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py`; `--json` gives `entries` and `problems`.
 - Send to a roster address with `send.py --to <address> --from "<your session name>" --text "<message>"`.
   Use `session:<id>` for Claude, `worker:<unit>/<short name>` for staff workers, or `codex:<thread id>` for Codex daemon sessions.
