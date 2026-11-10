@@ -251,6 +251,7 @@ class OffloadCommandFixture(unittest.TestCase):
             "leftover_timeout_s": "300",
             "unreachable_backoff_s": "300",
             "free_floor_gib": "60",
+            "abandoned_session_minutes": "9",
             "mac_budget_gib": "24",
             "mac_budget_gib.hana": "64",
             "linux_only.hana": "",

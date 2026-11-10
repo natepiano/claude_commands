@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 import io
@@ -127,12 +129,13 @@ exit "$CLEANUP_TEST_STATUS"
         disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
         disk_status: int = 0,
         free_floor_gib: float = 100,
+        abandoned_session_minutes: int = 7,
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         config = offload.OffloadConfig(
             enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
-            default_target_budget_gib="24", values={},
+            default_target_budget_gib="24", values={"abandoned_session_minutes": str(abandoned_session_minutes)},
         )
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
@@ -146,6 +149,52 @@ exit "$CLEANUP_TEST_STATUS"
                  "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status)},
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
+
+    def test_remote_text_removes_only_old_abandoned_sessions_before_building(self) -> None:
+        minutes = 3
+        cases: tuple[tuple[str, int, bool, tuple[str, ...]], ...] = (
+            ("debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("aarch64-apple-darwin/debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("debug/incremental/crate/s-new-working", 1, True, ()),
+            ("aarch64-apple-darwin/debug/incremental/crate/s-new-working", 1, True, ()),
+            ("debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            ("aarch64-apple-darwin/debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            *((f"debug/{name}/incremental/crate/s-old-working", minutes + 2, True, ())
+              for name in ("deps", "build", ".fingerprint", "examples")),
+            ("deep/triple/debug/incremental/crate/s-old-working", minutes + 2, True, ()),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir", "other-target")),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir=other-target",)),
+            ("", 0, False, ()),
+        )
+        target = self.mirror / "target"
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for relative, age, keep, words in cases:
+                for status in (0, 42):
+                    with self.subTest(shell=shell, session=relative, words=words, status=status):
+                        shutil.rmtree(target, ignore_errors=True)
+                        session = target / relative
+                        lock = session.with_name(session.name.removesuffix("-working") + ".lock")
+                        if relative:
+                            session.mkdir(parents=True)
+                            _ = (session / "compiler-output").write_text("session data")
+                            _ = lock.write_text("session lock")
+                            modified = time.time() - age * 60
+                            os.utime(session, (modified, modified))
+                            os.utime(lock, (modified, modified))
+                        answer = self.run_remote(shell, status, words, free_floor_gib=50,
+                                                 abandoned_session_minutes=minutes)
+                        self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                        cleanup = "skipped" if words else "kept"
+                        self.assertEqual(answer.stdout.splitlines(),
+                                         ["nextest finished", f"mac_exit={status}", f"mac_cleanup={cleanup}"])
+                        build_target = self.mirror / "other-target" if words else target
+                        self.assertEqual((build_target / "nextest-output").read_text(), "built\n")
+                        if relative:
+                            self.assertEqual(session.exists(), keep)
+                            self.assertEqual(lock.exists(), keep)
+                            if keep:
+                                self.assertEqual((session / "compiler-output").read_text(), "session data")
+                                self.assertEqual(lock.read_text(), "session lock")
 
     def test_remote_text_below_space_floor_removes_only_repository_target_after_pass_and_failure(self) -> None:
         target = self.mirror / "target"
