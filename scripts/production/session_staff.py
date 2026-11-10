@@ -22,7 +22,7 @@ from typing import NamedTuple, cast
 from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
@@ -634,7 +634,7 @@ class MemberSources:
 
 def member_sources(*, dependencies: Callable[[Path], None] | None = None) -> MemberSources:
     from scripts.herdr import herdr
-    from scripts.shutdown import pane_record
+    from scripts.agents import pane_record
 
     session = herdr.shared_session(dependencies=dependencies)
     try:
@@ -874,7 +874,7 @@ class LaunchMembership:
 
 def record_membership(launch: PaneLaunch) -> PaneLaunch:
     """Keep pane settings from the conversation history without staff labels."""
-    from scripts.shutdown import pane_record
+    from scripts.agents import pane_record
 
     result = launch.copy()
     result["environment"] = pane_record.retained_environment(result, pane_record.launches())
@@ -891,7 +891,7 @@ class RepairedSessionLabels:
 def repair_marks() -> list[RepairedSessionLabels]:
     """Remove saved staff labels and recover missing pane observations."""
     from scripts.message import sessions
-    from scripts.shutdown import pane_record
+    from scripts.agents import pane_record
 
     record = staff.snapshot()
     history = pane_record.launches()

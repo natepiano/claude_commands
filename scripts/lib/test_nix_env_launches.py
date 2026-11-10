@@ -27,7 +27,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.production_doc import Production
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

@@ -56,7 +56,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 from scripts.accounts import next_moves
-from scripts.shutdown import remote, stop_results
+from scripts.agents import remote, stop_results
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
     StoredGroupSelection as StoredGroupSelection, StoredGroupSelections as StoredGroupSelections,
@@ -65,7 +65,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
-    from scripts.shutdown.inventory import ListedSession, Session
+    from scripts.agents.inventory import ListedSession, Session
     from scripts.production import staff
 
 
@@ -2776,9 +2776,9 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
 
     account_config = read_account_settings(account_config)
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
     else:
-        inventory = import_module("scripts.shutdown.inventory")
+        inventory = import_module("scripts.agents.inventory")
 
     checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
     if isinstance(checked, MoveRefused):
@@ -2794,7 +2794,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
         else:
             eligible.append(identity)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
-    batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
+    batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
     sources = {item.session_id: claude_config_label(item.config_dir) for item in live if item.session_id in eligible}
     results = batch(eligible, checked.destination.label, why=why, cause=cause, source_accounts=sources)
     for identity, result in zip(eligible, results):
@@ -2998,9 +2998,9 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     notices = (f"{group}: no live session moves",) if not ids else ()
     if group == "showrunners":
         if TYPE_CHECKING:
-            from scripts.shutdown import inventory
+            from scripts.agents import inventory
         else:
-            inventory = import_module("scripts.shutdown.inventory")
+            inventory = import_module("scripts.agents.inventory")
         live_ids = {member.session_id for member in members}
         notices += tuple(
             f"{runner.name}: no session runs under the id its update timer names; "
@@ -3040,9 +3040,9 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
     del alerts
     target = note_file.canonical_label(target)
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
     else:
-        inventory = import_module("scripts.shutdown.inventory")
+        inventory = import_module("scripts.agents.inventory")
     try:
         refuse_default(target)
         try:

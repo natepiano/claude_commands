@@ -241,7 +241,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/shutdown/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
    Update the two caller-plan examples to name the installed merge gate with `--checkout <tree>`.
 6. Keep repository and step fields separate in service snapshots and queue queries.
@@ -279,8 +279,8 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
-- `scripts/message/top_level.py`, `scripts/shutdown/shutdown.py` — installed hold writer routing.
-- `scripts/message/test_top_level.py`, `scripts/shutdown/test_shutdown_cli.py` — caller tests.
+- `scripts/message/top_level.py`, `scripts/agents/shutdown.py` — installed hold writer routing.
+- `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
 - `scripts/production/dailies_render.py` — `NoCycle` from `read_cycle()` in the hold lines.
 - `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py` — hold line tests.
 - `docs/plans/builds-production.md`, `docs/plans/build-followups-worker-seats.md` — installed merge-gate examples.
@@ -2170,43 +2170,19 @@ Median CPU over 50 starts on the real entry, Mac state folder present: `eligible
 
 **Ruled out:** a shared cache of `mac_test.conf`, because it saves 0.8 ms.
 
-### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: todo
+### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: done
 
-**Depends on:** verify's Phase 42c on `builds` (verify tells resources when it lands), and Phase 97. Merge `origin/builds` first.
+#### As-built
 
-**Approved:** builds showrunner, 2026-11-09 ("agree the change with its owner first"). verify-unit, 2026-11-09: "agree to all three rows, and you write them after 42c lands."
-
-#### Work Order
-
-**Goal:** `eligible` and `release-wait` with Mac state present load no `sweep`, `copies` or whole `mac_test` module.
-
-**Measured:** Phase 97's profile, as upper bounds that overlap: the `sweep` import 32 ms on `eligible`, the `copies` import 24 ms on `eligible` and 27 ms on `release-wait`, and the `mac_test` import 62 ms on `release-wait`.
-
-**Spec:**
-
-1. **Git path helpers.** Move `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir` and `local_origin_git_dir` from `scripts/lint/sweep.py` to `scripts/buildlog/repository.py`. Remove the `sweep` import from `offload.repository_identity`.
-2. **Repository scope types.** Move `AllRepositories`, `SelectedRepository`, `RepositoryScope` and `ALL_REPOSITORIES` from `scripts/copies/copies.py` to `scripts/lib/copy_record.py`. Import `copies` in `offload.py` only where copying occurs.
-3. **Claim reader.** Move the claim reader that `build_targets.command_release_wait` needs, with its state paths, lock and record types, from `scripts/mac_test/mac_test.py` to a module with few imports. Keep the decoder and the lock behavior. Build on the claim reads as 42c leaves them.
-4. **Move only.** Each change only moves code. Each moved name has one home and no copy. Add no guard, check or config key.
-5. **Numbers.** Report the median CPU and wall ms per start over 50 starts, before and after, for `eligible` and `release-wait`, with the Mac state folder present.
-6. **Owner read.** Send verify the diff before the checkpoint.
-
-**Constraints from prior phases:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`. `target_config.command_configuration` keeps one `read_targets` result for one `eligible` or `release-wait` start. The eligibility types live in `target_config.py`, and `targets.py` re-exports them. The numbers to improve are CPU 137.673 ms on `eligible` and 101.707 ms on `release-wait`, with the Mac state folder present.
+With the Mac state folder present, `eligible` loads no `sweep` or `copies` module. `release-wait` loads no `copies` or whole `mac_test` module. Each move keeps one home for each moved name and adds no guard, check or config key. Median CPU per start over 50 alternating starts, on a merge that includes the `transfers` record: `eligible` falls from 175.239 ms to 128.873 ms, and `release-wait` falls from 150.339 ms to 61.271 ms.
 
 **Files:**
-- `scripts/lint/sweep.py`
-- `scripts/buildlog/repository.py`
-- `scripts/mac_test/offload.py`
-- `scripts/copies/copies.py`
-- `scripts/lib/copy_record.py`
-- `scripts/mac_test/mac_test.py`
-- `scripts/build_targets/build_targets.py`
-- `scripts/build_targets/test_build_targets.py`
+- `scripts/buildlog/repository.py` — `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir`, `local_origin_git_dir` and their path constants.
+- `scripts/lib/copy_record.py` — `AllRepositories`, `SelectedRepository`, `RepositoryScope`, `ALL_REPOSITORIES`.
+- `scripts/mac_test/claim_state.py` — the claim reader, `locked`, `state_paths`, the record types, the block and event types, `record_after_unlock`. `ClaimOwnerRecord` carries `transfers`.
+- `scripts/mac_test/offload.py` — binds `copies` for types only. Each run-time use has a local import.
+- `scripts/build_targets/test_build_targets.py` — the module rows that show each module absent on the named path.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the production files.
-- `test` owns `test_build_targets.py` and each test file that names a moved item.
+**Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
 
-**State:** none.
-
-**Gate:** the targeted test; `basedpyright` 0/0/0 on each changed file; the module rows of `test_build_targets.py` show the three modules absent on the named paths; the median CPU per start falls on the real entry with the Mac state folder present; verify has read the diff.
+**Ruled out:** a comparison of unpaired start-cost runs.

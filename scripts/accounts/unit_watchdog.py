@@ -26,16 +26,16 @@ from typing import NotRequired, TypedDict, Protocol, cast
 from scripts.accounts import outage_alerts, role_map
 from scripts.production import showrunners, staff
 from scripts.whoami import account
-from scripts.shutdown import stop_results
+from scripts.agents import stop_results
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.production import live_units, unit_lookup
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.message import sessions
 from scripts.lib.user_zone import user_zone
 
@@ -192,7 +192,7 @@ def _restart(label: str, identity: str, source: str) -> str:
             return live.reason
         if isinstance(live, sessions.LiveSessionProcess):
             return ""  # Another recovery already brought this conversation back.
-        resume = cast(ResumeUnit, import_module("scripts.shutdown.stop_resume").resume)
+        resume = cast(ResumeUnit, import_module("scripts.agents.stop_resume").resume)
         result = resume(identity, why="unit watchdog recovery", to=label)
         if isinstance(result, stop_results.ClaudeUp):
             return ""

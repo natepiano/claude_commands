@@ -25,7 +25,7 @@ from scripts.production.staff_test_support import (
     production_membership, unit_membership, recorded_showrunner, transcript_fixture,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 
 
 def record_destination_stop(identities: list[str], identity: str) -> worker_admission.DestinationStopped:

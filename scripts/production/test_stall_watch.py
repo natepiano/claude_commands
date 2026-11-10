@@ -35,7 +35,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import showrunners, staff
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit
@@ -519,8 +519,8 @@ always=natedev
 
     def stop_unit(self) -> Path:
         """Stop the fixture's unit through the real cancellation boundary; return its isolated launch file."""
-        from scripts.shutdown import stop_resume
-        from scripts.shutdown import pane_record
+        from scripts.agents import stop_resume
+        from scripts.agents import pane_record
         with (mock.patch.object(pane_record, "RECORD_DIR", self.root / "launches"),
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee"))):
@@ -1232,8 +1232,8 @@ always=natedev
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_stop_retires_a_transferred_units_current_production_key(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown import pane_record as staff_launches
+        from scripts.agents import pane_record
+        from scripts.agents import pane_record as staff_launches
 
         self.configure({"showrunner": ["unit-one"], "receiver": []})
         row = unit_membership("showrunner", "unit-one")
@@ -1270,7 +1270,7 @@ always=natedev
         self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
         transcript = self.projects / "project/204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
         _ = transcript.write_text(tool_call("Edit", {"file_path": "note.txt"}, START - 30))
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
         wall = [float(START)]
         # Observation starts before stop/resume, even when pane reading finishes afterwards.
         def resumed(session: str, **options: object) -> stop_resume.ClaudeUp:

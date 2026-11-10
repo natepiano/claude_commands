@@ -121,7 +121,7 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
         self.events.unlink(missing_ok=True)
         self.taplo_events.unlink(missing_ok=True)
         functions = shell_functions(
-            VERIFY, "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
+            VERIFY, "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
             "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
             "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
         )

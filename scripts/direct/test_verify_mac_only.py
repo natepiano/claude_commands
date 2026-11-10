@@ -77,7 +77,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
     def mac_result(self, *, extra: dict[str, str], fetch: str = "") -> subprocess.CompletedProcess[str]:
         """Pass a runner result through the real result reader and call recorder."""
         functions = shell_functions(
-            VERIFY, "target_for_settings", "target_platform", "step_state", "release_wait_claim",
+            VERIFY, "verify_helper", "target_for_settings", "target_platform", "step_state", "release_wait_claim",
             "phase_wait_finish", "collect_routing_wait", "collect_hold_wait", "note_event",
             "try_mac_test", "check_mac_only_result", "mac_only_refuse", "try_reserved_target",
         )

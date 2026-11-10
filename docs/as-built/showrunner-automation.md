@@ -603,7 +603,7 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `session_staff.anomalies` collects diagnostics and preserves other callers' stderr output.
     The command prints read failures below the table on stdout when they make the table wrong or incomplete.
     Staff name conflicts also produce lines. Each process has at most one line.
-    The command does not scan other processes.
+    Detached run checks share one process snapshot when needed.
     A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
     A process without an identity reports an unreadable thread when its pane holds staff.
     One staff candidate retains its pane placement with unknown status.
@@ -629,20 +629,38 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `| Unit | Status | Phase | Non-Phase Work | Queued |`.
+  - **Phase productions:** `| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
     Both tables add a **Machine** column after **Status** only when a row runs on another machine.
     The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
+    `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
+    `worker.py list --json` keeps its existing fields.
     Phase shows `phase <n> of <m> — <task>`.
     The task uses the newest plan run's open step, then the phase title.
     Other phase states include `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Cells limit task text to 80 characters and end longer text with `…`.
-    Non-Phase Work reads only the unit's newest run.
-    A finished run gives `—`.
-    Otherwise, it shows the newest open phase absent from the plan, followed by ` +<k> more` when needed.
-    Queued shows the first queued item, followed by ` +<n> more` when needed.
-    An unreadable queue shows `queue unreadable` and prints its path and cause on stderr.
+    Progress uses `█` for done, `▓` for open, and `░` for todo, followed by `<done>/<total>`.
+    Plans above 20 phases use 20 equal groups, with open before todo before done.
+    Repair rounds append `fix rounds <n>` and `+ 1 running` when applicable.
+    When the plan has no phases, an open run supplies Progress and ETA from its full event history.
+    This fallback changes neither Phase, Non-Phase Work, nor Queued.
+    A finished newest run supplies no fallback.
+    ETA uses the latest stated promise from `eta_trail`, never `schedule_end`.
+    Passed promises add `late <elapsed>`; open phases without promises show `no ETA`.
+    A predicted plan finish adds `ends <time>`.
+    Times use the production zone and a short date outside the current day.
+    Workers uses `worker_runs` to show waiting runs, queued results, missing runs, and working workers.
+    Run workers appear first; idle workers append a count, and closed workers add nothing.
+    Remote units show no worker facts.
+    The command reads panes once for the displayed units and their workers.
+    It shares one lazy process snapshot and reads no CPU totals or log tails.
+    Non-Phase Work uses the unit's newest unfinished run and shows open phases absent from the configured plan.
+    Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
+    Each item or title uses an 80-character limit; counts remain after the cut.
+    A configured plan with phases takes priority over the newest run's plan.
+    The fallback plan path resolves against the staff worktree.
+    An unreadable queue retains `queue unreadable` and reports its path and cause.
   - **Style productions:** `production_field(lines, "Kind") == "style"` selects `style_units.table`.
     It prints `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`.
     Ticket shows `#<number without unit prefix> · <rule stem> · <crate> · <ticket work>`.
@@ -654,7 +672,7 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `NoTicket` represents a unit with no such ticket.
   - **Style step:** `format_step(step, ticket, idle)` says in words what the unit does now. It takes `open_step` on the newest run. When the step's activity text is not empty and is not a generic word, the cell shows that text, for example `building 5 frontend-boundaries moves`. Otherwise it maps the label: `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. Another label shows as it is; an empty label shows `—`. With no open step, an assigned ticket shows `starting <ticket work>`, a checkpointed ticket shows `waiting for the showrunner to merge`, and a unit with no ticket shows `idle — <last refill outcome>` or `idle`. The full refill outcome appears only in Step, including any sync wait reason. The cell never shows a bare `impl` or `checkpoint sent`. ETA (`eta_cell`) is `current.eta.time` as `HH:MM`, else `—`.
   - **Style counts:** Findings built is the all-time built count for the unit family; Last 24 h counts findings built in the last 24 h. These two columns and Findings left align right; text columns align left. The recent count uses `built_at`, or `style_ledger.legacy_built_at_sql` on a ledger before schema 25 (`style-showrunner.md`). Findings left (`left_cell(approved, filed, split, now)`) counts filed findings with approved decisions. `FamilyCounts.filed` counts all filed findings of the family. When the two counts are equal the cell shows `<approved>`; otherwise it shows `<approved> approved of <filed> filed`. A recorded split appends `: ready <a> · changed <b> · structure <c> · other <d> (<age>)`. Age counts whole minutes below 60 (`<n> min`), whole hours below 24 (`<n> h`), else whole days (`<n> d`), since `split_at`. A split row with no refill outcome leaves an idle unit as `idle`. Each distinct proposal file is read once. `proposal_issue.decision_answer` decides approval; `rules.style_family` on its unit decides family. A built finding with no decision file uses its build ticket's family. The total line is `All families: <built> findings built · <approved> approved findings left[ of <filed> filed] · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`; `of <filed> filed` shows only when the counts differ. `<filed>` sums `LedgerSnapshot.total_filed`, which counts every filed finding in a ledger, also findings with no resolvable family. The date is now plus `approved / r` days. Zero recent builds ends it with `no ETA: nothing built in 24 h`. Numbers use thousands commas; times and the date use the production zone.
-  - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables and `board_json.py`. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
+  - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
 
 - **A unit's newest run.** `unit_run.py --production <showrunner name> <unit>` prints the run id, machine, and UTC start.
   Staff supplies the current unit folder.

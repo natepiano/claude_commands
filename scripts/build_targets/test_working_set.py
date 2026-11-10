@@ -18,7 +18,7 @@ from unittest import mock
 
 from scripts.build_targets import working_set
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 class WorkingSetTests(unittest.TestCase):

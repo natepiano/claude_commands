@@ -27,13 +27,16 @@ import tempfile
 import time
 import traceback
 from types import FrameType
-from typing import BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
 from scripts.mac_test import cargo_manifest
 from scripts.build_hold import override_guard
-from scripts.copies import copies
+from scripts.lib import copy_record
+
+if TYPE_CHECKING:
+    from scripts.copies import copies
 from scripts.direct import result_environment
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -443,7 +446,7 @@ class OffloadRequest:
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
     environment: tuple[tuple[str, str], ...] = ()
     fetch: FetchFolder | NoFetch = NO_FETCH
-    repository_scope: copies.RepositoryScope = copies.ALL_REPOSITORIES
+    repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
 
     @property
@@ -1046,13 +1049,11 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
 
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
-    from scripts.lint import sweep
-
-    name = sweep.repo_name(str(repo_root))
-    common = sweep.git_common_dir(str(repo_root))
+    name = repository.repo_name(str(repo_root))
+    common = repository.git_common_dir(str(repo_root))
     if name is None or common is None:
         return UNKNOWN_REPOSITORY
-    source = Path(sweep.source_git_dir(common))
+    source = Path(repository.source_git_dir(common))
     if not (source / "config").is_file():
         return KnownRepository(name)
     key = repository.repository_key(str(source.parent))
@@ -1274,6 +1275,8 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    from scripts.copies import copies
+
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
@@ -1471,6 +1474,8 @@ def linux_version_declined_recently(target: str, repository_name: str, hold_s: f
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     root = Path(__file__).resolve().parents[2]
     listing = controller.capture_copy(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
@@ -1497,7 +1502,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture_copy(["rsync", "-rlptc", "--compress", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
@@ -1705,6 +1710,8 @@ def copy_tree(
     request: OffloadRequest,
     repository: KnownRepository,
 ) -> bool:
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
@@ -2127,6 +2134,8 @@ def claimed_run(
     repository: KnownRepository,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     release_allowed = True
     sync_after_release = False
     evidence = controller.attempt_evidence
@@ -2388,6 +2397,8 @@ def run_offload(
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
     if isinstance(eligibility, IneligibleMacStep):
         return declined(eligibility.reason, started)
@@ -2430,6 +2441,8 @@ def run_offload(
 
 
 def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> copies.RemoteMirror:
+    from scripts.copies import copies
+
     scope = request.repository_scope
     if isinstance(scope, copies.AllRepositories):
         scope = copies.SelectedRepository(repository.name)
@@ -2546,6 +2559,8 @@ def holder_session() -> str:
 
 
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
+    from scripts.copies import copies
+
     words = arguments.nextest_words
     if words[:1] == ["--"]:
         words = words[1:]

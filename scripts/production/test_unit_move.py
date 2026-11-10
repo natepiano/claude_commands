@@ -1,7 +1,7 @@
 """Move a private unit worktree with native session evidence and row lifecycle calls."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 import json
@@ -24,7 +24,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_worker
-from scripts.shutdown import pane_record, restart, shutdown_record
+from scripts.agents import pane_record, restart, shutdown_record
 from scripts.herdr import herdr
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.atomic_file import write_text_atomic
@@ -39,7 +39,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
     def test_resuming_a_stopped_unit_tab_retires_the_old_record_before_a_folder_move(self) -> None:
         from scripts.production import add_unit
         from scripts.production import unit_lookup
-        from scripts.shutdown.test_pane_restore import FakeClient
+        from scripts.agents.test_pane_restore import FakeClient
         from datetime import datetime, timezone
 
         old = self.root / "project-alpha"
@@ -69,7 +69,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
         with (mock.patch.object(pane_record, "RECORD_DIR", records),
-              mock.patch("scripts.shutdown.pane_record.RECORD_DIR", records),
+              mock.patch("scripts.agents.pane_record.RECORD_DIR", records),
               mock.patch.dict(os.environ, self.env)):
             pane_record.write("agents", original)
             with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(labeled)),
@@ -237,7 +237,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         from scripts.herdr import herdr
         from scripts.message import sessions
         from scripts.accounts import accounts
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
 
         kinds: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
         for kind in kinds:
@@ -307,7 +307,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
 
     def test_a_foreign_native_session_receives_no_stop_signal(self) -> None:
         from scripts.herdr import herdr
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
 
         client = herdr.Herdr("agents")
         panes: list[herdr.PaneIdentity] = [{"pane_id": "w1:p1", "workspace_id": "w1", "label": "stale",
@@ -403,7 +403,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         from scripts.herdr import herdr
         from scripts.message import sessions as native_sessions
         from scripts.accounts import accounts
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
 
         client = herdr.Herdr("agents")
         panes: list[herdr.PaneIdentity] = [{"pane_id": "w1:p1", "session_id": self.owner.current_session,
@@ -726,8 +726,8 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
     def assert_recovery(self, step: str) -> None:
         from contextlib import ExitStack
         from scripts.production import unit_move as moving
-        from scripts.shutdown import shutdown
-        from scripts.shutdown import restart
+        from scripts.agents import shutdown
+        from scripts.agents import restart
 
         class InterruptedMove(BaseException):
             pass
@@ -806,7 +806,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assert_recovery("start")
 
     def test_both_native_families_resume_current_session_without_a_launch_record(self) -> None:
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         for kind in ("claude", "codex"):
             with self.subTest(kind=kind), saved_fixture(self.root) as restore:
@@ -826,7 +826,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                 restore()
 
     def test_dirty_work_does_not_refuse_a_nondestructive_move(self) -> None:
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         _ = (self.source / "kept.txt").write_text("Keep the uncommitted edit.\n")
         _ = (self.source / "draft.md").write_text("Keep the untracked draft.\n")
@@ -841,7 +841,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assertEqual(len(backend.starts), 1)
 
     def test_existing_target_refuses_without_overwriting_any_file(self) -> None:
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         self.destination.mkdir()
         marker = self.destination / "owned-by-another-unit.txt"
@@ -859,7 +859,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
 
     def test_same_row_lock_refuses_without_stopping_or_moving(self) -> None:
         import fcntl
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         backend = FolderSessionFixture(self.owner, live=True)
         lock = self.staff_file.parent / "rows" / f"{self.owner.id}.lock"
@@ -876,7 +876,7 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assertFalse(self.destination.exists())
 
     def test_stopped_unit_moves_its_row_and_branch_and_stays_stopped(self) -> None:
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         backend = FolderSessionFixture(self.owner, live=False)
         with backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False):
@@ -1001,7 +1001,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
 
     def test_f006_hard_kill_states_finish_without_cleanup_or_automatic_starts(self) -> None:
         from scripts.production import unit_move
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         for step in ("stop", "move", "publish"):
             with self.subTest(step=step), saved_fixture(self.root) as restore, ExitStack() as recovery:
@@ -1042,7 +1042,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
 
     def test_f006_failed_start_reports_the_restart_command_immediately(self) -> None:
         from scripts.lint.memory_test_support import write_config_fixture
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         _ = write_config_fixture(self.configuration, "RENAME_LIVE_WAIT_SECONDS=0.01\nRENAME_POLL_SECONDS=0.001\n")
         backend = FolderSessionFixture(self.owner, live=True)
@@ -1197,7 +1197,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
             self.assertNotEqual(pending_types[0], pending_types[1])
 
     def test_git_timeout_reports_a_rename_error_and_a_move_anomaly(self) -> None:
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         real_git = unit_move.git
         def git(folder: Path, *arguments: str) -> str:

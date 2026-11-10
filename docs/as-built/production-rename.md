@@ -76,5 +76,5 @@ The command edits no document fields, plan headers, prose, marks, or history.
 Unit renames change matching folder and branch suffixes unless `--to-branch` supplies the branch; see `unit-rename.md`.
 Folder-only moves use `unit_move.py move-folder --unit <staff id> --to <path>`.
 
-`scripts/shutdown/test_shutdown_cli.py` uses private staff records, temporary files, and a fake herdr.
+`scripts/agents/test_shutdown_cli.py` uses private staff records, temporary files, and a fake herdr.
 The tests cover row rename, display repair, optional moves, and recovery after an interruption.

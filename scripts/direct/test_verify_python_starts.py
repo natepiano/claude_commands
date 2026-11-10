@@ -118,6 +118,7 @@ class VerifyOutputRootsTests(unittest.TestCase):
             harness = workspace / "metadata.sh"
             _ = harness.write_text(
                 'set -euo pipefail\n'
+                + shell_function(VERIFY.read_text(), "verify_helper") + "\n"
                 + shell_function(VERIFY.read_text(), "set_gate_metadata") + "\n"
                 + shell_function(VERIFY.read_text(), "load_metadata") + "\n"
                 + "cargo() { [[ ${CARGO_FAIL:-0} == 0 ]] || return 1; cat metadata.json; }\n"
@@ -164,7 +165,7 @@ class PairedTreeKeyTests(TreeWatchFixture):
         harness = session / "keys.sh"
         _ = harness.write_text('set -euo pipefail\nCMD=$1; shift; ARGS=("$@")\n'
                                + 'GATE_METADATA=$TEST_METADATA\n'
-                               + "\n".join(shell_function(VERIFY.read_text(), name) for name in ("tree_key", "set_verdict_keys")) + '''
+                               + "\n".join(shell_function(VERIFY.read_text(), name) for name in ("verify_helper", "tree_key", "set_verdict_keys")) + '''
 tree_key
 tree_key --tree-content
 set_verdict_keys --watch-start "$UNIT_SESSION_DIR/start"
