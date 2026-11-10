@@ -294,7 +294,7 @@ found = staff_sources.member(staff_sources.UnitMember('old', 'alpha'), record)
 assert isinstance(found, staff_sources.NoSuchMember)
 
 marked = unit_lookup.LabeledSession('alpha', unit_lookup.ClaudeNotRunning(),
-                                unit_lookup.herdr.HerdrPlace('agents', 'w1:p1'),
+                                unit_lookup.HerdrPlace('agents', 'w1:p1'),
                                 identity=unit_lookup.LiveSession(record.find(kind='unit')[0].current_session))
 grouped = unit_lookup.group_labeled_sessions([marked], record=record)
 assert list(grouped.units['receiving']) == ['alpha']

@@ -62,8 +62,9 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
-
-NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+from scripts.herdr.herdr_types import HerdrFailure as HerdrFailure
+from scripts.herdr.herdr_types import HerdrMissing as HerdrMissing
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS as NATIVE_ID_MARKS
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
@@ -146,20 +147,8 @@ def _platform() -> str:
     return os.environ.get("HERDR_PLATFORM", _PLATFORM)
 
 
-class HerdrFailure(Exception):
-    """An external command failure or malformed herdr response."""
-
-    def __init__(self, message: str, code: str = "") -> None:
-        super().__init__(message)
-        self.code: str = code
-
-
 class NativeRegistryUnavailable(ValueError):
     """The process has no native registry identity."""
-
-
-class HerdrMissing(HerdrFailure):
-    """No herdr binary is available."""
 
 
 class _DarwinProcessGone(HerdrFailure):
