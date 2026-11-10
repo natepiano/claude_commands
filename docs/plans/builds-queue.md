@@ -1413,15 +1413,47 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** a row for runs outside the queue in `/build:queue`.
 
-### Phase 23a — Queue boundary imports stay small, if a prototype shows a real gain  · status: todo
+### Phase 42 — A file copied to a remote tree always counts as changed for Cargo  · status: todo
 
-**Depends on:** Phase 23.
+**Depends on:** none. Source: builds, 2026-11-09, from sdlc and cargo-liner.
 
-1. **The ask (builds, 2026-11-09, from natest's measurement).** The queue boundary pulls in admission imports at 46 test starts. The ceiling is 18.7 CPU seconds for each whole gate. "Prototype separating them, measure, keep it only if the gain is real."
-2. **Source.** Item 2 of the phase 114 follow-up proposals: separate the queue boundary interface from admission imports that ordinary style commands do not use. The next measurement targets are `queue_place` and `admission_records`.
-3. **Order of work.** Measure a disposable prototype first. 18.7 CPU seconds is a ceiling, not a gain. Keep the change only if the measured gain is real; otherwise close the phase with the measurement.
-4. **Coordination.** The style side goes through devtools. The Work Order follows at phase start.
-5. **Code version and type identity (architect review of 23, 2026-11-09).** An import of `queue_place` loads `admission_records` and `memory_admit` today. `ADMISSION_CODE_PATHS` in `scripts/build_queue/admission_code.py` lists files by hand, so a module that the change extracts must join that list, or the admission code version misses it. Types that cross the wire and snapshot boundaries keep one identity. Tests: a changed extracted module changes the version, and a snapshot round trip gives the same types.
+#### Work Order
+
+**Goal:** A Mac gate never tests old Rust against new source.
+
+**Spec:**
+
+1. A small case proves the cause first. `rsync -t` keeps the source mtime, so a changed file can be older than the last build, and Cargo reads it as fresh.
+2. The remote copy drops `-t`. `-c` still skips equal content, so only a changed file takes a new mtime.
+3. The flags are defined once, in `scripts/copies/copies.py`. `scripts/mac_test/offload.py` uses that definition. No caller adds a touch step or a guard.
+4. A real local `rsync` test proves that a changed file with an old source mtime lands newer than the source, and that an unchanged file keeps its destination mtime.
+
+**Files:**
+- `scripts/copies/copies.py`
+- `scripts/copies/test_remote_copies.py`
+- `scripts/mac_test/offload.py`
+- `scripts/mac_test/test_offload.py`
+
+**Workers:** `1 writer` — `impl` owns the fix and its tests, on a branch cut from builds so that the hash carries no held phase.
+
+**State:** none.
+
+**Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** none — the copy stays silent; a Mac gate only stops testing stale builds.
+
+### Phase 23a — Queue boundary imports stay small, if a prototype shows a real gain  · status: done
+
+#### As-built
+
+- No code changed. The prototype moved the five admission imports of `queue_place.py` into the functions that use them. The gain was not real under the phase rule, so the prototype was discarded.
+- Five style test modules, three repeats on each tree, 49,651 process starts: the baseline mean is 124.521 CPU seconds and the prototype mean is 107.340. The gain is 17.182 CPU seconds. The baseline spread is 36.988 and the prototype spread is 26.310.
+- `test_standing_checkpoint`, the module with natest's 46 starts, shows a gain of −0.434 CPU seconds.
+- The import of `queue_place` costs 188,760 µs at baseline and 17,392 µs with the prototype.
+
+**Gotchas:** the repeats of these modules differ by up to 37 CPU seconds on one tree, so three repeats cannot show a gain of this size.
+
+**Ruled out:** lazy admission imports in `queue_place.py`, and a separate boundary module, until a measurement shows a gain larger than the spread.
 
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
 **Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`). 10g changes the offload path. The second to land resolves; the director names the merge owner before the work runs in parallel (architect review of 18, 2026-11-06). 18c is complete.
