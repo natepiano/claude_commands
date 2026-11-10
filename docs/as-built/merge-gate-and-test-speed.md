@@ -584,6 +584,7 @@ A failed Mac advance names the published local commit and leaves retry to main s
   An interrupted update is not a tracked edit. When each changed tracked file, and each untracked file new at origin/main, equals origin/main, the job finishes the update.
   It removes those untracked files, restores those tracked files to HEAD, then runs `git merge --ff-only`.
   A tracked candidate's index entry must also equal HEAD or origin/main. Any other change blocks as `dirty`, and no file changes.
+  The `dirty` detail names each path that blocks the update, or git's first error line when git cannot list them.
   It never resets, stashes, or creates a merge commit.
   Each run appends `MAIN_SYNC_STATE_DIR/sync.jsonl`, default `~/.local/state/main-sync/`.
   No blocked-state marker exists.
