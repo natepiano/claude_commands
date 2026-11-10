@@ -1859,7 +1859,7 @@ else: raise AssertionError(args)
                 return policy(method, endpoint, body, headers, timeout)
             raise AssertionError((method, endpoint))
         _ = cast(object, self.enterContext(mock.patch.object(box, 'tailnet_request', side_effect=tailnet)))
-        _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'state_paths', return_value=mac_test.StatePaths(self.state, 'aws'))))
+        _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         return devices
 
     def join_fixture(self, devices: dict[str, object], arguments: Sequence[str], key: str,
@@ -2139,6 +2139,7 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
+        self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()
         with self.credentials.open('a') as handle:
@@ -2954,11 +2955,11 @@ else: raise AssertionError(args)
         self.assertNotIn('AccessKey', json.dumps(template))
         self.assertNotIn('mkfs', json.dumps(template))
 
-    def test_repository_configuration_enables_approved_aws_control_and_exchange(self) -> None:
+    def test_repository_configuration_keeps_aws_settings_without_registering_the_builder(self) -> None:
         root = Path(__file__).resolve().parents[2]
         self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'on')
         self.assertEqual(conf.read(root / 'config/build_targets.conf').text('targets').split(','),
-                         ['mac', 'natedev', 'aws'])
+                         ['mac', 'natedev'])
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
