@@ -2456,3 +2456,43 @@ Declined by the builds showrunner on 2026-11-10: the gain is under the 30 CPU s 
 - The probe estimate (about 47 ms per start) was too high: every state read still loads `staff` (about 17 ms) for the run owner, and `models_registry` (about 14 ms) loads for a module constant.
 
 **Ruled out:** a recorder import phase while every state read needs `staff`; a larger gain needs a recorder that does not resolve the owner through staff on each start.
+
+### Phase 123 — A changed shell script selects the tests of the scripts that call it  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the builds showrunner, 2026-11-10: go for the script-call closure in `affected_modules.py`, after Phase 122. Correct selection first. Send the before/after module count and the targeted CPU with the checkpoint.
+
+**Why:** the Phase 121 repair changed `scripts/direct/board.sh`. Its targeted run did not select `test_verify_lint_tool_failures`, which runs `verify.sh`, which sources `board.sh`. The merge gate found the failure instead. A changed shell script selects only the tests that name it, not the tests of the scripts that run it.
+
+**Goal:** a changed shell script also selects every test that names a script that calls it, directly or through other scripts.
+
+**Spec:**
+
+1. A script is a tracked or dirty file under `scripts/` that is not Python and ends in `.sh` or has an execute bit.
+2. A script calls a target when its text names the target by the current test rule (`names_changed_file`: the full path, or the name with its folder). It also calls the target through a token that ends in `/` plus the target's full path (`$HOME/.claude/scripts/direct/verify.sh`), or a token that ends in `/` plus the name when the target is in the caller's own folder (`"$SCRIPT_DIR/board.sh"`).
+3. The changed scripts seed the closure. Add each script that calls a closure member until no new script is found. Removed scripts seed the closure too.
+4. A test is selected when it, or its imported test-support modules, names any closure member by the current test rule. The other selection rules do not change.
+5. Python files are not callers. Read script text from the worktree only when a changed script exists; the fact cache does not change.
+6. Measure the module count for a `board.sh` change and for two other scripts before and after. Measure the targeted CPU for the `board.sh` change before and after.
+
+**Files:**
+- `scripts/production/affected_modules.py` — the script-call closure; owner natest
+- `scripts/production/test_affected_modules.py` — one test for the call chain, with negative rows; owner natest
+- `docs/as-built/merge-gate-and-test-speed.md` — the targeted selection line; owner natest
+
+**Workers:** 1 writer; one small change with its test
+- `impl` — all files
+
+**State:** none
+
+**Constraints from prior phases:** tests use no live state. A complete-path token that is only a fragment of a longer path (`old/config/custom.json`) must not select a test; that rule stays for tests.
+
+**Acceptance gate:**
+- A `board.sh` change selects `test_verify_lint_tool_failures`.
+- The new test fails without the closure and passes with it.
+- `test_affected_modules.py` and the merge-gate importers of `affected_modules.py` pass.
+- `basedpyright` reports 0 errors, 0 warnings, 0 notes for both Python files.
+- A targeted test on the change passes.

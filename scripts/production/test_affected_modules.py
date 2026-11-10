@@ -480,6 +480,38 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertCountEqual([path.name for path in self.selection().modules],
                               ["test_support_path.py", "test_folder_path.py"])
 
+    def test_a_changed_script_selects_tests_of_every_script_that_calls_it(self) -> None:
+        self.write("scripts/component/tool.sh", "# runner.sh calls this file.\ntrue\n")
+        self.write("scripts/component/runner.sh", 'source "$SCRIPT_DIR/tool.sh"\n')
+        self.write("scripts/entry/front.sh", 'exec "$HOME/.claude/scripts/component/runner.sh"\n')
+        self.write("scripts/entry/launch", 'exec "$SCRIPT_DIR/front.sh"\n')
+        (self.repo / "scripts/entry/launch").chmod(0o755)
+        self.write("scripts/other/elsewhere.sh", 'source "$SCRIPT_DIR/tool.sh"\n')
+        self.write("scripts/other/fragment.sh", "cat old/component/tool.sh\n")
+        self.write("scripts/component/helper.py", 'COMMAND = ["scripts/component/tool.sh"]\n')
+        for name, text in (
+            ("test_tool.py", "SCRIPT = 'scripts/component/tool.sh'\n"),
+            ("test_runner.py", "PARTS = 'component runner.sh'\n"),
+            ("test_front.py", "SCRIPT = 'scripts/entry/front.sh'\n"),
+            ("test_launch.py", "SCRIPT = 'scripts/entry/launch'\n"),
+            ("test_elsewhere.py", "SCRIPT = 'scripts/other/elsewhere.sh'\n"),
+            ("test_fragment.py", "SCRIPT = 'scripts/other/fragment.sh'\n"),
+            ("test_helper.py", "SCRIPT = 'scripts/component/helper.py'\n"),
+            ("test_relative_front.py", "SCRIPT = 'SCRIPT_DIR/front.sh'\n"),
+        ):
+            self.add_test(f"checks/{name}", text)
+        self.certify()
+        expected = ["test_tool.py", "test_runner.py", "test_front.py", "test_launch.py"]
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                if removed:
+                    (self.repo / "scripts/component/tool.sh").unlink()
+                else:
+                    self.write("scripts/component/tool.sh", "# runner.sh calls this file.\nfalse\n")
+                _ = self.commit()
+                self.assertCountEqual([path.name for path in self.selection().modules], expected)
+                self.certify()
+
     def test_dirty_paths_include_edits_untracked_files_deletions_and_renames(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/component/deleted.py", "VALUE = 1\n")
