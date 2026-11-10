@@ -34,35 +34,10 @@ The sdlc showrunner, 2026-11-10: "a stall-watch fault from hana. The claude1 log
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** when a watched unit's pane shows the Claude login limit, stall-watch tells the showrunner the login cause once and sends no bump. When the login returns, the normal idle watch starts again with a fresh stretch.
-
-**Spec:**
-
-1. Add a `login_limit_pattern` to `config/stall_watch.conf` that matches `Login reached its time limit`. Read it at use, the same way as the other status patterns.
-2. In `watch_pass`, after the permission-prompt branch and before the idle stretch, detect the login limit in the pane text. A pane shows the limit only when the match is in the newest part of the pane, after the last assistant turn-end on screen. Old text from before a later successful turn does not count.
-3. While the pane shows the limit:
-   - Send no `bump` to the unit.
-   - Send one `tell` to the showrunner that names the unit and the login cause: the Claude login reached its time limit and needs `/login`.
-   - Record that tell in the saved stretch, so later passes send nothing more while the limit stays on screen.
-   - Keep the idle clock reset, so the unit gets no bump at the moment the login returns.
-   - The per-unit log line reads `inspected <showrunner name>/<unit>: login limit`.
-4. When the pane no longer shows the limit, clear the login mark. The unit then follows the normal idle path.
-5. Add rows to the existing stall-watch tests: a pane at the login limit gets one tell and no bump across two passes; a pane where the login returned gets the normal bump after the stall time. Add no other check.
-
-**Files:**
-- `scripts/production/stall_watch.py` — the login-limit branch and the saved mark
-- `scripts/production/test_stall_watch.py` — the new rows
-- `config/stall_watch.conf` — `login_limit_pattern`
-
-**Workers:** 1 writer — one small change in one module.
-- `impl` — the files above.
-
-**State:** the saved stretch file gains a login mark — a saved stretch from before the change must still read.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- The Test command above passes.
-- `basedpyright scripts/production/stall_watch.py scripts/production/test_stall_watch.py` gives `0 errors, 0 warnings, 0 notes`.
+- `config/stall_watch.conf` holds `login_limit_pattern`, read at use.
+- `watch_pass` in `scripts/production/stall_watch.py` checks the pane text after the last turn end. While the limit shows and the login is not back, it sends one tell to the showrunner, sends no bump, keeps the idle clock reset and logs `login limit`.
+- The saved stretch keeps a `login_since` mark. An old stretch file without the mark still reads.
+- `login_restored` reads the usage store only for a pane at the limit. A successful read for the session's login that is newer than the session's last transcript activity means the login is back. The unit then follows the normal idle path.
+- Rows in `test_a_resumed_holding_unit_gets_a_fresh_idle_stretch_before_its_bump` cover the limit, the return on a new turn and the return through the usage store.
