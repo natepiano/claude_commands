@@ -2478,27 +2478,16 @@ A changed shell script now selects the tests of every script that calls it, dire
 **Ruled out:** Python files as callers (a `board.sh` change would select 521-575 modules). A changed Python file that a shell script runs still selects only its importers and the tests that name it.
 
 ### Phase 124 — Test modules start faster because three test-support files load their heavy imports only when used  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** About 30 CPU s less import work per merge gate, with no production code change.
-
-**Spec:**
-1. `scripts/lint/memory_test_support.py`: import `read_memory_config` inside `admission_configuration_fixture()`. Keep `AdmissionPolicy` and `MemoryConfig` under `TYPE_CHECKING`.
-2. `scripts/build_queue/queue_fixture.py`: import `roster` and `UnitLabels` inside `QueueFixture.__init__`, and `head_facts` and `queue_view` inside `model()`. Keep `queue_view` and `UnitLabels` under `TYPE_CHECKING` for annotations.
-3. `scripts/build_queue/admission_test_support.py`: import `step_estimator` inside `history()`.
-4. Use the phase 117 form: the import is the first statement of the function that uses it.
-5. Do not change `scripts/production/staff_test_support.py`. Its isolation patches `pane_record.RECORD_DIR` only when the module is already loaded.
+Three test-support files load their heavy imports at the function that uses them, in the phase 117 form. `memory_test_support.py` imports `read_memory_config` in `admission_configuration_fixture`. `queue_fixture.py` imports `roster` and `UnitLabels` in `QueueFixture.__init__`, and `head_facts` and `queue_view` in `model`; it keeps `queue_view` and `UnitLabels` under `TYPE_CHECKING`. `admission_test_support.py` imports `step_estimator` in `history`. A paired import scan of 745 gate test modules, phase base against the change, measured 149.8 to 117.0 and 143.2 to 115.2 CPU s: about 30 CPU s saved per gate. 440 modules load less, and the classes built fell from 428,232 to 322,648. The targeted gate passed 109 of 109 modules.
 
 **Files:**
-- `scripts/lint/memory_test_support.py`
-- `scripts/build_queue/queue_fixture.py`
-- `scripts/build_queue/admission_test_support.py`
+- `scripts/lint/memory_test_support.py` — delayed `admission_records` import
+- `scripts/build_queue/queue_fixture.py` — delayed `roster`, `unit_labels`, `head_facts` and `queue_view` imports
+- `scripts/build_queue/admission_test_support.py` — delayed `step_estimator` import
 
-**Workers:** No-worker mode (Codex quota is 0%). The director writes the three edits.
+**Gotchas:** Dataclass creation is about two thirds of test-module import CPU, so a cut is worth the classes it skips. `-X importtime` names only the first loader of a module; use paired CPU scans to rank a cut.
 
-**Acceptance gate:**
-1. The build_queue, lint and verify tests that import the three files pass.
-2. basedpyright reports zero errors and zero warnings on the three files.
-3. A paired import scan of all gate test modules, phase base against the change, shows about 30 CPU s less per gate.
+**Ruled out:** a dataclass code cache in the module runner, because it replaces a private stdlib name; a delayed `pane_record` import in `staff_test_support.py`, because its isolation patches `RECORD_DIR` only when that module is already loaded.
