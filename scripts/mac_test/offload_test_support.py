@@ -105,6 +105,10 @@ class WireResult(TypedDict):
 
 
 class RemoteClaimRecord(TypedDict):
+    claim_id: str
+    episode: str
+    attempt: str
+    submitting_session: str
     copy: NotRequired[bool]
     pid: int
     proc_start: str
@@ -144,6 +148,14 @@ def main() -> int:
         record = {"pid": owner_pid, "proc_start": proc_start, "what": "nextest hana",
                   "worktree": arguments[arguments.index("--worktree") + 1], "since": "2026-10-12T00:00:00+00:00",
                   "remote_host": arguments[arguments.index("--remote") + 1]}
+        previous_path = state / "claims" / "hana.json"
+        previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+        for field in ("claim_id", "episode", "attempt"):
+            flag = "--" + field.replace("_", "-")
+            record[field] = (previous[field] if "--from-pid" in arguments
+                             else arguments[arguments.index(flag) + 1])
+        record["submitting_session"] = arguments[arguments.index("--session") + 1]
+        identity_line = "claim_identity=" + json.dumps({field: record[field] for field in ("claim_id", "episode", "attempt")})
         actions = (root / "state-events").read_text().splitlines()
         if (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
                 or os.environ.get("MAC_TEST_TAKEOVER_FIRST") == "1" and actions == ["claim"]):
@@ -151,6 +163,7 @@ def main() -> int:
             record["remote_host"] = "previous-mac"
             (state / "claims").mkdir(exist_ok=True)
             (state / "claims" / "hana.json").write_text(json.dumps(record))
+            print(identity_line, flush=True)
             print("leftovers: previous-mac", flush=True)
             return 13
         takeover = os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
@@ -162,12 +175,20 @@ def main() -> int:
         (root / "claim-started").write_text("started\n", encoding="utf-8")
         while not (root / "finish-claim").exists():
             time.sleep(0.01)
+        print(identity_line, flush=True)
         if takeover:
             print("leftovers: " + os.environ.get("MAC_TEST_TAKEOVER_REPLY", "reply-mac"), flush=True)
             return 13
         return 0
     if action == "release":
-        (state / "claims" / "hana.json").unlink(missing_ok=True)
+        path = state / "claims" / "hana.json"
+        if path.exists():
+            arguments = sys.argv[2:]
+            record = json.loads(path.read_text())
+            identity = {field: arguments[arguments.index("--" + field.replace("_", "-")) + 1]
+                        for field in ("claim_id", "episode", "attempt")}
+            if all(record[field] == value for field, value in identity.items()):
+                path.unlink()
         return 0
     return 12
 
@@ -587,7 +608,9 @@ raise SystemExit(offload.main())
 
     def write_kept_claim(self, host: str = "previous-mac") -> RemoteClaimRecord:
         self.claim_file.parent.mkdir(parents=True, exist_ok=True)
-        record: RemoteClaimRecord = {"pid": 1073741824, "proc_start": "gone", "what": "older tests",
+        record: RemoteClaimRecord = {"claim_id": "kept-claim", "episode": "kept-episode", "attempt": "kept-attempt",
+                                     "submitting_session": "fixture-session",
+                                     "pid": 1073741824, "proc_start": "gone", "what": "older tests",
                                      "worktree": str(self.repository), "since": datetime.now(timezone.utc).isoformat(),
                                      "remote_host": host}
         _ = self.claim_file.write_text(json.dumps(record))

@@ -93,7 +93,8 @@ def _line(connection: socket.socket, pending: bytearray, deadline: float) -> byt
     return line
 
 
-def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -> wire.Reply:
+def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
+           | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     timeout = records.read_memory_config().query_timeout_seconds
@@ -115,6 +116,36 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -
         raise wire.AdmissionUnavailable(f"no answer in {timeout:g} s") from error
     except (OSError, ValueError) as error:
         raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
+
+
+def request_placement(request: wire.PlacementRequest) -> wire.Assignment | wire.PlacementWait | wire.DispatchStatus:
+    """Request a durable destination without selecting a fallback in the caller."""
+    reply = _query(request)
+    if isinstance(reply, (wire.Assignment, wire.PlacementWait, wire.DispatchStatus)):
+        return reply
+    raise wire.AdmissionUnavailable("invalid placement answer")
+
+
+def claim_failure(request: wire.ClaimFailure) -> wire.DispatchStatus:
+    reply = _query(request)
+    if isinstance(reply, wire.DispatchStatus):
+        return reply
+    raise wire.AdmissionUnavailable("invalid claim failure answer")
+
+
+def consume_permission(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+    """A repeated call can return status but cannot restore a lost authorization."""
+    reply = _query(request)
+    if isinstance(reply, (wire.FirstAuthorization, wire.DispatchStatus)):
+        return reply
+    raise wire.AdmissionUnavailable("invalid permission answer")
+
+
+def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
+    reply = _query(request)
+    if isinstance(reply, wire.DispatchStatus):
+        return reply
+    raise wire.AdmissionUnavailable("invalid execution report answer")
 
 
 @dataclass

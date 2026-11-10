@@ -26,12 +26,13 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from types import FrameType
 from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
-from scripts.mac_test import cargo_manifest
+from scripts.mac_test import cargo_manifest, claim_state
 from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
@@ -303,6 +304,8 @@ class MacClaimFromWait:
     """A live local process owns the reservation for transfer."""
 
     owner_pid: int
+    identity: claim_state.ClaimIdentity
+    submitting_session: claim_state.SubmittingSession
 
 
 @dataclass(frozen=True)
@@ -750,6 +753,10 @@ class CliArguments(argparse.Namespace):
         self.verb: MacVerb = "nextest"
         self.kind: str = ""
         self.claim_owner_pid: int = 0
+        self.claim_id: str = ""
+        self.episode: str = ""
+        self.attempt: str = ""
+        self.claim_session: str = ""
         self.environment: list[str] = []
         self.fetch: str | None = None
 
@@ -761,6 +768,7 @@ class ProcessController:
         self.active: ActiveProcess = IDLE_PROCESS
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
         self.copy_failure_detail: str = ""
+        self.claim_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
 
     def stop(self) -> None:
         active = self.active
@@ -801,7 +809,10 @@ class ProcessController:
                 attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
             else:
                 stdout, stderr = process.communicate()
-                attempt.answer = read_claim_answer(CommandOutput(process.returncode, stdout, stderr))
+                answer = CommandOutput(process.returncode, stdout, stderr)
+                attempt.answer = read_claim_answer(answer)
+                if answer.status in (0, 13):
+                    self.claim_identity = claim_state.reply_claim_identity(stdout)
         finally:
             self.active = IDLE_PROCESS
 
@@ -1316,6 +1327,11 @@ def parse_probe(output: str) -> ProbeResult:
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
+    identity = (claim_state.ClaimIdentity(uuid.uuid4().hex, request.call_id, uuid.uuid4().hex)
+                if isinstance(request.admission, UnclaimedMacRun) else request.admission.identity)
+    session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
+               else claim_state.session_id(request.admission.submitting_session))
+    identity_words = ["--claim-id", identity.claim_id, "--episode", identity.episode, "--attempt", identity.attempt]
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
                if isinstance(request.admission, MacClaimFromWait) else [])
@@ -1332,6 +1348,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--remote",
         config.host,
         *copy_words,
+        *identity_words,
+        "--identity", "--session", session,
         *selection,
         *handoff,
         *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
@@ -1339,6 +1357,9 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
 
 
 def release_claim(controller: ProcessController, target: str = "") -> None:
+    identity = controller.claim_identity
+    if isinstance(identity, claim_state.NoClaimIdentity):
+        return
     result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
@@ -1346,10 +1367,15 @@ def release_claim(controller: ProcessController, target: str = "") -> None:
             "release",
             "--pid",
             str(os.getpid()),
+            "--claim-id", identity.claim_id,
+            "--episode", identity.episode,
+            "--attempt", identity.attempt,
             *(["--target", target] if target else []),
         ]
     )
     if isinstance(result, CommandOutput):
+        if result.status == 0:
+            controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
         for line in result.stdout.splitlines():
             if line.startswith("copy_bytes="):
                 transfers = cast(list[buildlog_sync.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
@@ -1363,6 +1389,8 @@ def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
     if slots and (len(slots) != 1 or not slots[0].isascii() or not slots[0].isdecimal() or int(slots[0]) < 1):
         return MacClaimNotConfirmed("state", result.stdout, result.stderr)
     slot = int(slots[0]) if slots else 1
+    if result.status in (0, 13) and isinstance(claim_state.reply_claim_identity(result.stdout), claim_state.NoClaimIdentity):
+        return MacClaimNotConfirmed("state", result.stdout, result.stderr)
     if result.status == 0:
         return FreshMacClaim(slot)
     if result.status == 13:
@@ -2551,6 +2579,8 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--filter-run", action="store_true")
     _ = run.add_argument("--copy", action="store_true")
     _ = run.add_argument("--claim-owner-pid", type=int, default=0)
+    for field in ("claim-id", "episode", "attempt", "claim-session"):
+        _ = run.add_argument("--" + field, default="")
     _ = run.add_argument("--result")
     _ = run.add_argument("--env", dest="environment", action="append", default=[])
     _ = run.add_argument("--fetch")
@@ -2569,6 +2599,7 @@ def holder_session() -> str:
 
 
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
+    from scripts.build_hold.build_hold import NoOwningSession, OwningSession
     from scripts.copies import copies
 
     words = arguments.nextest_words
@@ -2595,7 +2626,11 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         target=arguments.target,
         environment=tuple((name, os.environ[name]) for name in arguments.environment),
         fetch=FetchFolder(arguments.fetch.removesuffix("/")) if arguments.fetch is not None else NO_FETCH,
-        admission=MacClaimFromWait(arguments.claim_owner_pid) if arguments.claim_owner_pid else UnclaimedMacRun(),
+        admission=MacClaimFromWait(
+            arguments.claim_owner_pid,
+            claim_state.ClaimIdentity(arguments.claim_id, arguments.episode, arguments.attempt),
+            OwningSession(arguments.claim_session) if arguments.claim_session else NoOwningSession(),
+        ) if arguments.claim_owner_pid else UnclaimedMacRun(),
     )
 
 

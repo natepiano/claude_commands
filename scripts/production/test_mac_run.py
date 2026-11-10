@@ -375,7 +375,9 @@ class MacRunTests(unittest.TestCase):
         self.assertRegex(result.stdout, r"busy: unit tests since \d\d:\d\d")
         self.assert_no_build_started()
         self.assertTrue((self.state_directory / "run.json").exists())
-        released = self.state_command("release", "--pid", str(os.getpid()))
+        claim = cast(dict[str, str], json.loads((self.state_directory / "run.json").read_text()))
+        released = self.state_command("release", "--pid", str(os.getpid()), "--claim-id", claim["claim_id"],
+                                      "--episode", claim["episode"], "--attempt", claim["attempt"])
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
 
     def test_unreadable_state_exits_nine_without_starting_build(self) -> None:

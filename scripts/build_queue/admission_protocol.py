@@ -45,6 +45,14 @@ from scripts.build_queue.admission_wire import (
     Refused as Refused,
     Ok as Ok,
     BuildHistoryReply as BuildHistoryReply,
+    PlacementRequest as PlacementRequest,
+    ClaimFailure as ClaimFailure,
+    ConsumePermission as ConsumePermission,
+    ExecutionReport as ExecutionReport,
+    PlacementWait as PlacementWait,
+    Assignment as Assignment,
+    FirstAuthorization as FirstAuthorization,
+    DispatchStatus as DispatchStatus,
     VERSION as VERSION,
     NO_RUN as NO_RUN,
     PROTOCOL_ACQUISITION_TIMING as PROTOCOL_ACQUISITION_TIMING,
@@ -109,7 +117,8 @@ class MineReply:
 
 
 
-Reply = Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
+Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
+         | PlacementWait | Assignment | FirstAuthorization | DispatchStatus)
 
 _REPLIES: dict[str, type] = {**REPLY_TYPES, "view": ViewReply, "explain": ExplainReply, "mine": MineReply}
 

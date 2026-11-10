@@ -50,10 +50,11 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1", "TEST_COPY_CLAIM": mac_test_script})
 
         admission = caller_admission(self, self.root, self.environment)
+        identity = ["--claim-id", "new-test-claim", "--episode", "new-test-episode", "--attempt", "new-test-attempt"]
 
         def claim(*words: str) -> subprocess.CompletedProcess[str]:
             with admission.loop_turn():
-                return invoke_mac_claim([*words, "--pid", str(os.getpid())],
+                return invoke_mac_claim([*words, "--pid", str(os.getpid()), *identity],
                                         self.environment, self.root)
 
         new_test = claim("claim", "--what", "nextest other", "--worktree", str(self.root))

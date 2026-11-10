@@ -2126,7 +2126,10 @@ try_mac_test() {
         if [[ "$reserved_target" != "$selected_target" || "$reserved_settings" != "$1" ]]; then
             return 0
         fi
-        runner_args+=(--claim-owner-pid $$)
+        local claim_id episode attempt claim_session
+        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
+        runner_args+=(--claim-owner-pid $$ --claim-id "$claim_id" --episode "$episode" --attempt "$attempt"
+            --claim-session "$claim_session")
     fi
     if declare -F release_token >/dev/null; then release_token || return $?; fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
@@ -2609,8 +2612,13 @@ target_for_settings() {
 
 release_wait_claim() {
     [[ -n "${HOLD_WAIT_DIR:-}" ]] || return 0
-    "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ >/dev/null 2>&1 || true
-    rm -f "$HOLD_WAIT_DIR/ssh-reservation"
+    local claim_id="" episode="" attempt="" claim_session=""
+    if [[ -s "$HOLD_WAIT_DIR/ssh-reservation.identity" ]]; then
+        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
+        "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ --claim-id "$claim_id" \
+            --episode "$episode" --attempt "$attempt" --session "$claim_session" >/dev/null 2>&1 || true
+    fi
+    rm -f "$HOLD_WAIT_DIR/ssh-reservation" "$HOLD_WAIT_DIR/ssh-reservation.identity"
 }
 
 ssh_reserve_hook() {
@@ -2634,7 +2642,8 @@ ssh_reserve_hook() {
     local remote_kind
     remote_kind=$(remote_step_kind)
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
-        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
+        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" \
+        --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity" --target "$name"
     if [[ "${3:-}" == 0 ]]; then printf '%s ' --new-step; fi
     if [[ "$(target_platform "$name")" == macos ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
 }

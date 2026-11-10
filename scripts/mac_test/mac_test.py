@@ -23,12 +23,14 @@ import sys
 import tempfile
 import time
 import threading
+import uuid
 from typing import TYPE_CHECKING, Literal, TypeGuard, cast
 from urllib.parse import quote
 
 
 from scripts.build_hold import override_guard
 from scripts.mac_test import offload
+from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import (
     CiSwitch as CiSwitch,
     NoMacBlock as NoMacBlock,
@@ -90,6 +92,7 @@ from scripts.buildlog import sync as buildlog_sync
 
 if TYPE_CHECKING:
     from scripts.build_hold import build_hold
+    from scripts.build_queue.placement import SubmittingSession
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -312,6 +315,11 @@ class CliArguments(argparse.Namespace):
         self.from_pid: int = 0
         self.package: str = ""
         self.verb: offload.MacVerb = "nextest"
+        self.claim_id: str = ""
+        self.episode: str = ""
+        self.attempt: str = ""
+        self.identity: bool = False
+        self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
 
 
 def config_path(target: str = "") -> Path:
@@ -486,12 +494,10 @@ def read_claim_block(paths: StatePaths) -> MacBlockState:
     return read_block(paths.block)
 
 
-def blocking_claim_block(paths: StatePaths) -> MacBlockState:
+def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBlockState:
     """Return the block that prevents this session from starting new work."""
-    from scripts.build_hold import build_hold
-
     block = read_claim_block(paths)
-    if isinstance(block, NoMacBlock) or block_belongs_to(block, build_hold.owning_session()):
+    if isinstance(block, NoMacBlock) or block_belongs_to(block, session):
         return NO_MAC_BLOCK
     return block
 
@@ -1689,19 +1695,29 @@ def requested_showrunner(name: str) -> Showrunner:
     return NamedShowrunner(name) if name else NO_SHOWRUNNER
 
 
-def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim) -> ClaimAttempt:
+def print_claim_identity(args: CliArguments, record: RunRecord) -> None:
+    if args.identity:
+        identity = claim_state.claim_identity(record)
+        print("claim_identity=" + json.dumps({"claim_id": identity.claim_id,
+              "episode": identity.episode, "attempt": identity.attempt}))
+
+
+def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
+                         *, session: SubmittingSession) -> ClaimAttempt:
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
         return ClaimFinished(1)
     kept["pid"] = args.pid
     kept["proc_start"] = proc_start.start
+    kept["submitting_session"] = claim_state.session_id(session)
     kept["cleanup_pending"] = True
     if args.copy:
         kept["copy"] = True
     else:
         _ = kept.pop("copy", None)
     write_json(claim.path, kept)
+    print_claim_identity(args, kept)
     print(f"leftovers: {kept['remote_host']}")
     if "slot" in kept:
         print(f"slot: {kept['slot']}")
@@ -1717,7 +1733,7 @@ def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
 
 
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
-               *, reserve_wait: bool = False) -> ClaimAttempt:
+               *, session: SubmittingSession, reserve_wait: bool = False) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
     from scripts.build_hold import build_hold
 
@@ -1727,16 +1743,19 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         print(f"state unreadable: {error.path}")
         return ClaimFinished(12)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
+    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     try:
-        block = blocking_claim_block(paths)
+        block = blocking_claim_block(paths, session)
     except (OSError, StateReadError):
         print(f"state unreadable: {paths.block}")
         return ClaimFinished(12)
     for claim in overlapping:
         record = claim.record
         if ("remote_host" in record and record.get("cleanup_pending")
-                and record["pid"] == args.pid and not run_is_kept(record)
+                and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
+                and not run_is_kept(record)
                 and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
+            print_claim_identity(args, record)
             print(f"leftovers: {record['remote_host']}")
             if "slot" in record:
                 print(f"slot: {record['slot']}")
@@ -1752,9 +1771,11 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             return ClaimFinished(12)
         for claim in overlapping:
             if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
+                    and claim_state.claim_identity(claim.record) == identity
                     and not run_is_kept(claim.record) and "slot" in claim.record
                     and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
                     and isinstance(block, NoMacBlock)):
+                print_claim_identity(args, claim.record)
                 print(f"claimed\nslot: {claim.record['slot']}")
                 return ClaimFinished(0)
         for slot in slots:
@@ -1777,10 +1798,10 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         for claim in overlapping:
             record = claim.record
             if scopes_overlap(claim.scope, scope) and run_is_kept(record):
-                return take_over_kept_claim(args, claim, record)
+                return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
-    owner = build_hold.owning_session()
+    owner = session
     if overlapping:
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
@@ -1791,6 +1812,10 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
         return ClaimFinished(1)
     claimed: RunRecord = {
+        "claim_id": args.claim_id or uuid.uuid4().hex,
+        "episode": args.episode or uuid.uuid4().hex,
+        "attempt": args.attempt or uuid.uuid4().hex,
+        "submitting_session": claim_state.session_id(session),
         "pid": args.pid,
         "proc_start": proc_start.start,
         "what": args.what,
@@ -1813,6 +1838,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
+    print_claim_identity(args, claimed)
     if isinstance(scope, RepositoryScope) and scope.slot:
         remember_slot(paths, scope, claimed)
     print("claimed")
@@ -1839,7 +1865,8 @@ def stop_copy(holder: RunRecord) -> None:
         pass
 
 
-def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> ClaimAttempt:
+def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
+                     *, session: SubmittingSession) -> ClaimAttempt:
     """Transfer a live reservation under the target lock without releasing capacity."""
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
@@ -1847,6 +1874,9 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     claims = read_claims(paths)
     owners = [claim for claim in claims if scopes_overlap(claim.scope, scope)
               and claim.record["pid"] == args.from_pid
+              and claim_state.claim_identity(claim.record) == claim_state.ClaimIdentity(
+                  args.claim_id, args.episode, args.attempt)
+              and claim.record["submitting_session"] == claim_state.session_id(session)
               and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
               and process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])
               and (claim.record["worktree"] == args.worktree or claim.record.get("cleanup_pending"))]
@@ -1860,7 +1890,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     # Retained remote work keeps its cleanup path.
     if "remote_host" not in claim.record:
         try:
-            block = blocking_claim_block(paths)
+            block = blocking_claim_block(paths, session)
         except (OSError, StateReadError):
             print(f"state unreadable: {paths.block}")
             return ClaimFinished(12)
@@ -1875,6 +1905,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     record["pid"] = args.pid
     record["proc_start"] = start.start
     write_json(claim.path, record)
+    print_claim_identity(args, record)
     if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
         remember_slot(paths, claim.scope, record)
         print(f"slot: {claim.scope.slot}")
@@ -1885,7 +1916,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -
     return ClaimFinished(0)
 
 
-def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "") -> int:
+def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
+                       session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
     """Reserve a slot for a live local wait without starting remote work."""
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = offload.read_config(settings)
@@ -1894,18 +1926,20 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "")
         return 1
     args.worktree = args.repo_root
     args.what = f"{args.verb} {args.package or 'workspace'}"
-    return command_claim(args, paths, watch_claim=False)
+    return command_claim(args, paths, watch_claim=False, session=session)
 
 
-def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True) -> int:
+def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True,
+                  session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
+    session = claim_state.submitting_session(session)
     scope = target_claim_scope(paths, args.worktree)
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
     while True:
         with locked(paths.lock):
-            attempt = (adopt_wait_claim(args, paths, scope) if args.from_pid
-                       else claim_once(args, paths, scope, reserve_wait=not watch_claim))
+            attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
+                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim))
         if isinstance(attempt, ClaimFinished):
             if watch_claim and attempt.status in (0, 13):
                 start_claim_watcher(paths)
@@ -1949,7 +1983,9 @@ def command_release(args: CliArguments, paths: StatePaths) -> int:
                 record = read_run(path)
             except StateReadError:
                 continue
-            if isinstance(record, dict) and record["pid"] == args.pid:
+            if (isinstance(record, dict) and record["pid"] == args.pid
+                    and claim_state.claim_identity(record) == claim_state.ClaimIdentity(
+                        args.claim_id, args.episode, args.attempt)):
                 transfers = record.get("transfers", [])
                 if transfers:
                     print("copy_bytes=" + json.dumps(transfers))
@@ -1962,6 +1998,7 @@ def command_release(args: CliArguments, paths: StatePaths) -> int:
 
 def free_now(
     paths: StatePaths, settings: Path | offload.DefaultMacSettings, repo_root: Path, copy: bool = False,
+    *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -1980,9 +2017,10 @@ def free_now(
                else offload.read_backoff(time.time(), paths.target))
     if isinstance(backoff, offload.ActiveBackoff):
         return "backoff"
+    session = claim_state.submitting_session(session)
     scope = target_claim_scope(paths, str(repo_root))
     try:
-        block = blocking_claim_block(paths)
+        block = blocking_claim_block(paths, session)
         if not isinstance(block, NoMacBlock):
             return "blocked"
         claims = read_claims(paths)
@@ -2016,7 +2054,7 @@ def command_free_now(args: CliArguments, paths: StatePaths) -> int:
     settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
     if not args.settings and args.target:
         settings = config_path(args.target)
-    answer = free_now(paths, settings, Path(args.repo_root), args.copy)
+    answer = free_now(paths, settings, Path(args.repo_root), args.copy, session=args.session)
     print(answer)
     return 0 if answer == "free" else 1
 
@@ -2373,6 +2411,11 @@ def parser() -> argparse.ArgumentParser:
 
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
+    for command in (claim, wait_claim, release):
+        for field in ("claim-id", "episode", "attempt"):
+            _ = command.add_argument("--" + field, required=command is release, default="")
+    for command in (claim, wait_claim):
+        _ = command.add_argument("--identity", action="store_true")
 
     block = commands.add_parser("block")
     _ = block.add_argument("--holder", required=True)
@@ -2391,6 +2434,14 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")
     _ = commands.add_parser("watch-claim")
+
+    def parsed_session(value: str) -> SubmittingSession:
+        from scripts.build_hold import build_hold
+
+        return build_hold.OwningSession(value) if value else build_hold.NoOwningSession()
+
+    for command in (claim, wait_claim, free):
+        _ = command.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
     for command in commands.choices.values():
         _ = command.add_argument("--target", default=argparse.SUPPRESS)
     return root
@@ -2412,9 +2463,9 @@ def main() -> int:
 
 def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "claim":
-        return command_claim(args, paths)
+        return command_claim(args, paths, session=args.session)
     if args.command == "claim-wait":
-        return command_claim_wait(args, paths)
+        return command_claim_wait(args, paths, session=args.session)
     if args.command == "release":
         return command_release(args, paths)
     if args.command == "free-now":

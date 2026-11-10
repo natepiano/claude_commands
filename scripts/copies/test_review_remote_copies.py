@@ -34,9 +34,10 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import offload
-from scripts.mac_test import mac_test
+from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
+from scripts.build_hold.build_hold import NoOwningSession
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
 
@@ -196,6 +197,8 @@ class RemoteEntryTests(unittest.TestCase):
             self.fail("The test process has no start identity")
         paths.claims.mkdir(parents=True)
         _ = (paths.claims / "repository.json").write_text(json.dumps({
+            "claim_id": "live-copy-claim", "episode": "copy-episode", "attempt": "copy-attempt",
+            "submitting_session": "",
             "pid": os.getpid(), "proc_start": start.start, "what": "tests", "worktree": str(self.source),
             "since": "2026-11-05T12:00:00+00:00", "repo_name": "repository", "repo_key": "",
         }))
@@ -660,13 +663,20 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             with redirect_stdout(output):
                 status = mac_test.command_claim(args, mac_test.state_paths(args.target))
             attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, output.getvalue(), ""))
+            if status in (0, 13):
+                controller.claim_identity = claim_state.reply_claim_identity(output.getvalue())
 
         def release(current: offload.ProcessController, name: str) -> None:
             self.assertIs(current, controller)
+            identity = current.claim_identity
+            if isinstance(identity, claim_state.NoClaimIdentity):
+                return
             args = mac_test.CliArguments()
             args.pid = os.getpid()
             args.target = name
+            args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
             _ = mac_test.command_release(args, mac_test.state_paths(name))
+            current.claim_identity = claim_state.NO_CLAIM_IDENTITY
 
         def stream(arguments: Sequence[str]) -> offload.ReportedMacStatus:
             self.assertIn("mirror-use", arguments[-1])
@@ -807,9 +817,11 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             paths = mac_test.state_paths("linux")
             scope = mac_test.RepositoryScope("repository", "key")
             with mac_test.locked(paths.lock), redirect_stdout(io.StringIO()):
-                first = mac_test.claim_once(args, paths, scope, reserve_wait=True)
+                first = mac_test.claim_once(args, paths, scope, session=NoOwningSession(), reserve_wait=True)
             self.assertEqual(first, mac_test.ClaimFinished(0))
-            request = replace(request, admission=offload.MacClaimFromWait(os.getpid()))
+            reservation, = mac_test.read_claims(paths)
+            request = replace(request, admission=offload.MacClaimFromWait(
+                os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))
             result = offload.claim_for_run(controller, config, request, offload.KnownRepository("repository"), (2,))
             self.assertIsInstance(result, offload.MacClaimNotConfirmed)
             claims = mac_test.read_claims(paths)
