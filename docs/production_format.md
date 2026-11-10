@@ -140,6 +140,8 @@ Refill refuses a configuration with a missing owner.
 | `<unit staff name>` | names, values, types, modules | 1 |
 
 `Open tickets` sets how many tickets the unit can have assigned at once; an empty value means 1.
+A row whose unit reads `<name> (retired <date>)` makes no assignment and claims no family.
+A table with only retired rows has no assignments and no owner check.
 Each ticket gets its own Codex worker through `assign.sh`.
 The Families table in `docs/style_production.md` sets work order, not ownership.
 Apply each rule exception the same way in every crate, for any unit count.

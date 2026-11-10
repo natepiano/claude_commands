@@ -60,6 +60,8 @@ The columns are `Unit`, `Families` and `Open tickets`.
 The unit is a staff name. `Families` lists its owned families, separated by commas.
 Each family needs exactly one owner; refill refuses a missing owner.
 `Open tickets` is the number assigned at once, default 1.
+A row whose unit reads `<name> (retired <date>)` makes no assignment and claims no family.
+A table with only retired rows returns no assignments and has no owner check.
 Each ticket gets its own Codex worker through `assign.sh`.
 The Families table in `docs/style_production.md` sets work order, not owners.
 Apply an exception the same way in every crate, for any unit count.

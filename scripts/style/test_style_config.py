@@ -71,6 +71,15 @@ class StyleConfigTests(unittest.TestCase):
             ("one unit", f"| cargo-liner-style | {all_families} | |", AcceptedConfig(combined)),
             ("four units", "\n".join(f"| {row.unit} | {row.families[0]} | {row.open_tickets} |" for row in four),
              AcceptedConfig(four)),
+            ("all units retired", "\n".join(
+                f"| sample-{family} (retired 2026-11-09) | {family} | 0 |"
+                for family in ("names", "values", "types", "modules")), AcceptedConfig(())),
+            ("retired row beside live rows",
+             f"| sample-style | {all_families} | 1 |\n| old-style (retired 2026-11-09) | names | 0 |",
+             AcceptedConfig((StyleUnitAssignment("sample-style", ("names", "values", "types", "modules")),))),
+            ("retired row hides no gap",
+             "| sample-style | names, values, types | 1 |\n| old-style (retired 2026-11-09) | modules | 0 |",
+             RefusedConfig("modules: no style owner")),
             ("missing family", "| cargo | names, values, types | 1 |", RefusedConfig("modules: no style owner")),
             ("two owners", f"| cargo | {all_families} | 1 |\n| other | names | 1 |",
              RefusedConfig("names: two style owners: cargo, other")),
