@@ -2491,3 +2491,20 @@ Three test-support files load their heavy imports at the function that uses them
 **Gotchas:** Dataclass creation is about two thirds of test-module import CPU, so a cut is worth the classes it skips. `-X importtime` names only the first loader of a module; use paired CPU scans to rank a cut.
 
 **Ruled out:** a dataclass code cache in the module runner, because it replaces a private stdlib name; a delayed `pane_record` import in `staff_test_support.py`, because its isolation patches `RECORD_DIR` only when that module is already loaded.
+
+### Phase 125 — Message sends and test modules start faster because roster, pane records and unit lookup load the herdr client only when they call it  · status: done
+
+#### As-built
+
+New `scripts/herdr/herdr_types.py` holds the one definition of `HerdrFailure`, `HerdrMissing` and `NATIVE_ID_MARKS`; `herdr.py` re-exports the same objects. `roster.py`, `pane_record.py` and `unit_lookup.py` take `HerdrPlace` from `place.py`, keep annotation-only names under `TYPE_CHECKING`, and import `herdr` in each function that calls the client. Importing any of the three loads no `scripts.herdr.herdr`. A paired import scan of 745 gate test modules found 201 modules that load less, and the classes built fell from 322,685 to 304,696. Those modules saved 8.3 and 5.8 CPU s, about 7 CPU s per gate. A roster read, which each `send.py` roster lookup pays, saved 31-41 ms of a 258-302 ms median at host load above 40.
+
+**Files:**
+- `scripts/herdr/herdr_types.py` — new; failure types and native ID marks
+- `scripts/herdr/herdr.py` — re-exports the moved names
+- `scripts/message/roster.py`, `scripts/agents/pane_record.py`, `scripts/production/unit_lookup.py` — delayed `herdr` imports
+- `scripts/herdr/test_herdr.py`, `scripts/production/unit_status_test_support.py` — isolated-copy lists add `herdr_types.py`
+- `scripts/production/test_unit_lookup.py` — reads `unit_lookup.HerdrPlace`
+
+**Gotchas:** A test that copies `herdr.py` to an isolated folder must also copy `herdr_types.py`. `send.py` loads `roster` lazily, so its bare start does not change. The `-X importtime` self cost overstated the gain by about half, because other paths still load part of the same closure.
+
+**Ruled out:** a split of `admission_records.py` now, because alone it is under the bar and the queue unit has phases there; it is in the next items.

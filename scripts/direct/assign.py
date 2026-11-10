@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Literal, NoReturn, cast, final, overload
 
 from scripts.astra import astra_roles
+from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily
@@ -616,7 +617,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
             try:
                 thread = client.native_session(current.pane, "codex", max(0, deadline - time.monotonic()))
                 break
-            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                 if time.monotonic() >= deadline:
                     raise
                 _ = threading.Event().wait(max(0, min(0.1, deadline - time.monotonic())))
@@ -629,7 +630,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
     except side_pane.SidePaneRefused as error:
         print(str(error), file=sys.stderr)
         result = worker_panes.ExitCode.REFUSED
-    except (herdr.HerdrFailure, conf.Unusable, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (herdr_types.HerdrFailure, conf.Unusable, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"assign.sh: consultation unavailable: {error}", file=sys.stderr)
         result = worker_panes.ExitCode.UNCERTAIN
     finally:
@@ -640,7 +641,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
                     print(f"assign.sh: consultation close unproved: {closed.reason}; "
                           + f"pane {opened.pane} ({args.new_worker}) stays open", file=sys.stderr)
                     result = 1
-            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"assign.sh: consultation close failed: {error}", file=sys.stderr)
                 result = 1
     return result

@@ -40,6 +40,7 @@ SCRIPTS = REPOSITORY_ROOT / "scripts"
 _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 
 from scripts.whoami import account  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
@@ -1682,7 +1683,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
         if name.startswith("SHOWRUNNER_"):
             _ = environment.pop(name, None)
     if probe:
-        from scripts.herdr.herdr import NATIVE_ID_MARKS
+        from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 
         environment[PROBE_ENV] = "1"
         for name in NATIVE_ID_MARKS:
@@ -2867,8 +2868,6 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
     """Resume workers on the destination in their existing conversations."""
     from scripts.production import staff, session_staff
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
-    from scripts.herdr import herdr
-
     target = note_file.canonical_label(target)
     if _label_is(target, "codex"):
         _ = _codex_move_target(target)
@@ -2901,7 +2900,7 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             reason = restart_refusal(row.id) if row.current_session else ""
             results.append(SessionMoveRefused(row.id, reason) if reason else
                            pane_moves.move_worker(row, record, target, why, run))
-        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
             results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
     outcomes = tuple(results)
     stdout, stderr, code = _move_output(outcomes, ())
@@ -4808,7 +4807,7 @@ def _local_codex_processes() -> dict[str, CodexRoleProcess]:
 
     try:
         agents = herdr.Herdr(herdr.shared_session()).agents()
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         agents = []
     activities: dict[str, Literal["busy", "idle"]] = {
         agent["agent_session"].session_id: "busy" if agent["agent_status"] == herdr.AgentStatus.WORKING else "idle"
