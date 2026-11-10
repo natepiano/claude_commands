@@ -49,6 +49,8 @@ if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
     from scripts.production import staff
 
+# Checksums skip equal files. Changed files get the receiver write time.
+RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 GATE_RECORD = ".gate.json"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -1717,7 +1719,7 @@ def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: li
     receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
     # Keep the existing command order while metadata removal keeps the record last.
     exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
-    return ["rsync", "-rlptc", "--compress", "--delete", f"--rsync-path={receiver}",
+    return ["rsync", RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", "--delete", f"--rsync-path={receiver}",
             *(f"--exclude=/{name}" for name in exclusions),
             f"--exclude-from={excludes}", "-e", shlex.join(["ssh", *options]),
             f"{source}/", f"{mirror.host}:{shlex.quote(mirror.path)}/"]
