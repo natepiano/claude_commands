@@ -250,12 +250,15 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
     row = record.by_id(reference)
     if row is not None:
         owner = record.parent_of(row) if row.kind == "worker" else row
-        if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
-            from scripts.production.production_doc import read_production
-            return read_production(owner).checkout
-        tree = RowResolver(record).unit_worktree(row)
-        if isinstance(tree, PresentWorktree):
-            return tree.path
+        if owner is not None:
+            if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
+                from scripts.production.production_doc import read_production
+                return read_production(owner).checkout
+            tree = RowResolver(record).unit_worktree(row)
+            if isinstance(tree, PresentWorktree):
+                return tree.path
+            if row.kind == "worker" and isinstance(tree, RemovedWorktree):
+                return Path.cwd()
     report_anomaly(f"{reference}: staff worktree is unavailable")
     return Path.cwd()
 
