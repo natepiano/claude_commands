@@ -88,10 +88,11 @@ class AwsCli:
         self.timeout_s = timeout_s
         self.execute = execute
 
-    def call(self, operation: str, *arguments: str, service: str = 'ec2') -> dict[str, object]:
+    def call(self, operation: str, *arguments: str, service: str = 'ec2',
+             timeout_s: float | None = None) -> dict[str, object]:
         result = self.execute(['aws', '--profile', self.profile, '--region', self.region,
                                service, operation, *arguments, '--output', 'json'], capture_output=True, text=True,
-                              timeout=self.timeout_s, check=False)
+                              timeout=self.timeout_s if timeout_s is None else timeout_s, check=False)
         if result.returncode:
             raise AwsUnavailable(result.stderr.strip() or f'{operation}: failed')
         if not result.stdout.strip() or service == 'cloudformation' and operation == 'deploy':
