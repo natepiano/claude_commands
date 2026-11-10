@@ -1349,22 +1349,21 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(note_file, "read_notes", return_value=[])):
             agent_notes.main()
         self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusalTimeUnknown())
-        self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedCommandUnknown())
+        self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedWorkerUnknown())
 
-    def test_blocked_cli_converts_stopped_worker_command_at_the_argument_boundary(self) -> None:
-        command = "worker.py assign impl 'finish the patch'"
+    def test_blocked_cli_converts_stopped_worker_at_the_argument_boundary(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
-                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl", command]),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl"]),
               patch.object(agent_notes, "blocked", return_value=[]) as blocked,
               patch.object(note_file, "read_notes", return_value=[])):
             agent_notes.main()
         blocked.assert_called_once()
         self.assertEqual(blocked.call_args.kwargs["stopped"],
-                         quota_alert.StoppedWorkerCommand("own-director", "impl", command))
+                         quota_alert.StoppedWorker("own-director", "impl"))
 
     def test_blocked_cli_rejects_incomplete_stopped_context_before_reporting(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
-                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl"]),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director"]),
               patch.object(agent_notes, "blocked") as blocked,
               redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited):
             agent_notes.main()

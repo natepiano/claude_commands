@@ -9,7 +9,6 @@ except FileNotFoundError:
 import hashlib
 import io
 import json
-import shlex
 import subprocess
 import sys
 from contextlib import redirect_stderr
@@ -389,8 +388,7 @@ def report_quota_refusals() -> list[str]:
         if not isinstance(refusal, refusal_watch.TranscriptRefusal):
             continue
         try:
-            stopped = quota_alert.StoppedWorkerCommand(str(parent.current_session), row.name,
-                                                       shlex.join(active.launcher_command))
+            stopped = quota_alert.StoppedWorker(str(parent.current_session), row.name)
             lines += quota_alert.blocked(list(note_file.read_notes()), agent_accounts.codex_account(backend.codex_home),
                                          window=refusal.window, refused_at=refusal.refused_at, stopped=stopped)
             progress_history.record_quota_refusal(recorded.directory, active.instance_id, refusal.entry_id)

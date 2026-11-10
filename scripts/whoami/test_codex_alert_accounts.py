@@ -732,30 +732,38 @@ always=director
         self.assertEqual(agent_accounts.workers_home(), soon.home)
         self.assertIn("direct=codex", registry_view())
 
-    def test_each_exited_refusal_tells_only_its_director_even_with_an_open_fallback(self) -> None:
+    def test_each_stopped_worker_refusal_tells_only_its_director_even_with_an_open_fallback(self) -> None:
         source = self.account(1)
         readings = self.readings(source, self.report(source, 0))
         note = self.note(1, "active", 0)
-        commands = (("director-a", "impl", "worker.py assign impl 'first task'"),
-                    ("director-b", "test", "worker.py assign test 'second task'"))
-        with patch.object(quota_alert, "relay", return_value=None) as relay:
-            for director, worker, command in commands:
+        workers = (("director-a", "impl"), ("director-b", "test"))
+        with (patch.object(quota_alert, "relay", return_value=None) as relay,
+              patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST)):
+            for director, worker in workers:
                 log = quota_alert.blocked([note], source, self.now, codex_readings=readings,
-                    stopped=quota_alert.StoppedWorkerCommand(director, worker, command))
-                self.assertTrue(any(f"quota rerun {worker} -> {director}: sent" in line for line in log))
+                    stopped=quota_alert.StoppedWorker(director, worker))
+                self.assertIn(f"quota relay {worker} -> {director}: sent", log)
                 with quota_alert.state_file() as state:
                     self.assertIsInstance(state["fallback"], quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(relay.call_count, 2)
-            for call, (director, worker, command) in zip(relay.call_args_list, commands):
+            for call, (director, worker) in zip(relay.call_args_list, workers):
                 recipient, text, key = cast(tuple[str, str, str | None], call.args)
                 self.assertEqual(recipient, f"session:{director}")
-                self.assertIn(worker, text)
-                self.assertIn(command, text)
-                self.assertIn("Rerun this command on Claude", text)
+                self.assertEqual(text, quota_alert.stopped_worker_relay(worker, quota_alert.NO_WORKER_MODE_STARTED))
                 self.assertIsNone(key)
             _ = quota_alert.blocked([note], source, self.now, codex_readings=readings,
-                                    stopped=quota_alert.StoppedCommandUnknown())
+                                    stopped=quota_alert.StoppedWorkerUnknown())
             self.assertEqual(relay.call_count, 2)
+
+    def test_stopped_worker_relay_names_each_outcome(self) -> None:
+        cases = ((quota_alert.WorkersMoved("codex2"), "Workers moved to codex2, and the move resumes the pass. "),
+                 (quota_alert.WorkersWaitForReset("14:05"), "Workers wait for the reset at 14:05. "),
+                 (quota_alert.NO_WORKER_MODE_STARTED, "No-worker mode started. "),
+                 (quota_alert.REFUSAL_OUTCOME_UNKNOWN, ""))
+        for outcome, sentence in cases:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(quota_alert.stopped_worker_relay("impl", outcome),
+                    f"Codex refused worker impl for quota. Its pass stays open. {sentence}Do not rerun its assign command.")
 
     def account(self, number: int, *, default: bool = False) -> agent_accounts.KnownCodexAccount:
         home = self.root / (".codex" if default else f".codex{number}")
@@ -928,8 +936,10 @@ always=director
         with (patch.object(quota_alert, "switch_to_claude") as fallback,
               patch.object(accounts, "swap", wraps=accounts.swap) as swap):
             log = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
-                codex_readings=readings, window=refusals.KnownWindow("weekly"))
+                codex_readings=readings, window=refusals.KnownWindow("weekly"),
+                stopped=quota_alert.StoppedWorker("director-a", "impl"))
         fallback.assert_not_called()
+        self.assertEqual(self.relayed, [quota_alert.stopped_worker_relay("impl", quota_alert.WorkersMoved("codex2"))])
         swap.assert_called_once()
         self.assertEqual(swap.call_args.args[:2], ("workers", "codex2"))
         self.assertEqual(agent_accounts.workers_home(), target.home)
@@ -976,7 +986,10 @@ always=director
         log: list[str] = []
         for _attempt in range(2):
             log += quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
-                codex_readings=readings, window=refusals.KnownWindow("five_hour"))
+                codex_readings=readings, window=refusals.KnownWindow("five_hour"),
+                stopped=quota_alert.StoppedWorker("director-a", "impl"))
+        waits = quota_alert.stopped_worker_relay("impl", quota_alert.WorkersWaitForReset(quota_alert.reset_display(refusals.KnownReset(reset))))
+        self.assertEqual(self.relayed, [waits, waits])
         self.assertEqual(agent_accounts.workers_home(), old.home)
         self.assertIn("direct=codex", registry_view())
         self.assertEqual(sum(text.startswith("workers wait for codex1's 5-hour reset at ")
