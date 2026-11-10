@@ -105,6 +105,8 @@ def sync_productions(repo: Path) -> tuple[ConfiguredStyleProduction, ...]:
         if not style_config.has_style_units(lines):
             continue
         config = style_config.read_config(row.doc.path)
+        if isinstance(config.route, style_config.ParentUnitRoute) and not config.assignments:
+            continue
         productions.append(ConfiguredStyleProduction(row.name, config))
     return tuple(productions)
 

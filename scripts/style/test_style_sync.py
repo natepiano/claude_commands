@@ -689,23 +689,43 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
 
     def test_no_style_production_and_another_branch_point_are_silent(self) -> None:
-        self.assertEqual(self.notice(), (0, ""))
+        for retired in (False, True):
+            with self.subTest(retired=retired):
+                if retired:
+                    doc = self.repo / "retired-production.md"
+                    _ = doc.write_text(
+                        f"# Production\n- **Kind:** product\n- **Merge branch:** main\n"
+                        + f"- **Showrunner checkout:** {self.repo}\n")
+                    write_style_units(doc, (StyleUnitAssignment(
+                        "sample (retired 2026-11-09)", ("names", "values", "types", "modules"), 0),))
+                    _ = recorded_showrunner("sample-parent", doc)
+                with mock.patch.object(style_sync, "_waiting_directors",
+                                       side_effect=AssertionError("no roster read")) as roster:
+                    self.assertIsInstance(style_sync.direct_route(self.repo), style_sync.NoDirectRoute)
+                    self.assertEqual(self.notice(), (0, ""))
+                roster.assert_not_called()
         self.production("init/catalyst")
         self.assertEqual(self.notice(), (0, ""))
         self.assertFalse((self.root / "sent.json").exists())
 
     def test_found_production_sends_the_keyed_sync_message_to_its_current_address(self) -> None:
         self.production()
-        with mock.patch("scripts.style.style_sync.subprocess.run", wraps=subprocess.run) as calls:
-            self.assertEqual(self.notice(), (0, ""))
-        call = cast(RecordedCall, json.loads((self.root / "sent.json").read_text()))
-        arguments = call["arguments"]
-        self.assertEqual(arguments, [
-            "--to", "session:fake-style", "--from", "style_sync", "--text",
-            f"From style_sync: branch point main moved to {self.tip[:7]}; sync.",
-            "--key", "style-sync:sample-style", "--timeout", "10",
-        ])
-        self.assertLess(int(arguments[-1]), cast(int, calls.call_args_list[-1].kwargs["timeout"]))
+        for retired in (False, True):
+            with self.subTest(retired=retired):
+                if retired:
+                    write_style_units(self.doc, (StyleUnitAssignment(
+                        "sample (retired 2026-11-09)", ("names", "values", "types", "modules"), 0),))
+                (self.root / "sent.json").unlink(missing_ok=True)
+                with mock.patch("scripts.style.style_sync.subprocess.run", wraps=subprocess.run) as calls:
+                    self.assertEqual(self.notice(), (0, ""))
+                call = cast(RecordedCall, json.loads((self.root / "sent.json").read_text()))
+                arguments = call["arguments"]
+                self.assertEqual(arguments, [
+                    "--to", "session:fake-style", "--from", "style_sync", "--text",
+                    f"From style_sync: branch point main moved to {self.tip[:7]}; sync.",
+                    "--key", "style-sync:sample-style", "--timeout", "10",
+                ])
+                self.assertLess(int(arguments[-1]), cast(int, calls.call_args_list[-1].kwargs["timeout"]))
 
     def test_linked_worktree_notification_finds_the_same_production(self) -> None:
         self.production()
