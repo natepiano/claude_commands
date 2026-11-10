@@ -2476,3 +2476,29 @@ A changed shell script now selects the tests of every script that calls it, dire
 **Gotchas:** `~/.claude/scripts/lib/py -m` imports main's code from a worktree; run local tests with the worktree's `scripts/lib/py`.
 
 **Ruled out:** Python files as callers (a `board.sh` change would select 521-575 modules). A changed Python file that a shell script runs still selects only its importers and the tests that name it.
+
+### Phase 124 — Test modules start faster because three test-support files load their heavy imports only when used  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** About 30 CPU s less import work per merge gate, with no production code change.
+
+**Spec:**
+1. `scripts/lint/memory_test_support.py`: import `read_memory_config` inside `admission_configuration_fixture()`. Keep `AdmissionPolicy` and `MemoryConfig` under `TYPE_CHECKING`.
+2. `scripts/build_queue/queue_fixture.py`: import `roster` and `UnitLabels` inside `QueueFixture.__init__`, and `head_facts` and `queue_view` inside `model()`. Keep `queue_view` and `UnitLabels` under `TYPE_CHECKING` for annotations.
+3. `scripts/build_queue/admission_test_support.py`: import `step_estimator` inside `history()`.
+4. Use the phase 117 form: the import is the first statement of the function that uses it.
+5. Do not change `scripts/production/staff_test_support.py`. Its isolation patches `pane_record.RECORD_DIR` only when the module is already loaded.
+
+**Files:**
+- `scripts/lint/memory_test_support.py`
+- `scripts/build_queue/queue_fixture.py`
+- `scripts/build_queue/admission_test_support.py`
+
+**Workers:** No-worker mode (Codex quota is 0%). The director writes the three edits.
+
+**Acceptance gate:**
+1. The build_queue, lint and verify tests that import the three files pass.
+2. basedpyright reports zero errors and zero warnings on the three files.
+3. A paired import scan of all gate test modules, phase base against the change, shows about 30 CPU s less per gate.
