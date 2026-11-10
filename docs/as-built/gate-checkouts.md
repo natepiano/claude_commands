@@ -123,9 +123,13 @@ The standing folder retains only `target/`, `.gate.json`, and `.claude-busy` aft
 The code does not remove legacy checkout files.
 
 The cache's `.gate.json` stores each tracked path's blob identity and modification time in nanoseconds.
-After preparation, a path with the same blob identity receives its saved time.
+After preparation, one `git grep` finds tracked files that name `CARGO_MANIFEST_DIR`.
+These files retain their new checkout times, including when their blob identities stay unchanged.
+Cargo rebuilds their crates and the dependents instead of reusing compiled output that holds a removed checkout path.
+Every other path with the same blob identity receives its saved time.
 A changed blob retains its new checkout time.
-This preserves unchanged source times across temporary checkouts.
+Unchanged crates without these files can reuse their cached build output.
+This rule does not cover a dependency macro that reads `CARGO_MANIFEST_DIR` at expansion in a caller without that text.
 Cargo gates refresh source remotes and both gate records after use.
 
 `scratch.mark_cargo_cache` marks and refreshes the standing cache's `target/`.

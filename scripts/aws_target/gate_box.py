@@ -46,7 +46,7 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
 
 
 # This program runs inside the instance's tool shell, not on natedev.
-GUEST = r'''import contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
+GUEST = r'''import concurrent.futures, contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
 os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
@@ -85,9 +85,14 @@ memory_thread = None
 cpu_started = None
 try:
     result['tools'] = {}
-    for name in ('git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv', 'sqlite3'):
+    def tool_version(name):
         version = subprocess.run([name, '--version'], capture_output=True, text=True)
-        result['tools'][name] = (version.stdout or version.stderr).strip()
+        return (version.stdout or version.stderr).strip()
+    names = ('git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv', 'sqlite3')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(names)) as tools:
+        for name, version in zip(names, tools.map(tool_version, names)):
+            result['tools'][name] = version
+    stage('tools checked')
     result['tools']['python_sqlite'] = sqlite3.sqlite_version
     if links['step'] == 'start':
         result['tools_ready_at'] = time.time()
