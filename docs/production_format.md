@@ -128,6 +128,27 @@ The showrunner staff row gives its path. The row's `name` is the production name
 Read the current showrunner name from its staff row.
 Send to the address from `showrunners.py address <showrunner name>`.
 
+## Style units
+
+Include this table when the production controls style units.
+It can name one to four units. Each family has exactly one owner.
+One unit can own all four families. Unit names are staff names, not derived family ids.
+Refill refuses a configuration with a missing owner.
+
+| Unit | Families | Open tickets |
+| --- | --- | --- |
+| `<unit staff name>` | names, values, types, modules | 1 |
+
+`Open tickets` sets how many tickets the unit can have assigned at once; an empty value means 1.
+Each ticket gets its own Codex worker through `assign.sh`.
+The Families table in `docs/style_production.md` sets work order, not ownership.
+Apply each rule exception the same way in every crate, for any unit count.
+
+With `**Kind:** style`, units merge through the style showrunner and its style merge branch.
+Otherwise, units branch from the branch point and the parent merges each ticket as a normal unit checkpoint.
+The parent's merge branch is the branch point for the direct route.
+Direct units use `style_sync.py` for normal main merges; see `docs/style_production.md`.
+
 ## Hub files
 
 | File | Owner unit | Other units that touch it |
@@ -298,11 +319,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    dispatch (user, 2026-10-16), and when the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
-   Standing style units instead use
-   `git fetch origin <style merge branch> && git merge --ff-only origin/<style merge branch>`.
-   Refill waits for the previous ticket's merge, so no unmerged unit work remains
-   at phase start. Report a refused fast-forward to the style showrunner as an
-   error; never create a merge commit to work around it.
+   Standing style units use the configured sync route.
+   A pending sync stops new assignments while assigned workers finish.
+   Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrunner route or Direct route.
 6. **Start order.** The showrunner records a start-order wait as an owed action in its notes.
    Use `cargo-berth sequence` for merge order.
 7. **What a phase fixes** (user, 2026-09-28 and 2026-10-01). Reviews, design

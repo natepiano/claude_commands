@@ -19,6 +19,7 @@ from scripts.style import style_proposals
 from scripts.lib import berth_board
 from scripts.style import rules
 from scripts.style import style_ledger
+from scripts.style.style_config import StyleUnitAssignment
 
 from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 from scripts.production import staff
@@ -72,7 +73,9 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_names_skips_held_structure_and_preserves_unclassified_warning(self) -> None:
+    def test_combined_unit_skips_held_structure_and_preserves_unclassified_warning(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("modules", "names")),
+                          StyleUnitAssignment("types", ("types",)), StyleUnitAssignment("values", ("values",))))
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
         _ = self.rule("legacy", "")
@@ -82,7 +85,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((code, errors), (3, "unclassified: 1 rules — pull nate_style\n"))
         self.assertIn("waiting for structure: crates/alpha, crates/beta\n", output)
         self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names")), ())
-        # Releasing the product holds makes the original structure read eligible.
+        # The structure read becomes eligible after the product releases the files.
         self.assertEqual(self.run_next(), (0, "phase written: 1\n",
                                           "unclassified: 1 rules — pull nate_style\n"))
         ticket, = self.ledger().ticket_open(ticket_owner_id("names"))
@@ -101,7 +104,9 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], [str(next(row.id for row in staff.initial_snapshot().find(kind="unit") if row.name == "names"))])
 
-    def test_names_structure_wait_and_read_exclude_crates_outside_its_pilot_scope(self) -> None:
+    def test_combined_unit_structure_wait_and_read_exclude_crates_outside_its_pilot_scope(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("modules", "names")),
+                          StyleUnitAssignment("types", ("types",)), StyleUnitAssignment("values", ("values",))))
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
         self.sync()
@@ -131,13 +136,15 @@ class StylePlanTests(StylePlanFixture):
             code = style_plan.main(["next-phase", "--unit", "modules", "--plan", str(plan), "--repo", str(worktree)])
 
         self.assertEqual((code, output.getvalue()), (
-            3, "no available work: modules no available work, types no family unit, values no family unit, names none approved\n"
+            3, "no available work: modules no available work\n"
             + "waiting for sync\n"))
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], [str(next(row.id for row in staff.initial_snapshot().find(kind="unit") if row.name == "modules"))])
 
 
     def test_unheld_structure_read_starts_before_a_second_board_read(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("modules", "names")),
+                          StyleUnitAssignment("types", ("types",)), StyleUnitAssignment("values", ("values",))))
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
         self.sync()
@@ -145,9 +152,7 @@ class StylePlanTests(StylePlanFixture):
                                AssertionError("unnecessary second board read")]) as board:
             self.assertEqual(self.run_next(), (
                 0,
-                "structure stays with modules: global:rust/structure.md crates/alpha/src/lib.rs: no eligible structure ticket\n"
-                + "structure stays with modules: global:rust/structure.md crates/alpha/src/other.rs: no eligible structure ticket\n"
-                + "phase written: 1\n",
+                "phase written: 1\n",
                 "",
             ))
         self.assertEqual(board.call_count, 1)
@@ -175,13 +180,15 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_refill_drops_a_busy_edit_ticket_once_and_reads_unheld_structure(self) -> None:
-        _ = self.rule("structure", "tier: D\nfamily: modules\n")
-        read = self.rule("read")
+    def test_refill_drops_a_busy_structure_ticket_once_and_reads_unheld_structure(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("modules", "names")),
+                          StyleUnitAssignment("types", ("types",)), StyleUnitAssignment("values", ("values",))))
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        _ = self.rule("read")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
-                          list(self.sources[:2]), [read])
+        ledger.ticket_add("1", ticket_owner_id("names"), "structure", "modules", "crates/alpha",
+                          list(self.sources[:2]), [structure])
         output = io.StringIO()
         with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources[:2])) as board, redirect_stdout(output):
             result = style_plan.next_phase("names", self.plan, self.repo)

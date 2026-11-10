@@ -19,8 +19,10 @@ from zoneinfo import ZoneInfo
 
 from scripts.production import live_units
 from scripts.production import proposal_issue
+from scripts.production.issues import frontmatter
 from scripts.production import style_units
-from scripts.style import style_ledger
+from scripts.style import style_ledger, style_config
+from scripts.style.ledger_test_support import write_style_units
 from scripts.production import unit_lookup
 from scripts.herdr.herdr import HerdrPlace
 from scripts.direct import plan_history
@@ -58,7 +60,8 @@ class StyleUnitsTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}))
         self.doc = self.root / "style-production.md"
-        _ = self.doc.write_text("# Production\n")
+        _ = self.doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n")
+        write_style_units(self.doc)
         owner = fixture_member("showrunner", name="style-owner", doc=staff.LiveDoc(remote.local_machine(), self.doc))
         self.owners = {name: fixture_member("unit", name=name, parent=owner.id)
                        for name in ("names", "types")}
@@ -131,7 +134,7 @@ class StyleUnitsTests(unittest.TestCase):
     def test_same_named_unit_in_another_production_keeps_its_own_ticket(self) -> None:
         _ = self.ticket(number="14")
         other_doc = self.root / "other-production.md"
-        _ = other_doc.write_text("# Production\n")
+        _ = other_doc.write_text(self.doc.read_text())
         other = fixture_member("showrunner", name="other-style", doc=staff.LiveDoc(remote.local_machine(), other_doc))
         unit = fixture_member("unit", name="names", parent=other.id)
         with closing(sqlite3.connect(self.database)) as connection, connection:
@@ -150,6 +153,7 @@ class StyleUnitsTests(unittest.TestCase):
         row = self.owners["names"]
         _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("table-cleared")))
         _ = staff.rename(row.id, "sample-style-names")
+        _ = self.doc.write_text(self.doc.read_text().replace("| names |", "| sample-style-names |"))
         before = self.database.read_bytes()
 
         output = self.render([live_unit("sample-style-names")])
@@ -428,6 +432,23 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(self.root / "missing.md", "filed", 7, ticket=ticket)
         self.findings(self.root / "missing.md", "built", 3, ticket="missing-ticket")
         self.assertIn("| 5 | 5 | 0 |", self.render())
+
+    def test_combined_unit_sums_pinned_families_once(self) -> None:
+        names = self.decision("names", "names")
+        types = self.decision("types", "types")
+        for decision in (names, types):
+            unit_id = frontmatter(decision)["unit"][0]
+            _ = decision.write_text(decision.read_text().replace(unit_id, str(self.owners["names"].id)))
+        self.findings(names, "built", 2, built_at="2026-10-28T11:00:00+00:00")
+        self.findings(types, "built", 3, built_at="2026-10-28T11:00:00+00:00")
+        self.findings(names, "filed", 5)
+        self.findings(types, "filed", 7)
+        _ = staff.rename(self.owners["names"].id, "cargo-liner-style")
+        write_style_units(self.doc, (style_config.StyleUnitAssignment(
+            "cargo-liner-style", ("names", "values", "types", "modules")),))
+        output = self.render([live_unit("cargo-liner-style")])
+        self.assertIn("| cargo-liner-style | exited | idle | idle | — | 5 | 5 | 12 |", output)
+        self.assertIn("All families: 5 findings built · 12 approved findings left · 5 built", output)
 
     def test_total_with_a_rate_counts_all_families_once_and_uses_thousands_commas(self) -> None:
         names = self.decision("names", "names")
