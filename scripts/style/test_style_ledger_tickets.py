@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.agents import remote
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, ticket_owner_id, write_style_units
 
 import unittest
 import io
@@ -37,6 +37,30 @@ from scripts.style.ledger_test_support import (remove_finding_anchor_schema, rem
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def test_peer_migration_preserves_old_rows_and_accepts_multiple_peers(self) -> None:
+        database = self.root / "old-peers.sqlite"
+        with closing(sqlite3.connect(database)) as connection, connection:
+            for version, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if version <= 37:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (37)")
+            _ = connection.executemany("INSERT INTO ticket_predecessors VALUES (?,?)", [("2", "1"), ("3", "2")])
+        with closing(style_ledger.Ledger(self.repo, database)):
+            pass
+        with closing(sqlite3.connect(database)) as connection, connection:
+            self.assertEqual(connection.execute("SELECT * FROM ticket_predecessors ORDER BY ticket").fetchall(),
+                             [("2", "1"), ("3", "2")])
+            _ = connection.execute("INSERT INTO ticket_predecessors VALUES ('3','1')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                _ = connection.execute("INSERT INTO ticket_predecessors VALUES ('3','1')")
+        with closing(style_ledger.Ledger(self.repo, database)):
+            pass
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM ticket_predecessors ORDER BY ticket,predecessor").fetchall(),
+                             [("2", "1"), ("3", "1"), ("3", "2")])
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
+
     def fixed_style_units(self) -> tuple[staff.StaffRow, staff.StaffRow]:
         _ = self.enterContext(isolated_staff_file(self.root / "identity-staff.json", {}))
         owner = fixture_member("showrunner", name="style-owner")
@@ -2859,6 +2883,8 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             git.assert_not_called()
 
     def test_transition_audit_assignment_unit_state_precedes_branch_git(self) -> None:
+        write_style_units(self.repo / ".git/style-production.md",
+                          tuple(replace(row, unit="read") if row.unit == "names" else row for row in DEFAULT_STYLE_ASSIGNMENTS))
         ledger = self.ledger()
         rule = self.rule("read")
         self.add_ticket("1001", [rule], unit="read")
@@ -3202,6 +3228,8 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(cast(dict[str, str], json.loads(pins[0][0])), {rule_id: old_blob})
 
     def test_listed_and_structure_tickets_keep_their_payloads_and_one_resume_point(self) -> None:
+        write_style_units(self.repo / ".git/style-production.md",
+                          tuple(replace(row, unit="listed") if row.unit == "names" else row for row in DEFAULT_STYLE_ASSIGNMENTS))
         listed = self.rule(
             "listed", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
             + "  kind: regex\n  pattern: value\n  surface: whole\n",

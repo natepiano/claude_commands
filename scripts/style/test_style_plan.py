@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, ticket_owner_id, write_style_units
+from scripts.style.style_config import StyleUnitAssignment
 
 import fcntl
 import io
@@ -56,10 +57,12 @@ class StylePlanTests(StylePlanFixture):
 
     def test_family_plans_use_each_units_config_plan_for_old_and_full_ids(self) -> None:
         expected: dict[rules.Family, str] = {}
+        assignments: list[StyleUnitAssignment] = []
         owner = recorded_showrunner("sample-style", self.doc)
         families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
         for index, family in enumerate(families):
             unit = f"sample-style-{family}" if index % 2 else family
+            assignments.append(StyleUnitAssignment(unit, (family,)))
             worktree = self.root / f"plan-{family}"
             relative = f"docs/style-production/units/retained-{family}.md"
             plan = worktree / relative
@@ -70,7 +73,47 @@ class StylePlanTests(StylePlanFixture):
             _ = recorded_unit("sample-style", unit, worktree, self.doc, plan=relative)
         _ = fixture_unit_location(owner, "feature", self.root / "feature")
 
+        write_style_units(self.doc, tuple(assignments))
         self.assertEqual(dict(unit_plans.family_plan_texts(self.doc)), expected)
+
+    def test_combined_unit_reads_its_standing_plan_once(self) -> None:
+        families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
+        self.style_units((StyleUnitAssignment("names", families),))
+        read_text = Path.read_text
+        reads: list[Path] = []
+
+        def read(path: Path, **_kwargs: object) -> str:
+            reads.append(path)
+            return read_text(path)
+
+        with mock.patch.object(Path, "read_text", side_effect=read, autospec=True):
+            texts = unit_plans.family_plan_texts(self.doc)
+
+        self.assertEqual(set(texts), set(families))
+        self.assertEqual(reads.count(self.plan), 1)
+        self.assertTrue(all(text == self.plan.read_text() for text in texts.values()))
+
+    def test_arbitrary_unit_name_selects_configured_work_on_both_routes(self) -> None:
+        _ = self.rule("configured-names")
+        member = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "names", self.unit)
+        _ = staff.rename(member.id, "maintenance")
+        self.style_units((StyleUnitAssignment("maintenance", ("names", "types", "values", "modules")),))
+        self.sync()
+        for direct in (False, True):
+            with self.subTest(direct=direct):
+                if direct:
+                    _ = self.doc.write_text(self.doc.read_text().replace("**Kind:** style", "**Kind:** product")
+                                            .replace("**Merge branch:** style/main", "**Merge branch:** main")
+                                            .replace(str(self.style), str(self.repo)))
+                    self.ledger().set_tip(self.tip, "main")
+                with mock.patch.object(style_plan, "main_changes", wraps=style_plan.main_changes) as changes:
+                    result = style_plan.next_phase("maintenance", self.plan, self.repo)
+                self.assertIsInstance(result, style_plan.PhaseWritten)
+                self.assertEqual(changes.call_args.args[1], "main")
+                ticket, = self.ledger().ticket_open(ticket_owner_id("maintenance"))
+                self.assertEqual(ticket["family"], "names")
+                self.assertEqual(style_plan.style_document(self.repo, "maintenance"), self.doc)
+                self.ledger().ticket_drop(ticket["id"])
 
     def test_next_phase_keeps_the_declared_plan_path_for_old_and_full_ids(self) -> None:
         _ = self.rule("read")
@@ -82,6 +125,8 @@ class StylePlanTests(StylePlanFixture):
         for number, unit in enumerate(("names", "sample-style-names"), 1):
             with self.subTest(unit=unit):
                 member = staff.rename(member.id, unit_names.name(unit))
+                write_style_units(self.doc, tuple(StyleUnitAssignment(unit, row.families) if row.families == ("names",)
+                                                 else row for row in DEFAULT_STYLE_ASSIGNMENTS))
                 _ = retained.write_text(self.plan_header().replace("`names`", f"`{unit}`"))
                 result = style_plan.next_phase(unit, retained, self.repo)
                 self.assertEqual(result, style_plan.PhaseWritten(str(number)))
@@ -221,6 +266,8 @@ class StylePlanTests(StylePlanFixture):
         unit = "sample-style-names"
         member = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "names", self.unit)
         _ = staff.rename(member.id, unit_names.name(unit))
+        write_style_units(self.doc, tuple(StyleUnitAssignment(unit, row.families) if row.families == ("names",)
+                                         else row for row in DEFAULT_STYLE_ASSIGNMENTS))
         retained = self.plan.with_name("retained-names-plan.md")
         _ = self.plan.rename(retained)
         first = self.sources[-1]
