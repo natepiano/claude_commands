@@ -689,20 +689,35 @@ def retirement_terminate(pids: list[int], what: dict[int, str], wait: float | No
 
 def retirement_process_description(pid: int, *, settings: conf.ConfigRead) -> str:
     try:
-        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-        parent = fields[1]
-    except (OSError, IndexError):
+        parent = str(pane_record.process_parent(pid)) if sys.platform == "darwin" else (
+            Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         parent = "unknown"
     return (f"unowned process {pid}, parent {parent}, command {' '.join(retirement_command_line(pid, settings=settings)).strip() or 'unknown'}, "
             f"start {retirement_proc_start(pid) or 'unknown'}")
 
 def retirement_process_session(pid: int) -> str:
+    if sys.platform == "darwin":
+        return herdr.darwin_process_environment(pid).get("CLAUDE_CODE_SESSION_ID", "")
     raw = Path(f"/proc/{pid}/environ").read_bytes()
     for field in raw.split(b"\0"):
         key, _, value = field.partition(b"=")
         if key == b"CLAUDE_CODE_SESSION_ID":
             return value.decode("utf-8")
     return ""
+
+def retirement_process_ids(*, settings: conf.ConfigRead) -> list[int]:
+    if sys.platform == "darwin":
+        result = retirement_run(["ps", "-axo", "pid="], settings=settings)
+        if result.returncode:
+            raise OSError(f"ps -axo pid=: {retirement_failure(result)}")
+        return [int(value) for value in result.stdout.split() if value.isdecimal()]
+    return [int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdecimal()]
+
+def retirement_process_inside(pid: int, worktree: Path) -> bool:
+    if sys.platform == "darwin":
+        return pid in unit_move.processes_inside(worktree)
+    return Path(f"/proc/{pid}/cwd").resolve(strict=True).is_relative_to(worktree.resolve())
 
 def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: str = "", *, settings: conf.ConfigRead) -> list[str]:
     """Only a proven, isolated group of this stopped session can be ended."""
@@ -711,8 +726,9 @@ def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: st
     if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE and time.monotonic() >= operation_limit:
         raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
     poll = settings.number("RETIRE_POLL_SECONDS")
-    description = retirement_process_description(pid, settings=settings)
+    description = f"unowned process {pid}"
     try:
+        description = retirement_process_description(pid, settings=settings)
         started = retirement_proc_start(pid)
         session_id = recorded_session_id or retirement_last_session(unit)
         if not started or not session_id or retirement_process_session(pid) != session_id:
@@ -726,15 +742,11 @@ def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: st
             raise RetirementRefused("process does not lead an isolated group")
         _ = process_group.check_process_group(pid)
         retirement_members: list[tuple[int, str]] = []
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdecimal():
-                continue
-            member = int(entry.name)
+        for member in retirement_process_ids(settings=settings):
             try:
                 if os.getpgid(member) != pid:
                     continue
-                cwd = (entry / "cwd").resolve(strict=True)
-                if not cwd.is_relative_to(unit.worktree.resolve()) or retirement_process_session(member) != session_id:
+                if not retirement_process_inside(member, unit.worktree) or retirement_process_session(member) != session_id:
                     raise RetirementRefused(f"group member {member} has no worktree/session ownership")
                 birth = retirement_proc_start(member)
                 if not birth:
@@ -749,7 +761,7 @@ def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: st
             raise RetirementRefused("the recorded session became live or unreadable")
         if any(retirement_proc_start(member) != birth or os.getpgid(member) != pid
                or retirement_process_session(member) != session_id
-               or not Path(f"/proc/{member}/cwd").resolve(strict=True).is_relative_to(unit.worktree.resolve())
+               or not retirement_process_inside(member, unit.worktree)
                for member, birth in retirement_members) or retirement_proc_start(pid) != started:
             raise RetirementRefused("process identity changed before signal")
         if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE and time.monotonic() >= operation_limit:
@@ -759,15 +771,13 @@ def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: st
         raise
     except ProcessLookupError:
         return []
-    except (OSError, ValueError, RetirementRefused) as error:
+    except (OSError, ValueError, RetirementRefused, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         return [f"{description} works inside {unit.worktree}; stop it first: {error}"]
     deadline = min(time.monotonic() + duration, operation_limit)
     def still_running() -> bool:
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
-        except (OSError, IndexError):
-            return False
-        return state != "Z" and retirement_proc_start(pid) == started and retirement_alive(pid)
+        observed = process_start.process_start(pid)
+        return isinstance(observed, process_start.Unreadable) or (
+            isinstance(observed, process_start.Started) and observed.start == started and retirement_alive(pid))
     while still_running():
         now = time.monotonic()
         if now >= operation_limit:
@@ -825,6 +835,8 @@ def retirement_run_processes(owner: staff.StaffRow, inside: list[int], *, record
             for pid in inside if (leader := retirement_session_of(pid)) in leaders}
 
 def retirement_command_name(pid: int) -> str:
+    if sys.platform == "darwin":
+        return retirement_run(["ps", "-o", "comm=", "-p", str(pid)]).stdout.strip() or "?"
     try:
         return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
     except OSError:
@@ -1089,6 +1101,21 @@ def retirement_stop_members(row: staff.StaffRow, record: staff.StaffSnapshot) ->
     reasons.extend(stop_reasons)
     return pane_workers, reasons
 
+def retirement_close_idle_shell(unit: RetiringUnit, pid: int, record: staff.StaffSnapshot) -> bool:
+    try:
+        publication = pane_record.publication_for_session(unit.staff_member.current_session, record=record)
+        if publication is None:
+            return False
+        client = herdr.Herdr(publication.path.stem)
+        pane = next((pane for pane in client.panes() if pane["pane_id"] == publication.entry["pane_id"]), None)
+        if (pane is not None
+                and pane_record.pane_shell_pid(herdr.HerdrPlace(client.session, pane["pane_id"])) == pid
+                and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell)):
+            return client.close_retained_pane(pane["pane_id"], terminal=pane.get("terminal_id", ""))
+    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
+        pass
+    return False
+
 def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, record: staff.StaffSnapshot,
                              pane_workers: list[worker_panes.WorkerPane], require_cleanup: bool = False) -> int:
     row = unit.staff_member
@@ -1106,7 +1133,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     for reason in retirement_terminate(list(classified), classified, settings=settings):
         print(f"anomaly: {reason}")
     for pid in inside:
-        if pid != os.getpid() and pid not in classified:
+        if pid != os.getpid() and pid not in classified and not retirement_close_idle_shell(unit, pid, record):
             for reason in retirement_stop_orphan(unit, pid, row.current_session, settings=settings):
                 print(f"anomaly: {reason}")
     if require_cleanup and (retirement_holds({member.current_session for member in owned})
