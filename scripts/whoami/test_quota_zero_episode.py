@@ -244,7 +244,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
         _ = self.alert(self.now + timedelta(minutes=2), spare_left=50)
         _ = self.alert(self.now + timedelta(minutes=4), spare_left=50)
-        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         self.assertEqual(len([row for row in moves.read_moves() if row["kind"] == "requested"]), 1)
 
     def test_workers_target_allowance_changes_below_the_same_threshold_send_one_notice(self) -> None:
@@ -268,7 +268,11 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             spare_accounts=((3, 50, "0"), (2, 90, "0")))
         with mock.patch.object(accounts, "check_codex_target", wraps=accounts.check_codex_target) as check:
             returned = quota_alert.run_workers_next_moves(readings, self.now)
-            self.swap.assert_called_once_with("workers", "codex3", why=f"auto: {head.id}", cause="auto")
+            self.swap.assert_called_once_with("workers", "codex3", why=f"auto: {head.id}", cause="auto", worker_moves="detach",
+                worker_move_journal=moves.read_moves())
+            self.assertEqual(next_moves.read_next_moves(), (head, later))
+            role_map.write_role_map(role_map.RoleMapChange("workers", "codex3", "fixture move", self.now.isoformat()))
+            _ = support.complete_worker_moves(returned, self.now)
             self.assertEqual(next_moves.read_next_moves(), (later,))
             self.assertEqual([call.args[0] for call in check.call_args_list], ["codex3"])
             self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex3", self.root / ".codex3"))
@@ -278,8 +282,12 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             readings = self.readings(now, selected=3, left=50,
                 spare_accounts=((2, 90, "0"),))
             returned = quota_alert.run_workers_next_moves(readings, now)
-        self.swap.assert_called_once_with("workers", "codex2", why=f"auto: {later.id}", cause="auto")
+        self.swap.assert_called_once_with("workers", "codex2", why=f"auto: {later.id}", cause="auto", worker_moves="detach",
+            worker_move_journal=moves.read_moves())
         self.assertEqual([call.args[0] for call in check.call_args_list], ["codex2"])
+        self.assertEqual(next_moves.read_next_moves(), (later,))
+        role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture move", now.isoformat()))
+        _ = support.complete_worker_moves(returned, now)
         self.assertEqual(next_moves.read_next_moves(), ())
         self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex2", self.root / ".codex"))
         self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"],
@@ -457,7 +465,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.relay.reset_mock()
         _ = self.alert(self.now + timedelta(minutes=2), spare_accounts=((2, 100, "0"),))
         self.swap.assert_called_once_with("workers", "codex2",
-            why="codex1 weekly usage used; move to room", cause="auto", included_only=True)
+            why="codex1 weekly usage used; move to room", cause="auto", included_only=True, worker_moves="detach")
         self.phone.assert_not_called()
         self.relay.assert_not_called()
         with quota_alert.state_file() as state:
@@ -481,7 +489,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.relay.reset_mock()
         _ = self.alert(self.now + timedelta(minutes=4), spare_left=50)
         self.swap.assert_called_once_with("workers", "codex2",
-            why="codex1 weekly usage used; move to room", cause="auto", included_only=True)
+            why="codex1 weekly usage used; move to room", cause="auto", included_only=True, worker_moves="detach")
         self.phone.assert_not_called()
         self.relay.assert_not_called()
         with quota_alert.state_file() as state:
@@ -665,7 +673,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         _ = self.note(1, "off")
         _ = self.alert(spare_left=50)
         _ = self.alert(self.now + timedelta(minutes=2), spare_left=50)
-        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         entries = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
         self.assertEqual(len(entries), 1)
         entry = entries[0]
@@ -742,8 +750,12 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             _ = self.alert(checked, spare_left=50)
             self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
             self.swap.assert_not_called()
+        before_recovery = tuple(moves.read_moves())
         _ = self.alert(until, spare_left=50)
-        self.swap.assert_called_once_with("workers", "codex2", why="Codex has room again", cause="credits off")
+        recovery_requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual(len(recovery_requests), 1)
+        self.swap.assert_called_once_with("workers", "codex2", why="Codex has room again", cause="credits off", worker_moves="detach",
+            worker_move_journal=(*before_recovery, *recovery_requests))
         self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
         requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
         self.assertEqual(len(requests), 1)
@@ -932,8 +944,12 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         _ = self.alert(until - timedelta(minutes=1))
         self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
         self.swap.assert_not_called()
+        before_recovery = tuple(moves.read_moves())
         _ = self.alert(until, spare_left=50)
-        self.swap.assert_called_once_with("workers", "codex2", why="Codex has room again", cause="credits off")
+        recovery_requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual(len(recovery_requests), 1)
+        self.swap.assert_called_once_with("workers", "codex2", why="Codex has room again", cause="credits off", worker_moves="detach",
+            worker_move_journal=(*before_recovery, *recovery_requests))
         self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
 
     def test_credits_off_hold_releases_on_explicit_account_change(self) -> None:
@@ -980,7 +996,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
     def test_zero_credits_off_prefers_weekly_room_over_a_sooner_reset_on_paid_credits(self) -> None:
         _ = self.note(1, "off")
         _ = self.alert(spare_accounts=((2, 0, "6370"), (3, 50, "0")))
-        self.swap.assert_called_once_with("workers", "codex3", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex3", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         self.assertIn("codex3", self.zero_pushes()[-1].body)
         requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
         self.assertEqual(len(requests), 1)
@@ -991,7 +1007,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
     def test_zero_credits_off_uses_a_paid_target_only_when_no_account_has_weekly_room(self) -> None:
         _ = self.note(1, "off")
         _ = self.alert(spare_accounts=((2, 0, "6370"), (3, 0, "0")))
-        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         body = self.zero_pushes()[-1].body
         self.assertIn("codex2", body)
         self.assertIn("paid credits", body)
@@ -999,7 +1015,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
     def test_credits_off_prefers_both_windows_with_room_over_weekly_room_funded_by_credits(self) -> None:
         _ = self.note(1, "off")
         _ = self.alert(spare_accounts=((2, 50, "6370"), (3, 40, "0")), spare_five_hour=((2, 0), (3, 100)))
-        self.swap.assert_called_once_with("workers", "codex3", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex3", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         body = self.zero_pushes()[-1].body
         self.assertIn("codex3", body)
         self.assertIn("40%", body)
@@ -1010,7 +1026,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         body = self.zero_pushes()[-1].body
         self.assertIn("paid credits", body)
         self.assertNotIn("50%", body)
-        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
         self.assertEqual(len(requests), 1)
         request = requests[0]
@@ -1056,7 +1072,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         opening = self.zero_pushes()[-1]
         _ = self.note(1, "off")
         _ = self.alert(self.now + timedelta(minutes=2), spare_left=50)
-        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         with quota_alert.state_file() as state:
             forecast_at = state.get("codex_zero", {})["codex1"]["forecast_at"]
         requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
@@ -1096,7 +1112,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         _ = self.note(1, "on")
         for minutes in (2, 60, 120):
             _ = self.alert(self.now + timedelta(minutes=minutes), selected=2, left=50)
-        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off", worker_moves="detach")
         self.assertEqual(len(self.zero_pushes()), 1)
         self.relay.assert_not_called()
         with quota_alert.state_file() as state:

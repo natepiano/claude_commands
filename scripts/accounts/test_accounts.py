@@ -21,6 +21,7 @@ import json
 import os
 import selectors
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -45,7 +46,7 @@ from scripts.agents import stop_resume
 from scripts.agents import remote, stop_results
 from scripts.accounts import pane_moves
 from scripts.message import sessions
-from scripts.herdr import herdr
+from scripts.herdr import herdr, worker_panes
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -6580,6 +6581,120 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual((rows[-1]["role"], rows[-1]["cause"], rows[-1]["why"]),
                          ("workers", "auto", "auto: workers-entry"))
 
+    def test_detached_workers_swap_selects_the_target_before_starting_one_unit(self) -> None:
+        default, target = self.workers_fixture()
+        self.assertEqual(accounts.role_account("workers"), accounts.CodexWorkersAccount("codex2", default))
+        commands: list[list[str]] = []
+        expected_label, expected_home = "codex1", target
+
+        def start(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            self.assertEqual(accounts.read_role_map().workers, expected_label)
+            self.assertEqual(accounts.role_account("workers").home, expected_home)
+            commands.append(command)
+            inactive = command[0] == "systemctl" and not any(saved[0] == "systemd-run" for saved in commands)
+            return subprocess.CompletedProcess(command, int(inactive), "", "")
+
+        with (patch.object(shutil, "which", return_value="/fixture/systemd-run"),
+              patch.object(subprocess, "run", side_effect=start),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")),
+              patch.object(accounts, "move_workers", side_effect=AssertionError("move must run outside the pass"))):
+            result = accounts.swap("workers", "codex1", why="auto: workers-entry", cause="auto", worker_moves="detach")
+            expected_label, expected_home = "codex2", default
+            repeated = accounts.swap("workers", "codex2", why="newer selection", cause="auto", worker_moves="detach")
+        self.assertIsInstance(result, accounts.WorkersSwapStarted)
+        self.assertIsInstance(repeated, accounts.WorkersSwapStarted)
+        self.assertEqual(commands, [
+            ["systemctl", "--user", "is-active", "--quiet", "accounts-workers-move"],
+            ["systemd-run", "--user", "--collect", "--quiet", "--unit=accounts-workers-move",
+             str(accounts.SCRIPTS / "lib/py"), str(accounts.SCRIPTS / "accounts/accounts.py"),
+             "move", "workers", "codex1", "--follow-role", "--why", "auto: workers-entry"],
+            ["systemctl", "--user", "is-active", "--quiet", "accounts-workers-move"],
+        ])
+
+    def test_direct_codex_move_and_preview_refuse_a_target_outside_the_workers_role(self) -> None:
+        _ = self.workers_fixture()
+        before = self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()
+        for dry_run in (False, True):
+            with (self.subTest(dry_run=dry_run),
+                  patch.object(pane_moves, "move_worker", side_effect=AssertionError("mismatched move started")),
+                  patch.object(pane_moves, "preview_worker", side_effect=AssertionError("mismatched preview started")),
+                  patch.object(accounts, "_launch_worker_moves", side_effect=AssertionError("mismatched unit started"))):
+                result = accounts.move_workers("codex1", dry_run=dry_run)
+            self.assertEqual(result, accounts.MoveRefused(
+                "workers role is codex2; run accounts.py swap workers codex1 to select it"))
+            self.assertEqual((self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()), before)
+
+    def test_detached_move_finishes_on_the_latest_role_and_settles_each_group_request(self) -> None:
+        _ = self.workers_fixture()
+        for follow_role, change_after, old_snapshot in (
+                (False, 1, False), (False, 2, False), (True, 1, False), (True, 2, False), (True, 1, True)):
+            with self.subTest(follow_role=follow_role, change_after=change_after, old_snapshot=old_snapshot):
+                case = f"{follow_role}-{change_after}-{old_snapshot}"
+                workers = (self.workers_member("first-" + case), self.workers_member("second-" + case))
+                earlier_id, latest_id = "earlier-" + case, "latest-" + case
+                between_id = "between-" + case
+                journal_snapshot: list[moves.MoveEntry] = []
+
+                def request(identity: str, target_label: str) -> moves.RequestedMove:
+                    entry = moves.RequestedMove(kind="requested", at="2026-11-10T22:00:00Z",
+                        tool="codex", subject="workers", move_id=identity, cause="auto", why="auto: " + identity,
+                        **{"from": "codex2", "to": target_label}, window="weekly")
+                    moves.append_move(entry)
+                    return entry
+
+                calls: list[tuple[staff.StaffId, str]] = []
+
+                def move(row: staff.StaffRow, record: staff.StaffSnapshot, target_label: str,
+                         why: str, run: Path) -> accounts.SessionMoveOutcome:
+                    del record, why, run
+                    lock_path = moves.store_file().with_name("workers_move.run.lock")
+                    with lock_path.open("a") as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    calls.append((row.id, target_label))
+                    if len(calls) == change_after:
+                        if old_snapshot:
+                            _ = request(between_id, "codex1")
+                            _ = accounts.swap("workers", "codex1", why="intermediate selection", cause="auto", worker_moves="detach")
+                        latest = request(latest_id, "codex2")
+                        _ = accounts.swap("workers", "codex2", why="newer selection", cause="auto", worker_moves="detach",
+                            worker_move_journal=[*journal_snapshot, latest] if old_snapshot else moves.READ_CURRENT_MOVE_JOURNAL)
+                        if old_snapshot:
+                            pending = cast(dict[str, object], json.loads(moves.store_file().with_name("workers_move.json").read_text()))
+                            self.assertEqual(pending["requests"], [earlier_id, between_id, latest_id])
+                    return accounts.SessionMoveRefused(row.id, "fixture worker refused")
+
+                with (patch.object(accounts, "_launch_worker_moves"),
+                      patch.object(pane_moves, "move_worker", side_effect=move)):
+                    _ = request(earlier_id, "codex1")
+                    _ = accounts.swap("workers", "codex1", why="earlier selection", cause="auto", worker_moves="detach")
+                    journal_snapshot = moves.read_moves()
+                    result = accounts.move_workers("codex1", follow_role=follow_role)
+                assert isinstance(result, accounts.GroupMoveStartFailed)
+                self.assertEqual(result.target, "codex2")
+                for row in workers:
+                    self.assertEqual([target_label for identity, target_label in calls if identity == row.id][-1], "codex2")
+                self.assertEqual(sum(saved[1] == "codex1" for saved in calls), change_after)
+                expected_ids = [earlier_id, between_id, latest_id] if old_snapshot else [earlier_id, latest_id]
+                outcomes = [row for row in moves.read_moves()
+                            if row["kind"] != "requested" and row["move_id"] in expected_ids]
+                self.assertEqual(outcomes[0]["kind"], "failed")
+                assert outcomes[0]["kind"] == "failed"
+                self.assertEqual(outcomes[0]["reason"], "superseded by codex2")
+                if old_snapshot:
+                    self.assertEqual(outcomes[1]["kind"], "failed")
+                    assert outcomes[1]["kind"] == "failed"
+                    self.assertEqual(outcomes[1]["reason"], "superseded by codex2")
+                    self.assertEqual(outcomes[2]["kind"], "confirmed")
+                else:
+                    self.assertEqual(outcomes[1]["kind"], "confirmed")
+                self.assertEqual([row["move_id"] for row in outcomes], expected_ids)
+                self.assertFalse(moves.store_file().with_name("workers_move.json").exists())
+                with patch.object(staff, "require_stopped", return_value=None):
+                    for row in workers:
+                        self.assertEqual(staff.retire(row.id), row)
+
     def test_unset_workers_role_refuses_independently_of_the_callers_home(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
             message = "accounts: workers has no mapped account; run accounts.py set-role workers <codexN>"
@@ -6792,6 +6907,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
     def test_worker_release_refusals_name_the_reason_and_next_action(self) -> None:
         _ = self.workers_fixture()
+        role_map.write_role_map(role_map.RoleMapChange("workers", "codex1", "fixture selection", datetime.now(timezone.utc).isoformat()))
         worker = self.workers_member()
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
         for result, reason, action in (
@@ -6813,6 +6929,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
     def test_worker_release_when_not_running_leaves_resume_pending(self) -> None:
         _ = self.workers_fixture()
+        role_map.write_role_map(role_map.RoleMapChange("workers", "codex1", "fixture selection", datetime.now(timezone.utc).isoformat()))
         worker = self.workers_member()
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
         with patch.object(pane_moves, "move_worker",
@@ -6842,8 +6959,11 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 report.source = agent_accounts.CodexHomeSource(default)
                 worker = self.workers_member()
                 before = self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()
-                with patch.object(pane_moves, "move_worker",
-                                  return_value=stop_results.ResumePending(worker.id, target, "destination is not ready")) as stop:
+                with (patch.object(pane_moves, "move_worker",
+                                   return_value=stop_results.ResumePending(worker.id, target, "destination is not ready")) as stop,
+                      patch.object(pane_moves, "preview_worker", return_value=pane_moves.WorkerResume(
+                          worker_panes.StoppedWorker(worker, "fixture-pane", "fixture-terminal"),
+                          "impl", "codex1"))):
                     code, stdout, stderr = self.run_cli("swap", "workers", target, *([] if shared else ["--dry-run"]))
                 self.assertEqual((code, stderr), (1 if shared else 0, ""))
                 if shared:
@@ -7123,6 +7243,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         return row
 
     def move(self, target: str, *, why: str = "") -> accounts.GroupMoveStarted | accounts.GroupMoveStartFailed:
+        if target.startswith("codex"):
+            role_map.write_role_map(role_map.RoleMapChange("workers", target, "fixture selection", datetime.now(timezone.utc).isoformat()))
         result = accounts.move_workers(target, why=why)
         assert isinstance(result, (accounts.GroupMoveStarted, accounts.GroupMoveStartFailed))
         return result
@@ -7405,6 +7527,36 @@ class PaneWorkerMoveTests(unittest.TestCase):
         append.assert_not_called()
         self.assertEqual(self.world.launches, [])
         self.stop.assert_not_called()
+
+    def test_worker_move_preview_lists_actions_and_refusals_and_counts_empty_rows(self) -> None:
+        opened = self.worker("open", family="codex")
+        stopped = self.worker("stopped", family="codex", live=False)
+        unknown = self.worker("unassigned", family="codex", live=False)
+        closed = fixture_worker("closed", self.owner.id, backend=staff.CodexBackend(self.root / ".codex1"))
+        empty = fixture_worker("empty", self.owner.id, backend=staff.CodexBackend(self.root / ".codex1"))
+        other = self.worker("other-family", family="claude")
+        opened = staff.set_worker_role(opened.id, staff.KnownWorkerRole("impl"))
+        stopped = staff.set_worker_role(stopped.id, staff.KnownWorkerRole("impl"))
+        record = staff.local_snapshot()
+        record = replace(record, rows=tuple(replace(row, current_session=staff.StaffId(""))
+                                           if row.id == empty.id else row for row in record.rows))
+        before = self.fixture.staff_state()
+        role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture selection", datetime.now(timezone.utc).isoformat()))
+        with patch.object(staff, "local_snapshot", return_value=record):
+            result = accounts.move_workers("codex2", dry_run=True)
+        assert isinstance(result, accounts.GroupMoveDryRun)
+        self.assertEqual(sorted(result.lines), sorted((
+            f"{opened.name} ({opened.id}): would stop and resume the same conversation on codex2 in its worker pane",
+            f"{stopped.name} ({stopped.id}): would stop and resume the same conversation on codex2 in its worker pane",
+            f"{unknown.name} ({unknown.id}): not moved: dispatch role is unavailable",
+            "2 workers: nothing to move",
+        )))
+        for row in (closed, empty, other):
+            self.assertNotIn(str(row.id), "\n".join(result.lines))
+        self.assertEqual(self.fixture.staff_state(), before)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.launches, [])
+        self.assertEqual(self.world.requests, [])
 
     def test_move_workers_catches_the_worker_panes_herdr_failure(self) -> None:
         from scripts.herdr import worker_panes

@@ -18,13 +18,14 @@ import math
 import os
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
 import sys
 import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextvars import ContextVar
+from contextvars import Context, ContextVar
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
@@ -426,6 +427,10 @@ class AccountsError(ValueError):
         self.source: ObservedStateCause | NoObservedStateCause = source
 
 
+class WorkerMovesStartFailed(AccountsError):
+    """The detached worker runner did not start; its request remains pending."""
+
+
 @dataclass(frozen=True)
 class AccountStatus:
     """The user-visible state of one default or named account directory."""
@@ -484,6 +489,7 @@ class CommandLine(argparse.Namespace):
     since: str = ""
     until: str = ""
     dry_run: bool = False
+    follow_role: bool = False
     alerts: MoveAlerts = "user"
     claude_args: list[str] = []
     probe: bool = False
@@ -2746,11 +2752,21 @@ class SessionMoveRefused:
 SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
 
 
+class WorkerResumePreview(Protocol):
+    """The observed source account for a worker that can resume on the target."""
+
+    @property
+    def source(self) -> str: ...
+
+
 class PaneMoves(Protocol):
     def move_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
                     why: str, run: Path) -> SessionMoveOutcome: ...
 
     def run_for_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> Path: ...
+
+    def preview_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
+                       why: str, run: Path) -> WorkerResumePreview | SessionMoveRefused | stop_results.ClaudeUp: ...
 
 
 class AccountWorkerActivity(Protocol):
@@ -2862,50 +2878,128 @@ class GroupMoveStarted:
     outcomes: tuple[SessionMoveOutcome, ...] = field(default=(), kw_only=True)
 
 
+@dataclass(frozen=True)
+class FollowWorkersRole:
+    """Move Codex workers to the current workers role."""
+
+
+@dataclass(frozen=True)
+class FixedClaudeWorkersTarget:
+    """Move Claude workers to this account without reading the workers role."""
+
+    label: str
+
+
 def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
+                 follow_role: bool = False,
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
-    """Resume workers on the destination in their existing conversations."""
+    """Follow the Codex workers role or move Claude workers to the requested account."""
+    target = note_file.canonical_label(target)
+    if not follow_role or dry_run:
+        if _label_is(target, "codex"):
+            selected = _current_workers_target()
+            if target != selected:
+                return MoveRefused(f"workers role is {selected}; run accounts.py swap workers {target} to select it")
+            _ = _codex_move_target(target)
+        else:
+            checked = check_move_target(target, datetime.now(timezone.utc), repair=False, account_config=account_config)
+            if isinstance(checked, MoveRefused):
+                return checked
+    if not dry_run:
+        destination = FollowWorkersRole() if _label_is(target, "codex") else FixedClaudeWorkersTarget(target)
+        return _run_worker_moves(destination, why)
+    return _preview_worker_moves(target, why)
+
+
+def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
+    """Preview workers after the caller checks the destination."""
     from scripts.production import staff, session_staff
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
-    target = note_file.canonical_label(target)
-    if _label_is(target, "codex"):
-        _ = _codex_move_target(target)
-    else:
-        checked = check_move_target(target, datetime.now(timezone.utc), repair=False, account_config=account_config)
-        if isinstance(checked, MoveRefused):
-            return checked
     record = staff.local_snapshot()
-    rows = record.find(kind="worker")
+    family = "codex" if _label_is(target, "codex") else "claude"
+    rows = tuple(row for row in record.find(kind="worker")
+                 if not row.current_session or session_staff.worker_family(record, row.id) == family)
     identities = tuple(str(row.id) for row in rows)
 
-    def restart_refusal(identity: staff.StaffId) -> str:
-        if session_staff.worker_family(record, identity) != ("codex" if _label_is(target, "codex") else "claude"):
-            return f"cannot restart on {target} through assign.sh"
-        return ""
-
-    if dry_run:
-        lines: list[str] = []
-        for row in rows:
-            reason = restart_refusal(row.id)
-            preview = f"would stop and resume the same conversation on {target} in its worker pane"
-            if reason:
-                preview = f"not moved: {reason}"
-            lines.append(f"{row.name} ({row.id}): {preview}")
-        return GroupMoveDryRun(identities, tuple(lines))
-    results: list[SessionMoveOutcome] = []
+    lines: list[str] = []
+    nothing = 0
     for row in rows:
         try:
             run = pane_moves.run_for_worker(row, record)
-            reason = restart_refusal(row.id) if row.current_session else ""
-            results.append(SessionMoveRefused(row.id, reason) if reason else
-                           pane_moves.move_worker(row, record, target, why, run))
+            decision = pane_moves.preview_worker(row, record, target, why, run)
         except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
-            results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
-    outcomes = tuple(results)
+            decision = SessionMoveRefused(row.id, str(error).replace("\n", " "))
+        if isinstance(decision, stop_results.ClaudeUp) or isinstance(decision, SessionMoveRefused) and decision.returncode == 0:
+            nothing += 1
+            continue
+        preview = (f"not moved: {decision.reason}" if isinstance(decision, SessionMoveRefused) else
+                   f"would stop and resume the same conversation on {target} in its worker pane")
+        lines.append(f"{row.name} ({row.id}): {preview}")
+    if nothing:
+        lines.append(f"{nothing} workers: nothing to move")
+    return GroupMoveDryRun(identities, tuple(lines))
+
+
+def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.StaffSnapshot,
+                     target: str, why: str) -> SessionMoveOutcome:
+    from scripts.production import staff
+
+    try:
+        run = pane_moves.run_for_worker(row, record)
+        return pane_moves.move_worker(row, record, target, why, run)
+    except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
+        return SessionMoveRefused(row.id, str(error).replace("\n", " "))
+
+
+def _current_workers_target() -> str:
+    """Read the authority without reusing the command's earlier observation."""
+    return Context().run(read_role_map).workers
+
+
+def _resolve_worker_move_target(destination: FollowWorkersRole | FixedClaudeWorkersTarget) -> str:
+    return _current_workers_target() if isinstance(destination, FollowWorkersRole) else destination.label
+
+
+def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
+                      why: str) -> GroupMoveStarted | GroupMoveStartFailed:
+    from scripts.production import staff, session_staff
+
+    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
+    results: dict[staff.StaffId, SessionMoveOutcome] = {}
+    attempted: dict[staff.StaffId, str] = {}
+    family = "codex" if isinstance(destination, FollowWorkersRole) else "claude"
+    with _workers_move_lock("run"):
+        if isinstance(destination, FollowWorkersRole):
+            with _workers_move_lock("schedule"):
+                if isinstance(_read_pending_worker_moves(), NoPendingWorkerMoves):
+                    _queue_worker_moves(_resolve_worker_move_target(destination))
+        while True:
+            record = staff.local_snapshot()
+            for row in record.find(kind="worker"):
+                target = _resolve_worker_move_target(destination)
+                if row.current_session and session_staff.worker_family(record, row.id) != family:
+                    continue
+                if attempted.get(row.id) == target:
+                    continue
+                results[row.id] = _move_worker_row(pane_moves, row, record, target, why)
+                attempted[row.id] = target
+            with _workers_move_lock("schedule") if isinstance(destination, FollowWorkersRole) else nullcontext():
+                target = _resolve_worker_move_target(destination)
+                latest = staff.local_snapshot()
+                if any(attempted.get(row.id) != target for row in latest.find(kind="worker")
+                       if not row.current_session or session_staff.worker_family(latest, row.id) == family):
+                    continue
+                if isinstance(destination, FollowWorkersRole):
+                    pending = _read_pending_worker_moves()
+                    if isinstance(pending, PendingWorkerMoves):
+                        _complete_worker_move_requests(pending.requests, target)
+                        _workers_move_file().unlink()
+                break
+    outcomes = tuple(results.values())
     stdout, stderr, code = _move_output(outcomes, ())
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
-    return outcome(identities, target, stdout, stderr, code, outcomes=outcomes)
+    return outcome(tuple(str(identity) for identity in results), target, stdout, stderr, code, outcomes=outcomes)
 
 
 
@@ -3117,9 +3211,158 @@ def codex_home_label(home: Path) -> str:
     return agent_accounts.codex_home_role_label(home)
 
 
+WorkerMoves = Literal["wait", "detach"]
+
+
+@dataclass(frozen=True)
+class PendingWorkerMoves:
+    """Accepted group requests await the end of a detached workers move."""
+
+    requests: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoPendingWorkerMoves:
+    """No detached workers move needs a retry."""
+
+
+@dataclass(frozen=True)
+class KeepWorkersRole:
+    """Restart pending moves without changing the selected account."""
+
+
+KEEP_WORKERS_ROLE = KeepWorkersRole()
+
+
+class WorkerMovesDocument(TypedDict):
+    requests: list[str]
+
+
+def _workers_move_file() -> Path:
+    return moves.store_file().with_name("workers_move.json")
+
+
+@contextmanager
+def _workers_move_lock(purpose: Literal["run", "schedule"]) -> Generator[None]:
+    path = _workers_move_file().with_suffix(f".{purpose}.lock")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with file_lock.exclusive(path):
+        yield
+
+
+def _pending_workers_requests(
+    journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> dict[str, moves.RequestedMove]:
+    pending: dict[str, moves.RequestedMove] = {}
+    entries = moves.read_moves() if isinstance(journal, moves.ReadCurrentMoveJournal) else journal
+    for entry in entries:
+        if entry["subject"] != "workers":
+            continue
+        if entry["kind"] == "requested":
+            pending[entry["move_id"]] = entry
+        elif entry["move_id"] in pending:
+            del pending[entry["move_id"]]
+    return pending
+
+
+def _read_pending_worker_moves() -> PendingWorkerMoves | NoPendingWorkerMoves:
+    try:
+        raw = cast(object, json.loads(_workers_move_file().read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoPendingWorkerMoves()
+    if not isinstance(raw, dict):
+        raise AccountsError("accounts: invalid pending workers move")
+    requests = cast(dict[str, object], raw).get("requests")
+    if not isinstance(requests, list) or not all(isinstance(value, str) for value in cast(list[object], requests)):
+        raise AccountsError("accounts: invalid pending workers move requests")
+    return PendingWorkerMoves(tuple(cast(list[str], requests)))
+
+
+def _queue_worker_moves(
+    label: str, journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> None:
+    requests = tuple(_pending_workers_requests(journal).values())
+    saved = _read_pending_worker_moves()
+    # Keep saved requests even when this pass has an older journal snapshot.
+    accepted = list(saved.requests) if isinstance(saved, PendingWorkerMoves) else []
+    boundary = next((index + 1 for index in range(len(requests) - 1, -1, -1)
+                     if requests[index]["to"] == label), len(requests))
+    accepted.extend(request["move_id"] for request in requests[:boundary] if request["move_id"] not in accepted)
+    document = WorkerMovesDocument(requests=accepted)
+    atomic_file.write_text_atomic(_workers_move_file(), json.dumps(document) + "\n", new_file_mode=0o600)
+
+
+def _complete_worker_move_requests(requests: tuple[str, ...], target: str) -> None:
+    pending = _pending_workers_requests()
+    home = str(_codex_account_home(target) if _label_is(target, "codex") else claude_account_dir(target))
+    for identity in requests:
+        request = pending.get(identity)
+        if request is None:
+            continue
+        common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool=request["tool"],
+                                  subject="workers", move_id=identity)
+        if request["to"] == target:
+            moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=home))
+        else:
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=f"superseded by {target}"))
+
+
+def _launch_worker_moves(label: str, why: str) -> None:
+    command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "accounts/accounts.py"), "move", "workers", label,
+               "--follow-role", "--why", why]
+    try:
+        if shutil.which("systemd-run") is None:
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            return
+        unit = "accounts-workers-move"
+        if subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit], check=False).returncode == 0:
+            return
+        started = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", *command],
+                                 capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise WorkerMovesStartFailed(f"accounts: could not start the workers move: {error}") from error
+    if started.returncode:
+        raise WorkerMovesStartFailed(f"accounts: could not start the workers move: {started.stderr.strip()}")
+
+
+def _start_worker_moves(
+    label: str, why: str, *, change: RoleMapChange | KeepWorkersRole = KEEP_WORKERS_ROLE,
+    journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> None:
+    """Write the role and pending work under the final-check lock, then start one detached move."""
+    with _workers_move_lock("schedule"):
+        if isinstance(change, RoleMapChange):
+            write_role_map(change)
+        _queue_worker_moves(label, journal)
+        _launch_worker_moves(label, why)
+
+
+def resume_worker_moves(
+    journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+) -> None:
+    """Restart an unfinished handoff without replacing its role selection."""
+    with _workers_move_lock("schedule"):
+        pending = _read_pending_worker_moves()
+        entries = moves.read_moves() if isinstance(journal, moves.ReadCurrentMoveJournal) else journal
+        requests = _pending_workers_requests(entries)
+        if isinstance(pending, NoPendingWorkerMoves) and not requests:
+            return
+        target = _current_workers_target()
+        if isinstance(pending, NoPendingWorkerMoves):
+            if not any(request["to"] == target for request in requests.values()):
+                return
+            _queue_worker_moves(target, entries)
+        why = next((request["why"] for request in reversed(tuple(requests.values())) if request["to"] == target),
+                   "retry workers move")
+        _launch_worker_moves(target, why)
+
+
 def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
                   cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
-                  included_only: bool = False) -> WorkersSwapOutcome:
+                  included_only: bool = False, worker_moves: WorkerMoves = "wait",
+                  worker_move_journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+                  ) -> WorkersSwapOutcome:
     """Check the live allowance before changing the workers account."""
     refuse_default(label)
     try:
@@ -3145,16 +3388,17 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
         if not report.problem:
             account_anomaly(f"{account_label} ({_codex_folder(target_home)}): {readiness.problem}")
     if dry_run:
-        preview = move_workers(account_label, dry_run=True, why=why)
-        if isinstance(preview, MoveRefused):
-            raise AccountsError(preview.reason)
-        assert isinstance(preview, GroupMoveDryRun)
+        preview = _preview_worker_moves(account_label, why)
         return WorkersSwapDryRun(preview.lines)
     try:
+        if worker_moves == "detach":
+            change = RoleMapChange("workers", account_label, why, datetime.now(timezone.utc).isoformat(), cause=cause)
+            _start_worker_moves(account_label, why, change=change, journal=worker_move_journal)
+            return WorkersSwapStarted(())
         _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, why=why, cause=cause)
     except OSError as error:
         raise AccountsError(f"accounts: could not move the workers role: {error}") from error
-    moved = move_workers(account_label, why=why)
+    moved = move_workers(account_label, why=why, follow_role=True)
     if isinstance(moved, MoveRefused):
         raise AccountsError(moved.reason)
     assert not isinstance(moved, GroupMoveDryRun)
@@ -3163,11 +3407,17 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
 
 def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
          cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
-         included_only: bool = False) -> SwapOutcome | WorkersSwapOutcome:
-    """Move workers; included_only requires room without paid credits at the live check."""
+         included_only: bool = False, worker_moves: WorkerMoves = "wait",
+         worker_move_journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
+         ) -> SwapOutcome | WorkersSwapOutcome:
+    """Move workers; included_only requires room without paid credits at the live check.
+
+    "detach" writes the role, then moves the workers in their own process and returns at once.
+    """
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause, included_only=included_only)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause, included_only=included_only,
+                             worker_moves=worker_moves, worker_move_journal=worker_move_journal)
     raise AccountsError(UNIT_ROLE_GONE)
 
 
@@ -5284,6 +5534,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = move_command.add_argument("--from", dest="source", default="")
     _ = move_command.add_argument("--to", dest="target", default="")
     _ = move_command.add_argument("--dry-run", action="store_true")
+    _ = move_command.add_argument("--follow-role", action="store_true", help=argparse.SUPPRESS)
     _ = move_command.add_argument("--no-alert", dest="alerts", action="store_const", const="none", default="user")
     _ = move_command.add_argument("--why", default="")
     for action in ("role", "env"):
@@ -5415,7 +5666,8 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             if options.session == "workers":
                 if not options.label or options.source or options.target:
                     raise AccountsError("move workers requires <claudeN|codexN>")
-                moved = move_workers(options.label, dry_run=options.dry_run, why=options.why, account_config=account_config)
+                moved = move_workers(options.label, dry_run=options.dry_run, why=options.why,
+                                     follow_role=options.follow_role, account_config=account_config)
             elif options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:
                     raise AccountsError("move units|showrunners requires <claudeN>")
