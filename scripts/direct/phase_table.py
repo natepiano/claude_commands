@@ -395,6 +395,14 @@ class NoPlan(Exception):
     """The requested worker session does not identify a readable plan."""
 
 
+class RemovedPlan(NoPlan):
+    """The run names a plan file that no longer exists, as after its as-built."""
+
+    def __init__(self, plan_path: Path) -> None:
+        super().__init__(f"Unable to read plan {plan_path}")
+        self.plan_path: Path = plan_path
+
+
 def _json_object(text: str) -> dict[str, object] | None:
     try:
         parsed: object = json.loads(text)  # pyright: ignore[reportAny]
@@ -644,6 +652,14 @@ def parallel_line(check: ParallelCheck) -> str:
         f"Parallel: unknown — {which} no **Depends on:** line; "
         + "add one under each phase heading and rerun"
     )
+
+
+def session_parallel_line(session_dir: Path) -> str:
+    """The session's `Parallel:` line; ad hoc work after its plan's removal has no plan to read."""
+    try:
+        return parallel_line(build(session_dir).parallel)
+    except RemovedPlan as removed:
+        return f"Parallel: none — no plan at {removed.plan_path}; the run does ad hoc work"
 
 
 def _normalized_title(title: str) -> str:
@@ -1019,6 +1035,8 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
         resolver = session_staff.RowResolver(record)
     try:
         phases = plan_history.plan_phases(plan_path, resolver=resolver)
+    except FileNotFoundError as error:
+        raise RemovedPlan(plan_path) from error
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
@@ -1976,7 +1994,7 @@ def main() -> int:
             refresh(session_dir.expanduser().resolve())
             return 0
         if command == "parallel":
-            print(parallel_line(build(session_dir.expanduser().resolve()).parallel))
+            print(session_parallel_line(session_dir.expanduser().resolve()))
             return 0
         if command == "prune":
             if production_doc is None:
