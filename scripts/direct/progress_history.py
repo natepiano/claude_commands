@@ -28,10 +28,9 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import cache
 from pathlib import Path
-from typing import Literal, NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, TypedDict, cast
 
-from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs  # noqa: E402
@@ -39,9 +38,13 @@ from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import session_staff, staff, unit_config  # noqa: E402
-from scripts.agents import remote  # noqa: E402
-from scripts.usage import agents_log  # noqa: E402
+
+# Each verb imports the staff, plan and worker modules it uses inside its own
+# function: loading them at every start cost about 50 ms CPU per call.
+if TYPE_CHECKING:
+    from scripts.direct import plan_history
+    from scripts.production import session_staff, staff
+    from scripts.usage import agents_log
 
 
 SCHEMA_VERSION = 1
@@ -382,6 +385,7 @@ def _refuse_eta(message: str) -> NoReturn:
 
 
 def _local_eta_epoch(value: str, option: str) -> float:
+    from scripts.direct import plan_history
     zone = user_zone()
     if re.fullmatch(r"\d{2}:\d{2}", value):
         today = datetime.fromtimestamp(plan_history.now_epoch(), zone)
@@ -408,6 +412,7 @@ def _session_dir(args: argparse.Namespace) -> Path:
 
 def set_unit(session_dir: Path, production: str, unit: str) -> None:
     """Persist unit identity without changing the run's history or workers."""
+    from scripts.agents import worker_lifecycle
     if any(not value or value in (".", "..") or "/" in value or "\\" in value
            for value in (production, unit)):
         raise ValueError("invalid production or unit identity")
@@ -431,6 +436,7 @@ def _set_unit(args: argparse.Namespace) -> None:
 
 def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
     """Resolve the command's names once and store the fixed unit id."""
+    from scripts.production import staff
     if state.get(unit_runs.OWNER_FIELD):
         return
     record = staff.initial_snapshot()
@@ -446,11 +452,13 @@ def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
 
 
 def _state_path(session_dir: Path) -> Path:
+    from scripts.direct import plan_history
     return session_dir / plan_history.STATE_FILENAME
 
 
 def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> dict[str, object]:
     """Omit folder copies from state, events, and nested wait attribution."""
+    from scripts.production import staff
     if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
         return dict(fields)
     if not unit_owned and (fields.get(unit_runs.OWNER_FIELD) or fields.get("main_agent") or fields.get("owner_session")):
@@ -472,6 +480,8 @@ def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> di
 
 
 def _read_state(session_dir: Path) -> dict[str, object]:
+    from scripts.direct import plan_history
+    from scripts.production import staff
     path = _state_path(session_dir)
     try:
         state = _json_object(path.read_text(encoding="utf-8"))
@@ -514,6 +524,7 @@ def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: s
 
 def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[Path]:
     """Remove active state folder copies. Keep recorded history unchanged."""
+    from scripts.direct import plan_history
     moved: list[Path] = []
     for root in SESSION_ROOTS:
         for path in root.glob(f"*/{plan_history.STATE_FILENAME}"):
@@ -531,6 +542,8 @@ def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[
 
 def _refresh_phase_table(session_dir: Path) -> None:
     """Rewrite a production unit's phase note without affecting the recorder."""
+    from scripts.direct import plan_history
+    from scripts.production import session_staff
     try:
         state = _read_state(session_dir)
         plan_doc = _string(state.get("project_plan_doc")) or _string(
@@ -759,6 +772,7 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
     unclassifiable heading is reported, never counted by default: a miscount here
     silently corrupts every project percentage the run reports.
     """
+    from scripts.direct import plan_history
     try:
         phases, duplicates = plan_history.plan_phase_details(plan_path)
     except OSError:
@@ -855,6 +869,7 @@ def _explicit_plan_timing(
     plan_doc: str,
     now: float,
 ) -> ProjectTiming:
+    from scripts.direct import plan_history
     plan_path = plan_history.resolve_plan_path(working_dir, plan_doc)
     existing = _read_plan_project_start(plan_path)
     if existing is not None:
@@ -900,6 +915,8 @@ def _historical_project_timing(
     working_dir: Path,
     branch: str,
 ) -> ProjectTiming | None:
+    from scripts.direct import plan_history
+    from scripts.production import staff
     runs_dir = plan_history.history_root() / "runs"
     latest_event: dict[str, object] | None = None
     latest_started_at = -1.0
@@ -1062,6 +1079,8 @@ class ActiveDispatchUnavailable:
 
 def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoActiveDispatch | ActiveDispatchUnavailable:
     """Read the active pass through the worker's fixed staff id."""
+    from scripts.agents import worker_lifecycle
+    from scripts.production import session_staff, staff
     try:
         row = staff.snapshot().by_id(worker_id)
         if row is None:
@@ -1135,6 +1154,7 @@ _dispatch_reads: ContextVar[DispatchReads | ReadDispatches] = ContextVar("dispat
 @contextmanager
 def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generator[None]:
     """Share history reads within one command, without retaining them afterward."""
+    from scripts.usage import agents_log
     states: dict[Path, dict[str, object]] = {}
     for run in runs:
         path = run / unit_runs.STATE_FILE
@@ -1152,6 +1172,9 @@ def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generat
 
 def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
     """Read the newest open or finished dispatch across the staff parent's runs."""
+    from scripts.direct import phase_reservation
+    from scripts.production import staff
+    from scripts.usage import agents_log
     reads = _dispatch_reads.get()
     if isinstance(reads, ReadDispatches):
         try:
@@ -1465,6 +1488,7 @@ def _close_active_activity(
 
 
 def _start_activity(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     if _string(state.get("status")) != "active":
@@ -1488,6 +1512,7 @@ def _start_activity(args: argparse.Namespace) -> None:
 
 
 def _finish_activity(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     status = _arg_string(args, "status", "completed") or "completed"
@@ -1501,6 +1526,8 @@ def _finish_activity(args: argparse.Namespace) -> None:
 
 
 def _start_run(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
+    from scripts.production import staff, unit_config
     session_dir = _session_dir(args)
     existing = _state_path(session_dir)
     if existing.exists():
@@ -1602,6 +1629,8 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 
 
 def _start_phase(args: argparse.Namespace) -> None:
+    from scripts.direct import phase_reservation, plan_history
+    from scripts.production import staff
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     now = plan_history.now_epoch()
@@ -1723,6 +1752,7 @@ class LaunchCheck(TypedDict):
 def _launch_refused(
     state: dict[str, object], args: argparse.Namespace, reason: str,
 ) -> NoReturn:
+    from scripts.direct import plan_history
     event = _event(state, "launch_refused", plan_history.now_epoch(), phase_record={})
     event.update(reason=reason, pass_kind=_arg_string(args, "pass_kind"),
                  phase_id=_optional_arg(args, "phase_id"), prompt_file=_optional_arg(args, "prompt_file"),
@@ -1799,6 +1829,8 @@ def _checked_launch(
 
 
 def _check_launch(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
+    from scripts.production import staff
     session_dir = _session_dir(args)
     try:
         state = _read_state(session_dir)
@@ -1861,6 +1893,8 @@ def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.Wor
 
 
 def _start_pass(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
+    from scripts.production import staff
     if not _launcher_owned() and not getattr(args, "dispatch_owned", False):
         raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
     session_dir = _session_dir(args)
@@ -1970,6 +2004,7 @@ class DispatchRunNotRecorded(Enum):
 
 
 def _dispatch_state_link(worker_id: staff.StaffId) -> Path:
+    from scripts.production import staff
     return staff.record_path().parent / "dispatches" / str(worker_id)
 
 
@@ -1997,6 +2032,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
                    worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
     """Record a published worker's dispatch and return its durable pass id."""
+    from scripts.production import staff
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
     args = argparse.Namespace(
@@ -2020,6 +2056,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
     """Record completion for the exact dispatch, including DONE after a launcher error."""
+    from scripts.direct import plan_history
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
@@ -2147,6 +2184,7 @@ def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> 
 
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
+    from scripts.direct import plan_history
     if not _state_path(session_dir).is_file():
         return
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
@@ -2160,6 +2198,7 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
 
 
 def _finish_pass(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     status = _arg_string(args, "status")
     orphaned = bool(getattr(args, "orphaned_launcher", False))
@@ -2229,6 +2268,7 @@ def _arm_review(args: argparse.Namespace) -> None:
     only earns the reviewer a row in the stage table while the writer it
     overlaps is still going.
     """
+    from scripts.direct import phase_reservation, plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _arg_string(args, "phase_id")
@@ -2299,6 +2339,7 @@ def _clear_armed_review(
 
 
 def _disarm_review(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     _ = _clear_armed_review(
@@ -2311,6 +2352,8 @@ def _disarm_review(args: argparse.Namespace) -> None:
 
 def load_events(event_types: Collection[str] = (), *,
                 record: staff.StaffSnapshot | None = None) -> tuple[list[dict[str, object]], int]:
+    from scripts.direct import plan_history
+    from scripts.production import staff
     events: list[dict[str, object]] = []
     if record is None:
         record = staff.initial_snapshot()
@@ -2679,6 +2722,7 @@ def _current_hold_seconds(state: dict[str, object], candidate_percent: int, now:
 
 
 def _calibrate(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     now = plan_history.now_epoch()
@@ -2956,6 +3000,8 @@ def _run_events(state: dict[str, object], *,
     Read only this run for its phase table.
     The read cost depends on this run's history.
     """
+    from scripts.direct import plan_history
+    from scripts.production import staff
     history_file = _string(state.get("history_file"))
     if not history_file:
         return []
@@ -4192,6 +4238,7 @@ def _current_worker_cells(
 
 def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[StageWindow]:
     """Current worker notes show accepted-turn telemetry; historical windows stay intact."""
+    from scripts.agents import worker_lifecycle
     try:
         roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
     except worker_lifecycle.WorkerStateUnreadable:
@@ -4375,6 +4422,7 @@ def _eta_cell(percent: int, elapsed: int, as_of: float, now: float, floor: int =
     `elapsed` is measured at `as_of`, which a report between windows sets to
     its last recorded moment; the day is still named from `now`.
     """
+    from scripts.direct import plan_history
     eta = plan_history.eta_seconds(percent, elapsed)
     return "" if eta is None else _arrival_label(as_of + max(eta, floor), now)
 
@@ -4416,6 +4464,7 @@ def _eta_band_cells(
     otherwise push the pessimistic end down to 1% and quote an arrival ninety-nine
     times the elapsed clock — a number no reader can use and none should trust.
     """
+    from scripts.direct import plan_history
     band = plan_history.eta_band_seconds(percent, elapsed, spread)
     if isinstance(band, plan_history.EtaProjectionUnavailable):
         return "", ""
@@ -4459,6 +4508,7 @@ def _timeline(args: argparse.Namespace) -> None:
     questions asked after the fact -- how many fix passes, how long each review
     took -- without reading the raw event stream by hand.
     """
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     now = plan_history.now_epoch()
@@ -4589,6 +4639,7 @@ class NoReportedWindow:
 
 def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     """Count phase headings after resolving the plan against the run folder."""
+    from scripts.direct import plan_history
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
     if plan_doc:
         candidate = plan_history.resolve_plan_path(Path(_string(state.get("working_dir"))), plan_doc)
@@ -4598,6 +4649,7 @@ def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
 
 def _run_plan_path(state: dict[str, object]) -> Path | None:
     """The plan this run's phase ids come from, which the project plan may not be."""
+    from scripts.direct import plan_history
     plan_doc = _string(state.get("plan_doc"))
     if not plan_doc:
         return None
@@ -4606,6 +4658,7 @@ def _run_plan_path(state: dict[str, object]) -> Path | None:
 
 def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], counted: Path) -> dict[str, object]:
     """Add a numbered run phase when the plan has no heading for it."""
+    from scripts.direct import plan_history
     phase = _object_dict(state.get("phase"))
     phase_id = _string(phase.get("id")) if phase is not None else ""
     order = counts.get("order")
@@ -4625,6 +4678,7 @@ def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], co
 
 def _plan_lists_phase(plan: Path, phase_id: str) -> bool:
     """Return whether a numbered heading names `phase_id`."""
+    from scripts.direct import plan_history
     try:
         phases, _ = plan_history.plan_phase_details(plan)
     except OSError:
@@ -4634,6 +4688,7 @@ def _plan_lists_phase(plan: Path, phase_id: str) -> bool:
 
 def _phase_missing_from_plan(state: dict[str, object], phase_id: str) -> Path | None:
     """Return the run's plan when it lacks the requested numbered phase."""
+    from scripts.direct import plan_history
     if re.fullmatch(plan_history.PHASE_ID, phase_id) is None:
         return None
     plan = _run_plan_path(state)
@@ -4687,6 +4742,7 @@ def _summary_table(
     Percentages and elapsed clocks are measured at `as_of`. The project ETA
     follows the current plan chain; every arrival is named from `now`'s day.
     """
+    from scripts.direct import plan_history
     headers = list(SUMMARY_HEADERS)
     project_row = [
         "Project", str(project["percent"]), _format_duration(project["elapsed"]),
@@ -4727,6 +4783,7 @@ def _project_chain_eta(
     Phase row's band (user, 2026-10-26). A finished plan's low and high are
     its recorded finish.
     """
+    from scripts.direct import plan_history
     from scripts.direct import phase_table
 
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
@@ -4765,6 +4822,7 @@ def _project_chain_eta(
 
 def _phase_eta_line(session_dir: Path, phase_number: str) -> str:
     """Describe the phase's promises, never its advanced schedule end."""
+    from scripts.direct import plan_history
     from scripts.direct import phase_table
 
     try:
@@ -4977,6 +5035,7 @@ def _print_last_recorded(
     It writes no event, window or state, so pass counts, convergence and
     calibration never see it.
     """
+    from scripts.direct import plan_history
     events = _run_events(state)
     plan_phase_counts = _state_plan_phase_counts(state)
     recorded = _recorded_report(state, phase, events, plan_phase_counts, now)
@@ -5013,6 +5072,7 @@ def _print_last_recorded(
 
 
 def _report_progress(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     tables = getattr(args, "tables", False) is True
     now = plan_history.now_epoch()
@@ -5259,6 +5319,7 @@ def _progress(args: argparse.Namespace) -> None:
 
 
 def _eta(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
@@ -5438,6 +5499,7 @@ def _holder_from_args(args: argparse.Namespace, kind: str) -> NamedHolder | Hold
 
 
 def _wait_holder(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     if os.environ.get(PROBE_ENV) == "1":
         return
     state = _read_state(_session_dir(args))
@@ -5527,6 +5589,9 @@ class ProductionNotRecorded:
 
 def resolve_production_unit(state: Mapping[str, object], *, resolver: session_staff.RowResolver | None = None) -> ProductionUnitIdentity | ProductionNotRecorded:
     """Read the production and unit names from the current staff row."""
+    from scripts.agents import remote
+    from scripts.direct import plan_history
+    from scripts.production import session_staff, staff
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         record = resolver.record
@@ -5662,6 +5727,7 @@ def _phase_identity(state: dict[str, object], phase: dict[str, object]) -> dict[
 def resolve_worker_pass(session_dir: Path, state: dict[str, object],
                         thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
     """Use the thread's full roster name, never a server's inherited slot."""
+    from scripts.production import session_staff, staff
     phases = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
     candidates: list[dict[str, object]] = []
     for record in _open_passes(state).values():
@@ -5751,6 +5817,7 @@ def _start_wait(args: argparse.Namespace) -> None:
 
 
 def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
+    from scripts.direct import plan_history
     holder = _holder_from_args(args, _arg_string(args, "kind"))
     resolution = _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
@@ -5810,6 +5877,7 @@ def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, 
 
 
 def _finish_wait(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     if os.environ.get(PROBE_ENV) == "1":
         return
     state = _read_state(_session_dir(args))
@@ -5826,6 +5894,7 @@ def _finish_wait(args: argparse.Namespace) -> None:
 
 
 def _checkpoint(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     if os.environ.get(PROBE_ENV) == "1":
         return
     state = _read_state(_session_dir(args))
@@ -5872,6 +5941,7 @@ def resolve_checkpoint(commit: str, working_dir: Path, phase_id: str) -> (
 
 
 def _external_wait_file() -> Path:
+    from scripts.direct import plan_history
     return plan_history.history_root() / "wait_attribution.jsonl"
 
 
@@ -5897,6 +5967,7 @@ def _start_external_wait(args: argparse.Namespace) -> None:
 
 
 def _record_external_wait(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     commit = _arg_string(args, "commit")
     attribution = (ProductionHandoff(_arg_string(args, "production"), commit)
                    if _arg_string(args, "command") == "start-handoff-wait" else
@@ -5931,6 +6002,7 @@ def _record_external_wait(args: argparse.Namespace) -> None:
 
 
 def _finish_external_wait(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     if os.environ.get(PROBE_ENV) == "1":
         return
     path = _external_wait_file()
@@ -5946,6 +6018,7 @@ def _finish_external_wait(args: argparse.Namespace) -> None:
 
 
 def _showrunner_supplier(state: dict[str, object]) -> NamedSupplier | NoNamedSupplier:
+    from scripts.production import session_staff, staff
     try:
         resolver = session_staff.RowResolver(staff.snapshot())
         identity = resolve_production_unit(state, resolver=resolver)
@@ -5974,6 +6047,7 @@ def _turn_supplier(state: dict[str, object], reason: str) -> NamedSupplier | NoN
 
 def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | None = None) -> NamedSupplier | NoNamedSupplier:
     """Resolve the supplier alias at arrival, including a restarted showrunner."""
+    from scripts.production import session_staff, staff
     if identity.startswith("showrunner:"):
         from scripts.message import sessions
 
@@ -6170,6 +6244,7 @@ def _turn_waits_for_marker(marker: dict[str, object], waits: dict[str, dict[str,
 
 def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) -> bool:
     """Start a director's declared user/supplier wait once, before the stop."""
+    from scripts.direct import plan_history
     if os.environ.get(PROBE_ENV) == "1":
         return False
     lines = final_message.strip().splitlines()
@@ -6265,6 +6340,7 @@ def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
                         source_checkpoint: str, target_branch: str, merged_at: float,
                         issue: str = "") -> dict[str, object]:
     """Record a pushed merge once; callers must not call this for a rolled-back merge."""
+    from scripts.direct import plan_history
     if not all((project, merge_commit, source_checkpoint, target_branch)) or not (phase_id or issue):
         raise ValueError("A merge receipt needs its project, phase or issue, both commits, and target branch")
     path = plan_history.history_root() / "merge_receipts.jsonl"
@@ -6289,6 +6365,7 @@ def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
 
 
 def _history_window(args: argparse.Namespace) -> tuple[float, float]:
+    from scripts.direct import plan_history
     bounds: list[float] = []
     for name, default in (("since", 0.0), ("until", plan_history.now_epoch())):
         text = _arg_string(args, name)
@@ -6451,6 +6528,7 @@ def _read_waits(args: argparse.Namespace) -> None:
 
 
 def _read_receipts(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     since, until = _history_window(args)
     path = plan_history.history_root() / "merge_receipts.jsonl"
     receipts: list[dict[str, object]] = []
@@ -6493,6 +6571,7 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     workers. When the current phase closes, the most recently started older open
     phase becomes current again.
     """
+    from scripts.direct import phase_reservation, plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _optional_arg(args, "phase_id")
@@ -6563,12 +6642,14 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
 
 
 def _clear_run_pointer(session_dir: Path) -> None:
+    from scripts.production import staff
     for row in staff.initial_snapshot().rows:
         if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == session_dir.resolve():
             _ = staff.clear_run(row.id, session_dir)
 
 
 def _finish_run(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     now = plan_history.now_epoch()
@@ -6617,6 +6698,7 @@ def write_review_turn(session_dir: Path, metadata: Mapping[str, object], *,
                       reviewer: str, thread_id: str, lens: str, pass_number: int,
                       started_at: int, status: str, raised: int, details: Mapping[str, object]) -> None:
     """Store one review result without replacing another result from the same second."""
+    from scripts.direct import plan_history
     record: dict[str, object] = {
         "arm": "own", "unit": metadata.get("unit", ""), "phase": metadata.get("phase", ""),
         "phase_instance_id": metadata.get("phase_instance_id", ""),
@@ -6651,6 +6733,7 @@ def _review_trial(args: argparse.Namespace) -> None:
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
     Each time rounds to the nearest whole minute.
     """
+    from scripts.direct import plan_history
     from scripts.direct import findings
 
     session_dir = _session_dir(args)
@@ -6737,6 +6820,7 @@ def _review_trial(args: argparse.Namespace) -> None:
 
 
 def _aggregate(args: argparse.Namespace) -> None:
+    from scripts.direct import plan_history
     events, ignored = load_events()
     samples = _calibration_samples(events)
     requested_percent = _arg_integer(args, "percent", -1)
@@ -6773,6 +6857,7 @@ def _add_identity_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from scripts.production import staff
     parser = argparse.ArgumentParser(
         description="Record and aggregate durable unit progress events."
     )

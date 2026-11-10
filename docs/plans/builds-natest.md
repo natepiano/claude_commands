@@ -2444,7 +2444,7 @@ A whole gate starts 997 interpreter version checks instead of 3,351. At a paired
 
 **Ruled out:** a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
 
-### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: todo
+### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: done
 
 **Depends on:** none
 

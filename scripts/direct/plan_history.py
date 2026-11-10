@@ -8,13 +8,15 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
-from scripts.production import staff
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.production import session_staff  # noqa: E402
-from scripts.agents import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
+
+# The functions that read staff import it themselves, so a caller that reads
+# no staff does not pay about 25 ms CPU at each start.
+if TYPE_CHECKING:
+    from scripts.production import session_staff, staff
 
 
 # How far the percentage beside an ETA is assumed to be off when no calibration
@@ -94,11 +96,15 @@ def resolve_plan_path(working_dir: Path, value: str) -> Path:
 
 def plan_member(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> session_staff.MemberFound | session_staff.NoSuchMember:
     """Resolve the plan folder through the current staff worktree."""
+    from scripts.agents import remote
+    from scripts.production import session_staff, staff
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     return resolver.member_by_folder(remote.local_machine(), plan_path.expanduser().resolve().parent)
 
 
 def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[list[PlanPhase], list[str]]:
+    from scripts.agents import remote
+    from scripts.production import session_staff
     text = plan_path.read_text(encoding="utf-8")
     try:
         member = plan_member(plan_path, resolver=resolver)
@@ -189,6 +195,7 @@ def _text(value: object) -> str:
 
 def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
     """Resolve the director's current folder without changing its stored record."""
+    from scripts.production import staff
     if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
         return fields
     row = unit_runs.run_owner(fields, record)
@@ -218,6 +225,7 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
 def plan_runs(plan_path: Path, *,
               record: staff.StaffSnapshot | None = None) -> list[Path]:
     """Return this plan's durable run files, oldest first."""
+    from scripts.production import staff
     target = plan_path.expanduser().resolve()
     try:
         paths = list((history_root() / "runs").glob("*.jsonl"))
