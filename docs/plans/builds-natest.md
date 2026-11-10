@@ -2444,40 +2444,15 @@ A whole gate starts 997 interpreter version checks instead of 3,351. At a paired
 
 **Ruled out:** a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
 
-### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: todo
+### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: done (declined)
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+Declined by the builds showrunner on 2026-11-10: the gain is under the 30 CPU s per gate bar. Checkpoint `8c9858589` was reverted by `25ec7c5ef`; the code is unchanged.
 
-**Source:** the builds showrunner, 2026-11-10: go for `progress_history.py` and `plan_history.py` imports, in the Phase 117 delayed-import form; measure in pairs and send the gain with the checkpoint. The sdlc showrunner gave its go with two conditions: type-only imports stay under `TYPE_CHECKING` so basedpyright stays 0/0/0, and the notice reports the paired CPU per start before and after.
+- Change measured: `progress_history.py` and `plan_history.py` imported the staff, plan, reservation and worker modules inside the functions that use them, with type-only imports under `TYPE_CHECKING`.
+- `import scripts.direct.progress_history` went from about 87 ms to about 45 ms.
+- Paired CPU per start, minimum of 30 pairs on natedev under load: `start-wait` 132.5 to 106.2 ms, `finish-wait` 136.1 to 108.3, `start-activity` 132.7 to 108.3, `finish-activity` 133.7 to 105.0, `review-trial` 137.0 to 115.6. The saving is 21-29 ms per start, about 20 CPU s per gate at 772 starts.
+- The probe estimate (about 47 ms per start) was too high: every state read still loads `staff` (about 17 ms) for the run owner, and `models_registry` (about 14 ms) loads for a module constant.
 
-**Why:** a whole gate starts `scripts/direct/progress_history.py` about 772 times. Each start spends about 107 ms CPU on imports on natedev, 82.6 CPU s per gate. Most of it is dataclass definitions (about 0.36 ms each) in `staff.py`, `session_staff.py`, `unit_config.py` and `worker_lifecycle.py`, which most verbs never use. A probe with those modules absent cut the import by about 47 ms per start: about 36 CPU s per gate. Director calls get the same gain.
-
-**Goal:** a `progress_history.py` verb that does not use the staff, plan or reservation modules does not import them, and the paired CPU per start drops by about 40 ms.
-
-**Spec:**
-
-1. In `scripts/direct/progress_history.py`, import `plan_history`, `phase_reservation`, `worker_lifecycle`, `staff`, `session_staff`, `unit_config` and `remote` inside each function that uses them, as Phase 117 did for `findings`. Keep each name under `TYPE_CHECKING` for annotations.
-2. In `scripts/direct/plan_history.py`, import `staff`, `session_staff` and `remote` inside each function that uses them, with the same `TYPE_CHECKING` rule.
-3. No behavior change. No test change unless a test patches a moved name.
-4. Prove with `python3 -X importtime` that `import scripts.direct.progress_history` loads none of the seven modules.
-5. Measure the CPU per start in same-load random-order pairs, phase base against the change, for one verb that `verify.sh` calls (`finish-wait`) and for `--help`-free `review-trial`; multiply by 772 for the per-gate estimate.
-
-**Files:**
-- `scripts/direct/progress_history.py` — delayed imports; owner sdlc, go given
-- `scripts/direct/plan_history.py` — delayed imports; owner sdlc, go given
-
-**Workers:** 1 writer; one mechanical change in two files
-- `impl` — all files
-
-**State:** none
-
-**Constraints from prior phases:** Phase 117 form: the import sits at the function that uses it; a test that patches a delayed import patches the package attribute. Shared import costs overlap, so a single-import ranking overstates the saving by about half. Tests use no live state.
-
-**Acceptance gate:**
-- `import scripts.direct.progress_history` loads none of the seven modules.
-- The paired CPU per start, before and after, is reported.
-- The importers of `progress_history.py` and `plan_history.py` pass.
-- `basedpyright` reports 0 errors, 0 warnings, 0 notes for both files.
-- A targeted test on the change passes.
+**Ruled out:** a recorder import phase while every state read needs `staff`; a larger gain needs a recorder that does not resolve the owner through staff on each start.
