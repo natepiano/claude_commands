@@ -50,13 +50,7 @@ from scripts.astra import design_roles  # noqa: E402
 
 
 def _seat_session_dir() -> Path | None:
-    """The unit's session directory when this Codex process is one of its workers.
-
-    The worker's own run comes first: the launcher names it as UNIT_RUN_DIR in the
-    environment of every app-server it starts for a run, and a director running phases side by
-    side marks just one of their runs. The marker is read when that variable is unset or names a
-    folder that is gone, so a stale variable never lets an edit through unchecked.
-    """
+    """Read the worker's run from its environment, then the director's staff row."""
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         return None
@@ -64,11 +58,9 @@ def _seat_session_dir() -> Path | None:
     if board and Path(board).is_dir():
         return Path(board)
     try:
-        marker = unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None)
-        lines = marker.read_text(encoding="utf-8").splitlines()
+        run = unit_runs.open_run(session_id)
     except (OSError, UnicodeError):
         return None
-    run = Path(lines[0].strip()) if lines and lines[0].strip() else None
     return run if run is not None and run.is_dir() else None
 
 

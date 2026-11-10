@@ -200,6 +200,7 @@ class RemoteCopiesTests(unittest.TestCase):
         fixture = OffloadCommandFixture()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
+        fixture.environment["STAFF_FILE"] = os.environ["STAFF_FILE"]
         fixture.fixture["hold_run"] = True
         fixture.sync_fixture()
         process = fixture.start_command(extra={"CLAUDE_CODE_SESSION_ID": holder.current_session,

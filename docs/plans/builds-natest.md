@@ -1638,12 +1638,12 @@ The verify hold and token wait fixtures keep every run root inside the test root
 
 - A test reads the mirrors that the claim reply carries.
 - `test_claim_server_keeps_a_second_admission_waiting_until_release` shows that a second admission waits while the lock is held.
-- `RemoteEntryTests.setUp` sets `UNIT_ACTIVE_DIR` inside the test root before `warm_claim_servers()`, so admission reads no live active marker.
+- `RemoteEntryTests.setUp` sets a private `STAFF_FILE` inside the test root before `warm_claim_servers()`, so admission reads no live run pointer.
 
 **Files:**
 - `scripts/copies/test_review_remote_copies.py` — the module
 
-**Gotchas:** an inherited `UNIT_RUN_DIR` moves the active folder outside the test root unless `UNIT_ACTIVE_DIR` is set.
+**Gotchas:** without a private `STAFF_FILE`, admission reads the live staff record and its run pointers.
 
 **Ruled out:** a CPU claim; the before and after samples ran under different loads.
 
@@ -2373,9 +2373,10 @@ Replay over the last 20 first-parent merges on `origin/builds`, one graph from t
 6. Prove the change with one whole-gate pair, phase base against the change, at the same load, on the merge-gate module set. One pair costs about 45 minutes and 10,000 CPU s. Keep the revisions, load, filesystem roots, bytecode conditions, signal evidence and complete results outside the disposable copies.
 
 **Files:**
-- `scripts/direct/progress_history.py` — heavy imports that the ranking names; the final list follows the ranking
-- `scripts/lib/` — one small helper, only if several sites need it
-- `scripts/direct/test_review_launcher.py` — the module whose timeout sets the repair; the first reply names each further file and its owner
+- `scripts/direct/phase_table.py` — delayed `unit_lookup` import; owner devtools-unit
+- `scripts/direct/progress_history.py` — delayed `findings` import; owner verify-unit
+- `scripts/mac_test/mac_test.py` — delayed `offload` and `buildlog.sync` imports; owner verify-unit
+- `scripts/copies/test_review_remote_copies.py` — the patch target of `offload` moves with the delayed import
 
 **Workers:** 1 writer; the ranking, the changes and the proof depend on one another
 - `impl` — all the files the ranking names
@@ -2391,3 +2392,16 @@ Replay over the last 20 first-parent merges on `origin/builds`, one graph from t
 - The pair shows the CPU saved per gate and no new failure. A missing result, a timeout, a signal stop or a new skip counts as no saving.
 - `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed file.
 - Each changed file's module tests pass.
+
+### Phase 118 — The test_times report tests pass on every date  · status: done
+
+#### As-built
+
+`REPORT_PROCESS` in `scripts/test_times/test_show.py` replaces the report module's `datetime` with a subclass whose `now` returns the time in `TEST_REPORT_EPOCH`. `report_process` sets `TEST_REPORT_EPOCH` to `EPOCH + 300`, the time the in-process `ReportTime` returns. The report child and the in-process tests use the same fixed clock, so the module passes 33 of 33 tests on every date. The first-report test expects the same-day stamp `rows as of 09:30 EST`; the module-report stamp test keeps the other-day stamp.
+
+**Files:**
+- `scripts/test_times/test_show.py` — the report child's fixed clock
+
+**Gotchas:** A patch of `show.datetime` in the parent does not reach a child process; every child report needs `TEST_REPORT_EPOCH`. A fixed fixture date with the seven-day `TOP_MAX_AGE_DAYS` window fails seven days after that date when the clock is real.
+
+**Ruled out:** fast track for this file, because it refuses Python files that import `scripts/production/staff.py`.

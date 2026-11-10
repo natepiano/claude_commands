@@ -195,9 +195,9 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
     director = staff.runtime_id()
     session = args.session_dir
     if not session:
-        marker = unit_runs.marker(director, os.environ.get("UNIT_ACTIVE_DIR"))
-        if marker.is_file():
-            session = marker.read_text().strip()
+        opened = unit_runs.open_run(director)
+        if opened is not None:
+            session = str(opened)
         elif unit_runs.environ("RUN_DIR"):
             session = unit_runs.environ("RUN_DIR")
         else:
@@ -750,7 +750,7 @@ def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
         own_names = {slot, *(text(entry.get("worker_name")) for entry in passes if entry.get("worker_name"))}
         if names - own_names:
             return
-        held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), env.get("UNIT_ACTIVE_DIR"), record=record)
+        held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), record=record)
         if {Path(folder).resolve() for folder in held} != {run}:
             return
         commands = ([PYTHON, PROGRESS, "finish-run", "--session-dir", str(run), "--status", "error"],

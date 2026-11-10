@@ -12,6 +12,8 @@ import textwrap
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
 from typing import NamedTuple, cast, override
 from unittest.mock import patch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -166,7 +168,8 @@ class IsolatedHookTests(unittest.TestCase):
             "CLAUDE_CONTEXT_HOOK_DEBUG": "0", "CLAUDE_CONTEXT_HOOK_MODE": "dynamic",
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause"),
             "FN_LENGTH_HOOK_STATE": str(self.root / "fn-length"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         })
@@ -297,13 +300,13 @@ class RealHookEquivalenceTests(IsolatedHookTests):
                     self.assertEqual(outcome.output, {})
 
     def test_dispatcher_allows_stop_during_an_active_run_near_compaction(self) -> None:
-        session_id = "dispatcher-active-director"
+        session_id = fixture_runtime_id("dispatcher-active-director")
         run = self.root / "unit-run"
         run.mkdir()
         _ = (run / "director").write_text(session_id + "\n", encoding="utf-8")
-        markers = Path(self.environment["UNIT_ACTIVE_DIR"])
-        markers.mkdir()
-        _ = (markers / session_id).write_text(str(run) + "\n", encoding="utf-8")
+        row = staff.StaffRow(staff.StaffId(session_id), "showrunner", "director", staff.StaffRoot(),
+                             current_session=staff.StaffId(session_id), run=staff.OpenRun(run))
+        _ = Path(self.environment["STAFF_FILE"]).write_text(json.dumps({"schema": 2, "rows": [row.to_json()]}))
         settings = self.home / ".claude/settings.json"
         settings.parent.mkdir(parents=True)
         _ = settings.write_text(json.dumps({"autoCompactWindow": 200_000}), encoding="utf-8")

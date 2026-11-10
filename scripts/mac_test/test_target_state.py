@@ -104,7 +104,7 @@ class IsolatedTargetState(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "CLAUDE_CODE_SESSION_ID": "",
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))

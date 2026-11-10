@@ -338,7 +338,6 @@ class MergeGateLedgerTests(MergeGateFixture):
 
     def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
         from scripts.production import showrunners, staff
-        from scripts.production.staff_test_support import fixture_member
         from scripts.agents import remote
 
         production = self.checkout / "quiet-production.md"
@@ -346,7 +345,8 @@ class MergeGateLedgerTests(MergeGateFixture):
         output = io.StringIO()
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "", "STAFF_FILE": str(self.root / "staff.json")}
         with mock.patch.dict(os.environ, environment):
-            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), production))
+            owner = showrunners.owner_for("quiet", staff.local_snapshot())
+            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), production))
         with mock.patch.dict(os.environ, environment), \
                 mock.patch.object(showrunners, "timer_docs", return_value={"quiet": production}), \
                 mock.patch.object(showrunners, "tell", return_value="could not tell quiet: offline") as send, \

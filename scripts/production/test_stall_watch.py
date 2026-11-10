@@ -2620,9 +2620,7 @@ always=natedev
                     _ = held_folder.rename(outside_folder)
                     held_folder = outside_folder
                     self.unheld_runs.add("unit-one")
-                    active = self.root / "held" / "active"
-                    active.mkdir()
-                    _ = (active / director.current_session).write_text(str(held_folder) + "\n")
+                    _ = staff.set_run(director.id, staff.OpenRun(held_folder))
                 detached_folder = held_folder / "detached_runs"
                 if detached_status:
                     detached_folder.mkdir(parents=True, exist_ok=True)

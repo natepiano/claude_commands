@@ -300,7 +300,7 @@ question, never on a path. Use the unit's own reviewer under <TeamReview/> and d
 On completion, read the dispatch's status and summary paths.
 A successful dispatch continues as above. An error applies <WorkerLaunchFailure/>.
 If the error remains, apply <RetainPhaseReservation/> and report the fix log.
-Record the error, clear the session marker, and stop.
+Record the error. Clear the run pointer in the director's staff row. Stop the run.
 The launcher records either outcome in the ledger.
 Apply the recovery in <LongLivedWorkers/> first, because the pane worker can still finish the round.
 Run `abandon` only when that recovery cannot finish it.
