@@ -70,7 +70,12 @@ def capacity_error(reason: str) -> bool:
 
 def aws_down(reason: str) -> bool:
     return any(code in reason for code in ('Could not connect to the endpoint', 'EndpointConnectionError',
-                                           'ServiceUnavailable', 'InternalError', 'RequestTimeout', 'Connection timed out'))
+                                           'ServiceUnavailable', 'InternalError', 'RequestTimeout', 'Connection timed out',
+                                           'InternalFailure', 'ServerInternal', '(Unavailable)'))
+
+
+def definite_refusal(reason: str) -> bool:
+    return 'An error occurred (' in reason and not aws_down(reason)
 
 
 def launch_error_code(reason: str) -> str:
@@ -308,6 +313,8 @@ class GateWorker:
                     launch = {}
                     save(path, {'variant': offset + 1})
                     continue
+                if not definite_refusal(str(error)):
+                    raise
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                 return LocalFallback(f'{size} in {ledger.text(subnet, "zone")}: {launch_error_code(str(error))}')
             instances = ledger.rows(reply, 'Instances')
@@ -383,7 +390,8 @@ class GateWorker:
             return {'status': 'complete', 'instance': instance, 'result': row}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
-            if not launch.get('instance'):
+            # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
+            if 'arguments' not in launch:
                 self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
             if row and not gate_box.decode_run(row['gate']).passed:
                 return {'status': 'complete', 'result': row}

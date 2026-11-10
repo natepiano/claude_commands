@@ -69,6 +69,7 @@ settings = {
     'build_budget_gib': values['loopback.build_budget_gib'],
     'target_budget_gib': values['loopback.target_budget_gib'],
     'free_floor_gib': values['loopback.free_floor_gib'],
+    'abandoned_session_minutes': values['abandoned_session_minutes'],
 }
 import shutil
 mirror = home / '.local/state/build-target/mirror/proof/1'
@@ -93,6 +94,7 @@ def main() -> int:
     registry = Path(os.environ.get('BUILD_TARGETS_CONFIG', str(root / 'config/build_targets.conf'))).expanduser()
     config = conf.read(registry)
     values = config.values()
+    values['abandoned_session_minutes'] = str(conf.read('mac_test').whole('abandoned_session_minutes'))
     memory = int(linux_runner.positive_setting(values, 'loopback.memory_gib') * admission_records.GIB)
     # The isolated fixture has no history for nextest, check or doc.
     try:
