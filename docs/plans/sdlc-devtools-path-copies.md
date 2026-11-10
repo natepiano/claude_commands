@@ -13,7 +13,7 @@ The staff row owns the current unit folder. Other records must use the staff ide
 | Worker review context | Recorder dispatch and prompt records | `direct/assign.py`, `direct/progress_history.py` | Native worker assignment and completion |
 | Progress state and history | `progress_history_state.json` and history events | `direct/progress_history.py` | Run, phase, worker, cleanup, and usage readers |
 | Run folder marker | run folder: `working_dir` | direct launch/progress paths, `direct/workers.py` relocation | `retire_unit`, `unit_move`, run discovery |
-| Active run marker | `unit/active/<session id>` names the run; `<run>/active_marker` names the mark | `lib/unit_runs.py:activate` | Run discovery, shutdown inventory, and `unit_runs.end` |
+| Open run pointer | The director's staff row stores `run` | `staff.set_run` | Run discovery and `staff.clear_run` |
 | Detached command record | `detached_runs/*.json`: command folder and arguments | `agents/detached_runs.py` | Supervisor, delivery, duplicate detection, and lifecycle consumers |
 | Dev-shell record, removed | No current mesh dev-shell record | No writer | Native pane launch owns its environment |
 | Rename journal, deleted | No new record | Removed from `production/rename_unit.py` | Staff supplies the folder |

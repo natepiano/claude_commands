@@ -101,15 +101,11 @@ start; read that record.
 
 1. **The argument**, when one is given.
 
-2. **The `/unit:direct` run active in this session.** `/unit:direct` writes
-   `/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}` (under `delegate/` for a run
-   started before the folder rename) containing the run's
-   session directory, whose basename is the run id:
+2. **The open `/unit:direct` run in this session.** The director's staff row
+   records the run folder in `run`. `unit_runs.open_run` selects the row by
+   `current_session`.
 
-   The marker is keyed by Claude session id, so a hit means *this* session's run —
-   the currently executing plan, unambiguously.
-
-3. **The most recent run in this working directory**, when no marker exists
+3. **The most recent run in this working directory**, when the staff row has no run
    (the run already ended, or this is a fresh session in the same repo). State
    the run's timestamp when falling back to this, so a stale match is visible:
    `No active run — using the plan from the <timestamp> run in this directory:
@@ -125,13 +121,12 @@ start; read that record.
        with open(pathlib.Path.home() / ".claude/scripts/lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
    except FileNotFoundError:
        pass
-   from scripts.lib.unit_runs import history_root
-   sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-   markers = [pathlib.Path(f"/tmp/claude/{name}/active/{sid}") for name in ("unit", "delegate")]
-   marker = next((path for path in markers if path.is_file()), markers[0])
+   from scripts.lib.unit_runs import history_root, open_run
+   from scripts.production import staff
+   sid = staff.runtime_id()
+   opened = open_run(sid)
    runs = history_root() / "runs"
-   active = runs / f"{pathlib.Path(marker.read_text().strip()).name}.jsonl" \
-       if sid and marker.is_file() else None
+   active = runs / f"{opened.name}.jsonl" if opened is not None else None
 
    def started(rec):
        for line in rec.read_text().splitlines():
@@ -154,10 +149,10 @@ start; read that record.
        print("no run record")
    ```
 
-   The `(active is not None and i == 0)` guard decides the match: the marker's run
-   is authoritative regardless of directory, but without a marker only a run whose
-   `working_dir` **is** the cwd may match. Dropping the guard makes the newest run
-   on the machine win from any directory.
+   The `(active is not None and i == 0)` guard selects the match.
+   The staff row's run takes priority in any directory.
+   Without that pointer, a run matches only when its `working_dir` equals the cwd.
+   Without the guard, the newest run on the machine can match from any directory.
 
 4. **A single plan doc in conversation**, if the durable lookup found nothing.
 

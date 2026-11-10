@@ -1638,12 +1638,12 @@ The verify hold and token wait fixtures keep every run root inside the test root
 
 - A test reads the mirrors that the claim reply carries.
 - `test_claim_server_keeps_a_second_admission_waiting_until_release` shows that a second admission waits while the lock is held.
-- `RemoteEntryTests.setUp` sets `UNIT_ACTIVE_DIR` inside the test root before `warm_claim_servers()`, so admission reads no live active marker.
+- `RemoteEntryTests.setUp` sets a private `STAFF_FILE` inside the test root before `warm_claim_servers()`, so admission reads no live run pointer.
 
 **Files:**
 - `scripts/copies/test_review_remote_copies.py` — the module
 
-**Gotchas:** an inherited `UNIT_RUN_DIR` moves the active folder outside the test root unless `UNIT_ACTIVE_DIR` is set.
+**Gotchas:** without a private `STAFF_FILE`, admission reads the live staff record and its run pointers.
 
 **Ruled out:** a CPU claim; the before and after samples ran under different loads.
 

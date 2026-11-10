@@ -15,7 +15,10 @@ import subprocess
 import sys
 from pathlib import Path
 from types import FrameType
-from typing import NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, NoReturn, TypedDict, cast
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 
 HOOK_BUDGET_SECONDS = 5
@@ -47,15 +50,12 @@ def _record_typed_prompt() -> None:
         )
 
 
-def _record_activity(session_id: str, source: str, prompt: str) -> None:
-    """Send classified activity from a showrunner or unit director session.
-
-    The call runs detached, so neither natedev's push nor the Mac's ssh slows the prompt.
-    """
+def _record_activity(session_id: str, source: str, prompt: str, record: staff.StaffSnapshot) -> None:
+    """Send the session activity without blocking the prompt hook."""
     try:
         from scripts.hooks import conversation_pause
 
-        if not conversation_pause.is_showrunner_or_unit_director(session_id):
+        if not conversation_pause.is_showrunner_or_unit_director(session_id, record=record):
             return
         override = os.environ.get("AUTO_SILENCE_COMMAND")
         script = Path(__file__).resolve().parent.parent / "notify" / "auto_silence.py"
@@ -102,19 +102,15 @@ def main() -> None:
             conversation_pause.scheduled_senders,
             lambda: conversation_pause.read_scheduled_prompts(session_id),
         )
-        # Classify before matching the declared wait. A timer or unrelated
-        # message does not supply the answer. Read the marker directly so long
-        # waits survive active_run's liveness timeout.
-        from scripts.hooks.direct_run import marker_path
+        # Read the staff pointer so long waits retain the current run.
+        from scripts.lib import unit_runs
 
-        try:
-            run_text = marker_path(session_id).read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            run_text = ""
-        if run_text:
+        record = conversation_pause.session_staff(session_id)
+        run = unit_runs.open_run(session_id, record=record)
+        if run is not None:
             from scripts.direct.progress_history import finish_turn_wait
 
-            finish_turn_wait(Path(run_text), session_id, source=source.name, prompt=prompt)
+            finish_turn_wait(run, session_id, source=source.name, prompt=prompt)
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
         activity_source = {conversation_pause.PromptSource.TYPED: "UserTypedPrompt",
@@ -123,9 +119,9 @@ def main() -> None:
                            conversation_pause.PromptSource.NOTICE: "HarnessNotice"}[source]
         if not prompt.strip():
             activity_source = "UnknownPrompt"
-        _record_activity(session_id, activity_source, prompt)
+        _record_activity(session_id, activity_source, prompt, record)
         reply = conversation_pause.message_arrived(
-            session_id, source, prompt, conversation_pause.now_epoch())
+            session_id, source, prompt, conversation_pause.now_epoch(), record=record)
         if reply is conversation_pause.NoReply.NOTHING:
             return
         result: dict[str, object] = {

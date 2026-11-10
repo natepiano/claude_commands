@@ -1037,9 +1037,9 @@ class StaffTestCase(unittest.TestCase):
         })
         write_text_atomic(run / "director", director + "\n")
         if director_run:
-            from scripts.lib import unit_runs
-
-            write_text_atomic(unit_runs.marker(director), str(run) + "\n")
+            owner = staff.local_snapshot().by_current_session(director)
+            assert owner is not None
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
         return run
 
     @contextmanager

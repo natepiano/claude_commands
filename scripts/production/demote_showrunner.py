@@ -92,7 +92,7 @@ def child_plan(child: Production, plan: Path) -> Path:
     return plan
 
 
-def checked(parent: Production, name: str, plan: Path, record: staff.StaffSnapshot,
+def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault, record: staff.StaffSnapshot,
             port: unit_config.AppPort | unit_config.NoAppPort) -> Demotion:
     try:
         row = showrunners.owner_for(name, record)
@@ -101,7 +101,15 @@ def checked(parent: Production, name: str, plan: Path, record: staff.StaffSnapsh
     if row.parent != staff.ReportsTo(parent.owner.id):
         raise Refusal(f"{name} is not attached to {parent.name}")
     child = read_production(row, record=record)
+    if isinstance(plan, unit_config.PlanDefault):
+        saved_plan = unit_config.default_plan(child.checkout, child.doc)
+        if not isinstance(saved_plan, unit_config.PlanFile):
+            raise Refusal(f"plan default is missing; looked in {child.checkout / '.unit.toml'} and {child.doc}")
+        plan = saved_plan.path
     plan = child_plan(child, plan)
+    if isinstance(port, unit_config.NoAppPort):
+        saved = unit_config.read(child.checkout, cleanup=False)
+        port = unit_config.default_port(child.checkout, saved.port if isinstance(saved, unit_config.UnitConfig) else port)
     add_unit.require_merge_branch(parent)
     marked = live_session(row.current_session, record)
     if isinstance(marked, unit_lookup.NoSession) or not isinstance(marked.claude, unit_lookup.LiveClaude):
@@ -300,7 +308,7 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("child")
-    _ = parser.add_argument("--plan", required=True, type=Path)
+    _ = parser.add_argument("--plan", default=unit_config.PlanDefault(), type=Path)
     _ = parser.add_argument("--check", action="store_true")
     _ = parser.add_argument("--port", type=int)
     args = parser.parse_args(argv)
@@ -308,7 +316,7 @@ def _main(argv: list[str]) -> int:
     parent = read_production(showrunners.own_name(), record=record)
     name = cast(str, args.child)
     path = record_path(parent, name)
-    plan = cast(Path, args.plan)
+    plan = cast(Path | unit_config.PlanDefault, args.plan)
     raw_port = cast(int | None, args.port)
     port = unit_config.NoAppPort() if raw_port is None else unit_config.AppPort(raw_port)
     fields: dict[str, object] = {}
@@ -320,10 +328,12 @@ def _main(argv: list[str]) -> int:
             fields = {}
     if fields:
         request = saved_request(parent, fields)
-        if child_plan(request.child, plan) != request.plan or port != request.port:
+        if ((isinstance(plan, Path) and child_plan(request.child, plan) != request.plan)
+                or (raw_port is not None and port != request.port)):
             raise Refusal(f"{name}: the pending demotion uses {request.plan} and port {request.port}")
     else:
         request = checked(parent, name, plan, record, port)
+    port = request.port
     if cast(bool, args.check):
         print(f"check: {name} can become a unit of {parent.name}")
         return 0
@@ -348,7 +358,7 @@ def main(argv: list[str]) -> int:
         with staff.operation():
             try:
                 return _main(argv)
-            except Refusal as error:
+            except (Refusal, unit_config.ConfigRefused) as error:
                 print(f"demote_showrunner: {error}", file=sys.stderr)
                 return 2
             except (OSError, ValueError, accounts.AccountsError, update_registration.RegistrationFailure, herdr.HerdrFailure) as error:
