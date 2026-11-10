@@ -2380,7 +2380,7 @@ Four shared imports load at the function that uses them: `unit_lookup` in `read_
 
 **Ruled out:** fast track for this file, because it refuses Python files that import `scripts/production/staff.py`.
 
-### Phase 119 — A targeted test with no selected module ends at once and starts no cloud box  · status: todo
+### Phase 119 — A targeted test with no selected module ends at once and starts no cloud box  · status: done
 
 **Depends on:** none
 
@@ -2397,8 +2397,8 @@ Four shared imports load at the function that uses them: `unit_lookup` in `read_
 1. One function in `merge_gate.py` makes the targeted selection: the tested tree, the passed-tree ledger, `select_affected` and `report_selection`. `run_suites` and the cloud path both use it. Remove the copy in `cloud_gate.prepare`.
 2. `run_gate_suites` makes the selection before `cloud.route` when the mode is `SuiteMode.TARGETED_TEST` and `full` is false.
 3. When that selection is an `AffectedSelection` with no modules, `run_gate_suites` returns `GateRun((), 0.0, 0.0, selection_certified=True)` at once. Requested type directories still run locally, as they do after a cloud run. Only a selection with no affected test passes this way. A requested type directory that does not exist stays an error. A targeted test takes no package name and no filter.
-4. A non-empty selection goes to the route as `SelectedModules`, and `prepare` uses those paths. The selection runs once per targeted test.
-5. The cloud route keeps its local fallback. A fallback run uses the same selected modules.
+4. A non-empty selection goes to the route as `TreeSelection`, which holds the module paths and the Git tree that the selection read. `prepare` uses those paths and refuses when its snapshot is another tree. A refusal starts no box and becomes the local fallback.
+5. The cloud route keeps its local fallback. A fallback run makes its own selection against the tree that it runs. An edit made while the cloud reservation waits is never tested with a selection from the older tree.
 6. A merge gate and `--full` keep the full suite and the current route.
 7. Add rows to the existing tests. Do not add a new test module.
 
@@ -2417,7 +2417,8 @@ Four shared imports load at the function that uses them: `unit_lookup` in `read_
 
 **Acceptance gate:**
 - A targeted test with no changed path prints the selection, ends with exit 0 and starts no cloud box.
-- `select_affected` runs once per targeted test.
+- `select_affected` runs once per targeted test on the cloud path; a local fallback selects once more against its own tree.
+- A checkout that changes after the selection starts no box and is not tested with the older selection.
 - The module tests of each changed file pass.
 - `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed file.
 - A targeted test on the change passes.
