@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.direct import plan_history
 from scripts.lib import unit_runs
 from scripts.lib.user_zone import user_zone
-from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production import session_staff, staff, unit_config, unit_names
 from scripts.production.production_doc import Refusal, production_field
 from scripts.agents import remote
 
@@ -43,6 +43,8 @@ class Production(NamedTuple):
 
 
 def read_production(path: Path, *, resolver: session_staff.RowResolver | None = None) -> Production:
+    from scripts.production import unit_lookup
+
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     try:
         owner = unit_lookup.doc_owner(path.expanduser(), resolver.record)

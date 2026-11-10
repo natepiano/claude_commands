@@ -23,6 +23,8 @@ from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
@@ -66,9 +68,9 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
-        self.enterContext(mock.patch.dict(os.environ, {"UNIT_ACTIVE_DIR": str(self.root / "active")}))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
-        _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
+        _ = self.enterContext(mock.patch("scripts.mac_test.offload", offload))
         self.source = self.root / "checkout"
         self.source_seed.copy_to(self.source, self.root / "origin.git")
         self.mirror = self.root / "mirrors/repository"
@@ -744,15 +746,14 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 _ = offload.run_offload(controller, bad_config, request, 0)
 
     def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
-        active = self.root / "active"
-        active.mkdir()
         run = self.root / "unit-run"
-        _ = (active / "director-session").write_text(str(run))
+        owner = fixture_member("showrunner", name="director-session")
+        _ = staff.set_run(owner.id, staff.OpenRun(run))
         environment = {key: value for key, value in os.environ.items()
                        if key not in {"UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR",
-                                      "PLAN_DELEGATE_SESSION_DIR", "UNIT_ACTIVE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
+                                      "PLAN_DELEGATE_SESSION_DIR", 
                                       "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}}
-        environment.update(UNIT_RUN_DIR=str(run), UNIT_ACTIVE_DIR=str(active),
+        environment.update(UNIT_RUN_DIR=str(run),
                            CLAUDE_CODE_SESSION_ID="worker-shell-session")
         with mock.patch.dict(os.environ, environment, clear=True):
             args = offload.parser().parse_args([
@@ -763,7 +764,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             mirror = offload.request_mirror(config, request, offload.KnownRepository("repository"))
             with copies.remote_lease(mirror):
                 copies.register_remote(mirror)
-                with self.assertRaisesRegex(copies.CopyError, "busy; held by session director-session"):
+                with self.assertRaisesRegex(copies.CopyError, f"busy; held by session {owner.current_session}"):
                     copies.remove_trees(mirror.owner)
 
     def test_failed_admission_keeps_both_local_and_remote_owners(self) -> None:

@@ -27,7 +27,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 
 HOOKS = Path(__file__).resolve().parent
-SESSION = "wait-director"
+SESSION = fixture_runtime_id("wait-director")
 SHOWRUNNER_SESSION = fixture_runtime_id("wait-showrunner")
 STOP = "stop-direct-continue.py"
 PROMPT = "user-prompt-submit-conversation-pause.py"
@@ -98,9 +98,6 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         _ = history.write_text(json.dumps({"schema_version": 1, "event_type": "phase_started", "run_id": "run",
                                           "phase_id": "6", "phase_instance_id": "original-six",
                                           "timestamp_epoch": 1000, "wait_coverage": {"state": "Recorded"}}) + "\n")
-        active = root / "active"
-        active.mkdir()
-        _ = (active / SESSION).write_text(str(run))
         true_command = shutil.which("true")
         false_command = shutil.which("false")
         if true_command is None or false_command is None:
@@ -115,7 +112,9 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         resources.enter_context(isolated_staff_file(root / "staff.json", staff_environment))
         _ = fixture_member("showrunner", name="expected-showrunner",
                            runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc(remote.local_machine(), document))
-        _ = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
+        owner = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
+        owner = staff.update_current_session(owner.id, staff.native_id(SESSION))
+        _ = staff.set_run(owner.id, staff.OpenRun(run))
         sessions = root / "sessions"
         sessions.mkdir()
         for index, name in enumerate(("expected-showrunner", "claude-build-followups-other", "claude-one", "claude-two", "postmaster")):
@@ -147,7 +146,7 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         )))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root), "XDG_STATE_HOME": str(root / "state"),
-            "UNIT_ACTIVE_DIR": str(active), "UNIT_HISTORY_DIR": str(root / "history"), "UNIT_SYNC_WRITES": "0",
+            "UNIT_HISTORY_DIR": str(root / "history"), "UNIT_SYNC_WRITES": "0",
             "CLAUDE_PROBE_SESSION": "0", "CLAUDE_CODE_SESSION_ID": SESSION,
             "CONVERSATION_PAUSE_STATE_DIR": str(root / "pause"), "NOTIFIER_STATE_DIR": str(root / "notifier"),
             "SHOWRUNNER_STATE_DIR": str(root / "showrunner"), "ESCALATE_STATE_DIR": str(root / "escalate"),

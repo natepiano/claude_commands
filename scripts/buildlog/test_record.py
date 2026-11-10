@@ -141,7 +141,7 @@ class RecordTests(unittest.TestCase):
         environment["BUILDLOG_DIR"] = str(self.root)
         environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
         environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
-        environment["UNIT_ACTIVE_DIR"] = str(self.base / "active")
+        environment["STAFF_FILE"] = str(self.base / "staff.json")
         environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
         environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
         environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""

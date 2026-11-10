@@ -199,7 +199,10 @@ Run files keep staff references instead of copied native identities.
   It retains newlines, tabs, and the last 4000 characters.
   With no readable text, the summary is `The background agent <name> produced no summary.`
   It preserves the log and any summary that the worker writes.
-- `scripts/direct/unit_notifier.sh <claude_session_id> [on|off]` reads the marker `<session id>` from `UNIT_ACTIVE_DIR`, else from `/tmp/claude/unit/active` or `/tmp/claude/delegate/active` (it names the session directory; its basename is the run id). No mode creates the `unit-<run id>` instance (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains) (`--every` from `UNIT_PROGRESS_INTERVAL_SECONDS` rounded up to minutes, `--hold`, check `direct_run.py check`); `off` runs `notifier.sh stop unit-<run id>` and prints `progress updates off: unit-<run id>`; `on` runs `notifier.sh start` and prints `progress updates on: unit-<run id> <next_due line>` (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains). A missing or empty marker exits 1 and changes nothing; a `notifier.sh` failure passes its message and status through; a bad mode word or more than two arguments prints the usage and exits 2.
+- The director's staff row records its open run folder in `run`.
+  `unit_runs.open_run(session_id)` reads that pointer.
+  `direct_run.py check` uses the pointer to identify the current run.
+  The notifier instance uses `unit-<run id>` or the former `delegate-<run id>` prefix.
 - `/unit:report [tables|on|off]` (`commands/unit/report.md`): `on` or `off` runs `zsh ~/.claude/scripts/direct/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`, relays its line and composes no report; a failure is relayed as printed. A Codex unit has no notifier, so the command says the switch is unavailable there.
 
 ## Invariants
