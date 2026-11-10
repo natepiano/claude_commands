@@ -1000,6 +1000,31 @@ class AccountsTests(unittest.TestCase):
         })
         self.assertEqual(decode_session_counts(json.dumps(published), published["machine"]), published)
 
+    def test_open_worker_counts_use_the_recorded_home_with_shared_sessions(self) -> None:
+        from scripts.herdr import worker_panes
+        from scripts.herdr.test_worker_panes import PaneWorld
+        from scripts.production.staff_test_support import unit_membership
+
+        numbered = self.home / ".codex1"
+        shared = self.home / ".codex" / "sessions"
+        shared.mkdir(parents=True)
+        numbered.mkdir()
+        (numbered / "sessions").symlink_to(shared, target_is_directory=True)
+        owner = unit_membership("show", "unit")
+        owner = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
+        row = fixture_worker("shared-worker", owner.id, backend=staff.CodexBackend(numbered))
+        _ = staff.set_home(row.id, staff.SessionHome(numbered))
+        world = PaneWorld()
+        world.add(owner, "w1:p0")
+        world.add(row, "w1:p99", family="codex")
+        read_sessions = cast(Callable[..., accounts.LocalRoleSessions], getattr(accounts, "_read_local_role_sessions"))
+        with (patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}),
+              patch.object(worker_panes, "_client", return_value=world),
+              patch.object(herdr, "native_process", side_effect=world.native_process),
+              patch.object(herdr, "_startup_processes", side_effect=world.descendants)):
+            observed = read_sessions(accounts.GroupAccounts())
+        self.assertEqual(observed.counts[(numbered, "workers")], {row.current_session: "idle"})
+
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
         row = SharedStatusDocumentTests().row()
         now = datetime.now(timezone.utc)

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.agents import worker_lifecycle
+from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
 from scripts.production import staff, session_staff
 from scripts.agents.stop_results import ReleaseSource, SourceReleased
@@ -466,6 +467,7 @@ def publish(allowed: WorkerStartAllowed, runtime_id: str) -> PublishedWorker:
                 row = staff.update_current_session(allowed.slot.row.current_session, identity)
             else:
                 row = staff.ensure_worker(identity, allowed.name, allowed.parent)
+            row = pane_launch.staff_admitted(row)
         return PublishedWorker(row)
     except worker_lifecycle.OperationDeadlineExpired:
         raise

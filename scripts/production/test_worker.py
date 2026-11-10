@@ -2243,7 +2243,7 @@ class WorkerCommandTests(unittest.TestCase):
                 _ = staff.set_hold(row.id, staff.Exited("TEST", "TEST", "Exit the worker."))
             if index == 0:
                 _ = staff.set_home(row.id, staff.SessionHome(self.fixture.root / ".codex2"))
-            columns[index] = f"{'codex2' if index == 0 else 'account unknown'} {expected}"
+            columns[index] = f"{'codex2' if index == 0 else 'codex'} {expected}"
         code, output, errors = self.command("list")
         self.assertEqual(code, 0, errors)
         self.assertEqual(output.splitlines(), [
@@ -2277,7 +2277,7 @@ class WorkerCommandTests(unittest.TestCase):
                 code, output, errors = self.command("list")
                 self.assertEqual(code, 0, errors)
                 column = " mac" if machine == "mac" else ""
-                self.assertIn(f" 3 {members[2].name} impl account unknown{column} open exited", output.splitlines())
+                self.assertIn(f" 3 {members[2].name} impl codex{column} open exited", output.splitlines())
                 code, output, errors = self.command("list", "--json")
                 self.assertEqual(code, 0, errors)
                 self.assertEqual(json.loads(output), json.loads(json_before))
@@ -2331,9 +2331,9 @@ class WorkerCommandTests(unittest.TestCase):
         selected.assert_not_called()
 
     def test_list_worker_without_backend_reports_account_unavailable(self) -> None:
-        row = self.fixture.worker("missing-backend", family="codex")
+        row = staff.ensure_worker(staff.native_id(fixture_runtime_id("missing-backend")),
+                                  "missing-backend", self.fixture.parent.id)
         self.fixture.dispatch(row, "impl", completed=True)
-        (Path(os.environ["CODEX_HOME"]) / "sessions" / f"{row.current_session}.jsonl").unlink()
         self.assertNotIn(row.id, staff.snapshot().backends)
         code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)

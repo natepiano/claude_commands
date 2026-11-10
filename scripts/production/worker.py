@@ -770,7 +770,10 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if isinstance(started_panes, dict):
                             started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
                         changed = True
-                    code = _resume_launcher(state.row, active)
+                        row = cast(worker_panes.OpenWorker, result).row
+                    else:
+                        row = state.row
+                    code = _resume_launcher(row, active)
                     if code != ExitCode.OK:
                         outcome = code
             except (herdr.HerdrFailure, OSError, ValueError) as error:

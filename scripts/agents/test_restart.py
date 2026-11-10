@@ -928,33 +928,37 @@ class WorkerRestartTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), f"{opened.row.name}: unchanged\n")
 
     def test_start_row_resumes_the_selected_worker_on_the_requested_account_without_its_sibling(self) -> None:
-        selected, sibling = self.case.opened(), self.case.opened("review", "review")
         world = self.case.fixture.world
-        for opened in (selected, sibling):
-            _ = progress_history.begin_dispatch(self.case.run_dir, slot=opened.row.name, phase="8", role="impl",
-                worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
-                prompt=self.case.prompt, kind="impl", lens="")
-            _ = world.stop(opened.row, world)
-        destination = self.case.fixture.root / "codex2"
-        before = len(world.launches)
-        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
-              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
-                  "codex2", destination, "fixture-login")),
-              redirect_stdout(io.StringIO())):
-            resumed_pane = restart.start_row(selected.row, staff.snapshot(), world,
-                target_account=accounts.CodexWorkersAccount("codex2", destination),
-                worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
-        self.assertEqual(resumed_pane, selected.pane)
-        self.assertEqual(world.locations[resumed_pane]["terminal_id"], selected.terminal)
-        self.assertEqual(world.closed, [])
-        self.assertEqual(staff.snapshot().by_id(selected.row.id), replace(selected.row, role=staff.KnownWorkerRole("impl")))
-        self.assertIn(selected.row.current_session, world.requests[-1][1])
-        self.assertEqual(len(world.launches), before + 1)
-        self.assertEqual(world.requests[-1][2]["CODEX_HOME"], str(destination))
-        self.assertIn(resumed_pane, world.foreground)
-        self.assertNotIn(sibling.pane, world.foreground)
-        self.assertIsInstance(progress_history.active_dispatch(sibling.row.id, self.case.run_dir),
-                              progress_history.ActiveDispatch)
+        for index, folder in enumerate(("codex2", ".codex2")):
+            with self.subTest(folder=folder):
+                selected = self.case.opened(f"impl{index}")
+                sibling = self.case.opened(f"review{index}", "review")
+                for opened in (selected, sibling):
+                    _ = progress_history.begin_dispatch(self.case.run_dir, slot=opened.row.name, phase="8", role="impl",
+                        worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                        prompt=self.case.prompt, kind="impl", lens="")
+                    _ = world.stop(opened.row, world)
+                destination = self.case.fixture.root / folder
+                before = len(world.launches)
+                with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                      patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                          "codex2", destination, "fixture-login")),
+                      redirect_stdout(io.StringIO())):
+                    resumed_pane = restart.start_row(selected.row, staff.snapshot(), world,
+                        target_account=accounts.CodexWorkersAccount("codex2", destination),
+                        worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
+                self.assertEqual(resumed_pane, selected.pane)
+                self.assertEqual(world.locations[resumed_pane]["terminal_id"], selected.terminal)
+                self.assertEqual(world.closed, [])
+                self.assertEqual(staff.snapshot().by_id(selected.row.id), replace(selected.row,
+                    role=staff.KnownWorkerRole("impl"), home=staff.SessionHome(destination)))
+                self.assertIn(selected.row.current_session, world.requests[-1][1])
+                self.assertEqual(len(world.launches), before + 1)
+                self.assertEqual(world.requests[-1][2]["CODEX_HOME"], str(destination))
+                self.assertIn(resumed_pane, world.foreground)
+                self.assertNotIn(sibling.pane, world.foreground)
+                self.assertIsInstance(progress_history.active_dispatch(sibling.row.id, self.case.run_dir),
+                                      progress_history.ActiveDispatch)
 
     def test_start_row_keeps_the_selected_unnumbered_codex_home(self) -> None:
         opened = self.case.opened()
@@ -974,7 +978,8 @@ class WorkerRestartTests(unittest.TestCase):
         self.assertEqual(resumed_pane, opened.pane)
         self.assertEqual(world.locations[resumed_pane]["terminal_id"], opened.terminal)
         self.assertEqual(world.closed, [])
-        self.assertEqual(staff.snapshot().by_id(opened.row.id), replace(opened.row, role=staff.KnownWorkerRole("impl")))
+        self.assertEqual(staff.snapshot().by_id(opened.row.id), replace(opened.row,
+            role=staff.KnownWorkerRole("impl"), home=staff.SessionHome(destination)))
         self.assertIs(cast(object, restore.call_args.kwargs["account"]), selected)
         resolve.assert_not_called()
         self.assertEqual(world.requests[-1][2]["CODEX_HOME"], str(destination))
