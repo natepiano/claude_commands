@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.build_queue import admission_records
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import unittest
 import fcntl
@@ -564,17 +564,27 @@ class MergeGateProducerTests(ProducerFixture):
         _ = self.enterContext(isolated_source_readers())
 
     def test_record_changes_writes_the_checkpoint_units_staff_id(self) -> None:
-        _ = self.merge()
+        merged = self.merge()
         merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
         assert isinstance(self.unit.parent, staff.ReportsTo)
         self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.parent.id)
 
+        with self.subTest(producer="recorded before the unit leaves staff"):
+            before = self.listing.read_bytes()
+            _ = self.listing.unlink()
+            record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.unit.id))
+            with mock.patch.object(staff, "snapshot", return_value=record):
+                merge_gate.record_changes(self.repo, self.listing, self.doc, "main",
+                    known_producer=change_review.KnownMergeProducer(merged, self.unit.id))
+            self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
+            self.assertEqual(self.listing.read_bytes(), before)
+
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
-        _ = self.merge()
         record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.unit.id))
         output = io.StringIO()
         with (mock.patch.object(staff, "snapshot", return_value=record), redirect_stdout(output)):
+            _ = self.merge()
             merge_gate.record_changes(self.repo, self.listing, self.doc,
                                       "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")

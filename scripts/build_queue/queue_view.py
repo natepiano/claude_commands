@@ -406,11 +406,24 @@ def cloud_update_age(seconds: float) -> str:
 def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
     if isinstance(row.wait, wire.CloudSlotWait):
         return (Span(work.state),)
-    text = work.state + " · " + work.modules
-    if work.failed_modules:
-        noun = "module" if work.failed_modules == 1 else "modules"
-        text += f" · {work.failed_modules} failed {noun}"
+    text = " · ".join(filter(None, (work.state, work.modules, cloud_failed_modules(work))))
     return (Span(text),)
+
+
+def cloud_failed_modules(work: CloudWork) -> str:
+    if work.failed_modules <= 0:
+        return ""
+    noun = "module" if work.failed_modules == 1 else "modules"
+    return f"{work.failed_modules} failed {noun}"
+
+
+def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
+    if isinstance(row.wait, wire.CloudSlotWait):
+        return cloud_status(row, work)
+    parts = (work.state if work.state != "running" else "",
+             work.modules if isinstance(row.counter, progress_profile.ProgressCounter) else "",
+             cloud_failed_modules(work))
+    return (Span(" · ".join(filter(None, parts))),)
 
 
 def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:

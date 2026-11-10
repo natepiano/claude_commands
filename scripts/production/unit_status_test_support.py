@@ -1,7 +1,7 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
@@ -107,9 +107,8 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/herdr").mkdir()
         for name in ("herdr.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
-        (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
-            _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
+            _ = shutil.copy2(SCRIPT.parents[1] / "agents" / name, root / "scripts/agents" / name)
         _ = shutil.copytree(SCRIPT.parents[1] / "lib", root / "scripts/lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
         _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')

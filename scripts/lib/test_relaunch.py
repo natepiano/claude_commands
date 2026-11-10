@@ -19,7 +19,7 @@ from unittest.mock import patch
 # Hang guards allow for load 136 on natedev (2026-10-29).
 
 from scripts.lib.process_group import send_process_group
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib import relaunch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -230,7 +230,7 @@ class RelaunchTests(ShutdownTestCase):
     def test_director_resume_without_a_pane_marker_names_its_workers(self) -> None:
         from scripts.production import staff
         from scripts.production.staff_test_support import fixture_member, fixture_worker
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         with patch.dict(os.environ, {"HOME": str(self.root), "ROSTER_RUN_ROOT": str(self.root / "runs"),
                                      "UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}):
@@ -256,8 +256,8 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(stdout, "")
 
     def test_herdr_relaunch_restores_its_conversation_marks_and_one_resume_note(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.stop_resume import resume_message
+        from scripts.agents import pane_record
+        from scripts.agents.stop_resume import resume_message
 
         program = self.root / ".local/bin/claude"
         program.parent.mkdir(parents=True)
@@ -290,7 +290,7 @@ class RelaunchTests(ShutdownTestCase):
                 self.assertEqual(observed["marks"], native if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
 
     def test_explicit_move_account_replaces_the_saved_launch_account(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
 
         entry = pane_record.launch("w1:p2", "session", str(self.root),
@@ -307,7 +307,7 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(restored["ENABLE_TOOL_SEARCH"], "true")
 
     def test_pane_delivery_does_not_add_a_second_prompt(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
 
         entry = pane_record.launch("w1:p2", "session", str(self.root), {}, ["claude"])
@@ -318,7 +318,7 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(arguments, ["claude", "--resume", "session"])
 
     def test_enveloped_resume_needs_no_source_record(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
         from scripts.lib import script_prompts
 

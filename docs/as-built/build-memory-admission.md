@@ -45,7 +45,10 @@ The service removes the progress files when the reservation ends.
 
 The queue pane and the build page show each cloud gate in the main table.
 A running row shows machine `aws` and its vCPU count.
-The last column shows the state, module count, and failed modules.
+The queue pane's last column shows the state, module count, and failed modules.
+On the build page, a cloud row with a module counter draws the local rows' progress line.
+Small text under the line shows the module count and failed modules.
+The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
 The Head line shows `cloud N of M slots`.
@@ -1475,12 +1478,16 @@ Only targets with our use stamp, mirror mark, or a registered copy ancestor are 
 Resolved paths must stay inside these roots. The scan does not follow directory symlinks.
 
 The sweep reads the local and natedev Mac claims under their existing admission locks.
-It keeps these locks until deletion ends. A live or kept claim protects its mirror.
+Each reader releases its admission lock before it returns a claim snapshot.
+The sweep holds acquired mirror leases through deletion.
+It reads claims again before each removal group outside those leases.
+A live or kept claim protects its mirror.
 For a marked target without a copy record, the claim check compares each existing claimed mirror path.
 A missing unrelated claimed mirror does not protect the target.
 Other claim read errors still protect the target.
 Remote mirror removal keeps its own lease exemption and still checks sibling leases.
-An unreadable claim reply or a lost lock process protects every target.
+An unreadable claim reply protects every target.
+The claim server prints its reply after it releases the admission lock.
 The Mac uses `lsof` for other process use. Unreadable process use protects every target.
 The sweep checks protection again before each target deletion.
 It takes only the shortfall, in the existing least recently used order.
@@ -1488,7 +1495,7 @@ The result line reports removed bytes, free bytes before and after, and skipped 
 `--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
 The nix-darwin `nate.jobs.disk-floor` job runs this same command every 120 seconds on the Mac.
 `modules/darwin/default.nix` imports the new `modules/darwin/disk-floor.nix` module.
-The job uses the mirror leases and claim locks above, plus the shared floor lock.
+The job uses mirror leases, short claim reads, and the shared floor lock.
 It trims only the shortfall below `sweep_floor_gib`, without an offload request.
 `ensure_mac_disk_floor()` keeps its 100 GiB on-demand trigger.
 
@@ -1738,3 +1745,9 @@ The merge gate and style lint own private folders through `build_folders.tempora
 The contexts remove these folders after success or an exception.
 Style review keeps its input folder for the review worker and finish command.
 Session TMPDIRs and unit session folders remain for later session commands.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

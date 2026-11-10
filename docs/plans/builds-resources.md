@@ -235,11 +235,13 @@ Own what a build may use and when it starts: memory admission and the memory que
    `read_cycle()` (`build_hold.py:978`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:967`) returns `Path | None`, for the same no-current-cycle state.
    Return the existing `NoCycle` (`build_hold.py:84`) from both in place of `None`. Add no second type for this state.
    Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
+   Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
+   Replace each one with `assert isinstance(cycle, build_hold.HoldCycle)`. This change keeps the assertion's intent.
 5. Route callers through the installed copy.
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/shutdown/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
    Update the two caller-plan examples to name the installed merge gate with `--checkout <tree>`.
 6. Keep repository and step fields separate in service snapshots and queue queries.
@@ -273,11 +275,12 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — caller tests.
 - `scripts/build_hold/override_guard.py`, `scripts/build_hold/build_hold.py` — shared guard and hold mutation boundary.
 - `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
+- `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_build_targets.py`, `scripts/direct/test_verify_mac_lifecycle.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py` — `read_cycle()` callers that narrow to `HoldCycle`.
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
-- `scripts/message/top_level.py`, `scripts/shutdown/shutdown.py` — installed hold writer routing.
-- `scripts/message/test_top_level.py`, `scripts/shutdown/test_shutdown_cli.py` — caller tests.
+- `scripts/message/top_level.py`, `scripts/agents/shutdown.py` — installed hold writer routing.
+- `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
 - `scripts/production/dailies_render.py` — `NoCycle` from `read_cycle()` in the hold lines.
 - `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py` — hold line tests.
 - `docs/plans/builds-production.md`, `docs/plans/build-followups-worker-seats.md` — installed merge-gate examples.
@@ -306,6 +309,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   4. `test_release_recovers_recipient_notices_from_a_damaged_referenced_cycle`.
   5. `test_status_names_unreadable_pending_records_and_cycles_without_hiding_them`.
 - Every changed module and caller passes its tests. Basedpyright reports `0 errors, 0 warnings, 0 notes` for those modules.
+- No `read_cycle()` caller checks its result with `is not None` or `is None`, in source or in tests.
 - After installation, query the service and inspect its saved state. Repository and step fields remain separate.
   A checkout mutation attempt refuses before state changes. A private-state attempt still works.
 - Name queue-unit files as `also touches`, tested against `origin/builds-queue`.
@@ -1072,7 +1076,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 `scratch.registered_plan(unit)` is the single resolver, using `unit_lookup.unit_parent` with `staff.snapshot`, `phase_table.show_production` and `proposals_table.unit_plan_paths` to locate the registered plan.
 `target` and `hand_over` validate new phase tasks through `plan_history.plan_phases` before creation, adoption or record replacement; missing phases and unreadable plans raise cause-bearing refusals naming a real phase, `gate:<id>` or `--until <when>`.
 `checked_task` stays shape-only for legacy updates, holds and end, so existing invalid phase tasks remain cleanable.
-`tmp_sweep.worker_use` keeps a mesh record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
+`tmp_sweep.worker_use` keeps a detached run record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
 
 **Files:**
 - `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py` — resolver, assignment guard and private-plan assignment/legacy-cleanup cases.
@@ -1080,9 +1084,9 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 - `scripts/production/test_merge_checkpoint.py` — private `registered_plan` fixture for phase-end cleanup.
 - `docs/as-built/build-memory-admission.md` — scratch task and retention rules.
 
-**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only mesh cwd keeps.
+**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only detached run cwd keeps.
 
-**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished mesh record's cwd live.
+**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished detached run record's cwd live.
 
 **Ruled out:** A second unit-plan registry; semantic validation on legacy update/end paths.
 
@@ -1677,7 +1681,6 @@ One bad entry in a run marker folder keeps only its own session's runs; every ot
 **Gotchas:**
 - A NUL byte in a marker path makes `os.path.realpath` raise `ValueError`; the per-marker handler catches `OSError`, `UnicodeError` and `ValueError`.
 - The guard reads the director only for a folder not already kept, so a good marker keeps `ACTIVE_MARKER` when another marker is bad.
-- `session_staff.worker_run_index` lists the `active` folder as a run, and the shared roster lock creates `active/mesh_roster.json.lock`; models-rename-track owns that caller.
 
 **Ruled out:** a test that counts director reads (it needs a configured mock).
 
@@ -1859,8 +1862,16 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Constraints from prior phases:**
 - Rounds 1-9 are in `phases/81/mac_link_report.md` in the run folder `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297`. Read it before any new step.
-- builds approved one controlled reproduction on 2026-11-08. The script is `/tmp/claude/scratch/until-2026-11-09T2200Z-resources-p81-repro/reproduce.sh`.
-- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Change the script's room check from four targets to one. Also change its schedule: today it keeps `target-A`, `target-B` and both control targets until the final cleanup (`reproduce.sh` lines 190-204), about 355 GiB. Record each build's result, then remove that private target before the next case or control starts.
+- builds approved one controlled reproduction on 2026-11-08. Its first script no longer exists, because its scratch folder ended. Before the first case, write a new script at `phases/81/reproduce.sh` in the run folder.
+- The script takes the normal Mac claim before its first remote command. At every exit it removes its private folder and releases the claim. `ssh mac` exits 0 on a failure, so the script prints one result line for each step.
+- The script runs this procedure on the Mac, in the private folder `~/.local/state/mac-test/repro81`:
+  1. Use Rust 1.99.0 on arm64 macOS. Keep the measured opt-level, codegen-units, incremental and shared-generics settings.
+  2. Use one small library and one integration-test crate. Start from the `HairlineFade`/`CascadeCombine` resource path.
+  3. Build in series, with no offload, no cleanup, no source copy during a build and no second compiler.
+  4. Sequential case: build one revision, change only the generic body or the caller, and rebuild with the completed incremental history. Its control builds the same changed revision in a new empty target.
+  5. Interrupted case: interrupt an intermediate compile, and then finish the build. Its control runs the same intermediate compile with no interrupt.
+  6. Reduce the source while the same promoted-symbol failure stays.
+- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Before the source copy, the script reads the deployed `sweep_floor_gib` and requires `free - (source_size + debug_size) >= floor`. Record each build's result, then remove that private target before the next case or control starts.
 - The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
 - Keep sccache and the hana test mirror. Run no gc command on the Mac.
 - New evidence, 2026-11-09 (Phase 92 retrospective): a Mac hana link failed at 11:56 UTC with the same signature, undefined `.llvm.<hash>` symbols in `libhana_conduit`.
@@ -1878,7 +1889,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - `docs/as-built/build-memory-admission.md` — the changed rule.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` owns the report, the source files and the as-built doc, and runs the final suites.
+- `impl` owns the report, the reproduction script, the source files and the as-built doc, and runs the final suites.
 - `test` owns the test files.
 
 **Acceptance gate:**
@@ -1891,7 +1902,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 #### As-built
 - nixos branch `resources-mac-floor` (`efdf8bfc1`, on nixos main `064af4a3c`) adds `modules/darwin/disk-floor.nix`: `nate.jobs.disk-floor` runs `sweep.py --floor-only --host mac` on the Mac every 120 s. It is the same command as the on-demand sweep in `offload.ensure_mac_disk_floor()`, so it takes the same mirror leases, both claim locks and the floor lock, and trims only the shortfall below `sweep_floor_gib` (150 GiB). The 100 GiB on-demand trigger is unchanged.
-- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep, folder-audit and codex-mesh-sweep kept every entry.
+- The same branch puts `/usr/sbin` on the Mac `jobPath` (`modules/darwin/nate-backend.nix`), after `/usr/bin:/bin`. Before it, launchd jobs found no `lsof`, so tmp-sweep and folder-audit kept every entry.
 - `docs/as-built/build-memory-admission.md` describes the Mac floor job.
 - The job runs only after the showrunner pushes the branch to nixos main and the Mac runs `darwin-rebuild`.
 - No Python change and no new test: the job calls an existing entry point.
@@ -1995,7 +2006,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
 
-Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:5990`).
+Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6010`).
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
@@ -2056,14 +2067,14 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 
 #### As-built
 - The floor sweep trims the Mac mirror targets by design: it removes only the shortfall, least recently used first, and never a target a live build holds. On 2026-11-09 both mirror targets held live nextest runs at each scan; later trims took them.
-- `LockedClaims.holds` (`scripts/mac_test/floor_claims.py`) skips a claimed mirror path that does not exist, so a missing unrelated mirror no longer protects a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal (`scripts/copies/copies.py`) keeps its own lease exemption and still checks sibling leases.
+- `ClaimSnapshot.holds` (`scripts/mac_test/floor_claims.py`) skips missing claimed mirror paths. A missing unrelated mirror does not protect a marked target without a copy record. Other claim read errors still protect the target. Remote mirror removal keeps its own lease exemption and checks sibling leases.
 - While a crossing delivery is pending, the Mac measures each direct folder child of its floor roots (`mac_folder_measurement`, `CurrentMacFolders` in `scripts/lint/sweep.py`). `mac_folder_reclaimable_bytes` counts the blocks that deleting that folder alone frees: an inode counts once only when all its hard links are inside the folder; symlinks are not followed. The alert lists the folders by size and recommends the largest; protected folders keep their labels. No natedev disk snapshot is needed.
 - `notify_floor_problem` takes the machine name from its floor policy; it has no `machine` parameter.
 - `docs/as-built/build-memory-admission.md` states the claim and folder-measurement rules.
 
 **Files:**
 - `scripts/lint/sweep.py` — the Mac folder measurement and the folder choices.
-- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `LockedClaims.holds`.
+- `scripts/mac_test/floor_claims.py` — the missing-mirror rule in `ClaimSnapshot.holds`.
 - `scripts/lint/test_sweep.py`, `scripts/mac_test/test_floor_sweep.py` — rows in `test_crossing_recommends_one_measured_choice_that_frees_the_shortfall` (Mac rows) and `test_no_proc_mac_sweep_takes_only_the_oldest_shortfall` (mirror row).
 - `docs/as-built/build-memory-admission.md` — the changed rules.
 
@@ -2091,62 +2102,30 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 **Gotchas:** held paths taken at the first scan miss a live use that `shrink_floor` finds later; compute them from the final `busy` map. The no-evidence branch walks `_build_trees` only when a cargo lock is held.
 
 ### Phase 94 — Each fall below the floor line gives one phone push, and the return gives one more  · status: done
-**Depends on:** Phase 93 (same file, `scripts/lint/sweep.py`). Merge `origin/builds` first.
 
-**Approved:** builds added Spec 7 and 8 on 2026-11-09 ("Both go in the phase 94 checkpoint"); a new config key needs no user go. The user, via natedev and the builds showrunner, 2026-11-09: "I got about 8 pushovers for Mac being below 150gib. All by less than 2gib. This is unhelpful. A single notice is fine. And a notice when we are back for good above 150. But telling me over and over is not helpful." builds, 2026-11-09: "Each fall gives exactly two pushes: one at the fall below 150 GiB and one at the return above 155 GiB. Nothing between them."
+#### As-built
 
-#### Work Order
-
-**Goal:** each fall of free space below the phone alert line gives exactly two phone pushes for that machine: one at the fall, and one when free space returns above the rearm line (`sweep_phone_floor_gib` plus `sweep_phone_rearm_gib`, today 155 GiB). Nothing is sent between them.
-
-**Defect:** on 2026-11-09 the user got about 8 Mac pushes, each less than 2 GiB below 150 GiB. One came at 149.8 GiB after the Mac had the Phase 91 rearm rule (Mac HEAD 9b15a1923 contains d7c726761; `sweep_phone_rearm_gib=5` is present). The Phase 91 rule (`notify_floor_problem`, `scripts/lint/sweep.py:3859`) opens an `OpenPhoneCrossing` only from `AbovePhoneFloor` and rearms only above the rearm line, so a repeat means the crossing state did not hold. The Mac floor pass runs from two paths: the Mac launchd job `org.nixos.disk-floor` and the natedev ssh call in `scripts/mac_test/offload.py:1564` (`sweep.py --floor-only --host mac`).
-
-**Spec:**
-1. **Cause, read-only first.** Write `phases/94/cause.md` in the run folder before any source edit.
-   - List each Mac push of 2026-11-09 from the natedev push records, with its time and free space.
-   - Read the Mac crossing state (`floor_record_path()` and its scope record) and say which file each path reads and writes. Compare the environment (`HOME`, state folders) of the launchd job and the ssh call.
-   - Read `root_scope` in `notify_floor_problem` for the Mac filesystem: a pass that is not root scope keeps no crossing state.
-   - For each push, say whether it repeated a crossing that had already alerted, and why. Give one line per proven cause with its evidence, and name the candidates ruled out.
-   - Mac commands are read-only: `ssh mac` with `cat`, `ls`, `stat` or a log read of named files. Change nothing on the Mac, start no Mac test, and run no sweep without `--dry-run`. `ssh mac` exits 0 even on failure: print a sentinel and check it.
-2. **Fix the cause where it lives.** Every path that sends a machine's floor push reads and writes one crossing state for that machine, under its record lock. A second path, a lost receipt or a non-root-scope pass cannot open a second crossing while one is open. If the cause lives in a file outside **Files**, name it in `cause.md` and post blocked before you edit it.
-3. **Return push.** When an open crossing whose fall push was sent rearms (free space above the rearm line), send one phone push. Add the catalog entry `sweep.disk_floor_recovered` in `scripts/notify/push_catalog.py`: sender `disk_floor`, need `note`, no action. Proposed words: title `{machine} disk space is back`; body `{machine} has {free} free, above the {rearm} line. The next fall below {floor} sends one alert.` Keep the return receipt in the same crossing state, so a retry sends it once and a lost delivery retries until accepted. No return push goes for a crossing whose fall push was never sent. The rule is the same for natedev and the Mac.
-4. **Text approval.** A new text needs the user's approval. Run `~/.claude/scripts/lib/py scripts/notify/review.py texts --id sweep.disk_floor_recovered` without `--approve`, three times, and report each verdict. Write no approval record, and never pass `--approve` or `--user-spec`. Do not change `sweep.disk_floor`.
-5. **Tests.** Each row fails before the fix and passes after it.
-   - One machine, readings 200, 149.8, 148.5, 149.9, 148.2, then 156 for 60 minutes, then 149 GiB: exactly three pushes — a fall push at 149.8, a return push after 60 minutes above 155, and a fall push at 149.
-   - Readings that stay between 150 and 155 after a fall send nothing; a reading at exactly 155 does not rearm.
-   - A failed return delivery retries at the next pass above the line and then sends nothing more.
-   - The proven cause from step 1: a row that drives both paths (or the lost state) and gets one fall push.
-   - Keep the Phase 91 rows (`test_crossing_sends_both_channels_once_and_rearms_only_above_the_line`, `test_phone_floor_crossing_sends_once_until_free_space_rises`, `test_crossing_retries_only_the_channel_without_a_receipt`, `test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key`). Any change to an existing assertion needs the director's approval first.
-6. Update `docs/as-built/build-memory-admission.md` for the two-push rule and the cause fix.
-7. **Deploy repeat** (builds, 2026-11-09, from natedev): the Mac alerted again at 147.7 GiB after Phases 92 and 93 reached the Mac. Free space stayed at 148 to 150 GiB all morning, with no rise above 155 GiB between alerts. Find how the crossing state behaves across a deploy: for example, a changed receipt key, or a state file that the new code does not read as an open crossing. Fix it so that a deploy never opens a second crossing while one is open. Write the proof in `cause.md`. Test row: an open crossing written before a deploy, then a pass below the line after the deploy, gives no push.
-8. **Folder list** (builds, 2026-11-09, from natedev): the alert listed 31 folders, 20 of them at 0.0 GiB, and cut paths to `~/.…/cargo-liner`. Show only the largest folders that together cover the shortfall, largest first, at most `sweep_alert_folder_count` folders. Never show a folder of 0 bytes. Show each path in full (home-relative with `~` is allowed); never cut a path with `…`. If a text limit is reached, show fewer folders, not shorter paths. Add the new key to `config/lint.conf`: `sweep_alert_folder_count=3`, `# range: 3..5`. Test rows: a list with zero-byte folders and more folders than the count shows only the covering folders, at most the count, with full paths; a long path shows in full.
-9. **Quiet hours** (builds, 2026-11-09, from the user via natedev): when quiet hours end, the held pushes of one alert kind collapse to the latest state: one push, or none when free space is back above the line. The silence queue in `scripts/notify` belongs to sdlc. This phase makes the `disk_floor` sender ready for it with the current API. When an open crossing rearms, run `send.py retire --to user --from disk_floor --key <the crossing's fall key>` before the return push. A kept fall push is then dropped (`silence.drop`). If the retire reports a dropped kept push, the fall never reached the user: send no return push and close the crossing. Run the retire on the machine whose silence queue holds the push; name that machine in `cause.md`. Keep one stable fall key per crossing for the retire. `--clears-when` is not used: `send.py` accepts it only with `--need blocked`. Test rows: a fall kept by silence and then a rise above the rearm line gives a retire and no return push; a fall that was delivered gives the return push.
-10. **Back for good** (builds, 2026-11-09, answer A): the Mac rose to 155.23 GiB at 07:33–09:26 and fell to 147.7 GiB; the 5 GiB margin alone does not mean "back for good". Add the key `sweep_phone_rearm_minutes=60` to `config/lint.conf` (`# range: 0..`). An open crossing rearms, and sends the return push, only after every pass for 60 minutes reads above the rearm line. A pass at or below the rearm line restarts the 60 minutes. Keep the time of the first pass above the rearm line in the crossing state, under its record lock. Test rows: this morning's readings 155.23, 154.47, 150.86, then 147.7 give no return push and no second fall push; 60 minutes of passes above 155 give one return push; a dip to 155 or lower at minute 59 gives no return push.
-
-**Constraints from prior phases:**
-- Phase 91 rule in `notify_floor_problem` and `save_delivery`: rearm only above the line plus `sweep_phone_rearm_gib`, strictly; send crossing text only below the line; accept a crossing receipt only when the delivered message held crossing text. Keep all three.
-- Phase 93: `notify_floor_problem` receives `FloorOutcome.held_targets`; held folders are never recommended. Keep it.
-- Phase 92: `notify_floor_problem` takes the machine from its `policy`.
-
-**Constraints:**
-- Tests make their folders in a tempdir and never touch the real `/tmp`, `~/rust` or Mac home.
-- Never run the real sweep without `--dry-run`.
+- Each fall of free space below `sweep_phone_floor_gib` (150 GiB) gives one fall push for that machine, and the return gives one `sweep.disk_floor_recovered` push. No push goes between them. The rule is the same for natedev and the Mac.
+- `notify_floor_problem` rearms a crossing only when every pass during `sweep_phone_rearm_minutes` (60) reads strictly above the line plus `sweep_phone_rearm_gib` (155 GiB). `AboveRearmLine.since` keeps the first above-line time under the record lock. A reading at or below 155 GiB restarts the interval.
+- `RecoveringPhoneCrossing` holds the return receipt, the retirement result and `ReturnPushPolicy`. The fall key is `phone:<identity>` and the return key is `phone-recovered:<identity>`. A failed return delivery retries above the rearm line and a repeat is stopped by the receipt. A later fall opens a new episode even when the prior return receipt is pending.
+- At recovery, `retire_floor_fall` retires the crossing's fall key on natedev, which owns the silence queue. The Mac reaches natedev through `silence.SSH`. A dropped kept push means no return push and the crossing closes, even when the retire exits with an error. A retire with no count suppresses the return push in saved state, and the next pass retries. Only an accepted fall and a first retire result of zero dropped permit a return push.
+- The alert folder list shows only the largest folders that cover the shortfall, at most `sweep_alert_folder_count` (3, range 3..5). It never shows 0-byte folders and shows each path in full (`~` allowed). At the text limit it shows fewer folders. `notify_floor_problem` falls back to `UNAVAILABLE_FOLDER_CHOICES`.
+- Both Mac floor paths, the launchd job and the ssh call, read and write the same `floor.json` under one `floor-alert.lock`.
 
 **Files:**
-- `scripts/lint/sweep.py` — crossing state, return push, the cause fix.
-- `scripts/lint/test_sweep.py` — the crossing rows.
+- `scripts/lint/sweep.py` — crossing states, timed rearm, return push, fall-key retirement, folder list.
+- `scripts/lint/test_sweep.py` — return, retirement, lost-receipt, timed-rearm and folder-list rows.
 - `scripts/notify/push_catalog.py` — `sweep.disk_floor_recovered`.
+- `scripts/notify/push_texts_reviewed.json` — approval records for the natedev and Mac return examples.
+- `config/lint.conf` — `sweep_phone_rearm_minutes`, `sweep_alert_folder_count`.
 - `docs/as-built/build-memory-admission.md` — the two-push rule and the folder list.
-- `config/lint.conf` — the new keys `sweep_alert_folder_count` and `sweep_phone_rearm_minutes`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `sweep.py`, `push_catalog.py`, `config/lint.conf` and the as-built doc, writes `cause.md`, and runs the final suites.
-- `test` owns `test_sweep.py`.
+**Gotchas:**
+- The approval record for the return text carries the reviewer's objection to a push that asks for no action. The user approved the words on 2026-11-09.
+- A pending fall phone receipt gets no return push.
 
-**Acceptance gate:**
-- The new rows fail before the fix and pass after it.
-- `scripts/lint/test_sweep.py` and `scripts/mac_test/test_floor_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
-- `scripts/notify/test_push_texts.py` passes for every text except `sweep.disk_floor_recovered`, which waits on the user's approval.
+**Ruled out:**
+- A deploy repair for the crossing record: the older and current formats read the same crossing, and the 147.7 GiB alert followed a real rise to 155.23 GiB.
 
 ### Phase 95 — Each test folder goes when its test ends  · status: done
 
@@ -2159,3 +2138,51 @@ Registered jobs already take no margin: `test_registered_and_unregistered_jobs_e
 - `scripts/lint/test_build_shape.py` — `IndexStepEvidenceTests` fixture.
 
 **Ruled out:** a check, a scan or a signal handler for leftover folders.
+
+### Phase 96 — The hand cleanup command runs when typed by its path  · status: done
+
+#### As-built
+
+`scripts/lint/tmp_sweep.py` has git mode 100755, so `~/.claude/scripts/lint/tmp_sweep.py --plan <new-plan.json>` runs when typed by its path.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — mode only.
+
+**Gotchas:** the small-fix path refuses this file because it imports `scripts/production/staff.py`.
+
+### Phase 97 — A build target command repeats no work at start  · status: done
+
+#### As-built
+
+`eligible` and `release-wait` open `build_targets.conf` once per start. `target_config.command_configuration` keeps one `read_targets` result for one command. The state readers load only when a branch reads state, the AWS ledger loads only when AWS routing is on, and `release-wait` loads the Mac test code only when a target state folder exists. Output lines and exit codes do not change.
+
+Median CPU over 50 starts on the real entry, Mac state folder present: `eligible` 160.887 to 137.673 ms, `release-wait` 106.328 to 101.707 ms. With the folder absent: `eligible` 150.415 to 130.788 ms, `release-wait` 99.996 to 42.445 ms.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — delayed state reader and ledger loads; `command_configuration` around `eligible` and `release-wait`.
+- `scripts/build_targets/target_config.py` — one-command registry retention; home of `AnyEligibleTarget`, `LocalRequired`, `Routing`, `ANY_ELIGIBLE_TARGET`, `EligibleTarget` and `ExcludedTarget`.
+- `scripts/build_targets/targets.py` — re-exports those eligibility types.
+- `scripts/build_targets/test_build_targets.py` — real-entry rows for one registry open and module absence by branch.
+
+**Binds later work:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`.
+
+**Gotchas:** natedev has the Mac state folder, so the rows with the folder present are its normal case.
+
+**Ruled out:** a shared cache of `mac_test.conf`, because it saves 0.8 ms.
+
+### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: done
+
+#### As-built
+
+With the Mac state folder present, `eligible` loads no `sweep` or `copies` module. `release-wait` loads no `copies` or whole `mac_test` module. Each move keeps one home for each moved name and adds no guard, check or config key. Median CPU per start over 50 alternating starts, on a merge that includes the `transfers` record: `eligible` falls from 175.239 ms to 128.873 ms, and `release-wait` falls from 150.339 ms to 61.271 ms.
+
+**Files:**
+- `scripts/buildlog/repository.py` — `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir`, `local_origin_git_dir` and their path constants.
+- `scripts/lib/copy_record.py` — `AllRepositories`, `SelectedRepository`, `RepositoryScope`, `ALL_REPOSITORIES`.
+- `scripts/mac_test/claim_state.py` — the claim reader, `locked`, `state_paths`, the record types, the block and event types, `record_after_unlock`. `ClaimOwnerRecord` carries `transfers`.
+- `scripts/mac_test/offload.py` — binds `copies` for types only. Each run-time use has a local import.
+- `scripts/build_targets/test_build_targets.py` — the module rows that show each module absent on the named path.
+
+**Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
+
+**Ruled out:** a comparison of unpaired start-cost runs.

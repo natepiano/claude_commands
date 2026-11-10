@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from io import StringIO
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import time
@@ -24,10 +25,19 @@ down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
 down would delete all scaler access keys and remove only the scaler credential profile.
 down would remove compute resources, then the foundation stack and retained Budget.
-down would delete the data volume. The /home build cache is lost.
+down would delete the data volume and the gate image with its snapshot. The /home build cache is lost.
 down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
 down keeps the spend ledger, charge history, disabled routing.json, admin.gpg, and the box image.
 Run deploy.py down --approve-destroy to remove the target.'''
+
+BUILDER_DRY_RUN = '''remove-builder would disable builder routing and aws-target.service.
+remove-builder refuses while an AWS job still runs.
+remove-builder would delete the builder Tailscale device and builder compute resources.
+remove-builder would delete the retained data volume. The /home build cache is lost.
+remove-builder keeps the stack, Budget, scaler credentials, gate resources, and gate-deployment.json.
+remove-builder keeps admin.gpg, and the box image.
+remove-builder resolves builder accounting and keeps the spending history.
+Run deploy.py remove-builder --approve-destroy to remove only the builder.'''
 
 
 @dataclass(frozen=True)
@@ -56,8 +66,10 @@ class NeverJoined:
 class TargetRemoval:
     def __init__(self, settings: Path, directory: Path, output: Path, admin: admin_secrets.AdminSecretSession,
                  api: AwsCli, execute: AwsExecutor, *, tailnet: box.TailnetTransport = box.tailnet_request,
-                 pause: Callable[[float], object] = time.sleep, clock: Callable[[], float] = time.time) -> None:
+                 pause: Callable[[float], object] = time.sleep, clock: Callable[[], float] = time.time,
+                 builder_only: bool = False) -> None:
         self.settings = settings
+        self.builder_only = builder_only
         self.directory = directory
         self.output = output
         self.admin = admin
@@ -197,6 +209,19 @@ class TargetRemoval:
     def verify(self) -> bool:
         self.saved = deployment_record(self.directory)
         receipt = self.directory / 'down-complete.json'
+        builder_receipt = self.directory / 'builder-removal.json'
+        if builder_receipt.exists() and (self.builder_only
+                or ledger.mapping(self.saved.get('outputs', {})).get('ComputeEnabled') == 'false'):
+            previous = remote.read_record(builder_receipt)
+            outputs = ledger.mapping(self.saved.get('outputs', {})).copy()
+            previous_outputs = ledger.mapping(previous.get('outputs', {}))
+            self.saved['data_volume_id'] = (self.saved.get('data_volume_id') or outputs.get('DataVolumeId')
+                                           or previous.get('data_volume_id') or previous_outputs.get('DataVolumeId', ''))
+            if not outputs.get('DataVolumeId'):
+                outputs['DataVolumeId'] = self.saved['data_volume_id']
+            if not outputs.get('InstanceId'):
+                outputs['InstanceId'] = previous_outputs.get('InstanceId', '')
+            self.saved['outputs'] = outputs
         complete = not self.saved and receipt.exists()
         if complete:
             self.saved = remote.read_record(receipt)
@@ -220,7 +245,7 @@ class TargetRemoval:
                                         str(outputs.get('InstanceId', '')), str(saved.get('data_volume_id', '')),
                                         str(saved.get('budget_name', '')))
         path = self.directory / 'down.json'
-        if path.exists():
+        if path.exists() and not self.builder_only:
             journal = remote.read_record(path)
             for key in ('account_id', 'region', 'stack_id', 'deployment_id'):
                 if journal.get(key) != getattr(self.identity, key):
@@ -259,9 +284,9 @@ class TargetRemoval:
         return False
 
     def remember(self) -> None:
-        path = self.directory / 'down.json'
-        if not path.exists():
-            write_text_atomic(path, json.dumps(asdict(self.identity)) + '\n')
+        path = self.directory / ('builder-removal.json' if self.builder_only else 'down.json')
+        if self.builder_only or not path.exists():
+            write_text_atomic(path, json.dumps(self.saved if self.builder_only else asdict(self.identity)) + '\n')
 
     def compute(self) -> bool:
         stack = self._stack()
@@ -300,10 +325,8 @@ class TargetRemoval:
         print('removed: foundation stack, scaler user, policies, and Budget actions')
         return True
 
-    def retained(self) -> bool:
+    def data_volume(self) -> bool:
         changed = False
-        if not self.identity.volume or not self.identity.budget:
-            raise ValueError('missing saved volume or Budget identity; run deploy.py up once to record it')
         if self.identity.volume:
             reply: dict[str, object]
             try:
@@ -333,6 +356,12 @@ class TargetRemoval:
                 self._wait(volume_absent, 'the data volume deletion did not finish')
                 print('removed: data volume; the /home build cache is lost')
                 changed = True
+        return changed
+
+    def retained(self) -> bool:
+        if not self.identity.volume or not self.identity.budget:
+            raise ValueError('missing saved volume or Budget identity; run deploy.py up once to record it')
+        changed = self.data_volume()
         if self.identity.budget:
             account = self.identity.account_id
             try:
@@ -371,6 +400,22 @@ class TargetRemoval:
         (self.directory / 'deployment.json').unlink(missing_ok=True)
         return changed
 
+    def gate_image(self) -> bool:
+        directory = self.directory / 'gate-image'
+        if not directory.exists():
+            return False
+        from scripts.aws_target.gate_box import GATE_IMAGE_OWNER_TAG
+        box.cleanup_images(self.api, {}, GATE_IMAGE_OWNER_TAG)
+        book = ledger.CostLedger(self.directory)
+        inventories = book.read_snapshot().inventories
+        if inventories and any(item.name == 'gate-image' for item in inventories[-1].resources):
+            previous = inventories[-1]
+            book.record_inventory(ledger.ResourceInventory(int(self.clock()),
+                tuple(item for item in previous.resources if item.name != 'gate-image'), 'gate image removed',
+                builder_removed=previous.builder_removed))
+        shutil.rmtree(directory)
+        return True
+
     def _kept_image(self) -> None:
         path = self.directory / 'image.json'
         if path.exists():
@@ -380,7 +425,7 @@ class TargetRemoval:
     def run(self) -> bool:
         stages = (('routing-off', self.routing), ('tailscale-device', self.devices), ('scaler-keys', self.scaler),
                   ('compute', self.compute), ('foundation', self.foundation), ('retained-resources', self.retained),
-                  ('local-state', self.local_state))
+                  ('gate-image', self.gate_image), ('local-state', self.local_state))
         with control_lock(self.directory / 'up'), ExitStack() as locks:
             try:
                 if self.verify():

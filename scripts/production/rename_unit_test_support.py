@@ -1,7 +1,7 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -24,12 +24,13 @@ from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import shutdown
-from scripts.shutdown import pane_record
+from scripts.agents import shutdown
+from scripts.agents import pane_record
 from scripts.style import style_ledger
 
-SCRIPT = Path(__file__).resolve().parents[1] / "shutdown/shutdown.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 SLUG = "demo"
 
 
@@ -67,8 +68,8 @@ class UnitRenameFixture(StaffTestCase):
         super().setUp()
         # Git worktrees and production docs embed absolute paths. Each independent
         # copy returns to the seed's original path, with its own refs and origin.
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {SLUG: ("alpha", "mul_add")},
                            locations={(SLUG, "alpha"): self.rust / "claude-demo-alpha",
@@ -115,7 +116,7 @@ class UnitRenameFixture(StaffTestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "UNIT_SYNC_WRITES": "0",
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
         })
 
@@ -127,7 +128,7 @@ class UnitRenameFixture(StaffTestCase):
         _ = self.git("init", "--bare", str(self.origin))
         _ = self.git("init", "-b", SLUG)
         for key, value in (("user.name", "Unit Rename Test"), ("user.email", "rename@example.invalid"),
-                           ("gc.auto", "0"), ("maintenance.auto", "false")):
+                           ("gc.auto", "0")):
             _ = self.git("config", key, value)
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.doc, self.production_doc())
@@ -338,7 +339,7 @@ class FolderRenameFixture(StaffTestCase):
         return result.stdout.strip()
 
     def command(self, *, new: str = "") -> subprocess.CompletedProcess[str]:
-        from scripts.shutdown import shutdown as folder_rename
+        from scripts.agents import shutdown as folder_rename
 
         arguments = ["rename", f"folder-production/{self.old_name}", new or self.new_name]
         return invoke_cli(folder_rename, lambda: folder_rename.main(arguments), arguments,
@@ -393,7 +394,7 @@ class FolderSessionFixture:
             raise AssertionError("The move must never start a second session")
         if row.current_session != self.owner.current_session:
             raise AssertionError("The move must resume current_session")
-        from scripts.shutdown import restart
+        from scripts.agents import restart
 
         kind, _environment, arguments = restart.session_launch(str(row.current_session), row.name)
         self.resumes.append((kind, arguments))
@@ -405,7 +406,7 @@ class FolderSessionFixture:
 
     @contextmanager
     def installed(self) -> Generator[None]:
-        from scripts.shutdown import restart, pane_record
+        from scripts.agents import restart, pane_record
 
         def live_members(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
             return [row for row in rows if self.live and row.id == self.owner.id]

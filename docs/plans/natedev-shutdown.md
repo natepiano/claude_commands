@@ -159,7 +159,7 @@ Each phase deletes the skill and the code it replaces when it lands. `staff.py` 
 
 ### Phase 13d: a worker's detached run belongs to that worker — done
 
-- `mesh_runs.py start` reads the caller first. A worker's run always uses that worker's run folder, name and staff id; `--to` is used only for a caller that is not a worker.
+- `scripts/agents/detached_runs.py start` reads the caller first. A worker's run always uses that worker's run folder, name and staff id; `--to` is used only for a caller that is not a worker. The script was `mesh_runs.py` until ce529466f (2026-11-08) removed the mesh and `codex_mesh.py`.
 
 ### Phase 17a: `worker.py list --json --all` reads a bounded part of the history files
 

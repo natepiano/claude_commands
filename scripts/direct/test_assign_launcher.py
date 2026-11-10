@@ -27,7 +27,7 @@ from scripts.production import fake_unit_host, staff, test_worker as worker_fixt
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_session, fixture_runtime_id, fixture_worker, foreign_hostname, transcript_fixture
 from scripts.message import send, sessions
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.usage import agents_log
 
 def setUpModule() -> None:

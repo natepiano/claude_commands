@@ -28,7 +28,7 @@ from scripts.production.fake_unit_host import HostedUnit, labeled
 from scripts.message.sessions import SessionRecord
 from scripts.production.unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff, session_staff, unit_config
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, fixture_worker, recorded_showrunner, StaffTestCase
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
@@ -352,7 +352,7 @@ print(observed.row.id)
         self.assertIsInstance(found["alpha"].claude, LiveClaude)
 
     def test_restarted_unit_without_process_marks_uses_its_repaired_pane_record(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
         from scripts.production import session_pane
 
@@ -412,7 +412,7 @@ print(observed.row.id)
 
     def test_repair_creates_the_missing_live_launch_from_staff_and_rerun_writes_nothing(self) -> None:
         from scripts.production import session_staff
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         owner = unit_membership("show", "alpha")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
@@ -432,7 +432,7 @@ print(observed.row.id)
     def test_folder_labels_reach_tab_sort_queue_and_repair_with_an_unrelated_session_name(self) -> None:
         from scripts.production import session_staff
         from scripts.message import unit_labels
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         doc = self.root / "production.md"
         _ = doc.write_text("# show\n")

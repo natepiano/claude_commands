@@ -35,6 +35,18 @@ def fake_cargo_output_roots(
         for roots in mappings:
             if resolved == roots.workspace_root:
                 return roots
+        from scripts.copies import copies
+
+        if mappings and (resolved / copies.GATE_RECORD).is_file():
+            record = copies.read_record(resolved)
+            for roots in mappings:
+                if record.source == str(roots.workspace_root):
+                    def relocated(output: Path) -> Path:
+                        if output.is_relative_to(roots.workspace_root):
+                            return (resolved / output.relative_to(roots.workspace_root)).resolve()
+                        return output
+
+                    return CargoOutputRoots(resolved, relocated(roots.target_directory), relocated(roots.build_directory))
         return CargoOutputUnavailable("the fixture has no Cargo output mapping")
 
     with ExitStack() as stack:

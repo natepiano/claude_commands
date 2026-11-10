@@ -335,6 +335,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
                    worker_panes.worker_pass(row, session_dir))
             return DispatchSubmission.SUBMITTED
+        if row is not None:
+            owner = staff.snapshot().parent_of(row)
+            if owner is not None:
+                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], None],
+                                   import_module("scripts.herdr.turn_end").finish_late_completion)
+                finish_late(row, owner, hold, completion_actions.held_role)
         if isinstance(started, StartAtDispatch):
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
         else:
@@ -663,7 +669,7 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | Uns
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
     """Supply Claude child launchers and pane dispatch ids to the shared builder."""
-    from scripts.shutdown.inventory import worker_resumes
+    from scripts.agents.inventory import worker_resumes
 
     holder = record.by_id(parent)
     if holder is None:

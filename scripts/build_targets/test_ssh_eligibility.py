@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from functools import partial
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +19,7 @@ from typing import cast, override
 
 from scripts.lib import process_start as process_identity
 from scripts.lib.process_start_test_support import process_reader
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
 from unittest import mock
@@ -184,6 +187,13 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(self.reserve("mac"), 0)
         paths = mac_test.state_paths("mac")
         claim, = mac_test.read_claims(paths)
+        for published in (True, False):
+            with self.subTest(existing_wait_claim=True, reservation_published=published):
+                if not published:
+                    (self.root / "reservation.tsv").unlink()
+                self.assertEqual(self.reserve("mac"), 0)
+                self.assertEqual(mac_test.read_claims(paths)[0].record, claim.record)
+        self.commands.clear()
         block = mac_test.ActiveMacBlock(
             "assembly", "assembly checks", datetime.now(timezone.utc),
             datetime.now(timezone.utc) + timedelta(hours=1),
@@ -199,6 +209,45 @@ class SshEligibilityTests(unittest.TestCase):
                 self.assertFalse(destination.exists())
                 retained, = mac_test.read_claims(paths)
                 self.assertEqual(retained.record, claim.record)
+
+        for refusal, remote_cleanup, refusal_status in (("blocked", False, 1), ("backoff", False, 1),
+                                                        ("blocked", True, 0)):
+            record = dict(claim.record)
+            if remote_cleanup:
+                record.update(remote_host="fake-mac", cleanup_pending=True)
+            _ = claim.path.write_text(json.dumps(record))
+            if refusal == "blocked":
+                offload.backoff_path("mac").unlink(missing_ok=True)
+                mac_test.write_block(paths.block, block)
+            else:
+                paths.block.unlink(missing_ok=True)
+                offload.write_backoff(10**12, "mac")
+            for published in (False, True):
+                expected = 0 if refusal == "backoff" and published else refusal_status
+                with self.subTest(refusal=refusal, cleanup_pending=remote_cleanup,
+                                  state_lock_held=True, reservation_published=published):
+                    destination = self.root / "reservation.tsv"
+                    if published:
+                        _ = destination.write_text(f"mac\t{self.root / 'mac_test.conf'}\n")
+                    else:
+                        destination.unlink(missing_ok=True)
+                    command = [sys.executable, "-c",
+                               "import fcntl,sys; from pathlib import Path; "
+                               + "lock=Path(sys.argv[1]).open('a+'); fcntl.flock(lock,fcntl.LOCK_EX); "
+                               + "print('locked',flush=True); sys.stdin.read()", str(paths.lock)]
+                    with REAL_POPEN(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as holder:
+                        assert holder.stdout is not None and holder.stdin is not None
+                        self.assertEqual(holder.stdout.readline(), "locked\n")
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            pending = executor.submit(self.reserve, "mac")
+                            try:
+                                self.assertEqual(pending.result(timeout=TEST_HANG_GUARD_SECS), expected)
+                                self.assertEqual(destination.exists(), expected == 0)
+                                self.assertEqual(mac_test.read_claims(paths)[0].record, record)
+                            finally:
+                                holder.stdin.close()
+                                _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(self.commands, [])
 
     def test_disabled_aws_neither_contacts_a_host_nor_reserves_capacity(self) -> None:
         _ = write_config_fixture(self.root / "aws_target.conf", "offload=off\n")

@@ -216,8 +216,8 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     def setUp(self) -> None:
         self.cleanup_failures = ()
         self.root: Path = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(self.assert_nothing_outlives)
         self.home: Path = self.root / "home"
         self.bin_directory: Path = self.root / "bin"
@@ -264,13 +264,13 @@ class VerifyHoldWaitFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        VerifyHoldTools.setUpClass()
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
+        VerifyHoldTools.setUpClass()
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
         self.addCleanup(self.fixture_cleanups)
+        self.fixture.setUp()
         root = self.fixture.root
         pressure = root / "memory-pressure"
         write_pressure_reading(pressure)
@@ -296,7 +296,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         script = self.fixture.root / "unblocked-step.sh"
         _ = script.write_text('set -eo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
-            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+            + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
 PY=$CLAUDE_PYTHON

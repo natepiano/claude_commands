@@ -23,8 +23,8 @@ from unittest.mock import patch
 from weakref import finalize
 
 from scripts.production import staff, worker_admission
-from scripts.shutdown import pane_record, restart, stop_resume
-from scripts.shutdown.stop_results import SourceReleased
+from scripts.agents import pane_record, restart, stop_resume
+from scripts.agents.stop_results import SourceReleased
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import models_registry, process_start, unit_runs
@@ -2571,7 +2571,7 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_account_move_keeps_open_and_stopped_panes_without_an_active_dispatch(self) -> None:
         from scripts.accounts import pane_moves, moves
-        from scripts.shutdown import stop_results
+        from scripts.agents import stop_results
 
         run = self.run_state()
         for family in ("codex", "claude"):

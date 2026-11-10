@@ -921,3 +921,52 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Gotchas:**
 - Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
+
+### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
+
+#### As-built
+
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
+
+### Phase 45 — Copy watch test processes end by themselves · status: done
+
+#### As-built
+
+- Every helper process that `test_copy_watch.py` starts arms `signal.alarm` at the test hang guard as its first action: the step stub, the runner stub, the parent wrapper, its delayed child and the live-pid child.
+- The fixture passes `TEST_HANG_GUARD_SECS` from `test_hang_guard` in each process environment.
+- A suite that is killed before `tearDown` leaves no helper for longer than the guard. The real watcher did not change and ends when its parent is gone.
+- No new test. A one-second trial showed the step stub and the runner stub in hold mode end with SIGALRM.
+
+**Files:**
+- `scripts/mac_test/test_copy_watch.py` — the fixture processes and their time limit.
+
+**Gotchas:**
+- A forked child does not inherit a pending alarm, so each process arms its own. An alarm does stay across `exec`.
+
+### Phase 46 — Report and memory commands load only the code they use · status: done
+
+#### As-built
+
+- `disk.py` imports `scripts.lint.sweep` inside the four functions that use it. `disk.read_snapshot` does not load it.
+- `memory.window_report` imports `queue_snapshot` on each run. It imports `room_text` and `memory_admit` only for a queue snapshot in the window.
+- `report.py` has no direct queue or sweep import, so the report command loads neither `sweep` nor `queue_evidence`.
+- Thirty interleaved process pairs measured 0.268 CPU seconds saved per report process and 0.148 per memory process. The saving is 16.25 CPU seconds per merge gate at 7 report, 41 `test_index` and 23 memory children, and 5.3 without the `test_index` children.
+- Program output, row counts and SQL do not change.
+
+**Files:**
+- `scripts/buildlog/disk.py` — the disk snapshot and its floor.
+- `scripts/buildlog/memory.py` — the memory snapshot and the window report.
+
+**Gotchas:**
+- A module-level import of `sweep` or `queue_evidence` in these files brings the cost back.
+
+**Ruled out:**
+- A separate module for the `disk.py` writers needs caller and test edits and saves no more.

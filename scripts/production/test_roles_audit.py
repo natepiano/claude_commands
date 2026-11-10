@@ -785,7 +785,7 @@ other_names = []
             "docs/as-built/usage-ledger.md",
             "docs/as-built/build-memory-admission.md",
             "docs/production_format.md",
-            "scripts/shutdown/shutdown.py",
+            "scripts/agents/shutdown.py",
             "scripts/direct/assign.sh",
             "scripts/usage/collect.py",
         )

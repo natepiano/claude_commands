@@ -23,7 +23,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import staff
-from scripts.shutdown import shutdown, stop_resume, restart_support
+from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import unit_runs
@@ -766,7 +766,7 @@ class StaffTests(StaffCommandTestCase):
     def test_staff_fixture_keeps_registry_paths_under_its_private_folder(self) -> None:
         from scripts.lib.session_paths import sessions_directory
         from scripts.production import showrunners
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         keys = ("SHOWRUNNER_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "HERDR_PANE_RECORD_DIR", "XDG_CONFIG_HOME")
         root = self.root / "registry-fixture"
@@ -1011,6 +1011,23 @@ class StaffTests(StaffCommandTestCase):
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
         self.assertEqual(staff.restore_unit(removed.id, location), unit)
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        document = staff.LiveDoc("natedev", self.root / "child-production.md")
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=document)
+                self.assertEqual(promoted, replace(unit, kind="showrunner", worktree=staff.WORKTREE_UNFILLED, doc=document))
+                child = fixture_member("unit", name="child-" + machine, parent=promoted.id)
+                retained = fixture_member("worker", name="worker-" + machine, parent=promoted.id)
+                destination = staff.UnitRole(unit.name, parent.id, location)
+                demoted = staff.change_director(unit.id, destination)
+                self.assertEqual(demoted, unit)
+                self.assertEqual(staff.by_id(child.id), replace(child, parent=staff.ReportsTo(parent.id)))
+                self.assertEqual(staff.by_id(retained.id), retained)
+                unchanged = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                self.assertEqual(staff.change_director(unit.id, destination), unit)
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
+                self.assert_refused(lambda: staff.change_director(retained.id, destination))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), unchanged)
 
     def test_restore_unit_refuses_missing_identity_or_another_member_without_writing(self) -> None:
         parent, unit, worker = self.tree()
@@ -2001,7 +2018,7 @@ class StaffTests(StaffCommandTestCase):
 
     def test_explicit_staff_file_is_local_even_on_a_mac(self) -> None:
         with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.mac_file)}), mock.patch(
-            "scripts.shutdown.remote.other_machine", return_value="natedev",
+            "scripts.agents.remote.other_machine", return_value="natedev",
         ):
             row = fixture_member("showrunner", name="private")
             self.assertEqual(staff.snapshot().rows, (row,))

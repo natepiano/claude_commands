@@ -10,7 +10,7 @@ import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import json
 import fcntl
@@ -25,6 +25,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from threading import Event, Thread
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
@@ -33,6 +34,12 @@ from uuid import UUID
 
 
 from scripts.lib import build_folders, conf, copy_record, file_lock, scratch
+from scripts.lib.copy_record import (
+    AllRepositories as AllRepositories,
+    SelectedRepository as SelectedRepository,
+    RepositoryScope as RepositoryScope,
+    ALL_REPOSITORIES as ALL_REPOSITORIES,
+)
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -42,6 +49,8 @@ if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
     from scripts.production import staff
 
+# Checksums skip equal files. Changed files get the receiver write time.
+RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 GATE_RECORD = ".gate.json"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -161,22 +170,6 @@ def list_owner_name(owner: CopyOwner, staff_names: ListStaffNames) -> OwnerDispl
 
 def _owner_display_text(owner: OwnerDisplay) -> str:
     return owner.name if isinstance(owner, (CurrentStaffOwnerName, RoleOwnerName)) else "unavailable"
-
-
-@dataclass(frozen=True)
-class AllRepositories:
-    """Remove copies from every repository."""
-
-
-@dataclass(frozen=True)
-class SelectedRepository:
-    """Remove copies from one repository identity."""
-
-    name: str
-
-
-RepositoryScope = AllRepositories | SelectedRepository
-ALL_REPOSITORIES = AllRepositories()
 
 
 def repository_scope(repo: object) -> RepositoryScope:
@@ -307,6 +300,11 @@ class GateLease:
 
 
 @dataclass(frozen=True)
+class NoGateCache:
+    """This gate needs no retained Cargo cache."""
+
+
+@dataclass(frozen=True)
 class KnownHolder:
     pid: int
 
@@ -325,6 +323,17 @@ class UnreadableHolder:
 
 
 @dataclass(frozen=True)
+class TrackedFileTime:
+    """The time last used for one tracked blob in a gate cache."""
+
+    blob: str
+    mtime_ns: int
+
+
+NO_TRACKED_TIMES: Mapping[str, TrackedFileTime] = {}
+
+
+@dataclass(frozen=True)
 class GateRecord:
     owner: str
     repo: str
@@ -332,6 +341,7 @@ class GateRecord:
     commit: str
     last_use: float
     holder_pid: int
+    tracked_times: dict[str, TrackedFileTime] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -397,7 +407,7 @@ def source_owner(source: Path) -> str:
         if isinstance(owner, str):
             return checked_owner(owner)
     from scripts.production import staff
-    from scripts.shutdown.remote import local_machine
+    from scripts.agents.remote import local_machine
     try:
         member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
         if member is not None:
@@ -535,14 +545,24 @@ def read_record(tree: Path) -> GateRecord:
                 or not isinstance(moment, (int, float)) or not isinstance(pid, int)):
             raise ValueError("invalid owner, repo, source, commit, last_use or holder_pid")
         owner, repo, source, commit = cast(list[str], labels)
-        return GateRecord(owner, repo, source, commit, float(moment), pid)
+        times: dict[str, TrackedFileTime] = {}
+        stored = fields.get("tracked_times", {})
+        if isinstance(stored, dict):
+            for name, value in cast(dict[str, object], stored).items():
+                if isinstance(value, list) and len(cast(list[object], value)) == 2:
+                    blob, mtime = cast(list[object], value)
+                    if isinstance(blob, str) and isinstance(mtime, int):
+                        times[name] = TrackedFileTime(blob, mtime)
+        return GateRecord(owner, repo, source, commit, float(moment), pid, times)
     except (OSError, ValueError) as error:
         raise CopyError(f"{tree / GATE_RECORD}: unreadable gate record: {error}") from error
 
 
-def write_record(tree: Path, owner: str, repo: str, source: Path, commit: str) -> None:
+def write_record(tree: Path, owner: str, repo: str, source: Path, commit: str, *,
+                 tracked_times: Mapping[str, TrackedFileTime] = NO_TRACKED_TIMES) -> None:
     fields = {"owner": owner, "repo": repo, "source": str(source), "commit": commit,
-              "last_use": time.time(), "holder_pid": os.getpid()}
+              "last_use": time.time(), "holder_pid": os.getpid(),
+              "tracked_times": {name: [item.blob, item.mtime_ns] for name, item in tracked_times.items()}}
     write_text_atomic(tree / GATE_RECORD, json.dumps(fields) + "\n")
 
 
@@ -630,11 +650,30 @@ def _scratch_gate_word(owner: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "-", f"{owner_name(copy_owner(owner))}-gate").lstrip("-_")
 
 
+if TYPE_CHECKING:
+    GateDirectoryBase = tempfile.TemporaryDirectory[str]
+else:
+    GateDirectoryBase = tempfile.TemporaryDirectory
+
+
+class GateCheckoutDirectory(GateDirectoryBase):
+    """Remove a private gate folder and report a removal failure separately."""
+
+    @override
+    def cleanup(self) -> None:
+        caller_error = sys.exception()
+        try:
+            super().cleanup()
+        except OSError as error:
+            raise PostUseError(f"{self.name}: fresh copy removal failed: {error}",
+                               caller_error=caller_error) from error
+
+
 @contextmanager
 def fresh_tree(owner: str) -> Generator[GateLease]:
-    """Hold a private scratch checkout and delete its folder after use."""
-    path = scratch.new(word=_scratch_gate_word(owner), throwaway=True)
-    try:
+    """Hold one private checkout under TMPDIR for the gate's lifetime."""
+    with GateCheckoutDirectory(prefix=_scratch_gate_word(owner) + "-") as directory:
+        path = Path(directory)
         descriptors: list[int] = []
         with claim_tree(path, create=False, inherited_fds=descriptors) as state:
             if state is not ClaimState.ACQUIRED:
@@ -642,13 +681,6 @@ def fresh_tree(owner: str) -> Generator[GateLease]:
             checkout = path / "checkout"
             checkout.mkdir()
             yield GateLease(checkout, tuple(descriptors))
-    finally:
-        caller_error = sys.exception()
-        try:
-            shutil.rmtree(path)
-        except OSError as error:
-            raise PostUseError(f"{path}: fresh copy removal failed: {error}",
-                               caller_error=caller_error) from error
 
 
 def keeps_build_cache(source: Path, base: str) -> bool:
@@ -711,6 +743,7 @@ def refresh_remotes(tree: Path, source: Path) -> None:
 
     source_references = references(source, refs, "refs/heads")
     current_refs = references(tree, "refs/remotes/origin", "refs/remotes/source")
+    mappings: list[str] = []
     for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
         mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
         for key, value in ((f"remote.{remote}.url", remote_url),
@@ -725,7 +758,9 @@ def refresh_remotes(tree: Path, source: Path) -> None:
         if current != expected:
             # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
             _ = git(tree, "update-ref", "--no-deref", "-d", prefix + "HEAD")
-            _ = git(tree, "fetch", "-q", "--prune", "--", str(source), mapping)
+            mappings.append(mapping)
+    if mappings:
+        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 
 
 def final_object_store(store: Path) -> Path:
@@ -749,11 +784,10 @@ def initialize_git(tree: Path, source: Path, *, follow_alternates: bool = False)
     if not (tree / ".git").exists():
         # clone needs an empty destination; the tree already holds scratch's busy mark.
         # Stage only Git metadata, so first creation never has an unlocked checkout.
-        stage = tree / CLONE_STAGE
-        if stage.exists():
-            shutil.rmtree(stage)
         clone_source = source
         clone_mode = "--shared"
+        if source in ACTIVE_GATES.get():
+            clone_mode = "--no-local"
         if follow_alternates:
             original = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "objects").decode().strip()).resolve()
             store = final_object_store(original)
@@ -764,9 +798,10 @@ def initialize_git(tree: Path, source: Path, *, follow_alternates: bool = False)
                 record = scratch.task_of(record_path.parent if record_path is not None else checkout)
                 if isinstance(record, copy_record.Registered):
                     clone_mode = "--no-local"
-        _ = git(source, "clone", clone_mode, "--no-checkout", "--quiet", "--", str(clone_source), str(stage))
-        _ = (stage / ".git").rename(tree / ".git")
-        stage.rmdir()
+        with tempfile.TemporaryDirectory(dir=tree, prefix=CLONE_STAGE + "-") as directory:
+            stage = Path(directory)
+            _ = git(source, "clone", clone_mode, "--no-checkout", "--quiet", "--", str(clone_source), str(stage))
+            _ = (stage / ".git").rename(tree / ".git")
     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
         raise CopyError(f"{tree}: standing checkout must own its .git directory")
     actual = git(tree, "rev-parse", "--absolute-git-dir").decode().strip()
@@ -781,7 +816,7 @@ def initialize_git(tree: Path, source: Path, *, follow_alternates: bool = False)
     refresh_remotes(tree, source)
     exclude = tree / ".git/info/exclude"
     text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    entries = [entry for entry in (f"/{GATE_RECORD}", f"/{scratch.BUSY}", "/target/")
+    entries = [entry for entry in (f"/{GATE_RECORD}", f"/{scratch.BUSY}", "/target")
                if entry not in text.splitlines()]
     if entries:
         exclude.parent.mkdir(parents=True, exist_ok=True)
@@ -1080,28 +1115,65 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         yield source
         return
     keep_cache = keeps_build_cache(source, base)
-    lease_context = available_tree(owner, name, load_config()) if keep_cache else fresh_tree(owner)
-    with lease_context as lease:
+    with ExitStack() as lifetime:
+        cache_lease = lifetime.enter_context(available_tree(owner, name, load_config())) if keep_cache else NoGateCache()
+        lease = lifetime.enter_context(fresh_tree(owner))
         tree = lease.tree
-        token = COMMAND_LOCKS.set(lease.descriptors)
+        previous = read_record(cache_lease.tree).tracked_times if isinstance(cache_lease, GateLease) else {}
+        if isinstance(cache_lease, GateLease):
+            write_record(cache_lease.tree, owner, name, source, base, tracked_times=previous)
+        descriptors = cache_lease.descriptors if isinstance(cache_lease, GateLease) else ()
+        token = COMMAND_LOCKS.set((*descriptors, *lease.descriptors))
         active = ACTIVE_GATES.set((*ACTIVE_GATES.get(), tree))
         try:
             prepare(tree, source, owner, name, base, policy, merge)
+            write_text_atomic(tree.parent / copy_record.TEMPORARY_GATE_RECORD, json.dumps({
+                "task": f"gate:{owner}", "source_path": str(source), "source_commit": base,
+            }) + "\n")
+            if isinstance(cache_lease, GateLease):
+                cache = cache_lease.tree
+                mark_target(cache)
+                shutil.rmtree(tree / "target")
+                (tree / "target").symlink_to(cache / "target", target_is_directory=True)
+                for path, current in tracked_file_times(tree).items():
+                    saved = previous.get(path)
+                    if saved is not None and saved.blob == current.blob:
+                        file = tree / path
+                        os.utime(file, ns=(file.lstat().st_atime_ns, saved.mtime_ns), follow_symlinks=False)
             try:
                 yield tree
             finally:
-                if keep_cache:
+                if isinstance(cache_lease, GateLease):
                     caller_error = sys.exception()
                     try:
                         refresh_remotes(tree, source)
-                        mark_target(tree)
-                        write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
+                        mark_target(cache_lease.tree)
+                        commit = commit_at(tree, "HEAD")
+                        write_record(tree, owner, name, source, commit)
+                        write_record(cache_lease.tree, owner, name, source, commit, tracked_times=tracked_file_times(tree))
                     except (OSError, scratch.ScratchError, CopyError) as error:
                         raise PostUseError(f"{tree}: post-use refresh failed: {error}",
                                            caller_error=caller_error) from error
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
+
+
+def tracked_file_times(tree: Path) -> dict[str, TrackedFileTime]:
+    """Read tracked blob identities and their current file times."""
+    times: dict[str, TrackedFileTime] = {}
+    for entry in git(tree, "ls-tree", "-rz", "HEAD").split(b"\0"):
+        if not entry:
+            continue
+        metadata, path = entry.split(b"\t", 1)
+        _, kind, blob = metadata.split()
+        if kind != b"blob":
+            continue
+        name = os.fsdecode(path)
+        file = tree / name
+        if file.exists() or file.is_symlink():
+            times[name] = TrackedFileTime(blob.decode("ascii"), file.lstat().st_mtime_ns)
+    return times
 
 
 def list_trees() -> None:
@@ -1137,6 +1209,9 @@ def list_trees() -> None:
             print(f"{number}\t{owner}\t{record.repo}\t{host}\t{tree}\t-\t{record.commit}\t{state}\t{record.holder_pid}\t{disk}")
     mirrors = sorted(remote_mirrors(), key=lambda mirror: (mirror.host, mirror.path))
     for mirror, lease in list_remote_leases(mirrors, staff_names):
+        if mirror.host == "localhost" and not floor_claims.mirror_local_path(mirror.path).exists():
+            unregister_remote(mirror.host, mirror.path)
+            continue
         number += 1
         owner = _owner_display_text(list_owner_name(copy_owner(mirror.owner), staff_names))
         if isinstance(lease, HeldMirrorLease):
@@ -1150,7 +1225,8 @@ def list_trees() -> None:
             state = "idle" if isinstance(lease, IdleMirrorLease) else "unavailable"
             pid = "-"
             session = "-"
-        print(f"{number}\t{owner}\t{mirror.repository.name}\t{mirror.host}\t{mirror.path}\t{session}\t-\t{state}\t{pid}\t-")
+        local_host = host if mirror.host == "localhost" else mirror.host
+        print(f"{number}\t{owner}\t{mirror.repository.name}\t{local_host}\t{mirror.path}\t{session}\t-\t{state}\t{pid}\t-")
 
 
 def removing_path(tree: Path) -> Path:
@@ -1368,9 +1444,16 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                 present.append(tree)
             except (CopyError, OSError, scratch.ScratchError) as error:
                 failures.append(str(error))
+        unreachable_hosts: set[str] = set()
         for mirror in mirrors:
             try:
-                remove_remote_mirror(mirror)
+                if mirror.host not in unreachable_hosts:
+                    try:
+                        remove_remote_mirror(mirror)
+                        continue
+                    except RemoteHostUnreachable:
+                        unreachable_hosts.add(mirror.host)
+                defer_remote_removal(mirror)
             except (CopyError, OSError, subprocess.SubprocessError) as error:
                 failures.append(str(error))
                 failure_type = RemoteMirrorKept
@@ -1402,6 +1485,11 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         raise failure_type("\n".join(failures))
 
 
+class RemoteRemoval(Enum):
+    KEEP = "keep"
+    DEFERRED = "deferred"
+
+
 @dataclass(frozen=True)
 class RemoteMirror:
     """An owner's registered repository copy on a remote host."""
@@ -1411,6 +1499,7 @@ class RemoteMirror:
     host: str
     path: str
     session: str
+    removal: RemoteRemoval = RemoteRemoval.KEEP
 
 
 @dataclass(frozen=True)
@@ -1536,6 +1625,32 @@ def register_remote(mirror: RemoteMirror) -> None:
             "host": mirror.host, "path": mirror.path, "session": mirror.session,
             "holder_pid": os.getpid(), "last_use": time.time(),
         }) + "\n")
+    remove_deferred_mirrors(mirror.host)
+
+
+def defer_remote_removal(mirror: RemoteMirror) -> None:
+    """Keep the removal request until the next use of the host."""
+    with file_lock.exclusive(remote_registry() / "records.lock"):
+        path = remote_record_path(mirror)
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["removal"] = RemoteRemoval.DEFERRED.value
+        write_text_atomic(path, json.dumps(fields) + "\n")
+    print(f"{mirror.host}:{mirror.path}: removal deferred; removal runs at the next use of the host")
+
+
+def remove_deferred_mirrors(host: str) -> None:
+    """Retry local removal requests after a successful use of the host."""
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            mirror = read_remote_mirror(path)
+            if mirror.host != host or mirror.removal is not RemoteRemoval.DEFERRED:
+                continue
+            with remote_lease(mirror):
+                current = read_remote_mirror(path)
+                if current.removal is RemoteRemoval.DEFERRED:
+                    remove_remote_mirror(current)
+        except (CopyError, OSError, subprocess.SubprocessError) as error:
+            print(f"anomaly: deferred mirror removal: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def unregister_remote(host: str, path: str) -> None:
@@ -1556,7 +1671,8 @@ def read_remote_mirror(path: Path) -> RemoteMirror:
         if not all(isinstance(value, str) for value in values):
             raise ValueError("invalid remote mirror record")
         unit, repo, host, remote, session = cast(list[str], values)
-        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session)
+        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
+                            RemoteRemoval(fields.get("removal", "keep")))
     except (OSError, ValueError) as error:
         raise CopyError(f"{path}: repair remote mirror record: {error}") from error
 
@@ -1603,7 +1719,7 @@ def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: li
     receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
     # Keep the existing command order while metadata removal keeps the record last.
     exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
-    return ["rsync", "-rlpc", "--delete", f"--rsync-path={receiver}",
+    return ["rsync", RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", "--delete", f"--rsync-path={receiver}",
             *(f"--exclude=/{name}" for name in exclusions),
             f"--exclude-from={excludes}", "-e", shlex.join(["ssh", *options]),
             f"{source}/", f"{mirror.host}:{shlex.quote(mirror.path)}/"]
@@ -1690,8 +1806,9 @@ def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
     descendant_prefix = os.path.join(root, "")
     if isinstance(processes.uses, tmp_sweep.ProcessUsesUnavailable):
         return True
-    if any(pid != os.getpid() and (path == root or path.startswith(descendant_prefix))
-           for path, pid, _ in processes.uses.paths):
+    if any(pid != os.getpid() and how in (tmp_sweep.WORKS_IN, tmp_sweep.MAPS_FILE, tmp_sweep.WRITES_FILE)
+           and (path == root or path.startswith(descendant_prefix))
+           for path, pid, how in processes.uses.paths):
         return True
     try:
         group = floor_claims.read_mirror_record(tree / floor_claims.MIRROR_RECORD).get("process_group")
@@ -1703,12 +1820,26 @@ def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
 @contextmanager
 def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Generator[None]:
     """Lock the mirror before any claim or record operation."""
-    tree.parent.mkdir(parents=True, exist_ok=True)
-    with floor_claims.mirror_lock_path(tree).open("a+") as lock:
+    if not create and not tree.parent.exists():
+        yield
+        return
+    parent_lock = floor_claims.mirror_parent_lock_path(tree)
+    parent_lock.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as leases:
+        lease_files: list[TextIO] = []
         try:
+            outside = leases.enter_context(parent_lock.open("a+"))
+            lease_files.append(outside)
+            fcntl.flock(outside.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(outside.fileno()).st_ino != parent_lock.stat().st_ino:
+                raise BlockingIOError
+            if create:
+                tree.parent.mkdir(parents=True, exist_ok=True)
+            lock = leases.enter_context(floor_claims.mirror_lock_path(tree).open("a+"))
+            lease_files.append(lock)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             busy = mirror_has_process(tree, scan_mirror_processes((tree,)))
-        except BlockingIOError:
+        except (BlockingIOError, FileNotFoundError):
             busy = True
         if busy:
             try:
@@ -1719,11 +1850,13 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
         if create:
             tree.mkdir(parents=True, exist_ok=True)
             write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")
-        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), lock.fileno()))
+        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *(lease.fileno() for lease in lease_files)))
         try:
             yield
         finally:
             COMMAND_LOCKS.reset(token)
+            if not tree.parent.exists():
+                parent_lock.unlink(missing_ok=True)
             # Closing releases only our descriptor. Live children retain the flock.
 
 
@@ -1751,18 +1884,32 @@ def mirror_lease_set(mirrors: set[Path]) -> Generator[frozenset[Path]]:
         yield frozenset(protected)
 
 
+@dataclass(frozen=True)
+class MirrorSweepLeases:
+    """Separate acquired mirror leases from mirrors that another process holds."""
+
+    held: frozenset[Path]
+    busy: frozenset[Path]
+
+
 @contextmanager
-def mirror_sweep_leases(root: Path) -> Generator[frozenset[Path]]:
-    """Take idle mirror leases before the floor claim lock."""
+def mirror_sweep_leases(root: Path) -> Generator[MirrorSweepLeases]:
+    """Take idle mirror leases before reading the floor claims."""
     mirrors = {mark.parent for pattern in (f"*/{floor_claims.MIRROR_MARK}", f"*/*/{floor_claims.MIRROR_MARK}")
                for mark in root.glob(pattern)}
-    mirrors.update(floor_claims.mirror_local_path(item.path) for item in remote_mirrors() if item.host == "localhost")
+    for item in remote_mirrors():
+        if item.host == "localhost":
+            checkout = floor_claims.mirror_local_path(item.path)
+            if checkout.exists():
+                mirrors.add(checkout)
+            else:
+                unregister_remote(item.host, item.path)
     authority_glob = floor_claims.removal_authority_path(Path("*")).name
     mirrors.update(path.parent / path.name[1:-len(floor_claims.MIRROR_REMOVAL_SUFFIX)]
                    for pattern in (authority_glob, "*/" + authority_glob)
                    for path in root.glob(pattern))
     with mirror_lease_set(mirrors) as protected:
-        yield protected
+        yield MirrorSweepLeases(frozenset(mirrors) - protected, protected)
 
 
 @contextmanager
@@ -1779,12 +1926,28 @@ def target_mirror_leases(targets: Sequence[str]) -> Generator[frozenset[Path]]:
         yield protected
 
 
+class RemoteHostUnreachable(CopyError):
+    """The removal command could not connect to the mirror host."""
+
+
 def remove_remote_mirror(mirror: RemoteMirror) -> None:
     command = remote_copies_command("mirror-remove", mirror, "--host", mirror.host)
-    answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
-                            capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+    command += '; copies_status=$?; printf "\\nrc=%s\\n" "$copies_status"; exit "$copies_status"'
+    try:
+        answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
+                                capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        raise RemoteHostUnreachable(f"{mirror.host}:{mirror.path}: {error}") from error
     if answer.returncode:
-        raise CopyError(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
+        failure = (RemoteHostUnreachable if answer.returncode == 255 and any(
+            text in answer.stderr.lower() for text in (
+                "ssh: connect to host ", "ssh: connect to address ", "ssh: could not resolve hostname ",
+            )) else CopyError)
+        raise failure(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
+    status = next((line for line in reversed(answer.stdout.splitlines()) if line.startswith("rc=")), "")
+    if status != "rc=0":
+        detail = status or "remote status is missing"
+        raise CopyError(f"{mirror.host}:{mirror.path}: {detail}; {failure_detail(answer)}")
     unregister_remote(mirror.host, mirror.path)
 
 
@@ -1802,11 +1965,11 @@ def clear_mirror_content(tree: Path) -> None:
 
 
 @contextmanager
-def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.LockedClaims]:
-    """Take the claim lock, then the record lock, while the caller holds the lease."""
-    with floor_claims.locked_claims(load_config().git_timeout_seconds) as claims:
-        with file_lock.exclusive(floor_claims.record_lock_path(tree)):
-            yield claims
+def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.ClaimSnapshot]:
+    """Read claims, then lock the record while the caller holds the mirror lease."""
+    claims = floor_claims.read_claims(load_config().git_timeout_seconds)
+    with file_lock.exclusive(floor_claims.record_lock_path(tree)):
+        yield claims
 
 
 def mirror_remove(args: CopyArguments) -> int:

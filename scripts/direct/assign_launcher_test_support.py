@@ -22,7 +22,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff, unit_config, test_worker, worker
 from scripts.production.cli_fixture import invoke_cli
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"

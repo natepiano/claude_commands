@@ -297,8 +297,11 @@ def diagnostic_counts(output: str) -> tuple[int, int, int, int]:
     return totals["warning"], len(crates["warning"]), totals["error"], len(crates["error"])
 
 
-def directory_gib(path: Path) -> float:
-    return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file()) / GIB if path.exists() else 0.0
+def directory_gib(path: Path, excluded: tuple[Path, ...] = ()) -> float:
+    if not path.exists():
+        return 0.0
+    return sum(entry.stat().st_size for entry in path.rglob("*")
+               if entry.is_file() and not any(entry.resolve().is_relative_to(root) for root in excluded)) / GIB
 
 
 def trial_output_gib(clone: Path) -> tuple[float, float]:
@@ -307,10 +310,10 @@ def trial_output_gib(clone: Path) -> tuple[float, float]:
     roots = {clone / "target"}
     for output in saved:
         roots.update((output.roots.target_directory, output.roots.build_directory))
-    mend = clone / "mend-target"
+    mend = clone / "target/mend-target"
     roots = {root.resolve() for root in roots if not root.resolve().is_relative_to(mend.resolve())}
     outer = [root for root in roots if not any(root != parent and root.is_relative_to(parent) for parent in roots)]
-    return sum(directory_gib(root) for root in outer), directory_gib(mend)
+    return sum(directory_gib(root, (mend.resolve(),)) for root in outer), directory_gib(mend)
 
 
 def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
@@ -341,7 +344,7 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         finally:
             if cwd is not None:
                 target_gib, mend_target_gib = trial_output_gib(cwd)
-                mend_target = cwd / "mend-target"
+                mend_target = cwd / "target/mend-target"
                 if mend_target.is_dir() and not mend_target.is_symlink():
                     scratch.mark_cargo_cache(mend_target)
         if held():
@@ -377,8 +380,8 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
             warnings, warning_crates, errors, error_crates = diagnostic_counts(clippy.stdout)
             if clippy.returncode and errors == 0:
                 return failed(first_error(clippy))
-            mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(checkout / "mend-target"),
-                              "CARGO_BUILD_BUILD_DIR": str(checkout / "mend-target/intermediates")}
+            mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(checkout / "target/mend-target"),
+                              "CARGO_BUILD_BUILD_DIR": str(checkout / "target/mend-target/intermediates")}
             mend = run("cargo-mend", ["cargo", f"+{version}", "install", "--path",
                                       str(Path.home() / "rust/cargo-liner/crates/cargo-mend"),
                                       "--root", str(checkout / "target" / "mend-root")], checkout, mend_env, 3600)

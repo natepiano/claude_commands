@@ -46,6 +46,8 @@ def compiler_message(package: str, level: str, code: str, line: int) -> str:
 class FakeRunner:
     def __init__(self, clone: Path, *, fail: str = "", timeout: str = "", diagnostics: str = "", clippy_exit: int = 0, killed: str = "", kill_status: int = 137, kill_output: str = "") -> None:
         self.clone = clone
+        self.cache = clone / "target"
+        self.stale_outputs: list[bool] = []
         self.fail = fail
         self.timeout = timeout
         self.diagnostics = diagnostics
@@ -59,11 +61,16 @@ class FakeRunner:
         self.calls.append((args, cwd, env, timeout))
         step = "toolchain" if args[0] == "rustup" else "clone" if args[:2] == ["git", "clone"] else "revision" if "rev-parse" in args else "checkout" if "checkout" in args else "clippy" if args[0] == "nix" else "cargo-mend"
         if step == "clippy":
-            target = self.clone / "target"
+            assert cwd is not None
+            self.clone = cwd
+            self.cache = (cwd / "target").resolve()
+            self.stale_outputs.append((cwd / "stale-output").exists())
+            _ = (cwd / "stale-output").write_text("old source")
+            target = Path(env["CARGO_TARGET_DIR"])
             target.mkdir(parents=True, exist_ok=True)
             _ = (target / "output").write_bytes(b"clippy")
         if step == "cargo-mend":
-            target = self.clone / "mend-target"
+            target = Path(env["CARGO_TARGET_DIR"])
             target.mkdir(parents=True, exist_ok=True)
             _ = (target / "output").write_bytes(b"mend")
             root = Path(args[args.index("--root") + 1]) / "bin"
@@ -86,7 +93,6 @@ class RustReleaseTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        _ = self.enterContext(fake_cargo_output_roots(children=True))
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"
@@ -107,6 +113,8 @@ class RustReleaseTests(unittest.TestCase):
         _ = subprocess.run(["git", "-C", str(source), "add", "."], check=True, capture_output=True)
         _ = subprocess.run(["git", "-C", str(source), "commit", "-qm", "trial source"], check=True, capture_output=True)
         _ = self.enterContext(mock.patch.object(rust_release, "HANA", source))
+        _ = self.enterContext(fake_cargo_output_roots(
+            cargo_output.CargoOutputRoots(source, source / "target", source / "target"), children=True))
 
 
     def test_free_space_checks_each_output_filesystem_once(self) -> None:
@@ -141,10 +149,10 @@ class RustReleaseTests(unittest.TestCase):
         (clone / "target" / "debug").mkdir(parents=True)
         external = self.scratch / "external"
         external.mkdir()
-        (clone / "mend-target").mkdir()
+        (clone / "target/mend-target").mkdir()
         _ = (clone / "target/debug/artifact").write_bytes(b"a" * 5)
         _ = (external / "intermediate").write_bytes(b"b" * 7)
-        _ = (clone / "mend-target/output").write_bytes(b"c" * 3)
+        _ = (clone / "target/mend-target/output").write_bytes(b"c" * 3)
         roots = cargo_output.CargoOutputRoots(clone, clone / "target", external)
         saved = (scratch.SavedCargoOutput(roots, ()),)
         with mock.patch.object(scratch, "save_cargo_outputs", return_value=saved):
@@ -384,17 +392,18 @@ class RustReleaseTests(unittest.TestCase):
         self.assertTrue(trial["mend_builds"])
         self.assertGreater(trial["target_gib"], 0)
         self.assertGreater(trial["mend_target_gib"], 0)
-        self.assertTrue((clone / ".git").is_dir())
+        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.cache.is_dir())
         self.assertEqual(["rustup", "git", "nix", "cargo"], [args[0] for args, _, _, _ in runner.calls])
         clippy = next(call for call in runner.calls if call[0][0] == "nix")
-        self.assertEqual(clone, clippy[1])
+        self.assertEqual(runner.clone, clippy[1])
         self.assertEqual(7200, clippy[3])
         self.assertEqual("0", clippy[2]["CARGO_INCREMENTAL"])
         self.assertEqual("-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3", clippy[2]["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"])
         mend = runner.calls[-1]
         self.assertEqual("1", mend[2]["RUSTC_BOOTSTRAP"])
-        self.assertEqual(str(clone / "mend-target"), mend[2]["CARGO_TARGET_DIR"])
-        self.assertEqual(str(clone / "mend-target/intermediates"), mend[2]["CARGO_BUILD_BUILD_DIR"])
+        self.assertEqual(str(runner.clone / "target/mend-target"), mend[2]["CARGO_TARGET_DIR"])
+        self.assertEqual(str(runner.clone / "target/mend-target/intermediates"), mend[2]["CARGO_BUILD_BUILD_DIR"])
         self.assertEqual(1, len(texts))
         self.assertIn("Errors: 1; new warnings: 2", texts[0][1])
         self.assertIn("Hana still uses Rust 1.99.0", texts[0][1])
@@ -408,22 +417,27 @@ class RustReleaseTests(unittest.TestCase):
                 _ = rust_release.trial_release("1.100.0", runner, lambda: False)
                 mend = runner.calls[-1]
                 root = Path(mend[0][mend[0].index("--root") + 1])
-                self.assertTrue(root.is_relative_to(clone / "target"))
-                self.assertTrue((root / "bin/cargo-mend").is_file())
-                for cache in (clone / "target", clone / "mend-target"):
+                self.assertTrue(root.is_relative_to(runner.clone / "target"))
+                self.assertFalse(runner.clone.exists())
+                self.assertTrue((runner.cache / "mend-root/bin/cargo-mend").is_file())
+                for cache in (runner.cache, runner.cache / "mend-target"):
                     self.assertIn(scratch.CARGO_TAG_LINE, (cache / scratch.CACHE_TAG).read_text())
                     self.assertTrue((cache / scratch.USE_STAMP).is_file())
 
     def test_next_trial_resets_sources_and_keeps_its_build_cache(self) -> None:
-        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
-        fake = FakeRunner(clone)
+        fake = FakeRunner(self.scratch / "unused-checkout")
         self.assertEqual(0, self.invoke(runner=fake))
-        _ = (clone / "stale-output").write_text("old source")
-        _ = (clone / "target/warm").write_text("retained")
+        first = fake.clone
+        cache = fake.cache
+        self.assertFalse(first.exists())
+        _ = (cache / "warm").write_text("retained")
         rust_release.state_path().unlink()
         self.assertEqual(0, self.invoke(runner=fake))
-        self.assertFalse((clone / "stale-output").exists())
-        self.assertEqual((clone / "target/warm").read_text(), "retained")
+        self.assertNotEqual(fake.clone, first)
+        self.assertEqual(fake.stale_outputs, [False, False])
+        self.assertFalse(fake.clone.exists())
+        self.assertEqual(fake.cache, cache)
+        self.assertEqual((cache / "warm").read_text(), "retained")
         state = rust_release.read_state()
         assert state is not None
         self.assertEqual("finished", state["trial"]["status"])
@@ -438,7 +452,8 @@ class RustReleaseTests(unittest.TestCase):
         trial = state["trial"]
         assert trial["status"] == "finished"
         self.assertFalse(trial["mend_builds"])
-        self.assertTrue((clone / ".git").is_dir())
+        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.cache.is_dir())
         self.assertIn("The tool that repairs Rust build errors fails to compile", texts[0][1])
 
     def test_failed_clippy_step_records_first_error_and_is_not_retried(self) -> None:
@@ -450,7 +465,8 @@ class RustReleaseTests(unittest.TestCase):
         trial = state["trial"]
         assert trial["status"] == "failed"
         self.assertEqual(("clippy", "error: clippy broke"), (trial["step"], trial["reason"]))
-        self.assertTrue((clone / ".git").is_dir())
+        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.cache.is_dir())
         calls = len(runner.calls)
         self.assertEqual(0, self.invoke(runner=runner))
         self.assertEqual(calls, len(runner.calls))
@@ -465,7 +481,8 @@ class RustReleaseTests(unittest.TestCase):
                 state = rust_release.read_state()
                 assert state is not None
                 self.assertEqual("waiting", state["trial"]["status"])
-                self.assertTrue((clone / ".git").is_dir())
+                self.assertFalse(killed.clone.exists())
+                self.assertTrue(killed.cache.is_dir())
                 retry = FakeRunner(clone)
                 self.assertEqual(0, self.invoke(at=datetime(2026, 11, 13, 3), runner=retry))
                 state = rust_release.read_state()
@@ -502,7 +519,8 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "failed"
         self.assertEqual("clippy", trial["step"])
         self.assertGreater(trial["target_gib"], 0)
-        self.assertTrue((clone / ".git").is_dir())
+        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.cache.is_dir())
 
     def test_waiting_text_is_not_repeated_after_later_trial_or_new_day(self) -> None:
         texts: list[tuple[str, str]] = []
@@ -571,7 +589,7 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(1, len(texts))
         self.assertEqual("cargo", runner.calls[-1][0][0])
 
-    def test_hold_after_nonzero_clippy_keeps_trial_waiting_and_checkout(self) -> None:
+    def test_hold_after_nonzero_clippy_keeps_trial_waiting_and_cache(self) -> None:
         clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone, fail="clippy")
 
@@ -582,7 +600,8 @@ class RustReleaseTests(unittest.TestCase):
         state = rust_release.read_state()
         assert state is not None
         self.assertEqual({"status": "waiting", "version": "1.100.0", "reason": "build hold active"}, state["trial"])
-        self.assertTrue((clone / ".git").is_dir())
+        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.cache.is_dir())
         self.assertEqual("nix", runner.calls[-1][0][0])
 
     def test_missing_pin_keeps_finished_trial_and_sent_text_for_return(self) -> None:

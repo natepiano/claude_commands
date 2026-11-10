@@ -29,10 +29,14 @@ from scripts.lib import process_group
 
 from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
+from scripts.production import session_staff, staff
 from scripts.copies import copies
 from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners
 from scripts.style import style_ledger
+from scripts.style import style_config
+from scripts.style import style_plan
+from scripts.style.unit_files import changed_files
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import scratch
 
@@ -67,34 +71,106 @@ class ToolLintRecord:
     diagnostics: Mapping[str, int]
 
 
+@dataclass(frozen=True)
+class ConfiguredStyleProduction:
+    name: str
+    config: style_config.StyleRepositoryConfig
+
+
+@dataclass(frozen=True)
+class DirectUnitSync:
+    """A direct sync uses the parent route and the unit's current branch."""
+    route: style_config.ParentUnitRoute
+    branch: session_staff.Branch
+    unit: staff.StaffId
+    worktree: Path
+
+
+@dataclass(frozen=True)
+class NoDirectRoute:
+    """The repository has no configured direct style unit."""
+
+
+def sync_productions(repo: Path) -> tuple[ConfiguredStyleProduction, ...]:
+    """Find style configurations in this repository's worktrees."""
+    trees = tuple(Path(line.removeprefix("worktree ")) for line in
+                  git(repo, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree "))
+    productions: list[ConfiguredStyleProduction] = []
+    for row in staff.snapshot().find(kind="showrunner"):
+        if not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) or not row.doc.path.is_file():
+            continue
+        if not any(row.doc.path.is_relative_to(tree) for tree in trees):
+            continue
+        lines = row.doc.path.read_text().splitlines()
+        if not style_config.has_style_units(lines):
+            continue
+        config = style_config.read_config(row.doc.path)
+        productions.append(ConfiguredStyleProduction(row.name, config))
+    return tuple(productions)
+
+
+def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
+    """Resolve the parent route and the unit branch for a direct sync."""
+    productions = tuple(production for production in sync_productions(repo)
+                        if isinstance(production.config.route, style_config.ParentUnitRoute))
+    if not productions:
+        return NoDirectRoute()
+    assignments = tuple(assignment for production in productions for assignment in production.config.assignments)
+    if not unit:
+        if len(assignments) != 1:
+            raise Refusal("specify --unit for a repository with multiple direct style units")
+        unit = assignments[0].unit
+    if unit not in {assignment.unit for assignment in assignments}:
+        raise Refusal(f"{unit}: no direct style assignment in this repository")
+    record = staff.snapshot()
+    route = style_config.config_for_unit(unit, record).route
+    assert isinstance(route, style_config.ParentUnitRoute)
+    row = next(row for row in record.find(kind="unit") if row.name == unit)
+    branch = session_staff.RowResolver(record, rows=(row,)).unit_branch(row)
+    if not isinstance(branch, session_staff.Branch):
+        raise style_config.StyleConfigError(f"{row.name}: {branch.reason}")
+    if not isinstance(row.worktree, staff.PresentWorktree):
+        raise style_config.StyleConfigError(f"{row.name}: no unit worktree")
+    return DirectUnitSync(route, branch, row.id, row.worktree.path)
+
+
+def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
+    caller = showrunners.own_name() or "style_sync"
+    sent = subprocess.run([
+        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", caller,
+        "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
+        "--key", f"style-sync:{target}",
+        "--timeout", str(SEND_SECONDS),
+    ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
+    outcome = send_result.send_outcome(sent.returncode, sent.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        if outcome.header.outcome in {"sent", "skipped", "kept", "replaced"}:
+            return
+        if outcome.header.outcome == "retry":
+            raise Refusal(f"send.py: needs a retry: {outcome.header.detail}")
+    raise Refusal(f"send.py: {failure_detail(sent)}")
+
+
 def notify(repo_dir: Path, branch: str, tip: str) -> None:
     """A failed notification must never turn a completed merge into a failure."""
     try:
-        standing = standing_style_production(repo_dir)
         branch = branch.removeprefix("refs/heads/")
-        if isinstance(standing, NoStyleProduction) or standing.branch_point != branch:
-            return
-        address = subprocess.run([str(PYTHON), str(SHOWRUNNERS), "address", standing.name],
-                                 capture_output=True, text=True, check=False, timeout=10)
-        if address.returncode or not address.stdout.strip():
-            raise Refusal(address.stderr.strip() or f"no address for {standing.name}")
-        caller = showrunners.own_name() or "style_sync"
-        sent = subprocess.run([
-            str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address.stdout.strip(), "--from", caller,
-            "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
-            "--key", f"style-sync:{standing.name}",
-            "--timeout", str(SEND_SECONDS),
-        ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
-        outcome = send_result.send_outcome(sent.returncode, sent.stdout)
-        if isinstance(outcome, send_result.ConfirmedSendOutcome):
-            match outcome.header.outcome:
-                case "sent" | "skipped" | "kept" | "replaced":
-                    return
-                case "retry":
-                    raise Refusal(f"send.py: needs a retry: {outcome.header.detail}")
-                case "queued" | "failed" | "refused" | "held" | "pending":
-                    pass
-        raise Refusal(f"send.py: {failure_detail(sent)}")
+        for production in sync_productions(repo_dir):
+            if production.config.route.branch_point.removeprefix("refs/heads/") != branch:
+                continue
+            if isinstance(production.config.route, style_config.ParentUnitRoute):
+                directors = _waiting_directors(production.name)
+                targets = tuple(assignment.unit for assignment in production.config.assignments)
+            else:
+                directors = (WaitingUnitDirector(production.name, runner_value("address", production.name)),)
+                targets = (production.name,)
+            for target in targets:
+                try:
+                    sync_notice(director_address(directors, target), target, branch, tip)
+                except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    if isinstance(production.config.route, style_config.StyleShowrunnerRoute):
+                        raise
+                    print(f"style_sync: notify {target}: " + " ".join(str(error).splitlines()))
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
@@ -147,12 +223,33 @@ def git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def own_handoff(repo: Path, tip: str, style_branch: str) -> int:
-    """Finish a tip holding the style branch's own tree without a new lint run."""
+def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
+    """Compare the tip with the unit branch or the style branch."""
     tip = git(repo, "rev-parse", "--verify", f"{tip}^{{commit}}")
+    sync = direct_route(repo, unit)
+    comparison_branch = sync.branch.name if isinstance(sync, DirectUnitSync) else style_branch
+    if isinstance(sync, DirectUnitSync):
+        style_branch = sync.route.receiving_branch
+        with style_ledger.publication_lock(sync.worktree), style_ledger.open_ledger(repo) as ledger:
+            _ = style_plan.recover_publication(sync.worktree, ledger)
+            opened = ledger.ticket_open(str(sync.unit))
+            if any(ticket["state"] == "assigned" for ticket in opened) or changed_files(sync.worktree):
+                ledger.wait_for_sync(str(sync.unit))
+                return 4
+            _ = git(sync.worktree, "merge", "--no-edit", tip)
+            for ticket in opened:
+                ledger.check_ticket_pipeline(ticket["id"])
+            pending = style_ledger.publication_path(sync.worktree, "pending-sync")
+            if pending.exists():
+                target = pending.read_text().strip()
+                if subprocess.run(["git", "-C", str(sync.worktree), "merge-base", "--is-ancestor", target, "HEAD"],
+                                  capture_output=True, check=False).returncode == 0:
+                    pending.unlink()
+            ledger.clear_sync_wait(str(sync.unit))
     style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
+    comparison_branch = "refs/heads/" + comparison_branch.removeprefix("refs/heads/")
     tree = git(repo, "rev-parse", "--verify", f"{tip}^{{tree}}")
-    if tree != git(repo, "rev-parse", "--verify", f"{style_branch}^{{tree}}"):
+    if tree != git(repo, "rev-parse", "--verify", f"{comparison_branch}^{{tree}}"):
         return 1
     with style_ledger.open_ledger(repo) as ledger:
         ledger.set_tip(tip, style_branch)
@@ -376,6 +473,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         with signal_mask(signal.SIG_UNBLOCK):
             (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
             intermediates = snapshot / "target/intermediates"
+            retained_target = (snapshot / "target").resolve()
             scratch.mark_cargo_cache(intermediates)
             saved = subprocess.run(
                 [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
@@ -388,7 +486,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             print(output, end="")
             # Build outputs are retained; only source changes invalidate coverage.
             rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-            rewritten = rewritten or (snapshot / "target").is_symlink()
+            rewritten = rewritten or (snapshot / "target").resolve() != retained_target
             records = lint_records(output, snapshot)
             for record in records:
                 passed = record.passed and not rewritten
@@ -441,6 +539,15 @@ class WaitingUnitDirector:
     address: str
 
 
+def director_address(directors: tuple[WaitingUnitDirector, ...], unit: str) -> str:
+    addresses = [director.address for director in directors if director.unit == unit]
+    if not addresses:
+        raise Refusal("no live director")
+    if len(addresses) != 1:
+        raise Refusal(f"{len(addresses)} directors")
+    return addresses[0]
+
+
 def _waiting_directors(name: str) -> tuple[WaitingUnitDirector, ...]:
     try:
         result = subprocess.run(
@@ -479,15 +586,16 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
         if not waits:
             return
         try:
-            standing = standing_style_production(repo)
+            productions = sync_productions(repo)
         except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
             for wait in waits:
                 print(f"style_ledger: wake {wait.unit}: " + " ".join(str(error).splitlines()))
             return
-        if isinstance(standing, NoStyleProduction):
+        if not productions:
             return
         try:
-            directors = _waiting_directors(standing.name)
+            directors = tuple(director for production in productions for director in _waiting_directors(production.name)
+                              if director.unit in {assignment.unit for assignment in production.config.assignments})
         except Refusal as error:
             for wait in waits:
                 print(f"style_ledger: wake {wait.unit}: {error}")
@@ -495,14 +603,12 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
         for wait in waits:
             try:
                 unit = ledger.unit_name(wait.unit)
-                addresses = [director.address for director in directors if director.unit == unit]
-                if not addresses:
-                    raise Refusal("no live director")
-                if len(addresses) != 1:
-                    raise Refusal(f"{len(addresses)} directors")
+                address = director_address(directors, unit)
+                name = next(production.name for production in productions
+                            if unit in {assignment.unit for assignment in production.config.assignments})
                 result = subprocess.run([
-                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", addresses[0], "--from", standing.name,
-                    "--text", f"From the showrunner of {standing.name}: ticket {ticket_id} merged; refill.",
+                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", name,
+                    "--text", f"From the showrunner of {name}: ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS),
                 ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
@@ -536,9 +642,17 @@ def replay_handoffs(ledger: style_ledger.Ledger, name: str, parent: str) -> int:
 
 
 def resume(repo: Path, name: str, branch_point: str, style_branch: str) -> int:
+    productions = sync_productions(repo)
+    production = next((production for production in productions if production.name == name
+                       or name in {assignment.unit for assignment in production.config.assignments}), None)
+    if production is not None:
+        route = production.config.route
+        branch_point, style_branch = route.branch_point, route.receiving_branch
     with style_ledger.open_ledger(repo) as ledger:
         for change in ledger.reconcile(branch_point, style_branch):
             print(change, flush=True)
+        if production is not None and isinstance(production.config.route, style_config.ParentUnitRoute):
+            return 0
         return replay_handoffs(ledger, name, runner_value("parent", name))
 
 
@@ -581,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = own.add_argument("--repo", type=Path, required=True)
     _ = own.add_argument("--tip", required=True)
     _ = own.add_argument("--style-branch", required=True)
+    _ = own.add_argument("--unit", default="")
     replay = commands.add_parser("resume")
     handoff = commands.add_parser("send-handoff")
     wake = commands.add_parser("wake-waiters")
@@ -598,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         if cast(str, args.command) == "own-handoff":
-            return own_handoff(cast(Path, args.repo), cast(str, args.tip), cast(str, args.style_branch))
+            return own_handoff(cast(Path, args.repo), cast(str, args.tip), cast(str, args.style_branch), cast(str, args.unit))
         if cast(str, args.command) == "wake-waiters":
             wake_waiters(cast(Path, args.repo), cast(str, args.ticket))
             return 0

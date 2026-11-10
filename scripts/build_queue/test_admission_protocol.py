@@ -24,6 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lib.build_steps import read_step_names
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts import build_queue
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
@@ -33,6 +34,32 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+
+    def test_client_startup_imports_only_the_wire_without_record_readers(self) -> None:
+        for operation in ("import", "release reply"):
+            with self.subTest(operation=operation):
+                source = "import json, sys; from scripts.build_queue import admission_client; "
+                if operation == "release reply":
+                    source += (
+                        "wire = admission_client.wire; "
+                        "reply = wire.parse_reply(wire.encode_reply(wire.Ok()), wire.ReleaseRequest('request', 'reservation', 0)); "
+                        "assert isinstance(reply, wire.Ok); ")
+                source += "print(json.dumps(sorted(sys.modules)))"
+                result = subprocess.run([sys.executable, "-c", source],
+                    cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+                    timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                loaded = cast(list[str], json.loads(result.stdout))
+                self.assertIn("scripts.build_queue.admission_wire", loaded)
+                for module in (
+                    "scripts.build_queue.admission_protocol", "scripts.build_queue.admission_records",
+                    "scripts.build_queue.queue_lines", "scripts.build_queue.progress_profile",
+                    "scripts.build_queue.scope_activity", "scripts.build_queue.cloud_progress",
+                    "scripts.buildlog.store", "scripts.lib.build_steps", "scripts.lib.user_zone",
+                    "scripts.message.send_budget", "scripts.message.send_result", "scripts.message.session_send",
+                ):
+                    with self.subTest(module=module):
+                        self.assertNotIn(module, loaded)
 
     def test_local_and_cloud_places_survive_the_request_wire(self) -> None:
         with AdmissionFixture() as fixture:

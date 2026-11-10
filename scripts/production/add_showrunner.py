@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from scripts.production import completion_receipt, staff
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 from scripts.production import showrunners
@@ -181,7 +181,7 @@ def launch(child: ProductionDocument, model: str, effort: str, resume: str | Non
     arguments = ["--model", model, "--effort", effort]
     if resuming:
         arguments.extend(["--resume", session_id])
-    from scripts.shutdown.launch_names import LaunchNames
+    from scripts.agents.launch_names import LaunchNames
 
     name = LaunchNames.read().name(session_id, child.name)
     arguments.extend(["--remote-control", name, "-n", name, "--settings", '{"disableAgentView": true}'])

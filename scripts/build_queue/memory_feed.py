@@ -7,6 +7,8 @@ except FileNotFoundError:
     pass
 
 import argparse
+import hashlib
+import importlib
 import json
 import os
 import sys
@@ -29,15 +31,13 @@ if __name__ == "__main__":
     _ = bootstrap.add_argument("--code-root", type=Path, default=Path(__file__).resolve().parents[2])
     installed, _remaining = bootstrap.parse_known_args(namespace=installed)
 
+FEED_IMPORT_STARTED_AT_NS = time.time_ns()
+
 from scripts.build_queue import admission_code
 
 
-def installed_code_version(code_root: Path) -> str:
-    """Use the admission service fingerprint for the installed sources."""
-    return admission_code.admission_code_version(code_root / "scripts")
-
-
-LOADED_ADMISSION_CODE_VERSION = installed_code_version(installed.code_root)
+# Preserve the schema check across the imports below.
+ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
 from scripts.buildlog import charts, mac_idle_alert
 from scripts.buildlog.store import host_name
@@ -47,7 +47,7 @@ from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.lib.build_steps import RECORDED_STEP_NAMES
+from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
@@ -56,6 +56,61 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 from scripts.review_links import review_link
+
+# These function-level imports also belong to the fixed source list.
+FUNCTION_IMPORT_MODULES = (
+    "scripts.buildlog.record", "scripts.buildlog.holds", "scripts.build_targets.target_config",
+    "scripts.production.production_doc", "scripts.build_hold.override_guard",
+    "scripts.production.change_routing",
+)
+
+
+def feed_code_paths() -> tuple[str, ...]:
+    """Freeze the feed modules and startup files after the imports finish."""
+    for name in FUNCTION_IMPORT_MODULES:
+        _ = importlib.import_module(name)
+    source_root = Path(__file__).resolve().parents[2]
+    paths = {"scripts/" + relative for relative in admission_code.ADMISSION_CODE_PATHS}
+    paths.update(("scripts/lib/package_root.py", "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
+    for module in tuple(sys.modules.values()):
+        source = getattr(module, "__file__", None)
+        if isinstance(source, str) and source.endswith(".py"):
+            path = Path(source).resolve()
+            if path.is_relative_to(source_root):
+                paths.add(path.relative_to(source_root).as_posix())
+    return tuple(sorted(paths))
+
+
+FEED_CODE_PATHS = feed_code_paths()
+
+
+def installed_feed_code_version(code_root: Path) -> str:
+    """Hash the fixed feed sources and startup files in the installed copy."""
+    digest = hashlib.sha256()
+    for relative in FEED_CODE_PATHS:
+        try:
+            content = (code_root / relative).read_bytes()
+        except OSError:
+            return ""
+        digest.update(relative.encode() + b"\0" + content + b"\0")
+    return digest.hexdigest()
+
+
+def loaded_feed_code_version(code_root: Path) -> str:
+    """Reject an installation that changes while the feed imports its modules."""
+    if admission_code.admission_code_version(code_root / "scripts") != ADMISSION_VERSION_AT_IMPORT:
+        return ""
+    version = installed_feed_code_version(code_root)
+    try:
+        if any((code_root / relative).stat().st_mtime_ns > FEED_IMPORT_STARTED_AT_NS for relative in FEED_CODE_PATHS):
+            return ""
+    except OSError:
+        return ""
+    return version
+
+
+LOADED_FEED_CODE_VERSION = loaded_feed_code_version(installed.code_root)
+
 
 GIB = 1024 ** 3
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
@@ -274,6 +329,7 @@ class CloudWorkRow(TypedDict):
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
+    progress: RowProgress | NoProgress
     stale: bool
     late_age: str
 
@@ -534,6 +590,13 @@ def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress 
     return {"kind": "NoProgress", "reason": reason}
 
 
+def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
+    if isinstance(counter, progress.NoCounter):
+        return {"kind": "NoProgress", "reason": counter.reason}
+    return {"kind": "RowProgress", "phase": "testing", "done": counter.done,
+            "total": counter.total, "percent": counter.percent, "unit": "modules"}
+
+
 def run_keep_text(hold: admission_records.RunKeepAside, steps: Sequence[admission_records.RunningStep]) -> str:
     lines = [keep_aside_text(hold)]
     for step in steps:
@@ -674,7 +737,7 @@ class SwapReadingPass:
 
 
 def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[str, unit_labels.UnitLabels],
-              row_limit: int) -> SwapReading | SwapUnavailable:
+              row_limit: int, names: StepNames) -> SwapReading | SwapUnavailable:
     """Account for host swap with disjoint cgroup owners and an explicit difference."""
     owners: dict[Path, tuple[str, str]] = {}
     for step in steps:
@@ -691,7 +754,7 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
             continue
         if path.is_relative_to(CGROUP) and path.name not in SWAP_OWNER_SLICES:
             identity = step_labels(step, labels)
-            name, detail = step_text(step, RECORDED_STEP_NAMES), identity.session
+            name, detail = step_text(step, names), identity.session
             if step.step == SWAP_NAMES["between"]:
                 name, detail = identity.session or str(path.name), SWAP_NAMES["between"]
             elif isinstance(memory, admission_records.UnownedSliceMemory):
@@ -739,6 +802,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE) -> MemoryPage:
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
+    names = read_step_names()
     parsed = admission_client.view()
     explanation = parsed.explanation
     captured = explanation.room
@@ -778,7 +842,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         metadata = step if step is not None else run_steps.get(hold.memory.owner)
         identity = step_labels(metadata, labels) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
-        name = step_text(step, RECORDED_STEP_NAMES) if step is not None else identity.session or hold.memory.owner
+        name = step_text(step, names) if step is not None else identity.session or hold.memory.owner
         detail = unit if step is not None else SWAP_NAMES["between"]
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
@@ -795,7 +859,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         step = entry.step
         memory = step.measured
         identity = step_labels(step, labels)
-        name, detail = step_text(step, RECORDED_STEP_NAMES), identity.unit
+        name, detail = step_text(step, names), identity.unit
         unit, state = detail, ""
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
@@ -858,7 +922,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
-        waiters.append({"name": step_text(waiter, RECORDED_STEP_NAMES), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
+        waiters.append({"name": step_text(waiter, names), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room})
@@ -866,7 +930,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
     model = queue_view.QueueModel(
         parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
-        queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=RECORDED_STEP_NAMES)
+        queue_view.HostLoadUnavailable(), admission_records.NoWaiter(), names=names)
     cloud_slots_used = 0
     cloud_slots = 0
     if isinstance(parsed, wire.CloudQueueRead):
@@ -882,7 +946,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "showrunner": identity.showrunner, "unit": identity.unit, "pid": cloud.owner.pid,
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
-                "state": information.state, "status": plain([queue_view.cloud_status(cloud, information)]),
+                "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
+                "progress": cloud_row_progress(cloud.counter),
                 "stale": isinstance(information.update, queue_view.CloudUpdateLate)
                          and not isinstance(cloud.wait, wire.CloudSlotWait),
                 "late_age": queue_view.cloud_update_age(information.update.seconds)
@@ -897,7 +962,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         for entry in queue_view.waiting_builds(model)]
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
-    swap = read_swap(parsed.view.running, labels, configuration.swap_rows)
+    swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names)
     if isinstance(swap, SwapUnavailable):
         raise RuntimeError(swap.reason)
     pressure_values = read_stalls()
@@ -946,8 +1011,8 @@ def main(argv: Sequence[str]) -> int:
     report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
     next_report_at = 0.0
     while True:
-        if installed_code_version(args.code_root) != LOADED_ADMISSION_CODE_VERSION:
-            print("The installed admission code changed. Restart the feed.", file=sys.stderr)
+        if installed_feed_code_version(args.code_root) != LOADED_FEED_CODE_VERSION:
+            print("The installed feed code changed. Restart the feed.", file=sys.stderr)
             return 1
         now = time.monotonic()
         if isinstance(report, ReportNotRead) or now >= next_report_at:
