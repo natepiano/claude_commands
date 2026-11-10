@@ -2509,3 +2509,25 @@ New `scripts/herdr/herdr_types.py` holds the one definition and the one import p
 **Gotchas:** One owner switches all callers: a re-export kept for old callers is a forbidden shim (builds, 2026-11-10). `staff.py` loads `herdr_types` through its lazy `import_module` form. A test that copies `herdr.py` to an isolated folder must also copy `herdr_types.py`. `send.py` loads `roster` lazily, so its bare start does not change. The `-X importtime` self cost overstated the gain by about half, because other paths still load part of the same closure.
 
 **Ruled out:** a split of `admission_records.py` now, because alone it is under the bar and the queue unit has phases there; it is in the next items.
+
+### Phase 126 — A targeted test reads the same working tree each time, so its cloud snapshot check no longer fails at random  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `cloud_gate.working_tree` returns the true working tree when a file is edited in the same clock tick as the last index write.
+
+**Cause:** `working_tree` copies the index with `shutil.copyfile`. The copy gets a new mtime. Git then treats every entry as clean by stat (not racy). A same-size edit in the tick of the index write keeps the size and the coarse mtime of the entry, so `git add -A` skips it and `write-tree` returns the stale tree. The real index has the old mtime, so `git status` sees the edit, and `dirty_paths` reports it. In 3,300 local repeats, `copyfile` gave 6 stale trees; `shutil.copy2` (keeps the mtime) gave none. This is the cause of the flaky `test_merge_gate_suites` row `change=subject, fallback=True` (natedev merge of P124, cloud gate 2e90e0).
+
+**Spec:**
+1. New `scripts/lib/git_index.py` `private_copy(source, destination)`: open the index once, `fstat` that file, copy its bytes, and set the copy's mtime from the same `fstat`. `shutil.copy2` is not enough: it stats the path again after the read, and git replaces the index by rename.
+2. Every Python private index copy calls `private_copy`: `cloud_gate.working_tree`, `checkpoint_gate.py` (two copies), `models_registry.py`, `copies.py` `staged_tree` and `style_footprint.py` `worktree_commit`.
+3. `scripts/validate_and_push/validate_ci.sh` `worktree_tree` copies the index from one file descriptor and takes the time from it (`touch -r /dev/fd/3`).
+4. Tests: `test_cloud_gate.py` (same-size edit at the index mtime with `core.trustctime=false`), `scripts/lib/test_git_index.py` (source replaced after open), and one `test_rerun.py` row.
+
+**Files:** `scripts/lib/git_index.py`, `scripts/lib/test_git_index.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/hooks/checkpoint_gate.py`, `scripts/lib/models_registry.py`, `scripts/copies/copies.py`, `scripts/style/style_footprint.py`, `scripts/validate_and_push/validate_ci.sh`, `scripts/validate_and_push/test_rerun.py`.
+
+**Workers:** 1 writer (one rule and its tests).
+- impl: all files.
+
+**Acceptance gate:** the cloud_gate test fails with `copyfile`, and the git_index test fails with `copy2`; both pass with `private_copy`. Targeted tests for the changed files pass. basedpyright 0/0/0 on the changed files; `bash -n` and shellcheck pass on `validate_ci.sh`.

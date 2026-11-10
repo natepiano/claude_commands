@@ -16,7 +16,6 @@ import difflib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +25,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
 
+from scripts.lib import git_index
 from scripts.style.candidate_generators import boilerplate_allows, mask_source
 
 RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
@@ -4149,9 +4149,7 @@ def worktree_commit(repo: Path, source: WholeWorktree | TicketSourcePaths = _WHO
     with tempfile.TemporaryDirectory(prefix="style-footprint-") as directory:
         temporary_index = Path(directory) / "index"
         if isinstance(source, WholeWorktree) and index.exists():
-            # Git uses the index timestamp to recheck files whose stat data may
-            # still match after a same-size edit. Preserve that timestamp.
-            _ = shutil.copy2(index, temporary_index)
+            git_index.private_copy(index, temporary_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
 
         def snapshot_git(*arguments: str) -> str:

@@ -780,6 +780,30 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(gate.checked_git(clone, 'rev-parse', 'HEAD^{tree}'), request['tree'])
         self.assertEqual((clone / 'untracked').read_text(), 'untracked file\n')
 
+    def test_working_tree_reads_a_same_size_edit_at_the_index_mtime(self) -> None:
+        _ = gate.checked_git(self.repo, 'config', 'core.trustctime', 'false')
+        source = self.repo / 'racy'
+        _ = source.write_text('before\n')
+        timestamp = 1_600_000_000_000_000_000
+        os.utime(source, ns=(timestamp, timestamp))
+        _ = gate.checked_git(self.repo, 'add', 'racy')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Add the racy file')
+        index = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index'))
+        os.utime(index, ns=(timestamp, timestamp))
+        _ = source.write_text('edited\n')
+        index_mtime = index.stat().st_mtime_ns
+        os.utime(source, ns=(index_mtime, index_mtime))
+        environment = {**os.environ, 'GIT_INDEX_FILE': str(self.root / 'expected-index')}
+        for arguments in (('read-tree', 'HEAD'), ('add', '-A')):
+            _ = subprocess.run(['git', *arguments], cwd=self.repo, env=environment,
+                               check=True, capture_output=True)
+        expected = subprocess.run(['git', 'write-tree'], cwd=self.repo, env=environment,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(expected, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
+        tree, dirty = cloud_gate.working_tree(self.repo)
+        self.assertIn('racy', dirty)
+        self.assertEqual(tree, expected)
+
     def test_targeted_selection_runs_locally_and_sends_only_selected_paths(self) -> None:
         for dirty, paths, later in ((False, ('test_one.py',), ''), (True, ('test_one.py',), ''),
                                     (False, ('test_two.py',), ''), (True, (), ''),
