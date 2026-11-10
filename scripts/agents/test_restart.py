@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.agents import remote
+from scripts.herdr import herdr_types
 
 import io
 import math
@@ -197,7 +198,7 @@ class CodexSnapshotTests(RestartTestCase):
                 "foreground_processes": [{"pid": 998089, "argv": ["python3"]}]}
         with (patch.dict(os.environ, environment),
               patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "w1:p1"}),
-              patch.object(herdr, "native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
+              patch.object(herdr, "native_process", side_effect=herdr_types.HerdrFailure("fixture unknown")),
               patch.object(herdr, "_process_display_name", return_value="TEST-gate"),
               patch.object(client, "listed", side_effect=listed_rows) as listed,
               patch.object(client, "result", return_value={"process_info": info}) as process,
@@ -229,7 +230,7 @@ class CodexSnapshotTests(RestartTestCase):
         def answer(*_: str) -> dict[str, object]:
             return {"process_info": info}
 
-        reads: tuple[object, ...] = (answer, herdr.HerdrFailure("fixture unread"))
+        reads: tuple[object, ...] = (answer, herdr_types.HerdrFailure("fixture unread"))
         for read in reads:
             with self.subTest(read=type(read).__name__):
                 self.assert_codex_pane_keeps_unknown(client, environment, listed_rows, read)
@@ -238,11 +239,11 @@ class CodexSnapshotTests(RestartTestCase):
                                         listed_rows: Callable[[str], list[dict[str, object]]],
                                         read: object) -> None:
         with (patch.dict(os.environ, environment),
-              patch.object(herdr, "native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
+              patch.object(herdr, "native_process", side_effect=herdr_types.HerdrFailure("fixture unknown")),
               patch.object(herdr, "_process_display_name", return_value="TEST-worker"),
               patch.object(client, "listed", side_effect=listed_rows),
               patch.object(client, "result", side_effect=read) as process,
-              patch.object(herdr, "pane_native_process", side_effect=herdr.HerdrFailure("fixture unknown")),
+              patch.object(herdr, "pane_native_process", side_effect=herdr_types.HerdrFailure("fixture unknown")),
               patch.object(sessions, "running_sessions", return_value=[]),
               patch.object(herdr, "running_codex_threads", return_value=set()),
               patch.object(restart, "live_members", return_value=[]) as members):
@@ -1435,7 +1436,7 @@ class RestartTests(RestartTestCase):
             with self.subTest(fault=fault):
                 selected = {**pane}
                 with (patch.object(herdr.Herdr, "panes", return_value=[selected, selected] if fault == "duplicate-panes" else [selected],
-                          side_effect=herdr.HerdrFailure("pane list unavailable") if fault == "unreadable-panes" else None),
+                          side_effect=herdr_types.HerdrFailure("pane list unavailable") if fault == "unreadable-panes" else None),
                       patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                           "w1:p9", herdr.PromptSubmissionNotRequired())) as launch,
                       redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
@@ -1773,7 +1774,7 @@ class RestartTests(RestartTestCase):
                   patch.object(restart.worker_panes, "observe_parents", return_value={self.rows[0].id: [
                       worker_panes.OpenWorker(self.rows[1], "worker-pane", "worker-terminal", herdr.AgentStatus.IDLE)]}),
                   patch.object(herdr.Herdr, "panes", return_value=[{**self.panes()[0], "session_id": identity}],
-                               side_effect=herdr.HerdrFailure("socket unavailable") if unavailable else None),
+                               side_effect=herdr_types.HerdrFailure("socket unavailable") if unavailable else None),
                   patch.object(herdr, "saved_layout", return_value=layout),
                   patch.object(self, "workspace_label", label),
                   redirect_stderr(io.StringIO()) as errors,
@@ -1885,7 +1886,7 @@ class RestartTests(RestartTestCase):
     def test_started_row_leaves_pending_when_layout_save_fails(self) -> None:
         self.running.clear()
         shutdown_record.save([str(self.rows[0].id)])
-        with (patch.object(herdr.Herdr, "remember_row_tab", side_effect=herdr.HerdrFailure("layout unavailable")),
+        with (patch.object(herdr.Herdr, "remember_row_tab", side_effect=herdr_types.HerdrFailure("layout unavailable")),
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.restart(), 0)
         self.assertEqual(shutdown_record.read(), [])
@@ -2002,7 +2003,7 @@ class RestartTests(RestartTestCase):
                        opening: herdr.NoOpeningPrompt, timeout: int, *, agent: str = "",
                        reported_unknown: str = "", codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> herdr.AgentLaunched:
             if agent == self.rows[0].name:
-                raise herdr.HerdrFailure("fixture launch failed")
+                raise herdr_types.HerdrFailure("fixture launch failed")
             return launch(name, destination, prepared, kind, arguments, opening, timeout, agent=agent,
                           reported_unknown=reported_unknown, codex=codex)
 
@@ -2077,7 +2078,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(shutdown_record.read(), ["row-0", "gone"])
 
     def test_layout_error_keeps_the_live_rows_and_other_tab_saves(self) -> None:
-        with (patch.object(herdr.Herdr, "save_layout", side_effect=herdr.HerdrFailure("layout unavailable")),
+        with (patch.object(herdr.Herdr, "save_layout", side_effect=herdr_types.HerdrFailure("layout unavailable")),
               patch.object(herdr.Herdr, "remember_row_tab") as remember,
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("fixture"), save_tabs=True),
@@ -2400,7 +2401,7 @@ class RestartTests(RestartTestCase):
         with (patch.object(pane_record, "publication_for_session", return_value=self.retained_director()),
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p9", herdr.PromptSubmissionNotRequired())),
-              patch.object(pane_launch, "finish_restore", side_effect=herdr.HerdrFailure("wrong_target", code="wrong_target")),
+              patch.object(pane_launch, "finish_restore", side_effect=herdr_types.HerdrFailure("wrong_target", code="wrong_target")),
               patch.object(herdr.Herdr, "remember_row_tab") as remember,
               patch.object(restart, "_restore_workers") as workers,
               redirect_stderr(io.StringIO()) as errors):

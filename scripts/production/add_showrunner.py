@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from scripts.production import completion_receipt, staff
+from scripts.herdr import herdr_types
 from scripts.agents.remote import local_machine
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
@@ -135,7 +136,7 @@ def checked(child: ProductionDocument, caller: str, ending: EndingTab = NO_ENDIN
     try:
         if herdr_tab_open(child.name, ending):
             raise Refusal(f"a tab named {child.name} is already open in herdr session {herdr.shared_session()}")
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         raise Refusal(str(error)) from error
 
 
@@ -195,7 +196,7 @@ def launch(child: ProductionDocument, model: str, effort: str, resume: str | Non
             before_prompt if before_prompt is not None else
             lambda observed: ensure_staff_showrunner(child, runtime_id=observed.session_id)), timeout_ms=90_000)
     if isinstance(launched, herdr.nix_env.Refused):
-        raise herdr.HerdrFailure(launched.reason)
+        raise herdr_types.HerdrFailure(launched.reason)
     outcome = launched.outcome
     return (outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted))
             else herdr.PromptNotSubmitted("launcher supplied no submit proof"))
@@ -291,7 +292,7 @@ def _main(argv: list[str]) -> int:
             from scripts.message import sessions
             if any(item["sessionId"] == resume for item in sessions.live_sessions()):
                 raise Refusal(f"session {resume} is still live")
-    except (Refusal, OSError, herdr.HerdrFailure) as refusal:
+    except (Refusal, OSError, herdr_types.HerdrFailure) as refusal:
         print(f"add_showrunner: {refusal}", file=sys.stderr)
         return 2
     if cast(bool, args.check):
@@ -326,7 +327,7 @@ def _main(argv: list[str]) -> int:
     except herdr.AgentNotReady as error:
         print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
         return SESSION_NOT_READY
-    except (OSError, subprocess.SubprocessError, herdr.HerdrFailure) as error:
+    except (OSError, subprocess.SubprocessError, herdr_types.HerdrFailure) as error:
         said = cast(object, error.stderr) if isinstance(error, subprocess.CalledProcessError) else None
         detail = said.strip() if isinstance(said, str) and said.strip() else str(error)
         print(f"add_showrunner: the session did not start: {detail}", file=sys.stderr)

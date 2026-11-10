@@ -23,6 +23,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
+from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
@@ -1861,7 +1862,7 @@ class WorkerRenameTests(StaffTestCase):
                     del tab
                     if pane in failed_panes:
                         failed_panes.remove(pane)
-                        raise herdr.HerdrFailure("fixture retitle failed")
+                        raise herdr_types.HerdrFailure("fixture retitle failed")
                     changed = fixture.world.locations[pane]["label"] != title
                     fixture.world.locations[pane]["label"] = title
                     return changed
@@ -1923,7 +1924,7 @@ class WorkerRenameTests(StaffTestCase):
         unit = fixture_member("unit", name="TEST-unit", parent=owner.id)
         row = fixture_worker("TEST-worker", unit.id)
         arguments = ["rename", str(row.id), "TEST-renamed"]
-        with mock.patch.object(herdr.Herdr, "retitle_row", side_effect=herdr.HerdrFailure("pane unavailable")):
+        with mock.patch.object(herdr.Herdr, "retitle_row", side_effect=herdr_types.HerdrFailure("pane unavailable")):
             result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments, dict(os.environ), CHECKOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(staff.by_id(row.id), replace(row, name="TEST-renamed"))
@@ -1949,7 +1950,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         row = self.production_row()
         displays = support.RenameDisplays(row)
         with (displays.installed(), mock.patch.object(herdr.Herdr, "panes",
-                side_effect=herdr.HerdrFailure("display unavailable"))):
+                side_effect=herdr_types.HerdrFailure("display unavailable"))):
             result = self.run_command(row.name, row.name)
         self.assert_success(result)
         self.assertEqual(result.stderr.strip(), "anomaly: set_displays: display unavailable")

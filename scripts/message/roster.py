@@ -1286,11 +1286,11 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
     problems: list[str] = []
     try:
         sessions = herdr.live_sessions()
-    except herdr.HerdrMissing as error:
+    except herdr_types.HerdrMissing as error:
         for production in productions:
             _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         _problem(problems, "herdr sessions", error)
         for production in productions:
             _problem(problems, f"unit hosts for {production} were not read", error)
@@ -1304,7 +1304,7 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
         name = session["name"]
         try:
             agents = worker_panes.agent_inventory(herdr.Herdr(name))
-        except herdr.HerdrFailure as error:
+        except herdr_types.HerdrFailure as error:
             _problem(problems, f"herdr session {name}", error)
             continue
         for agent in agents:
@@ -1319,7 +1319,7 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                 try:
                     thread = CodexThread(herdr.Herdr(name).native_pane_process(
                         pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity)
-                except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                     pass
             process = codex_processes.get(HerdrPlace(name, pane))
             if process is not None and process.marks.get("CODEX_THREAD_ID", "") in worker_threads:

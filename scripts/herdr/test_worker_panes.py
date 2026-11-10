@@ -23,6 +23,7 @@ from unittest.mock import patch
 from weakref import finalize
 
 from scripts.production import staff, worker_admission
+from scripts.herdr import herdr_types
 from scripts.agents import pane_record, restart, stop_resume
 from scripts.agents.stop_results import SourceReleased
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session, fixture_worker
@@ -235,7 +236,7 @@ class PaneWorld(herdr.Herdr):
     def startup_processes(self, pane: str, kind: str, timeout: float) -> herdr.PaneStartupObservation:
         del kind, timeout
         if pane not in self.locations:
-            raise herdr.HerdrFailure("fixture pane is absent", "pane_not_found")
+            raise herdr_types.HerdrFailure("fixture pane is absent", "pane_not_found")
         process = self.foreground.get(pane)
         activity = (herdr.AgentProcessPresent((herdr.AgentProcessIdentity(process[0], 1),))
                     if process is not None else herdr.PaneAtShell())
@@ -251,7 +252,7 @@ class PaneWorld(herdr.Herdr):
                             pane_row: Mapping[str, object] | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
         del timeout, pane_row
         if pane in self.foreground and self.foreground[pane][0] in self.unreadable_environment:
-            raise herdr.HerdrFailure("process environment is unreadable")
+            raise herdr_types.HerdrFailure("process environment is unreadable")
         if self.report_reads_before_publish and any(
                 command[:3] == ("agent", "prompt", pane) for command in self.commands):
             self.locations[pane]["agent_status"] = self.turn_end_status.value
@@ -371,13 +372,13 @@ class PaneWorld(herdr.Herdr):
         del deadline
         if arguments[:2] == ("pane", "list"):
             if self.unreadable:
-                raise herdr.HerdrFailure("pane inventory unreadable")
+                raise herdr_types.HerdrFailure("pane inventory unreadable")
             return {"panes": [dict(value) for value in self.locations.values()]}
         if arguments[:2] == ("pane", "process-info"):
             pane = arguments[-1]
             self.process_reads.append(pane)
             if pane in self.unknown:
-                raise herdr.HerdrFailure(self.unknown[pane])
+                raise herdr_types.HerdrFailure(self.unknown[pane])
             shell = self.shells.setdefault(pane, 998000 + len(self.shells))
             pid, name, argv = self.foreground.get(pane, (shell, "zsh", ["zsh"]))
             return {"process_info": {"shell_pid": shell, "foreground_process_group_id": pid,
@@ -1900,7 +1901,7 @@ class WorkerPaneTests(StaffTestCase):
                                     proof_signals.extend(self.world.signals)
                                 proof_failed = True
                                 replace_after_proof(pane)
-                                raise herdr.HerdrFailure("native proof interrupted")
+                                raise herdr_types.HerdrFailure("native proof interrupted")
                             return identity
 
                         def prove_codex(client: herdr.Herdr, pane: str, terminal: str) -> str:
@@ -1910,7 +1911,7 @@ class WorkerPaneTests(StaffTestCase):
                             proof_signals.extend(self.world.signals)
                             proof_failed = True
                             replace_after_proof(pane)
-                            raise herdr.HerdrFailure("native proof interrupted")
+                            raise herdr_types.HerdrFailure("native proof interrupted")
 
                         with patch.object(stop_resume, "release_source", side_effect=release):
                             with ExitStack() as faults:

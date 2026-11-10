@@ -62,9 +62,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
-from scripts.herdr.herdr_types import HerdrFailure as HerdrFailure
-from scripts.herdr.herdr_types import HerdrMissing as HerdrMissing
-from scripts.herdr.herdr_types import NATIVE_ID_MARKS as NATIVE_ID_MARKS
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS, HerdrFailure, HerdrMissing
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels

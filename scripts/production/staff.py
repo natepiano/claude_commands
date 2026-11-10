@@ -1620,9 +1620,10 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
         renamed = _transaction(edit)
     if renamed.kind == "worker":
         herdr = import_module("scripts.herdr.herdr")
+        herdr_types = import_module("scripts.herdr.herdr_types")
         client = cast(Callable[[str], object], herdr.Herdr)
         shared_session = cast(Callable[[], str], herdr.shared_session)
-        display_failure = cast(type[Exception], herdr.HerdrFailure)
+        display_failure = cast(type[Exception], herdr_types.HerdrFailure)
 
         try:
             retitle = cast(Callable[[str], bool], getattr(client(shared_session()), "retitle_row"))

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 from scripts.message import sessions  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.message.sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, session_staff, unit_config  # noqa: E402
@@ -524,7 +525,7 @@ def observed_session_labels(*, record: staff.StaffSnapshot | None = None, runnin
         processes = herdr.herdr_processes(membership=StaffLabels(record))
         claudes, unread = _claudes(processes, running=running)
         return tuple(_herdr_labeled(claudes, unread, processes))
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         raise OSError(str(error)) from error
 
 

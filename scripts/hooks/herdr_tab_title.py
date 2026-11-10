@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from typing import TypedDict, cast
 
 from scripts.herdr import herdr, worker_panes  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff
 from scripts.agents import pane_record
@@ -100,7 +101,7 @@ def main() -> int:
     try:
         payload = cast(StopPayload, json.loads(sys.stdin.read() or "{}"))
         _ = sync(payload, os.environ)
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"herdr title: {error}", file=sys.stderr)
     return 0
 
