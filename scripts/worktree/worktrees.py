@@ -18,7 +18,7 @@ from typing import cast
 
 from scripts.lib.process_failure import failure_detail
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 @dataclass(frozen=True)

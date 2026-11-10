@@ -33,7 +33,7 @@ class VerifyLintToolVersionTests(VerifyLintCacheFixture):
         self.taplo_events.unlink(missing_ok=True)
         functions = self.root / "cache-functions.sh"
         _ = functions.write_text(shell_functions(
-            VERIFY, "hash_stream", "lint_code_key", "tree_key", "set_verdict_keys",
+            VERIFY, "verify_helper", "hash_stream", "lint_code_key", "tree_key", "set_verdict_keys",
             "cache_lookup", "user_clock", "cache_record",
         ) + shell_functions(VERIFY.parent.parent / "lint/invoke.sh", "invoke_clippy"), encoding="utf-8")
         script = r'''

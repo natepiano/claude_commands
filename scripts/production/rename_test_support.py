@@ -22,14 +22,14 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 from scripts.production import merge_checkpoint
 from scripts.production.production_doc import Production, production_field, read_production
-from scripts.shutdown import shutdown
+from scripts.agents import shutdown
 from scripts.production import showrunners
 from scripts.production import tidy_wrapped
 from scripts.production import unit_move
@@ -38,7 +38,7 @@ from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-SCRIPT = Path(__file__).resolve().parents[1] / "shutdown/shutdown.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
 
 

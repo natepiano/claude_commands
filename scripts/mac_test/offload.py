@@ -27,13 +27,16 @@ import tempfile
 import time
 import traceback
 from types import FrameType
-from typing import BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
 from scripts.mac_test import cargo_manifest
 from scripts.build_hold import override_guard
-from scripts.copies import copies
+from scripts.lib import copy_record
+
+if TYPE_CHECKING:
+    from scripts.copies import copies
 from scripts.direct import result_environment
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -399,6 +402,10 @@ class OffloadConfig:
         return float(self.values["fetch_limit_mib"])
 
     @property
+    def abandoned_session_minutes(self) -> int:
+        return int(self.values["abandoned_session_minutes"])
+
+    @property
     def mirror_busy_backoff_s(self) -> float:
         return float(self.values["mirror_busy_backoff_s"])
 
@@ -443,7 +450,7 @@ class OffloadRequest:
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
     environment: tuple[tuple[str, str], ...] = ()
     fetch: FetchFolder | NoFetch = NO_FETCH
-    repository_scope: copies.RepositoryScope = copies.ALL_REPOSITORIES
+    repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
 
     @property
@@ -1032,6 +1039,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     config = conf.read(settings)
     values = config.values()
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
+    values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
         enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
                  else config.text("offload") == "on"),
@@ -1046,13 +1054,11 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
 
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
-    from scripts.lint import sweep
-
-    name = sweep.repo_name(str(repo_root))
-    common = sweep.git_common_dir(str(repo_root))
+    name = repository.repo_name(str(repo_root))
+    common = repository.git_common_dir(str(repo_root))
     if name is None or common is None:
         return UNKNOWN_REPOSITORY
-    source = Path(sweep.source_git_dir(common))
+    source = Path(repository.source_git_dir(common))
     if not (source / "config").is_file():
         return KnownRepository(name)
     key = repository.repository_key(str(source.parent))
@@ -1274,6 +1280,8 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    from scripts.copies import copies
+
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
@@ -1471,6 +1479,8 @@ def linux_version_declined_recently(target: str, repository_name: str, hold_s: f
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     root = Path(__file__).resolve().parents[2]
     listing = controller.capture_copy(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
@@ -1497,7 +1507,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture_copy(["rsync", "-rlptc", "--compress", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
@@ -1705,6 +1715,8 @@ def copy_tree(
     request: OffloadRequest,
     repository: KnownRepository,
 ) -> bool:
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
@@ -1795,12 +1807,13 @@ def remote_test_command(
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
     repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
-    elif any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
+    elif custom_target:
         cleanup_command = "echo mac_cleanup=skipped"
     else:
-        target = shlex.quote(mirror_target(repository, request.target, request.slot))
         floor = shlex.quote(f"{config.free_floor_gib:g}")
         cleanup_command = (
             'if free_gib=$(df -g "$HOME"); then '
@@ -1814,13 +1827,22 @@ def remote_test_command(
             + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
         )
+    abandoned_sessions = ""
+    if not custom_target:
+        remove_sessions = 'for session do rm -rf -- "$session" "${session%-working}.lock"; done'
+        abandoned_sessions = (
+            f'{{ find "$HOME"/{target} -maxdepth 5 -type d '
+            + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
+            + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
+            + f"-exec sh -c {shlex.quote(remove_sessions)} sh {{}} + >/dev/null 2>&1 || :; }} && "
+        )
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     clear_environment = clear_environment + " && " if clear_environment else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -2127,6 +2149,8 @@ def claimed_run(
     repository: KnownRepository,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     release_allowed = True
     sync_after_release = False
     evidence = controller.attempt_evidence
@@ -2388,6 +2412,8 @@ def run_offload(
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
     if isinstance(eligibility, IneligibleMacStep):
         return declined(eligibility.reason, started)
@@ -2430,6 +2456,8 @@ def run_offload(
 
 
 def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> copies.RemoteMirror:
+    from scripts.copies import copies
+
     scope = request.repository_scope
     if isinstance(scope, copies.AllRepositories):
         scope = copies.SelectedRepository(repository.name)
@@ -2546,6 +2574,8 @@ def holder_session() -> str:
 
 
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
+    from scripts.copies import copies
+
     words = arguments.nextest_words
     if words[:1] == ["--"]:
         words = words[1:]

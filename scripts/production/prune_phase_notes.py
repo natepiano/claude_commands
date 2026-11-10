@@ -18,7 +18,7 @@ from scripts.direct import phase_table
 from scripts.production import showrunners, staff
 from scripts.production.production_doc import Refusal
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 def prune_all() -> list[str]:

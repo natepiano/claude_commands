@@ -1118,6 +1118,8 @@ Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and not
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
 Each scratch folder belongs to a task. The task's end removes its folders.
 `scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
+The DONE completion hook ends that task before pane closure. Other workers' folders remain.
 `scratch.py list` shows each folder's task and last change.
 The other commands are `adopt`, `hold`, `release`, `renew` and `end`.
 
@@ -1153,9 +1155,9 @@ The hold record stays in `~/.local/state/scratch/holds.json`.
 `end` removes the held folder unless a repository in it has uncommitted changes, a stash or commits absent from all remotes.
 The folder stays with its hold marked ended.
 
-A folder uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
+A folder made without `--worker` uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
 `--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
-Each folder holds `.scratch.json` with its task, maker session and times.
+Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
 
@@ -1743,3 +1745,9 @@ The merge gate and style lint own private folders through `build_folders.tempora
 The contexts remove these folders after success or an exception.
 Style review keeps its input folder for the review worker and finish command.
 Session TMPDIRs and unit session folders remain for later session commands.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

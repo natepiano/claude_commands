@@ -85,13 +85,15 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
         cases = (
             ("eligible", "Mac state absent", "mac", False,
              ("scripts.build_targets.targets",)),
+            ("eligible", "Mac state present", "mac", True,
+             ("scripts.build_targets.targets", "scripts.lint.sweep", "scripts.copies.copies")),
             ("eligible", "AWS routing off", "aws", False,
              ("scripts.build_targets.targets", "scripts.aws_target.ledger")),
             ("release-wait", "Mac state absent", "mac", False,
              ("scripts.build_targets.targets", "scripts.mac_test.mac_test", "scripts.mac_test.offload",
               "scripts.copies.copies")),
             ("release-wait", "Mac state present", "mac", True,
-             ("scripts.build_targets.targets",)),
+             ("scripts.build_targets.targets", "scripts.copies.copies", "scripts.mac_test.mac_test")),
         )
         for command, branch, target, present, omitted_modules in cases:
             with self.subTest(command=command, branch=branch):
@@ -114,9 +116,10 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                     + f"settings.{target}={'aws_target' if target == 'aws' else 'mac_test'}.conf\n")
                 if branch == "AWS routing off":
                     _ = write_config_fixture(configuration / "aws_target.conf", "offload=off\n", template="aws_target")
+                claims = root / "mac-state" / "claims"
                 if present:
-                    claims = root / "mac-state" / "claims"
                     claims.mkdir(parents=True)
+                if present and command == "release-wait":
                     started = process_identity.process_start(os.getpid())
                     self.assertIsInstance(started, process_identity.Started)
                     assert isinstance(started, process_identity.Started)
@@ -137,7 +140,7 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                 self.assertEqual(opens.get("build_targets.conf", 0), 1)
                 modules = cast(list[str], report["modules"])
                 self.assertEqual(set(omitted_modules).intersection(modules), set())
-                if present:
+                if present and command == "release-wait":
                     with mock.patch.dict(os.environ, environment):
                         remaining = mac_test.read_claims(mac_test.state_paths("mac"))
                     self.assertEqual([claim.record["what"] for claim in remaining], ["remote claim"])

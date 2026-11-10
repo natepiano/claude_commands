@@ -1,7 +1,7 @@
 """Check fixed producer routing and shared fixtures for the count readers."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os

@@ -34,7 +34,7 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary, process
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 
 
 @dataclass(frozen=True)

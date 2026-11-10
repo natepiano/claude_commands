@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 @dataclass(frozen=True)
 class Category:

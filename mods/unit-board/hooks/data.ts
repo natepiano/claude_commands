@@ -1,21 +1,10 @@
 import type { ProcessRunResult } from 'claude-code';
 import type { StoredAccountsStatus } from '../types/accounts';
-import type { BoardData, BoardResult } from '../types/board';
-import type { BoardSnapshot } from '../types';
 
 export type RefreshPaths =
-  | { kind: 'board'; board: string; sources: string[] }
   | { kind: 'discovery'; sources: string[]; loadedAt: number }
   | { kind: 'liveness' };
 export interface RefreshFiles { stat(path: string): Promise<{ mtimeMs: number }> }
-export interface BoardLoader {
-  home(): Promise<string | undefined>;
-  registry(): Promise<string | undefined>;
-  now(): Promise<number>;
-  run(argv: readonly string[]): Promise<ProcessRunResult>;
-  read(path: string): Promise<string>;
-}
-
 /** Shared by panes; it owns neither a timer nor any pane's state. */
 export async function refreshIfChanged<T>(
   files: RefreshFiles,
@@ -30,12 +19,7 @@ export async function refreshIfChanged<T>(
     // Process exits can leave every registry file unchanged. Recheck counts on
     // the existing pane tick, without a separate timer or remote discovery.
     if (path.kind === 'liveness') { changed = true; continue; }
-    let written: number;
-    if (path.kind === 'discovery') written = path.loadedAt;
-    else {
-      try { written = (await files.stat(path.board)).mtimeMs; }
-      catch { changed = true; continue; }
-    }
+    const written = path.loadedAt;
     for (const source of path.sources) {
       if (!isOpen()) return false;
       try { if ((await files.stat(source)).mtimeMs > written) changed = true; }
@@ -47,48 +31,6 @@ export async function refreshIfChanged<T>(
   if (!isOpen()) return false;
   await set(fresh);
   return true;
-}
-
-export function snapshotPaths(snapshot: BoardSnapshot<BoardData>): RefreshPaths[] {
-  return [
-    ...snapshot.files.map((board, index): RefreshPaths => ({ kind: 'board', board, sources: snapshot.boards[index]?.sources ?? [] })),
-    { kind: 'discovery', sources: snapshot.watch, loadedAt: snapshot.loadedAt },
-    ...(snapshot.boards.some(board => board.live) ? [{ kind: 'liveness' } as const] : []),
-  ];
-}
-
-export async function loadBoard(
-  calls: BoardLoader, session: string, isOpen: () => boolean,
-  watch: (paths: RefreshPaths) => void,
-): Promise<BoardSnapshot<BoardData>> {
-  const ensureOpen = () => { if (!isOpen()) throw new Error('Pane closed.'); };
-  ensureOpen();
-  const home = await calls.home();
-  if (!home) throw new Error('Home directory is unavailable.');
-  const registry = await calls.registry();
-  const loadedAt = await calls.now();
-  ensureOpen();
-  watch({ kind: 'discovery', sources: [registry || `${home}/.local/state/notifier`], loadedAt });
-  const result = await calls.run([
-    `${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/direct/board_json.py`, '--session', session,
-  ]);
-  ensureOpen();
-  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'The board could not be refreshed.');
-  const response = JSON.parse(result.stdout) as BoardResult;
-  for (const paths of [response.files, response.watch]) {
-    if (!Array.isArray(paths) || !paths.every(path => typeof path === 'string')) {
-      throw new Error('The board generator returned an invalid path list.');
-    }
-  }
-  watch({ kind: 'discovery', sources: response.watch, loadedAt });
-  const boards: BoardData[] = [];
-  // The generator supplies staff-id paths from the staff record.
-  for (const path of response.files) {
-    ensureOpen();
-    boards.push(JSON.parse(await calls.read(path)) as BoardData);
-  }
-  ensureOpen();
-  return { files: response.files, boards, watch: response.watch, loadedAt };
 }
 
 export interface AccountsLoader {

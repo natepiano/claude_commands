@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib import git_exclude
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -504,7 +504,6 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (isinstance(existing, ExistingUnitRow)
             and isinstance(request.session, ResumedSession)
-            and isinstance(request.session.handoff, ResumeStoppedSession)
             and request.plan_cell == existing.plan):
         plan_context = ExistingConversationPlan()
     if isinstance(request.session, ResumedSession) and isinstance(existing, ExistingUnitRow):
@@ -562,7 +561,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
 
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     """Require one live, attributed inventory identity before requesting its safe stop."""
-    from scripts.shutdown import inventory
+    from scripts.agents import inventory
 
     processes = sessions.session_processes(session_id)
     if isinstance(processes, sessions.SessionLivenessUnknown):
@@ -580,7 +579,7 @@ def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
 
 
 def stop_for_attach(handoff: RunningSessionHandoff) -> None:
-    from scripts.shutdown import stop_resume
+    from scripts.agents import stop_resume
 
     result = stop_resume.stop(handoff.session_id)
     if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
@@ -613,7 +612,7 @@ def attached_pid(handoff: RunningSessionHandoff) -> int:
 def finish_attach(handoff: StoppedSessionHandoff,
                   selected: ClaudeLaunchAccount, outcome: herdr.PromptSubmitOutcome, timeout: float) -> int:
     del selected
-    from scripts.shutdown import restart
+    from scripts.agents import restart
 
     if isinstance(outcome, herdr.PromptNotSubmitted):
         raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: {outcome.reason}")
@@ -762,7 +761,7 @@ def launch_session(
 ) -> herdr.PromptSubmitOutcome:
     """Start Claude in a tab of the shared herdr session, carrying its session labels."""
     from scripts.accounts import accounts
-    from scripts.shutdown.launch_names import LaunchNames
+    from scripts.agents.launch_names import LaunchNames
     from scripts.whoami.account import named_account_environment
 
     environment = {"ENABLE_TOOL_SEARCH": "true"}
@@ -1087,7 +1086,7 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
         return ""
     if explicit:
         return explicit
-    from scripts.shutdown import pane_record
+    from scripts.agents import pane_record
     try:
         entry = pane_record.launch_for_session(request.session.session_id)
     except (OSError, ValueError) as error:

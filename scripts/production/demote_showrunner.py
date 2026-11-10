@@ -21,7 +21,7 @@ from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.shutdown import pane_record, remote, stop_resume
+from scripts.agents import pane_record, remote, stop_resume
 from scripts.whoami.account import named_account_environment
 
 
@@ -81,6 +81,17 @@ def live_session(session: str, record: staff.StaffSnapshot) -> unit_lookup.Label
                  if isinstance(item.claude, unit_lookup.LiveClaude) and item.claude.session_id == session), unit_lookup.NoSession())
 
 
+def child_plan(child: Production, plan: Path) -> Path:
+    """Resolve the plan inside the child's checkout."""
+    plan = plan.expanduser()
+    plan = (plan if plan.is_absolute() else child.checkout / plan).resolve()
+    try:
+        _ = plan.relative_to(child.checkout)
+    except ValueError as error:
+        raise Refusal("plan must be inside the child checkout") from error
+    return plan
+
+
 def checked(parent: Production, name: str, plan: Path, record: staff.StaffSnapshot,
             port: unit_config.AppPort | unit_config.NoAppPort) -> Demotion:
     try:
@@ -90,12 +101,16 @@ def checked(parent: Production, name: str, plan: Path, record: staff.StaffSnapsh
     if row.parent != staff.ReportsTo(parent.owner.id):
         raise Refusal(f"{name} is not attached to {parent.name}")
     child = read_production(row, record=record)
+    plan = child_plan(child, plan)
     add_unit.require_merge_branch(parent)
     marked = live_session(row.current_session, record)
     if isinstance(marked, unit_lookup.NoSession) or not isinstance(marked.claude, unit_lookup.LiveClaude):
         raise Refusal(f"{name}: cannot read the live pane")
     worktree = child.checkout
-    promote_showrunner.check_director(name, marked, marked.claude, worktree, plan)
+    promote_showrunner.check_director(name, marked, marked.claude, worktree)
+    relative_plan = plan.relative_to(child.checkout).as_posix()
+    if add_unit.git(child, "cat-file", "-e", f"{child.merge_branch}:{relative_plan}", check=False).returncode != 0:
+        raise Refusal(f"plan {relative_plan} is missing on {child.merge_branch}")
     check_units(child, record)
     return Demotion(parent, child, marked, marked.claude, worktree, child.merge_branch, plan, port)
 
@@ -157,7 +172,7 @@ def unit_document(request: Demotion) -> None:
         if title not in headers:
             headers.append(title)
     values = {"Unit": request.child.name, "Worktree": str(request.worktree), "Branch": request.branch,
-              "Plan": str(request.plan.relative_to(parent.checkout))}
+              "Plan": str(request.plan.relative_to(request.worktree))}
     if isinstance(request.port, unit_config.AppPort):
         if "Port" not in headers:
             headers.append("Port")
@@ -182,7 +197,7 @@ def unit_document(request: Demotion) -> None:
 
 
 def launch(request: Demotion) -> int:
-    plan = request.plan.relative_to(request.parent.checkout)
+    plan = request.plan.relative_to(request.worktree)
     config = unit_config.read(request.worktree, cleanup=False)
     desired = (unit_config.UnitConfig(unit_config.PlanFile(plan), request.port, ())
                if isinstance(config, unit_config.ConfigMissing)
@@ -293,8 +308,7 @@ def _main(argv: list[str]) -> int:
     parent = read_production(showrunners.own_name(), record=record)
     name = cast(str, args.child)
     path = record_path(parent, name)
-    plan = cast(Path, args.plan).expanduser()
-    plan = (plan if plan.is_absolute() else parent.checkout / plan).resolve()
+    plan = cast(Path, args.plan)
     raw_port = cast(int | None, args.port)
     port = unit_config.NoAppPort() if raw_port is None else unit_config.AppPort(raw_port)
     fields: dict[str, object] = {}
@@ -306,7 +320,7 @@ def _main(argv: list[str]) -> int:
             fields = {}
     if fields:
         request = saved_request(parent, fields)
-        if plan != request.plan or port != request.port:
+        if child_plan(request.child, plan) != request.plan or port != request.port:
             raise Refusal(f"{name}: the pending demotion uses {request.plan} and port {request.port}")
     else:
         request = checked(parent, name, plan, record, port)
@@ -322,7 +336,7 @@ def _main(argv: list[str]) -> int:
         }
         fields = {"source": request.child.owner.to_json(), "session": request.claude.name, "socket": request.claude.socket,
                   "pid": request.claude.pid, "host": request.marked.place.session, "pane": request.marked.place.pane,
-                  "worktree": str(request.worktree), "branch": request.branch, "plan": str(plan), "port": str(port.number) if isinstance(port, unit_config.AppPort) else "",
+                  "worktree": str(request.worktree), "branch": request.branch, "plan": str(request.plan), "port": str(port.number) if isinstance(port, unit_config.AppPort) else "",
                   "launch": retained, "directors": [row.id for row in record.rows
                       if row.parent == staff.ReportsTo(request.child.owner.id) and row.kind in {"unit", "showrunner"}]}
         save(path, fields, Step.PREPARED)

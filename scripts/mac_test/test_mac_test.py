@@ -1145,7 +1145,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def repository(self, name: str) -> Path:
-        """A folder that sweep.repo_name reads as the named repository."""
+        """A folder that repository.repo_name reads as the named repository."""
         directory = self.root / "repositories" / name
         (directory / ".git").mkdir(parents=True)
         return directory

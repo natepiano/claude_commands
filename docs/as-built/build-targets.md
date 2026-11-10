@@ -527,7 +527,7 @@ It returns failure when the hash command fails.
 `lint_code_key` uses framed present or absent file bytes under `pipefail`.
 An unreadable file gives an empty key and a cache miss.
 
-`VERIFY_PY_TRACE=<file>` records one row per helper: helper name, wall milliseconds, and CPU milliseconds.
+`VERIFY_PY_TRACE=<file>` records one row per helper call: helper name, wall milliseconds, and CPU milliseconds.
 The CPU value excludes child processes.
 Inline helpers use `VERIFY_PY_HELPER` as their name.
 The trace runner records at exit, exec, or SIGTERM and preserves the signal status.
@@ -671,3 +671,30 @@ Other refused answers retain their refusal.
 The pinned interval closes before execution starts, and a remote reservation closes the Cargo-token interval.
 Pinned routing skips the ordinary remote retry delay.
 Token wait timestamps read `scripts/lib/user_zone.py` directly and need no `USER_ZONE_SCRIPT` variable.
+
+
+## Synchronous verify helpers
+
+`verify.sh` starts `verify_helper.py` with `coproc` before its first synchronous helper call.
+The helper imports each Python program once and calls its existing `main` on the main thread.
+Each request carries the arguments, environment, working directory, and input text.
+The helper restores this state after each call.
+It returns the exit status and captured output to the caller.
+The helper replays stderr when each call ends.
+The helper exits when its input pipe closes.
+Group signals can also end the helper.
+On Linux, the kernel sends SIGKILL to the helper when its parent exits.
+The helper checks its parent again after it sets this Linux option.
+It also checks for a changed parent after each one-second input timeout.
+Its idle process holds no caller output pipe.
+
+The background tree watcher keeps its own PID and signal handlers.
+The detached step recorders from `invoke.sh` also keep their own processes.
+Shell fixtures and scripts without `main` use their original process path.
+A failed helper request also uses that path.
+The change does not wrap or re-execute `verify.sh`.
+
+`VERIFY_PY_TRACE` retains one timing row for each helper call.
+The adjacent `.calls` file records each shared call's program file name and first argument, separated by a tab.
+Fallback calls appear only in the interpreter wrapper's observations.
+Calls inside `verify_helper.py` therefore remain visible without claiming another process start.

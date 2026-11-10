@@ -1734,7 +1734,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, merge_branch
 
 def nightly_owner(args: GateArguments) -> str:
     from scripts.production import session_staff, showrunners, staff, unit_lookup
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     try:
         doc = change_review.production_doc(args.production)

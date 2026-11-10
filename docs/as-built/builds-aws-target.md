@@ -30,6 +30,9 @@ The target is live. The user approved go-live on 2026-11-03. The stacks exist in
 ### Linux execution: `scripts/mac_test/linux_runner.py`
 
 1. Tracked scripts transfer first. Then `rsync --delete` copies the source, with untracked files, and protects ignored paths, `.git` and `target`.
+   Both copies use `copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS` (`-rlpc`).
+   Checksums skip files with equal content and keep their destination modification times.
+   Changed files get the receiver write time, so Cargo detects changed source with an old source modification time.
 2. Each slot caches the shell exports. The cache key is `flake.nix`, `flake.lock`, `nix/` and the shell selector. Reuse checks that the referenced store paths exist.
 3. The execution probe evaluates the shell and checks Rust, nextest and mend parity inside it. `probe_timeout_s` covers reachability. `shell_timeout_s` covers shell evaluation.
 4. `.linux-run.json` records ownership before shell evaluation. Unconfirmed cleanup keeps the marker and the claim. `linux_startup=unresolved` starts no work and maps to `BusyMacDecline(LostRunLeftovers())` with no backoff.

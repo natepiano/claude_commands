@@ -72,7 +72,11 @@ class OffloadForwardTests(OffloadCommandFixture):
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = offload.read_config(self.config_path)
         expected = (
-            'cd .local/state/mac-test/mirror/hana && PATH="$HOME/.cargo/bin:$PATH" '
+            'cd .local/state/mac-test/mirror/hana && { find "$HOME"/.local/state/mac-test/mirror/hana/target -maxdepth 5 -type d '
+            + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
+            + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
+            + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
+            + 'PATH="$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + '~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
@@ -88,7 +92,8 @@ class OffloadForwardTests(OffloadCommandFixture):
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
-        self.assertIn("cd .local/state/mac-test/mirror/hana && rm -rf -- target/shots && PATH=", fetch)
+        self.assertTrue(fetch.startswith("cd .local/state/mac-test/mirror/hana && { find "))
+        self.assertIn(" || :; } && rm -rf -- target/shots && PATH=", fetch)
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)

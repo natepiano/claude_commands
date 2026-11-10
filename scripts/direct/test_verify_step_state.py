@@ -138,6 +138,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.fixture.environment.update({
             "BASH_ENV": str(shell), "TEST_STATE_OBSERVER": str(observer),
             "TEST_PYTHON_STARTS": str(starts),
+            "VERIFY_PY_TRACE": str(root / "python-trace"),
             "TEST_REAL_PYTHON": sys.executable, "CLAUDE_PYTHON": str(self.fixture.bin_directory / "python3"),
         })
         return starts
@@ -146,7 +147,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self, body: str, *, kind: str, package: str = "sample", pinned: str = "",
     ) -> subprocess.CompletedProcess[str]:
         functions = shell_functions(
-            VERIFY, "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
+            VERIFY, "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
             "run", "run_step", "finish_step_token", "route_compiling_step",
             "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
@@ -178,6 +179,9 @@ initialize_step_record
 
     def verbs(self, starts: Path) -> list[str]:
         words = [cast(list[str], json.loads(line)) for line in starts.read_text().splitlines()]
+        calls = Path(self.fixture.environment["VERIFY_PY_TRACE"] + ".calls")
+        if calls.exists():
+            words.extend(line.split("\t") for line in calls.read_text().splitlines())
         return [row[1] for row in words if len(row) > 1 and Path(row[0]).name == "step_record.py"]
 
     def observations(self) -> list[dict[str, object]]:

@@ -236,19 +236,19 @@ Own what a build may use and when it starts: memory admission and the memory que
    Return the existing `NoCycle` (`build_hold.py:84`) from both in place of `None`. Add no second type for this state.
    Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
    Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
-   Replace each one with `assert isinstance(cycle, build_hold.HoldCycle)`. This change keeps the assertion's intent.
+   Replace each one with `assert not isinstance(cycle, build_hold.NoCycle)`. `HoldCycle` is a `TypedDict`, so `isinstance` against it raises `TypeError`. This change keeps the assertion's intent.
 5. Route callers through the installed copy.
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/shutdown/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
    Update the two caller-plan examples to name the installed merge gate with `--checkout <tree>`.
 6. Keep repository and step fields separate in service snapshots and queue queries.
    Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
    Show repository and step separately in the queue overview and cards. Show a missing repository as `—`.
 7. Test refusal and allowed private writes at every mutation entry point, including `export_priority()` and restart recovery.
-   Test interrupted cancellation publication and imported-place migration through the service.
+   Test interrupted cancellation publication, and `WaiterPlace.queue_identity` across restart and owner exit, through the service.
    Test queue queries and service state after admission. Do not require a live `.waiting` file.
    Fake both memory readings. Never change real coordination state in a test.
 
@@ -258,10 +258,9 @@ Own what a build may use and when it starts: memory admission and the memory que
   Displays, the client and the wait text use that pass's frozen result. Add no separate admission rule in a reader.
 - Phase 20: `PendingLeft` saves durable cancellation facts. Restart publishes one cancellation with its original time.
   Keep the one lifecycle outbox and the saved finalization intent. Add no second lifecycle writer.
-- Phase 20: an old `NoWaiter` place identity is migration input, not proof that a step ended.
-  `WaiterPlace.queue_identity` carries the logical identity. Preserve it through restart and owner exit.
-  builds-queue Phase 10x (89ba4f087) removed the legacy import and its test `test_imported_and_restored_places_record_one_owner_exit_after_restarts`.
-  Add no user control or display for either migration or pending cancellation.
+- Phase 20: `WaiterPlace.queue_identity` carries the logical identity. Preserve it through restart and owner exit.
+  builds-queue Phase 10x (89ba4f087) removed the legacy place import and its test. Add no migration for old places.
+  Add no user control or display for pending cancellation.
 - Phase 41: token waiters keep their arrival and priority times. They hold neither the head position nor head room.
   Preserve the saved offset and transition identity for priority publication retries.
 - Phases 22 and 23: hold recovery can migrate receipts and recover damaged release records.
@@ -279,8 +278,8 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
-- `scripts/message/top_level.py`, `scripts/shutdown/shutdown.py` — installed hold writer routing.
-- `scripts/message/test_top_level.py`, `scripts/shutdown/test_shutdown_cli.py` — caller tests.
+- `scripts/message/top_level.py`, `scripts/agents/shutdown.py` — installed hold writer routing.
+- `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
 - `scripts/production/dailies_render.py` — `NoCycle` from `read_cycle()` in the hold lines.
 - `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py` — hold line tests.
 - `docs/plans/builds-production.md`, `docs/plans/build-followups-worker-seats.md` — installed merge-gate examples.
@@ -1837,65 +1836,23 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Ruled out:**
 - A timing comparison on a shared Mac: timing runs need a Mac with no interactive demo and the same power source. That is outside this code.
 
-### Phase 81 — A Mac test build never links stale objects from an old build  · status: todo
-**Depends on:** none. Merge `origin/builds` first.
+### Phase 81 — The Mac link failure is diagnosed and parked, with no tooling change  · status: done
 
-**Approved:** builds showrunner, 2026-11-08 ("a Mac build fault from hana, as your next phase now").
+#### As-built
 
-#### Work Order
+- No code ships. The Mac link failure has no proven cause, and the phase is parked.
+- The failure: a Hana Mac test build ends with `Undefined symbols for architecture arm64` and missing `.llvm.<hash>` names, on the long-lived mirror target `~/.local/state/mac-test/mirror/hana/target`.
+- The retained records from 2026-11-02 to 2026-11-09 hold nine failures and no unknown run, from 2026-11-08 04:59:59 UTC to 2026-11-09 12:07:51 UTC. All use `--features hana/dynamic_linking`.
+- The referring crate changes: hana_diegetic, hana_mimesis_tools, hana_catalyst, then hana_conduit. No failure comes after the one `cargo clean -p hana_conduit` at 12:08 UTC on 2026-11-09.
+- On Rust 1.99.0 on the Mac, a two-crate case (24 builds) and a real Hana build, generic-body edit and rebuild in one private target (20.8 GiB, 773 s and 55 s) all link. A target with one build of history does not reproduce the failure. An interrupted compile is untested.
 
-**Goal:** find why Mac test builds of hana failed to link with undefined ThinLTO-promoted symbols, and fix the cause in the build tooling. No `incremental = false`, and no other workaround.
+**Files:** none changed.
 
-**Measured (demo via hana, 2026-11-07 23:59 to 2026-11-08 01:18 EST):** three Mac runs failed the same way. Log on natedev: `/tmp/claude/unit/11db7b37-3b59-4a18-a50c-f71ae8c8b561/evidence/mac-link-undefined-llvm-symbols.log`.
-1. The command was `verify.sh test hana_catalyst`. verify.sh ran on natedev and sent a copy to the Mac mirror `/Users/natemccoy/.local/state/mac-test/mirror/hana` (`mac_test: running a copy on the Mac while natedev compiles`).
-2. The linker printed `Undefined symbols for architecture arm64`. The missing names have `.llvm.<hash>` suffixes: `World::get_resource::<CascadeCombine<hana_diegetic::render::HairlineFade>>`, referred from `hana_diegetic::panel::lifecycle::prepare_cascade_seed::<HairlineFade>` in `libhana_diegetic-46693889639531b7.rlib`, and `_anon.07f7ce924af2bea6e273f39da1024b91.146` to `.150`.
-3. `incremental = false` in `[profile.dev]` made the run pass. demo reverted that change.
+**Binds later work:** If the link error comes back after commit `1670aa2ac` on a touched mirror, send the record to the builds showrunner, and the work reopens.
 
-**Spec:**
-1. Find the cause first, with read-only commands only. Write the report to `phases/81/mac_link_report.md` in the run folder. Change no Mac setting and start no Mac test for measurement.
-   - Read the log. Find which target folder, profile and toolchain the Mac build used, and what the offload copies or removes in it.
-   - Check each candidate and give its evidence: stale incremental objects in the Mac target; a partial target removal by the Mac post-run cleanup (Phase 75) or the floor sweep (Phase 78) while a build used the target; two toolchains or two builds that share one target folder at the same time; a copy of build output from natedev into the Mac target.
-   - Give one line for each proven cause with its evidence. Say which candidates you ruled out and how.
-2. Fix the proven cause where it lives in the build tooling, so a Mac build never links objects that a different or interrupted build left. If the cause lives in verify.sh or the offload and another unit owns that code, name the owner in the report and post blocked.
-3. Add a test that fails without the fix and passes with it.
-4. Update the as-built doc that describes the changed tooling.
+**Gotchas:** The referring crate name comes from the linker block, and a fixed package name does not cover the failure. The mirror target holds many sessions and several metadata variants of a crate, which a private target does not have.
 
-**Constraints from prior phases:**
-- Rounds 1-9 are in `phases/81/mac_link_report.md` in the run folder `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297`. Read it before any new step.
-- builds approved one controlled reproduction on 2026-11-08. Its first script no longer exists, because its scratch folder ended. Before the first case, write a new script at `phases/81/reproduce.sh` in the run folder.
-- The script takes the normal Mac claim before its first remote command. At every exit it removes its private folder and releases the claim. `ssh mac` exits 0 on a failure, so the script prints one result line for each step.
-- The script runs this procedure on the Mac, in the private folder `~/.local/state/mac-test/repro81`:
-  1. Use Rust 1.99.0 on arm64 macOS. Keep the measured opt-level, codegen-units, incremental and shared-generics settings.
-  2. Use one small library and one integration-test crate. Start from the `HairlineFade`/`CascadeCombine` resource path.
-  3. Build in series, with no offload, no cleanup, no source copy during a build and no second compiler.
-  4. Sequential case: build one revision, change only the generic body or the caller, and rebuild with the completed incremental history. Its control builds the same changed revision in a new empty target.
-  5. Interrupted case: interrupt an intermediate compile, and then finish the build. Its control runs the same intermediate compile with no interrupt.
-  6. Reduce the source while the same promoted-symbol failure stays.
-- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Before the source copy, the script reads the deployed `sweep_floor_gib` and requires `free - (source_size + debug_size) >= floor`. Record each build's result, then remove that private target before the next case or control starts.
-- The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
-- Keep sccache and the hana test mirror. Run no gc command on the Mac.
-- New evidence, 2026-11-09 (Phase 92 retrospective): a Mac hana link failed at 11:56 UTC with the same signature, undefined `.llvm.<hash>` symbols in `libhana_conduit`.
-  - The Mac build log shows the builds in series under the mirror lease, with no overlap.
-  - The log shows no floor take between the last good link (11:53 UTC) and the failure. So the floor sweep and a two-build overlap are ruled out as causes.
-  - hana sets `[profile.dev.package.hana_conduit] opt-level = 3` and `[profile.dev.package."*"] opt-level = 3`. The earlier failures (hana_diegetic, hana_catalyst) were also workspace members above opt-level 0. Incremental compilation plus local ThinLTO promotes `.llvm.<hash>` names in such members.
-  - Separate the package profile settings in hana's `Cargo.toml` from the effective profile of the generated instance the Mac builds. Read the instance's real profile before you name a cause.
-  - builds approved one `cargo clean -p hana_conduit` in the Mac mirror. It finished at 12:08 UTC on 2026-11-09. That approval is used; it permits no other cleanup.
-- The reproduction hold and the start approval stay: start no reproduction case until builds approves its start.
-
-**Files:**
-- `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
-- `scripts/mac_test/floor_claims.py` — the floor claims, when the cause is there.
-- `scripts/mac_test/test_offload_cleanup.py`, `scripts/mac_test/test_floor_sweep.py`, `scripts/mac_test/test_offload.py` — the regression test.
-- `docs/as-built/build-memory-admission.md` — the changed rule.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the report, the reproduction script, the source files and the as-built doc, and runs the final suites.
-- `test` owns the test files.
-
-**Acceptance gate:**
-- The report names each proven cause with its evidence, or states that no cause could be proven and what was ruled out.
-- The regression test fails before the fix and passes after it.
-- The changed test modules pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` for every changed Python file.
+**Ruled out:** `incremental = false` and a clean-and-retry, because both are workarounds. A floor sweep or a two-build overlap, because the Mac build log shows builds in series and no floor take before the 11:56 UTC failure. `rsync -t` kept times, because that flag landed on 2026-11-09 at 13:21 EST, after the last failure.
 
 ### Phase 82 — The Mac keeps its disk floor without waiting for a test run  · status: done
 **Approved:** builds showrunner, 2026-11-08. Checkpoint `ab051b13a`.
@@ -1978,7 +1935,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
 2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:68`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
-   The readers of the room's `ci_keep_aside` lose their CI keep-aside text: `scripts/build_queue/queue_evidence.py` (lines 118 and 223-224) and `scripts/build_queue/memory_feed.py` (lines 499 and 764).
+   The readers of the room's `ci_keep_aside` lose their CI keep-aside text: `scripts/build_queue/queue_evidence.py` (lines 118 and 223-224) and `scripts/build_queue/memory_feed.py` (lines 555 and 828).
    The key also leaves the test fixture `scripts/lint/fixtures/build_admission.conf` (line 17).
 3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
 4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove or change the tests of the mixed rule only with an approved assertion change. Three modules hold such tests:
@@ -2170,43 +2127,19 @@ Median CPU over 50 starts on the real entry, Mac state folder present: `eligible
 
 **Ruled out:** a shared cache of `mac_test.conf`, because it saves 0.8 ms.
 
-### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: todo
+### Phase 98 — A build target start loads no sweep, copy or Mac test code it does not use  · status: done
 
-**Depends on:** verify's Phase 42c on `builds` (verify tells resources when it lands), and Phase 97. Merge `origin/builds` first.
+#### As-built
 
-**Approved:** builds showrunner, 2026-11-09 ("agree the change with its owner first"). verify-unit, 2026-11-09: "agree to all three rows, and you write them after 42c lands."
-
-#### Work Order
-
-**Goal:** `eligible` and `release-wait` with Mac state present load no `sweep`, `copies` or whole `mac_test` module.
-
-**Measured:** Phase 97's profile, as upper bounds that overlap: the `sweep` import 32 ms on `eligible`, the `copies` import 24 ms on `eligible` and 27 ms on `release-wait`, and the `mac_test` import 62 ms on `release-wait`.
-
-**Spec:**
-
-1. **Git path helpers.** Move `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir` and `local_origin_git_dir` from `scripts/lint/sweep.py` to `scripts/buildlog/repository.py`. Remove the `sweep` import from `offload.repository_identity`.
-2. **Repository scope types.** Move `AllRepositories`, `SelectedRepository`, `RepositoryScope` and `ALL_REPOSITORIES` from `scripts/copies/copies.py` to `scripts/lib/copy_record.py`. Import `copies` in `offload.py` only where copying occurs.
-3. **Claim reader.** Move the claim reader that `build_targets.command_release_wait` needs, with its state paths, lock and record types, from `scripts/mac_test/mac_test.py` to a module with few imports. Keep the decoder and the lock behavior. Build on the claim reads as 42c leaves them.
-4. **Move only.** Each change only moves code. Each moved name has one home and no copy. Add no guard, check or config key.
-5. **Numbers.** Report the median CPU and wall ms per start over 50 starts, before and after, for `eligible` and `release-wait`, with the Mac state folder present.
-6. **Owner read.** Send verify the diff before the checkpoint.
-
-**Constraints from prior phases:** `command_release_wait` checks `target_config.ssh_target_state_directory` before it loads `mac_test`. `target_config.command_configuration` keeps one `read_targets` result for one `eligible` or `release-wait` start. The eligibility types live in `target_config.py`, and `targets.py` re-exports them. The numbers to improve are CPU 137.673 ms on `eligible` and 101.707 ms on `release-wait`, with the Mac state folder present.
+With the Mac state folder present, `eligible` loads no `sweep` or `copies` module. `release-wait` loads no `copies` or whole `mac_test` module. Each move keeps one home for each moved name and adds no guard, check or config key. Median CPU per start over 50 alternating starts, on a merge that includes the `transfers` record: `eligible` falls from 175.239 ms to 128.873 ms, and `release-wait` falls from 150.339 ms to 61.271 ms.
 
 **Files:**
-- `scripts/lint/sweep.py`
-- `scripts/buildlog/repository.py`
-- `scripts/mac_test/offload.py`
-- `scripts/copies/copies.py`
-- `scripts/lib/copy_record.py`
-- `scripts/mac_test/mac_test.py`
-- `scripts/build_targets/build_targets.py`
-- `scripts/build_targets/test_build_targets.py`
+- `scripts/buildlog/repository.py` — `repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir`, `local_origin_git_dir` and their path constants.
+- `scripts/lib/copy_record.py` — `AllRepositories`, `SelectedRepository`, `RepositoryScope`, `ALL_REPOSITORIES`.
+- `scripts/mac_test/claim_state.py` — the claim reader, `locked`, `state_paths`, the record types, the block and event types, `record_after_unlock`. `ClaimOwnerRecord` carries `transfers`.
+- `scripts/mac_test/offload.py` — binds `copies` for types only. Each run-time use has a local import.
+- `scripts/build_targets/test_build_targets.py` — the module rows that show each module absent on the named path.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the production files.
-- `test` owns `test_build_targets.py` and each test file that names a moved item.
+**Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
 
-**State:** none.
-
-**Gate:** the targeted test; `basedpyright` 0/0/0 on each changed file; the module rows of `test_build_targets.py` show the three modules absent on the named paths; the median CPU per start falls on the real entry with the Mac state folder present; verify has read the diff.
+**Ruled out:** a comparison of unpaired start-cost runs.

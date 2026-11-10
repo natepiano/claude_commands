@@ -17,6 +17,7 @@ from scripts.style import unit_plans
 from scripts.lib import berth_board
 from scripts.style import rules
 from scripts.style import style_ledger
+from scripts.style.style_config import StyleUnitAssignment
 
 from scripts.style.style_plan_test_support import StylePlanFixture
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
@@ -95,7 +96,9 @@ class StylePlanTests(StylePlanFixture):
         ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]), ("read", [read], [self.sources[0]]))
 
-    def test_names_reads_blocking_structure_when_its_only_unblocked_file_is_busy(self) -> None:
+    def test_combined_unit_reads_blocking_structure_when_its_only_unblocked_file_is_busy(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("modules", "names")),
+                          StyleUnitAssignment("types", ("types",)), StyleUnitAssignment("values", ("values",))))
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
         _ = self.rule("read")
@@ -121,7 +124,9 @@ class StylePlanTests(StylePlanFixture):
         self.assertTrue(style_plan.blocked_by_structure(file_cell, (other_file, own_file)))
         self.assertFalse(style_plan.blocked_by_structure(file_cell, (other_file, crate_structure, other_crate)))
 
-    def test_names_reads_structure_when_every_pending_names_file_is_closed(self) -> None:
+    def test_combined_unit_reads_structure_when_every_pending_names_file_is_closed(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("modules", "names")),
+                          StyleUnitAssignment("types", ("types",)), StyleUnitAssignment("values", ("values",))))
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         read = self.rule("read")
         self.sync()
@@ -134,7 +139,9 @@ class StylePlanTests(StylePlanFixture):
                          ("structure", "modules", [self.sources[0]]))
         self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_names_reads_structure_when_its_unblocked_names_file_is_busy(self) -> None:
+    def test_combined_unit_reads_structure_when_its_unblocked_names_file_is_busy(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("modules", "names")),
+                          StyleUnitAssignment("types", ("types",)), StyleUnitAssignment("values", ("values",))))
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.rule("read")
         self.sync()

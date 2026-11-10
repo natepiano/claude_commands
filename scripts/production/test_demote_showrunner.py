@@ -19,7 +19,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, demote_showrunner as demote, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-from scripts.shutdown import pane_record, remote, stop_resume
+from scripts.agents import pane_record, remote, stop_resume
 
 
 class DemoteShowrunnerTests(StaffTestCase):
@@ -88,6 +88,7 @@ class DemoteShowrunnerTests(StaffTestCase):
         _ = self.git("add", ".")
         _ = self.git("commit", "-q", "-m", "fixture")
         _ = self.git("worktree", "add", "-q", "-b", self.child_branch, str(self.child_tree))
+        self.plan = self.child_tree / self.plan_relative
         _ = self.git("init", "--bare", "-q", str(self.root / "origin.git"))
         _ = self.git("remote", "add", "origin", str(self.root / "origin.git"))
         _ = self.worker
@@ -186,8 +187,17 @@ class DemoteShowrunnerTests(StaffTestCase):
 
     def test_check_stops_nothing_and_writes_nothing(self) -> None:
         before = self.staff_file.read_bytes()
-        self.assertEqual(self.run_command("--check")[0], 0)
-        self.assert_no_actions(before)
+        _ = self.git("rm", str(self.plan_relative))
+        _ = self.git("commit", "-q", "-m", "keep the unit plan on the child branch")
+        for current_has_plan in (True, False):
+            if not current_has_plan:
+                _ = self.git("-C", str(self.child_tree), "switch", "-c", "without-plan")
+                _ = self.git("-C", str(self.child_tree), "rm", "--", str(self.plan_relative))
+                _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "remove the plan from the current branch")
+            for plan in (self.plan, self.plan_relative):
+                with self.subTest(current_has_plan=current_has_plan, plan=plan):
+                    self.assertEqual(self.run_command("--check", "--plan", str(plan))[0], 0)
+                    self.assert_no_actions(before)
 
     def test_refuses_a_child_outside_the_callers_production(self) -> None:
         _ = staff.move(self.child.id, staff.STAFF_ROOT)
@@ -214,9 +224,33 @@ class DemoteShowrunnerTests(StaffTestCase):
 
     def test_refuses_an_uncommitted_plan(self) -> None:
         before = self.staff_file.read_bytes()
-        write_text_atomic(self.plan, "changed\n")
-        self.assertEqual(self.run_command()[0], 2)
-        self.assert_no_actions(before)
+        original = self.plan.read_text()
+        untracked = self.child_tree / "untracked-plan.md"
+        branch_only = self.child_tree / "temporary-plan.md"
+        _ = self.git("-C", str(self.child_tree), "switch", "-c", "temporary-plan-branch")
+        write_text_atomic(branch_only, "# Temporary plan\n")
+        _ = self.git("-C", str(self.child_tree), "add", "--", branch_only.name)
+        _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "commit the temporary plan")
+        for plan in (self.plan, untracked, self.checkout / self.plan_relative,
+                     self.child_tree / ".." / "parent" / self.plan_relative, branch_only):
+            with self.subTest(plan=plan):
+                if plan in (self.plan, untracked):
+                    write_text_atomic(plan, "changed\n")
+                try:
+                    for flags in ((), ("--check",)):
+                        with self.subTest(flags=flags):
+                            code, _, errors = self.run_command(*flags, "--plan", str(plan))
+                            self.assertEqual(code, 2)
+                            if plan == branch_only:
+                                self.assertIn(f"plan {branch_only.name} is missing on {self.child_branch}", errors)
+                            elif plan not in (self.plan, untracked):
+                                self.assertIn("plan must be inside the child checkout", errors)
+                            self.assert_no_actions(before)
+                finally:
+                    if plan == self.plan:
+                        write_text_atomic(self.plan, original)
+                    elif plan == untracked:
+                        untracked.unlink()
 
     def test_refuses_live_units_and_accepts_retired_units(self) -> None:
         rows = [fixture_member("unit", name=name, parent=self.child.id) for name in ("alpha", "beta")]
@@ -316,6 +350,8 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(self.stop.call_count, 1)
 
     def test_demotes_the_same_staff_row_and_commits_the_unit_row(self) -> None:
+        _ = self.git("rm", str(self.plan_relative))
+        _ = self.git("commit", "-q", "-m", "keep the unit plan on the child branch")
         _ = self.retired_unit("old", "deleted-branch")
         _ = self.git("-C", str(self.child_tree), "switch", "-c", "temporary-branch")
         fields: dict[str, object] = {}
@@ -326,7 +362,8 @@ class DemoteShowrunnerTests(StaffTestCase):
                     demote.save(self.journal(), fields, demote.Step.PLACED)
                 with (mock.patch.object(demote, "save", wraps=demote.save) as save,
                       mock.patch.object(demote, "checked", wraps=demote.checked) as checked):
-                    code, _, errors = self.run_command()
+                    plan = self.plan_relative if saved_completion else self.plan
+                    code, _, errors = self.run_command("--plan", str(plan))
                 self.assertEqual(code, 0, errors)
                 checked.assert_called_once()
                 fields = cast(dict[str, object], save.call_args.args[1])
@@ -368,7 +405,7 @@ class DemoteShowrunnerTests(StaffTestCase):
 
     def test_rerun_resumes_each_completed_step(self) -> None:
         self.stop.side_effect = [False, True]
-        self.assertEqual(self.run_command()[0], 1)
+        self.assertEqual(self.run_command("--plan", str(self.plan_relative))[0], 1)
         self.assertEqual(cast(dict[str, object], json.loads(self.journal().read_text()))["step"], demote.Step.QUESTIONS_MOVED)
         self.assertEqual(self.run_command()[0], 0)
         self.detach.assert_called_once()
