@@ -1440,6 +1440,19 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 9. **Host-scoped run identity (architect review of 18, 2026-11-06).** Two hosts can give the same pid and start time; `running_builds()` groups runs by `run_owner(pid, start_time)` today. One named run identity carries the host through placement, sampling, grouping and release. Test: a mixed-host fixture with the same pid and start time on two hosts keeps two runs, with separate accounting and the right Machine labels.
 10. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
 
+### Phase 43a — A gate copy at a new path rebuilds what holds its manifest path  · status: done
+
+#### As-built
+
+`copies.standing` restores the saved file time of each tracked file with an unchanged blob, except a file whose content names `CARGO_MANIFEST_DIR`. `copies.manifest_path_files(tree)` finds those files with one `git grep --no-color -l -z -F` in the checkout. Those files keep their write time from the new checkout, so Cargo rebuilds their crates and the dependents. Every other unchanged file keeps its saved time, so a same-commit gate stays a cache hit for the other crates. `standing` is the only path in `copies.py` that restores saved times.
+
+**Files:**
+- `scripts/copies/copies.py` — `manifest_path_files` and the restore rule in `standing`.
+- `scripts/copies/test_copies.py` — rows in the repeated-gate test, with forced Git color.
+- `docs/as-built/gate-checkouts.md` — the rule and its limit.
+
+**Gotchas:** Cargo does not track `CARGO_MANIFEST_DIR`, because Cargo sets it for rustc. A dependency macro that reads the variable at expansion, in a caller without that text, stays outside this rule.
+
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 
 #### As-built
