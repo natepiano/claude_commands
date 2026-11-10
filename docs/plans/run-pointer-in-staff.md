@@ -50,98 +50,27 @@ The showrunner's scope:
 
 ### Phase 1 — The staff row holds the open run  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** a director's open run folder is in its staff row. Every reader gets it from there. The mark folders and the `active_marker` files are not written or read.
-
-**Spec:** change no file outside Files without a line in the summary; another test file beside a listed script is in scope.
-1. `staff.py`:
-   - Add `OpenRun(path: Path)` and `NoRun`, and `StaffRow.run: OpenRun | NoRun`, default `NoRun`. JSON key `run`: a string path; absent means `NoRun`.
-   - Add `set_run(identity: StaffId, run: OpenRun) -> StaffRow` and `clear_run(identity: StaffId, run: Path) -> StaffRow`. `clear_run` clears only while the row still names that run (compare resolved paths). Both go through the existing row transaction.
-   - CLI: `staff.py set-run <session id> <run folder>` and `staff.py clear-run <session id> <run folder>`. The session id finds the row by `current_session`. No row: print one line and exit 1.
-2. Writers:
-   - `prepare_session.sh`: `staff.py set-run` replaces `unit_runs.py activate`.
-   - `progress_history.py start-run`: `staff.set_run` replaces `unit_runs.activate`.
-   - `end_session.sh`: `staff.py clear-run` for each held run replaces `unit_runs.py end`. Its messages say "run pointer" in place of "marker". A failed clear prints one line and sets the exit status, as today.
-3. `unit_runs.py`:
-   - Add `open_run(session_id: str, *, record=RunStaffAtUse.LOCAL) -> Path | None`: the run in the row whose `current_session` is that session.
-   - `held` reads `open_run` in place of the mark and drops `active_override`.
-   - Remove `activate`, `end`, `marker`, `active_dirs`, `marker_lock`, `marker_must_stay`, `ACTIVE_MARKER_FILE`, `former_owners`, `removal_check`, the `activate`, `end` and `removal-check` subcommands, and the `active` folder skip in `run_folders`. Update the module docstring.
-4. Readers. Change each to `unit_runs.open_run`, `unit_runs.held` or the row:
-   - The showrunner's list: `scripts/build_hold/build_hold.py`, `scripts/production/worker.py`, `scripts/production/session_staff.py`, `scripts/direct/progress_history.py`, `scripts/production/unit_status.sh`, `scripts/message/unit_labels.py`, `scripts/agents/shutdown.py`.
-   - Also found by the plan author: `scripts/direct/assign.py`, `scripts/production/promote_showrunner.py`, `scripts/production/unit_lookup.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/shutdown.py`, `scripts/herdr/worker_panes.py`, `scripts/message/roster.py`, `scripts/usage/agents_log.py`, `scripts/hooks/pre-tool-use-berth.py`, `scripts/hooks/direct_run.py`, `scripts/hooks/conversation_pause.py`, `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh`, `scripts/lint/tmp_sweep.py`.
-   - Run `grep -rn -E 'active_dirs|unit_runs\.(marker|activate|end)|ACTIVE_DIR|/active\b|"active"' scripts commands docs/direct config` and change each remaining reader. Report each line you leave and why.
-   - Remove the `UNIT_ACTIVE_DIR` and `PLAN_DELEGATE_ACTIVE_DIR` overrides, which only point at a mark folder. A test uses `STAFF_FILE` in their place. Keep the run-root overrides.
-5. Hooks: each hook reads the run with one row read. Measure the hook's added time on the live staff record (read only) and put the number in your summary.
-6. Docs: change each statement about the mark folders to the row: `commands/plan/shrink.md`, `commands/unit/direct.md`, `docs/direct/*.md`, `docs/as-built/hierarchy.md`, `docs/as-built/session-notifier.md`, `docs/plans/sdlc-devtools-path-copies.md`, and any other file the grep in item 4 finds.
-7. Deploy one-off (outside the repo). Make its folder with `~/.claude/scripts/lib/scratch.py new --until <date 7 days ahead>`; do not use `--worker`. It takes `--checkout <path>` and imports the code from that checkout. For each mark file in `/tmp/claude/unit/active` and `/tmp/claude/delegate/active`:
-   - Find the row whose `current_session` is the mark's name.
-   - When the row exists, the run folder exists, the run's state is not finished (`completed`, `stopped`, `error`, `ended`), and the row has no run: `set_run`.
-   - Print one line for each mark: copied, or skipped with the reason.
-   Then remove both `active` folders and each `<run>/active_marker` file, and print the counts. Report its path and command in your summary. Do not run it.
-8. Tests: change the existing mark tests to rows in `STAFF_FILE` fixtures. Add rows to the existing staff tests for `set_run`, `clear_run` of the same run, and `clear_run` of another run (no change). Keep every main-path test. Add no test that only proves a tool is installed.
+- `staff.py` holds `OpenRun(path: Path)`, `NoRun` and `StaffRow.run: OpenRun | NoRun`. The JSON key `run` is a path string; an absent key reads as `NoRun`.
+- `staff.set_run(identity, run)` and `staff.clear_run(identity, run)` go through the row transaction. `clear_run` clears only while the row still names that run (resolved paths). The CLI is `staff.py set-run|clear-run <session id> <run folder>`; no row prints one line and exits 1.
+- `prepare_session.sh` and `progress_history.py start-run` set the pointer. `end_session.sh` and `finish-run` clear it, for every row kind.
+- `unit_runs.open_run(session_id)` returns the run of the row whose `current_session` is that session. `unit_runs.held` reads it. The mark folders `/tmp/claude/unit/active` and `/tmp/claude/delegate/active`, the `active_marker` files, the mark API and the `UNIT_ACTIVE_DIR` and `PLAN_DELEGATE_ACTIVE_DIR` overrides are gone.
+- Every reader reads the row: hooks, build hold, worker list, staff, roster, unit labels, unit status, shutdown, inventory, restart, worker panes, agents log and the tmp sweep. Each hook makes one staff read per call.
+- A one-off outside the repo copies live marks into rows at deploy, then deletes both mark folders: `/tmp/claude/scratch/until-2026-11-18T0500Z-run-pointer-deploy-5fcad7/migrate_run_pointers.py --checkout <checkout>`. It keeps each mark whose copy failed and exits nonzero.
 
 **Files:**
 - `scripts/production/staff.py` — the field, `set_run`, `clear_run`, the CLI.
-- `scripts/production/test_staff.py` — rows for the field and both edits.
-- `scripts/lib/unit_runs.py` — `open_run`, `held`, the removals.
-- `scripts/lib/test_unit_runs.py` — mark tests become row tests.
-- `scripts/direct/prepare_session.sh` — writer.
-- `scripts/direct/end_session.sh` — clearer.
-- `scripts/direct/test_end_session.py` — clear rows.
-- `scripts/direct/progress_history.py` — writer at `start-run`.
-- `scripts/direct/test_progress_history.py` — writer rows.
-- `scripts/hooks/pre-tool-use-berth.py` — hook reader.
-- `scripts/hooks/direct_run.py` — hook reader.
-- `scripts/hooks/conversation_pause.py` — hook reader.
-- `scripts/hooks/test_conversation_pause.py` — hook rows.
-- `scripts/build_hold/build_hold.py` — reader.
-- `scripts/build_hold/test_build_hold.py` — reader rows.
-- `scripts/build_hold/override_guard.py` — drop the mark overrides.
-- `scripts/build_hold/override_guard.sh` — drop the mark overrides.
-- `scripts/build_hold/test_override_guard.py` — override rows.
-- `scripts/production/worker.py` — reader.
-- `scripts/production/test_worker.py` — reader rows.
-- `scripts/production/session_staff.py` — reader.
-- `scripts/production/test_session_staff.py` — reader rows.
-- `scripts/production/unit_status.sh` — reader.
-- `scripts/production/test_unit_status.py` — reader rows.
-- `scripts/production/promote_showrunner.py` — reader.
-- `scripts/production/test_promote_showrunner.py` — reader rows.
-- `scripts/production/unit_lookup.py` — reader.
-- `scripts/production/test_unit_lookup.py` — reader rows.
-- `scripts/message/unit_labels.py` — reader.
-- `scripts/message/test_unit_labels.py` — reader rows.
-- `scripts/message/roster.py` — reader.
-- `scripts/message/test_roster.py` — reader rows.
-- `scripts/agents/shutdown.py` — reader.
-- `scripts/agents/test_shutdown_record.py` — reader rows.
-- `scripts/direct/assign.py` — reader.
-- `scripts/shutdown/restart.py` — reader.
-- `scripts/shutdown/inventory.py` — reader.
-- `scripts/shutdown/shutdown.py` — reader.
-- `scripts/herdr/worker_panes.py` — reader.
-- `scripts/herdr/test_worker_panes.py` — reader rows.
-- `scripts/usage/agents_log.py` — reader.
-- `scripts/usage/test_agents_log.py` — reader rows.
-- `scripts/lint/tmp_sweep.py` — reader.
-- `scripts/lint/test_tmp_sweep.py` — reader rows.
-- `commands/plan/shrink.md` — doc.
-- `commands/unit/direct.md` — doc.
-- `docs/as-built/hierarchy.md` — doc.
-- `docs/as-built/session-notifier.md` — doc.
-- `docs/as-built/session-roster.md` — doc.
-- `docs/as-built/build-targets.md` — doc.
-- `docs/as-built/merge-gate-and-test-speed.md` — doc.
-- `docs/as-built/build-followups-fn-length-hook.md` — doc.
-- `docs/plans/sdlc-devtools-path-copies.md` — doc.
+- `scripts/lib/unit_runs.py` — `open_run`, `held`.
+- `scripts/direct/prepare_session.sh`, `scripts/direct/end_session.sh` — set and clear the pointer.
+- `scripts/direct/progress_history.py` — sets the pointer at `start-run` and on reopen; clears it at `finish-run`.
+- `scripts/hooks/conversation_pause.py`, `scripts/hooks/user-prompt-submit-conversation-pause.py`, `scripts/hooks/direct_run.py`, `scripts/hooks/pre-tool-use-berth.py` — hook readers.
+- `scripts/agents/shutdown.py`, `scripts/agents/inventory.py` — shutdown readers.
+- `scripts/build_hold/build_hold.py`, `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh` — build hold reader; no mark overrides.
 
-**Workers:** 2 writers. The API in items 1 and 3 is fixed above, so both start at once.
-- `impl` — items 1, 2, 3, 5, 7: `staff.py`, `unit_runs.py`, `prepare_session.sh`, `end_session.sh`, `progress_history.py`, the three hooks, their tests, and the deploy one-off.
-- `test2` — items 4 (all readers not in `impl`'s list), 6 and their tests.
-
-**State:** the staff record gains the `run` key. Old rows have no key and read as `NoRun`.
-
-**Acceptance gate:** the targeted test is green; basedpyright reports 0 on the lint line; the grep in item 4 shows no reader of a mark folder.
+**Gotchas:**
+- `prepare_session.sh` continues when the session has no staff row, but exits on an unreadable staff record.
+- The reopen path publishes the pointer before it writes `active`, so a rerun after a failed write publishes it.
+- The user-prompt hook reads staff once and passes the record to activity, holds and timers.
+- The stop hook allows the stop with no output when staff is unreadable.
+- Tests use their own `STAFF_FILE` and run root, never live staff or live units.
