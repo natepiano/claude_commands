@@ -2423,3 +2423,23 @@ A whole gate starts 997 interpreter version checks instead of 3,351. At a paired
 **Gotchas:** an inherited `CLAUDE_PYTHON` makes a seeded cache useless; pop it inside the fixture's `patch.dict` so cleanup restores it.
 
 **Ruled out:** a test-only start path in `scripts/lib/py`; a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
+
+### Phase 121 — Board helpers and the style lint record stop starting Python  · status: done
+
+#### As-built
+
+`flatten()`, `lock_guard()` and the `style_sync.py lint` record loop start no Python process. The estimated saving is about 42 CPU s per gate on natedev: 28.4 from the two board helpers (paired per-call cost times the Phase 115 whole-gate call counts) and 13.5 from `style/test_style_sync.py` (median 44.0 to 29.5 CPU s in `module_cost.py` pairs).
+
+- `flatten()` in `scripts/direct/board.sh` uses bash parameter expansion. It replaces newline, CR and tab with a space, removes each character outside `[[:print:]]`, and cuts to `MAX_MESSAGE_CHARS` characters. It pins a UTF-8 locale in a `local LC_ALL` (C.UTF-8, then en_US.UTF-8, then UTF-8), so text keeps its non-ASCII characters in a C or empty caller locale.
+- `lock_guard()` opens descriptor 9 in the shell and takes `flock(LOCK_EX|LOCK_NB)` with one perl call; perl exits 75 when the lock is busy. The shell keeps the lock after perl exits. The return codes do not change.
+- `style_sync.py lint` opens `style_ledger.open_ledger(repo)` once, only when records exist, and calls `ledger.lint_record` per record. `main` also catches `rule_catalog.RuleValidationError` and `sqlite3.Error`. The `LEDGER` constant and the diagnostic file are gone; `style_ledger.py lint-record` stays.
+
+**Files:**
+- `scripts/direct/board.sh` — `flatten`, `lock_guard` (owner sdlc).
+- `scripts/direct/test_board_text.py` — Unicode and limit rows in the inherited, C and no-locale cases.
+- `scripts/style/style_sync.py`, `scripts/style/test_style_sync.py` — in-process lint records (owner style unit).
+- `docs/as-built/build-memory-admission.md` — the perl guard line.
+
+**Gotchas:** bash `[[:print:]]` and `${#text}` follow the locale; a launchd job or an `env -i` child has none. perl resolves from the `verify.sh` PATH: `/run/current-system/sw/bin/perl` on natedev, `/usr/bin/perl` on the Mac. The locale rows did not run on the Mac (SSH timed out).
+
+**Ruled out:** a whole-gate paired timing for this gain, because its noise is about 27 CPU s.

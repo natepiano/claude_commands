@@ -313,7 +313,7 @@ class StyleSyncTests(unittest.TestCase):
             self.assertEqual(ledger.tip_seen(tip), "own hand-off")
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM lint_runs").fetchone(), (0,))
         seen = subprocess.run([
-            str(style_sync.PYTHON), str(style_sync.LEDGER), "tip", "seen", "--repo", str(self.repo), "--tip", tip,
+            str(style_sync.PYTHON), str(Path(style_ledger.__file__)), "tip", "seen", "--repo", str(self.repo), "--tip", tip,
         ], capture_output=True, text=True, check=True)
         self.assertEqual(seen.stdout.strip(), "seen (own hand-off: synced with no lint run)")
 
@@ -1415,7 +1415,7 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
         _ = self.git("merge", "--no-ff", "-qm", "Integrate handoff", "style/main")
         merge = self.git("rev-parse", "HEAD")
         def acknowledge() -> subprocess.CompletedProcess[str]:
-            return subprocess.run([str(style_sync.PYTHON), str(style_sync.LEDGER), "handoff", "merged",
+            return subprocess.run([str(style_sync.PYTHON), str(Path(style_ledger.__file__)), "handoff", "merged",
                                    "--repo", str(self.repo), "--checkpoint", checkpoint, "--merge-commit", merge],
                                   capture_output=True, text=True, check=False)
         refused = acknowledge()
