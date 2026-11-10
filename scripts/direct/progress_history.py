@@ -2159,6 +2159,11 @@ def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> 
     _update_dispatch(session_dir, instance_id, "hook_notice", notice)
 
 
+def record_quota_refusal(session_dir: Path, instance_id: str, refusal_id: str) -> None:
+    """Record a reported quota refusal so the timer reports it once."""
+    _update_dispatch(session_dir, instance_id, "quota_refusal", refusal_id)
+
+
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
     if not _state_path(session_dir).is_file():
