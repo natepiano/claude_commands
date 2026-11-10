@@ -34,7 +34,7 @@ from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
 from scripts.notify.user_action import ActionRequired
 from scripts.whoami.test_quota_alert import REGISTRY
-from scripts.whoami.quota_alert_test_support import worker_mode_broadcasts
+from scripts.whoami.quota_alert_test_support import complete_worker_moves, worker_mode_broadcasts
 
 CURRENT_READING_AGE = timedelta()
 
@@ -59,6 +59,7 @@ class CodexAccountAlertTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(worker_mode_broadcasts())
+        _ = self.enterContext(patch.object(accounts, "_launch_worker_moves", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.sent = []
@@ -221,6 +222,7 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
         requests = [row for row in moves.read_moves() if row["kind"] == "requested"]
         self.assertEqual([(row.get("cause"), row["why"], row["to"]) for row in requests],
@@ -246,6 +248,7 @@ always=director
         self.assertEqual(journal[0]["move_id"], journal[1]["move_id"])
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
 
     def test_interrupted_workers_log_removal_does_not_replay_after_operator_return(self) -> None:
@@ -255,6 +258,7 @@ always=director
         with patch.object(next_moves, "write_next_moves", side_effect=OSError("fixture log replacement failed")):
             try:
                 _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
+                _ = complete_worker_moves(readings, self.now)
             except OSError:
                 pass
         self.assertEqual(agent_accounts.workers_home(), target.home)
@@ -314,6 +318,7 @@ always=director
         self.assertEqual(next_moves.read_next_moves(), (entry,))
         _ = quota_alert.run_workers_next_moves(readings, self.now)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
 
     def test_pending_failure_retry_after_a_failed_state_save_records_one_failure(self) -> None:
@@ -358,6 +363,7 @@ always=director
         self.assertEqual(failures, pending)
         self.assertEqual(len(failures), 1)
         self.assertEqual(agent_accounts.workers_home(), target.home)
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
         with quota_alert.state_file() as state:
             self.assertFalse(state.get("pending_move_failures"))
@@ -460,15 +466,20 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         journal = moves.store_file()
         journal.parent.mkdir(parents=True, exist_ok=True)
-        _ = journal.write_bytes(b'{"kind":')
-        output = io.StringIO()
-        with redirect_stdout(output):
-            _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
-        self.assertEqual(agent_accounts.workers_home(), target.home)
+        for repeat in (False, True):
+            with self.subTest(repeat=repeat):
+                before = journal.read_bytes() if repeat else b""
+                _ = journal.write_bytes(before + b'{"kind":')
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=readings)
+                self.assertEqual(agent_accounts.workers_home(), target.home)
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
+                lines = [line for line in output.getvalue().splitlines() if "torn final line" in line]
+                self.assertEqual(len(lines), 1)
+                self.assertIn("moves.jsonl", lines[0])
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
-        lines = [line for line in output.getvalue().splitlines() if "torn final line" in line]
-        self.assertEqual(len(lines), 1)
-        self.assertIn("moves.jsonl", lines[0])
         self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"],
                          [f"auto: {entry.id}"])
 
@@ -572,8 +583,10 @@ always=director
         readings = self.readings(source, self.report(source), self.report(target, 80))
         with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
             returned = quota_alert.run_workers_next_moves(readings, self.now)
-        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto")
+        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto", worker_moves="detach",
+            worker_move_journal=moves.read_moves())
         self.assertEqual(returned.workers, accounts.CodexWorkersAccount(target.label, target.home))
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), (later,))
         self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"], [f"auto: {head.id}"])
 
@@ -622,8 +635,10 @@ always=director
         head = next_moves.add_next_move("workers", 1, "codex2")
         with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
             returned = quota_alert.run_workers_next_moves(readings, self.now)
-        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto")
+        swap.assert_called_once_with("workers", "codex2", why=f"auto: {head.id}", cause="auto", worker_moves="detach",
+            worker_move_journal=moves.read_moves())
         self.assertEqual(returned.workers, accounts.CodexWorkersAccount(target.label, target.home))
+        _ = complete_worker_moves(readings, self.now)
         self.assertEqual(next_moves.read_next_moves(), ())
         self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"], [f"auto: {head.id}"])
 
@@ -1135,7 +1150,7 @@ always=director
         self.save_room(old, 0)
         self.save_room(target, 1)
         readings = self.readings(old, self.report(old, 0), self.report(target, 1))
-        with patch.object(accounts, "_write_role", side_effect=OSError("fixture workers role write failed")) as write:
+        with patch.object(accounts, "write_role_map", side_effect=OSError("fixture workers role write failed")) as write:
             _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
                 codex_readings=readings, window=refusals.KnownWindow("weekly"))
         write.assert_called_once()

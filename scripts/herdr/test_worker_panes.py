@@ -1097,23 +1097,66 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.stops, [])
 
+    def test_open_worker_follows_its_family_account_in_the_same_pane(self) -> None:
+        for family in ("codex", "claude"):
+            _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+            launches_before = len(self.world.launches)
+            stops_before = self.world.stops.copy()
+            source = self.root / family
+            selected = (accounts.CodexWorkersAccount("codex1", source) if family == "codex"
+                        else accounts.NamedAccount("claude1", source))
+            first = self.start("account-" + family, account=selected)
+            assert isinstance(first, worker_panes.OpenWorker)
+            self.completed_dispatch(first.row, "impl")
+            for destination in (source, self.root / (family + "2")):
+                with (self.subTest(family=family, destination=destination.name),
+                      patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex2", destination)),
+                      patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.NamedAccount("claude2", destination))):
+                    result = self.start(first.row.name)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.assertEqual(result.row.id, first.row.id)
+                self.assertEqual(result.row.current_session, first.row.current_session)
+                self.assertEqual((result.pane, result.terminal), (first.pane, first.terminal))
+                if destination == source:
+                    self.assertEqual(result, first)
+                    self.assertEqual(len(self.world.launches), launches_before + 1)
+                    self.assertEqual(self.world.stops, stops_before)
+                else:
+                    self.assertEqual(len(self.world.launches), launches_before + 2)
+                    self.assertEqual(self.world.launches[-1], herdr.ExistingPane(first.pane, first.terminal))
+                    self.assertEqual(self.world.stops, stops_before + [str(first.row.current_session)])
+                    key = "CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"
+                    self.assertEqual(self.world.requests[-1][2][key], str(destination))
+                    self.assertIn(str(first.row.current_session), self.world.requests[-1][1])
+                self.assertEqual(self.world.closed, [])
+
     def test_unreadable_launch_environment_without_a_current_dispatch_is_uncertain(self) -> None:
-        first = self.start()
-        assert isinstance(first, worker_panes.OpenWorker)
-        self.world.unreadable_environment.add(self.world.foreground[first.pane][0])
-        before = self.staff_state()
-        commands = self.world.commands.copy()
-        with patch.object(staff, "runtime_id", return_value=self.parent.current_session):
-            code, output, diagnostic = self.command("start-or-resume", first.row.name, "--role", "impl")
-        self.assertEqual(code, worker_panes.ExitCode.UNCERTAIN)
-        self.assertEqual(output, "")
-        self.assertEqual(len(diagnostic.splitlines()), 1)
-        self.assertIn("launch environment is unproved", diagnostic)
-        self.assertEqual(self.staff_state(), before)
-        self.assertEqual(self.world.commands, commands)
-        self.assertEqual(len(self.world.launches), 1)
-        self.assertEqual(self.world.stops, [])
-        self.assertEqual(self.world.closed, [])
+        for status in ("missing", "completed", "refused", "error"):
+            with self.subTest(status=status):
+                first = self.start("unreadable-" + status)
+                assert isinstance(first, worker_panes.OpenWorker)
+                if status != "missing":
+                    self.dispatch(first.row, "impl")
+                    state_path = self.root / "run/progress_history_state.json"
+                    state = cast(dict[str, object], json.loads(state_path.read_text()))
+                    passes = cast(dict[str, dict[str, object]], state["pass"])
+                    passes[first.row.name]["status"] = status
+                    write_text_atomic(state_path, json.dumps(state))
+                self.world.unreadable_environment.add(self.world.foreground[first.pane][0])
+                before = self.staff_state()
+                commands = self.world.commands.copy()
+                launches = self.world.launches.copy()
+                with patch.object(staff, "runtime_id", return_value=self.parent.current_session):
+                    code, output, diagnostic = self.command("start-or-resume", first.row.name, "--role", "impl")
+                self.assertEqual(code, worker_panes.ExitCode.UNCERTAIN)
+                self.assertEqual(output, "")
+                self.assertEqual(len(diagnostic.splitlines()), 1)
+                self.assertIn("launch environment is unproved", diagnostic)
+                self.assertEqual(self.staff_state(), before)
+                self.assertEqual(self.world.commands, commands)
+                self.assertEqual(self.world.launches, launches)
+                self.assertEqual(self.world.stops, [])
+                self.assertEqual(self.world.closed, [])
 
     def test_current_dispatch_reuses_a_worker_with_an_unreadable_launch_environment(self) -> None:
         first = self.start()

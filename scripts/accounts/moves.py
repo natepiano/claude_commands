@@ -242,7 +242,16 @@ class ReadCurrentMoveJournal:
 
 READ_CURRENT_MOVE_JOURNAL = ReadCurrentMoveJournal()
 
-def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
+
+@dataclass(frozen=True)
+class MoveReplayEvidence:
+    """Validated move rows and recorded queue entries from one journal read."""
+
+    entries: tuple[MoveEntry, ...]
+    history: RecordedAutoEntries
+
+
+def read_replay_evidence() -> MoveReplayEvidence | UnreadableMoveJournal:
     """Read replay evidence under the same flock as journal appenders."""
     path = store_file()
     try:
@@ -277,12 +286,19 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
                     or row.get("kind") == "requested" and row.get("tool") == "codex" and row.get("subject") == "workers"
                     and row.get("cause") == "auto" and row.get("move_id") not in failed):
                 ids.add(why.removeprefix("auto: "))
-        return RecordedAutoEntries(frozenset(ids))
+        journal = _resolve_journal_entries(cast(list[JournalEntry], cast(object, rows)))
+        return MoveReplayEvidence(tuple(account_moves(journal)), RecordedAutoEntries(frozenset(ids)))
     except FileNotFoundError:
-        return RecordedAutoEntries(frozenset())
+        return MoveReplayEvidence((), RecordedAutoEntries(frozenset()))
     except (OSError, ValueError, UnicodeError) as error:
         print(f"account moves: anomaly: cannot read recorded workers moves: {error}")
         return UnreadableMoveJournal()
+
+
+def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
+    """Return recorded queue entries from the shared replay reader."""
+    evidence = read_replay_evidence()
+    return evidence.history if isinstance(evidence, MoveReplayEvidence) else evidence
 
 
 def append_move(entry: MoveEntry) -> None:
@@ -318,9 +334,8 @@ def append_move(entry: MoveEntry) -> None:
         append_journal_line(output.fileno(), json.dumps(entry, sort_keys=True))
 
 
-def read_journal() -> list[JournalEntry]:
-    """Read valid transitions in order, skipping malformed or incomplete lines."""
-    # Keep this module a standard-library leaf until a journal is actually read.
+def _resolve_journal_entries(journal: list[JournalEntry]) -> list[JournalEntry]:
+    """Resolve legacy homes through historical evidence for both journal readers."""
     from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
 
     def numbered(value: object, tool: str) -> str | HomeAccountUnresolved:
@@ -347,6 +362,28 @@ def read_journal() -> list[JournalEntry]:
         matching = sorted((item for item in evidence if item.tool == tool and item.at <= at), key=lambda item: item.at)
         return numbered(matching[-1].label, tool) if matching else HomeAccountUnresolved(home)
 
+    entries: list[JournalEntry] = []
+    for value in journal:
+        raw: dict[str, object] = dict(value)
+        if raw["kind"] in ("routed to claude", "routed back", "routing not restored"):
+            raw["owner"] = _routing_owner(raw["owner"])
+            if raw["kind"] == "routed to claude":
+                _ = raw.setdefault("why", raw["cause"])
+            entries.append(cast(RoutingEntry, cast(object, raw)))
+            continue
+        entry = _canonical_entry(cast(MoveEntry, value))
+        fields: dict[str, object] = dict(entry)
+        for field in ("from", "to", "label"):
+            if fields.get(field) in ("default", f"~/.{entry['tool']}", str(homes[entry["tool"]])):
+                fields[field] = historical(entry, field)
+        if fields["kind"] == "requested":
+            _ = fields.setdefault("cause", "refusal")
+        entries.append(cast(MoveEntry, cast(object, fields)))
+    return entries
+
+
+def read_journal() -> list[JournalEntry]:
+    """Read valid transitions in order, skipping malformed or incomplete lines."""
     try:
         with store_file().open("r+", encoding="utf-8", errors="replace") as source:
             fcntl.flock(source.fileno(), fcntl.LOCK_EX)
@@ -366,22 +403,8 @@ def read_journal() -> list[JournalEntry]:
             if legacy.get("kind") == "routed to claude":
                 _ = legacy.setdefault("why", legacy.get("cause"))
         if _valid(cast(object, value)):
-            raw = cast(dict[str, object], value)
-            if raw["kind"] in ("routed to claude", "routed back", "routing not restored"):
-                raw["owner"] = _routing_owner(raw["owner"])
-                if raw["kind"] == "routed to claude":
-                    _ = raw.setdefault("why", raw["cause"])
-                entries.append(cast(RoutingEntry, cast(object, raw)))
-                continue
-            entry = _canonical_entry(cast(MoveEntry, value))
-            fields: dict[str, object] = dict(entry)
-            for field in ("from", "to", "label"):
-                if fields.get(field) in ("default", f"~/.{entry['tool']}", str(homes[entry["tool"]])):
-                    fields[field] = historical(entry, field)
-            if fields["kind"] == "requested":
-                _ = fields.setdefault("cause", "refusal")
-            entries.append(cast(MoveEntry, cast(object, fields)))
-    return entries
+            entries.append(cast(JournalEntry, value))
+    return _resolve_journal_entries(entries)
 
 
 def account_moves(journal: list[JournalEntry]) -> list[MoveEntry]:
