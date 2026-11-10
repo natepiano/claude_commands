@@ -458,6 +458,28 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertCountEqual([path.name for path in self.selection().modules],
                               ["test_path.py", "test_root_path.py"])
 
+        self.certify()
+        self.write("scripts/component/tool.sh", "true\n")
+        self.write("scripts/component/reader_test_support.py",
+                   'from pathlib import Path\nTOOL = Path(__file__).with_name("tool.sh")\n'
+                   + 'from scripts.component import relay_test_support\n')
+        self.write("scripts/component/relay_test_support.py",
+                   "from scripts.component import reader_test_support\n")
+        self.write("scripts/adapters/path_adapter.py",
+                   "from scripts.component import reader_test_support\n")
+        for path, text in (
+            ("component/test_support_path.py", "from scripts.component import relay_test_support\n"),
+            ("checks/test_folder_path.py", "PARTS = 'component tool.sh'\n"),
+            ("checks/test_basename.py", "NAME = 'tool.sh'\n"),
+            ("checks/test_support_through_production.py", "from scripts.adapters import path_adapter\n"),
+        ):
+            self.add_test(path, text)
+        self.certify()
+        self.write("scripts/component/tool.sh", "false\n")
+        _ = self.commit()
+        self.assertCountEqual([path.name for path in self.selection().modules],
+                              ["test_support_path.py", "test_folder_path.py"])
+
     def test_dirty_paths_include_edits_untracked_files_deletions_and_renames(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/component/deleted.py", "VALUE = 1\n")

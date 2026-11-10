@@ -2334,7 +2334,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `-S`, `-I`, `-I -S` and thin entry scripts: 49 to 139 new failures for 7 to 80 CPU s.
 - Warm bytecode: 14.8 CPU s net, which is too small to justify a preparation step.
 
-### Phase 116 — A targeted test run selects every test that reads a changed file as text  · status: todo
+### Phase 116 — A targeted test run selects every test that reads a changed file as text  · status: done
 
 **Depends on:** none
 
