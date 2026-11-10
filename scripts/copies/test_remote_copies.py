@@ -270,12 +270,13 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertIn("--session holder-session", receiver)
         self.assertIn("--delete", command)
         self.assertIn("--compress", command)
-        self.assertIn("-rlptc", command)
+        self.assertIn("-rlpc", command)
         exclude = self.root / "excludes"
         _ = exclude.write_text("/target/\n")
         output = self.root / "receiver"
-        for body in ("before", "edited"):
-            with self.subTest(body=body):
+        previous_mtime = 0
+        for body, unchanged in (("before", False), ("edited", False), ("edited", True)):
+            with self.subTest(body=body, unchanged=unchanged):
                 source = self.source / "same-size.txt"
                 _ = source.write_text(body)
                 os.utime(source, (1_000_000_000, 1_000_000_000))
@@ -283,7 +284,11 @@ class RemoteCopiesTests(unittest.TestCase):
                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
                 self.assertEqual((output / "same-size.txt").read_text(), body)
-                self.assertEqual((output / "same-size.txt").stat().st_mtime_ns, source.stat().st_mtime_ns)
+                destination_mtime = (output / "same-size.txt").stat().st_mtime_ns
+                self.assertGreater(destination_mtime, source.stat().st_mtime_ns)
+                if unchanged:
+                    self.assertEqual(destination_mtime, previous_mtime)
+                previous_mtime = destination_mtime
 
     def test_owner_removal_keeps_another_owner_and_repository(self) -> None:
         mine, other, elsewhere = self.remote(), self.remote("beta", "mirror/beta"), self.remote("alpha", "mirror/else")

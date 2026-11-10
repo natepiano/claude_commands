@@ -1030,7 +1030,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(controller.copy_failure_detail, "copy: rsync: rsync: config denied")
         self.assertEqual(commands[-1][0], "rsync")
         self.assertIn("--compress", commands[-1])
-        self.assertIn("-rlptc", commands[-1])
+        self.assertIn("-rlpc", commands[-1])
 
     def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
         self.write_portable_workspace()
@@ -1262,7 +1262,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(
             copy["args"],
             [
-                "-rlptc",
+                "-rlpc",
                 "--stats",
                 "--compress",
                 "--delete",

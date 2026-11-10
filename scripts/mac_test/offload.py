@@ -1474,6 +1474,8 @@ def linux_version_declined_recently(target: str, repository_name: str, hold_s: f
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     root = Path(__file__).resolve().parents[2]
     listing = controller.capture_copy(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
@@ -1500,7 +1502,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture_copy(["rsync", "-rlptc", "--compress", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
