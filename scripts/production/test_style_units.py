@@ -447,7 +447,7 @@ class StyleUnitsTests(unittest.TestCase):
         write_style_units(self.doc, (style_config.StyleUnitAssignment(
             "cargo-liner-style", ("names", "values", "types", "modules")),))
         output = self.render([live_unit("cargo-liner-style")])
-        self.assertIn("| cargo-liner-style | active | idle | idle | — | 5 | 5 | 12 |", output)
+        self.assertIn("| cargo-liner-style | exited | idle | idle | — | 5 | 5 | 12 |", output)
         self.assertIn("All families: 5 findings built · 12 approved findings left · 5 built", output)
 
     def test_total_with_a_rate_counts_all_families_once_and_uses_thousands_commas(self) -> None:

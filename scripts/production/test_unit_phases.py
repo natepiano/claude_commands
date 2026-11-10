@@ -34,6 +34,7 @@ from scripts.production import unit_lookup
 from scripts.herdr import herdr, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
+from scripts.production.production_doc import read_production
 from scripts.production import style_units
 from scripts.style import style_ledger
 from scripts.style.ledger_test_support import write_style_units
@@ -795,7 +796,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(style_units, "table", return_value="ticket table") as tickets,
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
-        phases.assert_called_once_with([product_unit], {})
+        phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone)
         tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
         self.assertEqual(doc.read_bytes(), before)
         self.assertEqual(output.getvalue(), "product table\n\nticket table\n")
