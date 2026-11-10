@@ -16,7 +16,7 @@ from unittest import mock
 
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 copy_to_mac = cast(Callable[..., None], getattr(staff, "_copy_to_mac"))
 

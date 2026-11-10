@@ -19,7 +19,7 @@ from scripts.production.production_doc import cell_value
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 @dataclass(frozen=True)

@@ -43,6 +43,16 @@ if [[ -z "${DIRECTOR_SESSION_ID}" ]]; then
   exit 0
 fi
 
+STATUS=0
+cleanup() {
+  if "$@"; then
+    return 0
+  else
+    echo "end_session: failed: $*" >&2
+    STATUS=1
+  fi
+}
+
 # The marker is under unit/, or delegate/ for a run started before the rename.
 if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
   MARKER="${UNIT_ACTIVE_DIR}/${DIRECTOR_SESSION_ID}"
@@ -72,7 +82,12 @@ fi
 if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
   HELD_ARGS+=(--active "${UNIT_ACTIVE_DIR}")
 fi
-HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}" || true)"
+if HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}")"; then
+  :
+else
+  echo "end_session: failed: unit_runs.py held" >&2
+  STATUS=1
+fi
 while IFS= read -r run; do
   if [[ -n "${run}" && "${run}" != "${SESSION_DIR}" ]]; then
     RUNS+=("${run}")
@@ -85,18 +100,25 @@ if (( ${#RUNS[@]} > 0 )); then
     REMOVE_ARGS+=(--session-dir "${run}")
   done
   for run in "${RUNS[@]}"; do
-    "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}" || exit 1
+    cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
   done
-  "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
-  "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}" || true
+  cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
+  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}"
   # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
+  for run in "${RUNS[@]}"; do
+    cleanup "$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" end "${run}"
+  done
 fi
 
 "$PY" "${SCRIPT_DIR}/../copies/copies.py" remove || true
 
-if [[ -f "${MARKER}" ]]; then
-  rm -f "${MARKER}"
-  echo "Unit run ended; marker cleared."
+if [[ -n "${SESSION_DIR}" ]]; then
+  if [[ ! -e "${MARKER}" ]]; then
+    echo "Unit run ended; marker cleared."
+  else
+    echo "Unit run marker remains."
+  fi
 else
   echo "No active unit run marker for this session."
 fi
+exit "${STATUS}"

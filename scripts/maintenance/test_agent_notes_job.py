@@ -36,7 +36,7 @@ class JobTests(unittest.TestCase):
 
     def test_refusal_part_hands_moves_to_the_detached_batch_before_stopping(self) -> None:
         from scripts.accounts import refusal_watch, moves
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
 
         def refusal_pass(**_options: object) -> list[str]:
             results = stop_resume.move_sessions(["member"], "claude5", why="auto: head", cause="auto",

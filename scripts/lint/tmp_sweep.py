@@ -107,7 +107,7 @@ from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 if TYPE_CHECKING:
     from scripts.production import staff

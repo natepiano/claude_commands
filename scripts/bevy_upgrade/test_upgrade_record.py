@@ -106,10 +106,10 @@ class RecordTests(unittest.TestCase):
 
     def test_unique_module_names_load_with_shutdown_first_on_the_path(self) -> None:
         directory = Path(__file__).resolve().parent
-        shutdown = directory.parent / "shutdown"
+        shutdown = directory.parent / "agents"
         script = (
             "import sys\nfrom pathlib import Path\n"
-            + "from scripts.shutdown import shutdown_record\nfrom scripts.bevy_upgrade import upgrade_record, upgrade_report\n"
+            + "from scripts.agents import shutdown_record\nfrom scripts.bevy_upgrade import upgrade_record, upgrade_report\n"
             + "assert Path(shutdown_record.__file__).resolve() == Path(sys.argv[2]) / 'shutdown_record.py'\n"
             + "assert Path(upgrade_record.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_record.py'\n"
             + "assert Path(upgrade_report.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_report.py'\n"

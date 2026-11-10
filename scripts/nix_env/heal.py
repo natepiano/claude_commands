@@ -356,7 +356,7 @@ def confirm_relaunch(directory: Path, session: HealSession, history: HealHistory
 
 def request_stop(directory: Path, limits: HealLimits, session: HealSession, pending: PendingRestart, history: HealHistory,
                  histories: dict[str, HealHistory]) -> bool:
-    from scripts.shutdown import stop_resume
+    from scripts.agents import stop_resume
 
     result = stop_resume.stop(session.session_id)
     if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
@@ -416,7 +416,7 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
     pending["kind"] = "launching"
     history["restart_at"] = time.time()
     save_history(directory, histories)
-    from scripts.shutdown import stop_resume
+    from scripts.agents import stop_resume
     try:
         result = stop_resume.resume(session.session_id, why="nix shell heal")
     except (OSError, subprocess.TimeoutExpired) as error:

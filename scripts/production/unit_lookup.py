@@ -27,7 +27,7 @@ from scripts.herdr.herdr import HerdrPlace  # noqa: E402
 from scripts.message.sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, session_staff, unit_config  # noqa: E402
 from scripts.production.session_labels import StaffLabels
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib import unit_runs  # noqa: E402
 
 USAGE = "usage: unit_lookup.py list <production name> | pane <production name> <unit>"

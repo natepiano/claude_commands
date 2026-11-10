@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.build_queue import admission_records
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass

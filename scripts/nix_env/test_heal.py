@@ -17,7 +17,7 @@ from unittest.mock import Mock, call, patch
 from scripts.lib import conf, nix_env
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.nix_env import heal
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.notify import push_texts
 from scripts.message import sessions
 from scripts.whoami import account
