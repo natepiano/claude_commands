@@ -2444,40 +2444,55 @@ A whole gate starts 997 interpreter version checks instead of 3,351. At a paired
 
 **Ruled out:** a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
 
-### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: todo
+### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: done (declined)
+
+#### As-built
+
+Declined by the builds showrunner on 2026-11-10: the gain is under the 30 CPU s per gate bar. Checkpoint `8c9858589` was reverted by `25ec7c5ef`; the code is unchanged.
+
+- Change measured: `progress_history.py` and `plan_history.py` imported the staff, plan, reservation and worker modules inside the functions that use them, with type-only imports under `TYPE_CHECKING`.
+- `import scripts.direct.progress_history` went from about 87 ms to about 45 ms.
+- Paired CPU per start, minimum of 30 pairs on natedev under load: `start-wait` 132.5 to 106.2 ms, `finish-wait` 136.1 to 108.3, `start-activity` 132.7 to 108.3, `finish-activity` 133.7 to 105.0, `review-trial` 137.0 to 115.6. The saving is 21-29 ms per start, about 20 CPU s per gate at 772 starts.
+- The probe estimate (about 47 ms per start) was too high: every state read still loads `staff` (about 17 ms) for the run owner, and `models_registry` (about 14 ms) loads for a module constant.
+
+**Ruled out:** a recorder import phase while every state read needs `staff`; a larger gain needs a recorder that does not resolve the owner through staff on each start.
+
+### Phase 123 — A changed shell script selects the tests of the scripts that call it  · status: done
 
 **Depends on:** none
 
 #### Work Order
 
-**Source:** the builds showrunner, 2026-11-10: go for `progress_history.py` and `plan_history.py` imports, in the Phase 117 delayed-import form; measure in pairs and send the gain with the checkpoint. The sdlc showrunner gave its go with two conditions: type-only imports stay under `TYPE_CHECKING` so basedpyright stays 0/0/0, and the notice reports the paired CPU per start before and after.
+**Source:** the builds showrunner, 2026-11-10: go for the script-call closure in `affected_modules.py`, after Phase 122. Correct selection first. Send the before/after module count and the targeted CPU with the checkpoint.
 
-**Why:** a whole gate starts `scripts/direct/progress_history.py` about 772 times. Each start spends about 107 ms CPU on imports on natedev, 82.6 CPU s per gate. Most of it is dataclass definitions (about 0.36 ms each) in `staff.py`, `session_staff.py`, `unit_config.py` and `worker_lifecycle.py`, which most verbs never use. A probe with those modules absent cut the import by about 47 ms per start: about 36 CPU s per gate. Director calls get the same gain.
+**Why:** the Phase 121 repair changed `scripts/direct/board.sh`. Its targeted run did not select `test_verify_lint_tool_failures`, which runs `verify.sh`, which sources `board.sh`. The merge gate found the failure instead. A changed shell script selects only the tests that name it, not the tests of the scripts that run it.
 
-**Goal:** a `progress_history.py` verb that does not use the staff, plan or reservation modules does not import them, and the paired CPU per start drops by about 40 ms.
+**Goal:** a changed shell script also selects every test that names a script that calls it, directly or through other scripts.
 
 **Spec:**
 
-1. In `scripts/direct/progress_history.py`, import `plan_history`, `phase_reservation`, `worker_lifecycle`, `staff`, `session_staff`, `unit_config` and `remote` inside each function that uses them, as Phase 117 did for `findings`. Keep each name under `TYPE_CHECKING` for annotations.
-2. In `scripts/direct/plan_history.py`, import `staff`, `session_staff` and `remote` inside each function that uses them, with the same `TYPE_CHECKING` rule.
-3. No behavior change. No test change unless a test patches a moved name.
-4. Prove with `python3 -X importtime` that `import scripts.direct.progress_history` loads none of the seven modules.
-5. Measure the CPU per start in same-load random-order pairs, phase base against the change, for one verb that `verify.sh` calls (`finish-wait`) and for `--help`-free `review-trial`; multiply by 772 for the per-gate estimate.
+1. A script is a tracked or dirty file under `scripts/` that is not Python and ends in `.sh` or has an execute bit.
+2. A script calls a target when its text names the target by the current test rule (`names_changed_file`: the full path, or the name with its folder). It also calls the target through a token that ends in `/` plus the target's full path (`$HOME/.claude/scripts/direct/verify.sh`), or a token that ends in `/` plus the name when the target is in the caller's own folder (`"$SCRIPT_DIR/board.sh"`).
+3. The changed scripts seed the closure. Add each script that calls a closure member until no new script is found. Removed scripts seed the closure too.
+4. A test is selected when it, or its imported test-support modules, names any closure member by the current test rule. The other selection rules do not change.
+5. Python files are not callers. Read script text from the worktree only when a changed script exists; the fact cache does not change.
+6. Measure the module count for a `board.sh` change and for two other scripts before and after. Measure the targeted CPU for the `board.sh` change before and after.
 
 **Files:**
-- `scripts/direct/progress_history.py` — delayed imports; owner sdlc, go given
-- `scripts/direct/plan_history.py` — delayed imports; owner sdlc, go given
+- `scripts/production/affected_modules.py` — the script-call closure; owner natest
+- `scripts/production/test_affected_modules.py` — one test for the call chain, with negative rows; owner natest
+- `docs/as-built/merge-gate-and-test-speed.md` — the targeted selection line; owner natest
 
-**Workers:** 1 writer; one mechanical change in two files
+**Workers:** 1 writer; one small change with its test
 - `impl` — all files
 
 **State:** none
 
-**Constraints from prior phases:** Phase 117 form: the import sits at the function that uses it; a test that patches a delayed import patches the package attribute. Shared import costs overlap, so a single-import ranking overstates the saving by about half. Tests use no live state.
+**Constraints from prior phases:** tests use no live state. A complete-path token that is only a fragment of a longer path (`old/config/custom.json`) must not select a test; that rule stays for tests.
 
 **Acceptance gate:**
-- `import scripts.direct.progress_history` loads none of the seven modules.
-- The paired CPU per start, before and after, is reported.
-- The importers of `progress_history.py` and `plan_history.py` pass.
-- `basedpyright` reports 0 errors, 0 warnings, 0 notes for both files.
+- A `board.sh` change selects `test_verify_lint_tool_failures`.
+- The new test fails without the closure and passes with it.
+- `test_affected_modules.py` and the merge-gate importers of `affected_modules.py` pass.
+- `basedpyright` reports 0 errors, 0 warnings, 0 notes for both Python files.
 - A targeted test on the change passes.
