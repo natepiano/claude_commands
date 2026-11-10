@@ -2351,7 +2351,7 @@ Replay over the last 20 first-parent merges on `origin/builds`, one graph from t
 
 **Ruled out:** following production modules for names, because `test_indirect_path.py` must stay unselected; a new source fact or cache version.
 
-### Phase 117 — Scripts and tests start faster because the heaviest shared imports load only when used  · status: todo
+### Phase 117 — Scripts and tests start faster because the heaviest shared imports load only when used  · status: done
 
 **Depends on:** Phase 116
 
@@ -2405,3 +2405,45 @@ Replay over the last 20 first-parent merges on `origin/builds`, one graph from t
 **Gotchas:** A patch of `show.datetime` in the parent does not reach a child process; every child report needs `TEST_REPORT_EPOCH`. A fixed fixture date with the seven-day `TOP_MAX_AGE_DAYS` window fails seven days after that date when the clock is real.
 
 **Ruled out:** fast track for this file, because it refuses Python files that import `scripts/production/staff.py`.
+
+### Phase 119 — A targeted test with no selected module ends at once and starts no cloud box  · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the builds showrunner, 2026-11-10: "a targeted test with no changed paths selected 0 modules (gate d2f28b, builds-resources e442a075f) and still launched a 32-CPU cloud box that ran nothing. Make a targeted test with an empty selection return at once, before any route to a box. Fix it where the selection is made, one rule. If the route call is in queue's code, tell queue the line. Send me the hash."
+
+**Why:** `run_gate_suites` in `scripts/production/merge_gate.py` calls `cloud_gate.route` before any selection. `cloud_gate.prepare` then makes its own copy of the targeted selection, and `run_service` starts a box for an empty module list. The local path in `run_suites` holds a second copy of the same selection.
+
+**Goal:** a targeted test selects its modules once, before the cloud route, and an empty selection returns a passed run with no box, no reservation and no bundle.
+
+**Spec:**
+
+1. One function in `merge_gate.py` makes the targeted selection: the tested tree, the passed-tree ledger, `select_affected` and `report_selection`. `run_suites` and the cloud path both use it. Remove the copy in `cloud_gate.prepare`.
+2. `run_gate_suites` makes the selection before `cloud.route` when the mode is `SuiteMode.TARGETED_TEST` and `full` is false.
+3. When that selection is an `AffectedSelection` with no modules, `run_gate_suites` returns `GateRun((), 0.0, 0.0, selection_certified=True)` at once. Requested type directories still run locally, as they do after a cloud run. Only a selection with no affected test passes this way. A requested type directory that does not exist stays an error. A targeted test takes no package name and no filter.
+4. A non-empty selection goes to the route as `SelectedModules`, and `prepare` uses those paths. The selection runs once per targeted test.
+5. The cloud route keeps its local fallback. A fallback run uses the same selected modules.
+6. A merge gate and `--full` keep the full suite and the current route.
+7. Add rows to the existing tests. Do not add a new test module.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the one selection function, the empty return before the route; owner devtools-unit (sdlc)
+- `scripts/aws_target/cloud_gate.py` — `prepare` and `route` take the selected modules; owner builds-aws (builds)
+- `scripts/production/test_merge_gate_suites.py` — rows: an empty targeted selection calls no route; a non-empty selection reaches the route once
+- `scripts/aws_target/test_cloud_gate.py` — rows: `prepare` uses the given modules and selects nothing itself
+
+**Workers:** 1 writer; the selection function and its two callers depend on one another
+- `impl` — all files
+
+**State:** none
+
+**Constraints from prior phases:** a targeted run also selects each test whose text or test-support modules name a changed file. There is one way to start a script; a test-only path will not land. Tests use no live state and no live unit.
+
+**Acceptance gate:**
+- A targeted test with no changed path prints the selection, ends with exit 0 and starts no cloud box.
+- `select_affected` runs once per targeted test.
+- The module tests of each changed file pass.
+- `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed file.
+- A targeted test on the change passes.
