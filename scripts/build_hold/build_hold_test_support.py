@@ -154,7 +154,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             # No test reads the machine's own session records, or passes for the session that runs it.
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
-            "UNIT_ACTIVE_DIR": str(self.scratch / "active"),
+            "STAFF_FILE": str(self.scratch / "staff.json"),
             "UNIT_RUN_DIR": "",
             "UNIT_SESSION_DIR": "",
             "BUILD_HOLD_TEST_LIFETIME_FIFO": str(fifo),

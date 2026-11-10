@@ -206,7 +206,8 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 `scripts/production/merge_gate.py` merges a checkpoint into a production's merge branch and tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 `scripts/production/targeted_test.py --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
-Targeted tests select modules by direct imports, complete path tokens, changed test modules, and folders of changed Python source files.
+Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
+File tokens can occur in a test or its imported test-support modules.
 Merge gates and nightly runs use all modules.
 Default merge and tests-only runs do not run basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
@@ -343,8 +344,15 @@ A static Python graph selects a test module under four rules:
 
 1. The test module changed.
 2. The test module directly imports a changed Python file.
-3. The test module names a changed path as a complete token.
+3. The test or an imported `*_test_support.py` module names a changed file through tokens.
 4. The test module shares a folder with a changed non-test Python file and names its stem as a whole word.
+
+The third rule follows imports only through `*_test_support.py` modules.
+A whole path token matches any changed file, including a repository-root file.
+A base name token also matches when the source shares the file's folder or contains that folder's name as a token.
+Repository-root files require a whole path token.
+The rule uses cached tokens and imports for Python and non-Python changed paths.
+Configuration selection keeps its existing rule.
 
 The fourth rule counts names in imports, strings, and comments.
 Removed source files also count.
@@ -770,11 +778,14 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
-| `UNIT_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/direct_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
 | `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
-`UNIT_ACTIVE_DIR` and its former name `PLAN_DELEGATE_ACTIVE_DIR` are on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when one of them, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
+The build hold reader finds the run owner through `StaffRow.run`.
+Tests use a private `STAFF_FILE` and private run folders.
+The build hold guard checks the state overrides listed in `override_guard.py` and `.sh`.
+An installed script exits 2 when a listed override is set or `HOME` differs from the account home.
+Tests use the checkout's scripts.
 
 Before the rename, each listed `UNIT_*` name had the prefix `PLAN_DELEGATE_*`.
 `UNIT_RUN_DIR` had the name `PLAN_DELEGATE_BOARD_DIR`.
@@ -788,7 +799,7 @@ The status line reads assignments from staff rows instead of these environment n
 
 ## Invariants
 
-- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/unit/active/` and `/tmp/claude/delegate/active/`, a real herdr server, the real `codex app-server`, and phone sends. Test discovery never starts a real session host or builds a missing host binary.
+- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, live run folders, a real herdr server, the real `codex app-server`, and phone sends. Test discovery never starts a real session host or builds a missing host binary.
   - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `observe_workers_home` raises on any fallback to a live Codex home.
   - Sockets use private temp dirs or ephemeral ports. No test depends on a fixed port: the refused-start test binds an ephemeral port and closes it.
   - No test writes into the repo.

@@ -337,6 +337,28 @@ def dependency_graph(repo: Path, *, state_dir: Path | None = None
     return result.imports, result.tokens
 
 
+def names_changed_file(graph: SourceGraph, path: str, changed: set[str],
+                       folder_names: dict[str, set[str]]) -> bool:
+    """Match file tokens in the test and its imported test-support modules."""
+    pending = [path]
+    seen: set[str] = set()
+    while pending:
+        source = pending.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        tokens = graph.tokens.get(source, frozenset())
+        if tokens & changed:
+            return True
+        parent = str(Path(source).parent)
+        if any(tokens & names and (parent == folder or Path(folder).name in tokens)
+               for folder, names in folder_names.items()):
+            return True
+        pending.extend(dependency for dependency in graph.imports.get(source, set())
+                       if dependency.endswith("_test_support.py"))
+    return False
+
+
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
                     state_dir: Path | None = None) -> AffectedSelection | FullSuite:
@@ -382,11 +404,16 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         for source in python:
             if not is_test_module(source):
                 folder_stems[str(Path(source).parent)].add(Path(source).stem)
+        folder_names: dict[str, set[str]] = defaultdict(set)
+        for source in changed:
+            parent = str(Path(source).parent)
+            if parent != ".":
+                folder_names[parent].add(Path(source).name)
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
             if (path in changed or graph.imports.get(path, set()) & python
-                    or old_graph.get(path, set()) & removed or graph.tokens.get(path, frozenset()) & changed
+                    or old_graph.get(path, set()) & removed or names_changed_file(graph, path, changed, folder_names)
                     or config_reads.get(path, set()) & configs):
                 selected.append(module)
                 continue

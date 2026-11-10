@@ -60,6 +60,12 @@ import sys
 report = runpy.run_path(str(Path(sys.argv[1]) / 'scripts/test_times/show.py'))
 main = report['main']
 main.__globals__['TOOL_REPOSITORY'] = Path(sys.argv[2])
+report_datetime = report['datetime']
+class ReportTime(report_datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls.fromtimestamp(float(os.environ['TEST_REPORT_EPOCH']), tz)
+main.__globals__['datetime'] = ReportTime
 index = report['index']
 if sys.argv[3]:
     table = sys.argv[3]
@@ -218,8 +224,8 @@ class TestTimesTests(unittest.TestCase):
             [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
              str(self.repo), changed_table, str(child_event.fileno()),
              *(arguments or ("top", "--repo", str(self.repo)))],
-            cwd=self.root, env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            pass_fds=(child_event.fileno(),),
+            cwd=self.root, env={**os.environ, "TEST_REPORT_EPOCH": str(EPOCH + 300)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(child_event.fileno(),),
         )
         child_event.close()
         try:
@@ -256,7 +262,7 @@ class TestTimesTests(unittest.TestCase):
             errors = self.report_pipe(cast(BinaryIO, process.stderr))
             self.assertIn("tools/test_alpha.py", first)
             self.assertNotIn("tools/test_beta.py", first.split("unmeasured:")[0])
-            self.assertEqual(errors, "rows as of 11-03 09:30 EST\n")
+            self.assertEqual(errors, "rows as of 09:30 EST\n")
             self.assertIsNone(process.poll(), "The supervisor must still wait for its refresh child")
             event.sendall(b"F")
         with self.report_process() as (process, event):

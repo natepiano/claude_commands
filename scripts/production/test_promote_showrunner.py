@@ -265,7 +265,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
         self.runs_production, self.pane, self.child_refusal = True, unit_effort.Ready(), ""
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(session_records), "UNIT_ACTIVE_DIR": str(self.root / "active")}))
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(session_records)}))
         self.assertEqual(accounts.setup("claude2"), [])
         _ = self.enterContext(mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
@@ -542,8 +542,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.pane = unit_effort.Skipped("a form, prompt or menu is open")
 
         def run_open() -> None:
-            (self.root / "active").mkdir()
-            _ = (self.root / "active" / SESSION).write_text("/tmp/run")
+            row = staff.local_snapshot().by_current_session(SESSION)
+            assert row is not None
+            _ = staff.set_run(row.id, staff.OpenRun(self.root / "run"))
 
         cases = {
             "this session runs no production": no_production,

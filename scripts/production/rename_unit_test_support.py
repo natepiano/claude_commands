@@ -105,7 +105,7 @@ class UnitRenameFixture(StaffTestCase):
             "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),

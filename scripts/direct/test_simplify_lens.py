@@ -43,7 +43,7 @@ class DailySimplifyTests(NixFixture):
             "CLAUDE_PYTHON": sys.executable, "CLAUDE_CONFIG_DIR": str(self.home / ".claude1"),
             "USAGE_STATE_DIR": str(self.root / "usage"), "USER_ZONE": "America/New_York",
             "AGENT_NOTES_DIR": str(self.root / "notes"),
-            "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"), 
             "SIMPLIFY_TEST_CALLS": str(self.calls), "SIMPLIFY_TEST_NOW": "2026-11-06T03:30:00+00:00",
             "TMPDIR": str(self.root / "tmp"),
         })

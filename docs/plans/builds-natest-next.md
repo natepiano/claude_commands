@@ -1,13 +1,13 @@
 # builds-natest — Next
 
-The phase backlog of natest-unit. At each phase end, rank modules by median CPU with `python3 ~/.claude/scripts/test_times/show.py top --repo ~/.claude`. The next speed phase takes the highest ranked live module that no phase holds, subject to the floor rule.
+The phase backlog of natest-unit. Phase 117 is next under the showrunner's approved shared-import work. After Phase 117, apply item 6a to compare measured removable CPU across modules and shared commands. Keep the current owner holds.
 
 ## Order
 
 Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed phases confirm their targets at dispatch.
 
 1. Phases 65, 64, 66, 55, 63, 70 and 71 are complete, and they form one tip.
-2. Phases 69, 44, 97 and 99 are complete. Phase 97: `copies/test_review_remote_copies.py`, 45.8 to 21.7 CPU s in pairs. Phase 99 reports `direct/test_assign_claude.py` at 49.3 to 14.9 CPU s in module_cost. Its pairs report 43.4 to 22.4 CPU s and 59.7 to 33.0 wall s. Phases 102-108 are complete, and no todo phase remains. Phase 108: `hooks/test_hook_dispatch.py`, 26.9 to 10.3 CPU s in warm pairs (62% less) and 36.7 to 12.2 with no bytecode writes. Apply item 6a to refresh the ranking and profile the highest eligible module. Keep the current production limits and follow item 6a without a CPU stop rule. Phase 100 is complete: `hooks/test_direct_turn_wait_hooks.py`, 26.1 to 3.9 CPU s in pairs. Phase 101 is complete: `herdr/test_herdr.py`, 26.0 to 5.7 CPU s in pairs (78% less).
+2. Phases 69, 44, 97 and 99 are complete. Phase 97: `copies/test_review_remote_copies.py`, 45.8 to 21.7 CPU s in pairs. Phase 99 reports `direct/test_assign_claude.py` at 49.3 to 14.9 CPU s in module_cost. Its pairs report 43.4 to 22.4 CPU s and 59.7 to 33.0 wall s. Phases 102-108 and 114-116 are complete. Phase 117 remains and precedes the next item 6a selection. Phase 108: `hooks/test_hook_dispatch.py`, 26.9 to 10.3 CPU s in warm pairs (62% less) and 36.7 to 12.2 with no bytecode writes. Apply item 6a to refresh the ranking and profile the highest eligible module. Keep the current production limits and follow item 6a without a CPU stop rule. Phase 100 is complete: `hooks/test_direct_turn_wait_hooks.py`, 26.1 to 3.9 CPU s in pairs. Phase 101 is complete: `herdr/test_herdr.py`, 26.0 to 5.7 CPU s in pairs (78% less).
 3. Phase 67 follows Phase 82: lint judgment and the parser cases, previously 231 CPU s. Its required functions already exist on origin/builds. The four SSH target files, previously 146.1 CPU s, waited for verify's import and function changes (Phase 66 floor). Remeasured 2026-11-09 with `module_cost.py`, sequential, revision `5ff151123`: the four files total 92.0 CPU s (146.1 before), and routing is 47.9. Their `build_targets.py` starts run through `verify.sh`, so the import hold stays.
 4. Phase 63 is complete. Phase 70 reports the token order hang; its cause stays open. Read the call output and queue files at its next recurrence.
 5. Phase 72 complete; the lifecycle writer and the first admission stack stay unproved. Phase 73 makes no code change: verify-unit owns the surviving token-renewal delay, and the Mac case needs no edit because queue lacked Phase 63's marker wait.
@@ -22,7 +22,7 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 11. Rule 2 cleanup (the user, 2026-11-07: "do rules 1 and 2"). After Phase 87 measures the yield, the cleanup takes the next modules by CPU s spent on rare-case tests: `production/test_dailies_render_holds.py`, `agents/test_models_conf_publish.py`, `direct/test_progress_history.py`, `lint/test_memory_admit.py`, then the rest. Skip modules that a speed phase holds.
 
-Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's multi-unit hash merges. The style unit reports the merge. Never: `types/basedpyright`, 238.4 CPU s.
+`style/test_style_sync.py`, 66.6 CPU s, is free: the style unit's multi-unit hash reached main on 2026-11-09. Never: `types/basedpyright`, 238.4 CPU s.
 
 `types/basedpyright` takes 2-4 min in a gate (report-unit, 2026-11-03). It is not in the gate's module files; Phase 2 records it, and it goes to the proposal below, never to a speed phase.
 
@@ -44,15 +44,20 @@ Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's m
   - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
   - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
   - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
-- [ ] **Report missed failures under the current targeted selector.**
-  - Target: the showrunner's notice, using targeted-test and full merge-gate records.
-  - Record the selector revision, chosen base, changed paths and selected modules for each tested tree.
+- [ ] **Report missed failures and excessive selection under the current targeted selector.**
+  - Target: natest owns the selector audit; the showrunner owns its notice.
+  - Record the selector revision, chosen base, changed paths, selected modules and measured CPU for each tested tree.
   - Compare omitted modules with full-gate results for that same tree.
-  - Separate same-commit passes, failures on nearby commits and unresolved single-commit failures.
-  - Keep Phase 112's replay counts of 55, 41 and 4 as historical evidence.
-  - Completion condition: after a day on builds, report missed failing modules and affected gate runs.
-  - Keep the Phase 37 estimates as history. The merge gate continues to run all modules.
-  - Revealed by: Phase 37 architect review, 2026-11-06. Updated after Phases 111 and 112.
+  - Separate same-commit passes, nearby-commit failures and unresolved single-commit failures.
+  - Audit both 107-module increases and the 147-module selection for `scripts/direct/verify.sh`.
+  - Classify matches against repository files separately from names used only by fake commands.
+  - Preserve selection of `direct/test_verify_lint_output.py`.
+  - Audit the 26 direct repository scanners and actual scan use through the four identified support modules. The 493 importers do not prove 493 executed scans.
+  - Document `targeted_test.py --full` as the available full-coverage check for scan-dependent changes.
+  - Completion condition: after a day on builds, report missed failures, confirmed unnecessary selections and their measured CPU.
+  - Submit any selector change with its coverage cases for separate approval.
+  - Keep the Phase 37 estimates and Phase 112 replay counts as history. The merge gate continues to run all modules.
+  - Revealed by: Phases 111-116.
 - [ ] **Architecture proposal: the assign launcher starts fewer child processes**
   - Target: `scripts/direct/assign.py` for recorder coordination, owned by sdlc. Target: `scripts/lib/models_registry.py:launch_settings` and `scripts/agents/models_config.sh` for resolver cost, owned by the models unit. Retain the comparable-build measurements across all four launcher modules. The Phase 89 prototype gain of 14.9% is one pair, measured before the port onto builds.
   - Why needed: the current coordinator starts recorder commands and a shell resolver. The codex_mesh deletion removes the follow commands from the Phase 54 profile. Phase 99's adapter changes test execution only. Profile the current production commands before using the historical gain estimates.
@@ -68,11 +73,12 @@ Waiting: `style/test_style_sync.py`, 66.6 CPU s, starts after the style unit's m
   - Why needed: `module_seconds.json` keeps 728 keys for 664 test files; old `delegate/*` keys remain after the folder moved. Memory admission reads the peak file the same way.
   - Completion condition: send the showrunner a proposal to drop keys whose module file is gone, with the key counts.
   - Revealed by: plan research, 2026-11-03.
-- [x] **The build log test suite finishes about 20 seconds sooner.** Taken by Phase 28 (2026-11-05): parallel starts, one process for each module.
-  - Target: `scripts/buildlog/test_index.py` — `LogIsolationTests.test_each_module_uses_a_temporary_log`
-  - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
-  - Completed by Phase 28: eight workers run one process for each discovered module, and each module keeps both checks in its own subTest. Paired module medians: 26.0 s -> 5.8 s.
-  - Revealed by: Phase 3
+- [x] **Index isolation shares production imports and keeps separate test imports.**
+  - Target: `scripts/buildlog/test_index.py` — `LogIsolationTests.test_each_module_uses_a_temporary_log`.
+  - Completed by Phase 114: one parent imports the production modules and forks one child per test module. Each child imports its test module and keeps both existing assertions.
+  - Same-load paired module CPU falls from 30.7 to 12.0 seconds. Module wall time rises from 7.1 to 16.0 seconds because the children run serially.
+  - Keep the eight-worker measurements of Phase 28 as history.
+  - Revealed by: Phase 3; updated after Phase 114.
 - [x] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.** The daily simplify work removed this test's cost (Phase 51 as-built).
   - Target: `scripts/direct/test_simplify_lens.py` — `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` (25 s, 8 review-launcher runs)
   - Why needed: Phase 6 left this test as the module's largest cost. Each of the 8 runs checks the report result, the saved status and the review record's `status` and `raised` fields, so a parse-only call cannot replace them.

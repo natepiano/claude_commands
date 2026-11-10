@@ -1163,7 +1163,7 @@ class WorkerPaneTests(StaffTestCase):
         run_b = self.root / "next-run"
         with patch.dict(os.environ, {"UNIT_RUN_DIR": str(run_b)}):
             _ = self.run_state()
-            unit_runs.activate(run_b, self.parent.current_session)
+            _ = staff.set_run(self.parent.id, staff.OpenRun(run_b))
             resumed = self.start(row.name)
             self.assertIsInstance(resumed, worker_panes.OpenWorker)
             assert isinstance(resumed, worker_panes.OpenWorker)

@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 from scripts.whoami.account_test_support import write_codex_auth
 from typing import ClassVar, cast
 
@@ -121,8 +122,10 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         copies.mkdir()
         _ = shutil.copy2(support.DIRECT_DIR.parent / "copies/copies.py", copies / "copies.py")
         environment["COPIES_CONFIG"] = str(support.DIRECT_DIR.parents[1] / "config/copies.conf")
-        marker = Path(environment["UNIT_ACTIVE_DIR"]) / environment["CODEX_THREAD_ID"]
-        unit_runs.activate(session, environment["CODEX_THREAD_ID"], marker.parent)
+        with patch.dict(os.environ, environment):
+            row = staff.local_snapshot().by_current_session(environment["CODEX_THREAD_ID"])
+            assert row is not None
+            _ = staff.set_run(row.id, staff.OpenRun(session))
         registry = Path(environment["NOTIFIER_SESSIONS_DIR"])
         registry.mkdir(parents=True)
         from scripts.message import sessions
@@ -135,7 +138,8 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "raise SystemExit(2)"))
         result = self.run_assignment(self.assign_command(session), environment)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(unit_runs.open_run(environment["CODEX_THREAD_ID"]), result.stdout + result.stderr)
         state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
         self.assertEqual(state["status"], "error")
         self.assertEqual([event["status"] for event in self.launch_records(session, "run_finished")], ["error"])
