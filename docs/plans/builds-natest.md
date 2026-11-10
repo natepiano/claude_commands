@@ -2405,42 +2405,21 @@ A targeted test with no selected module ends at once and starts no cloud box. Wi
 
 ### Phase 120 — Test fixtures stop starting Python to check the version  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+A whole gate starts 997 interpreter version checks instead of 3,351. At a paired cost of 20.83 ms per check, this removes about 49 CPU s per gate on natedev and about 78 on a cloud box.
 
-**Source:** item 6a of `builds-natest-next.md` and the builds showrunner, 2026-11-10: "tell me the whole phase gain per gate" and "pick the next candidate" under about 30 CPU s. The whole-gate samples of Phase 115 attribute `python -c` starts by their source.
-
-**Why:** 3,879 of 9,614 `python -c` starts in a whole gate are one line: the version check in `new_enough` in `scripts/lib/py`. The launcher runs it when it has no cached interpreter for the fixture home, or when `CLAUDE_PYTHON` is set, because a set `CLAUDE_PYTHON` skips the cache. At 13 to 31 ms per start, these starts cost 52 to 120 CPU s per gate on natedev, and about 1.6 times that on a cloud box. `seed_interpreter_cache` in `scripts/lib/py_floor_test_support.py` already removes them for the fixtures that use it.
-
-**Goal:** a whole gate starts at least 1,800 fewer version checks than the 3,351 that the attribution counted, and the removed CPU is the removed count times a paired per-check cost.
-
-**Spec:**
-
-1. Attribute first, with no repository edit. In a disposable copy, make `new_enough` append one line to a file outside the copy: the cause (cache file absent, cached path not executable, `CLAUDE_PYTHON` set), the value of `CLAUDE_PYTHON`, the cache file path, and the test module. Run every gate module in that copy, and remove the copy. Write `phases/120/probe_attribution.md` in the run folder: starts per module and per fixture, largest first.
-2. Stop after step 1 and report the table. The director tells each owner and showrunner before any test edit. The next pass does steps 3 to 6.
-3. A fixture that makes a temporary home and starts the launcher sets `XDG_CACHE_HOME` and calls `seed_interpreter_cache`. It uses one shared call for each fixture family, not one copy for each test.
-4. A fixture that sets `CLAUDE_PYTHON` to the real interpreter only to find Python removes the variable and seeds the cache instead.
-5. Keep the fixtures whose test checks the interpreter choice: a stub or observer named by `CLAUDE_PYTHON`, a cold-cache test, and a too-old-interpreter test. Name each kept fixture and its reason in the reply.
-6. After the sources that the attribution table names, continue down the full table. Stop when a fixture source removes fewer than 10 version checks.
-7. Make no change to `scripts/lib/py` and no test-only start path. A gain that needs a production change goes to the director as a proposal with its measured gain.
-8. Carry the approved `scripts/style/style_sync.py` change when style's 230219fe8 is on this branch; otherwise it moves to the next phase checkpoint. The director dispatches it as a separate pass. In `lint`, open `style_ledger.open_ledger(repo)` once around the record loop, only when `records` is not empty, and call `ledger.lint_record`. Add `rule_catalog.RuleValidationError` and `sqlite3.Error` to the `except` in `main`. Remove the `LEDGER` constant and the `diagnostic_file` write. Keep the `lint-record` command in `style_ledger.py`.
+- `scripts/lib/py` runs its version check (`new_enough`) when the interpreter cache file is absent or `CLAUDE_PYTHON` is set. A set `CLAUDE_PYTHON` skips the cache.
+- `interpreter_cache_environment(cache_home)` in `scripts/lib/py_floor_test_support.py` seeds the cache with `seed_interpreter_cache` and returns `{"XDG_CACHE_HOME": ...}` for a fixture's environment.
+- Fixtures that start scripts through the launcher in a temporary home seed the cache. Fixtures that set `CLAUDE_PYTHON` only to find Python drop it, and pop an inherited value inside their `patch.dict`.
+- These fixtures keep their interpreter setting because their tests check it: the hold family (its shell reads `PY=$CLAUDE_PYTHON`), observer and stub interpreters, the floor, root and shim fixtures, cold-cache and too-old tests, and the explicit interpreters of the override-guard, settings and merge-checkpoint fixtures.
 
 **Files:**
-- `scripts/lib/py_floor_test_support.py` — one shared call if the fixture families need it; owner natest-unit
-- `scripts/style/style_sync.py` — item 8 only; owner sdlc style unit, go given with three conditions
-- `scripts/` — the test fixtures and modules that the table of step 1 names; the checkpoint notice names each owner
+- `scripts/lib/py_floor_test_support.py` — `seed_interpreter_cache`, `interpreter_cache_environment`.
+- Test modules and support files in `scripts/` agents, build_hold, build_queue, build_targets, direct, hana_shot, hooks, lib, lint, mac_test, message, production, review_links, settings, style, test_times, usage, whoami and worktree — seed or drop per fixture.
 
-**Workers:** 1 writer; the edits follow one table and one rule
-- `impl` — all files
+**Binds later work:** the approved `scripts/style/style_sync.py` ledger change (one `style_ledger.open_ledger` around the `lint` record loop, `RuleValidationError` and `sqlite3.Error` in the `except`, no `LEDGER` constant or `diagnostic_file` write) is not in this phase.
 
-**State:** none
+**Gotchas:** an inherited `CLAUDE_PYTHON` makes a seeded cache useless; pop it inside the fixture's `patch.dict` so cleanup restores it.
 
-**Constraints from prior phases:** there is one way to start a script; a test-only path will not land. Tests use no live state and no live unit. The user allows a change to any test code when the owning unit director and its showrunner are told first. Phase 117 measures a gain by paired same-load whole-gate runs.
-
-**Acceptance gate:**
-- A whole-gate attribution after the edits shows at least 1,800 fewer version checks than the step 1 count of 3,351.
-- A paired measure gives the CPU of one version check; the phase gain is that cost times the removed count. A whole-gate pair has noise of about 27 CPU s, near this gain, so the phase does not use one.
-- The test modules that use each changed fixture pass.
-- `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed Python file.
-- A targeted test on the change passes.
+**Ruled out:** a test-only start path in `scripts/lib/py`; a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
