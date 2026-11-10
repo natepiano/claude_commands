@@ -9,6 +9,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from typing import cast, override
 from unittest import mock
 
@@ -51,9 +53,13 @@ class BuildHoldGuardTest(TemporaryGuardTest):
     def codex_unit(self, owner: str, inherited_session: str) -> None:
         run = self.root / "codex-run"
         run.mkdir()
-        active = self.root / "active"
-        active.mkdir()
-        _ = (active / owner).write_text(str(run) + "\n")
+        with isolated_staff_file(self.root / "staff.json", {}):
+            row = fixture_member("showrunner", name=owner)
+            _ = staff.set_run(row.id, staff.OpenRun(run))
+        os.environ["STAFF_FILE"] = str(self.root / "staff.json")
+        holder = self.holders / owner
+        if holder.exists():
+            _ = holder.rename(self.holders / row.current_session)
         os.environ.update({"UNIT_RUN_DIR": str(run), "UNIT_TEAM_ROLE": "impl",
                            "CODEX_THREAD_ID": "codex-thread", "CLAUDE_CODE_SESSION_ID": inherited_session})
 

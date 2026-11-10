@@ -30,7 +30,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
-from scripts.lib import unit_runs
 from scripts.build_hold import override_guard
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
@@ -363,23 +362,15 @@ def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession
     run = (environment.get("UNIT_RUN_DIR") or environment.get("PLAN_DELEGATE_BOARD_DIR")
            or environment.get("UNIT_SESSION_DIR") or environment.get("PLAN_DELEGATE_SESSION_DIR"))
     if run:
-        markers: list[Path] = []
-        for active in unit_runs.active_dirs(
-            environment.get("UNIT_ACTIVE_DIR") or environment.get("PLAN_DELEGATE_ACTIVE_DIR") or None
-        ):
-            try:
-                markers.extend(active.iterdir())
-            except OSError:
-                continue
-        matches: list[tuple[int, str]] = []
-        for marker in markers:
-            try:
-                if marker.is_file() and marker.read_text().strip() == run:
-                    matches.append((marker.stat().st_mtime_ns, marker.name))
-            except (OSError, UnicodeError):
-                continue
-        if matches:
-            return OwningSession(max(matches)[1])
+        from scripts.production import staff
+
+        try:
+            rows = staff.local_snapshot().rows
+        except staff.StaffUnreadable:
+            rows = ()
+        for row in rows:
+            if isinstance(row.run, staff.OpenRun) and str(row.run.path) == run and row.current_session:
+                return OwningSession(row.current_session)
     session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
     return OwningSession(session_id) if session_id else NoOwningSession()
 

@@ -12,6 +12,24 @@ setUpModule = support.setUpModule
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
+    def test_a_pending_claude_switch_restores_before_the_workers_back_notice(self) -> None:
+        _ = self.block([self.note("codex1.md", "active", "0")], self.now)
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            state["pending_switch"] = quota_alert.PendingClaudeSwitch(
+                fallback.owner, fallback.at, fallback.moved, fallback.hold, fallback.claude_account,
+                "refusal", "Codex refused work for quota", "Codex refused work for quota")
+            state["fallback"] = quota_alert.NoCodexQuotaFallback()
+        self.broadcasts.clear()
+        _ = self.alert([self.note("codex1.md", "active", "100")], self.now + timedelta(hours=1))
+        self.assertEqual(self.assignments()["direct"], "codex")
+        self.assertEqual(len(self.broadcasts), 1)
+        self.assertIn("Use workers again.", self.broadcasts[0][3])
+        with quota_alert.state_file() as state:
+            self.assertNotIn("pending_switch", state)
+            self.assertFalse(state.get("no_worker_mode", False))
+
     def test_recovery_moves_back_only_what_is_still_on_claude(self) -> None:
         _ = self.alert([self.note("codex1.md", "active", "0")], self.now)
         _ = self.refuse()
@@ -36,6 +54,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(set(cast(list[str], opened[0]["moved"])), {"direct", "design_roles"})
         # Reload through the persisted updater state, then recover in another pass.
         with quota_alert.state_file() as state:
+            self.assertTrue(state.get("no_worker_mode", False))
             fallback = state["fallback"]
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
@@ -50,6 +69,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(entries[1]["restored"], ["direct"])
         self.assertEqual(entries[1]["kept"], ["design_roles"])
         self.assertNotIn("move_id", entries[1])
+        self.assertEqual(len(self.broadcasts), 2)
+        self.assertIn("Use workers again.", self.broadcasts[1][3])
+        with quota_alert.state_file() as state:
+            self.assertFalse(state.get("no_worker_mode", False))
 
 
 if __name__ == "__main__":

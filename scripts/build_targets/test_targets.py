@@ -96,7 +96,7 @@ class IsolatedTargetTest(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
         _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))
@@ -170,11 +170,10 @@ class ConfigurationTests(IsolatedTargetTest):
                 target = target_config.SshTarget(name, platform, self.root / filename)
                 self.assertEqual(target_config.is_aws_target(target), expected)
 
-    def test_shipped_config_reads_mac_then_natedev_then_aws(self) -> None:
+    def test_shipped_config_reads_mac_then_natedev(self) -> None:
         self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
             targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
             targets.LocalTarget("natedev", "linux"),
-            targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf")),
         ))
 
     def test_order_follows_targets_key(self) -> None:

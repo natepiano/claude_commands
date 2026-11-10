@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import cast
 
 from scripts.accounts import accounts
+from scripts.herdr import herdr_types
 from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.shutdown import pane_record, remote, stop_resume
+from scripts.agents import pane_record, remote, stop_resume
 from scripts.whoami.account import named_account_environment
 
 
@@ -81,7 +82,18 @@ def live_session(session: str, record: staff.StaffSnapshot) -> unit_lookup.Label
                  if isinstance(item.claude, unit_lookup.LiveClaude) and item.claude.session_id == session), unit_lookup.NoSession())
 
 
-def checked(parent: Production, name: str, plan: Path, record: staff.StaffSnapshot,
+def child_plan(child: Production, plan: Path) -> Path:
+    """Resolve the plan inside the child's checkout."""
+    plan = plan.expanduser()
+    plan = (plan if plan.is_absolute() else child.checkout / plan).resolve()
+    try:
+        _ = plan.relative_to(child.checkout)
+    except ValueError as error:
+        raise Refusal("plan must be inside the child checkout") from error
+    return plan
+
+
+def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault, record: staff.StaffSnapshot,
             port: unit_config.AppPort | unit_config.NoAppPort) -> Demotion:
     try:
         row = showrunners.owner_for(name, record)
@@ -90,12 +102,30 @@ def checked(parent: Production, name: str, plan: Path, record: staff.StaffSnapsh
     if row.parent != staff.ReportsTo(parent.owner.id):
         raise Refusal(f"{name} is not attached to {parent.name}")
     child = read_production(row, record=record)
+    if isinstance(plan, unit_config.PlanDefault):
+        saved_plan = unit_config.default_plan(child.checkout, child.doc)
+        if not isinstance(saved_plan, unit_config.PlanFile):
+            raise Refusal(f"plan default is missing; looked in {child.checkout / '.unit.toml'} and {child.doc}")
+        plan = saved_plan.path
+    plan = child_plan(child, plan)
+    if isinstance(port, unit_config.NoAppPort):
+        saved = unit_config.read(child.checkout, cleanup=False)
+        port = unit_config.default_port(child.checkout, saved.port if isinstance(saved, unit_config.UnitConfig) else port)
     add_unit.require_merge_branch(parent)
     marked = live_session(row.current_session, record)
     if isinstance(marked, unit_lookup.NoSession) or not isinstance(marked.claude, unit_lookup.LiveClaude):
         raise Refusal(f"{name}: cannot read the live pane")
     worktree = child.checkout
-    promote_showrunner.check_director(name, marked, marked.claude, worktree, plan)
+    relative_plan = plan.relative_to(child.checkout).as_posix()
+    if not plan.is_file():
+        raise Refusal(f"plan {relative_plan} is missing in {child.checkout}")
+    tracked = add_unit.git(child, "ls-files", "--error-unmatch", "--", relative_plan, check=False)
+    if (tracked.returncode == 0
+            and add_unit.git(child, "cat-file", "-e", f"{child.merge_branch}:{relative_plan}", check=False).returncode != 0):
+        branch = add_unit.git(child, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        raise Refusal(f"plan {relative_plan} is committed only on {branch}; "
+                      + f"commit it on {child.merge_branch} or keep it untracked")
+    promote_showrunner.check_director(name, marked, marked.claude, worktree, skip_path=plan)
     check_units(child, record)
     return Demotion(parent, child, marked, marked.claude, worktree, child.merge_branch, plan, port)
 
@@ -157,7 +187,7 @@ def unit_document(request: Demotion) -> None:
         if title not in headers:
             headers.append(title)
     values = {"Unit": request.child.name, "Worktree": str(request.worktree), "Branch": request.branch,
-              "Plan": str(request.plan.relative_to(parent.checkout))}
+              "Plan": str(request.plan.relative_to(request.worktree))}
     if isinstance(request.port, unit_config.AppPort):
         if "Port" not in headers:
             headers.append("Port")
@@ -182,7 +212,7 @@ def unit_document(request: Demotion) -> None:
 
 
 def launch(request: Demotion) -> int:
-    plan = request.plan.relative_to(request.parent.checkout)
+    plan = request.plan.relative_to(request.worktree)
     config = unit_config.read(request.worktree, cleanup=False)
     desired = (unit_config.UnitConfig(unit_config.PlanFile(plan), request.port, ())
                if isinstance(config, unit_config.ConfigMissing)
@@ -265,7 +295,7 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
     if completed < Step.STARTED:
         try:
             started = launch(request)
-        except (OSError, ValueError, Refusal, accounts.AccountsError, herdr.HerdrFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
+        except (OSError, ValueError, Refusal, accounts.AccountsError, herdr_types.HerdrFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
             print(f"{request.child.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
             started = 1
         if started:
@@ -285,7 +315,7 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("child")
-    _ = parser.add_argument("--plan", required=True, type=Path)
+    _ = parser.add_argument("--plan", default=unit_config.PlanDefault(), type=Path)
     _ = parser.add_argument("--check", action="store_true")
     _ = parser.add_argument("--port", type=int)
     args = parser.parse_args(argv)
@@ -293,8 +323,7 @@ def _main(argv: list[str]) -> int:
     parent = read_production(showrunners.own_name(), record=record)
     name = cast(str, args.child)
     path = record_path(parent, name)
-    plan = cast(Path, args.plan).expanduser()
-    plan = (plan if plan.is_absolute() else parent.checkout / plan).resolve()
+    plan = cast(Path | unit_config.PlanDefault, args.plan)
     raw_port = cast(int | None, args.port)
     port = unit_config.NoAppPort() if raw_port is None else unit_config.AppPort(raw_port)
     fields: dict[str, object] = {}
@@ -306,10 +335,12 @@ def _main(argv: list[str]) -> int:
             fields = {}
     if fields:
         request = saved_request(parent, fields)
-        if plan != request.plan or port != request.port:
+        if ((isinstance(plan, Path) and child_plan(request.child, plan) != request.plan)
+                or (raw_port is not None and port != request.port)):
             raise Refusal(f"{name}: the pending demotion uses {request.plan} and port {request.port}")
     else:
         request = checked(parent, name, plan, record, port)
+    port = request.port
     if cast(bool, args.check):
         print(f"check: {name} can become a unit of {parent.name}")
         return 0
@@ -322,7 +353,7 @@ def _main(argv: list[str]) -> int:
         }
         fields = {"source": request.child.owner.to_json(), "session": request.claude.name, "socket": request.claude.socket,
                   "pid": request.claude.pid, "host": request.marked.place.session, "pane": request.marked.place.pane,
-                  "worktree": str(request.worktree), "branch": request.branch, "plan": str(plan), "port": str(port.number) if isinstance(port, unit_config.AppPort) else "",
+                  "worktree": str(request.worktree), "branch": request.branch, "plan": str(request.plan), "port": str(port.number) if isinstance(port, unit_config.AppPort) else "",
                   "launch": retained, "directors": [row.id for row in record.rows
                       if row.parent == staff.ReportsTo(request.child.owner.id) and row.kind in {"unit", "showrunner"}]}
         save(path, fields, Step.PREPARED)
@@ -334,10 +365,10 @@ def main(argv: list[str]) -> int:
         with staff.operation():
             try:
                 return _main(argv)
-            except Refusal as error:
+            except (Refusal, unit_config.ConfigRefused) as error:
                 print(f"demote_showrunner: {error}", file=sys.stderr)
                 return 2
-            except (OSError, ValueError, accounts.AccountsError, update_registration.RegistrationFailure, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, accounts.AccountsError, update_registration.RegistrationFailure, herdr_types.HerdrFailure) as error:
                 print(f"demote_showrunner: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 return 1
     return staff.cli_result(run)

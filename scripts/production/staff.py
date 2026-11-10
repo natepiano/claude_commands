@@ -157,7 +157,7 @@ def runtime_id(pid: int | None = None) -> str:
         if pid is not None or current <= 1:
             return ""
         try:
-            process_parent = cast(Callable[[int], int], import_module("scripts.shutdown.pane_record").process_parent)
+            process_parent = cast(Callable[[int], int], import_module("scripts.agents.pane_record").process_parent)
             current = process_parent(current)
         except worker_lifecycle.OperationDeadlineExpired:
             raise
@@ -317,6 +317,16 @@ class Exited(HoldRecord):
 
 
 @dataclass(frozen=True)
+class OpenRun:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoRun:
+    """The member has no open run."""
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -331,6 +341,7 @@ class StaffRow:
     exited: Exited | Active = field(default_factory=Active)
     role: KnownWorkerRole | WorkerRoleUnknown = field(default_factory=WorkerRoleUnknown, kw_only=True)
     home: SessionHome | HomeUnknown = field(default_factory=HomeUnknown, kw_only=True)
+    run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -340,6 +351,8 @@ class StaffRow:
         value: dict[str, object] = {**self.unknown_fields, "id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent.id if isinstance(self.parent, ReportsTo) else None, "current_session": self.current_session}
         if isinstance(self.role, KnownWorkerRole):
             value["role"] = self.role.value
+        if isinstance(self.run, OpenRun):
+            value["run"] = str(self.run.path)
         if isinstance(self.home, SessionHome):
             value["home"] = str(self.home.path)
         if not isinstance(self.worktree, WorktreeUnfilled):
@@ -373,11 +386,14 @@ class StaffRow:
         current = fields.get("current_session", staff_id)
         if not isinstance(current, str) or not _valid_id(current):
             raise StaffUnreadable("invalid current session")
+        run = fields.get("run")
+        if "run" in fields and (not isinstance(run, str) or not run):
+            raise StaffUnreadable("staff run must be a nonempty path string")
         role, home = fields.get("role"), fields.get("home")
         parsed_role = (KnownWorkerRole(role)
                        if isinstance(role, str) and role in WORKER_ROLES else WorkerRoleUnknown())
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
-        known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited"}
+        known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run"}
         invalid: list[str] = []
         for key, fact in (("role", parsed_role), ("home", parsed_home)):
             if isinstance(fact, (KnownWorkerRole, SessionHome)):
@@ -390,6 +406,7 @@ class StaffRow:
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
                    role=parsed_role, home=parsed_home,
+                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(),
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    unknown_fields=_unknown_fields(fields, known_fields))
@@ -729,7 +746,7 @@ def folder_move_path(unit: StaffId) -> Path:
 
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     return bool(_file_override()) or remote.other_machine() != OWNER_MACHINE
 
@@ -979,13 +996,11 @@ def _rows(value: object) -> list[StaffRow]:
     return sorted(rows, key=lambda row: row.id)
 
 
-def _load(*, initial: bool = False) -> StaffSnapshot:
+def _local_fields() -> dict[str, object]:
+    """Read the local record without constructing every staff row."""
     try:
-        text = _file().read_text(encoding="utf-8")
-        value = _decode(text)
+        value = _decode(_file().read_text(encoding="utf-8"))
     except FileNotFoundError as error:
-        if initial:
-            return StaffSnapshot(())
         raise StaffAbsent(f"cannot read staff record: {error}") from error
     except (OSError, UnicodeError) as error:
         raise StaffUnreadable(f"cannot read staff record {_file()}: {error}") from error
@@ -995,7 +1010,30 @@ def _load(*, initial: bool = False) -> StaffSnapshot:
     schema = fields.get("schema")
     if type(schema) is not int or schema not in (1, 2):
         raise StaffUnreadable(f"unsupported staff schema: {schema!r}")
+    return fields
+
+
+def _load(*, initial: bool = False) -> StaffSnapshot:
+    try:
+        fields = _local_fields()
+    except StaffAbsent:
+        if initial:
+            return StaffSnapshot(())
+        raise
     return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
+
+
+def local_by_current_session(session_id: str) -> StaffRow | None:
+    """Read one local row for a hook without constructing the other rows."""
+    rows = _local_fields().get("rows")
+    if not isinstance(rows, list):
+        raise StaffUnreadable("staff rows must be a list")
+    for value in cast(list[object], rows):
+        if isinstance(value, dict):
+            fields = cast(dict[str, object], value)
+            if fields.get("current_session", fields.get("id")) == session_id:
+                return StaffRow.from_json(fields)
+    return None
 
 
 def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
@@ -1154,7 +1192,7 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
 
 
 def _lookup(rows: list[StaffRow], target: str) -> StaffRow | None:
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     record = StaffSnapshot(tuple(rows))
     row = record.by_member_reference(target) or record.by_path(target)
@@ -1218,7 +1256,7 @@ def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
 def _copy_to_mac(*, detached: bool = True) -> None:
     """Send the latest default record under one lock, outside the writing process."""
     import subprocess
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     try:
         if "STAFF_FILE" in os.environ or remote.local_machine() != OWNER_MACHINE:
@@ -1411,6 +1449,38 @@ def set_home(identity: StaffId, home: SessionHome) -> StaffRow:
     return _transaction(edit)
 
 
+def set_run(identity: StaffId, run: OpenRun) -> StaffRow:
+    """Record the member's open run through the row transaction."""
+    if not is_owner():
+        row = by_id(identity)
+        if row is None:
+            raise StaffNotFound(identity)
+        return _remote_row(["set-run", row.current_session, str(run.path)])
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        changed = replace(row, run=run)
+        rows[rows.index(row)] = changed
+        return changed
+    return _transaction(edit)
+
+
+def clear_run(identity: StaffId, run: Path) -> StaffRow:
+    """Clear the pointer only while the member still names this run."""
+    if not is_owner():
+        row = by_id(identity)
+        if row is None:
+            raise StaffNotFound(identity)
+        return _remote_row(["clear-run", row.current_session, str(run)])
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if not isinstance(row.run, OpenRun) or row.run.path.resolve() != run.resolve():
+            return row
+        changed = replace(row, run=NoRun())
+        rows[rows.index(row)] = changed
+        return changed
+    return _transaction(edit)
+
+
 def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffRow:
     """Publish a proved runtime handoff without changing the member or its links."""
     _ = native_id(new_session)
@@ -1550,9 +1620,10 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
         renamed = _transaction(edit)
     if renamed.kind == "worker":
         herdr = import_module("scripts.herdr.herdr")
+        herdr_types = import_module("scripts.herdr.herdr_types")
         client = cast(Callable[[str], object], herdr.Herdr)
         shared_session = cast(Callable[[], str], herdr.shared_session)
-        display_failure = cast(type[Exception], herdr.HerdrFailure)
+        display_failure = cast(type[Exception], herdr_types.HerdrFailure)
 
         try:
             retitle = cast(Callable[[str], bool], getattr(client(shared_session()), "retitle_row"))
@@ -1945,6 +2016,11 @@ def _parser() -> argparse.ArgumentParser:
         _ = fact.add_argument("target")
         _ = fact.add_argument("value", choices=WORKER_ROLES if command == "set-worker-role" else None)
         _ = fact.add_argument("--json", action="store_true")
+    for command in ("set-run", "clear-run"):
+        run_parser = verbs.add_parser(command)
+        _ = run_parser.add_argument("target")
+        _ = run_parser.add_argument("path")
+        _ = run_parser.add_argument("--json", action="store_true")
     hold = verbs.add_parser("set-hold", help=argparse.SUPPRESS)
     _ = hold.add_argument("target")
     _ = hold.add_argument("--state", choices=("paused", "exited", "active"), required=True)
@@ -2031,6 +2107,12 @@ def _print_row(row: StaffRow, path: str) -> None:
 def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
     if arguments.verb == "set-worker-role":
         return set_worker_role(StaffId(arguments.target), KnownWorkerRole(cast(WorkerRole, arguments.value)))
+    if arguments.verb in ("set-run", "clear-run"):
+        row = by_current_session(arguments.target)
+        if row is None:
+            raise StaffNotFound(StaffId(arguments.target))
+        return (set_run(row.id, OpenRun(Path(arguments.path))) if arguments.verb == "set-run"
+                else clear_run(row.id, Path(arguments.path)))
     if arguments.verb == "set-home":
         return set_home(StaffId(arguments.target), SessionHome(Path(arguments.value).absolute()))
     if arguments.verb == "set-hold":
@@ -2147,7 +2229,7 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
-    with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home") else nullcontext():
+    with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home", "set-run", "clear-run") else nullcontext():
         result = _mutate(arguments)
     if isinstance(result, tuple):
         print(json.dumps(result))

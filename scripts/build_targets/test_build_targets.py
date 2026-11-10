@@ -19,6 +19,7 @@ from unittest import mock
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
@@ -35,8 +36,6 @@ from scripts.lib import test_hang_guard
 SHIPPED_STATUS = "\n".join((
     "mac: free",
     "natedev: free",
-    "aws: unavailable; evidence unavailable; month unavailable / $400.00",
-    "  spending unavailable; decision unavailable; no controller evidence; a priced resource inventory is required before spending",
     "",
 ))
 
@@ -57,7 +56,99 @@ def pacific_zone() -> Generator[None, None, None]:
         time.tzset()
 
 
+def setUpModule() -> None:
+    cache_home = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="targets-cache-")))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, interpreter_cache_environment(cache_home))))
+
+
 class FolderInvocationTests(NotificationGuardedTestCase):
+    def test_verify_commands_open_each_config_once(self) -> None:
+        code = """import io, json, os, runpy, sys
+from contextlib import redirect_stdout
+
+configuration = os.path.abspath(os.environ['CONF_DIR']) + os.sep
+opens = {}
+def record_open(event, arguments):
+    if event == 'open' and isinstance(arguments[0], (str, bytes)):
+        path = os.path.abspath(os.fsdecode(arguments[0]))
+        if path.startswith(configuration):
+            name = path[len(configuration):]
+            opens[name] = opens.get(name, 0) + 1
+
+sys.addaudithook(record_open)
+sys.argv = sys.argv[1:]
+with redirect_stdout(io.StringIO()):
+    try:
+        runpy.run_path(sys.argv[0], run_name='__main__')
+    except SystemExit as error:
+        if error.code not in (None, 0):
+            raise
+print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
+"""
+        entry = Path(__file__).with_name("build_targets.py").resolve()
+        cases = (
+            ("eligible", "Mac state absent", "mac", False,
+             ("scripts.build_targets.targets",)),
+            ("eligible", "Mac state present", "mac", True,
+             ("scripts.build_targets.targets", "scripts.lint.sweep", "scripts.copies.copies")),
+            ("eligible", "AWS routing off", "aws", False,
+             ("scripts.build_targets.targets", "scripts.aws_target.ledger")),
+            ("release-wait", "Mac state absent", "mac", False,
+             ("scripts.build_targets.targets", "scripts.mac_test.mac_test", "scripts.mac_test.offload",
+              "scripts.copies.copies")),
+            ("release-wait", "Mac state present", "mac", True,
+             ("scripts.build_targets.targets", "scripts.copies.copies", "scripts.mac_test.mac_test")),
+        )
+        for command, branch, target, present, omitted_modules in cases:
+            with self.subTest(command=command, branch=branch):
+                directory = self.enterContext(tempfile.TemporaryDirectory())
+                root = Path(directory)
+                configuration = root / "config"
+                environment = {key: value for key, value in os.environ.items()
+                               if key not in ("PYTHONPATH", "BUILD_TARGETS_CONFIG", "MAC_TEST_CONFIG")}
+                environment.update({**config_environment(configuration), "HOME": directory,
+                                    "BUILDLOG_DIR": str(root / "buildlog"),
+                                    "BUILD_HOLD_DIR": str(root / "holds"),
+                                    "BUILD_HOLD_RELEASE_DIR": str(root / "releases"),
+                                    "MAC_TEST_STATE_DIR": str(root / "mac-state"),
+                                    "MAC_IDLE_STATE_DIR": str(root / "mac-idle"),
+                                    "UNIT_RUN_DIR": str(root / "board"),
+                                    "NOTIFIER_SESSIONS_DIR": str(root / "sessions")})
+                _ = (configuration / "build_targets.conf").write_text(
+                    f"targets=natedev,{target}\nkind.natedev=local\nplatform.natedev=linux\n"
+                    + f"kind.{target}=ssh\nplatform.{target}={'linux' if target == 'aws' else 'macos'}\n"
+                    + f"settings.{target}={'aws_target' if target == 'aws' else 'mac_test'}.conf\n")
+                if branch == "AWS routing off":
+                    _ = write_config_fixture(configuration / "aws_target.conf", "offload=off\n", template="aws_target")
+                claims = root / "mac-state" / "claims"
+                if present:
+                    claims.mkdir(parents=True)
+                if present and command == "release-wait":
+                    started = process_identity.process_start(os.getpid())
+                    self.assertIsInstance(started, process_identity.Started)
+                    assert isinstance(started, process_identity.Started)
+                    owner = {"pid": os.getpid(), "proc_start": started.start,
+                             "worktree": directory, "since": NOW.isoformat()}
+                    _ = (claims / "local.json").write_text(json.dumps({**owner, "what": "local reservation"}))
+                    _ = (claims / "remote.json").write_text(json.dumps(
+                        {**owner, "what": "remote claim", "remote_host": "test-mac"}))
+                arguments = (["eligible", "--new-step", "--probe-marks-file", str(root / "probe-marks"),
+                              "--kind", "test", "--repo-root", directory, "--package", ""]
+                             if command == "eligible" else ["release-wait", "--pid", str(os.getpid())])
+                result = REAL_SUBPROCESS_RUN(
+                    [str(entry.parents[1] / "lib/py"), "-c", code, str(entry), *arguments],
+                    cwd=entry.parent, env=environment, capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = cast(dict[str, object], json.loads(result.stdout))
+                opens = cast(dict[str, int], report["opens"])
+                self.assertEqual(opens.get("build_targets.conf", 0), 1)
+                modules = cast(list[str], report["modules"])
+                self.assertEqual(set(omitted_modules).intersection(modules), set())
+                if present and command == "release-wait":
+                    with mock.patch.dict(os.environ, environment):
+                        remaining = mac_test.read_claims(mac_test.state_paths("mac"))
+                    self.assertEqual([claim.record["what"] for claim in remaining], ["remote claim"])
+
     def test_clean_target_import_omits_admission_service_and_loads_mac_test_once(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
         directory = self.enterContext(tempfile.TemporaryDirectory())
@@ -472,11 +563,9 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(output.getvalue(), (
             "mac: unreachable — ssh timed out\n"
             "natedev: held by hana since 13:05 PDT — render checks\n"
-            "aws: unreachable — ssh timed out\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
-                                  targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
@@ -733,7 +822,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.sleeps = 0
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "BUILD_TARGETS_POLL_S": "0.01",
             "BUILDLOG_HOLD_WAIT_FILE": str(self.root / "wait-seconds"),

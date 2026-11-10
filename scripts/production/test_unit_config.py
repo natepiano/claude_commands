@@ -5,25 +5,80 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import select
+import socket
 import subprocess
 import sys
 import tomllib
-import unittest
 from typing import cast
 from unittest import mock
 from unittest.mock import patch
 
-from scripts.lib import atomic_file, git_exclude
+from scripts.lib import atomic_file, conf, git_exclude
 from scripts.lib.git_exclude import ExcludeRefused
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_config as config
+from scripts.production.staff_test_support import StaffTestCase, fixture_member
+from scripts.agents import remote
 from scripts.production.unit_config_test_support import UnitConfigFixture
 from scripts.production.unit_config_format_test_support import (
     check_format, count_taplo, remove_assignment_spacing, require_taplo, write_aligning_config,
 )
 
 
-class UnitPortCellTests(unittest.TestCase):
+class UnitPortSelectionTests(StaffTestCase):
+    def test_port_range_excludes_recorded_reserved_and_bound_ports(self) -> None:
+        atomic_file.write_text_atomic(self.root / "Cargo.toml", '[package]\nname = "hana"\n')
+        peer = self.root / "peer"
+        peer.mkdir()
+        owner = fixture_member("showrunner", name="port-owner")
+        row = fixture_member("unit", name="port-peer", parent=owner.id,
+                             worktree=staff.PresentWorktree(remote.local_machine(), peer))
+        for cause in ("recorded", "bound", "mac", "smoke", "full", "available"):
+            with self.subTest(cause=cause), socket.socket() as held:
+                held.bind(("127.0.0.1", 0))
+                number = cast(tuple[str, int], held.getsockname())[1]
+                settings = self.root / "production.conf"
+                atomic_file.write_text_atomic(settings, f"# whole: 1..\nunit_port_first={number}\n# whole: 1..\nunit_port_last={number}\n"
+                    + f"# whole: 1..\nmac_run_port={number if cause == 'mac' else 1}\n"
+                    + f"# whole: 1..\nsmoke_port={number if cause == 'smoke' else 2}\n")
+                atomic_file.write_text_atomic(peer / ".unit.toml", 'plan = "plan.md"\nresponsibilities = []\n'
+                    + (f"port = {number}\n" if cause == "recorded" else ""))
+                if cause not in ("bound", "full"):
+                    held.close()
+                settings_read = conf.read(settings)
+                with patch.object(conf, "read", return_value=settings_read):
+                    if cause == "available":
+                        self.assertEqual(config.default_port(self.root, config.NoAppPort()), config.AppPort(number))
+                    else:
+                        with self.assertRaises(config.ConfigRefused) as refused:
+                            _ = config.default_port(self.root, config.NoAppPort())
+                        self.assertEqual(len(str(refused.exception).splitlines()), 1)
+                        self.assertIn(f"{number}..{number}", str(refused.exception))
+        self.assertIsNotNone(staff.snapshot().by_id(row.id))
+
+
+class UnitPortCellTests(StaffTestCase):
+    def test_app_port_defaults_skip_a_bound_port_and_keep_explicit_values(self) -> None:
+        import tempfile
+        _ = fixture_member("showrunner", name="port-defaults")
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as held:
+            root = Path(directory)
+            atomic_file.write_text_atomic(root / "Cargo.toml", '[package]\nname = "hana"\n')
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            occupied = cast(tuple[str, int], held.getsockname())[1]
+            for selected in (config.NoAppPort(), config.AppPort(8123)):
+                with self.subTest(selected=selected):
+                    port = config.default_port(root, selected)
+                    self.assertIsInstance(port, config.AppPort)
+                    assert isinstance(port, config.AppPort)
+                    self.assertNotEqual(port.number, occupied)
+                    if isinstance(selected, config.AppPort):
+                        self.assertEqual(port, selected)
+                    else:
+                        with socket.socket() as available:
+                            available.bind(("127.0.0.1", port.number))
+
     def test_raw_port_cells_accept_absence_numbers_and_history_notes(self) -> None:
         for raw in ("—", "-", "none", "", " `—` "):
             with self.subTest(raw=raw):

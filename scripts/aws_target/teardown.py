@@ -95,7 +95,7 @@ class TargetRemoval:
 
     def routing(self) -> bool:
         changed = box.close_routing(self.settings)
-        paths = mac_test.state_paths('aws')
+        paths = box.builder_state_paths()
         enabled = self._local(['systemctl', '--user', 'is-enabled', 'aws-target.service'])
         active = self._local(['systemctl', '--user', 'is-active', 'aws-target.service'])
         if enabled.stdout.strip() not in ('disabled', 'not-found') or active.stdout.strip() not in ('inactive', 'unknown'):
@@ -440,7 +440,7 @@ class TargetRemoval:
                 try:
                     if name == 'tailscale-device':
                         # Keep claims and controller actions excluded throughout resource removal.
-                        paths = mac_test.state_paths('aws')
+                        paths = box.builder_state_paths()
                         _ = locks.enter_context(mac_test.locked(paths.lock))
                         _ = locks.enter_context(control_lock(self.directory))
                         if box.running_claims(paths):

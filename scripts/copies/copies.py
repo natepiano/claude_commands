@@ -33,7 +33,13 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, conf, copy_record, file_lock, scratch
+from scripts.lib import build_folders, conf, copy_record, file_lock, git_index, scratch
+from scripts.lib.copy_record import (
+    AllRepositories as AllRepositories,
+    SelectedRepository as SelectedRepository,
+    RepositoryScope as RepositoryScope,
+    ALL_REPOSITORIES as ALL_REPOSITORIES,
+)
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -43,6 +49,8 @@ if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
     from scripts.production import staff
 
+# Checksums skip equal files. Changed files get the receiver write time.
+RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 GATE_RECORD = ".gate.json"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -164,22 +172,6 @@ def _owner_display_text(owner: OwnerDisplay) -> str:
     return owner.name if isinstance(owner, (CurrentStaffOwnerName, RoleOwnerName)) else "unavailable"
 
 
-@dataclass(frozen=True)
-class AllRepositories:
-    """Remove copies from every repository."""
-
-
-@dataclass(frozen=True)
-class SelectedRepository:
-    """Remove copies from one repository identity."""
-
-    name: str
-
-
-RepositoryScope = AllRepositories | SelectedRepository
-ALL_REPOSITORIES = AllRepositories()
-
-
 def repository_scope(repo: object) -> RepositoryScope:
     """Validate a repository scope at the public API boundary."""
     if isinstance(repo, SelectedRepository):
@@ -237,7 +229,7 @@ def staged_tree(source: Path) -> str:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
         private = temporary / "index"
         if index.exists():
-            _ = shutil.copyfile(index, private)
+            git_index.private_copy(index, private)
         result = subprocess.run(["git", "-C", str(source), "write-tree"],
                                 env={**os.environ, "GIT_INDEX_FILE": str(private)},
                                 capture_output=True, timeout=load_config().git_timeout_seconds)
@@ -415,7 +407,7 @@ def source_owner(source: Path) -> str:
         if isinstance(owner, str):
             return checked_owner(owner)
     from scripts.production import staff
-    from scripts.shutdown.remote import local_machine
+    from scripts.agents.remote import local_machine
     try:
         member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
         if member is not None:
@@ -751,6 +743,7 @@ def refresh_remotes(tree: Path, source: Path) -> None:
 
     source_references = references(source, refs, "refs/heads")
     current_refs = references(tree, "refs/remotes/origin", "refs/remotes/source")
+    mappings: list[str] = []
     for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
         mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
         for key, value in ((f"remote.{remote}.url", remote_url),
@@ -765,7 +758,9 @@ def refresh_remotes(tree: Path, source: Path) -> None:
         if current != expected:
             # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
             _ = git(tree, "update-ref", "--no-deref", "-d", prefix + "HEAD")
-            _ = git(tree, "fetch", "-q", "--prune", "--", str(source), mapping)
+            mappings.append(mapping)
+    if mappings:
+        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 
 
 def final_object_store(store: Path) -> Path:
@@ -1140,9 +1135,10 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 mark_target(cache)
                 shutil.rmtree(tree / "target")
                 (tree / "target").symlink_to(cache / "target", target_is_directory=True)
+                path_files = manifest_path_files(tree)
                 for path, current in tracked_file_times(tree).items():
                     saved = previous.get(path)
-                    if saved is not None and saved.blob == current.blob:
+                    if saved is not None and saved.blob == current.blob and path not in path_files:
                         file = tree / path
                         os.utime(file, ns=(file.lstat().st_atime_ns, saved.mtime_ns), follow_symlinks=False)
             try:
@@ -1162,6 +1158,20 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
+
+
+def manifest_path_files(tree: Path) -> set[str]:
+    """Find tracked files that name Cargo's manifest path variable."""
+    timeout = load_config().git_timeout_seconds
+    try:
+        result = subprocess.run(["git", "-C", str(tree), "grep", "--no-color", "-l", "-z", "-F", "--",
+                                 "CARGO_MANIFEST_DIR"], capture_output=True, timeout=timeout,
+                                pass_fds=COMMAND_LOCKS.get())
+    except subprocess.TimeoutExpired as error:
+        raise CopyError(f"git grep in {tree}: timed out after {timeout:g} seconds") from error
+    if result.returncode not in (0, 1):
+        raise CopyError(f"git grep in {tree}: {result.stderr.decode(errors='replace').strip()}")
+    return {os.fsdecode(path) for path in result.stdout.split(b"\0") if path}
 
 
 def tracked_file_times(tree: Path) -> dict[str, TrackedFileTime]:
@@ -1449,9 +1459,16 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                 present.append(tree)
             except (CopyError, OSError, scratch.ScratchError) as error:
                 failures.append(str(error))
+        unreachable_hosts: set[str] = set()
         for mirror in mirrors:
             try:
-                remove_remote_mirror(mirror)
+                if mirror.host not in unreachable_hosts:
+                    try:
+                        remove_remote_mirror(mirror)
+                        continue
+                    except RemoteHostUnreachable:
+                        unreachable_hosts.add(mirror.host)
+                defer_remote_removal(mirror)
             except (CopyError, OSError, subprocess.SubprocessError) as error:
                 failures.append(str(error))
                 failure_type = RemoteMirrorKept
@@ -1483,6 +1500,11 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         raise failure_type("\n".join(failures))
 
 
+class RemoteRemoval(Enum):
+    KEEP = "keep"
+    DEFERRED = "deferred"
+
+
 @dataclass(frozen=True)
 class RemoteMirror:
     """An owner's registered repository copy on a remote host."""
@@ -1492,6 +1514,7 @@ class RemoteMirror:
     host: str
     path: str
     session: str
+    removal: RemoteRemoval = RemoteRemoval.KEEP
 
 
 @dataclass(frozen=True)
@@ -1617,6 +1640,32 @@ def register_remote(mirror: RemoteMirror) -> None:
             "host": mirror.host, "path": mirror.path, "session": mirror.session,
             "holder_pid": os.getpid(), "last_use": time.time(),
         }) + "\n")
+    remove_deferred_mirrors(mirror.host)
+
+
+def defer_remote_removal(mirror: RemoteMirror) -> None:
+    """Keep the removal request until the next use of the host."""
+    with file_lock.exclusive(remote_registry() / "records.lock"):
+        path = remote_record_path(mirror)
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["removal"] = RemoteRemoval.DEFERRED.value
+        write_text_atomic(path, json.dumps(fields) + "\n")
+    print(f"{mirror.host}:{mirror.path}: removal deferred; removal runs at the next use of the host")
+
+
+def remove_deferred_mirrors(host: str) -> None:
+    """Retry local removal requests after a successful use of the host."""
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            mirror = read_remote_mirror(path)
+            if mirror.host != host or mirror.removal is not RemoteRemoval.DEFERRED:
+                continue
+            with remote_lease(mirror):
+                current = read_remote_mirror(path)
+                if current.removal is RemoteRemoval.DEFERRED:
+                    remove_remote_mirror(current)
+        except (CopyError, OSError, subprocess.SubprocessError) as error:
+            print(f"anomaly: deferred mirror removal: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def unregister_remote(host: str, path: str) -> None:
@@ -1637,7 +1686,8 @@ def read_remote_mirror(path: Path) -> RemoteMirror:
         if not all(isinstance(value, str) for value in values):
             raise ValueError("invalid remote mirror record")
         unit, repo, host, remote, session = cast(list[str], values)
-        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session)
+        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
+                            RemoteRemoval(fields.get("removal", "keep")))
     except (OSError, ValueError) as error:
         raise CopyError(f"{path}: repair remote mirror record: {error}") from error
 
@@ -1684,7 +1734,7 @@ def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: li
     receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
     # Keep the existing command order while metadata removal keeps the record last.
     exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
-    return ["rsync", "-rlptc", "--compress", "--delete", f"--rsync-path={receiver}",
+    return ["rsync", RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", "--delete", f"--rsync-path={receiver}",
             *(f"--exclude=/{name}" for name in exclusions),
             f"--exclude-from={excludes}", "-e", shlex.join(["ssh", *options]),
             f"{source}/", f"{mirror.host}:{shlex.quote(mirror.path)}/"]
@@ -1891,12 +1941,28 @@ def target_mirror_leases(targets: Sequence[str]) -> Generator[frozenset[Path]]:
         yield protected
 
 
+class RemoteHostUnreachable(CopyError):
+    """The removal command could not connect to the mirror host."""
+
+
 def remove_remote_mirror(mirror: RemoteMirror) -> None:
     command = remote_copies_command("mirror-remove", mirror, "--host", mirror.host)
-    answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
-                            capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+    command += '; copies_status=$?; printf "\\nrc=%s\\n" "$copies_status"; exit "$copies_status"'
+    try:
+        answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
+                                capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        raise RemoteHostUnreachable(f"{mirror.host}:{mirror.path}: {error}") from error
     if answer.returncode:
-        raise CopyError(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
+        failure = (RemoteHostUnreachable if answer.returncode == 255 and any(
+            text in answer.stderr.lower() for text in (
+                "ssh: connect to host ", "ssh: connect to address ", "ssh: could not resolve hostname ",
+            )) else CopyError)
+        raise failure(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
+    status = next((line for line in reversed(answer.stdout.splitlines()) if line.startswith("rc=")), "")
+    if status != "rc=0":
+        detail = status or "remote status is missing"
+        raise CopyError(f"{mirror.host}:{mirror.path}: {detail}; {failure_detail(answer)}")
     unregister_remote(mirror.host, mirror.path)
 
 

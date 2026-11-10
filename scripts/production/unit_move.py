@@ -26,18 +26,19 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 from scripts.direct import progress_history  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.production import tidy_wrapped  # noqa: E402
 from scripts.production import unit_lookup  # noqa: E402
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr  # noqa: E402
-from scripts.shutdown import pane_record  # noqa: E402
+from scripts.agents import pane_record  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.production.rename_state import RenameRefused, read_json, write_json  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
 
@@ -320,7 +321,7 @@ def unit_pane(found: unit_lookup.LabeledSession | None, _production: str) -> Uni
         return None
     try:
         shell = pane_record.pane_shell_pid(found.place)
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         raise RenameRefused(f"{found.unit}: cannot find its pane shell: {error}") from error
     if isinstance(found.claude, unit_lookup.LiveClaude) and shell == found.claude.pid:
         return None
@@ -333,7 +334,7 @@ def close_unit_pane(pane: UnitPane | None) -> None:
         return
     try:
         _ = herdr.Herdr(pane.place.session).close_retained_pane(pane.place.pane)
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         raise RenameRefused(f"{pane.unit}: pane close failed: {error}") from error
 
 
@@ -536,7 +537,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             _check_move_deadline()
             _ = locks.enter_context(staff.row_operation(str(member.id)))
         # The delayed import avoids the restart module's dependency on unit_move.
-        restart = import_module("scripts.shutdown.restart")
+        restart = import_module("scripts.agents.restart")
         live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
         stop_row = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], restart.stop_row)
         start_row = cast(Callable[[staff.StaffRow, staff.StaffSnapshot, herdr.Herdr], str], restart.start_row)
@@ -641,7 +642,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                                     pane, terminal = retained[member.id]
                                     if resumed != pane:
                                         _ = client.close_retained_pane(pane, terminal=terminal)
-                            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+                            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
                                 restart_notice(latest, error)
                         # Worker restore proves active starts and leaves idle workers closed.
                         expected = {member.id for member in members if member.kind != "worker"} & (live - reported)
@@ -649,7 +650,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                             for member in members:
                                 if member.id in expected - observed_live:
                                     restart_notice(member, "restart is incomplete")
-                except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+                except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
                     for member in members:
                         if member.id in live - observed_live:
                             restart_notice(member, error)
@@ -672,7 +673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (subprocess.TimeoutExpired, worker_lifecycle.OperationDeadlineExpired) as error:
         print(f"unit_move: anomaly: {error}", file=sys.stderr)
         return 0
-    except (RenameRefused, staff.StaffRefused, staff.StaffNotFound, OSError, ValueError, herdr.HerdrFailure) as error:
+    except (RenameRefused, staff.StaffRefused, staff.StaffNotFound, OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"unit_move: {error}", file=sys.stderr)
         return 1
 

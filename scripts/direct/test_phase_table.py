@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 import json
@@ -2145,6 +2145,22 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(line, "Parallel: none — no phase is waiting")
 
+    def test_parallel_after_the_plan_is_removed_names_ad_hoc_work(self) -> None:
+        self.parallel_plan("### Phase 2 — Parser  · status: todo")
+        self.plan.unlink()
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "parallel", "--session-dir", str(self.session_dir)],
+            env=self.environment(1_100),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, f"Parallel: none — no plan at {self.plan.resolve()}; the run does ad hoc work\n")
+        self.assertEqual(result.stderr, "")
+
     def test_production_json_carries_the_phases_that_could_start(self) -> None:
         self.parallel_plan(
             "### Phase 2 — Parser  · status: todo",
@@ -3366,7 +3382,7 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(top_level.returncode, 0)
         self.assertEqual(exclude.read_bytes(), before_top_level_refresh)
 
-    def test_refresh_reports_missing_state_and_unreadable_plan(self) -> None:
+    def test_refresh_reports_missing_state_and_skips_a_removed_plan(self) -> None:
         empty_session = self.root / "missing-state"
         empty_session.mkdir()
         missing_state = subprocess.run(
@@ -3414,8 +3430,9 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(missing_state.returncode, 1)
         self.assertEqual(len(missing_state.stderr.splitlines()), 1)
-        self.assertEqual(unreadable_plan.returncode, 1)
-        self.assertIn(str(missing_plan), unreadable_plan.stderr)
+        # A removed plan has no phase note to rewrite, so refresh writes nothing and stays quiet.
+        self.assertEqual((unreadable_plan.returncode, unreadable_plan.stderr), (0, ""))
+        self.assertEqual(list(self.vault_root.rglob("*.md")), [])
         self.assertEqual(unreadable_show.returncode, 1)
         self.assertIn(str(missing_plan), unreadable_show.stderr)
 

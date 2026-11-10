@@ -14,7 +14,7 @@ from unittest import mock
 from scripts.hooks import staff_session_identity
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 
 
 class SessionStartPaneRecordTests(StaffTestCase):

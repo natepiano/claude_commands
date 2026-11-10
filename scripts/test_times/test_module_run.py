@@ -18,6 +18,7 @@ from typing import ClassVar, cast, override
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
@@ -285,7 +286,7 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
         _ = env.pop(key, None)
     temporary = root / f"{name}_temporary"
     temporary.mkdir()
-    env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+    env.update({**interpreter_cache_environment(root / "cache"), "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
                 "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONPATH": os.pathsep.join((str(root), str(folder))), "TMPDIR": str(temporary)})
     args = [f"{name}.test_fixture"]

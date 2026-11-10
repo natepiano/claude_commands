@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.herdr import herdr
+from scripts.herdr import herdr_types
 
 from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
 
@@ -98,7 +99,7 @@ def _attach(pane: str) -> None:
     shared = herdr.shared_session()
     try:
         herdr.Herdr(shared).focus_tab_of(pane)
-    except (herdr.HerdrFailure, OSError) as error:
+    except (herdr_types.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: focus failed: {error}", file=sys.stderr)
     binary = herdr.herdr_binary()
     os.execvp(binary, [binary, "session", "attach", shared])
@@ -157,7 +158,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000,
         unset_environment=frozenset(unset_variables))
     if isinstance(launched, herdr.nix_env.Refused):
-        raise herdr.HerdrFailure(launched.reason)
+        raise herdr_types.HerdrFailure(launched.reason)
     pane, outcome = launched.pane, launched.outcome
     if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
         reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
@@ -228,13 +229,13 @@ def _main(argv: list[str]) -> int:
             return _remote_list(host)
         try:
             return _attach_remote(host, argv[3])
-        except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired) as error:
+        except (herdr_types.HerdrFailure, OSError, subprocess.TimeoutExpired) as error:
             print(f"herdr_sessions: {host.target}: attach failed: {' '.join(str(error).split())}", file=sys.stderr)
             return 1
     if len(argv) > 1 and argv[1] in ("start", "resume"):
         try:
             return _launch(argv[1], argv[2:])
-        except (herdr.HerdrFailure, OSError, ValueError) as error:
+        except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             print(f"herdr_sessions: {error}", file=sys.stderr)
             return 1
     if argv[1:] not in (["list"], ["sort-tabs"]) and not (len(argv) == 3 and argv[1] in ("attach", "focus") and argv[2]):
@@ -277,7 +278,7 @@ def _main(argv: list[str]) -> int:
                 role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
                 print(f"{row.get("label") or pane}\t{role}\t{claude}")
             return 0
-    except (herdr.HerdrFailure, OSError) as error:
+    except (herdr_types.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3
 

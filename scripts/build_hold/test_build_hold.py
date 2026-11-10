@@ -25,7 +25,8 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_hold import build_hold
 from scripts.build_hold import hold_enforcer
-from scripts.lib import unit_runs
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.message.sessions import SessionRecord
 
 from scripts.build_hold.build_hold_test_support import (
@@ -61,61 +62,46 @@ class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):
 
 
 class OwningSessionTests(IsolatedBuildHoldTest):
-    active: Path = Path()
     unit_run: Path = Path()
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.active = self.scratch / "active"
-        self.active.mkdir()
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
         self.unit_run = self.scratch / "run"
 
-    def marker(self, session_id: str, run: Path) -> Path:
-        marker = self.active / session_id
-        _ = marker.write_text(str(run) + "\n")
-        return marker
+    def owner(self, session_id: str, run: Path) -> None:
+        row = fixture_member("showrunner", name="owner-" + session_id[:8], runtime_id=session_id)
+        _ = staff.set_run(row.id, staff.OpenRun(run))
 
-    def test_board_marker_wins_over_inherited_session_id(self) -> None:
-        _ = self.marker("run-owner", self.unit_run)
+    def test_staff_run_wins_over_inherited_session_id(self) -> None:
+        self.owner(fixture_runtime_id("run-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "stale-session",
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("run-owner")))
 
     def test_board_directory_takes_priority_over_session_directory(self) -> None:
         other_run = self.scratch / "other-run"
-        _ = self.marker("board-owner", self.unit_run)
-        newer = self.marker("session-owner", other_run)
-        os.utime(newer, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
+        self.owner(fixture_runtime_id("board-owner"), self.unit_run)
+        self.owner(fixture_runtime_id("session-owner"), other_run)
         with mock.patch.dict(os.environ, {
             "UNIT_RUN_DIR": str(self.unit_run),
             "UNIT_SESSION_DIR": str(other_run),
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("board-owner"))
+            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("board-owner")))
 
-    def test_a_marker_under_either_run_folder_name_owns_the_run(self) -> None:
+    def test_a_staff_run_under_either_run_folder_name_owns_the_run(self) -> None:
         for name in ("unit", "delegate"):
-            active = self.scratch / name / "active"
-            active.mkdir(parents=True)
-            _ = (active / f"{name}-owner").write_text(f"{self.scratch / name / 'run'}\n")
-        environment = {name: value for name, value in os.environ.items() if name not in ("UNIT_ACTIVE_DIR", "PLAN_DELEGATE_ACTIVE_DIR")}
-        with mock.patch.object(unit_runs, "RUN_ROOT", self.scratch / "unit"), \
-                mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.scratch / "delegate"):
-            for name in ("unit", "delegate"):
-                environment["UNIT_RUN_DIR"] = str(self.scratch / name / "run")
-                with mock.patch.dict(os.environ, environment, clear=True):
-                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(f"{name}-owner"))
-
-    def test_marker_content_ignores_surrounding_whitespace(self) -> None:
-        marker = self.marker("run-owner", self.unit_run)
-        _ = marker.write_text(f" \t{self.unit_run}\n \t")
-        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+            identity = fixture_runtime_id(name + "-owner")
+            run = self.scratch / name / "run"
+            self.owner(identity, run)
+            with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}):
+                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(identity))
 
     def test_session_directory_is_used_when_board_directory_is_unset_or_empty(self) -> None:
-        _ = self.marker("run-owner", self.unit_run)
+        self.owner(fixture_runtime_id("run-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"UNIT_SESSION_DIR": str(self.unit_run)}):
             for board_is_set in (False, True):
                 with self.subTest(board_is_set=board_is_set):
@@ -123,82 +109,32 @@ class OwningSessionTests(IsolatedBuildHoldTest):
                         os.environ["UNIT_RUN_DIR"] = ""
                     else:
                         _ = os.environ.pop("UNIT_RUN_DIR", None)
-                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("run-owner")))
 
-    def test_no_matching_marker_falls_back_to_shell_session(self) -> None:
-        _ = self.marker("another-owner", self.scratch / "another-run")
+    def test_no_matching_staff_run_falls_back_to_shell_session(self) -> None:
+        self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "shell-session",
         }):
             self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
 
-    def test_no_run_uses_shell_session_without_marker_lookup(self) -> None:
-        _ = self.marker("another-owner", self.unit_run)
+    def test_no_run_uses_shell_session_without_staff_lookup(self) -> None:
+        self.owner(fixture_runtime_id("another-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):
-            with mock.patch.object(Path, "iterdir", side_effect=AssertionError("No run needs no marker lookup")):
+            with mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("No run needs no staff read")):
                 self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
 
-    def test_no_matching_marker_and_no_shell_session_has_no_owner(self) -> None:
-        _ = self.marker("another-owner", self.scratch / "another-run")
+    def test_no_matching_staff_run_and_no_shell_session_has_no_owner(self) -> None:
+        self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
             self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
 
     def test_no_run_and_no_shell_session_has_no_owner(self) -> None:
         self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
 
-    def test_newest_matching_marker_wins(self) -> None:
-        older = self.marker("z-earlier-owner", self.unit_run)
-        newer = self.marker("a-later-owner", self.unit_run)
-        _ = self.marker("other-run-owner", self.scratch / "other-run")
-        os.utime(older, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
-        os.utime(newer, ns=(1_100_000_000_000_000_000, 1_100_000_000_000_000_000))
-        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("a-later-owner"))
-
-    def test_missing_active_directory_is_skipped(self) -> None:
-        missing = self.scratch / "missing-active"
-        with mock.patch.dict(os.environ, {
-            "UNIT_ACTIVE_DIR": str(missing),
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
-        self.assertFalse(missing.exists())
-
-    def test_unreadable_active_directory_is_skipped(self) -> None:
-        with mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            with mock.patch.object(Path, "iterdir", side_effect=PermissionError("active directory denied")):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
-
-    def test_unreadable_marker_is_skipped(self) -> None:
-        _ = self.marker("run-owner", self.unit_run)
-        with mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            with mock.patch.object(Path, "read_text", side_effect=PermissionError("marker denied")):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
-
-    def test_invalid_marker_encoding_does_not_hide_readable_marker(self) -> None:
-        _ = (self.active / "invalid-marker").write_bytes(b"\xff")
-        _ = self.marker("run-owner", self.unit_run)
-        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
-
-    def test_marker_subdirectories_are_skipped(self) -> None:
-        (self.active / "not-a-marker").mkdir()
-        with mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
-
     def test_owner_results_are_frozen(self) -> None:
-        for owner in (build_hold.OwningSession("run-owner"), build_hold.NoOwningSession()):
+        for owner in (build_hold.OwningSession(fixture_runtime_id("run-owner")), build_hold.NoOwningSession()):
             with self.subTest(owner=type(owner).__name__):
                 with self.assertRaises(FrozenInstanceError):
                     setattr(owner, "session_id", "changed")
@@ -633,7 +569,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     [*arguments, "--target", "missing", "--holder", "alice"])
                 self.assertEqual(status, 2)
                 self.assertEqual((output + errors).splitlines(),
-                                 ["unknown target missing; configured targets: mac, natedev, aws"])
+                                 ["unknown target missing; configured targets: mac, natedev"])
                 self.assertEqual(calls, [])
                 self.assert_no_natedev_record()
 
@@ -2412,12 +2348,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         self.assertEqual(build.owner, build_hold.OwningSession("claude:10:100"))
 
     def test_worker_run_maps_to_owning_session_without_changing_environment(self) -> None:
-        active = self.scratch / "active"
-        active.mkdir()
-        _ = (active / "holder").write_text("/unit/run\n")
-        _ = self.process(10, "cargo", environment={"UNIT_RUN_DIR": "/unit/run", "UNIT_ACTIVE_DIR": str(active)})
+        with isolated_staff_file(self.scratch / "staff.json", {}):
+            owner = fixture_member("showrunner", name="holder")
+            _ = staff.set_run(owner.id, staff.OpenRun(Path("/unit/run")))
+        (self.holders / "holder").unlink()
+        _ = write_holder(self.holders, owner.current_session, "2026-10-28T12:00:00+00:00", "app test")
+        _ = self.process(10, "cargo", environment={"UNIT_RUN_DIR": "/unit/run"})
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("holder"))
+        self.assertEqual(build.owner, build_hold.OwningSession(owner.current_session))
         self.assertEqual(build.classification, "holder")
         self.assertEqual(os.environ["UNIT_RUN_DIR"], "")
 

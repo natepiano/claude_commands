@@ -426,6 +426,11 @@ class OffloadSettingsTests(unittest.TestCase):
         with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
             self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / ".local/state/build-targets/aws")
             self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "build-targets")}):
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "build-targets/aws")
+                self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": "~/private-targets", "HOME": str(self.root)}):
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "private-targets/aws")
 
     def test_ssh_target_state_path_refuses_invalid_names(self) -> None:
         for target in (".", "..", "../aws", "/tmp/aws", "aws/other"):
@@ -1030,7 +1035,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(controller.copy_failure_detail, "copy: rsync: rsync: config denied")
         self.assertEqual(commands[-1][0], "rsync")
         self.assertIn("--compress", commands[-1])
-        self.assertIn("-rlptc", commands[-1])
+        self.assertIn("-rlpc", commands[-1])
 
     def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
         self.write_portable_workspace()
@@ -1262,7 +1267,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(
             copy["args"],
             [
-                "-rlptc",
+                "-rlpc",
                 "--stats",
                 "--compress",
                 "--delete",

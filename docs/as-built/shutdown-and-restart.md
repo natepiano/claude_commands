@@ -19,7 +19,8 @@ The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, 
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
 Add `--dry-run` to print their names without stopping them.
-`agents` runs `scripts/shutdown/shutdown.py`; script callers keep that path.
+`agents` runs `scripts/agents/shutdown.py`.
+All lifecycle scripts use `scripts/agents/`.
 
 `agents pause NAME --why TEXT` stops the workers now.
 The director finishes its current turn and holds at the prompt.
@@ -30,8 +31,12 @@ The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
 `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
-Resume removes a pause record and sends the director one continuation message.
+Resume removes a pause record and sends a running director one continuation message.
+A paused director on the other machine gets the continuation message without a local liveness read.
+The machine comes from its worktree or its showrunner document.
+A stopped paused director starts through the shared resume path, including its requested `--to` account.
 Queued or failed delivery restores the same pause record and returns failure.
+A failed start or a start exception also restores the pause record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
 The prompt hook retains a paused director's hold for every prompt source.
 It adds context without blocking or removing the message.
@@ -40,7 +45,7 @@ It executes that path directly. A missing executable retains the exit record.
 The stop hook skips the automatic continuation for that director.
 Stop does not save or restore composer drafts.
 
-Stop, resume and account move use `scripts/shutdown/stop_resume.py`.
+Stop, resume and account move use `scripts/agents/stop_resume.py`.
 
 `stop(session)` ends only the selected local session's process.
 It reads the session identity, pid, and start time before TERM.
@@ -67,12 +72,12 @@ Unknown process evidence or an unproved stop gives `SourceReleaseUnknown`.
 A family switch preserves its source when release remains unproved.
 
 `agents resume NAME [--why TEXT] [--to ACCOUNT]` works from any directory.
-The short form is `resume NAME`, through `scripts/shutdown/resume`.
+The short form is `resume NAME`, through `scripts/agents/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
 
 The lookup accepts a short name, a staff id, or a current session id.
 An exact Codex thread name resolves through the shared `session_index.jsonl`.
-A raw session id takes priority over a thread name.
+A canonical UUID takes priority over a thread name and reads no index.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
@@ -82,10 +87,13 @@ Resume does not stop or move a running session.
 Unknown Codex process evidence prints an anomaly and does not block resume.
 A pane with the session id and a foreground program counts as already running.
 Without process evidence, its account remains unknown.
+Unknown process evidence without a pane that reports the id can allow a second process on the same conversation.
 A pane at its shell does not prevent resume.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved environment, arguments, and folder.
+`member_account.resume_account` selects the account for both families at invocation.
+The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
 Other Claude sessions, and sessions with no staff row, use the configured units account.
@@ -93,6 +101,7 @@ When the account does not change, the resume message names no move.
 `--to ACCOUNT` overrides the account for either family.
 Restart without ACCOUNT and folder moves use the role account.
 A herdr server restore keeps the saved account for both families.
+It passes the saved home to `restart.start_row` as an `AccountSelection`.
 It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.
@@ -102,6 +111,10 @@ The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
 Resume from its own empty pane executes the saved launch in that pane.
+`stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
+The workspace comes from the row's parent showrunner, the entry name, or the shared session.
+A role account change does not update an existing pane shell's `resume` alias.
+An alias with an old `CLAUDE_CONFIG_DIR` remains until a herdr restart or reboot.
 
 `resume_message.py` builds every opening message.
 The restore paths use these causes:
@@ -146,12 +159,35 @@ The batch includes the existing stay observation before it records a confirmed o
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
 
-Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
+Retirement, checkout moves, running-session attach and nix-shell healing use this API.
+Retirement reads process facts with the reader for the host that owns the worktree.
+Retirement keeps the recorded pane address and its terminal identity before cleanup.
+The remote retirement journal keeps both identities for completion retries.
+Cleanup excludes only that pane's proved idle shell from the remaining processes.
+After successful retirement, it closes that pane as its last step on the pane's machine.
+It sends no signal to that shell.
+A pane already gone needs no second close.
+Foreground work inside the worktree keeps the process refusal.
+Foreground work outside the worktree keeps the pane open and produces one anomaly line.
+A failed retirement closes no pane.
+Herdr refuses a changed terminal and keeps the new pane and its launch record.
+Retirement reports that mismatch without changing its result.
+The confirmed close retires the pane launch record.
+Unit rename closes the unit's own pane after its ownership checks.
+A pane already gone counts as closed.
+Checkout moves stop before moving files and resume afterward.
+The checkout coordinator excludes only its own pid from cwd holders.
+Other holders still refuse.
+Attach keeps its process and prompt-submission proofs.
+The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
 Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
 A unit with no pane launch record stays down.
 The watchdog does not read shutdown session records.
+Unit recovery writes its completion receipt and discards the parked facts before it restores workers.
+It returns the worker restore exit code.
+A completed recovery rerun restores the workers again.
 
 ## Worker resume results
 

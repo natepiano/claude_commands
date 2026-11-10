@@ -20,12 +20,13 @@ from pathlib import Path
 from typing import cast
 
 from scripts.production import showrunners  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.production.production_doc import ProductionDocument  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
 from scripts.herdr import pane_launch  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 
 
 # Matchers live in unit_lookup, so lower readers use the same join without an import cycle.
@@ -194,7 +195,7 @@ class CodexProcessThreads:
                         else:
                             self.threads[home][entry.name] = entry.thread_id
             return self.threads[home].get(name, "")
-        except (OSError, ValueError, herdr.HerdrFailure):
+        except (OSError, ValueError, herdr_types.HerdrFailure):
             return environment.get("CODEX_THREAD_ID", "")
 
 
@@ -203,7 +204,7 @@ class CodexProcessThreads:
 
         try:
             native = identity or (self.thread(pid, herdr.process_environment(pid)) if pid else "")
-        except (OSError, ValueError, herdr.HerdrFailure):
+        except (OSError, ValueError, herdr_types.HerdrFailure):
             native = identity
         return session_staff.ReportProcessIdentity(native, session_staff.morty_thread(native))
 
@@ -295,7 +296,7 @@ class _WorkerSources:
                     continue
                 try:
                     environment = herdr.process_environment(process.pid)
-                except (OSError, herdr.HerdrFailure):
+                except (OSError, herdr_types.HerdrFailure):
                     if process.pid in process_table.snapshot():
                         raise
                     continue

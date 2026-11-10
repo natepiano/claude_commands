@@ -123,9 +123,13 @@ The standing folder retains only `target/`, `.gate.json`, and `.claude-busy` aft
 The code does not remove legacy checkout files.
 
 The cache's `.gate.json` stores each tracked path's blob identity and modification time in nanoseconds.
-After preparation, a path with the same blob identity receives its saved time.
+After preparation, one `git grep` finds tracked files that name `CARGO_MANIFEST_DIR`.
+These files retain their new checkout times, including when their blob identities stay unchanged.
+Cargo rebuilds their crates and the dependents instead of reusing compiled output that holds a removed checkout path.
+Every other path with the same blob identity receives its saved time.
 A changed blob retains its new checkout time.
-This preserves unchanged source times across temporary checkouts.
+Unchanged crates without these files can reuse their cached build output.
+This rule does not cover a dependency macro that reads `CARGO_MANIFEST_DIR` at expansion in a caller without that text.
 Cargo gates refresh source remotes and both gate records after use.
 
 `scratch.mark_cargo_cache` marks and refreshes the standing cache's `target/`.
@@ -327,7 +331,7 @@ An unset source or Git path inside interpreter text can also pass when its top-l
 | --- | --- |
 | `scripts/copies/copies.py` | Creates temporary gate checkouts, standing caches, remote mirrors, and registered test clones. |
 | `scripts/production/add_unit.py` | Creates original unit worktrees. |
-| `scripts/shutdown/shutdown.py` | Restores original unit worktrees. |
+| `scripts/agents/shutdown.py` | Restores original unit worktrees. |
 | `scripts/style/add_style.py` | Creates a unit's original checkout, like `add_unit.py`. |
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
@@ -422,6 +426,7 @@ Each other changed path must match the merge branch or have a newer change on th
 After a successful merge-branch push, `merge_checkpoint.py` calls `end_landed(repo, merge_branch)`.
 It reports `Ended` or `Kept` as a `worktrees` step.
 It keeps a staff-held tree, a dirty tree, a different checked-out branch, and work that has not landed.
+It also keeps a branch whose only commits outside the merge branch are merges that brought it in.
 A kept tree does not fail the merge.
 An eligible tree ends through worktree removal, local and origin branch deletion, then record deletion.
 Missing paths or branches allow a retry to complete an interrupted end.

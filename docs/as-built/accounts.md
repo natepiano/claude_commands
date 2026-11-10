@@ -139,10 +139,42 @@ All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
 The notes timer delegates its moves through the same boundary before its part deadline can kill them.
+For workers, the notes job writes the role and starts the moves in their own process.
+The request stays pending until the detached process ends.
+A later notes pass starts an unfinished move again; workers already on the target stay unchanged.
+The detached process confirms registered requests for its final target, with the target home.
+It fails registered requests for other targets with `superseded by <label>`.
+Replay consumes the queued entry after either completion result.
+Each worker row records its own move result.
+Worker refusals do not keep the group request open.
+The next assign moves a refused or stopped worker to the selected account, so a lasting anomaly cannot cause endless group retries.
+One `accounts-workers-move` unit serves every target.
+The runner reads the role before each worker and repeats after a changed final role.
+A run lock serializes worker moves, including the fallback without systemd.
+Direct Codex worker moves use this runner and read the selected role before each worker.
+Both direct preview and execution refuse a Codex target that differs from the workers role.
+The refusal says `workers role is <role>; run accounts.py swap workers <codexN> to select it`.
+The swap preview shares the worker preview helper and can show a new target without changing the role.
+Claude worker moves use this runner with a fixed Claude label under the same run lock.
+Only Codex moves read or complete pending group requests and their marker.
+A short schedule lock protects startup, the pending marker, the final role check, and group completion.
+Both locks use `file_lock.exclusive`.
+The marker is `~/.local/state/accounts/workers_move.json`.
+Startup writes the role and marker while it holds the schedule lock.
+A new handoff during unit exit retains this marker for the next notes pass.
+A failed start leaves the request pending; the existing blocked-entry notice reports the cause once.
 Requests use each session's observed process account, including members outside their selected group account.
 Blocked notices check the queue head and target again before delivery.
 Quota recipients use one session address for both names and IDs.
 Workers keep their threads when their Claude owner moves.
+An assignment compares the process account home with the selected account home for Claude and Codex.
+It uses one process environment read for this check and the run check.
+An unreadable environment permits reuse only for a worker whose pass is active in the current run.
+A different account follows the existing close checks, stop, and resume in the same pane.
+Workers moves and previews omit workers of the other family.
+The preview shares the move decision and lists workers that would resume or receive a refusal, with each reason.
+One count line covers workers with nothing to move.
+These include closed workers without an active dispatch, workers without a current session, and workers already on the target.
 
 A group move validates the destination before changing the selection or stopping members.
 It selects the account for future launches and moves live off-target members.
@@ -179,6 +211,27 @@ Without a queued workers move, provider refusal or unavailable included usage ca
 Credit policy determines whether an exhausted account can continue.
 Worker assignment fallback to Claude remains separate from the selected Codex account.
 Routing returns only when the selected Codex account can work and its refusal has resolved.
+An owned workers refusal with no account capacity enables `no_worker_mode` on the workers-role host, `role_map.ROLE_MAP_HOST`.
+The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
+The saved flag triggers one broadcast to showrunners and unit directors on both machines.
+`config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
+The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
+Successful Codex recovery clears the flag and broadcasts OFF after the workers account and assignment restoration succeed.
+Recovery also clears the flag when no Claude assignment fallback was saved.
+An unfinished Claude switch or failed restoration retains the flag until recovery can finish.
+The state context saves each flag change and releases the lock before it starts a separate broadcast unit.
+The start uses `systemd-run --user --collect --quiet --no-block` with the user manager's environment.
+The unit uses the repository working directory and `scripts/lib/py` to run `scripts/production/broadcast.py`.
+The quota pass waits only for the unit start, so slow peer delivery cannot consume its 30-second budget.
+A failed unit start logs one failure line and has no retry.
+The separate unit records later delivery output in its journal.
+A refresh that clears the flag reports `notes refreshed; workers-back notice sent`.
+The flag survives state reloads and suppresses repeated ON notices during the same episode.
+`agent-notes.timer` starts `agent-notes.service` 30 seconds after the preceding service finishes, with one-second timer accuracy.
+`scripts/maintenance/agent_notes_job.py` runs its quota part after the notes part.
+`config/agent_notes.toml` sets the quota and notes intervals to 120 seconds.
+Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
+This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move through their dispatch lock, fresh pane evidence, `restart.stop_row`, and `worker_panes.start_or_resume`.
 They keep the same conversation and reuse a stopped pane.
 Only an open pass receives resume text through the shared target check.
@@ -253,7 +306,7 @@ The board sums available machine counts and identifies an unavailable peer.
 `status --stored` reads saved usage, role maps, and peer counts.
 It does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
-The [board design](unit-board.md) owns the display contract and refresh lifecycle.
+The [pane design](accounts-queue-panes.md) owns the display contract and refresh lifecycle.
 
 Account notes use numbered filenames.
 Each note shows its roles and live session count.

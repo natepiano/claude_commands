@@ -87,6 +87,11 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
             "--filter", "render", "--filter", "audio", "--features", "a")
         self.assertNotEqual(verdict, other_verdict)
         self.assertEqual(build, other_build)
+        for selection in (("--run-ignored", "only"),):
+            with self.subTest(selection=selection):
+                ignored_verdict = self.calculate_build_keys(
+                    "--filter", "native_rate", "--features", "a", *selection)[0]
+                self.assertNotEqual(verdict, ignored_verdict)
         for name, value in (("NEXTEST_TEST_THREADS", "1"), ("NEXTEST_RETRIES", "3"),
                             ("NEXTEST_STATUS_LEVEL", "all")):
             with self.subTest(input=name):

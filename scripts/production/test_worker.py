@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.agents import detached_runs, worker_lifecycle
+from scripts.herdr import herdr_types
 from scripts.accounts import accounts
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import turn_end, worker_panes
@@ -52,7 +53,7 @@ class DispatchAgent:
         self.last_replies: dict[str, str] = {}
         self.notices: list[str] = []
         self.notice_senders: list[send.SenderStamp] = []
-        self.questions: dict[str, str | herdr.HerdrFailure] = {}
+        self.questions: dict[str, str | herdr_types.HerdrFailure] = {}
         self.answers: list[tuple[str, str]] = []
         self.answer_inputs: dict[str, str] = {}
         self.answer_enters: dict[str, int] = {}
@@ -145,7 +146,7 @@ class DispatchAgent:
             result = run(*arguments, deadline=deadline)
             if arguments[:2] == ("pane", "read"):
                 question = self.questions.get(arguments[2], result)
-                if isinstance(question, herdr.HerdrFailure):
+                if isinstance(question, herdr_types.HerdrFailure):
                     raise question
                 return question
             if arguments[:2] == ("agent", "prompt") and arguments[2] in self.questions:
@@ -179,7 +180,7 @@ class DispatchAgent:
                     self.submitted.append((pane, line))
                     self.during_prompt()
                     if self.error:
-                        raise herdr.HerdrFailure(self.error)
+                        raise herdr_types.HerdrFailure(self.error)
                     if self.consultation_delivery == "prompt":
                         self.append(pane, "user", line)
                         self.complete(pane)
@@ -313,6 +314,17 @@ class WorkerCommandTests(unittest.TestCase):
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
         atomic_file.write_text_atomic(config.with_name("send.conf"),
                                       (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
+        atomic_file.write_text_atomic(config.with_name("scratch.conf"),
+                                      (Path(__file__).resolve().parents[2] / "config/scratch.conf").read_text())
+        root = self.fixture.root
+        (root / "worker-tmp").mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "TMPDIR": str(root / "worker-tmp"),
+            "SCRATCH_ROOT": str(root / "scratch"),
+            "SCRATCH_VISIBLE_ROOT": str(root / "visible-scratch"),
+            "SCRATCH_COPIES_ROOT": str(root / "copies"),
+            "SCRATCH_HOLDS": str(root / "scratch-holds.json"),
+        })))
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"
@@ -487,7 +499,7 @@ class WorkerCommandTests(unittest.TestCase):
         director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[director]),
               patch.object(progress_history, "active_dispatch", return_value=active),
-              patch.object(self.fixture.world, "prompt", side_effect=herdr.HerdrFailure("delivery failed")),
+              patch.object(self.fixture.world, "prompt", side_effect=herdr_types.HerdrFailure("delivery failed")),
               patch.object(herdr, "check_target", return_value=True),
               patch.object(subprocess, "run", side_effect=self.agent.run),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
@@ -762,7 +774,7 @@ class WorkerCommandTests(unittest.TestCase):
             nonlocal failed
             if method == "layout.export" and not failed:
                 failed = True
-                raise herdr.HerdrFailure("restore layout unavailable")
+                raise herdr_types.HerdrFailure("restore layout unavailable")
             return request(method, **params)
         with patch.object(self.fixture.world, "socket_request", side_effect=fail_one_layout), patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK):
             with redirect_stderr(io.StringIO()) as errors:
@@ -1163,7 +1175,7 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         question = "Which output format must I use?\nJSON or Markdown?\n"
         cases = (("before", question), ("after", question),
-                 ("unreadable", herdr.HerdrFailure("pane read failed\nterminal unavailable")))
+                 ("unreadable", herdr_types.HerdrFailure("pane read failed\nterminal unavailable")))
         for stage, visible in cases:
             with self.subTest(stage=stage):
                 self.agent.questions[opened.pane] = visible
@@ -1634,6 +1646,26 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(code, worker.ExitCode.REFUSED)
         self.assertIn("impl, impl2", errors.getvalue())
         self.assertEqual(self.agent.submitted, [])
+
+    def test_unnamed_assignment_keeps_the_busy_workers_pass(self) -> None:
+        def assign(launcher: str) -> worker.DispatchSubmission | worker.ExitCode:
+            return worker.assign(self.fixture.parent.id, "review", self.prompt, session_dir=self.run_dir,
+                slot="review", phase="8", kind="review", launcher_command=["assign.sh", launcher], reply=self.reply)
+
+        def passes() -> dict[str, dict[str, object]]:
+            return cast(dict[str, dict[str, dict[str, object]]],
+                        json.loads((self.run_dir / "progress_history_state.json").read_text()))["pass"]
+
+        self.assertEqual(assign("adversary"), worker.ExitCode.OK)
+        busy = self.agent.submitted[0][0]
+        self.fixture.world.locations[busy]["agent_status"] = "working"
+        _ = self.opened("review2", "review")
+        held = passes()["review"]
+        self.assertEqual(assign("rerun"), worker.ExitCode.OK)
+        self.assertNotEqual(self.agent.submitted[1][0], busy)
+        self.assertEqual(passes()["review"], held)
+        self.assertEqual((held["worker_name"], held["status"]), ("review", "active"))
+        self.assertEqual((passes()["review2"]["worker_name"], passes()["review2"]["status"]), ("review2", "active"))
 
     def test_add_uses_the_lowest_free_name(self) -> None:
         _ = self.opened("impl")

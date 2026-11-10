@@ -13,7 +13,7 @@ from typing import NamedTuple, TypedDict, cast
 from scripts.production import staff
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
 
 

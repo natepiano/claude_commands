@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lint import sweep
 from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 
@@ -108,6 +107,8 @@ class InvalidFloor(ValueError):
 
 
 def read_floor() -> int | None:
+    from scripts.lint import sweep
+
     config = str(conf.path("lint"))
     floor, key = sweep.floor_bytes(conf.read(Path(config)).values(), socket.gethostname())
     if floor is None and key is not None:
@@ -117,6 +118,8 @@ def read_floor() -> int | None:
 
 def outside_directory_bytes(folders: list[tuple[str, str]]) -> tuple[dict[str, int], dict[str, int]]:
     """Allocated bytes under folder roots and shallow directories, excluding cargo targets."""
+    from scripts.lint import sweep
+
     sizes: dict[str, int] = {}
     depths: dict[str, int] = {}
     seen: set[sweep.InodeKey] = set()
@@ -210,6 +213,8 @@ def measure(
     folders: list[tuple[str, str]], usage: Callable[[], filesystem.FilesystemUsage], floor: int | None,
     previous: PreviousOutsideMeasurement = NO_EARLIER_OUTSIDE_MEASUREMENT,
 ) -> MeasuredDiskSnapshot:
+    from scripts.lint import sweep
+
     seen: set[sweep.InodeKey] = set()
     rows: list[DiskRow] = [
         {"label": label, "bytes": sweep.directory_blocks(os.path.expanduser(path), seen)}
@@ -255,6 +260,8 @@ def capacity_rows(paths: list[Path], measured: tuple[tuple[int, filesystem.Files
 
 def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], list[str]]:
     """Read current mappings and retain saved output roots for older workspaces."""
+    from scripts.lint import sweep
+
     saved = sweep.saved_cargo_output_roots()
     mappings = list((*saved.workspaces, *saved.history))
     checkouts: list[str] = []

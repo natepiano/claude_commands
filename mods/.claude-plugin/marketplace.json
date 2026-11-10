@@ -12,7 +12,7 @@
     {
       "name": "unit-board",
       "source": "./unit-board",
-      "description": "Production board and unit detail pane."
+      "description": "Accounts and build queue panes."
     }
   ],
   "description": "Local Claude Code mods for session messaging and production views."

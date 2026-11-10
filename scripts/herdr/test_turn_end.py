@@ -4,24 +4,29 @@ from __future__ import annotations
 import json
 import io
 import os
+import shutil
 import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr
+from datetime import datetime
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.accounts import refusals
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
-from scripts.lib import atomic_file, process_start
+from scripts.lib import atomic_file, process_start, scratch
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
-from scripts.production import staff, test_worker, worker
+from scripts.production import staff, test_worker, worker, worker_admission
+from scripts.production.staff_test_support import fixture_worker
+from scripts.whoami import agent_accounts, note_file, quota_alert
 
 
 class NativeHookEntryTests(unittest.TestCase):
@@ -108,6 +113,7 @@ class TurnEndTests(unittest.TestCase):
                  for close in ("closed", "setup", "outside")]
         cases.extend((family, "closed", transcript) for family in ("codex", "claude")
                      for transcript in ("no final reply", "older reply"))
+        cases.append(("codex", "scratch", "current"))
         for family, close, transcript in cases:
             with self.subTest(family=family, close=close, transcript=transcript):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
@@ -116,6 +122,16 @@ class TurnEndTests(unittest.TestCase):
                 self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
+                kept_folders: list[Path] = []
+                if close == "scratch":
+                    peer = fixture_worker("scratch-peer", self.case.fixture.parent.id)
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}):
+                        folder = scratch.new_worker()
+                        atomic_file.write_text_atomic(folder / "trial.txt", "worker output")
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": str(peer.current_session)}):
+                        kept = scratch.new_worker()
+                        atomic_file.write_text_atomic(kept / "peer.txt", "peer output")
+                        kept_folders.append(kept)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
@@ -145,11 +161,42 @@ class TurnEndTests(unittest.TestCase):
                 self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
                 self.assertIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
                 self.assertNotIn(pane, self.case.fixture.world.locations)
+                if close == "scratch":
+                    self.assertEqual(list(Path(os.environ["TMPDIR"]).iterdir()), kept_folders)
+                    self.assertEqual((kept_folders[0] / "peer.txt").read_text(), "peer output")
                 self.assertEqual(staff.by_id(row.id), row)
                 log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
                 self.assertEqual((entry["thread_id"], entry["worker_name"], entry["reason"]),
                     (row.current_session, name, "the hook completion is already finished"))
+
+    def test_a_codex_quota_refusal_is_reported_once_with_its_stopped_command(self) -> None:
+        _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                            self.case.fixture.root / "conf/accounts.conf")
+        self.case.agent.finish_after = 1
+        self.assertIs(self.case.dispatch("impl"), worker.DispatchSubmission.SUBMITTED)
+        row = self.case.agent.row(self.case.agent.submitted[-1][0])
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        account = agent_accounts.KnownCodexAccount(backend.codex_home, "worker@example.com", "codex1")
+        refused_at = "2026-11-10T19:30:38.842000+00:00"
+        with (patch.object(quota_alert, "blocked", return_value=["workers moved"]) as blocked,
+              patch.object(agent_accounts, "codex_account", return_value=account),
+              patch.object(note_file, "read_notes", return_value=iter(()))):
+            self.assertEqual(turn_end.report_quota_refusals(), [])
+            # A later refusal in the same pass sends no second notice.
+            for timestamp, expected in ((refused_at, ["workers moved"]), ("2026-11-10T19:35:00+00:00", [])):
+                with worker_admission.transcript_source(row, backend).open("a", encoding="utf-8") as stream:
+                    _ = stream.write(json.dumps({"type": "event_msg", "timestamp": timestamp, "payload": {
+                        "type": "task_complete", "last_agent_message": None, "error": {
+                            "message": "You’ve hit your usage limit. Try again at Nov 15th, 2026 1:34 PM.",
+                            "codex_error_info": "usage_limit_exceeded"}}}) + "\n")
+                self.assertEqual(turn_end.report_quota_refusals(), expected)
+                self.assertEqual(turn_end.report_quota_refusals(), [])
+        blocked.assert_called_once_with([], account, window=refusals.UnknownWindow(),
+            refused_at=quota_alert.RefusedAt(datetime.fromisoformat(refused_at)),
+            stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
         opened = self.case.opened()
