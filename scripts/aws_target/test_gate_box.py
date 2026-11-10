@@ -98,7 +98,7 @@ class GateBoxTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
-        stages = ['boot', 'tools ready', 'source ready', 'tests start']
+        stages = ['boot', 'tools ready', 'tools checked', 'source ready', 'tests start']
         cases = [(False, failure) for failure in ('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start')]
         cases.extend(((True, ''), (True, 'tools ready')))
         for warm, failure in cases:
@@ -215,6 +215,9 @@ else:
                     self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
                 if not failure:
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
+                    self.assertEqual(list(ledger.mapping(results[-1]['tools'])),
+                                     ['git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup',
+                                      'cargo-nextest', 'uv', 'sqlite3', 'python_sqlite'])
                     lines = [line for line in log.splitlines() if ' stage=' in line]
                     self.assertEqual([line.split(' stage=', 1)[1] for line in lines], stages)
                     for line in lines:
