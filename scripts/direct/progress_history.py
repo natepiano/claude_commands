@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, cast
 
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import findings, phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs  # noqa: E402
@@ -6651,6 +6651,8 @@ def _review_trial(args: argparse.Namespace) -> None:
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
     Each time rounds to the nearest whole minute.
     """
+    from scripts.direct import findings
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _optional_arg(args, "phase_id")
