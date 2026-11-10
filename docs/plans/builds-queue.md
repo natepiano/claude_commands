@@ -1413,34 +1413,58 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** a row for runs outside the queue in `/build:queue`.
 
-### Phase 42 — A file copied to a remote tree always counts as changed for Cargo  · status: todo
+### Phase 42 — A file copied to a remote tree always counts as changed for Cargo  · status: done
 
-**Depends on:** none. Source: builds, 2026-11-09, from sdlc and cargo-liner.
+#### As-built
+
+- Both remote copy paths use `rsync -rlpc`, defined once as `RSYNC_RECEIVER_WRITE_TIME_FLAGS` in `scripts/copies/copies.py`. `remote_rsync` and `copy_tracked_scripts` in `scripts/mac_test/offload.py` read that definition.
+- A changed file takes the write time on the receiver, so Cargo rebuilds it. Checksums skip equal content, and an equal file keeps its destination mtime.
+- Proof: with `-rlptc`, a changed file with an old source mtime left Cargo Fresh with the old binary. With `-rlpc`, Cargo reports Dirty and rebuilds.
+
+**Files:**
+- `scripts/copies/copies.py` — the flag definition.
+- `scripts/mac_test/offload.py` — uses the definition.
+- `scripts/copies/test_remote_copies.py` — real `rsync` rows for a changed file and an equal file.
+- `scripts/mac_test/test_offload.py` — the expected flags.
+- `docs/as-built/mac-test-offload.md`, `docs/as-built/builds-aws-target.md` — the rule.
+
+**Binds later work:** A copy into a tree where Cargo builds does not use `-t`.
+
+**Gotchas:**
+- A mirror that is already stale stays stale after the flag change, because equal content is skipped and `target/` stays. The deploy step touches the sources of each remote mirror once, after the flags land. A touch before landing is undone by the next copy with the old flags.
+- A Mac ssh exit is always 0 under Tailscale SSH, so a remote step reports its result with a sentinel.
+
+**Ruled out:** A touch step or a guard at each caller.
+
+### Phase 43 — The copies configuration is parsed only when its file changes  · status: todo
+
+**Depends on:** Phase 42 on builds. Source: builds, 2026-11-09, from a style measurement relayed by sdlc.
 
 #### Work Order
 
-**Goal:** A Mac gate never tests old Rust against new source.
+**Goal:** A process that reads the copies configuration many times parses the file once.
 
 **Spec:**
 
-1. A small case proves the cause first. `rsync -t` keeps the source mtime, so a changed file can be older than the last build, and Cargo reads it as fresh.
-2. The remote copy drops `-t`. `-c` still skips equal content, so only a changed file takes a new mtime.
-3. The flags are defined once, in `scripts/copies/copies.py`. `scripts/mac_test/offload.py` uses that definition. No caller adds a touch step or a guard.
-4. A real local `rsync` test proves that a changed file with an old source mtime lands newer than the source, and that an unchanged file keeps its destination mtime.
+1. Measure first. style measured 13,288 `copies.load_config` calls in one `test_crate_run` run, at 6.19 CPU seconds in-process. Repeat a measurement on the unchanged tree with `scripts/test_times/module_cost.py`, so that the before and after figures use one method.
+2. Add one cache in `scripts/copies/copies.py`, at the source. No caller keeps its own copy.
+3. A value is read at use, so an edit to the file takes effect at the next call in a running process. The cache key holds every input of the result: the `COPIES_CONFIG` path, `CONF_DIR`, `HOME`, and the inode, size and `mtime_ns` of each file the read uses.
+4. An invalid configuration is never cached. Each call raises `CopyError` as it does today.
+5. The cached value cannot be changed by a caller. `CopiesConfiguration.allow_list` becomes a read-only mapping.
+6. Add rows to the existing configuration tests: a second call does not parse the file; an edited file gives the new value; a changed `COPIES_CONFIG` gives the other file's value; an invalid file raises on each call.
+7. Report a before and after with the same module and method, with the spread of repeated runs on one tree.
 
 **Files:**
 - `scripts/copies/copies.py`
-- `scripts/copies/test_remote_copies.py`
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/test_offload.py`
+- `scripts/copies/test_copies.py`
 
-**Workers:** `1 writer` — `impl` owns the fix and its tests, on a branch cut from builds so that the hash carries no held phase.
+**Workers:** `1 writer` — `impl` owns the cache, its tests and the measurement, on a branch cut from builds so that the hash carries no held phase.
 
 **State:** none.
 
-**Gate:** the targeted test, and `basedpyright` 0/0/0 on each changed file and each caller module.
+**Gate:** the targeted test, `basedpyright` 0/0/0 on each changed file and each caller module, and the before and after figures.
 
-**Change-Review:** none — the copy stays silent; a Mac gate only stops testing stale builds.
+**Change-Review:** none — no person sees a change; copy commands use less CPU.
 
 ### Phase 23a — Queue boundary imports stay small, if a prototype shows a real gain  · status: done
 
