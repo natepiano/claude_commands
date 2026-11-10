@@ -2459,40 +2459,20 @@ Declined by the builds showrunner on 2026-11-10: the gain is under the 30 CPU s 
 
 ### Phase 123 — A changed shell script selects the tests of the scripts that call it  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+A changed shell script now selects the tests of every script that calls it, directly or through other scripts. A `board.sh` change selects `test_verify_lint_tool_failures`, the test the Phase 121 repair missed.
 
-**Source:** the builds showrunner, 2026-11-10: go for the script-call closure in `affected_modules.py`, after Phase 122. Correct selection first. Send the before/after module count and the targeted CPU with the checkpoint.
-
-**Why:** the Phase 121 repair changed `scripts/direct/board.sh`. Its targeted run did not select `test_verify_lint_tool_failures`, which runs `verify.sh`, which sources `board.sh`. The merge gate found the failure instead. A changed shell script selects only the tests that name it, not the tests of the scripts that run it.
-
-**Goal:** a changed shell script also selects every test that names a script that calls it, directly or through other scripts.
-
-**Spec:**
-
-1. A script is a tracked or dirty file under `scripts/` that is not Python and ends in `.sh` or has an execute bit.
-2. A script calls a target when its text names the target by the current test rule (`names_changed_file`: the full path, or the name with its folder). It also calls the target through a token that ends in `/` plus the target's full path (`$HOME/.claude/scripts/direct/verify.sh`), or a token that ends in `/` plus the name when the target is in the caller's own folder (`"$SCRIPT_DIR/board.sh"`).
-3. The changed scripts seed the closure. Add each script that calls a closure member until no new script is found. Removed scripts seed the closure too.
-4. A test is selected when it, or its imported test-support modules, names any closure member by the current test rule. The other selection rules do not change.
-5. Python files are not callers. Read script text from the worktree only when a changed script exists; the fact cache does not change.
-6. Measure the module count for a `board.sh` change and for two other scripts before and after. Measure the targeted CPU for the `board.sh` change before and after.
+- `script_callers` in `scripts/production/affected_modules.py` seeds from the changed scripts (non-Python files under `scripts/` that end in `.sh` or have an execute bit, removed `.sh` files included). It adds each script that calls a member until no new caller is found.
+- `calls_script` counts a call by the test rule (`names_path`: the full path, or the name with its folder), by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the caller's own folder (`"$SCRIPT_DIR/board.sh"`).
+- Tests select by the unchanged test rule against the changed files plus the closure. Python files are not callers. Script text is read only when a changed script exists; the fact cache does not change. The closure costs 40-50 ms per selection.
+- Selection, before and after, of 745 modules (recorded median CPU, full suite 5,075 s): `board.sh` 117 to 264 modules and 1,358 to 2,905 CPU s; `lint` 152 to 264; `build_hold/cargo` 115 to 267; a Python-only change 5 to 5. About 260 tests run `verify.sh`, which sources `board.sh`.
 
 **Files:**
-- `scripts/production/affected_modules.py` — the script-call closure; owner natest
-- `scripts/production/test_affected_modules.py` — one test for the call chain, with negative rows; owner natest
-- `docs/as-built/merge-gate-and-test-speed.md` — the targeted selection line; owner natest
+- `scripts/production/affected_modules.py` — `path_tokens`, `folder_names_of`, `names_path`, `is_script`, `calls_script`, `script_callers`.
+- `scripts/production/test_affected_modules.py` — the call-chain test, with sibling, full-path, executable, fragment, other-folder and Python rows.
+- `docs/as-built/merge-gate-and-test-speed.md` — the targeted selection lines.
 
-**Workers:** 1 writer; one small change with its test
-- `impl` — all files
+**Gotchas:** `~/.claude/scripts/lib/py -m` imports main's code from a worktree; run local tests with the worktree's `scripts/lib/py`.
 
-**State:** none
-
-**Constraints from prior phases:** tests use no live state. A complete-path token that is only a fragment of a longer path (`old/config/custom.json`) must not select a test; that rule stays for tests.
-
-**Acceptance gate:**
-- A `board.sh` change selects `test_verify_lint_tool_failures`.
-- The new test fails without the closure and passes with it.
-- `test_affected_modules.py` and the merge-gate importers of `affected_modules.py` pass.
-- `basedpyright` reports 0 errors, 0 warnings, 0 notes for both Python files.
-- A targeted test on the change passes.
+**Ruled out:** Python files as callers (a `board.sh` change would select 521-575 modules). A changed Python file that a shell script runs still selects only its importers and the tests that name it.
