@@ -123,6 +123,16 @@ class MainSyncTests(unittest.TestCase):
         _ = git(self.checkout, "merge", "--ff-only", "-q", "origin/main")
         _ = self.commit("c")
         before = git(self.checkout, "rev-parse", "HEAD")
+
+        with self.subTest(case="clean status with a blocked untracked addition"):
+            _ = (self.checkout / "c").write_text("local addition")
+            self.assertEqual(git(self.checkout, "status", "--porcelain", "--untracked-files=no"), "")
+            outcome = main_sync.sync(self.checkout)
+            self.assertEqual(outcome.state, "dirty")
+            self.assertEqual(outcome.detail, f"{self.checkout} has local changes that block the update (c)")
+            self.assertEqual((self.checkout / "c").read_text(), "local addition")
+            (self.checkout / "c").unlink()
+
         _ = (self.checkout / "a").write_text("local edit")
         self.assertEqual(main_sync.sync(self.checkout).state, "dirty")
         self.assertEqual((self.checkout / "a").read_text(), "local edit")
@@ -149,6 +159,15 @@ class MainSyncTests(unittest.TestCase):
             self.assertEqual(git(self.checkout, "show", ":a"), "staged edit")
             self.assertEqual((self.checkout / "a").read_text(), "updated a")
             _ = git(self.checkout, "reset", "-q", "HEAD", "--", "a")
+
+        with self.subTest(case="two blocked files and one matching file"):
+            _ = (self.checkout / "b").write_text("local edit")
+            _ = (self.checkout / "c").write_text("local addition")
+            outcome = main_sync.sync(self.checkout)
+            self.assertEqual(outcome.state, "dirty")
+            self.assertEqual(outcome.detail, f"{self.checkout} has local changes that block the update (b, c)")
+            _ = git(self.checkout, "checkout", "-q", "b")
+            (self.checkout / "c").unlink()
 
         _ = git(self.checkout, "checkout", "-q", "a")
         _ = git(self.checkout, "commit", "-q", "--allow-empty", "-m", "local")
