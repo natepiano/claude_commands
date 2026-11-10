@@ -104,6 +104,45 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
             staff._transaction(lambda rows: None)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(self.staff_file.read_bytes(), before)
 
+    def test_run_pointer_edits_preserve_other_fields_and_a_newer_run(self) -> None:
+        _, unit, _ = self.tree()
+        old = self.root / "old-run"
+        new = self.root / "new-run"
+        cases = (
+            ("set", old, staff.OpenRun(old)),
+            ("clear", self.root / "other-run", staff.OpenRun(old)),
+            ("set", new, staff.OpenRun(new)),
+            ("clear", old, staff.OpenRun(new)),
+            ("clear", new / ".." / "new-run", staff.NoRun()),
+            ("clear", new, staff.NoRun()),
+        )
+        self.assertIsInstance(unit.run, staff.NoRun)
+        self.assertNotIn("run", unit.to_json())
+        for action, path, expected in cases:
+            with self.subTest(action=action, path=path):
+                result = (staff.set_run(unit.id, staff.OpenRun(path)) if action == "set"
+                          else staff.clear_run(unit.id, path))
+                self.assertEqual(result, replace(unit, run=expected))
+                self.assertEqual(staff.local_by_current_session(unit.current_session), result)
+                self.assertEqual(staff.StaffRow.from_json(result.to_json()), result)
+                self.assertEqual(staff.by_id(unit.id), result)
+                if isinstance(expected, staff.OpenRun):
+                    self.assertEqual(result.to_json()["run"], str(expected.path))
+                else:
+                    self.assertNotIn("run", result.to_json())
+
+    def test_run_pointer_cli_uses_the_current_session_and_reports_missing_rows(self) -> None:
+        _, unit, _ = self.tree()
+        current = staff.native_id(fixture_runtime_id("run-current"))
+        unit = staff.update_current_session(unit.current_session, current)
+        run = self.root / "run"
+        for verb, expected in (("set-run", staff.OpenRun(run)), ("clear-run", staff.NoRun())):
+            with self.subTest(verb=verb):
+                _ = self.cli(verb, current, str(run))
+                self.assertEqual(staff.by_id(unit.id), replace(unit, run=expected))
+                result = self.cli(verb, unit.id, str(run), code=1)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+
     def test_staff_admission_does_not_read_pane_publications(self) -> None:
         from scripts.herdr import pane_launch
 

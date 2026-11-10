@@ -849,10 +849,8 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, Wo
     runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
     for parent in parents.values():
         runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
-        try:
-            runs.append(Path(unit_runs.marker(parent.current_session).read_text().strip()))
-        except FileNotFoundError:
-            pass
+        if isinstance(parent.run, staff.OpenRun):
+            runs.append(parent.run.path)
     if current := unit_runs.environ("RUN_DIR"):
         runs.append(Path(current))
     found: dict[StaffId, WorkerDispatchRecord] = {}

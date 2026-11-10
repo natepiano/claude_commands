@@ -807,7 +807,7 @@ def retirement_runs_of(owner: staff.StaffRow, record: staff.StaffSnapshot) -> li
     found: list[Path] = []
     for root in unit_runs.run_roots(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
         for folder in sorted(root.iterdir()) if root.is_dir() else ():
-            if folder.name != "active" and record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
+            if record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
                 found.append(folder)
     return found
 

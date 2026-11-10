@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from typing import cast, override
 from unittest import mock
 
@@ -78,7 +80,7 @@ PY
             "BUILD_HOLD_RELEASE_DIR": str(release),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILD_TARGETS_SCRIPT": str(INVOKE.parent.parent / "build_targets" / "build_targets.py"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "",
             "UNIT_SESSION_DIR": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -88,7 +90,7 @@ PY
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-            "CLAUDE_CODE_SESSION_ID": "unit-director",
+            "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("unit-director"),
             "LINT_CONFIG_READER": str(lint_reader),
             "CYCLE_FILE": str(self.cycle_file),
             "STEP_STATE_LOG": str(self.root / "step-states"),
@@ -103,9 +105,9 @@ PY
         cycle: dict[str, object] = {
             "id": CYCLE_ID, "opened_at": now, "release_started_at": now,
             "holders": {"holder": {"since": now, "released_at": ""}},
-            "recipients": {"unit-director": "unit"},
+            "recipients": {fixture_runtime_id("unit-director"): "unit"},
             "entries": [{
-                "session_id": "unit-director", "name": "unit", "delivery": "Delivered",
+                "session_id": fixture_runtime_id("unit-director"), "name": "unit", "delivery": "Delivered",
             }],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle) + "\n")
@@ -122,11 +124,11 @@ PY
             env=self.environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
-    def set_owner_marker(self) -> None:
+    def set_owner_run(self) -> None:
         run = self.root / "unit-run"
-        active = Path(self.environment["UNIT_ACTIVE_DIR"])
-        active.mkdir()
-        _ = (active / "unit-director").write_text(str(run) + "\n")
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            row = fixture_member("showrunner", name="unit-director", runtime_id=fixture_runtime_id("unit-director"))
+            _ = staff.set_run(row.id, staff.OpenRun(run))
         self.environment["UNIT_RUN_DIR"] = str(run)
         self.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
 
@@ -157,7 +159,7 @@ PY
         self.assertEqual(json.loads((self.root / "wait-states").read_text()), self.entry())
 
     def test_immediate_memory_grant_leaves_release_record_unchanged(self) -> None:
-        self.set_owner_marker()
+        self.set_owner_run()
         before = self.cycle_file.read_bytes()
         result = self.invoke(str(self.root / "stubs" / "compile"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -198,13 +200,13 @@ class VerifyRoutingTests(unittest.TestCase):
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
-            "UNIT_ACTIVE_DIR": str(root / "active"),
+            "STAFF_FILE": str(root / "staff.json"),
             "UNIT_RUN_DIR": "",
             "UNIT_TEAM_ROLE": "",
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
             "MAC_TEST_STATE_DIR": str(root / "mac-state"),
             "VERIFY_MAC_RUNNER": str(root / "no-mac-runner"),
-            "CLAUDE_CODE_SESSION_ID": "unit-director",
+            "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("unit-director"),
         })
         self.fixture.environment["BUILD_TARGETS_POLL_S"] = "0.01"
         self.fixture.environment["BUILD_TARGETS_NOW"] = ""
@@ -213,12 +215,12 @@ class VerifyRoutingTests(unittest.TestCase):
     def record_hold_event(self, command: list[str]) -> None:
         _ = subprocess.run(command, env=self.fixture.environment, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
 
-    def set_owner_marker(self) -> None:
+    def set_owner_run(self) -> None:
         run = self.fixture.root / "unit-run"
         run.mkdir()
-        active = Path(self.fixture.environment["UNIT_ACTIVE_DIR"])
-        active.mkdir()
-        _ = (active / "unit-director").write_text(str(run) + "\n")
+        with isolated_staff_file(self.fixture.root / "staff.json", self.fixture.environment):
+            row = fixture_member("showrunner", name="unit-director", runtime_id=fixture_runtime_id("unit-director"))
+            _ = staff.set_run(row.id, staff.OpenRun(run))
         self.fixture.environment["UNIT_RUN_DIR"] = str(run)
         self.fixture.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
 
@@ -227,9 +229,9 @@ class VerifyRoutingTests(unittest.TestCase):
         cycle: dict[str, object] = {
             "id": CYCLE_ID, "opened_at": now, "release_started_at": "",
             "holders": {"holder": {"since": now, "released_at": ""}},
-            "recipients": {"unit-director": "unit"},
+            "recipients": {fixture_runtime_id("unit-director"): "unit"},
             "entries": [{
-                "session_id": "unit-director", "name": "unit", "delivery": "NotAttempted",
+                "session_id": fixture_runtime_id("unit-director"), "name": "unit", "delivery": "NotAttempted",
             }],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle) + "\n")
@@ -273,14 +275,14 @@ class VerifyRoutingTests(unittest.TestCase):
     def test_worker_with_stale_shell_id_builds_after_release(self) -> None:
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
-        self.set_owner_marker()
+        self.set_owner_run()
         with release_registered_call(self.cycle_file):
             result = self.fixture.verify("test", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
         self.assertEqual(self.state(), "Delivered")
         entries = read_cycle_file(self.cycle_file)["entries"]
-        self.assertEqual(entries[0]["session_id"], "unit-director")
+        self.assertEqual(entries[0]["session_id"], fixture_runtime_id("unit-director"))
         self.assertNotIn("outcome", entries[0])
 
     def test_ownerless_call_runs_after_release_without_a_call_record(self) -> None:

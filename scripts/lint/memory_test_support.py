@@ -119,7 +119,7 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
         **private_ci_environment(root),
         "BUILD_HOLD_DIR": str(root / "holders"),
         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-        "UNIT_ACTIVE_DIR": str(root / "active"),
+        "STAFF_FILE": str(root / "staff.json"),
         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
     }

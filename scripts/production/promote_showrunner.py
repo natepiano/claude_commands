@@ -55,10 +55,6 @@ def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(where), *arguments], capture_output=True, text=True, check=False)
 
 
-def run_marker(session_id: str) -> Path:
-    return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None)
-
-
 def _session_status(pid: int) -> str:
     """The session record's `status`: `busy` while a turn runs."""
     record = sessions.read_session(unit_lookup.sessions_dir() / f"{pid}.json")
@@ -82,7 +78,7 @@ def _quiet(unit: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.Li
 
 def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path) -> None:
     """Refuse a unit with a run open, whose workers end only with the run, or with work uncommitted."""
-    if run_marker(claude.session_id).exists():
+    if unit_runs.open_run(claude.session_id) is not None:
         raise Refusal(f"{unit} has a /unit:direct run open, and its workers with it; the run finishes first")
     status = _git(worktree, "status", "--porcelain")
     if status.returncode != 0:
