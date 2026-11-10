@@ -9,6 +9,7 @@ except FileNotFoundError:
 import hashlib
 import io
 import json
+import shlex
 import subprocess
 import sys
 from contextlib import redirect_stderr
@@ -365,6 +366,37 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         runs = receipt.runs if isinstance(receipt, worker.DispatchWaitingForRuns) else ()
         _send_notice(row.name, parent, run, passed, instance, outcome, path, reply, details, runs)
         return outcome
+
+
+def report_quota_refusals() -> list[str]:
+    """Report a pane Codex worker's quota refusal once per pass; Codex runs no Stop hook for that turn."""
+    from scripts.accounts import refusal_watch
+    from scripts.whoami import agent_accounts, note_file, quota_alert
+
+    record = staff.local_snapshot()
+    lines: list[str] = []
+    for row in record.rows:
+        parent = record.parent_of(row)
+        recorded = progress_history.recorded_dispatch_run(row.id)
+        if row.kind != "worker" or parent is None or not isinstance(recorded, progress_history.RecordedDispatchRun):
+            continue
+        active = progress_history.active_dispatch(row.id, recorded.directory)
+        backend = staff.backend(row)
+        if (not isinstance(active, progress_history.ActiveDispatch) or not isinstance(backend, staff.CodexBackend)
+                or worker_panes.worker_pass(row, recorded.directory).get("quota_refusal")):
+            continue
+        refusal = refusal_watch.transcript_refusal(str(row.current_session), config_dir=backend.codex_home)
+        if not isinstance(refusal, refusal_watch.TranscriptRefusal):
+            continue
+        try:
+            stopped = quota_alert.StoppedWorkerCommand(str(parent.current_session), row.name,
+                                                       shlex.join(active.launcher_command))
+            lines += quota_alert.blocked(list(note_file.read_notes()), agent_accounts.codex_account(backend.codex_home),
+                                         window=refusal.window, refused_at=refusal.refused_at, stopped=stopped)
+            progress_history.record_quota_refusal(recorded.directory, active.instance_id, refusal.entry_id)
+        except (OSError, ValueError) as error:
+            lines.append(f"anomaly: {row.name}: quota refusal not reported: {' '.join(str(error).splitlines())}")
+    return lines
 
 
 def run_finished(thread_id: str) -> None:

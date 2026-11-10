@@ -732,9 +732,14 @@ class AssignLauncherTests(HookAssignmentFixture):
                      "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
         result = invoke_assignment(arguments, os.environ.copy())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        submitted = self.native.agent.submitted.copy()
+        self.native.fixture.world.locations[submitted[0][0]]["agent_status"] = "working"
+        repeated = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.native.agent.submitted, submitted)
         self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
-        passed = assign.object_map(assign.object_map(state["pass"])["impl"])
+        passed = assign.object_map(assign.object_map(state["pass"])["impl2"])
         self.assertEqual((passed["worker_name"], passed["worker_id"], passed["status"]),
                          ("impl2", opened.row.id, "completed"))
         phase = self.session_dir / "phases/7"

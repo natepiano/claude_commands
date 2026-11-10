@@ -407,7 +407,8 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
             continue
         labels = {row.name, agent_name(parent_row, row.name)} if parent_row else {row.name}
         labelled = [pane for pane in panes if pane.get("label") in labels
-                    and _text(pane, "tab_id") in parent_tabs]
+                    and _text(pane, "tab_id") in parent_tabs
+                    and not any(pane in scan.found.get(sibling.id, []) for sibling in workers)]
         related_unknown = [item for item in scan.unknown if any(
             _text(pane, "pane_id") == item.pane for pane in labelled)]
         if related_unknown:

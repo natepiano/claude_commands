@@ -553,7 +553,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             completion_actions = replace(completion_actions, summary_file=str(target))
         if isinstance(reply, Path):
             reply = progress_history.worker_artifact(reply, slot, chosen.value)
-    return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=slot,
+    return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=chosen.value,
         phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
         fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
         completion_actions=completion_actions)

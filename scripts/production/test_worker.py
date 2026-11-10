@@ -1646,6 +1646,26 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("impl, impl2", errors.getvalue())
         self.assertEqual(self.agent.submitted, [])
 
+    def test_unnamed_assignment_keeps_the_busy_workers_pass(self) -> None:
+        def assign(launcher: str) -> worker.DispatchSubmission | worker.ExitCode:
+            return worker.assign(self.fixture.parent.id, "review", self.prompt, session_dir=self.run_dir,
+                slot="review", phase="8", kind="review", launcher_command=["assign.sh", launcher], reply=self.reply)
+
+        def passes() -> dict[str, dict[str, object]]:
+            return cast(dict[str, dict[str, dict[str, object]]],
+                        json.loads((self.run_dir / "progress_history_state.json").read_text()))["pass"]
+
+        self.assertEqual(assign("adversary"), worker.ExitCode.OK)
+        busy = self.agent.submitted[0][0]
+        self.fixture.world.locations[busy]["agent_status"] = "working"
+        _ = self.opened("review2", "review")
+        held = passes()["review"]
+        self.assertEqual(assign("rerun"), worker.ExitCode.OK)
+        self.assertNotEqual(self.agent.submitted[1][0], busy)
+        self.assertEqual(passes()["review"], held)
+        self.assertEqual((held["worker_name"], held["status"]), ("review", "active"))
+        self.assertEqual((passes()["review2"]["worker_name"], passes()["review2"]["status"]), ("review2", "active"))
+
     def test_add_uses_the_lowest_free_name(self) -> None:
         _ = self.opened("impl")
         _ = self.opened("impl3")
