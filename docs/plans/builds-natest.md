@@ -2426,45 +2426,20 @@ A whole gate starts 997 interpreter version checks instead of 3,351. At a paired
 
 ### Phase 121 — Board helpers and the style lint record stop starting Python  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+`flatten()`, `lock_guard()` and the `style_sync.py lint` record loop start no Python process. The estimated saving is about 42 CPU s per gate on natedev: 28.4 from the two board helpers (paired per-call cost times the Phase 115 whole-gate call counts) and 13.5 from `style/test_style_sync.py` (median 44.0 to 29.5 CPU s in `module_cost.py` pairs).
 
-**Source:** the builds showrunner, 2026-11-10: pick each speed phase by the CPU it removes, at least about 30 CPU s per gate. The sdlc showrunner gave a go for `board.sh` on 2026-11-10; the style unit gave a go for `style_sync.py` with three conditions; the verify unit has no objection to the perl guard, with two conditions.
-
-**Why:** a whole gate calls `flatten()` in `scripts/direct/board.sh` about 1,130 times and `lock_guard()` about 1,056 times. Each call starts Python, about 11 ms CPU on natedev: about 23 CPU s per gate. `style_sync.py lint` starts `style_ledger.py lint-record` once per record: 57 starts and 19.5 CPU s in `style/test_style_sync.py`. Production calls get the same saving.
-
-**Goal:** `flatten()`, `lock_guard()` and the `lint` record loop start no Python process, and the phase removes about 40 CPU s per gate on natedev.
-
-**Spec:**
-
-1. `flatten()` uses bash parameter expansion only. Replace each newline, CR and tab with a space. Remove each character outside `[[:print:]]`. Cut the result to `MAX_MESSAGE_CHARS` characters. The result is the same as now for ASCII and ordinary UTF-8 text. A rare Unicode format character that Python's `isprintable()` removes can stay; the sdlc showrunner accepts this.
-2. `lock_guard()` takes the exclusive non-blocking flock on descriptor 9 with one perl call: `use Fcntl ":flock"`, open descriptor 9 with `>&=`, `flock(LOCK_EX|LOCK_NB)`, exit 75 when the lock is busy. Keep the perl call in one helper with a one-line comment that says why: the Mac has no `flock(1)`. The lock stays on the shell's descriptor after perl exits. The return codes of `lock_guard()` do not change.
-3. perl must resolve from the PATH that `verify.sh` uses, on natedev after a NixOS rebuild and on the Mac (`/usr/bin/perl`). Name the evidence in the reply.
-4. Keep a test that proves a second holder of the guard is refused while the first holder lives, and gets the lock after the first holder dies. Add a row to the existing guard tests in `scripts/direct/test_board_reclaim.py` if no test proves both halves.
-5. Add rows to the existing `flatten` tests for a newline, a tab, a control character and a cut at `MAX_MESSAGE_CHARS`, if no row proves each.
-6. In `scripts/style/style_sync.py` `lint`, open `style_ledger.open_ledger(repo)` once around the record loop, only when `records` is not empty, and call `ledger.lint_record(tip, record.tool, passed, dict(record.diagnostics))`. Add `rule_catalog.RuleValidationError` and `sqlite3.Error` to the `except` in `main`. Remove the `LEDGER` constant and the `diagnostic_file` write. Keep the `lint-record` command in `style_ledger.py`. Keep the child's JSON checks in one place.
-7. Update the line in `docs/as-built/build-memory-admission.md` that says the guard is taken by python3 `fcntl`, in the same commit.
-8. Measure the gain: a paired per-call CPU cost, old helper against new, for each helper, times the whole-gate call count; and the `style/test_style_sync.py` module CPU before and after with `module_cost.py`. No whole-gate pair: its noise is about 27 CPU s.
+- `flatten()` in `scripts/direct/board.sh` uses bash parameter expansion. It replaces newline, CR and tab with a space, removes each character outside `[[:print:]]`, and cuts to `MAX_MESSAGE_CHARS` characters. It pins a UTF-8 locale in a `local LC_ALL` (C.UTF-8, then en_US.UTF-8, then UTF-8), so text keeps its non-ASCII characters in a C or empty caller locale.
+- `lock_guard()` opens descriptor 9 in the shell and takes `flock(LOCK_EX|LOCK_NB)` with one perl call; perl exits 75 when the lock is busy. The shell keeps the lock after perl exits. The return codes do not change.
+- `style_sync.py lint` opens `style_ledger.open_ledger(repo)` once, only when records exist, and calls `ledger.lint_record` per record. `main` also catches `rule_catalog.RuleValidationError` and `sqlite3.Error`. The `LEDGER` constant and the diagnostic file are gone; `style_ledger.py lint-record` stays.
 
 **Files:**
-- `scripts/direct/board.sh` — `flatten`, `lock_guard`; owner sdlc, go given
-- `scripts/direct/test_board_reclaim.py`, `scripts/direct/test_board_text.py` — rows only if a case is missing
-- `scripts/style/style_sync.py` — the `lint` record loop and the `except` in `main`; owner style unit, go given with three conditions
-- `scripts/style/test_style_sync.py` — only if a test reads the removed constant or diagnostic file
-- `docs/as-built/build-memory-admission.md` — the guard line
+- `scripts/direct/board.sh` — `flatten`, `lock_guard` (owner sdlc).
+- `scripts/direct/test_board_text.py` — Unicode and limit rows in the inherited, C and no-locale cases.
+- `scripts/style/style_sync.py`, `scripts/style/test_style_sync.py` — in-process lint records (owner style unit).
+- `docs/as-built/build-memory-admission.md` — the perl guard line.
 
-**Workers:** 1 writer; the board and style edits are small and share one measurement
-- `impl` — all files
+**Gotchas:** bash `[[:print:]]` and `${#text}` follow the locale; a launchd job or an `env -i` child has none. perl resolves from the `verify.sh` PATH: `/run/current-system/sw/bin/perl` on natedev, `/usr/bin/perl` on the Mac. The locale rows did not run on the Mac (SSH timed out).
 
-**State:** none
-
-**Constraints from prior phases:** there is one way to start a script; a test-only path will not land. Tests use no live state and no live unit. Test fixtures seed the interpreter cache with `interpreter_cache_environment`; a set `CLAUDE_PYTHON` skips that cache. The user allows a change to any test code when the owning unit director and its showrunner are told first.
-
-**Acceptance gate:**
-- `flatten()`, `lock_guard()` and `lint` start no Python process.
-- The guard test proves refusal while the first holder lives and the lock after it dies.
-- The measured gain per gate, from paired per-call costs and the module measure, is reported.
-- The test modules of `scripts/direct` that use `board.sh` and `style/test_style_sync.py` pass.
-- `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed Python file.
-- A targeted test on the change passes.
+**Ruled out:** a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
