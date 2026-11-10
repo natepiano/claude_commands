@@ -30,6 +30,7 @@ from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
@@ -768,7 +769,7 @@ class StaffTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
-            "CLAUDE_PYTHON": sys.executable,
+            **interpreter_cache_environment(self.root / "cache"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -783,6 +784,7 @@ class StaffTestCase(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
             "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
         })))
+        _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
 
