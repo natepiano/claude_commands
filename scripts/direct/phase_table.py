@@ -1908,7 +1908,11 @@ def owned_notes(production: str, unit: str) -> list[Path]:
 def refresh(session_dir: Path) -> None:
     """Rewrite a production unit's generated phase note, when it has one."""
     resolver = session_staff.RowResolver(staff.snapshot())
-    record = build(session_dir, resolver=resolver)
+    try:
+        record = build(session_dir, resolver=resolver)
+    except RemovedPlan:
+        # Ad hoc work after the as-built: the removed plan has no phase note to rewrite.
+        return
     reference = _production_reference(record.plan, resolver=resolver)
     if isinstance(reference, PlanOutsideProduction):
         return
