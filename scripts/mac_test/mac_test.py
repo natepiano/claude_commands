@@ -2465,11 +2465,6 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     return command_status(paths, config)
 
 
-
-
-RELEASE_STATES = ('stopping', 'stopped', 'terminated')
-
-
 @dataclass(frozen=True)
 class StoppedInstanceEvidence:
     target: str
@@ -2487,49 +2482,6 @@ def release_host(paths: StatePaths, generation: str) -> str:
     if not target_config.is_aws_target(configured) or not generation:
         raise StateReadError('instance evidence cannot release these claims')
     return offload.read_connection_settings(configured.settings).host
-
-
-def claim_matches_instance(claim: HeldClaim, host: str, generation: str, state: str) -> bool:
-    claim_generation = claim.record.get('instance_generation', '')
-    return (claim.record.get('remote_host') == host
-            and bool(claim_generation)
-            and (claim_generation != generation or state in RELEASE_STATES))
-
-
-def capture_release_evidence(paths: StatePaths, generation: str, state: str,
-                             observed_at: float) -> StoppedInstanceEvidence:
-    """Capture host claims whose generation ended before the observation."""
-    with locked(paths.lock):
-        host = release_host(paths, generation)
-        claims = tuple(claim for claim in read_claims(paths)
-                       if claim_matches_instance(claim, host, generation, state)
-                       and datetime.fromisoformat(claim.record['since']).timestamp() <= observed_at)
-    return StoppedInstanceEvidence(paths.target, generation, state, observed_at, claims, host)
-
-
-def release_stopped_claims(paths: StatePaths, evidence: StoppedInstanceEvidence) -> int:
-    """Release unchanged claims after a stop or a generation change."""
-    if evidence.target != paths.target:
-        raise StateReadError('instance evidence does not match the target')
-    released = 0
-    with locked(paths.lock):
-        host = release_host(paths, evidence.generation)
-        if host != evidence.remote_host:
-            raise StateReadError('instance host evidence does not match the target')
-        current = {claim.path: claim for claim in read_claims(paths)}
-        for claim in evidence.claims:
-            if claim.path not in current or current[claim.path].record != claim.record:
-                continue
-            if not claim_matches_instance(claim, host, evidence.generation, evidence.state):
-                continue
-            proof: dict[str, object] = {'target': evidence.target, 'generation': evidence.generation,
-                     'remote_host': host, 'state': evidence.state, 'observed_at': evidence.observed_at,
-                     'path': str(claim.path), 'claim': dict(claim.record)}
-            (paths.directory / 'release-evidence').mkdir(parents=True, exist_ok=True)
-            write_json(paths.directory / 'release-evidence' / claim.path.name, proof)
-            claim.path.unlink(missing_ok=True)
-            released += 1
-    return released
 
 
 if __name__ == "__main__":

@@ -711,6 +711,9 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         return cast(str, values["variable"])
 
     def test_aws_block_uses_mac_idle_policy_without_target_idle_keys(self) -> None:
+        _ = write_config_fixture(self.root / "build_targets.conf", "\n".join((
+            "targets=mac,natedev,aws", "kind.aws=ssh", "platform.aws=linux", "settings.aws=aws_target.conf",
+        )))
         settings = self.root / "aws_target.conf"
         values = conf.read(settings).values()
         self.assertTrue(all(key not in values for key in (

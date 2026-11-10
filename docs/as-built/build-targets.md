@@ -14,7 +14,13 @@ A held target admits only work that its hold rules permit.
 
 ### Targets: `config/build_targets.conf` and `scripts/build_targets/target_config.py`
 
-- The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev,aws` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. AWS is `kind.aws=ssh`, `platform.aws=linux`, `settings.aws=aws_target.conf`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
+- `scripts/lib/conf.py` reads the config as `key=value` lines.
+  `targets=mac,natedev` lists the shipped targets in selection order.
+  natedev uses `kind.natedev=local` and `platform.natedev=linux`.
+  The Mac uses `kind.mac=ssh`, `platform.mac=macos`, and `settings.mac=mac_test.conf`.
+  `config/mac_test.conf` retains the Mac settings.
+  The user removed the permanent AWS builder.
+  Cloud gates remain separate from this target registry.
 - `target_config.py` reads configuration through `scripts.lib.conf` without importing coordination state readers.
   `LocalTarget(name, platform)` and `SshTarget(name, platform, settings)` form the `Target` union.
   `Platform` is `linux` or `macos`. `ConfigError` aliases `conf.Unusable`.
@@ -25,7 +31,14 @@ A held target admits only work that its hold rules permit.
   `BUILD_TARGETS_CONFIG` selects private test configuration.
 
 - `targets.py` re-exports those names, so callers import them from one place. `build_hold.py` imports `read_targets` from `target_config` directly; going through `targets` would form the import cycle `build_hold` → `targets` → `build_hold`.
-- A new `ssh` target is a new entry plus its own settings file, and it reuses the same runner (probe, copy, run, release). `mac_test.state_paths(target)` gives each target its own claim, block and backoff state: the Mac keeps `~/.local/state/mac-test`, and every other target uses `~/.local/state/build-targets/<target>/`. The AWS target is one such entry; see [builds-aws-target.md](builds-aws-target.md).
+- A new `ssh` target needs a registry entry and its own settings file.
+  It reuses the configured runner for probes, copies, execution, and release.
+  `mac_test.state_paths(target)` resolves each registered target's claim, block, and backoff state.
+  The Mac uses `~/.local/state/mac-test`.
+  Other targets use `~/.local/state/build-targets/<target>/`.
+  The former AWS target has no shipped registry entry.
+  Cloud gates and teardown read the AWS state folder without target registration.
+  [AWS cloud gates and the former build target](builds-aws-target.md) describes that state.
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
@@ -95,7 +108,7 @@ The target table supplies each remote target's platform.
 3. Run other steps on the first eligible target in configured order.
 
 `test`, `check`, `doc`, `example`, and lint judgments use this order from their first step.
-The default order is Mac, natedev, AWS.
+The default order is Mac, then natedev.
 `--target <name>` pins movable steps to one target and waits for it.
 `--mac "<reason>"` pins movable steps to the Mac.
 `--local "<reason>"` pins all steps to natedev.

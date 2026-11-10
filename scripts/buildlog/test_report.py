@@ -385,7 +385,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(lines[lines.index("### Tests by target") + len(targets)], "### Mac")
         _ = index.update()
         with closing(index.read_only()) as connection:
-            self.assertEqual(report.mac_section(connection, local_day(STAMP)) + ["Mac copies: none started.", ""], mac)
+            self.assertEqual(report.mac_section(connection, local_day(STAMP)), mac)
+            self.assertEqual(self.section_lines(text, "### AWS")[-2:], ["Mac copies: none started.", ""])
             nextest_runs = cast(int, connection.execute(
                 "SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'"
                 + " AND date(started_at, 'localtime') = ?", (local_day(STAMP),),
@@ -420,8 +421,9 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         self.assertEqual(
             self.section_lines(text, "### Mac"),
-            ["### Mac", "", "No steps recorded on the Mac.", "", "Mac copies: none started.", ""],
+            ["### Mac", "", "No steps recorded on the Mac.", ""],
         )
+        self.assertEqual(self.section_lines(text, "### AWS")[-2:], ["Mac copies: none started.", ""])
         self.assertIn("### nextest", text)
 
     def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
@@ -1731,7 +1733,9 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         lines = text.splitlines()
         mac = self.section_lines(text, "### Mac")
-        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### Mac copies")
+        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### AWS")
+        aws = self.section_lines(text, "### AWS")
+        self.assertEqual(lines[lines.index("### AWS") + len(aws)], "### Mac copies")
         section = self.section_lines(text, "### Mac copies")
         self.assertEqual(section[2], "| Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved"
                          + " | Mac time on copies that did not win |")

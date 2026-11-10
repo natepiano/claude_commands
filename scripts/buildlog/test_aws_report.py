@@ -106,17 +106,19 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual(sum(line.startswith("- mac (fixture-mac):") for line in output.splitlines()), 1)
         self.assertNotIn("Mac rows as of", output)
 
-    def test_report_renders_each_configured_aws_target_and_keeps_the_single_target_text(self) -> None:
-        original = self.render()
-        self.assertIn("### AWS\n", original)
-        self.assertIn("AWS: up 2.00 h", original)
+    def test_report_renders_one_aws_section_without_target_registration(self) -> None:
         registry = self.root / "build_targets.conf"
-        _ = registry.write_text(registry.read_text().replace("targets=natedev,mac,aws", "targets=natedev,mac,aws,backup")
-            + "kind.backup=ssh\nplatform.backup=linux\nsettings.backup=aws_target.conf\nsync.hosts.backup=aws-backup\n")
-        output = self.render()
-        self.assertIn("### AWS: aws", output)
-        self.assertIn("### AWS: backup", output)
-        self.assertEqual(sum(line.startswith("AWS: up ") for line in output.splitlines()), 2)
+        fixture = registry.read_text()
+        shipped = (Path(__file__).resolve().parents[2] / 'config/build_targets.conf').read_text()
+        for source, configuration in (('fixture', fixture), ('shipped', shipped)):
+            with self.subTest(configuration=source):
+                _ = registry.write_text(configuration)
+                original = self.render()
+                self.assertIn("### AWS\n", original)
+                self.assertIn("AWS: up 2.00 h", original)
+                self.assertEqual(sum(line.startswith("AWS: up ") for line in original.splitlines()), 1)
+                self.assertLess(original.index("### Mac\n"), original.index("### AWS\n"))
+                self.assertLess(original.index("### AWS\n"), original.rindex("Mac copies: none started."))
         account = self.root / 'account/aws_target.conf'
         account.parent.mkdir()
         _ = account.write_bytes(self.settings.read_bytes())
@@ -169,8 +171,10 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("after go-live: 10.0 min", line)
 
     def test_mixed_host_report_uses_the_required_lead_and_preserves_negative_run_savings(self) -> None:
+        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
+        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
         self.comparison_rows()
-        self.write_records(self.attempt(), self.call("fallback-call"), self.remote_step())
+        self.write_records(self.attempt(), self.call("fallback-call"), self.remote_step(target=""))
         output = self.render()
         self.assertIn("### AWS", output)
         self.assertIn("AWS: up 2.00 h, 1 steps, about 0.08 h of queue wait saved for $2.00 ($24.00 per saved hour, estimated).", output)
@@ -213,6 +217,8 @@ class AwsReportTests(MeasurementFixture):
                 self.assertIn('for $22.00', output)
 
     def test_daily_charge_reconciliation_changes_cost_once_and_shows_its_difference(self) -> None:
+        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
+        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
         at = NOW + 86400
         result = measurement.read_charges(self.settings, self.state, at, self.charge_fetch(Decimal(3)))
         reading = narrow(self, result, measurement.ChargeRead)
@@ -282,7 +288,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("20.0 min", line)
         self.assertNotIn("25:00", line)
 
-    def test_aws_failure_preserves_mac_success_and_labels_the_aws_data_time(self) -> None:
+    def test_aws_failure_preserves_mac_success_without_an_aws_data_sync_line(self) -> None:
         self.exchange("mac", ok=True, at=NOW - 180)
         self.exchange("aws", ok=True, at=NOW - 120)
         self.exchange("aws", ok=False, at=NOW - 60)
@@ -294,9 +300,8 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("buildlog sync", aws)
         self.assertIn("current", mac)
         self.assertIn("latest failure none", mac)
-        self.assertIn("AWS report data synchronized at", output)
-        expected = sync.sync_time(store.utc_iso(NOW - 120), datetime.fromtimestamp(NOW, UTC))
-        self.assertIn(f"AWS report data synchronized at {expected}", output)
+        self.assertNotIn("AWS report data synchronized at", output)
+        self.assertNotIn("AWS report data never synchronized", output)
 
     def test_mac_failure_does_not_mark_the_aws_exchange_as_failed(self) -> None:
         self.exchange("aws", ok=True, at=NOW - 120)
@@ -315,7 +320,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("latest failure", aws)
         self.assertIn("buildlog sync", aws)
         self.assertIn("never synchronized; run buildlog sync", self.peer_line(output, "mac"))
-        self.assertIn("AWS report data never synchronized", output)
+        self.assertNotIn("AWS report data never synchronized", output)
 
     def test_global_pause_names_resume_for_each_active_peer(self) -> None:
         self.exchange("aws", ok=True, at=NOW - 120)
