@@ -1777,8 +1777,16 @@ class StandingTests(unittest.TestCase):
         self.assertTrue((self.gates / "unit_name-gate").exists())
 
     def test_record_is_local_metadata_and_repeated_use_preserves_tree(self) -> None:
+        path_files = ("manifest.rs", "build.rs")
+        for name in path_files:
+            _ = (self.source / name).write_text('env!("CARGO_MANIFEST_DIR")\n')
+        _ = self.git(self.source, "add", "--", *path_files)
+        _ = self.git(self.source, "commit", "-qm", "add manifest path inputs")
+        self.head = self.git(self.source, "rev-parse", "HEAD")
         with copies.standing(self.owner_id, str(self.source), copies.CommittedSource(self.head)) as tree:
             stable_mtime = (tree / "stable.txt").stat().st_mtime_ns
+            for name in path_files:
+                os.utime(tree / name, ns=(1_500_000_000_000_000_000, 1_500_000_000_000_000_000))
             record = self.record(tree)
             self.assertEqual(record["owner"], self.owner_id)
             self.assertEqual(record["repo"], self.source.name)
@@ -1790,10 +1798,16 @@ class StandingTests(unittest.TestCase):
             self.assertIn(os.getpid(), record.values())
             self.assertIn("/.gate.json", (tree / ".git/info/exclude").read_text())
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
-        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as reused:
+        saved_times = copies.read_record(self.cache(tree)).tracked_times
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "color.grep",
+                                          "GIT_CONFIG_VALUE_0": "always"}), \
+                copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as reused:
             self.assertNotEqual(reused, tree)
             self.assertEqual(self.cache(reused), self.cache(tree))
             self.assertEqual((reused / "stable.txt").stat().st_mtime_ns, stable_mtime)
+            for name in path_files:
+                with self.subTest(file=name):
+                    self.assertGreater((reused / name).stat().st_mtime_ns, saved_times[name].mtime_ns)
             self.assertEqual(self.git(reused, "status", "--porcelain"), "")
         self.assertEqual(list((self.base / "old-copies").glob("**/.scratch.json")), [])
 

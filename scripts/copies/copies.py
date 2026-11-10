@@ -1135,9 +1135,10 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 mark_target(cache)
                 shutil.rmtree(tree / "target")
                 (tree / "target").symlink_to(cache / "target", target_is_directory=True)
+                path_files = manifest_path_files(tree)
                 for path, current in tracked_file_times(tree).items():
                     saved = previous.get(path)
-                    if saved is not None and saved.blob == current.blob:
+                    if saved is not None and saved.blob == current.blob and path not in path_files:
                         file = tree / path
                         os.utime(file, ns=(file.lstat().st_atime_ns, saved.mtime_ns), follow_symlinks=False)
             try:
@@ -1157,6 +1158,20 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
+
+
+def manifest_path_files(tree: Path) -> set[str]:
+    """Find tracked files that name Cargo's manifest path variable."""
+    timeout = load_config().git_timeout_seconds
+    try:
+        result = subprocess.run(["git", "-C", str(tree), "grep", "--no-color", "-l", "-z", "-F", "--",
+                                 "CARGO_MANIFEST_DIR"], capture_output=True, timeout=timeout,
+                                pass_fds=COMMAND_LOCKS.get())
+    except subprocess.TimeoutExpired as error:
+        raise CopyError(f"git grep in {tree}: timed out after {timeout:g} seconds") from error
+    if result.returncode not in (0, 1):
+        raise CopyError(f"git grep in {tree}: {result.stderr.decode(errors='replace').strip()}")
+    return {os.fsdecode(path) for path in result.stdout.split(b"\0") if path}
 
 
 def tracked_file_times(tree: Path) -> dict[str, TrackedFileTime]:
