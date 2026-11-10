@@ -1334,7 +1334,7 @@ class Deployment:
             removal.remember()
             with step('remove-builder', 'disabling builder routing', self.settings_path):
                 _ = removal.routing()
-            paths = mac_test.state_paths('aws')
+            paths = box.builder_state_paths()
             with mac_test.locked(paths.lock), control_lock(self.directory):
                 if box.running_claims(paths):
                     raise DeploymentRefused('AWS claims remain live; retry after their completion')

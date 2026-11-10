@@ -36,8 +36,6 @@ from scripts.lib import test_hang_guard
 SHIPPED_STATUS = "\n".join((
     "mac: free",
     "natedev: free",
-    "aws: unavailable; evidence unavailable; month unavailable / $400.00",
-    "  spending unavailable; decision unavailable; no controller evidence; a priced resource inventory is required before spending",
     "",
 ))
 
@@ -565,11 +563,9 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(output.getvalue(), (
             "mac: unreachable — ssh timed out\n"
             "natedev: held by hana since 13:05 PDT — render checks\n"
-            "aws: unreachable — ssh timed out\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
-                                  targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()

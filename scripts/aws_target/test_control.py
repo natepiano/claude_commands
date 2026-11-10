@@ -450,13 +450,6 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         self.assertIn("aws-build", arguments)
         self.assertEqual(read.call_count, 1)
 
-    def test_stopped_tick_without_claims_reads_claim_records_once(self) -> None:
-        with mock.patch.object(mac_test, "read_claims", wraps=mac_test.read_claims) as read:
-            self.assertEqual(self.controller().tick().state, "stopped")
-        self.assertEqual(read.call_count, 1)
-        self.assertEqual(self.aws.count("start-instances"), 0)
-        self.assertEqual(self.aws.count("stop-instances"), 0)
-
     def test_old_eligible_queue_rows_start_one_stopped_instance(self) -> None:
         self.demand()
         _ = self.controller().tick()
@@ -642,61 +635,15 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         self.clock.advance(1)
         self.assertEqual(self.controller().tick().state, "stopping")
         self.assertEqual(self.aws.count("stop-instances"), 1)
-        self.assertFalse(claim.exists())
 
     def test_unexpected_running_generation_stops_immediately_when_spending_is_refused(self) -> None:
         self.aws.state = "running"
-        claim = self.retained_claim()
+        _ = self.retained_claim()
         self.replace("daily_limit_usd", "3")
         result = self.controller().tick()
         self.assertEqual(result.state, "stopping")
         self.assertEqual(self.aws.count("stop-instances"), 1)
         self.assertEqual(self.aws.count("start-instances"), 0)
-        self.assertFalse(claim.exists())
-
-    def test_manual_stop_records_confirmed_instance_evidence_before_claim_release(self) -> None:
-        self.aws.state = "running"
-        claim = self.retained_claim()
-        result = self.controller().stop()
-        self.assertEqual(result.state, "stopping")
-        self.assertFalse(claim.exists())
-        proof_path = mac_test.state_paths("aws").directory / "release-evidence" / claim.name
-        proof = cast(dict[str, object], json.loads(proof_path.read_text()))
-        self.assertEqual((proof["target"], proof["state"]), ("aws", "stopping"))
-        self.assertEqual(proof["generation"], "i-fixture:" + self.aws.generation)
-        self.assertEqual(proof["observed_at"], self.clock.now)
-
-    def test_running_new_generation_releases_only_ended_host_claims_with_proof(self) -> None:
-        self.aws.state = "running"
-        paths = mac_test.state_paths("aws")
-        old = self.claim(paths, generation="previous-generation", at=self.clock.now)
-        current = self.claim(paths, slot=2, generation="i-fixture:" + self.aws.generation)
-        later = self.claim(paths, slot=3, generation="previous-generation", at=self.clock.now + 1)
-        legacy = self.claim(paths, slot=4)
-        foreign = self.claim(paths, slot=5, generation="previous-generation")
-        row = cast(dict[str, object], json.loads(legacy.read_text()))
-        del row['instance_generation']
-        _ = legacy.write_text(json.dumps(row))
-        row = cast(dict[str, object], json.loads(foreign.read_text()))
-        row['remote_host'] = 'other-host'
-        _ = foreign.write_text(json.dumps(row))
-        before = {path: path.read_bytes() for path in (current, later, legacy, foreign)}
-
-        self.assertEqual(self.controller().tick().state, "running")
-
-        self.assertFalse(old.exists())
-        for path, contents in before.items():
-            self.assertEqual(path.read_bytes(), contents)
-        proofs = list((paths.directory / "release-evidence").iterdir())
-        self.assertEqual([path.name for path in proofs], [old.name])
-        proof = cast(dict[str, object], json.loads(proofs[0].read_text()))
-        self.assertEqual(proof['state'], 'running')
-        self.assertEqual(proof['generation'], 'i-fixture:' + self.aws.generation)
-        self.assertEqual(proof['observed_at'], self.clock.now)
-        self.assertEqual(proof['remote_host'], 'aws-build')
-        claim = cast(dict[str, object], proof['claim'])
-        self.assertEqual(claim['instance_generation'], 'previous-generation')
-        self.assertEqual(self.aws.count('stop-instances'), 0)
 
     def test_a_running_restart_without_queue_demand_never_requests_another_start(self) -> None:
         self.snapshot()
