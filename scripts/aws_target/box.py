@@ -31,6 +31,11 @@ from scripts.mac_test import linux_runner, offload, mac_test
 IMAGE_OWNER_TAG = 'aws-build-image'
 
 
+def builder_state_paths() -> mac_test.StatePaths:
+    """Resolve the former builder's claims and locks without target registration."""
+    return mac_test.StatePaths(target_config.ssh_target_state_directory('aws'), 'aws', platform='linux')
+
+
 def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]:
     """Read remote job claims whose owner process still runs without deleting claims."""
     return tuple(claim for claim in mac_test.read_claims(paths)
@@ -39,9 +44,9 @@ def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]
 
 def close_routing(settings: Path) -> bool:
     """Disable AWS routing while excluding new claims."""
-    path = target_config.ssh_target_state_directory('aws') / 'routing.json'
+    paths = builder_state_paths()
+    path = paths.directory / 'routing.json'
     desired: dict[str, object] = {'enabled': False, 'settings': str(settings.resolve())}
-    paths = mac_test.state_paths('aws')
     with mac_test.locked(paths.lock):
         changed = not path.exists() or json_record(path.read_text()) != desired
         if changed:
