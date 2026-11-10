@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
@@ -378,7 +379,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",
             "XDG_STATE_HOME": str(self.root / "state"),
             "CODEX_CONFIG_FILE": str(self.root / "absent"), "CODEX_MODELS_CACHE_FILE": str(self.root / "absent"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "synced"),

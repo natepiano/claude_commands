@@ -26,6 +26,7 @@ import unittest
 from unittest import mock
 import zlib
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
 from scripts.lib import conf, process_group
@@ -398,12 +399,16 @@ class HanaShotTest(BuildLogIsolatedTest):
         return [cast(dict[str, object], json.loads(line)) for line in self.timings.read_text().splitlines()]
 
     def script_environment(self, session_variables: dict[str, str] | None = None) -> dict[str, str]:
+        cache_home = self.scratch / "cache"
         environment = {
             **os.environ,
-            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "XDG_CACHE_HOME": str(cache_home),
             # RemoteTests puts its fake scp and ssh here.
             "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         }
+        # Keep the blocked cache in the timing-write failure test.
+        if not cache_home.exists() or cache_home.is_dir():
+            environment.update(interpreter_cache_environment(cache_home))
         for name in ("CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             _ = environment.pop(name, None)
         if session_variables is not None:

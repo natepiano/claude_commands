@@ -20,6 +20,7 @@ from collections.abc import Iterable, Iterator
 from types import ModuleType
 from unittest.mock import patch
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.usage import collect as collector
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -164,6 +165,7 @@ class CollectorFixture(unittest.TestCase):
         shutil.rmtree(self.fixture_root)
         _ = shutil.copytree(self.fixture_seed, self.fixture_root)
         self.root = self.fixture_root
+        _ = cast(object, self.enterContext(patch.dict(os.environ, interpreter_cache_environment(self.root / "cache"))))
         self.state = self.root / "state"
         self.db_path = self.state / "usage.db"
         self.bind_sources()

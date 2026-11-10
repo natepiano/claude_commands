@@ -1,6 +1,7 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import step_estimator
 from scripts.lib import test_phase
 
@@ -376,7 +377,7 @@ class AdmissionFixture(ExitStack):
             "BUILDLOG_RUN": "",
             "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
-            "HOME": str(self.root)}
+            "HOME": str(self.root), **interpreter_cache_environment(self.root / "cache")}
         self.enter_context(mock.patch.dict(os.environ, environment))
         if not (self.root / "build_admission.conf").exists():
             write_memory_config(self.root / "build_admission.conf")
@@ -889,7 +890,7 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     if not launcher.exists():
         launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
-    for key in ("USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+    for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())

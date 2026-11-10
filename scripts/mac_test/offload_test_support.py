@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast, override
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
 from scripts.copies.copies_test_support import copies_environment
 
@@ -292,7 +293,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_config()
         self.sync_fixture()
         self.environment = {
-            **os.environ,
+            **os.environ, **interpreter_cache_environment(self.root / "cache"),
             **config_environment(self.root),
             **copies_environment(self.root),
             "HOME": str(self.root / "home"),
