@@ -33,7 +33,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, conf, copy_record, file_lock, scratch
+from scripts.lib import build_folders, conf, copy_record, file_lock, git_index, scratch
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -229,7 +229,7 @@ def staged_tree(source: Path) -> str:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
         private = temporary / "index"
         if index.exists():
-            _ = shutil.copyfile(index, private)
+            git_index.private_copy(index, private)
         result = subprocess.run(["git", "-C", str(source), "write-tree"],
                                 env={**os.environ, "GIT_INDEX_FILE": str(private)},
                                 capture_output=True, timeout=load_config().git_timeout_seconds)
