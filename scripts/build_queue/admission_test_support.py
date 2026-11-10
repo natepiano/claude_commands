@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.build_queue import step_estimator
 from scripts.lib import test_phase
 
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -683,6 +682,8 @@ class AdmissionFixture(ExitStack):
         _ = (path.parent / "memory.current").write_text(str(used))
 
     def history(self) -> list[dict[str, object]]:
+        from scripts.build_queue import step_estimator
+
         path = self.state_dir / "anon_peaks.jsonl"
         return list(step_estimator.anonymous_history_rows(path))
 

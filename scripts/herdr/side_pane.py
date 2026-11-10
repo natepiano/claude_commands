@@ -17,6 +17,7 @@ from time import monotonic
 from typing import Literal, cast, final, get_args
 
 from scripts.herdr import herdr, worker_panes
+from scripts.herdr import herdr_types
 from scripts.lib import conf, nix_env
 from scripts.production import staff
 from scripts.agents import stop_resume
@@ -102,7 +103,7 @@ def _find(client: herdr.Herdr, panes: list[herdr.PaneIdentity], caller: CallerPa
         if isinstance(activity, herdr.PaneAtShell):
             return StoppedSidePane(identity, terminal)
         return OpenSidePane(identity, terminal)
-    except (herdr.HerdrFailure, OSError, ValueError) as error:
+    except (herdr_types.HerdrFailure, OSError, ValueError) as error:
         return _note(client, identity, str(error))
 
 
@@ -238,7 +239,7 @@ def main(arguments: list[str] | None = None) -> int:
     except SidePaneRefused as error:
         print(str(error), file=sys.stderr)
         return worker_panes.ExitCode.REFUSED
-    except (herdr.HerdrFailure, conf.Unusable, OSError, ValueError) as error:
+    except (herdr_types.HerdrFailure, conf.Unusable, OSError, ValueError) as error:
         print(f"anomaly: {args.label}: {error}; pane retained", file=sys.stderr)
         return worker_panes.ExitCode.UNCERTAIN
 

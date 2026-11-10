@@ -159,17 +159,6 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("10.0 s", output)
         self.assertEqual([row[0] for row in token.waits], [60.0])
 
-    def test_noon_go_live_splits_waits_within_the_same_day(self) -> None:
-        self.write_records(
-            self.local_step("before-noon", 60, 10, started_at=store.utc_iso(NOW - 1)),
-            self.local_step("after-noon", 600, 10, started_at=store.utc_iso(NOW + 1)),
-        )
-        _ = (self.state / "go-live.json").write_text(json.dumps({"at": NOW}))
-        output = self.render()
-        line = next(line for line in output.splitlines() if line.startswith("Natedev daily summed"))
-        self.assertIn("before go-live: 1.0 min", line)
-        self.assertIn("after go-live: 10.0 min", line)
-
     def test_mixed_host_report_uses_the_required_lead_and_preserves_negative_run_savings(self) -> None:
         shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
         _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
@@ -179,7 +168,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("### AWS", output)
         self.assertIn("AWS: up 2.00 h, 1 steps, about 0.08 h of queue wait saved for $2.00 ($24.00 per saved hour, estimated).", output)
         self.assertIn("Estimated run time saved: -0.01 h", output)
-        self.assertIn("unmatched for load", output)
+        self.assertNotIn("go-live", output)
 
     def test_missing_comparisons_show_unavailable_instead_of_a_saving(self) -> None:
         self.write_records(self.attempt(), self.call("fallback-call"), self.remote_step())
@@ -271,22 +260,6 @@ class AwsReportTests(MeasurementFixture):
                     output = self.render('2026-01-16')
                 self.assertNotIn(f'AWS bill (account, UTC {DAY},', output)
                 self.assertIn('estimated from configured prices', output)
-
-    def test_daily_queue_comparison_names_the_unmatched_load(self) -> None:
-        self.write_records(
-            self.local_step("before", 600, 10, started_at=store.utc_iso(MIDNIGHT - 3600)),
-            self.local_step("after", 1200, 10),
-            self.local_step("excluded-aws", 90000, 10, caller="verify-linux", host="aws-build", target="aws"),
-        )
-        _ = (self.state / "go-live.json").write_text(json.dumps({"at": MIDNIGHT}))
-        output = self.render()
-        self.assertIn("Natedev daily summed queue wait before go-live:", output)
-        self.assertIn("after go-live:", output)
-        self.assertIn("unmatched for load", output)
-        line = next(line for line in output.splitlines() if line.startswith("Natedev daily summed"))
-        self.assertIn("10.0 min", line)
-        self.assertIn("20.0 min", line)
-        self.assertNotIn("25:00", line)
 
     def test_aws_failure_preserves_mac_success_without_an_aws_data_sync_line(self) -> None:
         self.exchange("mac", ok=True, at=NOW - 180)

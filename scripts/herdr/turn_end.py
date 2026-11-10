@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.direct import progress_history
+from scripts.herdr import herdr_types
 from scripts.lib import atomic_file, scratch
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, worker, worker_admission
@@ -150,7 +151,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
         try:
             result = (worker.dispatch_turn(parent.id, state, client, delivery.line, delivery.completion_id, run=run)
                       if isinstance(state, worker_panes.OpenWorker) else worker.ExitCode.UNCERTAIN)
-        except (OSError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(str(error), file=sys.stderr)
             result = worker.ExitCode.UNCERTAIN
     if result is worker.DispatchSubmission.SUBMITTED:
@@ -214,7 +215,7 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
                 astra_roles.release(delivery.actions.held_role)
             completion = replace(completion, role_released=True)
             progress_history.save_hook_completion(run, instance, completion)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
             staff.StaffRefused, staff.StaffUnreadable) as error:
         details.append(_kept_pane_anomaly(row, state, str(error)))
     if not completion.recording_done:
@@ -257,7 +258,7 @@ def finish_late_completion(row: staff.StaffRow, parent: staff.StaffRow, hold: wo
                                replace(delivery, actions=replace(delivery.actions, end_worker=False)),
                                replace(completion, pane_closed=True,
                                        role_released=completion.role_released or same_hold, details=details), state, hold)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
             staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"anomaly: {row.name}: late result of pass {instance} was not reported: {error}; the result is in {completion.reply_file}", file=sys.stderr)
 
@@ -424,7 +425,7 @@ def main(arguments: list[str] | None = None) -> int:
             with cast(io.BufferedWriter, child.stdin) as stream:
                 _ = stream.write(payload.encode())
         return 0
-    except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr_types.HerdrFailure) as error:
         print(f"turn_end: {error}", file=sys.stderr)
         return 1
 

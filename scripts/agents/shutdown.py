@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, cast
 
 from scripts.accounts import accounts
+from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
@@ -463,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 record = staff.initial_snapshot()
                 rows = restart.live_rows(record, herdr.Herdr(herdr.shared_session()), save_tabs=True)
-            except (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
                 print(f"restart: save anomaly: {error}", file=sys.stderr)
             shutdown_record.update(started=[], pending=[str(row.id) for row in rows])
             print(f"saved {len(rows)} rows for restart at {time.strftime('%H:%M')}", flush=True)
@@ -771,7 +772,7 @@ def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: st
         raise
     except ProcessLookupError:
         return []
-    except (OSError, ValueError, RetirementRefused, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, RetirementRefused, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         return [f"{description} works inside {unit.worktree}; stop it first: {error}"]
     deadline = min(time.monotonic() + duration, operation_limit)
     def still_running() -> bool:
@@ -1088,7 +1089,7 @@ def unit_local_command() -> int:
                     _ = unit_config.write_parked(row.id, replace(config, retired=facts))
             else:
                 raise ValueError("unknown remote lifecycle action")
-        except (OSError, ValueError, herdr.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
             result["code"] = 1
             print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}")
     result["output"] = output.getvalue()
@@ -1110,7 +1111,7 @@ def retirement_stop_members(row: staff.StaffRow, record: staff.StaffSnapshot) ->
                 reasons.append(f"{member.name}: {outcome.reason}")
             elif isinstance(outcome, stop_resume.SessionNotFound):
                 reasons.append(f"{member.name}: no session on this machine")
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             reasons.append(f"{member.name}: {' '.join(str(error).splitlines())}")
     stop_reasons = stop_resume.stop_unit_workers(row.id, record)
     reasons.extend(stop_reasons)
@@ -1133,7 +1134,7 @@ def retirement_pane(row: staff.StaffRow, record: staff.StaffSnapshot) -> Retirin
                 if not terminal:
                     raise ValueError(f"{session}:{identity}: terminal identity is unavailable")
                 return RetiringPane(session, identity, terminal)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         print(f"anomaly: {row.name}: cannot read its pane: {error}")
     return herdr.NoPane(row.name)
 
@@ -1144,7 +1145,7 @@ def retirement_idle_shell(place: RetiringPane | herdr.NoPane, pid: int) -> bool:
     try:
         return (pane_record.pane_shell_pid(herdr.HerdrPlace(place.session, place.pane)) == pid
                 and isinstance(herdr.Herdr(place.session).pane_activity(place.pane), herdr.PaneAtShell))
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
         return False
 
 
@@ -1158,7 +1159,7 @@ def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane) -> None:
             print(f"anomaly: {place.session}:{place.pane}: foreground work keeps the pane open")
         elif not client.close_retained_pane(place.pane, terminal=place.terminal):
             print(f"anomaly: {place.session}:{place.pane}: pane close is not confirmed")
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         print(f"anomaly: {place.session}:{place.pane}: pane close failed: {error}")
 
 def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, record: staff.StaffSnapshot,
@@ -1760,7 +1761,7 @@ def rename_repair_displays(row: staff.StaffRow) -> bool:
         for kind in ("claude", "codex"):
             try:
                 native_sessions.add(client.native_session(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS))
-            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
                 continue
         if native_sessions != {row.current_session}:
             if pane.get("session_id") == row.current_session:
@@ -1812,7 +1813,7 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
                 changed = True
         try:
             changed = rename_repair_displays(row) or changed
-        except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound, herdr_types.HerdrFailure) as error:
             print(f"anomaly: set_displays: {error}", file=sys.stderr)
             changed = True
         print("done" if changed else "unchanged")
@@ -1865,7 +1866,7 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
         row = rename_owner(row, request.name)
         try:
             changed = rename_repair_displays(row) or changed
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: display: {error}", file=sys.stderr)
             changed = True
         if isinstance(movement, (unit_move.FolderMove, unit_move.PendingRename)):
@@ -1884,7 +1885,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr.HerdrFailure) as error:
+        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

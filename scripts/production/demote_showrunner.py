@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.accounts import accounts
+from scripts.herdr import herdr_types
 from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
@@ -294,7 +295,7 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
     if completed < Step.STARTED:
         try:
             started = launch(request)
-        except (OSError, ValueError, Refusal, accounts.AccountsError, herdr.HerdrFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
+        except (OSError, ValueError, Refusal, accounts.AccountsError, herdr_types.HerdrFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
             print(f"{request.child.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
             started = 1
         if started:
@@ -367,7 +368,7 @@ def main(argv: list[str]) -> int:
             except (Refusal, unit_config.ConfigRefused) as error:
                 print(f"demote_showrunner: {error}", file=sys.stderr)
                 return 2
-            except (OSError, ValueError, accounts.AccountsError, update_registration.RegistrationFailure, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, accounts.AccountsError, update_registration.RegistrationFailure, herdr_types.HerdrFailure) as error:
                 print(f"demote_showrunner: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 return 1
     return staff.cli_result(run)

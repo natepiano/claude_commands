@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, Protocol, cast
 
 from scripts.accounts import outage_alerts, role_map
+from scripts.herdr import herdr_types
 from scripts.production import showrunners, staff
 from scripts.whoami import account
 from scripts.agents import stop_results
@@ -157,7 +158,7 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
         production = parent.name if parent is not None else ""
         try:
             entry = pane_record.launch_for_session(member.current_session)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             report_failure(f"watchdog: {production}/{member.name} session {member.current_session}: {error}")
             continue
         if entry is None or entry.get("ended", False):
@@ -199,7 +200,7 @@ def _restart(label: str, identity: str, source: str) -> str:
         return (result.reason
                 if isinstance(result, stop_results.ResumeFailed)
                 else f"{identity}: no pane launch")
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         return str(error)
 
 
@@ -400,11 +401,11 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         # Save ownership before detaching; a later pass never starts a second copy.
                         _write_state({**state, **retained})
                         _start_recovery(source, job, min(limits.dispatch_seconds, remaining))
-                    except (OSError, ValueError, herdr.HerdrFailure) as error:
+                    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                         # Preserve incomplete observations, then continue with the next unit.
                         retained.update({key: value for key, value in state.items() if key not in retained})
                         lines.append(f"watchdog: {runner['name']}/{unit}: {error}")
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 # Keep pending recovery evidence when discovery is incomplete.
                 retained.update({key: value for key, value in state.items() if key not in retained})
                 lines.append(f"watchdog: {runner['name']}: {error}")

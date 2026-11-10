@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
 from scripts.herdr import herdr, herdr_sessions
+from scripts.herdr import herdr_types
 from scripts.production import add_unit, add_showrunner
 from scripts.notify import review
 from scripts.notify.user_action import NoActionRequired
@@ -105,7 +106,7 @@ class HerdrLaunchTests(NixFixture):
     def test_choke_point_keeps_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),
               patch.object(herdr, "open_tab", return_value="new-pane"),
-              patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start refused")),
+              patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start refused")),
               patch.object(herdr, "close_agent") as close):
             result = herdr.launch_agent("host", "space", "title", str(self.work), {}, "codex", [],
                                         herdr.NoOpeningPrompt(), 100, agent="fixture")

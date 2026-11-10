@@ -373,11 +373,9 @@ Unbilled days use the label `estimated from the newest bill` when a bill exists.
 Spot compute includes the older Spot builder when it uses the same instance type.
 The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
 Reports read local evidence without an AWS call or a coordination file.
-`go-live.json` records the first permitted running observation for the wait comparison.
 
 `### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
 Missing comparisons remain unavailable. Run time differences can remain negative.
-The daily wait comparison remains unmatched for load.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.

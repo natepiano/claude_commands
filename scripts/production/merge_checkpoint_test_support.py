@@ -42,7 +42,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host, staff
 from scripts.message import sessions
-from scripts.herdr.herdr import NATIVE_ID_MARKS
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, production_membership, unit_membership
 
 
@@ -151,7 +151,7 @@ with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
-from scripts.herdr.herdr import NATIVE_ID_MARKS
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 
 def git(*arguments):
     return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
