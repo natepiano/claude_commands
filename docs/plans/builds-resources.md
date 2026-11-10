@@ -2161,7 +2161,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Ruled out:** a full target remove when the trim leaves the target over budget, because it empties the warm cache; `sweep.py --target-dir` as the Mac entry, because `main()` also runs the host floor by hostname.
 
-### Phase 100 — Each hana CI cargo build waits in the build admission queue  · status: todo
+### Phase 100 — Each hana CI cargo build waits in the build admission queue  · status: done
 
 **Depends on:** Phase 101 on main, queue's 10d (landed 2026-11-10, e9fe34ff1, on main). **Approved:** builds showrunner, 2026-11-10 ("(a), current. Add the phase before Phase 88 and start now."). Source: natedev, 2026-11-10: modules/linux/hana-runners.nix (nixos main ef7b41c) has no ci_cargo_front, ADMISSION_SOCKET, socket group or BindPaths.
 
