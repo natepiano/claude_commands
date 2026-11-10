@@ -2193,25 +2193,22 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 101 — The CI cargo front takes a shared folder for its counter files  · status: done
 
-**Depends on:** none. Phase 100 waits on this phase, because the nixos flake lock can pin only a commit on main. Source: Phase 100 review, 2026-11-10: `nix develop` sets `TMPDIR` to a private `0700` folder, so the admission service cannot read the counter files. Fast track refused this change: the front imports a refused module through its imports.
+#### As-built
 
-#### Work Order
-
-**Goal:** A hana CI cargo call under `nix develop` writes its counter files in a folder the admission service can read, and cargo keeps the job's own environment.
-
-**Spec:**
-
-1. **The argument.** `scripts/build_queue/ci_cargo_front.py` takes an optional `--shared-folder <folder>` after `--front`. The temporary counter folder is made inside that folder. Without the argument, the front uses the default temporary folder.
-2. **The child environment.** The argument changes no environment variable. Cargo receives the job's `TMPDIR` and `PYTHONPATH`.
-3. **The packaged form.** The front runs as `python3 -I <root>/scripts/build_queue/ci_cargo_front.py --front "$0" --shared-folder <folder> -- "$@"`, with no `PYTHONPATH` set by the wrapper.
-4. **Proof.** The packaged wrapper test in `scripts/build_queue/test_ci_cargo_front.py` uses this form. It asserts that the reservation's sidecar is inside the shared folder, that cargo receives the job's `TMPDIR` and `PYTHONPATH`, and that the shared folder is empty after the release.
+- `scripts/build_queue/ci_cargo_front.py` takes `--shared-folder <folder>` after `--front`. `run_cargo` makes its temporary counter folder inside that folder. Without the argument, `JobTemporaryFolder` selects the default temporary folder.
+- The argument changes no environment variable. Cargo receives the job's `TMPDIR` and `PYTHONPATH`.
+- The packaged form is `python3 -I <root>/scripts/build_queue/ci_cargo_front.py --front "$0" --shared-folder <folder> -- "$@"`, with no `PYTHONPATH` from the wrapper. `scripts/lib/package_root.py`, executed at the top of the front, puts the checkout root on `sys.path`.
+- `test_packaged_wrapper_selects_the_next_cargo_and_admits_once` runs this form with and without the argument. It asserts the counter location, the job's `TMPDIR` and `PYTHONPATH`, empty folders after release and one history row.
 
 **Files:**
-- `scripts/build_queue/ci_cargo_front.py`
-- `scripts/build_queue/test_ci_cargo_front.py`
-- `docs/as-built/build-memory-admission.md`
+- `scripts/build_queue/ci_cargo_front.py` — the argument and the folder choice.
+- `scripts/build_queue/test_ci_cargo_front.py` — the packaged wrapper test.
+- `docs/as-built/build-memory-admission.md` — the shared folder, the private `TMPDIR`, the runner folder and the age rule.
 
-**Workers:** `1 writer`
-- `impl` owns the two Python files. The director owns the as-built text.
+**Binds later work:** the runner activation pins a `claude-commands` commit on main that holds `--shared-folder`.
 
-**Gate:** `scripts.build_queue.test_ci_cargo_front` passes; basedpyright reports no errors and no warnings on both Python files; the targeted test passes.
+**Gotchas:**
+- `nix develop` replaces `TMPDIR` with a private `nix-shell.*` folder at mode 0700, so `TMPDIR` cannot name files the admission service reads.
+- `~/.claude/scripts/lib/py -m` imports the installed main. Run checkout-only test support with the checkout's `scripts/lib/py`.
+
+**Ruled out:** a runner `TMPDIR` for the counter files, because `nix develop` replaces it; `python3 -m` for the packaged form, because hana has a top-level `scripts/` folder and cwd comes first.
