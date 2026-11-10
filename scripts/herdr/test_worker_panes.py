@@ -315,6 +315,9 @@ class PaneWorld(herdr.Herdr):
             source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
             if not source.read_text():
                 write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+            entry = pane_launch.launch(pane, identity, str(prepared.directory), prepared.env,
+                                       [kind, *agent_arguments], kind="codex")
+            pane_launch.write(pane_launch.record_directory() / f"{self.session}.json", entry)
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
