@@ -33,43 +33,10 @@ The sdlc showrunner, 2026-11-10: "a fault in scripts/lib/main_sync.py, reported 
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a checkout whose every change already equals origin/main advances to origin/main. A checkout with a real local edit still blocks as `dirty` and stays unchanged.
-
-**Spec:**
-
-1. Apply the new path only where `sync` now returns `dirty`: after the fetch, after the `diverged` check, and only when HEAD is an ancestor of origin/main.
-2. Collect the candidate paths:
-   - every tracked path whose index entry or working file differs from HEAD;
-   - every untracked file at a path that origin/main has and HEAD does not have.
-3. A candidate path is an interrupted write when its working state equals origin/main at that path:
-   - same content and same file mode; or
-   - the file is absent and origin/main has no file there.
-   A candidate whose working state equals HEAD is not a change and does not count.
-4. When each candidate path is an interrupted write:
-   - Put each tracked candidate back to its HEAD state in the index and the working tree.
-   - Remove each untracked candidate file. origin/main holds the same file, so the merge writes it again.
-   - Then run the existing `git merge --ff-only`. Git keeps its own guard over every other file.
-   - The outcome is `ADVANCED`. Its detail names the range and says that the run finished an interrupted update.
-5. When any candidate path differs from origin/main, return `dirty` as now. Change no file.
-6. Paths that equal HEAD and differ at origin/main are files the update did not reach. Leave them; the merge writes them.
-7. Add rows to the existing tests. Add no other check.
-   - In `test_it_fast_forwards_and_leaves_untracked_files`: origin/main changes one file, adds one file and removes one file. The checkout holds the changed file and the new untracked file at their origin/main content. The removed file is still present. `sync` returns `ADVANCED`, HEAD is the origin/main tip, the status is clean, and `session-state.json` stays.
-   - In `test_each_blocked_case_leaves_the_checkout_alone`: one changed file equals origin/main, and one other file has a real local edit. `sync` returns `dirty`, and both files keep their content.
-8. Update the module docstring for the new path.
-
-**Files:**
-- `scripts/lib/main_sync.py` — the interrupted-write proof and the restore before the merge
-- `scripts/lib/test_main_sync.py` — the new rows
-
-**Workers:** 1 writer — one small change in one module.
-- `impl` — the files above.
-
-**State:** the run changes files in a live checkout. It restores only files proved equal to origin/main, so a stop before the merge leaves a clean checkout at HEAD and the next run advances it.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- The Test command above passes.
-- `basedpyright scripts/lib/main_sync.py scripts/lib/test_main_sync.py` gives `0 errors, 0 warnings, 0 notes`.
+- `sync` in `scripts/lib/main_sync.py` runs the proof when the status shows changed tracked files, or when an untracked file is at a path that origin/main adds.
+- A candidate is proved when its working file equals origin/main in content and mode, or is absent where origin/main has no file. A path under a file counts as absent. A tracked candidate's index entry must equal HEAD or origin/main.
+- When every candidate is proved, `sync` removes the proved untracked files, restores the tracked files to HEAD, and runs `git merge --ff-only`. The detail says `finished an interrupted update`.
+- Any unproved candidate returns `dirty`, and no file changes. Git output keeps the bytes of each file name.
+- Rows in `test_it_fast_forwards_and_leaves_untracked_files` and `test_each_blocked_case_leaves_the_checkout_alone` cover the half-done update, a retry after a stopped restore, a directory replaced by a file, a staged edit and a real local edit.
