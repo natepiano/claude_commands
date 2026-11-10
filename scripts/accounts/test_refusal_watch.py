@@ -2630,6 +2630,7 @@ class RefusalWatchTests(unittest.TestCase):
             {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
              "payload": {"type": "task_complete", "error": {"message": "You've hit your usage limit."}}},
         ), (
+            {"type": "event_msg", "payload": {"type": "task_started"}},
             {"type": "event_msg", "payload": {"type": "user_message", "message": "continue"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "message": "I checked the usage limit."}},
             {"type": "response_item", "payload": {"type": "message", "role": "assistant",
