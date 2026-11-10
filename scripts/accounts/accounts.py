@@ -41,6 +41,7 @@ SCRIPTS = REPOSITORY_ROOT / "scripts"
 _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 
 from scripts.whoami import account  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
@@ -1688,7 +1689,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
         if name.startswith("SHOWRUNNER_"):
             _ = environment.pop(name, None)
     if probe:
-        from scripts.herdr.herdr import NATIVE_ID_MARKS
+        from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 
         environment[PROBE_ENV] = "1"
         for name in NATIVE_ID_MARKS:
@@ -2914,8 +2915,6 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
 def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
     """Preview workers after the caller checks the destination."""
     from scripts.production import staff, session_staff
-    from scripts.herdr import herdr
-
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
     record = staff.local_snapshot()
     family = "codex" if _label_is(target, "codex") else "claude"
@@ -2929,7 +2928,7 @@ def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
         try:
             run = pane_moves.run_for_worker(row, record)
             decision = pane_moves.preview_worker(row, record, target, why, run)
-        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
             decision = SessionMoveRefused(row.id, str(error).replace("\n", " "))
         if isinstance(decision, stop_results.ClaudeUp) or isinstance(decision, SessionMoveRefused) and decision.returncode == 0:
             nothing += 1
@@ -2945,12 +2944,11 @@ def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
 def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.StaffSnapshot,
                      target: str, why: str) -> SessionMoveOutcome:
     from scripts.production import staff
-    from scripts.herdr import herdr
 
     try:
         run = pane_moves.run_for_worker(row, record)
         return pane_moves.move_worker(row, record, target, why, run)
-    except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
         return SessionMoveRefused(row.id, str(error).replace("\n", " "))
 
 
@@ -5059,7 +5057,7 @@ def _local_codex_processes() -> dict[str, CodexRoleProcess]:
 
     try:
         agents = herdr.Herdr(herdr.shared_session()).agents()
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         agents = []
     activities: dict[str, Literal["busy", "idle"]] = {
         agent["agent_session"].session_id: "busy" if agent["agent_status"] == herdr.AgentStatus.WORKING else "idle"

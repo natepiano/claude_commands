@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
+from scripts.herdr import herdr_types
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -2043,7 +2044,7 @@ class RosterTests(unittest.TestCase):
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
         worker["cwd"] = str(self.home / "projects" / "unit-one")
         _ = worker_path.write_text(json.dumps(worker), encoding="utf-8")
-        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         director = next(entry for entry in found.entries if entry.name == "director")
         worker_entry = next(entry for entry in found.entries if entry.name == "claude-worker")
@@ -2479,7 +2480,7 @@ class RosterTests(unittest.TestCase):
         record = staff.snapshot()
         with (mock.patch.object(staff, "snapshot", return_value=record),
               mock.patch.object(sys, "platform", "darwin"),
-              mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")),
+              mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
             result = roster.roster(os.environ, roster.ThisMachine())
         director = next(row for row in result.entries if row.name == "director")
@@ -2496,7 +2497,7 @@ class PaneRosterTests(StaffTestCase):
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
-             mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), \
+             mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), \
              mock.patch.object(account, "process_config_dir", return_value=None), \
              mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())

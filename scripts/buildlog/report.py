@@ -2355,21 +2355,6 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
         for spend in spends:
             if spend.source == 'AWS bill' or (current_report and spend.day == today):
                 lines.extend(aws_report.spend_lines(spend, daily_limit, today=spend.day == today))
-        if isinstance(snapshot.go_live_at, int):
-            boundary = store.utc_iso(snapshot.go_live_at)
-            periods: list[list[object]] = []
-            for relation in ('<', '>='):
-                rows = fetch(connection, "SELECT sum(coalesce(mem_wait_s,0)) FROM steps WHERE "
-                             + natedev_step_predicate() + f' AND started_at {relation} ?'
-                             + " GROUP BY date(started_at,'localtime') ORDER BY date(started_at,'localtime')", boundary)
-                periods.append([row[0] for row in rows])
-            before, after = periods
-            lines.append('Natedev daily summed queue wait before go-live: '
-                         + (', '.join(seconds(value) for value in before) if before else 'unavailable')
-                         + '; after go-live: ' + (', '.join(seconds(value) for value in after) if after else 'unavailable')
-                         + '; unmatched for load.')
-        else:
-            lines.append('Natedev daily queue wait before and after go-live: unavailable; unmatched for load.')
     return [*lines, '']
 
 

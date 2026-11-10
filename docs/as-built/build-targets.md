@@ -36,6 +36,7 @@ A held target admits only work that its hold rules permit.
   `mac_test.state_paths(target)` resolves each registered target's claim, block, and backoff state.
   The Mac uses `~/.local/state/mac-test`.
   Other targets use `~/.local/state/build-targets/<target>/`.
+  `BUILD_TARGETS_STATE_DIR` changes the root, and tests use it.
   The former AWS target has no shipped registry entry.
   Cloud gates and teardown read the AWS state folder without target registration.
   [AWS cloud gates and the former build target](builds-aws-target.md) describes that state.

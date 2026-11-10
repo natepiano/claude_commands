@@ -13,6 +13,7 @@ from typing import final, override
 from unittest import mock
 
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.herdr import herdr_types
 from scripts.production.fake_unit_host import PaneShellFixture
 from scripts.production import unit_move
 from scripts.herdr import herdr
@@ -83,7 +84,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
     def test_a_pane_already_gone_counts_as_closed(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
-        gone = herdr.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
+        gone = herdr_types.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
         with (mock.patch.object(herdr.Herdr, 'pane_activity', return_value=herdr.PaneAtShell()),
               mock.patch.object(herdr.Herdr, 'panes', side_effect=[
                   [{'pane_id': 'w1:p1', 'terminal_id': 'unit-terminal', 'workspace_id': 'w1', 'session_id': None}], []]),
@@ -101,7 +102,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
-        failure = herdr.HerdrFailure('fixture close failed')
+        failure = herdr_types.HerdrFailure('fixture close failed')
         run = herdr.Herdr.run
         def fail_close(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
             if arguments == ('pane', 'close', 'w1:p1'):

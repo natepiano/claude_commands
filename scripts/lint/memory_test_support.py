@@ -6,12 +6,10 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from scripts.build_hold.override_guard import require_checkout
+
 if TYPE_CHECKING:
-    from scripts.build_hold.override_guard import require_checkout
-    from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
-else:
-    from scripts.build_hold.override_guard import require_checkout
-    from scripts.build_queue.admission_records import read_memory_config as read_fixture_config
+    from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
 
 require_checkout(Path(__file__))
 
@@ -24,8 +22,10 @@ def admission_configuration_fixture() -> MemoryConfig:
     """Read the fixed test settings with the original configuration reader."""
     from unittest.mock import patch
 
+    from scripts.build_queue.admission_records import read_memory_config
+
     with patch.dict(os.environ, {"CONF_DIR": str(ADMISSION_CONFIG_FIXTURE.parent)}):
-        return read_fixture_config(report=False)
+        return read_memory_config(report=False)
 
 
 def admission_policy_fixture() -> AdmissionPolicy:

@@ -15,7 +15,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -32,7 +31,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, cl
 from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf
+from scripts.lib import conf, git_index
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
@@ -444,7 +443,7 @@ def working_tree(repo: Path) -> tuple[str, set[str]]:
         return gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}'), dirty
     with tempfile.TemporaryDirectory(prefix='cloud-gate-index-') as temporary:
         index = Path(temporary) / 'index'
-        _ = shutil.copyfile(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index'), index)
+        git_index.private_copy(Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index')), index)
         environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
         _ = subprocess.run(['git', 'add', '-A'], cwd=repo, env=environment, check=True, capture_output=True)
         tree = subprocess.run(['git', 'write-tree'], cwd=repo, env=environment, check=True, capture_output=True, text=True)

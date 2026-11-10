@@ -413,11 +413,11 @@ class NewestExchange:
 
 @dataclass(frozen=True)
 class NoExchange:
-    """No readable user or assistant entry is present in the transcript."""
+    """The transcript has no readable exchange or turn start."""
 
 
 def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchange:
-    """Read the newest user or assistant turn, ignoring trailing bookkeeping."""
+    """Read the newest exchange or turn start and ignore later bookkeeping."""
     try:
         with path.open("rb") as source:
             position = source.seek(0, os.SEEK_END)
@@ -441,7 +441,7 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                         if isinstance(payload, dict):
                             message = cast(dict[str, object], payload)
                             if (entry.get("type") == "event_msg" and (message.get("type") in (
-                                    "user_message", "agent_message", "error")
+                                    "user_message", "agent_message", "error", "task_started")
                                     or message.get("type") == "task_complete" and isinstance(message.get("error"), dict)) or
                                     entry.get("type") == "response_item" and message.get("type") == "message"
                                     and message.get("role") in ("user", "assistant")):

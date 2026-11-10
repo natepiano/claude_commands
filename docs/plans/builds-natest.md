@@ -2476,3 +2476,50 @@ A changed shell script now selects the tests of every script that calls it, dire
 **Gotchas:** `~/.claude/scripts/lib/py -m` imports main's code from a worktree; run local tests with the worktree's `scripts/lib/py`.
 
 **Ruled out:** Python files as callers (a `board.sh` change would select 521-575 modules). A changed Python file that a shell script runs still selects only its importers and the tests that name it.
+
+### Phase 124 — Test modules start faster because three test-support files load their heavy imports only when used  · status: done
+
+#### As-built
+
+Three test-support files load their heavy imports at the function that uses them, in the phase 117 form. `memory_test_support.py` imports `read_memory_config` in `admission_configuration_fixture`. `queue_fixture.py` imports `roster` and `UnitLabels` in `QueueFixture.__init__`, and `head_facts` and `queue_view` in `model`; it keeps `queue_view` and `UnitLabels` under `TYPE_CHECKING`. `admission_test_support.py` imports `step_estimator` in `history`. A paired import scan of 745 gate test modules, phase base against the change, measured 149.8 to 117.0 and 143.2 to 115.2 CPU s: about 30 CPU s saved per gate. 440 modules load less, and the classes built fell from 428,232 to 322,648. The targeted gate passed 109 of 109 modules.
+
+**Files:**
+- `scripts/lint/memory_test_support.py` — delayed `admission_records` import
+- `scripts/build_queue/queue_fixture.py` — delayed `roster`, `unit_labels`, `head_facts` and `queue_view` imports
+- `scripts/build_queue/admission_test_support.py` — delayed `step_estimator` import
+
+**Gotchas:** Dataclass creation is about two thirds of test-module import CPU, so a cut is worth the classes it skips. `-X importtime` names only the first loader of a module; use paired CPU scans to rank a cut.
+
+**Ruled out:** a dataclass code cache in the module runner, because it replaces a private stdlib name; a delayed `pane_record` import in `staff_test_support.py`, because its isolation patches `RECORD_DIR` only when that module is already loaded.
+
+### Phase 125 — Message sends and test modules start faster because roster, pane records and unit lookup load the herdr client only when they call it  · status: done
+
+#### As-built
+
+New `scripts/herdr/herdr_types.py` holds the one definition and the one import path of `HerdrFailure`, `HerdrMissing` and `NATIVE_ID_MARKS`. `herdr.py` imports them for its own use and does not re-export them; all 53 caller files, production code and tests, read them from `herdr_types`. `roster.py`, `pane_record.py` and `unit_lookup.py` take `HerdrPlace` from `place.py`, keep annotation-only names under `TYPE_CHECKING`, and import `herdr` in each function that calls the client. Importing any of the three loads no `scripts.herdr.herdr`. A paired import scan of 745 gate test modules found 201 modules that load less, and the classes built fell from 322,685 to 304,696. Those modules saved 8.3 and 5.8 CPU s, about 7 CPU s per gate. A roster read, which each `send.py` roster lookup pays, saved 31-41 ms of a 258-302 ms median at host load above 40.
+
+**Files:**
+- `scripts/herdr/herdr_types.py` — new; failure types and native ID marks
+- `scripts/herdr/herdr.py` — imports the moved names; no re-export
+- 53 caller files across `production`, `herdr`, `agents`, `message`, `accounts`, `hooks`, `direct`, `lib` and `hana_instances` — read the moved names from `herdr_types`
+- `scripts/message/roster.py`, `scripts/agents/pane_record.py`, `scripts/production/unit_lookup.py` — delayed `herdr` imports
+- `scripts/herdr/test_herdr.py`, `scripts/production/unit_status_test_support.py` — isolated-copy lists add `herdr_types.py`
+- `scripts/production/test_unit_lookup.py` — reads `unit_lookup.HerdrPlace`
+
+**Gotchas:** One owner switches all callers: a re-export kept for old callers is a forbidden shim (builds, 2026-11-10). `staff.py` loads `herdr_types` through its lazy `import_module` form. A test that copies `herdr.py` to an isolated folder must also copy `herdr_types.py`. `send.py` loads `roster` lazily, so its bare start does not change. The `-X importtime` self cost overstated the gain by about half, because other paths still load part of the same closure.
+
+**Ruled out:** a split of `admission_records.py` now, because alone it is under the bar and the queue unit has phases there; it is in the next items.
+
+### Phase 126 — A targeted test reads the same working tree each time, so its cloud snapshot check no longer fails at random  · status: done
+
+#### As-built
+
+A private copy of the git index now keeps the mtime of the bytes it copies, so git keeps its racy-entry check. Before, `cloud_gate.working_tree` used `shutil.copyfile`. The copy got a new mtime, and git skipped a same-size edit made in the clock tick of the last index write. This gave the flaky `test_merge_gate_suites` tree mismatch. In 3,300 local repeats, `copyfile` gave 6 stale trees, and a copy that keeps the mtime gave none. New `scripts/lib/git_index.private_copy(source, destination)` opens the index once, takes `fstat` of that file, copies its bytes, and sets the copy's mtime from the same `fstat`. All six Python private index copies call it. `validate_ci.sh` `worktree_tree` copies from one file descriptor and takes the time with `touch -r /dev/fd/3`.
+
+**Files:**
+- `scripts/lib/git_index.py` — new; `private_copy`
+- `scripts/aws_target/cloud_gate.py`, `scripts/hooks/checkpoint_gate.py` (two copies), `scripts/lib/models_registry.py`, `scripts/copies/copies.py` (`staged_tree`), `scripts/style/style_footprint.py` (`worktree_commit`) — call `private_copy`
+- `scripts/validate_and_push/validate_ci.sh` — descriptor copy; ShellCheck removed two unused bindings
+- `scripts/aws_target/test_cloud_gate.py`, `scripts/lib/test_git_index.py`, `scripts/validate_and_push/test_rerun.py` — one regression each; each fails with the old copy
+
+**Gotchas:** `shutil.copy2` is not enough. It stats the path again after the read, and git replaces the index by rename, so a rewrite between the two gives old bytes with a newer mtime. Do not copy a git index with `cp` or `shutil.copyfile`; use `git_index.private_copy`. The macOS run of the `validate_ci.sh` regression is not verified.

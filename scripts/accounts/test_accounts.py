@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
+from scripts.herdr import herdr_types
 from scripts.whoami.note_file import note_name
 
 import ast
@@ -7537,7 +7538,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
         row = self.worker()
         self.dispatch(row)
-        with patch.object(worker_panes, "start_or_resume", side_effect=herdr.HerdrFailure("fixture start failed")):
+        with patch.object(worker_panes, "start_or_resume", side_effect=herdr_types.HerdrFailure("fixture start failed")):
             result = self.move("claude2")
         self.assertEqual(result.returncode, 1)
         self.assertIn("fixture start failed", result.stderr)
