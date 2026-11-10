@@ -16,7 +16,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 from scripts.message import sessions
 from scripts.message import process_identity
 from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name

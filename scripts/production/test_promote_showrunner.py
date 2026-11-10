@@ -22,7 +22,7 @@ from unittest import mock
 from scripts.production import add_showrunner
 from scripts.production import promote_showrunner
 from scripts.production import showrunners, worker
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.production import showrunner_tree
 from scripts.production import unit_effort
 from scripts.production import unit_lookup

@@ -241,7 +241,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/shutdown/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
    Update the two caller-plan examples to name the installed merge gate with `--checkout <tree>`.
 6. Keep repository and step fields separate in service snapshots and queue queries.
@@ -278,8 +278,8 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
 - `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/golden/` — display tests and goldens.
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
-- `scripts/message/top_level.py`, `scripts/shutdown/shutdown.py` — installed hold writer routing.
-- `scripts/message/test_top_level.py`, `scripts/shutdown/test_shutdown_cli.py` — caller tests.
+- `scripts/message/top_level.py`, `scripts/agents/shutdown.py` — installed hold writer routing.
+- `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
 - `scripts/production/dailies_render.py` — `NoCycle` from `read_cycle()` in the hold lines.
 - `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py` — hold line tests.
 - `docs/plans/builds-production.md`, `docs/plans/build-followups-worker-seats.md` — installed merge-gate examples.

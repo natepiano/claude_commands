@@ -19,7 +19,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import cloud_gate, gate_box, ledger
-from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli
+from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
@@ -49,6 +49,9 @@ class FakeGateAws:
         self.upload_error: str = ''
         self.upload_timeout: bool = False
         self.launch_timeouts: int = 0
+        self.launch_errors: list[subprocess.SubprocessError] = []
+        self.launch_reply: dict[str, object] = {'Instances': [{'InstanceId': 'i-fixture'}]}
+        self.describe_errors: list[AwsUnavailable | subprocess.TimeoutExpired] = []
         self.read_timeouts: int = 0
         self.billing_pages: list[dict[str, object]] = []
 
@@ -73,8 +76,10 @@ class FakeGateAws:
             if self.launch_timeouts:
                 self.launch_timeouts -= 1
                 raise subprocess.TimeoutExpired('aws run-instances', 1)
+            if self.launch_errors:
+                raise self.launch_errors.pop(0)
             error = self.refusals.pop(0) if self.refusals else ''
-            reply = {'Instances': [{'InstanceId': 'i-fixture'}]}
+            reply = self.launch_reply
         elif operation == 'get-object':
             if self.read_timeouts:
                 self.read_timeouts -= 1
@@ -90,6 +95,8 @@ class FakeGateAws:
         elif operation == 'terminate-instances':
             self.terminated = True
         elif operation == 'describe-instances':
+            if self.describe_errors:
+                raise self.describe_errors.pop(0)
             state = 'terminated' if self.terminated and self.confirm_termination else self.state
             instance: dict[str, object] = {'InstanceId': 'i-fixture', 'State': {'Name': state},
                                           'LaunchTime': '2026-01-15T00:00:00+00:00'}
@@ -253,7 +260,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                          cloud_progress.CloudProgress('setup', 32, 0, 1))
         self.assertEqual(cloud_gate.log_cloud_progress('Runner: 3 modules, whole machine, 16 CPUs\n', 32, 2),
                          cloud_progress.CloudProgress('running', 16, 0, 2))
-        self.fake.refusals = ['InsufficientInstanceCapacity'] * 3
+        self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 3
         with mock.patch.object(cloud_progress, 'publish', wraps=cloud_progress.publish) as publish:
             self.assertEqual(self.execute()['status'], 'complete')
         sizes = [cast(cloud_progress.CloudProgress, call.args[1]).size_vcpus for call in publish.call_args_list]
@@ -298,7 +305,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertFalse(gate_box.decode_run(result['gate']).passed)
 
     def test_capacity_tries_every_zone_before_the_smaller_size(self) -> None:
-        self.fake.refusals = ['InsufficientInstanceCapacity'] * 3
+        self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 3
         self.assertEqual(self.execute()['status'], 'complete')
         choices = [(row['InstanceType'], ledger.rows(row, 'NetworkInterfaces')[0]['SubnetId'])
                    for row in self.fake.launches]
@@ -306,7 +313,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                                    ('m7a.4xlarge', 'fixture-a'), ('m7a.4xlarge', 'fixture-b')])
 
     def test_all_capacity_refusals_allow_local_fallback(self) -> None:
-        self.fake.refusals = ['InsufficientInstanceCapacity'] * 4
+        self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 4
         with redirect_stdout(StringIO()) as output:
             self.assertEqual(self.execute()['status'], 'fallback')
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
@@ -362,9 +369,21 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.fake.upload_error = 'EndpointConnectionError'
         self.assertEqual(self.execute()['status'], 'fallback')
         self.assertEqual(self.fake.launches, [])
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent(int(self.now)))
+
+    def test_saved_variant_without_arguments_records_absence_before_launch(self) -> None:
+        self.fake.launch_timeouts = 1
+        self.assertEqual(self.execute()['status'], 'fallback')
+        cloud_gate.save(self.folder / 'launch.json', {'variant': 1})
+        self.fake.launches.clear()
+        with mock.patch.object(gate_box, 'presign', side_effect=OSError('Cannot prepare the launch')):
+            self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(self.fake.launches, [])
+        self.assertEqual(cloud_gate.read(self.folder / 'launch.json'), {'variant': 1})
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent(int(self.now)))
 
     def test_missing_image_allows_fallback(self) -> None:
-        self.fake.refusals = ['InvalidAMIID.NotFound']
+        self.fake.refusals = ['An error occurred (InvalidAMIID.NotFound) when calling the RunInstances operation: fixture']
         self.assertEqual(self.execute()['status'], 'fallback')
 
     def test_access_denial_allows_local_fallback(self) -> None:
@@ -386,13 +405,103 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(len(self.fake.launches), 2)
         self.assertEqual(self.fake.launches[0], self.fake.launches[1])
 
-    def test_uncertain_launch_releases_reservation_before_local_fallback(self) -> None:
+    def test_uncertain_launch_keeps_reservation_before_local_fallback(self) -> None:
         self.fake.launch_timeouts = 1
         self.assertEqual(self.execute()['status'], 'fallback')
-        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
         self.assertEqual(self.execute()['status'], 'complete')
         self.assertEqual(self.fake.launches[0], self.fake.launches[-1])
         self.assertEqual(len(self.book.read_snapshot().gate_reservations), 1)
+
+    def test_uncertain_launch_subprocess_error_keeps_reservation(self) -> None:
+        self.fake.launch_errors = [subprocess.CalledProcessError(1, 'aws run-instances')]
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        self.assertFalse(self.fake.terminated)
+
+    def test_uncertain_launch_cli_error_keeps_reservation(self) -> None:
+        reasons = [('Read timeout on endpoint URL: "https://fixture"', 1), ('run-instances: invalid reply', 1)]
+        reasons.extend((f'An error occurred ({code}) when calling the RunInstances operation: fixture',
+                        cloud_gate.settings().whole('launch_reply_tries'))
+                       for code in ('InternalFailure', 'ServerInternal', 'Unavailable'))
+        for reason, tries in reasons:
+            with self.subTest(reason=reason):
+                self.fake.refusals = [reason] * tries
+                self.fake.launches.clear()
+                self.assertEqual(self.execute(), {'status': 'fallback', 'reason': reason})
+                self.assertEqual(len(self.fake.launches), tries)
+                self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+                self.assertFalse(self.fake.terminated)
+
+    def test_uncertain_launch_reply_keeps_reservation(self) -> None:
+        replies: tuple[dict[str, object], ...] = (
+            {}, {'Instances': []}, {'Instances': [{'InstanceId': 'i-first'}, {'InstanceId': 'i-second'}]})
+        for reply in replies:
+            with self.subTest(reply=reply):
+                self.fake.launch_reply = reply
+                self.assertEqual(self.execute()['status'], 'fallback')
+                self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+                self.assertFalse(self.fake.terminated)
+        self.assertEqual(len(self.fake.launches), len(replies))
+
+    def test_uncertain_launch_log_write_error_keeps_reservation(self) -> None:
+        with mock.patch.object(cloud_gate.GateWorker, 'record_launch', side_effect=OSError('Cannot write the launch log')):
+            self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        self.assertFalse(self.fake.terminated)
+
+    def test_uncertain_launch_outage_reconciles_a_running_instance_at_expiry(self) -> None:
+        tries = cloud_gate.settings().whole('launch_reply_tries')
+        self.fake.refusals = ['EndpointConnectionError'] * tries
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(len(self.fake.launches), tries)
+        self.assertTrue(all(row == self.fake.launches[0] for row in self.fake.launches))
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        self.advance(1200)
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+        worker.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateRunning('i-fixture'))
+        query = self.fake.commands[-1]
+        self.assertEqual(query[query.index('--filters') + 1], 'Name=tag:GateAttempt,Values=attempt')
+
+    def test_uncertain_launch_timeout_reconciles_no_instance_at_expiry(self) -> None:
+        self.fake.launch_timeouts = 1
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        self.fake.has_instance = False
+        self.advance(1200)
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+        worker.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent(int(self.now)))
+        query = self.fake.commands[-1]
+        self.assertEqual(query[query.index('--filters') + 1], 'Name=tag:GateAttempt,Values=attempt')
+
+    def test_expired_uncertain_launch_keeps_reservation_until_reconciliation(self) -> None:
+        self.fake.launch_timeouts = 1
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.fake.has_instance = False
+        self.advance(1200)
+        outcome = self.execute()
+        self.assertEqual(outcome, {'status': 'fallback', 'reason': 'The expired launch remains unconfirmed'})
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        for error in (subprocess.TimeoutExpired('aws describe-instances', 1),
+                      AwsUnavailable('EndpointConnectionError')):
+            with self.subTest(error=type(error).__name__):
+                self.fake.describe_errors = [error]
+                self.assertEqual(self.execute()['status'], 'fallback')
+                self.assertEqual(len(self.fake.launches), 1)
+                self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+    def test_unauthorized_launch_records_absence_at_once(self) -> None:
+        self.fake.refusals = ['An error occurred (UnauthorizedOperation) when calling the RunInstances operation: fixture']
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent(int(self.now)))
 
     def test_invalid_result_identity_verdict_or_modules_is_rejected(self) -> None:
         for field, value in (('attempt', 'other'), ('tree', 'other'), ('commit', 'other'),

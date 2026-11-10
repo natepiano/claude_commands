@@ -1,6 +1,8 @@
 # Worker launch failure
 
 <WorkerLaunchFailure>
+Check the local launcher, model, configuration, and publication fault before treating a provider message as the cause.
+A real `hit your usage limit` launch or turn failure turns on <NoWorkerMode/> in `commands/unit/direct.md`.
 `assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
 Each recorder slot counts as one worker, even when its pass records no worker name.
 For Claude, this slot must record a new `pass_started` event during the launch.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -26,7 +26,7 @@ from scripts.production import unit_lookup
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.herdr import HerdrPlace
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership, showrunner_relationship
 from scripts.production.unit_lookup import UnitState
 from scripts.production.dailies_input_test_support import (DailiesInputFixture, SCRIPT, SHIM, RENDERER, WAITING, STAMP, AT,

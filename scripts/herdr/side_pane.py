@@ -19,7 +19,7 @@ from typing import Literal, cast, final, get_args
 from scripts.herdr import herdr, worker_panes
 from scripts.lib import conf, nix_env
 from scripts.production import staff
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 
 SideCommand = Literal["open", "send", "close"]
 

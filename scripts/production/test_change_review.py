@@ -28,7 +28,7 @@ from scripts.lib import copy_record
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
@@ -1166,21 +1166,43 @@ class ReadyListTests(ProducerFixture):
         merged = self.merge_change("Change-Review: Plain | Read | Ready\n"
                                    + "Change-Review: Restarted | Open | New service | after restart")
         self.promote()
-        code, output, error = self.ready()
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
-        notices = [line for line in output.splitlines() if "restart" in line]
-        self.assertEqual(len(notices), 1)
-        self.assertIn(merged[:8], notices[0])
-        self.assertIn(f"live --merged {merged[:8]}", notices[0])
-        self.assertIn(f"--repo {self.repo}", notices[0])
-        self.assertIn("--production top", notices[0])
-        self.assertEqual(self.live(merged)[0], 0)
-        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain", "Restarted"])
-        written = self.listing.read_bytes()
-        self.assertEqual(self.live(merged)[0], 0)
-        self.assertEqual(self.ready()[0], 0)
-        self.assertEqual(self.listing.read_bytes(), written)
+        for layout in ("not-imported", "imported", "later-side-checkpoint"):
+            with self.subTest(layout=layout):
+                if layout == "imported":
+                    outside_doc = self.root / "outside.md"
+                    _ = outside_doc.write_text(f"# Outside\n- **Repository:** `{self.repo}`\n"
+                        + "- **Merge branch:** `outside-integration`\n"
+                        + f"- **Change review:** `{self.root / 'change-review - outside.md'}`\n")
+                    _ = recorded_showrunner("outside", outside_doc)
+                    _ = self.git("checkout", "-b", "outside-integration", "main")
+                    _ = self.git("commit", "--allow-empty", "-m", "Independent outside work")
+                    _ = self.git("merge", "--no-ff", "integration", "-m", "Import published work")
+                    _ = self.git("push", "origin", "outside-integration")
+                    _ = self.git("checkout", "integration")
+                elif layout == "later-side-checkpoint":
+                    _ = self.git("checkout", "-b", "later-side", "old-branch")
+                    _ = self.git("commit", "--allow-empty", "-m",
+                                 "checkpoint(old-branch): later phase\n\nChange-Review: none — fixture continuation")
+                    _ = self.git("checkout", "outside-integration")
+                    _ = self.git("merge", "--no-ff", "later-side", "-m", "Merge later phase")
+                    _ = self.git("push", "origin", "outside-integration")
+                    _ = self.git("checkout", "integration")
+                _ = self.listing.write_text(change_review.skeleton(self.listing, self.doc, change_review.today()))
+                code, output, error = self.ready()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
+                notices = [line for line in output.splitlines() if "restart" in line]
+                self.assertEqual(len(notices), 1)
+                self.assertIn(merged[:8], notices[0])
+                self.assertIn(f"live --merged {merged[:8]}", notices[0])
+                self.assertIn(f"--repo {self.repo}", notices[0])
+                self.assertIn("--production top", notices[0])
+                self.assertEqual(self.live(merged)[0], 0)
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain", "Restarted"])
+                written = self.listing.read_bytes()
+                self.assertEqual(self.live(merged)[0], 0)
+                self.assertEqual(self.ready()[0], 0)
+                self.assertEqual(self.listing.read_bytes(), written)
 
     def test_the_live_command_uses_tools_outside_the_production_repository(self) -> None:
         merged = self.merge_change("Change-Review: Restarted | Open | New service | after restart")

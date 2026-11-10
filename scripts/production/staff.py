@@ -157,7 +157,7 @@ def runtime_id(pid: int | None = None) -> str:
         if pid is not None or current <= 1:
             return ""
         try:
-            process_parent = cast(Callable[[int], int], import_module("scripts.shutdown.pane_record").process_parent)
+            process_parent = cast(Callable[[int], int], import_module("scripts.agents.pane_record").process_parent)
             current = process_parent(current)
         except worker_lifecycle.OperationDeadlineExpired:
             raise
@@ -729,7 +729,7 @@ def folder_move_path(unit: StaffId) -> Path:
 
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     return bool(_file_override()) or remote.other_machine() != OWNER_MACHINE
 
@@ -1154,7 +1154,7 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
 
 
 def _lookup(rows: list[StaffRow], target: str) -> StaffRow | None:
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     record = StaffSnapshot(tuple(rows))
     row = record.by_member_reference(target) or record.by_path(target)
@@ -1218,7 +1218,7 @@ def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
 def _copy_to_mac(*, detached: bool = True) -> None:
     """Send the latest default record under one lock, outside the writing process."""
     import subprocess
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     try:
         if "STAFF_FILE" in os.environ or remote.local_machine() != OWNER_MACHINE:

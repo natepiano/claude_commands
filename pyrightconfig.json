@@ -59,7 +59,7 @@
         "scripts/notify",
         "scripts/production",
         "scripts/lib",
-        "scripts/shutdown",
+        "scripts/agents",
         "scripts/herdr"
       ]
     },
@@ -89,7 +89,7 @@
         ".",
         "scripts/nightly_review",
         "scripts/herdr",
-        "scripts/shutdown",
+        "scripts/agents",
         "scripts/whoami",
         "scripts/lib"
       ]
@@ -102,7 +102,7 @@
         "scripts/production",
         "scripts/direct",
         "scripts/notify",
-        "scripts/shutdown",
+        "scripts/agents",
         "scripts/lib",
         "scripts/herdr"
       ]
@@ -166,7 +166,7 @@
         "scripts/mac_test",
         "scripts/message",
         "scripts/notify",
-        "scripts/shutdown",
+        "scripts/agents",
         "scripts/whoami",
         "scripts/lib",
         "scripts/herdr"
@@ -184,10 +184,10 @@
       ]
     },
     {
-      "root": "scripts/shutdown",
+      "root": "scripts/agents",
       "extraPaths": [
         ".",
-        "scripts/shutdown",
+        "scripts/agents",
         "scripts/whoami",
         "scripts/message",
         "scripts/notify",

@@ -182,8 +182,8 @@ Held actions and wording decisions follow the active list. Their reductions are 
 | 57 | Merge cases | mac_test/test_offload_forward.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | verify-unit |
 | 58 | Merge cases | notify/test_push_texts.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | messaging-unit |
 | 59 | Merge cases | screen_record/test_screen_record.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | owner unknown; former stalls-unit |
-| 60 | Merge cases | shutdown/test_pane_record.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | shutdown-unit |
-| 61 | Merge cases | shutdown/test_stop_resume.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | shutdown-unit |
+| 60 | Merge cases | agents/test_pane_record.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | shutdown-unit |
+| 61 | Merge cases | agents/test_stop_resume.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | shutdown-unit |
 | 62 | Merge cases | statusline/test_statusline.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | owner unknown |
 | 63 | Merge cases | style/test_bulk_constants.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | owner unknown |
 | 64 | Merge cases | style/test_standing_checkpoint.py | 2 → 1 | Table | Named table keepers below retain all inputs and assertions | 0 | owner unknown |
@@ -432,24 +432,24 @@ The class columns count original methods. They include the held candidates.
 | settings/test_settings_local_keys.py | 19 | 19 | 0 | 0 | 0 | 0 | 0 | 0 | 19 | 19 | 5.045 |
 | shot_report/test_shot_report.py | 47 | 47 | 0 | 0 | 0 | 0 | 0 | 0 | 47 | 47 | 2.578 |
 | shot_report/test_transcripts.py | 94 | 69 | 0 | 0 | 0 | 0 | 25 | 0 | 75 | 94 | 3.965 |
-| shutdown/test_account_move.py | 18 | 18 | 0 | 0 | 0 | 0 | 0 | 0 | 18 | 18 | 1.663 |
-| shutdown/test_deadline.py | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 8 | 8 | 0.471 |
-| shutdown/test_inventory.py | 57 | 57 | 0 | 0 | 0 | 0 | 0 | 0 | 57 | 57 | 8.645 |
-| shutdown/test_native_label_filtering.py | 3 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 | 0.441 |
-| shutdown/test_pane_record.py | 32 | 30 | 0 | 0 | 0 | 0 | 2 | 0 | 31 | 32 | 4.212 |
-| shutdown/test_pane_restore.py | 19 | 19 | 0 | 0 | 0 | 0 | 0 | 0 | 19 | 19 | 6.081 |
-| shutdown/test_probe_inventory.py | 2 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 2 | 1.692 |
-| shutdown/test_remote.py | 6 | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 | 6 | 0.988 |
-| shutdown/test_remote_control.py | 18 | 18 | 0 | 0 | 0 | 0 | 0 | 0 | 18 | 18 | 1.225 |
-| shutdown/test_restart.py | 69 | 69 | 0 | 0 | 0 | 0 | 0 | 0 | 69 | 68 | 2.513 |
-| shutdown/test_restart_support.py | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 4 | 0.258 |
-| shutdown/test_resume_command.py | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0.654 |
-| shutdown/test_send_guard.py | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 4 | 0.851 |
-| shutdown/test_shutdown_record.py | 5 | 5 | 0 | 0 | 0 | 0 | 0 | 0 | 5 | 5 | 0.887 |
-| shutdown/test_shutdown_status.py | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | 13 | 13 | 0.941 |
-| shutdown/test_stop_resume.py | 163 | 161 | 0 | 0 | 0 | 0 | 2 | 0 | 162 | 162 | 4.617 |
-| shutdown/test_support.py | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.828 |
-| shutdown/test_time_limit.py | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0.751 |
+| agents/test_account_move.py | 18 | 18 | 0 | 0 | 0 | 0 | 0 | 0 | 18 | 18 | 1.663 |
+| agents/test_deadline.py | 8 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 8 | 8 | 0.471 |
+| agents/test_inventory.py | 57 | 57 | 0 | 0 | 0 | 0 | 0 | 0 | 57 | 57 | 8.645 |
+| agents/test_native_label_filtering.py | 3 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 | 0.441 |
+| agents/test_pane_record.py | 32 | 30 | 0 | 0 | 0 | 0 | 2 | 0 | 31 | 32 | 4.212 |
+| agents/test_pane_restore.py | 19 | 19 | 0 | 0 | 0 | 0 | 0 | 0 | 19 | 19 | 6.081 |
+| agents/test_probe_inventory.py | 2 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 2 | 1.692 |
+| agents/test_remote.py | 6 | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 | 6 | 0.988 |
+| agents/test_remote_control.py | 18 | 18 | 0 | 0 | 0 | 0 | 0 | 0 | 18 | 18 | 1.225 |
+| agents/test_restart.py | 69 | 69 | 0 | 0 | 0 | 0 | 0 | 0 | 69 | 68 | 2.513 |
+| agents/test_restart_support.py | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 4 | 0.258 |
+| agents/test_resume_command.py | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0.654 |
+| agents/test_send_guard.py | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 4 | 0.851 |
+| agents/test_shutdown_record.py | 5 | 5 | 0 | 0 | 0 | 0 | 0 | 0 | 5 | 5 | 0.887 |
+| agents/test_shutdown_status.py | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | 13 | 13 | 0.941 |
+| agents/test_stop_resume.py | 163 | 161 | 0 | 0 | 0 | 0 | 2 | 0 | 162 | 162 | 4.617 |
+| agents/test_support.py | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.828 |
+| agents/test_time_limit.py | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0.751 |
 | statusline/test_statusline.py | 75 | 73 | 0 | 0 | 0 | 0 | 2 | 0 | 74 | 75 | 28.383 |
 | style/test_add_style.py | 31 | 31 | 0 | 0 | 0 | 0 | 0 | 0 | 31 | 31 | 49.221 |
 | style/test_approved_renames.py | 89 | 83 | 0 | 0 | 0 | 0 | 6 | 0 | 86 | 89 | 0.517 |
@@ -1662,7 +1662,7 @@ Retain these calls and assertions for each row: `assertEqual`, `tempfile.Tempora
 | `TranscriptTest.test_piped_hana_shot_counts_with_distinct_result_images` | Table | B078: the proposed keeper retains this complete case |
 | `TranscriptTest.test_piped_curl_shot_counts_one_image` | Table | B078: the proposed keeper retains this complete case |
 
-### shutdown/test_pane_record.py
+### agents/test_pane_record.py
 
 Owner: shutdown-unit. Declared methods: 32. After active actions: 31, estimate.
 
@@ -1677,7 +1677,7 @@ Retain these calls and assertions for each row: `assert_repair_recovers_history`
 | `PaneRecordTests.test_repair_recovers_history_and_staff_identity_without_changing_conversations` | Table | B079: the proposed keeper retains this complete case |
 | `PaneRecordTests.test_repair_recovers_identity_from_a_three_field_launch_without_name_or_cwd` | Table | B079: the proposed keeper retains this complete case |
 
-### shutdown/test_stop_resume.py
+### agents/test_stop_resume.py
 
 Owner: shutdown-unit. Declared methods: 163. After active actions: 162, estimate.
 

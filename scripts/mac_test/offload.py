@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 
 from scripts.mac_test import cargo_manifest
+from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
 
@@ -400,6 +401,10 @@ class OffloadConfig:
     @property
     def fetch_limit_mib(self) -> float:
         return float(self.values["fetch_limit_mib"])
+
+    @property
+    def abandoned_session_minutes(self) -> int:
+        return int(self.values["abandoned_session_minutes"])
 
     @property
     def mirror_busy_backoff_s(self) -> float:
@@ -1035,6 +1040,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     config = conf.read(settings)
     values = config.values()
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
+    values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
         enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
                  else config.text("offload") == "on"),
@@ -1474,6 +1480,8 @@ def linux_version_declined_recently(target: str, repository_name: str, hold_s: f
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     root = Path(__file__).resolve().parents[2]
     listing = controller.capture_copy(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
@@ -1500,7 +1508,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture_copy(["rsync", "-rlptc", "--compress", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
@@ -1800,12 +1808,13 @@ def remote_test_command(
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
     repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
-    elif any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
+    elif custom_target:
         cleanup_command = "echo mac_cleanup=skipped"
     else:
-        target = shlex.quote(mirror_target(repository, request.target, request.slot))
         floor = shlex.quote(f"{config.free_floor_gib:g}")
         cleanup_command = (
             'if free_gib=$(df -g "$HOME"); then '
@@ -1819,13 +1828,16 @@ def remote_test_command(
             + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
         )
+    abandoned_sessions = ""
+    if not custom_target:
+        abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     clear_environment = clear_environment + " && " if clear_environment else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "

@@ -289,9 +289,11 @@ class RemoteEntryTests(unittest.TestCase):
     def remove_trees_through_cli(self, owner: str) -> None:
         """Run the real remote CLI without another SSH interpreter."""
         def remote_cli(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-            command = shlex.split(arguments[-1])[2:]
-            return invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
-                              combined_output=not bool(options.get("capture_output")))
+            command = shlex.split(arguments[-1].partition("; copies_status=")[0])[2:]
+            answer = invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
+                                combined_output=not bool(options.get("capture_output")))
+            return subprocess.CompletedProcess(arguments, answer.returncode,
+                                               answer.stdout + f"\nrc={answer.returncode}\n", answer.stderr)
 
         with mock.patch.object(copies, "subprocess", SimpleNamespace(run=remote_cli)):
             copies.remove_trees(owner)
@@ -575,7 +577,7 @@ from scripts.mac_test import linux_runner
 root, exports = Path(sys.argv[1]), Path(sys.argv[2])
 print('RUNNER', os.getpid(), flush=True)
 values = dict(kinds='test', devshell='default', shell_cache='cache', shell_timeout_s='1',
-              build_budget_gib='20', target_budget_gib='10', free_floor_gib='1')
+              build_budget_gib='20', target_budget_gib='10', free_floor_gib='1', abandoned_session_minutes='1')
 with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner.ShellEnvironment('key', exports, exports)),
       mock.patch.object(linux_runner, 'permission_refused', return_value=False),
       mock.patch.object(linux_runner, 'output_free_bytes', return_value=100 * 1024**3),
