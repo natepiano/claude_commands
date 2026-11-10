@@ -36,35 +36,9 @@ The open minor: with a clean status and an untracked file at a path that origin/
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** each `dirty` detail names every file that blocks the update, and never shows an empty list.
-
-**Spec:**
-
-1. The proof collects every candidate path that fails it, in sorted order, instead of stopping at the first one. It still changes no file when any path fails.
-2. A path fails the proof when its working file differs from origin/main, or when its index entry differs from both HEAD and origin/main, or when its index entry is unmerged.
-3. The `dirty` detail names each failed path, separated by `, `. Candidate paths that equal origin/main do not block, so the detail does not name them.
-4. This covers a clean status with an untracked file at a path that origin/main adds: the detail names that file.
-5. When git cannot list the candidates (a failed query or a failed status), the detail gives git's first error line in place of the list. A detail never ends with an empty list `()`.
-6. The detail text: `<checkout> has local changes that block the update (<paths>)`.
-7. Add rows to the existing test `test_each_blocked_case_leaves_the_checkout_alone`:
-   - A clean status and an untracked file at a path that origin/main adds, with other content: `sync` returns `dirty`, the detail names that file, and the file keeps its content.
-   - Two blocked files and one file that equals origin/main: the detail names both blocked files and not the matching file.
-8. Keep each existing assertion. If an existing assertion checks the old detail text, update only its text and say so in the summary. Add no other check.
-9. Update the module docstring if it describes the detail.
-
-**Files:**
-- `scripts/lib/main_sync.py` — the collected failed paths and the detail
-- `scripts/lib/test_main_sync.py` — the new rows
-
-**Workers:** 1 writer — one small change in one module.
-- `impl` — the files above.
-
-**State:** none — the detail text is the only change; no record, mark or file write changes.
-
-**Constraints from prior phases:** the interrupted-update proof from the main sync interrupted update run stays as built.
-
-**Acceptance gate:**
-- The Test command above passes.
-- `basedpyright scripts/lib/main_sync.py scripts/lib/test_main_sync.py` gives `0 errors, 0 warnings, 0 notes`.
+- `_finish_interrupted_update` in `scripts/lib/main_sync.py` checks every candidate path and collects each path that fails the proof. Any failed path stops the restore, and no file changes.
+- The `dirty` detail reads `<checkout> has local changes that block the update (<paths>)`. It names each failed path, and never a path that equals origin/main.
+- A failed git query gives git's first error line in place of the list.
+- Rows in `test_each_blocked_case_leaves_the_checkout_alone` cover a clean status with an untracked file that differs from origin/main, and two blocked files beside one matching file.
