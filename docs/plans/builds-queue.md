@@ -1436,35 +1436,18 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** A touch step or a guard at each caller.
 
-### Phase 43 — The copies configuration is parsed only when its file changes  · status: todo
+### Phase 43 — The copies configuration is parsed only when its file changes  · status: done
 
-**Depends on:** Phase 42 on builds. Source: builds, 2026-11-09, from a style measurement relayed by sdlc.
+#### As-built
 
-#### Work Order
+- No code changed. A prototype added one cache of the parsed copies configuration and a public `ConfigRead` method in `scripts/lib/conf.py`. The gain did not pay for them, so the prototype did not land.
+- Same load, 14,425 `copies.load_config` calls on the real config, old and new code one after the other, five runs each: 0.71 to 0.75 CPU seconds before and 0.24 to 0.25 after. The saving is about 0.5 CPU seconds per `test_crate_run` run.
+- `cProfile` reports 5.9 CPU seconds for the same calls. Most of that cost is profiler overhead.
+- `module_cost.py` on `style/test_crate_run.py`, three runs on each tree: the before mean is 59.974 CPU seconds (spread 1.657) and the after mean is 32.222 (spread 12.277). A machine load change caused most of that difference.
 
-**Goal:** A process that reads the copies configuration many times parses the file once.
+**Gotchas:** `module_cost.py` runs made at different machine loads cannot show a gain of this size. Run the old and new code one after the other. A cache of these settings must ask `ConfigRead` about recovery, because a text comparison of `values()` with the stored settings treats a host override as a recovered value and a recovered value with equal text as a live value. Its key must also hold the host name, and validation must run at each use.
 
-**Spec:**
-
-1. Measure first. style measured 13,288 `copies.load_config` calls in one `test_crate_run` run, at 6.19 CPU seconds in-process. Repeat a measurement on the unchanged tree with `scripts/test_times/module_cost.py`, so that the before and after figures use one method.
-2. Add one cache in `scripts/copies/copies.py`, at the source. No caller keeps its own copy.
-3. A value is read at use, so an edit to the file takes effect at the next call in a running process. The cache key holds every input of the result: the `COPIES_CONFIG` path, `CONF_DIR`, `HOME`, and the inode, size and `mtime_ns` of each file the read uses.
-4. An invalid configuration is never cached. Each call raises `CopyError` as it does today.
-5. The cached value cannot be changed by a caller. `CopiesConfiguration.allow_list` becomes a read-only mapping.
-6. Add rows to the existing configuration tests: a second call does not parse the file; an edited file gives the new value; a changed `COPIES_CONFIG` gives the other file's value; an invalid file raises on each call.
-7. Report a before and after with the same module and method, with the spread of repeated runs on one tree.
-
-**Files:**
-- `scripts/copies/copies.py`
-- `scripts/copies/test_copies.py`
-
-**Workers:** `1 writer` — `impl` owns the cache, its tests and the measurement, on a branch cut from builds so that the hash carries no held phase.
-
-**State:** none.
-
-**Gate:** the targeted test, `basedpyright` 0/0/0 on each changed file and each caller module, and the before and after figures.
-
-**Change-Review:** none — no person sees a change; copy commands use less CPU.
+**Ruled out:** a cache of the parsed copies configuration, until a measurement shows a gain that pays for the added code.
 
 ### Phase 23a — Queue boundary imports stay small, if a prototype shows a real gain  · status: done
 
@@ -1491,27 +1474,29 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Progress (2026-11-04):** checkpoint A is on main, with the test fixes for a `CONF_DIR` that lacks `build_folders.conf` (`build_folders._settings` then reads the repository file) and config read at use in `tmp_sweep`, `style_sync` and `folder_audit`. Checkpoint B is open.
 
-**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason: `floor`, `trim`, or `owner-ended` for a folder that the sweep removes after its owner is gone (architect review of 10q, 2026-11-05). Source today: `scripts/mac_test/linux_runner.py` removes or trims a slot build folder after each step and prints only `mac_cleanup=<result>` (line 839; `offload.py:934` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record. Test: an owner-ended removal writes one record with reason `owner-ended`, and a standing copy is never removed. One record contract: the floor sweep already records removals through `record_sweep_removal()` (`scripts/lint/sweep.py`) and `record.sweep_trim()` (`scripts/buildlog/record.py`). Extend or reuse that path, including an interrupted write; add no separate journal (architect review of 23, 2026-11-09).
+**Removal record (aws-unit ask via the builds showrunner, 2026-11-03):** each folder removal writes one record with: time, target, host, repository key, slot, folder path, bytes freed, free GiB before and after, and the reason: `floor`, `trim`, or `owner-ended` for a folder that the sweep removes after its owner is gone (architect review of 10q, 2026-11-05). Source today: `scripts/mac_test/linux_runner.py` removes or trims a slot build folder after each step and prints only `mac_cleanup=<result>` (line 839; `offload.py:934` parses it); no record names the folder or the bytes freed. aws-unit's weekly report (cold steps after a floor removal, time lost) reads this record. Test: an owner-ended removal writes one record with reason `owner-ended`, and a standing copy is never removed. One record contract: the floor sweep already records removals through `record_sweep_removal()` (`scripts/lint/sweep.py`) and `record.sweep_trim()` (`scripts/buildlog/record.py`). Extend or reuse that path, including an interrupted write; add no separate journal (architect review of 23, 2026-11-09). The readers are part of the contract (architect review of 43, 2026-11-09): `record.sweep_trim()` accepts the causes `budget take` and `floor take`, and `read_rebuild_evidence()` (`scripts/lint/sweep.py`) reads only natedev records with those causes. The Work Order names the schema writer, compatibility tests for the new causes, fields and remote records, and aws-unit's report consumer.
 
-**Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
+**Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the record contract in `scripts/buildlog/record.py` and its reader in `scripts/lint/sweep.py`, the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests, the `linux_runner` record tests and the record reader compatibility tests. B keeps the standing-copy exclusion and the remote-lease ownership.
 
 ### Phase 10g — The queue decides where every step runs  · status: todo
 **Depends on:** 10z and 10x (it changes the admission request and the queue service). verify-unit's Phase 27 hotfix is on builds (`a153ef36a`).
-**Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
+**Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` routes each step and retries temporary declines (`route_test`), and the service admits cloud work in its own pass (`_cloud_pass`), but no single owner places a step. At 14:04-14:17 on 2026-11-03 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
 
 **Outline (the Work Order follows at phase start).** Today's routing already has temporary declines, step eligibility, pins and cloud reservations (`verify.sh`, `build_targets.py`, `admission_service.py`). This phase moves those mechanisms behind one owner and keeps their policies.
 1. A step's admission request carries its eligible hosts (natedev, the Mac, SSH slots) and each host's exclusion reason.
 2. The queue service places each step on the first host that is free for it, and decides again on every pass while the step waits (Mac free, Mac disk over the floor, slot free).
 3. `verify.sh` and the offload path run the step where the queue says; they make no host choice.
 4. `build_targets.py` eligibility, slot reserve and the spending-guard exclusion move behind the queue decision.
-5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
+5. Owners: queue-unit switches every caller and owns `verify.sh` routing and offload, because verify-unit's run is closed. aws-unit owns target selection and spending integration. sdlc owns lifecycle callers. The edits are agreed with aws-unit and sdlc at phase start.
 6. Runs beside 10f where the file sets are disjoint.
 7. **Slots per host (architect review, 2026-11-05).** A local 10z slot cannot stand for memory kept on the Mac or an SSH target. Define placement, reservation and departure states per host. Tests: a move to another host releases the local claim, and a local claim is never reused on a remote host.
-8. **Machine column (Phase 24).** `/build:queue` (`queue_view.py`, `queue_card.py`) and the memory page feed read one `scripts.buildlog.store.host_name()` for every running row. When a step runs on another host, the service reply carries that host on its row, and both views show it in the Machine column. Tests: a running row placed on the Mac shows the Mac's name in the view, the card and the page.
+8. **Machine column (Phase 24).** `/build:queue` (`queue_view.py`, `queue_card.py`) and the memory page feed read one `scripts.buildlog.store.host_name()` for every running local row. Cloud rows have a separate representation, and `memory_feed.py` labels them `aws`. When a step runs on another host, the service reply carries that host on its row, and both views show it in the Machine column. Tests: a running row placed on the Mac shows the Mac's name in the view, the card and the page.
 9. **Host-scoped run identity (architect review of 18, 2026-11-06).** Two hosts can give the same pid and start time; `running_builds()` groups runs by `run_owner(pid, start_time)` today. One named run identity carries the host through placement, sampling, grouping and release. Test: a mixed-host fixture with the same pid and start time on two hosts keeps two runs, with separate accounting and the right Machine labels.
-10. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
+10. **Workers:** queue-unit `impl` owns the protocol, service, placement states and accounting. Queue-unit `adapter` owns `verify.sh`, offload and the routing helpers. Queue-unit `test` owns service and adapter integration tests after the shared contract is fixed. aws-unit owns target selection and spending integration; sdlc owns lifecycle callers.
 11. **Remote probes stay out of the service loop (architect review of 23, 2026-11-09).** The service must answer within one second. Host evidence arrives asynchronously, with explicit unavailable and stale states, as `OperatingSystemReader` does in `admission_service.py`. Test: a delayed remote probe leaves view, release and local admission requests responsive.
 12. **Submitting owner and remote execution are separate identities (architect review of 23, 2026-11-09).** `wire.Owner` names a local caller, and `_watch_owner()` opens its local pidfd. A host on the run identity does not say which identity controls caller death, remote sampling and release. Define distinct semantic identities. Test: a remote pid cannot bind a local owner watch.
+13. **Placement contract first (architect review of 43, 2026-11-09).** The Work Order settles this contract before work is divided. It separates fixed request constraints from refreshed host evidence, because an exclusion reason in a request can become old while a step waits. It defines host order, claim ownership, launch confirmation, rollback and uncertain remote cleanup. Tests: eligibility changes during a wait; two claimants compete for one host; the caller dies before launch; a cleanup cannot confirm that the remote work ended. The pin, tree-write, retry, cloud capacity and queue priority policies stay. Use semantic types for the submitting owner, the execution identity, unavailable evidence, a reserved host and uncertain cleanup.
+14. **Remote copy time rule (Phase 42).** Routing adapters keep the shared `RSYNC_RECEIVER_WRITE_TIME_FLAGS` path and its changed-content and unchanged-content timestamp checks.
 
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 
