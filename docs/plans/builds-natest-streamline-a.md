@@ -2374,7 +2374,7 @@ Keep both entry points.
 `message/test_send_delivery.py` checks stop boundaries and delivery counts.
 Keep both entry points.
 
-The split-crossing retirement dependency includes `scripts/shutdown/stop_resume.py`.
+The split-crossing retirement dependency includes `scripts/agents/stop_resume.py`.
 The session staff release test calls it with the shared fixture.
 Keep that test during fixture migration.
 This is a dependency, not a proven cross-module repeat.

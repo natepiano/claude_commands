@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # These are account decisions with a separate, explicit contract.
 EXCEPTIONS = {
     ("accounts/accounts.py", "exec_account"): "the user explicitly names the account",
-    ("shutdown/restart.py", "session_launch"): "a resume retains the account that holds its transcript",
+    ("agents/restart.py", "session_launch"): "a resume retains the account that holds its transcript",
     ("message/send.py", "relay"): "the relay retains the caller account or uses the showrunners resolver",
     ("notify/review.py", "reviewer_environment"): "the headless reviewer uses the units account through role_account",
 }
@@ -428,7 +428,7 @@ def session_launch(identity: str):
     return selected
 '''
         self.assertTrue(any("selects with role_account" in problem
-                            for problem in launch_account_violations(source, "shutdown/restart.py")))
+                            for problem in launch_account_violations(source, "agents/restart.py")))
 
     def test_all_python_claude_launchers_use_the_shared_account_resolver(self) -> None:
         violations: list[str] = []

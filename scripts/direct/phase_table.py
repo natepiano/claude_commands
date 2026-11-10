@@ -29,7 +29,7 @@ from scripts.lib import unit_runs
 from scripts.lib.user_zone import user_zone
 from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
 from scripts.production.production_doc import Refusal, production_field
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.

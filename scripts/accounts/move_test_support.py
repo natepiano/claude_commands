@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from scripts.accounts import moves
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 
 
 _NO_SOURCES: Mapping[str, str] = MappingProxyType({})

@@ -313,6 +313,17 @@ class WorkerCommandTests(unittest.TestCase):
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
         atomic_file.write_text_atomic(config.with_name("send.conf"),
                                       (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
+        atomic_file.write_text_atomic(config.with_name("scratch.conf"),
+                                      (Path(__file__).resolve().parents[2] / "config/scratch.conf").read_text())
+        root = self.fixture.root
+        (root / "worker-tmp").mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "TMPDIR": str(root / "worker-tmp"),
+            "SCRATCH_ROOT": str(root / "scratch"),
+            "SCRATCH_VISIBLE_ROOT": str(root / "visible-scratch"),
+            "SCRATCH_COPIES_ROOT": str(root / "copies"),
+            "SCRATCH_HOLDS": str(root / "scratch-holds.json"),
+        })))
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
         self.run_dir = self.fixture.root / "run"

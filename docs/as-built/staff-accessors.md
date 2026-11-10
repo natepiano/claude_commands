@@ -116,7 +116,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
-| `scripts/direct/board_json.py` | read | active, snapshot |
+| `scripts/direct/worker_runs.py` | read | find; pane worker rows |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/clear_phase_review.sh` | read | local_snapshot |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
@@ -199,7 +199,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
-| `scripts/shutdown/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
+| `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
@@ -231,19 +231,19 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
 | `scripts/review_links/change_page.py` | read | snapshot |
-| `scripts/shutdown/inventory.py` | read | local_snapshot |
-| `scripts/shutdown/launch_names.py` | read | initial_snapshot |
-| `scripts/shutdown/member_account.py` | read | StaffRow (type check only) |
-| `scripts/shutdown/pane_record.py` | read | initial_snapshot |
-| `scripts/shutdown/pane_restore.py` | read | row_operation |
-| `scripts/shutdown/remote_control.py` | read | initial_snapshot |
-| `scripts/shutdown/restart.py` | read | initial_snapshot, row_operation |
-| `scripts/shutdown/session_types.py` | read | snapshot |
-| `scripts/shutdown/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
-| `scripts/shutdown/shutdown_record.py` | read | snapshot |
-| `scripts/shutdown/stop_results.py` | read | StaffRow and backend types (type check only) |
-| `scripts/shutdown/stop_resume.py` | write | initial_snapshot, row_operation, resume, set_hold, child_environment |
-| `scripts/shutdown/unit_staff_test_support.py` | read | staff.json path |
+| `scripts/agents/inventory.py` | read | local_snapshot |
+| `scripts/agents/launch_names.py` | read | initial_snapshot |
+| `scripts/agents/member_account.py` | read | StaffRow (type check only) |
+| `scripts/agents/pane_record.py` | read | initial_snapshot |
+| `scripts/agents/pane_restore.py` | read | row_operation |
+| `scripts/agents/remote_control.py` | read | initial_snapshot |
+| `scripts/agents/restart.py` | read | initial_snapshot, row_operation |
+| `scripts/agents/session_types.py` | read | snapshot |
+| `scripts/agents/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
+| `scripts/agents/shutdown_record.py` | read | snapshot |
+| `scripts/agents/stop_results.py` | read | StaffRow and backend types (type check only) |
+| `scripts/agents/stop_resume.py` | write | initial_snapshot, row_operation, resume, set_hold, child_environment |
+| `scripts/agents/unit_staff_test_support.py` | read | staff.json path |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
 | `scripts/statusline/counts_row.py` | read | none (StaffRefused exception) |
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |

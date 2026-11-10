@@ -15,7 +15,7 @@ from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import fixture_worker
 
 
-from scripts.shutdown import remote, shutdown
+from scripts.agents import remote, shutdown
 from scripts.production import unit_lookup
 from scripts.production import unit_move
 from scripts.production import staff_sources
@@ -25,7 +25,7 @@ from scripts.production.staff_test_support import (
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment
-from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
+from scripts.agents.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
 

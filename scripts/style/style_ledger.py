@@ -2356,7 +2356,7 @@ def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
     row = record.by_id(staff.StaffId(reference))
     if row is not None:
         return ticket_holder(reference, record)
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     context = record.by_worktree(remote.local_machine(), ledger.repo)
     if context is None:
@@ -2844,7 +2844,7 @@ class Ledger:
     def bulk_holder(self) -> staff.StaffRow:
         """Resolve the style production's showrunner through the command's staff resolver."""
         from scripts.production.production_doc import Refusal, production_field
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         resolver = self.staff_resolver()
         common = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -2944,7 +2944,7 @@ class Ledger:
             # These files belong to this ledger, rather than a guessed unit folder.
             paths.update((self.database.parent / "bulk_review").glob("*.json"))
             if not references:
-                from scripts.shutdown import remote
+                from scripts.agents import remote
                 from scripts.production import unit_config
 
                 for identity in sorted(set(owners.values())):

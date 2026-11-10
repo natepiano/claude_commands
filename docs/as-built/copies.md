@@ -50,7 +50,16 @@ The lock files retain their inodes.
 `copies.py remove` takes the owner from the caller's staff row and includes that owner's remote mirrors within the repository scope.
 Retirement and production cleanup use the same removal path before deleting source trees or production state.
 Busy removal names the holder session and mirror path.
-A kept remote mirror raises `RemoteMirrorKept`, and retire refuses before it removes the worktree, because no sweep removes a mirror. A kept local tree prints one line, the retire continues, and the sweep takes the tree later.
+A host connection failure marks the local mirror record for deferred removal, so retirement can finish.
+Removal tries an unreachable host only once per call.
+`register_remote` retries deferred removals after the next successful copy or remote clone on that host.
+Registration replaces the current path's record first, so reuse clears its removal mark.
+A failed retry keeps the mark and prints one anomaly without failing the copy.
+A successful retry removes the record.
+Removal requires a zero status marker from the remote command before it deletes the local record.
+Authentication failures and remote removal refusals still raise `RemoteMirrorKept` and prevent retirement.
+A kept local tree prints one line, and retirement continues.
+The sweep removes the local tree later.
 Another owner's records remain.
 
 Local mirror rows display the machine name while their records retain `localhost`.

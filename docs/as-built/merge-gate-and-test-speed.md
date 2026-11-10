@@ -618,6 +618,13 @@ The fast check uses no full merge gate or queue admission.
 `config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
 Imports of refused repository modules also refuse the fix, including indirect imports.
 
+`GitRunner` is the only place in `fast_track.py` that starts Git.
+It keeps successful reads of objects addressed by full hash for one `reconcile` pass.
+Reads of refs and ancestry stay fresh, because another process can move them.
+Snapshot ref writes and recovery ref deletes use one `update-ref --stdin` batch.
+`copies.refresh_remotes` fetches both mappings in one fetch.
+The change took `test_fast_track` from 7,158 to 6,433 Git processes and the copies tests from 497 to 319 fetches.
+
 A successful check creates a `fast-track(<unit>): <why>` commit with `Fast-Track: <unit>`.
 `main_push_lock` protects its fast-forward push.
 A moved main causes another application and check within `max_push_attempts`.
@@ -717,6 +724,9 @@ It preserves the caller's working directory, interpreter cache, version floor, a
 `module_run.py` and `fast_track.py` load tests by package name.
 The cloud guest bootstrap supplies its own root after a fresh clone.
 The Pillow analysis and Blender entries retain their foreign interpreters and explicit `PYTHONPATH`.
+
+`update_registration.state_block` imports `merged_checkpoints` in its body.
+This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
 
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 

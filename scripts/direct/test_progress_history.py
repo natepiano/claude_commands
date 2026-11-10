@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
@@ -4167,34 +4167,48 @@ with patch.object(fcntl, "flock", admission):
         went away with the run, so the cleanup that ends the phase has to close
         all of them or they stay open in the ledger forever.
         """
-        session_dir = self.start_run("run-end", 46_000)
-        self.start_phase(session_dir, 46_010)
-        for offset, (slot, kind) in enumerate(
-            (("impl", "impl"), ("test", "fix"), ("review", "review"))
-        ):
-            self.start_slot_pass(session_dir, slot, kind, 46_020 + offset)
-        self.team_slot = ""
-        _ = self.run_command(
-            "finish-run",
-            "--session-dir",
-            str(session_dir),
-            "--status",
-            "stopped",
-            at=46_200,
-        )
-        finished = self.pass_events("run-end", "pass_finished")
-        self.assertEqual(
-            sorted(str(event.get("team_slot")) for event in finished),
-            ["impl", "review", "test"],
-        )
-        self.assertEqual(
-            {str(event.get("status")) for event in finished},
-            {"interrupted"},
-        )
-        self.assertEqual(
-            {str(record["status"]) for record in self.pass_slots(session_dir).values()},
-            {"interrupted"},
-        )
+        for status in ("stopped", "completed", "error"):
+            with self.subTest(status=status):
+                name = f"run-end-{status}"
+                session_dir = self.start_run(name, 46_000)
+                active = self.root / f"active-{status}"
+                unit_runs.activate(session_dir, "director", active)
+                marker = active / "director"
+                self.start_phase(session_dir, 46_010)
+                for offset, (slot, kind) in enumerate(
+                    (("impl", "impl"), ("test", "fix"), ("review", "review"))
+                ):
+                    self.start_slot_pass(session_dir, slot, kind, 46_020 + offset)
+                self.team_slot = ""
+                _ = self.run_command(
+                    "finish-run",
+                    "--session-dir",
+                    str(session_dir),
+                    "--status",
+                    status,
+                    at=46_200,
+                )
+                finished = self.pass_events(name, "pass_finished")
+                self.assertEqual(
+                    sorted(str(event.get("team_slot")) for event in finished),
+                    ["impl", "review", "test"],
+                )
+                self.assertEqual(
+                    {str(event.get("status")) for event in finished},
+                    {"interrupted"},
+                )
+                self.assertEqual(
+                    {str(record["status"]) for record in self.pass_slots(session_dir).values()},
+                    {"interrupted"},
+                )
+                self.assertEqual(list(active.iterdir()), [])
+                before = self.read_events(name)
+                # Retry repairs a mark left by an earlier end attempt.
+                _ = marker.write_text(f"{session_dir}\n")
+                _ = self.run_command("finish-run", "--session-dir", str(session_dir),
+                                     "--status", status, at=46_300)
+                self.assertEqual(list(active.iterdir()), [])
+                self.assertEqual(self.read_events(name), before)
 
     def test_a_round_gives_every_open_worker_its_own_column(self) -> None:
         """Two agents at work read across one row, not as whichever wrote last."""

@@ -181,10 +181,30 @@ class UnitRunsTest(StaffTestCase):
             with patch.object(unit_runs, "RUN_ROOT", current), patch.object(unit_runs, "FORMER_RUN_ROOT", former):
                 unit_runs.activate(run, "moving-session")
                 self.assertEqual(unit_runs.marker("moving-session").read_text(), f"{run}\n")
+                self.assertEqual((run / unit_runs.ACTIVE_MARKER_FILE).read_text(), f"{current / 'active/moving-session'}\n")
                 unit_runs.activate(run, "moving-session")
                 self.assertEqual(unit_runs.marker("moving-session").read_text(), f"{run}\n")
             self.assertFalse((old / "moving-session").exists())
             self.assertEqual((old / "other-session").read_text(), "keep other run\n")
+
+    def test_end_removes_only_the_recorded_runs_marker_and_can_repeat(self) -> None:
+        for target in ("this run", "another run", "empty", "missing"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                run, other, active = root / "run", root / "other", root / "active"
+                unit_runs.activate(run, "director", active)
+                path = active / "director"
+                if target == "another run":
+                    _ = path.write_text(f"{other}\n")
+                elif target == "empty":
+                    _ = path.write_text("")
+                elif target == "missing":
+                    path.unlink()
+                expected = {"director": f"{other}\n"} if target == "another run" else {"director": ""} if target == "empty" else {}
+                for attempt in range(2):
+                    with self.subTest(attempt=attempt):
+                        unit_runs.end(run)
+                        self.assertEqual({entry.name: entry.read_text() for entry in active.iterdir()}, expected)
 
     def test_an_override_replaces_both_names(self) -> None:
         self.assertEqual(unit_runs.run_roots("/x/runs"), (Path("/x/runs"),))

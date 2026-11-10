@@ -80,9 +80,9 @@ Anything else unexpected prints one anomaly line and the operation continues.
 
 User rule, 2026-11-04: "it should be impossible to start a worker in more than one way". The sdlc showrunner owns this rule.
 
-- The one way is `assign.sh`, run by the director as a background shell of its own session (a Claude background Bash, a Codex unified-exec terminal). It covers every role (implement, test, fix, review, follow-up, resume after a move) and both families.
-- `implement.sh`, `review.sh` and the `codex_mesh.py` start, follow, reopen, fork, adopt, prime and resume-account-move subcommands refuse when `assign.sh` did not call them.
+- The director submits assignments through `assign.sh`, for either native family. It returns after prompt delivery.
+- Native worker admission and pane operations implement worker start and reuse. The mesh command and its subcommands are removed.
 - `assign.sh` refuses when no live Claude or Codex process is in its parent chain (a `nohup`, `setsid` or `&` start).
-- The launcher stays alive while its worker has a live detached run, and puts the result into the same turn.
+- The completion hook keeps the pass active while detached work remains. A result returns to the same native worker conversation.
 - `scripts/direct/test_one_launch_path.py` fails when a file outside the launcher starts or follows a worker.
 - Worker panes (herdr-worker-panes decision 11) change what is behind `assign.sh`; they add no second way.

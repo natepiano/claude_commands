@@ -30,13 +30,13 @@ from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch,
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import fake_unit_host, showrunners, staff
 from scripts.message import sessions as reader_sessions
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, recorded_unit
-from scripts.shutdown import stop_resume
-from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
-from scripts.shutdown import pane_record as hook_pane_record
+from scripts.agents import stop_resume
+from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
+from scripts.agents import pane_record as hook_pane_record
 
-from scripts.shutdown import inventory, pane_record
+from scripts.agents import inventory, pane_record
 from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions
 from scripts.production import unit_lookup

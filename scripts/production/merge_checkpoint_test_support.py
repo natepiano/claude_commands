@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.production import checkpoint_gate
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 

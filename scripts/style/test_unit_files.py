@@ -16,7 +16,7 @@ from scripts.style import unit_files
 from scripts.style import style_ledger
 from scripts.style.git_process import GitReadFailed
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, recorded_showrunner, recorded_unit
 
 

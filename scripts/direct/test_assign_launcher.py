@@ -23,11 +23,11 @@ from scripts.lib import unit_runs
 from scripts.lint import style_review
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
-from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
+from scripts.production import fake_unit_host, staff, test_worker as worker_fixture, worker, worker_admission
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import fixture_session, fixture_runtime_id, fixture_worker, transcript_fixture
+from scripts.production.staff_test_support import fixture_session, fixture_runtime_id, fixture_worker, foreign_hostname, transcript_fixture
 from scripts.message import send, sessions
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.usage import agents_log
 
 def setUpModule() -> None:
@@ -52,11 +52,13 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "UNIT_RUN_ROOT": str(self.session_dir.parent),
             "SCRATCH_ROOT": str(self.session_dir.parent / "scratch"),
+            "SCRATCH_VISIBLE_ROOT": str(self.session_dir.parent / "visible-scratch"),
+            "SCRATCH_HOLDS": str(self.session_dir.parent / "scratch-holds.json"),
         })))
+        _ = shutil.copy2(ROOT / "config/scratch.conf", Path(os.environ["CONF_DIR"]) / "scratch.conf")
         for key in ("CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "PLAN_DELEGATE_RUN_DIR"):
             _ = os.environ.pop(key, None)
-        self.marker().parent.mkdir(parents=True, exist_ok=True)
-        _ = self.marker().write_text(f"{self.session_dir}\n")
+        unit_runs.activate(self.session_dir, staff.runtime_id(), self.marker().parent)
         directory = Path(os.environ["NOTIFIER_SESSIONS_DIR"])
         directory.mkdir(parents=True, exist_ok=True)
         _ = (directory / "director.json").write_text(json.dumps({
@@ -142,6 +144,9 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             prepared = self.run_launcher(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
             self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
             run = Path(prepared.stdout.split("Session ready at ")[-1].strip())
+            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+                unit_runs.OWNER_FIELD: self.native.fixture.parent.id,
+            }))
             marker = active / staff.runtime_id()
             self.assertEqual(marker.read_text().strip(), str(run), prepared.stdout + prepared.stderr)
             ended = self.run_launcher(["bash", str(ROOT / "scripts/direct/end_session.sh")])
@@ -160,7 +165,22 @@ class FailedLaunchRunTests(HookAssignmentFixture):
     def test_a_sole_claude_implementation_failure_ends_the_run_after_its_pass_starts(self) -> None:
         _ = write_registry(self.registry, {"assignments": {"direct": "claude"},
                                           "direct.claude": {"impl": "opus:high"}}, update=True)
-        self.native.agent.during_prompt = fail_worker_after_prompt
+        cleanup_environment = fake_unit_host.environment(self.native.fixture.root)
+        fake_unit_host.write(cleanup_environment, [])
+        responses = Path(cleanup_environment["FAKE_HERDR_RESPONSES"])
+        replies = read_object(responses)
+        replies["--session agents pane list"] = {"code": 0, "stdout": '{"result": {"panes": []}}'}
+        _ = responses.write_text(json.dumps(replies))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {**cleanup_environment, "GATE_TEST_HOST": "natedev"})))
+        # The cleanup children read the real hostname, and the fixture rows name natedev.
+        _ = self.enterContext(foreign_hostname())
+
+        def fail_after_pane_exit() -> None:
+            pane = self.native.agent.submitted[-1][0]
+            self.native.fixture.world.remove_pane(pane)
+            raise SystemExit(1)
+
+        self.native.agent.during_prompt = fail_after_pane_exit
         result = self.launch()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertFalse(self.marker().exists(), result.stdout + result.stderr)

@@ -15,7 +15,7 @@ from scripts.direct import progress_history
 from scripts.lib import conf
 from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
 from scripts.production import session_staff, staff
-from scripts.shutdown import restart, stop_resume, stop_results
+from scripts.agents import restart, stop_resume, stop_results
 
 WorkerStartFailure = (worker_panes.IncompleteStart | worker_panes.AdmissionRefused | worker_panes.UnpublishedWorker
                       | worker_panes.ProcessUnknownWorker | worker_panes.UncertainWorker | worker_panes.StartRefused)

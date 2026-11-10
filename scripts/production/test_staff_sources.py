@@ -22,7 +22,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources, session_staff
 from scripts.production.production_doc import ProductionDocument
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 from scripts.herdr import herdr
 from scripts.production import showrunners
 from scripts.production.session_staff import MemberSources

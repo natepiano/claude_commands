@@ -2,7 +2,7 @@
 """Tests for tidy_wrapped.py: only a wrapped production with no update timer loses its state files."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import io

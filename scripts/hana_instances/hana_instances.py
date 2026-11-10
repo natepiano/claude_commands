@@ -137,7 +137,7 @@ def local_processes(
 ) -> list[HanaProcess]:
     if environment_reader is None:
         # Phase 43 uses this existing reader; its owning module keeps the private name.
-        from scripts.shutdown.inventory import _process_environment  # pyright: ignore[reportPrivateUsage]
+        from scripts.agents.inventory import _process_environment  # pyright: ignore[reportPrivateUsage]
         environment_reader = _process_environment
     current = time.time() if now is None else now
     boot = next(float(line.split()[1]) for line in (proc_root / "stat").read_text().splitlines() if line.startswith("btime "))

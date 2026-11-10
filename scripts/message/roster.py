@@ -60,7 +60,7 @@ else:
     account = _lazy_module("scripts.whoami.account")
     agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
     note_file = _lazy_module("scripts.whoami.note_file")
-from scripts.shutdown import remote as remote  # noqa: E402
+from scripts.agents import remote as remote  # noqa: E402
 from scripts.message.sessions import RegistryRead, SessionRecord, messaging_socket_exists  # noqa: E402
 
 Kind = Literal["claude", "codex"]

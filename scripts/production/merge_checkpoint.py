@@ -39,7 +39,7 @@ from scripts.production.production_doc import Production, ProductionDocument, Re
 
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import merge_gate, production_doc, session_staff, staff, unit_config, unit_lookup, unit_names  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
