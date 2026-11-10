@@ -1832,6 +1832,8 @@ class RepositoryHistoryTests(unittest.TestCase):
                     ["cargo", "nextest", "run", "run"],
                     ["cargo", "+nightly", "nextest", "run", "-E", "test(one)"],
                     ["cargo", "nextest", "run", "--filterset=test(one)"],
+                    ["cargo", "nextest", "run", "-E", "package(sample)", "--run-ignored", "only"],
+                    ["cargo", "nextest", "run", "-E", "package(sample)", "--run-ignored=only"],
                     ["cargo", "test", "-p", "hana", "one_test"],
                     ["cargo", "test", "--", "--skip", "one_test"])
         for arguments in full:
