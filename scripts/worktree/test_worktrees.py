@@ -264,11 +264,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual((tree / "code.txt").read_text(), "unlanded work\n")
 
     def test_dirty_and_staff_held_trees_preserve_all_items(self) -> None:
-        for reason in ("dirty", "staff-held", "switched", "detached", "no-commit"):
+        for reason in ("dirty", "staff-held", "switched", "detached", "no-commit", "target-merge-only"):
             with self.subTest(reason=reason):
                 tree = self.trees / reason
                 self.make(tree, reason)
-                if reason != "no-commit":
+                if reason not in ("no-commit", "target-merge-only"):
                     _ = self.commit(tree, f"{reason}.txt", "landed work\n")
                     self.publish(tree, reason)
                     self.land(reason)
@@ -290,6 +290,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 elif reason == "detached":
                     _ = self.git(tree, "checkout", "--detach")
                     _ = self.commit(tree, f"{reason}-work.txt", "unlanded replacement work\n")
+                elif reason == "target-merge-only":
+                    _ = self.commit(self.merge_tree, "target.txt", "new target work\n")
+                    self.publish(self.merge_tree, "integration")
+                    _ = self.git(tree, "fetch", "origin", "integration")
+                    _ = self.git(tree, "merge", "--no-ff", "origin/integration", "-m", "Merge the target")
                 before = self.repository_state()
                 tip = self.git(tree, "rev-parse", "HEAD")
 
@@ -302,6 +307,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
                 if reason == "no-commit":
                     self.assertEqual(selected["detail"], "no commit of its own")
+                elif reason == "target-merge-only":
+                    self.assertEqual(selected["detail"], "only merges of the target outside it")
                 else:
                     self.assertEqual((tree / f"{reason}.txt").read_text(), "landed work\n")
                 if reason == "dirty":

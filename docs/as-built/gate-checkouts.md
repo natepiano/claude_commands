@@ -426,6 +426,7 @@ Each other changed path must match the merge branch or have a newer change on th
 After a successful merge-branch push, `merge_checkpoint.py` calls `end_landed(repo, merge_branch)`.
 It reports `Ended` or `Kept` as a `worktrees` step.
 It keeps a staff-held tree, a dirty tree, a different checked-out branch, and work that has not landed.
+It also keeps a branch whose only commits outside the merge branch are merges that brought it in.
 A kept tree does not fail the merge.
 An eligible tree ends through worktree removal, local and origin branch deletion, then record deletion.
 Missing paths or branches allow a retry to complete an interrupted end.
