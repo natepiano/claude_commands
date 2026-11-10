@@ -2336,46 +2336,20 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 ### Phase 116 — A targeted test run selects every test that reads a changed file as text  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+`names_changed_file(graph, path, changed, folder_names)` in `scripts/production/affected_modules.py` decides whether a test names a changed file as text. A source names the file when one of its tokens equals the whole path, or when a token equals the base name and the source sits in the file's folder or holds a token equal to the folder name. The sources of a test are the test module and each `*_test_support.py` module it reaches through test-support imports; production modules are not followed. `select_affected` builds `folder_names` from the changed paths, so a file at the repository root matches by whole path only. The rule uses the existing tokens and imports: the extractor, `CACHE_FORMAT_VERSION` and `EXTRACTOR_VERSION` are unchanged, and the selector adds no parse and no Git process.
 
-**Source:** the builds showrunner, 2026-11-09: "Make targeted_test select tests that read a changed file as text, by one rule at the source."
-
-**Why:** `scripts/direct/test_verify_lint_output.py` reads `scripts/direct/verify.sh` as text and does not import it. The path lives in `scripts/direct/verify_lint_scope_test_support.py` as `Path(__file__).with_name("verify.sh")`. The targeted run did not select the test for a `verify.sh` change, so the rule failed only at the merge gate.
-
-**Goal:** a targeted run selects a test when the test, or a test-support module it imports, names the changed file, and a replay shows how many modules this adds per landing.
-
-**Spec:**
-
-1. In `select_affected` in `scripts/production/affected_modules.py`, replace the complete-path clause `graph.tokens.get(path, frozenset()) & changed` with one rule. A source names a changed file when one of these holds:
-   - A token of the source equals the file's whole path. This is the current behavior.
-   - A token of the source equals the file's base name, and the source sits in the file's folder, or a token of the source equals the name of the file's folder.
-2. The sources for a test module are the test module and each `*_test_support.py` module it reaches through imports, following only test-support modules. Use `graph.imports` and `graph.tokens`. Do not follow production modules: `test_indirect_path.py` in the existing test must stay unselected.
-3. The rule applies to every changed path, Python or not. A changed file at the repository root has no folder name, so only its whole path can match.
-4. Add no new source fact. `extract_facts`, `CACHE_FORMAT_VERSION` and `EXTRACTOR_VERSION` do not change. The selector parses no extra source and adds no Git process.
-5. Do not change the configuration rule. `config_reads` and `configs` stay as they are. A `.conf` token already selects its reader.
-6. Update the selection rules in `docs/as-built/merge-gate-and-test-speed.md`: rule 3 in the numbered list and the summary sentence near line 209.
-7. Replay. In a scratch folder, write a script that builds the graph once from the current tree. Take the last 20 first-parent merges on `origin/builds`, and take the changed paths of each merge from its first parent. For each merge, compute the selection under the old rule and under the new rule. Report the mean and the largest count of added modules per landing, and name the added modules of the largest case. Report also the result for the changed set `{scripts/direct/verify.sh}`: `direct/test_verify_lint_output.py` must be in it.
-8. Report, without a change, how many test modules find repository files by `.glob(`, `.rglob(`, `os.walk(` or `iterdir(` on a repository path. The new rule cannot see those. Name the count and the five largest by module CPU.
+Replay over the last 20 first-parent merges on `origin/builds`, one graph from the current tree: a mean of 16.45 added modules per landing and a maximum of 107 (73 to 180, and 20 to 127). No merge loses a module. The changed set `{scripts/direct/verify.sh}` selects 147 modules, 4 before, and includes `direct/test_verify_lint_output.py`.
 
 **Files:**
-- `scripts/production/affected_modules.py` — the rule
-- `scripts/production/test_affected_modules.py` — new rows in the existing path-token test
-- `docs/as-built/merge-gate-and-test-speed.md` — the rule text
+- `scripts/production/affected_modules.py` — `names_changed_file` and its call in `select_affected`
+- `scripts/production/test_affected_modules.py` — rows in `test_complete_path_tokens_select_only_the_test_that_names_the_path`
+- `docs/as-built/merge-gate-and-test-speed.md` — selection rule 3 and the summary
 
-**Workers:** 1 writer; the rule and its test rows are one small change
-- `impl` — all the files above
+**Gotchas:** A name used only by a fake command also selects the test; the largest additions come from `build_targets.py` and `targets.py` names in verify test-support modules. A folder scan does not name a file: 26 direct test modules scan repository folders, and `targeted_test.py --full` is the full-coverage check for those changes.
 
-**State:** none
-
-**Constraints from prior phases:** the selector reuses cached source facts for each blob, and `test_configuration_selection_reuses_all_source_facts` guards that. The user's question about config edits is open, so the config rule stays as it is. A fix adds rows to the existing test of the same behavior.
-
-**Acceptance gate:**
-- New rows in `test_complete_path_tokens_select_only_the_test_that_names_the_path` prove these cases: a test whose imported support module holds `Path(__file__).with_name("tool.sh")` in the file's folder is selected; a test in another folder that holds both tokens `component` and `tool.sh` is selected; a test in another folder that holds only `tool.sh` is not selected; `test_fragment.py` stays unselected.
-- `python3 -m unittest discover -s scripts/production -p 'test_affected_modules.py'` passes, and `test_targeted_test.py` and `scripts/aws_target/test_cloud_gate.py` pass.
-- `basedpyright scripts/production/affected_modules.py scripts/production/test_affected_modules.py` prints `0 errors, 0 warnings, 0 notes`.
-- The replay table and the glob count are in the final reply.
+**Ruled out:** following production modules for names, because `test_indirect_path.py` must stay unselected; a new source fact or cache version.
 
 ### Phase 117 — Scripts and tests start faster because the heaviest shared imports load only when used  · status: todo
 
@@ -2391,27 +2365,29 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Spec:**
 
-1. Find the SIGTERM source first. The whole-gate confirmation stopped with SIGTERM twice, at 94 of 744 modules. Use the saved evidence under the Phase 115 run folder, and capture the sender with a signal trace in one scratch run. Name the sender in the final reply. Change no behavior of the sender unless it is a natest tool.
-2. Resolve the timeout of `scripts/direct/test_review_launcher.py` under delayed imports. Name the cause. Fix it where it lives.
-3. Rank the shared imports by CPU per start times the survey count of starts. Use the Phase 115 survey for the counts, and `python3 -X importtime` for the costs. `plan_history`, `session_staff` and `phase_reservation` are the known large dependencies of `progress_history.py`. `verify` owns the `progress_history.py` route after its Phase 42e.
+1. Find the SIGTERM source first. The whole-gate confirmation stopped with SIGTERM twice, at 94 of 744 modules. The run folders of Phase 115 no longer exist, and they held no signal trace. Recreate the pilot in one scratch folder with `tools/prepare.py` and its retained helpers from the evidence root, and capture the sender with a signal trace. Name the sender in the reply. Change no behavior of the sender unless it is a natest tool.
+2. Reproduce the timeout of `scripts/direct/test_review_launcher.py` under delayed imports before any production import changes. Name the cause. Fix it where it lives.
+3. Rank the shared imports by removable CPU. `python3 -X importtime` reports elapsed time, so use it only to identify dependencies. Measure the removable process CPU of each candidate in paired command runs, and multiply the difference by the start count in `survey.json`. Calculate each candidate again after each earlier change, because shared import costs overlap: `plan_history.py` already imports `session_staff.py`. `plan_history`, `session_staff` and `phase_reservation` are the known large dependencies of `progress_history.py`. `verify` owns the `progress_history.py` route after its Phase 42e.
 4. Change only the imports at the top of the ranking, until the next import saves less than 5 CPU s per gate. Use a function-level import at the use, or one small helper if several sites share the need. There is one way to start a script: tests and real use take the same path.
-5. Tell the owning unit director and its showrunner before each file changes.
-6. Prove the change with one whole-gate pair, phase base against the change, at the same load, on the merge-gate module set. One pair costs about 45 minutes and 10,000 CPU s.
+5. Name each file to change, its owner and any added repair file in a first reply, after items 1 to 3 and before any production edit. The director tells the owning unit director and its showrunner, then sends the go.
+6. Prove the change with one whole-gate pair, phase base against the change, at the same load, on the merge-gate module set. One pair costs about 45 minutes and 10,000 CPU s. Keep the revisions, load, filesystem roots, bytecode conditions, signal evidence and complete results outside the disposable copies.
 
 **Files:**
 - `scripts/direct/progress_history.py` — heavy imports that the ranking names; the final list follows the ranking
 - `scripts/lib/` — one small helper, only if several sites need it
+- `scripts/direct/test_review_launcher.py` — the module whose timeout sets the repair; the first reply names each further file and its owner
 
 **Workers:** 1 writer; the ranking, the changes and the proof depend on one another
 - `impl` — all the files the ranking names
 
 **State:** none
 
-**Constraints from prior phases:** interpreter flags, thin entries, the preloaded parent and warm bytecode are ruled out. A test-only start path will not land. Only named owners change their imports; natest is the owner of the switch and tells each file owner first.
+**Constraints from prior phases:** interpreter flags, thin entries, the preloaded parent and warm bytecode are ruled out. A test-only start path will not land. Only named owners change their imports; natest is the owner of the switch and tells each file owner first. Evidence root: the Phase 115 session folder holds `survey.json`, `per_start.csv`, `weight_audit.json`, `result.md` and `tools/`. A targeted run also selects each test whose text or test-support modules name a changed file.
 
 **Acceptance gate:**
 - The SIGTERM sender is named, and the whole-gate pair completes.
 - `direct/test_review_launcher.py` passes under the change.
-- The pair shows the CPU saved per gate and no new failure.
+- Every discovered module completes on both sides of the pair, with matching test identities and outcomes.
+- The pair shows the CPU saved per gate and no new failure. A missing result, a timeout, a signal stop or a new skip counts as no saving.
 - `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed file.
 - Each changed file's module tests pass.
