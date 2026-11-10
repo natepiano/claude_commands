@@ -315,6 +315,12 @@ Declined, lost, and invalid results return the step to its waiting state.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
 
+`test [<package>] --run-ignored only` runs only ignored tests on the selected target.
+It accepts repeated `--filter <name>` flags and `--features <list>`, but refuses `--test <name>`.
+Omit the package to select named tests across two packages in one call.
+The call must match a test. Its filtered result never supplies a full package pass.
+Its saved-result key includes `--run-ignored only`.
+
 `test [<package>] --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
