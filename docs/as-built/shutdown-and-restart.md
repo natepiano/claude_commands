@@ -159,7 +159,19 @@ The batch includes the existing stay observation before it records a confirmed o
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
 
-Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
+Retirement, checkout moves, running-session attach and nix-shell healing use this API.
+Retirement reads process facts with the reader for the host that owns the worktree.
+It closes only the idle pane shell named by the unit's launch record before it checks for remaining processes.
+It sends no signal to that shell.
+Foreground work and unreadable pane identity keep the process refusal.
+Retirement removes the pane launch entry through the confirmed close.
+Unit rename closes the unit's own pane after its ownership checks.
+A pane already gone counts as closed.
+Checkout moves stop before moving files and resume afterward.
+The checkout coordinator excludes only its own pid from cwd holders.
+Other holders still refuse.
+Attach keeps its process and prompt-submission proofs.
+The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
 Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
