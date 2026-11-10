@@ -17,7 +17,7 @@ from scripts.accounts import accounts
 from scripts.herdr import herdr
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, demote_showrunner as demote, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
-from scripts.production.production_doc import read_production
+from scripts.production.production_doc import Production, read_production
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.agents import pane_record, remote, stop_resume
 
@@ -184,6 +184,52 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.account.assert_not_called()
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertFalse(self.journal().exists())
+
+    def test_name_only_uses_the_child_plan_and_keeps_explicit_values(self) -> None:
+        original_doc = self.child_doc
+        for source in ("configuration", "production document"):
+            if source == "configuration":
+                _ = unit_config.write(self.child_tree, unit_config.UnitConfig(
+                    unit_config.PlanFile(self.plan_relative), self.port, ()))
+                expected = self.plan
+            else:
+                (self.child_tree / ".unit.toml").unlink()
+                self.child_doc = self.child_tree / "child.md"
+                _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.child_doc))
+                expected = self.child_doc
+            for flags in ((), ("--plan", str(self.plan), "--port", "8124")):
+                requests: list[demote.Demotion] = []
+                checked = demote.checked
+                def capture(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
+                            record: staff.StaffSnapshot, port: unit_config.AppPort | unit_config.NoAppPort) -> demote.Demotion:
+                    request = checked(parent, name, plan, record, port)
+                    requests.append(request)
+                    return request
+                with (self.subTest(source=source, flags=flags),
+                      mock.patch.object(demote, "checked", side_effect=capture),
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+                    code = demote.main([self.child_name, "--check", *flags])
+                    self.assertEqual(code, 0, errors.getvalue())
+                    self.assertEqual(requests[0].plan, self.plan if flags else expected)
+                    self.assertEqual(requests[0].port, unit_config.AppPort(8124) if flags else
+                                     self.port if source == "configuration" else unit_config.NoAppPort())
+        self.child_doc = original_doc
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), original_doc))
+        _ = unit_config.write(self.child_tree, unit_config.UnitConfig(
+            unit_config.PlanFile(self.plan_relative), self.port, ()))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            code = demote.main([self.child_name])
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
+
+    def test_name_only_without_a_plan_reports_one_refusal_line(self) -> None:
+        with redirect_stderr(io.StringIO()) as errors:
+            code = demote.main([self.child_name, "--check"])
+        self.assertEqual(code, 2)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("plan", errors.getvalue())
+        self.assertIn(str(self.child_doc), errors.getvalue())
+        self.assertEqual(self.events, [])
 
     def test_check_stops_nothing_and_writes_nothing(self) -> None:
         before = self.staff_file.read_bytes()

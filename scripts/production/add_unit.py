@@ -325,6 +325,20 @@ def launch_request(args: argparse.Namespace, *,
         else:
             standby = isinstance(saved.plan, unit_config.StandbyPlan)
             permanent = isinstance(saved.plan, unit_config.PermanentPlan)
+    if not any((given_plan is not None, given_brief is not None, standby, permanent)):
+        member = checked_unit_member(production, name, record)
+        folder = (member.row.worktree.path if isinstance(member, staff_sources.MemberFound)
+                  and isinstance(member.row.worktree, staff.PresentWorktree)
+                  else unit_names.worktree(production.checkout, unit_names.stem(name)))
+        try:
+            saved_plan = unit_config.default_plan(folder, production.doc, name)
+        except unit_config.ConfigRefused as error:
+            raise Refusal(str(error)) from error
+        if isinstance(saved_plan, unit_config.PlanFile):
+            given_plan = str(saved_plan.path)
+        else:
+            standby = isinstance(saved_plan, unit_config.StandbyPlan)
+            permanent = isinstance(saved_plan, unit_config.PermanentPlan)
     if sum((given_plan is not None, given_brief is not None, standby, permanent)) != 1:
         raise Refusal("give exactly one of --plan, --brief, --standby, or --permanent")
     kebab = unit_names.stem(name)
@@ -538,7 +552,9 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
             raise Refusal(f"unit {request.unit} Plan is {existing.plan!r}; expected {launch.plan_cell!r}")
         if mode == "brief" and isinstance(launch.plan, PlanGiven):
             plan_transition = BriefToPlanTransition()
-    launch = replace(launch, responsibilities=configuration_for(launch).responsibilities)
+    config = configuration_for(launch)
+    launch = replace(launch, responsibilities=config.responsibilities,
+                     port=SuppliedCell(str(config.port.number)) if isinstance(config.port, unit_config.AppPort) else launch.port)
     has_worktree = worktree_on_branch(launch)
     local_branch = git(production, "show-ref", "--verify", "--quiet",
                        f"refs/heads/{request.branch}", check=False).returncode == 0
@@ -1140,23 +1156,27 @@ def configuration_for(request: UnitLaunch) -> unit_config.UnitConfig:
     """Keep saved responsibilities or use explicit launch responsibilities."""
     existing = unit_config.read(request.worktree, cleanup=False)
     if isinstance(request.session, ResumedSession) and isinstance(existing, unit_config.UnitConfig):
-        return existing
+        selected = (unit_config.parse_port_cell(request.port.value)
+                    if isinstance(existing.port, unit_config.NoAppPort) and isinstance(request.port, SuppliedCell)
+                    else existing.port)
+        return replace(existing, port=unit_config.default_port(request.production.checkout, selected))
     plan = (unit_config.PlanFile(request.plan_path) if not isinstance(request.plan, Standby) else
             unit_config.PermanentPlan() if request.plan.permanent else unit_config.StandbyPlan())
     try:
-        port = (unit_config.parse_port_cell(request.port.value) if isinstance(request.port, SuppliedCell)
-                else existing.port if isinstance(existing, unit_config.UnitConfig) else unit_config.NoAppPort())
+        selected = (unit_config.parse_port_cell(request.port.value) if isinstance(request.port, SuppliedCell)
+                    else existing.port if isinstance(existing, unit_config.UnitConfig) else unit_config.NoAppPort())
+        port = unit_config.default_port(request.production.checkout, selected)
     except unit_config.ConfigRefused as error:
         raise Refusal(f"unit {request.unit_id}: {error}") from error
     responsibilities = (existing.responsibilities if isinstance(existing, unit_config.UnitConfig) else
                         tuple(dict.fromkeys(request.responsibilities)))
     config = unit_config.UnitConfig(plan, port, responsibilities)
     if isinstance(existing, unit_config.UnitConfig):
-        comparable = existing
+        comparable = replace(existing, port=port) if isinstance(existing.port, unit_config.NoAppPort) else existing
         stub = stub_plan(request.production, request.branch)
         if (isinstance(request.plan, PlanGiven) and existing.plan == unit_config.PlanFile(stub)
                 and recorded_mode(request, stub.as_posix()) == "brief"):
-            comparable = replace(existing, plan=plan)
+            comparable = replace(comparable, plan=plan)
         key = unit_config.first_difference(comparable, config)
         if key:
             raise Refusal(f"{request.worktree / '.unit.toml'}: {key} differs; no file was changed")
