@@ -4,7 +4,7 @@
 Changes that match origin/main can come from an interrupted update. Prove every
 candidate's content, mode, and index state before changing any file. Remove proved
 untracked files before restoring tracked paths to HEAD. Then finish the update
-with git merge --ff-only. Other local edits block the update.
+with git merge --ff-only. A blocked report names every path that fails the proof.
 
 Each run appends a JSON line to SYNC_LOG. Each blocked run with --notify calls
 send.py with a key for the host and state. send.py limits delivery to one message
@@ -107,17 +107,27 @@ def _matches_file(checkout: Path, name: str, entry: GitFileState) -> bool:
     return hashed.returncode == 0 and hashed.stdout.decode("ascii").strip() == entry.object_id
 
 
-def _has_untracked_update(checkout: Path) -> bool:
+def _blocking_error(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr.strip() or result.stdout.strip() or f"git exited with status {result.returncode}").splitlines()[0]
+
+
+def _has_untracked_update(checkout: Path, blocking_details: list[str]) -> bool:
     untracked = _git(checkout, "ls-files", "--others", "-z")
-    if untracked.returncode or not untracked.stdout:
+    if untracked.returncode:
+        blocking_details.append(_blocking_error(untracked))
+        return False
+    if not untracked.stdout:
         return False
     added = _git(checkout, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z",
                  "HEAD", "origin/main", "--")
+    if added.returncode:
+        blocking_details.append(_blocking_error(added))
+        return False
     added_paths = set(added.stdout.split("\0")) - {""}
-    return added.returncode == 0 and bool(set(untracked.stdout.split("\0")) & added_paths)
+    return bool(set(untracked.stdout.split("\0")) & added_paths)
 
 
-def _finish_interrupted_update(checkout: Path) -> bool:
+def _finish_interrupted_update(checkout: Path, blocking_details: list[str]) -> bool:
     """Restore candidates only after every changed working file matches origin/main."""
     queries = [
         _git(checkout, "ls-tree", "-r", "-z", "HEAD"),
@@ -127,8 +137,10 @@ def _finish_interrupted_update(checkout: Path) -> bool:
         _git(checkout, "ls-files", "--others", "-z"),
         _git(checkout, "ls-files", "--stage", "-z"),
     ]
-    if any(result.returncode for result in queries):
-        return False
+    for result in queries:
+        if result.returncode:
+            blocking_details.append(_blocking_error(result))
+            return False
     trees: list[dict[str, GitFileState]] = []
     for result in queries[:2]:
         files: dict[str, GitFileState] = {}
@@ -137,41 +149,53 @@ def _finish_interrupted_update(checkout: Path) -> bool:
                 metadata, name = record.split("\t", 1)
                 mode, kind, object_id = metadata.split()
                 if kind not in ("blob", "commit"):
+                    blocking_details.append(f"git reported an unsupported object type for {name}: {kind}")
                     return False
                 files[name] = GitFileState(mode, object_id)
         trees.append(files)
     head_files, target_files = trees
     index_files: dict[str, GitFileState] = {}
+    unmerged: set[str] = set()
     for record in queries[5].stdout.split("\0"):
         if record:
             metadata, name = record.split("\t", 1)
             mode, object_id, stage = metadata.split()
             if stage != "0":
-                return False
-            index_files[name] = GitFileState(mode, object_id)
-    tracked = set(queries[2].stdout.split("\0") + queries[3].stdout.split("\0")) - {""}
+                unmerged.add(name)
+            else:
+                index_files[name] = GitFileState(mode, object_id)
+    tracked = (set(queries[2].stdout.split("\0") + queries[3].stdout.split("\0")) - {""}) | unmerged
     untracked = {name for name in queries[4].stdout.split("\0")
                  if name in target_files and name not in head_files}
     restore: list[str] = []
     remove: list[str] = []
-    try:
-        for name in sorted(tracked | untracked):
-            if name in tracked and index_files.get(name, ABSENT_FILE) not in (
-                    head_files.get(name, ABSENT_FILE), target_files.get(name, ABSENT_FILE)):
-                return False
+    for name in sorted(tracked | untracked):
+        try:
+            if name in unmerged or (name in tracked and index_files.get(name, ABSENT_FILE) not in (
+                    head_files.get(name, ABSENT_FILE), target_files.get(name, ABSENT_FILE))):
+                blocking_details.append(name)
+                continue
             if _matches_file(checkout, name, head_files.get(name, ABSENT_FILE)):
                 continue
             if not _matches_file(checkout, name, target_files.get(name, ABSENT_FILE)):
-                return False
+                blocking_details.append(name)
+                continue
             (restore if name in tracked else remove).append(name)
+        except (OSError, UnicodeError, subprocess.TimeoutExpired):
+            blocking_details.append(name)
+    if blocking_details:
+        return False
+    try:
         for name in remove:
             (checkout / name).unlink()
         if restore:
             restored = _git(checkout, "--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree",
                             "--", *restore)
             if restored.returncode:
+                blocking_details.append(_blocking_error(restored))
                 return False
-    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        blocking_details.append(str(error) or type(error).__name__)
         return False
     return True
 
@@ -205,11 +229,13 @@ def sync(checkout: Path) -> Outcome:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
     status = _git(checkout, "status", "--porcelain", "--untracked-files=no")
     interrupted = False
-    if status.returncode or status.stdout.strip() or _has_untracked_update(checkout):
-        interrupted = status.returncode == 0 and _finish_interrupted_update(checkout)
-        if not interrupted:
-            changed = ", ".join(line[3:] for line in status.stdout.splitlines()[:5])
-            return Outcome("dirty", f"{checkout} has changed tracked files ({changed or _first_line(status)})")
+    blocking_details: list[str] = []
+    if status.returncode:
+        blocking_details.append(_blocking_error(status))
+    elif status.stdout.strip() or _has_untracked_update(checkout, blocking_details):
+        interrupted = _finish_interrupted_update(checkout, blocking_details)
+    if blocking_details:
+        return Outcome("dirty", f"{checkout} has local changes that block the update ({', '.join(blocking_details)})")
     merged = _git(checkout, "merge", "--ff-only", "-q", "origin/main")
     if merged.returncode:
         return Outcome("ff-failed", f"git merge --ff-only origin/main failed in {checkout}: {_first_line(merged)}")
