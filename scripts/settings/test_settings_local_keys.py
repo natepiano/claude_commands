@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 KEYS = Path(__file__).with_name("settings_local_keys.sh")
@@ -88,6 +89,7 @@ class SettingsFilterTests(unittest.TestCase):
         self.history = self.root / "settings.local-key-notices.json"
         self.root.mkdir()
         self.home.mkdir()
+        self.env.update(interpreter_cache_environment(self.home / "cache"))
         for folder in ("scripts/settings", "scripts/lib", "scripts/message", "config"):
             (self.root / folder).mkdir(parents=True)
         for source in KEYS.parent.glob("*.sh"):

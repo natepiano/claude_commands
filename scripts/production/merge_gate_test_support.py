@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -410,7 +411,7 @@ class MergeGateFixture(unittest.TestCase):
         home = self.root / "home"
         git_config = write_fixture_git_config(root.parent)
         self.environment = {
-            **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, **interpreter_cache_environment(root / "cache"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -425,7 +426,7 @@ class MergeGateFixture(unittest.TestCase):
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             # The calling showrunner is found from these update timers, never the live ones.

@@ -433,20 +433,25 @@ class OffloadSettingsTests(unittest.TestCase):
                 _ = offload.ssh_target_state_directory(target)
 
     def test_explicit_settings_path_controls_every_offload_field(self) -> None:
-        settings = self.root / "other-mac.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
-            + "unreachable_backoff_s=4\nfree_floor_gib=5\nmac_budget_gib=6\n"
-            + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\n", template="mac_test")
-        config = offload.read_config(settings)
-        self.assertTrue(config.enabled)
-        self.assertEqual(config.host, "other-mac")
-        self.assertEqual(config.connect_timeout_s, 2.0)
-        self.assertEqual(config.probe_timeout_s, 3.0)
-        self.assertEqual(config.unreachable_backoff_s, 4.0)
-        self.assertEqual(config.free_floor_gib, 5.0)
-        self.assertEqual(config.default_target_budget_gib, "6")
-        self.assertEqual(config.values["mac_budget_gib.hana"], "7")
-        self.assertEqual(config.values["linux_only.hana"], "local-package")
+        _ = write_config_fixture(self.settings, "mirror_busy_backoff_s=37\n", template="mac_test")
+        for filename, budget_key in (("other-mac.conf", "mac_budget_gib"),
+                                     ("aws_target.conf", "target_budget_gib")):
+            with self.subTest(settings=filename):
+                settings = self.root / filename
+                _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
+                    + f"unreachable_backoff_s=4\nfree_floor_gib=5\n{budget_key}=6\n"
+                    + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\nmirror_busy_backoff_s=91\n", template="mac_test")
+                config = offload.read_config(settings)
+                self.assertTrue(config.enabled)
+                self.assertEqual(config.host, "other-mac")
+                self.assertEqual(config.connect_timeout_s, 2.0)
+                self.assertEqual(config.probe_timeout_s, 3.0)
+                self.assertEqual(config.unreachable_backoff_s, 4.0)
+                self.assertEqual(config.free_floor_gib, 5.0)
+                self.assertEqual(config.default_target_budget_gib, "6")
+                self.assertEqual(config.values["mac_budget_gib.hana"], "7")
+                self.assertEqual(config.values["linux_only.hana"], "local-package")
+                self.assertEqual(config.mirror_busy_backoff_s, 37)
 
     def test_sender_normalizes_multiline_tool_versions_before_parity(self) -> None:
         versions = {"rustc": " rustc fixture \n", "nextest":
@@ -948,6 +953,33 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(self.events_for("ssh")), 1)
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
+        path = self.state_directory / "mirror-busy-hana.until"
+        self.assertFalse(path.exists())
+        self.fixture["rsync_status"] = 0
+        self.sync_fixture()
+        config = offload.read_config(self.config_path)
+        request = offload.OffloadRequest(self.repository, "hana", "busy", offload.NO_RESULT_FILE, (),
+                                        owner="verify", target="mac", holder_session="fixture")
+        mirror = offload.request_mirror(config, request, HANA)
+        with mock.patch.dict(os.environ, self.environment), copies.remote_lease(mirror):
+            result = self.command(runner_options=("--target", "mac"))
+            self.assertEqual(result.returncode, 75, result.stdout)
+            self.assertEqual(result.stdout, "mac_test: not running on the mac (busy)\n")
+            self.assert_wire("declined", "busy")
+        self.assertGreater(float(path.read_text()), time.time())
+        self.assertLessEqual(float(path.read_text()), time.time() + 120)
+        result = self.command(runner_options=("--target", "mac"))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(path.exists())
+        self.fixture["run_status_reported"] = False
+        self.fixture["run_lines"] = [{"stream": "stderr", "text": "copies: /mirror/hana: busy; held by session grep"}]
+        self.sync_fixture()
+        result = self.command(runner_options=("--target", "mac"))
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assert_wire("declined", "busy")
+        self.assertNotIn("without a final status", result.stdout)
+        self.assertTrue(path.exists())
+        self.assertFalse(self.claim_file.exists())
 
     def test_copy_refusal_keeps_rsync_stderr_in_output_and_the_result(self) -> None:
         self.fixture["rsync_status"] = 23
@@ -964,6 +996,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_claimed_commands()
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assertEqual(len(self.events_for("ssh")), 1)
+
+        _ = stub.write_text(source.replace("rsync: destination denied", "copies: /mirror/hana: busy; held by session reader"))
+        result = self.command(runner_options=("--target", "mac"))
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assertTrue((self.state_directory / "mirror-busy-hana.until").exists())
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()
@@ -993,7 +1030,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(controller.copy_failure_detail, "copy: rsync: rsync: config denied")
         self.assertEqual(commands[-1][0], "rsync")
         self.assertIn("--compress", commands[-1])
-        self.assertIn("-rlptc", commands[-1])
+        self.assertIn("-rlpc", commands[-1])
 
     def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
         self.write_portable_workspace()
@@ -1225,7 +1262,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(
             copy["args"],
             [
-                "-rlptc",
+                "-rlpc",
                 "--stats",
                 "--compress",
                 "--delete",

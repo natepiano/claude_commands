@@ -295,6 +295,7 @@ under that directory. This avoids half-applied durable-state writes.
 
 - Run pane assignments in the foreground. They return after submission.
 - Run `verify.sh final` through its detached verification path.
+- Each folder or file you make on another machine (the Mac) needs automatic removal. Use a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`.
 - Saved run output (traces, captures, logs) stays under a few GB: read each run
   and delete it before the next. A disk-floor sweeper keeps 300 GiB free on `/`
   by deleting only the shortfall, least recently used build output first, never
@@ -552,9 +553,8 @@ phase's gates pass. Follow its order through the next turn boundary.
 <PrepareSession>
 Run `bash ~/.claude/scripts/direct/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
-creates the run-active marker; every exit must
-eventually run `end_session.sh`
-through <RunSummary/> or single-mode completion.
+records the open run in the director's staff row.
+Run `end_session.sh` through <RunSummary/> or single-mode completion for every exit.
 
 When the plan header carries a `> **Issues:**` line, mark each issue it names
 as being built:

@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
+from unittest.mock import patch
 from scripts.whoami.account_test_support import write_codex_auth
 from typing import ClassVar, cast
 
 from scripts.direct import assign_claude_test_support as support
 from scripts.lib.test_models_registry import RegistryReadProbe
-from scripts.lib import models_registry
+from scripts.lib import models_registry, unit_runs
 from scripts.production import staff
 from scripts.production.cli_fixture import process_boundary
 
@@ -108,9 +110,22 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
     def test_a_failed_claude_launch_ends_its_run_and_keeps_its_worker_row(self) -> None:
         session = self.start_phase("failed-worker")
         environment = self.launch_environment(session)
-        marker = Path(environment["UNIT_ACTIVE_DIR"]) / environment["CODEX_THREAD_ID"]
-        marker.parent.mkdir(parents=True)
-        _ = marker.write_text(str(session) + "\n")
+        environment.update({
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
+            "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
+            "DESIGN_ROLES_STATE": str(self.root / "designs"),
+        })
+        # This backend has no native worker panes to remove.
+        _ = (self.assign_script.parent / "remove_workers.py").write_text("")
+        copies = self.root / "scripts/copies"
+        copies.mkdir()
+        _ = shutil.copy2(support.DIRECT_DIR.parent / "copies/copies.py", copies / "copies.py")
+        environment["COPIES_CONFIG"] = str(support.DIRECT_DIR.parents[1] / "config/copies.conf")
+        with patch.dict(os.environ, environment):
+            row = staff.local_snapshot().by_current_session(environment["CODEX_THREAD_ID"])
+            assert row is not None
+            _ = staff.set_run(row.id, staff.OpenRun(session))
         registry = Path(environment["NOTIFIER_SESSIONS_DIR"])
         registry.mkdir(parents=True)
         from scripts.message import sessions
@@ -123,7 +138,8 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "raise SystemExit(2)"))
         result = self.run_assignment(self.assign_command(session), environment)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(unit_runs.open_run(environment["CODEX_THREAD_ID"]), result.stdout + result.stderr)
         state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
         self.assertEqual(state["status"], "error")
         self.assertEqual([event["status"] for event in self.launch_records(session, "run_finished")], ["error"])

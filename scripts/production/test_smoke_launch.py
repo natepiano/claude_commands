@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 
@@ -43,7 +43,7 @@ class SmokeLaunchTests(unittest.TestCase):
             environment = {
                 "PATH": str(programs),
                 "HOME": str(home),
-                "CLAUDE_PYTHON": sys.executable,
+                **interpreter_cache_environment(root / "cache"),
                 "USER_ZONE": "UTC",
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "SMOKE_TEST_RECORDS": str(records),

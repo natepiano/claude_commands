@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from scripts.build_targets.target_config import (
+    AnyEligibleTarget as AnyEligibleTarget,
+    LocalRequired as LocalRequired,
+    Routing as Routing,
+    ANY_ELIGIBLE_TARGET as ANY_ELIGIBLE_TARGET,
+    EligibleTarget as EligibleTarget,
+    ExcludedTarget as ExcludedTarget,
     ConfigError as ConfigError,
     LocalTarget as LocalTarget,
     Platform as Platform,
@@ -32,31 +38,6 @@ if TYPE_CHECKING:
     from scripts.aws_target import ledger as cost_ledger, measurement
     from scripts.buildlog import record
     from scripts.mac_test import mac_test
-
-
-@dataclass(frozen=True)
-class AnyEligibleTarget:
-    """The test may run on any target that supports its repository and package."""
-
-
-@dataclass(frozen=True)
-class LocalRequired:
-    reason: str
-
-
-Routing = AnyEligibleTarget | LocalRequired
-ANY_ELIGIBLE_TARGET = AnyEligibleTarget()
-
-
-@dataclass(frozen=True)
-class EligibleTarget:
-    target: Target
-
-
-@dataclass(frozen=True)
-class ExcludedTarget:
-    target: Target
-    reason: str
 
 
 @dataclass(frozen=True)

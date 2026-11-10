@@ -40,8 +40,8 @@ from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imp
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
-from scripts.shutdown import stop_resume
-from scripts.shutdown import remote, stop_results
+from scripts.agents import stop_resume
+from scripts.agents import remote, stop_results
 from scripts.accounts import pane_moves
 from scripts.message import sessions
 from scripts.herdr import herdr
@@ -412,7 +412,9 @@ class AccountsTests(unittest.TestCase):
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
         moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
             subject="moved-session", move_id="move-one", kind="failed", reason="still on claude1"))
-        with (patch.object(sessions, "live_sessions", return_value=[owner]),
+        # Each run stores a usage reading at the current time; the two outputs must match.
+        with (patch.object(accounts, "datetime", RoleWriteTime),
+              patch.object(sessions, "live_sessions", return_value=[owner]),
               patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("scripts.message.sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir))):
@@ -473,7 +475,7 @@ class AccountsTests(unittest.TestCase):
     def test_missing_or_unreadable_staff_supplies_no_group_members(self) -> None:
         from scripts.production import staff
         from scripts.herdr import pane_launch
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
         read = cast(Callable[[], tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]],
                     getattr(accounts, "_local_session_counts"))
         records = self.root / "private-records"
@@ -503,7 +505,7 @@ class AccountsTests(unittest.TestCase):
         "cleared unit marks", "cleared staff identity", "unknown status", "native session",
     ]) -> None:
         from scripts.message import sessions
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
         from scripts.herdr import pane_launch
         from scripts.production import staff
         from scripts.production.staff_test_support import unit_membership, fixture_runtime_id
@@ -633,7 +635,7 @@ class AccountsTests(unittest.TestCase):
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_board_and_group_move_share_staff_membership_and_the_live_process_account(self) -> None:
         from scripts.herdr import pane_launch
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
         from scripts.production.staff_test_support import unit_membership
 
         for label in ("claude2", "claude4"):
@@ -670,7 +672,7 @@ class AccountsTests(unittest.TestCase):
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
         from scripts.herdr import pane_launch
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
         from scripts.production.staff_test_support import unit_membership
 
         for label in ("claude2", "claude4"):
@@ -2052,9 +2054,9 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
     def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
-        from scripts.shutdown.inventory import ListedSession
+        from scripts.agents.inventory import ListedSession
 
-        inventory = import_module("scripts.shutdown.inventory")
+        inventory = import_module("scripts.agents.inventory")
         owner = ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
                               self.home / ".claude1", "", "", "")
         target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
@@ -2084,11 +2086,11 @@ class AccountsTests(unittest.TestCase):
                 moved.assert_not_called()
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
-        from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+        from scripts.agents.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
 
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
-        inventory = import_module("scripts.shutdown.inventory")
+        inventory = import_module("scripts.agents.inventory")
         stale = showrunners.Showrunner(session="", socket="", name="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
@@ -2108,11 +2110,11 @@ class AccountsTests(unittest.TestCase):
         moved.assert_not_called()
 
     def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
-        from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+        from scripts.agents.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
 
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
-        inventory = import_module("scripts.shutdown.inventory")
+        inventory = import_module("scripts.agents.inventory")
         stale = [showrunners.Showrunner(session="", socket="", name=name, zone="America/New_York",
                                        doc=f"/w/doc-{name}-production.md") for name in ("first", "second")]
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
@@ -7108,7 +7110,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.root = self.fixture.root
         from scripts.herdr.test_worker_panes import PaneWorld
-        from scripts.shutdown import restart
+        from scripts.agents import restart
         from scripts.lib.test_models_registry import write_registry
         from scripts.lib import unit_runs
 

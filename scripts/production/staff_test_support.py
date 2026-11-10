@@ -30,12 +30,13 @@ from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
@@ -49,7 +50,7 @@ def foreign_hostname() -> Generator[None]:
         _ = startup.write_text('import os, socket\nsocket.gethostname = lambda: os.environ.get("GATE_TEST_HOST", "gate-fixture")\n')
         pythonpath = os.pathsep.join((directory, os.environ.get("PYTHONPATH", "")))
         from scripts.production import production_lifecycle, update_registration
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         with (mock.patch.object(shutdown, "local_machine", side_effect=lambda: remote.local_machine()),
               mock.patch.object(production_lifecycle, "local_machine", side_effect=lambda: remote.local_machine()),
@@ -185,7 +186,7 @@ def stopped_worker_module(directory: Path) -> Path:
     _ = (directory / "sitecustomize.py").write_text('''import json, os
 from pathlib import Path
 from scripts.production import staff
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 def stop(reference, kind=""):
     row = staff.by_id(staff.StaffId(reference))
     if os.environ.get("FIXTURE_STOPPED"):
@@ -203,7 +204,7 @@ from pathlib import Path
 from unittest.mock import patch
 from scripts.production import staff, worker_admission as admission
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_session
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 args = sys.argv[1:]
 run = Path(args[args.index("--session-dir") + 1])
 allowed = admission.admit(args[args.index("--name") + 1], run)
@@ -380,7 +381,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             if module is not None:
                 for key in ("NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
                     _ = contexts.enter_context(mock.patch.object(module, key, Path(environment[key])))
-        for name in ("pane_record", "scripts.shutdown.pane_record"):
+        for name in ("pane_record", "scripts.agents.pane_record"):
             module = sys.modules.get(name)
             if module is not None:
                 _ = contexts.enter_context(mock.patch.object(
@@ -482,7 +483,7 @@ from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
 from scripts.production import staff_sources
-from scripts.shutdown import remote
+from scripts.agents import remote
 from unittest import mock
 sys.platform = os.environ.get('STAFF_TEST_PLATFORM', 'linux')
 script = sys.argv.pop(1)
@@ -539,7 +540,7 @@ def isolated_source_readers() -> Generator[None]:
             }),
             ("pane_record", {"RECORD_DIR": Path(os.environ["HERDR_PANE_RECORD_DIR"])}),
         ):
-            qualified = "scripts.production.showrunners" if module_name == "showrunners" else "scripts.shutdown.pane_record"
+            qualified = "scripts.production.showrunners" if module_name == "showrunners" else "scripts.agents.pane_record"
             for name in (module_name, qualified):
                 module = sys.modules.get(name)
                 if module is not None:
@@ -768,7 +769,7 @@ class StaffTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
-            "CLAUDE_PYTHON": sys.executable,
+            **interpreter_cache_environment(self.root / "cache"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -783,6 +784,7 @@ class StaffTestCase(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
             "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
         })))
+        _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
 
@@ -810,7 +812,7 @@ class StaffTestCase(unittest.TestCase):
             ))
             _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
             _ = contexts.enter_context(mock.patch(
-                "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
+                "scripts.agents.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
             for module in {remote, sys.modules.get("remote", remote)}:
                 _ = contexts.enter_context(mock.patch.object(module, "local_machine", return_value=machine))
@@ -1037,9 +1039,9 @@ class StaffTestCase(unittest.TestCase):
         })
         write_text_atomic(run / "director", director + "\n")
         if director_run:
-            from scripts.lib import unit_runs
-
-            write_text_atomic(unit_runs.marker(director), str(run) + "\n")
+            owner = staff.local_snapshot().by_current_session(director)
+            assert owner is not None
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
         return run
 
     @contextmanager

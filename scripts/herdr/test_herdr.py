@@ -3067,7 +3067,7 @@ class HerdrTests(unittest.TestCase):
         copy_session_modules(message)
         _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "shutdown/remote.py"):
+        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "agents/remote.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
@@ -4895,7 +4895,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_process_snapshot_serves_roster_units_inventory_and_codex_from_one_scan(self) -> None:
         from scripts.message import roster
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))

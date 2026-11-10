@@ -23,11 +23,6 @@
   - Report additional wait savings and head delay.
   - Revealed by: Phase 30; baseline corrected against the current admission rule.
 
-- [ ] **Make the build_targets.py call from verify.sh cheap: it costs 199 ms of CPU on every step**
-  - Why needed: verify measured `build_targets.py` at 199 ms of CPU each time `verify.sh` starts it, on every step; it is the most costly helper.
-  - Completion condition: the call uses fewer imports or a lighter entry path; the change reports before and after CPU figures for the same call, and the build_targets and verify tests pass.
-  - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
-
 - [ ] **Match trims against each step's recorded Cargo output roots**
   - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/buildlog/step_outputs.py`, and their tests.
   - Dependency: Phase 64's shared root decoding and row facts, with Phase 62's recorded-root safety rules.
@@ -60,16 +55,6 @@
   - Preserve access from any pane and the current direct-command behavior.
   - Test unit selection from a non-showrunner pane and replacement of existing priority.
   - Revealed by: Phase 26; narrowed after the existing pane route and writer tests satisfied the access requirement.
-
-- [ ] **Mac claims and releases read session ownership without importing the build queue**
-  - Target: `scripts/build_hold/build_hold.py`, a new `scripts/build_hold/session_owner.py`, `scripts/mac_test/mac_test.py` (:31), and their tests.
-  - Why needed: six modules import `build_hold` at module level, and each one loads the build queue modules that only `admitted_processes()` uses.
-  - Measured (natest): `build_hold.py:43` imports `admission_service` at once, 126-132 ms on each `mac_test.py` claim and release.
-  - Design (builds showrunner 2026-11-05): move `owning_session()`, `OwningSession` and `NoOwningSession` into `scripts/build_hold/session_owner.py`, which imports only `os` and `unit_runs`.
-    `build_hold.py` imports the three from it, so its callers keep their names. Change `mac_test.py:31` to import the light module (one owner switches all callers; the showrunner settles that edit in verify's file).
-  - Completion condition: a fresh-interpreter test shows that importing `session_owner` loads no build queue module; `mac_test.py` claim and release are measured before and after (126-132 ms of `admission_service` import today).
-  - Start: when natedev says the send.py freeze on `build_hold.py` ends (the showrunner tells us).
-  - Revealed by: Phase 67 (builds showrunner 2026-11-05: next)
 
 - [ ] **One owner for Cargo target detection in scripts/lib/cargo_output.py** (after the held 63-64 hash lands)
   - Target: move `RUSTC_INFO`, `FINGERPRINT_DIR`, `has_cargo_tag`, `build_trees`, `is_cargo_target`, `enclosing_cargo_target` and its two result types from `scripts/lint/sweep.py` to `scripts/lib/cargo_output.py`; switch every caller (`sweep.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/memory.py`) and their tests.

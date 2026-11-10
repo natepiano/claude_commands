@@ -60,7 +60,7 @@ else:
     account = _lazy_module("scripts.whoami.account")
     agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
     note_file = _lazy_module("scripts.whoami.note_file")
-from scripts.shutdown import remote as remote  # noqa: E402
+from scripts.agents import remote as remote  # noqa: E402
 from scripts.message.sessions import RegistryRead, SessionRecord, messaging_socket_exists  # noqa: E402
 
 Kind = Literal["claude", "codex"]
@@ -1360,7 +1360,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     )
     runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
-    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
+    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems, record=membership)
     workers = _ledger_workers(runs, records, problems, membership)
     production_places: dict[str, _ProductionPlace] = {}
     try:

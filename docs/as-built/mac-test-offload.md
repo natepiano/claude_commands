@@ -53,6 +53,7 @@ Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-c
   It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
   It exits 0 only for `free`.
   A live claim blocks only its repository.
+  A live mirror refusal time also answers `busy` for that repository.
   A failed target probe blocks every repository.
   A version decline blocks only its repository.
   `verify.sh` passes its repository root with `--repo-root`.
@@ -279,13 +280,46 @@ Declined, lost, and invalid results return the step to its waiting state.
   The runner prints `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`.
   Nextest exit 4 becomes `NoTestMatchedOnMac` and runner exit 75.
   The runner prints `mac_test: no test matched on the Mac; running on natedev instead`.
+- **Abandoned compiler sessions.** Before a build on a Mac or Linux target, the step removes old abandoned compiler sessions and their locks.
+  It removes them only from its own mirror's default build folder.
+  `abandoned_session_minutes` sets the minimum age.
+  The bounded walk skips `deps`, `build`, `.fingerprint`, and `examples`.
+  It preserves recent sessions and finished sessions.
+  A Mac step skips this removal when it has an explicit `--target-dir`.
+  A Linux step skips this removal when `--target-dir` selects another folder.
+  A Linux step checks tool versions before this removal.
+  A missing target or a failed removal does not stop the build.
 - **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
 - **Markers.** Output streams as it arrives. `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
 - `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.
-- SIGINT, SIGTERM and SIGHUP stop the ssh child, check and end remote leftovers, then release only when their end is confirmed; exit is 128 plus the signal. A signal during the claim lets that call answer before cleanup. Without `mac_exit=<n>`, the run is `LostMacRun`, prints `mac_test: the link to the Mac dropped; running on natedev instead`, and exits 75 after cleanup. `check_leftovers(config, host, repository)` uses the two selectors in `mirror_selector_script(scope)`, which the claim watcher's activity check shares with scope `ALL_MIRRORS`: `pgrep -u "$(id -u)" -f "$mirror_command_pattern"` on mirror command paths, and `lsof` working directories matched by `awk` against `$mirror_cwd_pattern`. A `KnownRepository` scope stops both patterns at `mirror/<repo>` followed by `/`, a quote, a space or the end (the name escaped by `extended_regex_literal`), so a lost hana run's check never ends a cargo-liner run, nor one under `mirror/hana_other`. It sends TERM, then KILL, then counts again; the check's ssh call is bounded by `leftover_timeout_s` (`OffloadConfig`, from the settings file; default 10 s, and a missing or invalid value falls back to 10) and returns `LeftoversEnded | LeftoversRemain | LeftoverCheckFailed`. A failed check or remaining process keeps the remote claim.
+- SIGINT, SIGTERM, and SIGHUP stop the SSH child.
+  The runner checks remote leftovers and releases its claim only after it confirms their end.
+  The exit status is 128 plus the signal number.
+  A signal during the claim lets that call answer before cleanup.
+  A missing `mac_exit=<n>` becomes `LostMacRun`, unless `mirror-use` reports a busy refusal.
+  A busy refusal becomes `BusyMacDecline` and writes the repository's mirror refusal time.
+  Other missing completions report the runner's exit status and exit 75 after cleanup.
+  `check_leftovers` uses the two selectors from `mirror_selector_script(scope)`.
+  The claim watcher's activity check uses scope `ALL_MIRRORS`.
+  The command selector uses `pgrep` for mirror command paths.
+  The working-directory selector uses `lsof` and `awk`.
+  A `KnownRepository` scope stops both patterns at the repository boundary.
+  `extended_regex_literal` escapes the repository name.
+  Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
+  Cleanup sends TERM, then KILL, then counts again.
+  Its SSH call uses `leftover_timeout_s` from `OffloadConfig`.
+  It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.
+  A failed check or a remaining process keeps the remote claim.
+
 - Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
+
+`test [<package>] --run-ignored only` runs only ignored tests on the selected target.
+It accepts repeated `--filter <name>` flags and `--features <list>`, but refuses `--test <name>`.
+Omit the package to select named tests across two packages in one call.
+The call must match a test. Its filtered result never supplies a full package pass.
+Its saved-result key includes `--run-ignored only`.
 
 `test [<package>] --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
@@ -429,7 +463,10 @@ Both values use the existing configuration reader.
 
 ## Calibration and gotchas
 
-- The mirror copy is `rsync -rlpc`: checksums, no modification times. A touch-only edit never reaches the Mac; time a rebuild with a content edit.
+- The mirror copy and the tracked script copy use `copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS` (`rsync -rlpc`).
+  Checksums skip files with equal content and keep their destination modification times.
+  Changed files get the receiver write time, so Cargo detects changed source even when its source modification time is old.
+  A change to the source modification time alone causes no transfer.
 - GitHub lists hana's macOS job only after `macOS: Runner Availability` completes, and lists it at once as completed/skipped while the switch is off. A pending block therefore also waits on queued runs that have not reached that job.
 - A lost run whose cleanup cannot confirm the end keeps its claim. A remote claimant takes it over with exit 13 and checks the stored host. Remaining work declines `busy`; an unreadable host or failed check declines `unreachable` and starts the unreachable backoff. Both keep the claim. Stderr says `mac_test: <N> leftover processes of a lost run are still on the Mac; it stays busy until they end`, or `mac_test: could not confirm that a lost run's leftovers ended: <reason>; the Mac stays busy`.
 - A non-interactive bash starts an `&` child with `SIGINT` ignored, so a forwarded INT is lost until `offload.py run` installs its own handlers. `verify.sh` therefore forwards INT as TERM. A terminal interrupt reaches the runner twice: INT from the process group and TERM from the forward.
@@ -539,9 +576,40 @@ Existing waits keep their place on natedev until then.
 Below the required floor, it runs one shared floor sweep and reads free space again.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A caller that finds a running sweep waits for its result.
-The sweep runs without admission or claim locks.
+The sweep holds no admission or claim lock during removal.
+`floor_claims.serve()` reads claims and mirror leases under `state.lock`.
+It builds the reply under the lock and prints after the lock closes.
+It exits without reading stdin.
+`read_claims()` closes both reader processes before it returns a `ClaimSnapshot`.
+A lost SSH session cannot retain the state lock while the sweep runs.
+An unavailable or unreadable claim reply protects all output.
+
+`mirror_sweep_leases()` reports acquired leases separately from busy mirrors.
+The sweep keeps busy mirrors and holds acquired leases through removal.
+For output outside those leases, it reads claims again immediately before each removal group.
+A new claim or an unreadable reply keeps that output.
+Cargo locks, scratch busy locks, and process checks retain their existing roles.
+
+| Path class | Protection during removal |
+| --- | --- |
+| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease. |
+| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases. |
+| Marked gate caches and other output outside acquired leases | The sweep reads claims again before each removal group and retains existing output locks. |
+| `mirror-remove` payload, metadata, and removal authority | `local_mirror_lease` covers the operation; the record lock serializes metadata changes. |
+| A registered task clone's parent folder | An outside mirror lease survives parent removal and blocks concurrent `mirror-use`. No parent busy lock applies. |
+| `mirror-receive` cleanup of interrupted removal | The mirror lease and record lock cover the old payload and metadata. |
+| Natedev floor output | Existing build holds, mirror leases, process checks, scratch locks, and Cargo locks apply. |
 `mirror_root.py` reads the one `mirror_root` setting for offload and sweep.
 `free_now` reads local records only and starts no sweep or SSH request.
+
+`local_mirror_lease` first takes an outside lease, then the existing sibling lease.
+The outside file uses the mirror path hash and sits beside the task parent.
+After acquisition, the lease compares the open file inode with the path inode.
+A missing path or a changed inode causes the existing busy refusal.
+When task removal deletes the parent, lease cleanup deletes the outside file before it closes either lease.
+Both lease descriptors pass to remote commands.
+Task removal can delete the sibling lease and record lock while the outside lease remains locked.
+The sibling lease path stays unchanged, so a live lease from the old code still blocks removal.
 
 A disk decline remains retryable through the local queue leave hook.
 The step record retains `NatedevOnly("disk")` for idle-alert evidence.
@@ -556,7 +624,32 @@ A successful claim creates `MAC_WAIT_CLAIM_FILE`.
 A refused claim keeps the local queue place.
 `release_wait_claim` releases unused claims after an attempt and during cleanup.
 An unlocked `free-now` read cannot replace this claim handoff.
+`build_targets.command_reserve()` reads `free_now` before it tries `state.lock`.
+A block or an active backoff returns without waiting for that lock.
+`owns_wait_claim()` reads ownership without a lock before `free_now`.
+Unreadable state means the caller does not own the claim.
+A published reservation retains success during backoff.
+Without a published reservation, an owned wait claim still passes the policy check.
+The policy check refuses backoff without waiting for `state.lock`.
+A block refuses a plain owned claim.
+A retained remote cleanup claim keeps success under a block.
+A published reservation checks ownership before it returns success.
 
 `blocking_claim_block` applies the shared block rule to claim reuse and transfer.
-A reservation cannot override a later block from another session.
+A plain reservation cannot override a later block from another session.
 Each new step releases the previous step's reservation before local waits.
+
+## Mirror refusal times
+
+One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
+Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
+A mirror busy refusal during copy writes this time.
+No available slot lease also writes this time.
+A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost run.
+A successful copy removes the repository's refusal time.
+`free-now` reads this local record without SSH or a lock.
+A live time answers `busy` only for its target and repository.
+The claim and mirror lease still make the final decision under their locks.
+Read access alone does not make a mirror busy.
+A working directory, a mapped file, or a file open for writing still makes it busy.
+Unavailable scans and unreadable lease groups keep their protection.

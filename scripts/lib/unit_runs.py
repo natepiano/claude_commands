@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""Where unit runs keep their folders, under the new name and the former one.
-
-A /unit:direct run keeps its files in `/tmp/claude/unit/<run id>/` and marks its Claude session
-in `/tmp/claude/unit/active/<session id>`.
-Runs started before 2026-10-15 used `delegate` in both places and keep their folders
-until they end, so every reader takes both names. The former name is read until a removal
-step, on or after 2026-10-22, drops it; that step runs only while `unit_runs.py removal-check`
-passes, since a run started before the rename may stay open past that date.
-
-A test points a reader at its own folder with an override, which replaces both names.
+"""Read run folders and the open run in each director's staff row.
 
 Staff supplies each run's current owner. Run records keep task history.
+Run folders can use the current unit name or the former delegate name.
 """
 from __future__ import annotations
 try:
@@ -29,7 +21,7 @@ from enum import Enum
 from functools import cache
 from pathlib import Path
 from importlib import import_module
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -122,13 +114,14 @@ class RunStaffAtUse(Enum):
 
 
 
-def activate(run: Path, session_id: str) -> None:
-    """Write the current marker and remove the former marker."""
-    current, *former = active_dirs()
-    current.mkdir(parents=True, exist_ok=True)
-    _ = (current / session_id).write_text(f"{run}\n", encoding="utf-8")
-    for directory in former:
-        (directory / session_id).unlink(missing_ok=True)
+def open_run(session_id: str, *,
+             record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> Path | None:
+    """Read the open run from the row for the current session."""
+    from scripts.production import staff
+
+    row = (staff.local_by_current_session(session_id) if isinstance(record, RunStaffAtUse)
+           else record.by_current_session(session_id))
+    return row.run.path if row is not None and isinstance(row.run, staff.OpenRun) else None
 
 
 def history_root() -> Path:
@@ -151,27 +144,6 @@ def history_root_in(state: Path) -> Path:
 def run_archive() -> Path:
     """The usage backfill's run archive under its new name once it exists, else the former one."""
     return moved_folder(state_dir() / RUN_ARCHIVE_NAME, state_dir() / FORMER_RUN_ARCHIVE_NAME)
-
-
-def active_dirs(override: str | Path | None = None) -> tuple[Path, ...]:
-    """The folders that hold run markers, the new name first."""
-    return (Path(override),) if override else tuple(root / "active" for root in run_roots())
-
-
-def marker(session_id: str, override: str | Path | None = None) -> Path:
-    """The session's run marker: the first that exists, else where a new run writes it."""
-    candidates = [directory / session_id for directory in active_dirs(override)]
-    return next((path for path in candidates if path.is_file()), candidates[0])
-
-
-def marker_must_stay(path: Path) -> bool:
-    """Keep another session's marker when its owner is live or liveness is unknown.
-
-    The marker name is the session id; its age and target's existence say nothing
-    about the owning process. Reuse the registry's process-identity check.
-    """
-    from scripts.message import sessions
-    return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
 @cache
@@ -203,7 +175,7 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
 
 
 def run_folders(root_override: str | Path | None = None) -> list[Path]:
-    """List unique run folders in root and name order, without marker folders."""
+    """List unique run folders in root and name order."""
     folders: dict[Path, Path] = {}
     for root in run_roots(root_override):
         try:
@@ -211,7 +183,7 @@ def run_folders(root_override: str | Path | None = None) -> list[Path]:
         except OSError:
             continue
         for folder in candidates:
-            if folder != root / "active" and folder.is_dir():
+            if folder.is_dir():
                 _ = folders.setdefault(folder.resolve(), folder)
     return list(folders.values())
 
@@ -259,30 +231,25 @@ def held_by_session(root_override: str | Path | None = None, *,
 
 
 def held(session_id: str, root_override: str | Path | None = None,
-         active_override: str | Path | None = None, *,
+         *,
          scanned: dict[str, list[str]] | None = None,
          record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> list[str]:
-    """List directed folders with the verified marker first, then the shared scan's order."""
+    """List directed folders with the verified open run first."""
     if not session_id:
         return []
     folders = held_by_session(root_override, record=record) if scanned is None else scanned
-    active = Path(root_override) / "active" if root_override is not None and active_override is None else active_override
-    try:
-        lines = marker(session_id, active).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        lines = []
+    target = open_run(session_id, record=record)
     runs: list[str] = []
-    if lines and (target := lines[0].strip()):
-        resolved = Path(target).resolve()
+    if target is not None:
+        resolved = target.resolve()
         owner = next((session for session, paths in folders.items()
                       if any(Path(path).resolve() == resolved for path in paths)), None)
         if owner is None:
-            owner = director(Path(target), record=record)
+            owner = director(target, record=record)
             if owner == session_id:
-                # Cache an outside target only after its marker owner matches its director.
-                folders.setdefault(owner, []).append(target)
+                folders.setdefault(owner, []).append(str(target))
         if owner == session_id:
-            runs.append(target)
+            runs.append(str(target))
     seen = {Path(run).resolve() for run in runs}
     for folder in folders.get(session_id, ()):
         resolved = Path(folder).resolve()
@@ -290,42 +257,6 @@ def held(session_id: str, root_override: str | Path | None = None,
             seen.add(resolved)
             runs.append(folder)
     return runs
-
-
-class FormerOwner(NamedTuple):
-    session_id: str
-    name: str
-    run: str
-
-
-def former_owners(running: Mapping[str, str]) -> list[FormerOwner]:
-    """Each running session, by id to its name, that owns a marker under the former name."""
-    try:
-        markers = sorted((FORMER_RUN_ROOT / "active").iterdir())
-    except OSError:
-        return []
-    owners: list[FormerOwner] = []
-    for path in markers:
-        if path.name not in running and not marker_must_stay(path):
-            continue
-        try:
-            run = path.read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeError):
-            run = "an unreadable marker"
-        owners.append(FormerOwner(path.name, running.get(path.name, "live or uncheckable session"), run))
-    return owners
-
-
-def removal_check(running: Mapping[str, str]) -> int:
-    """Refuse the former name's removal while a running session owns a marker under it."""
-    owners = former_owners(running)
-    if not owners:
-        print(f"no running session owns a marker under {FORMER_RUN_ROOT / 'active'}; the former name can go")
-        return 0
-    print(f"keep the former name: {len(owners)} running session(s) own a marker under {FORMER_RUN_ROOT / 'active'}")
-    for owner in owners:
-        print(f"  {owner.name or 'unnamed'} ({owner.session_id}): {owner.run}")
-    return 1
 
 
 def live_run_folders(now: float, roots: Sequence[Path] | None = None) -> list[Path]:
@@ -374,21 +305,13 @@ def _held_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="unit_runs.py held", description="Print each run folder a session directs.")
     _ = parser.add_argument("session_id")
     _ = parser.add_argument("--root", default="", help="one run root in place of both run-folder names")
-    _ = parser.add_argument("--active", default="", help="one marker folder in place of both")
     args = parser.parse_args(argv)
-    for run in held(cast(str, args.session_id), cast(str, args.root) or None, cast(str, args.active) or None):
+    for run in held(cast(str, args.session_id), cast(str, args.root) or None):
         print(run)
     return 0
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) == 3 and argv[0] == "activate":
-        try:
-            activate(Path(argv[1]), argv[2])
-        except OSError as error:
-            print(f"unit_runs: marker not recorded: {error}", file=sys.stderr)
-            return 1
-        return 0
     if argv and argv[0] == "held":
         return _held_main(argv[1:])
     if argv == ["history-root"]:
@@ -396,13 +319,8 @@ def main(argv: list[str]) -> int:
         return 0
     if argv == ["move-history"]:
         return move_history(time.time())
-    if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id>",
-              file=sys.stderr)
-        return 2
-    from scripts.message.sessions import running_sessions
-
-    return removal_check({record["sessionId"]: record["name"] for record in running_sessions()})
+    print("usage: unit_runs.py history-root | move-history | held <session id>", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

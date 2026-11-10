@@ -4127,13 +4127,28 @@ def unmoved_change(change: FileChange, moves: ItemMoves) -> FileChange:
     return FileChange(FileStatus.MODIFIED, change.old_path, change.path, old, new, parse_hunks(patch))
 
 
-def worktree_commit(repo: Path) -> str:
-    """Snapshot tracked and non-ignored work through a disposable index."""
+@dataclass(frozen=True)
+class WholeWorktree:
+    """Capture all tracked and non-ignored work."""
+
+
+@dataclass(frozen=True)
+class TicketSourcePaths:
+    """Capture only the ticket's source paths over the current HEAD."""
+
+    paths: tuple[str, ...]
+
+
+_WHOLE_WORKTREE = WholeWorktree()
+
+
+def worktree_commit(repo: Path, source: WholeWorktree | TicketSourcePaths = _WHOLE_WORKTREE) -> str:
+    """Capture source paths through a disposable index without changing the real index."""
     head = git(repo, "rev-parse", "--verify", "HEAD^{commit}").strip()
     index = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
     with tempfile.TemporaryDirectory(prefix="style-footprint-") as directory:
         temporary_index = Path(directory) / "index"
-        if index.exists():
+        if isinstance(source, WholeWorktree) and index.exists():
             # Git uses the index timestamp to recheck files whose stat data may
             # still match after a same-size edit. Preserve that timestamp.
             _ = shutil.copy2(index, temporary_index)
@@ -4144,13 +4159,23 @@ def worktree_commit(repo: Path) -> str:
                                     capture_output=True, text=True, check=False)
             if result.returncode:
                 raise CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
-            return result.stdout.strip()
+            return result.stdout
 
-        _ = snapshot_git("add", "-A", "--", ":/")
-        tree = snapshot_git("write-tree")
-        if tree == git(repo, "rev-parse", f"{head}^{{tree}}").strip():
+        if isinstance(source, TicketSourcePaths):
+            _ = snapshot_git("read-tree", head)
+            if source.paths:
+                requested = tuple(f":(literal){path}" for path in source.paths)
+                tracked = snapshot_git("ls-tree", "-rz", "--name-only", head, "--", *requested)
+                paths = tuple(dict.fromkeys((*(path for path in tracked.split("\0") if path),
+                                             *(path for path in source.paths if os.path.lexists(repo / path)))))
+                if paths:
+                    _ = snapshot_git("add", "-A", "--", *(f":(literal){path}" for path in paths))
+        else:
+            _ = snapshot_git("add", "-A", "--", ":/")
+        tree = snapshot_git("write-tree").strip()
+        if isinstance(source, WholeWorktree) and tree == git(repo, "rev-parse", f"{head}^{{tree}}").strip():
             return head
-        return snapshot_git("commit-tree", "--no-gpg-sign", tree, "-p", head, "-m", "style-footprint")
+        return snapshot_git("commit-tree", "--no-gpg-sign", tree, "-p", head, "-m", "style-footprint").strip()
 
 
 def main(argv: list[str] | None = None) -> int:

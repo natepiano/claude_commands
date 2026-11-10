@@ -27,15 +27,20 @@ import tempfile
 import time
 import traceback
 from types import FrameType
-from typing import BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
 from scripts.mac_test import cargo_manifest
+from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
-from scripts.copies import copies
+from scripts.lib import copy_record
+
+if TYPE_CHECKING:
+    from scripts.copies import copies
 from scripts.direct import result_environment
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import repository, store
@@ -398,6 +403,14 @@ class OffloadConfig:
         return float(self.values["fetch_limit_mib"])
 
     @property
+    def abandoned_session_minutes(self) -> int:
+        return int(self.values["abandoned_session_minutes"])
+
+    @property
+    def mirror_busy_backoff_s(self) -> float:
+        return float(self.values["mirror_busy_backoff_s"])
+
+    @property
     def fetch_retention_days(self) -> float:
         return float(self.values["fetch_retention_days"])
 
@@ -438,7 +451,7 @@ class OffloadRequest:
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
     environment: tuple[tuple[str, str], ...] = ()
     fetch: FetchFolder | NoFetch = NO_FETCH
-    repository_scope: copies.RepositoryScope = copies.ALL_REPOSITORIES
+    repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
 
     @property
@@ -651,6 +664,11 @@ class MissingMacStatus:
 
 
 @dataclass(frozen=True)
+class MirrorUseBusy:
+    """The mirror lease refused the command before the runner started."""
+
+
+@dataclass(frozen=True)
 class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
@@ -660,7 +678,7 @@ class InterruptedTargetStatus:
     generation: str
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch
+RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch | MirrorUseBusy
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -872,6 +890,7 @@ class ProcessController:
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         mismatch = ""
+        mirror_refused = False
         build_target_directory = ""
         received_bytes = 0
         finished_output = False
@@ -885,6 +904,8 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                if mirror_busy_refusal(marker):
+                    mirror_refused = True
                 if marker.startswith("build_target_directory="):
                     build_target_directory = marker.removeprefix("build_target_directory=")
                     continue
@@ -918,6 +939,9 @@ class ProcessController:
                         print(line, end="", flush=True)
                     cleanup = CleanupUnconfirmed()
                     continue
+                if marker.startswith("mac_trim="):
+                    print(line, end="", flush=True)
+                    continue
                 if marker.startswith("mac_cleanup="):
                     cleanup = parse_cleanup(marker.removeprefix("mac_cleanup="))
                     continue
@@ -940,6 +964,8 @@ class ProcessController:
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
+        if mirror_refused:
+            return MirrorUseBusy()
         if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
@@ -1016,6 +1042,8 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
     config = conf.read(settings)
     values = config.values()
+    values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
+    values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
         enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
                  else config.text("offload") == "on"),
@@ -1030,13 +1058,11 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
 
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
-    from scripts.lint import sweep
-
-    name = sweep.repo_name(str(repo_root))
-    common = sweep.git_common_dir(str(repo_root))
+    name = repository.repo_name(str(repo_root))
+    common = repository.git_common_dir(str(repo_root))
     if name is None or common is None:
         return UNKNOWN_REPOSITORY
-    source = Path(sweep.source_git_dir(common))
+    source = Path(repository.source_git_dir(common))
     if not (source / "config").is_file():
         return KnownRepository(name)
     key = repository.repository_key(str(source.parent))
@@ -1142,6 +1168,29 @@ def backoff_path(target: str = "mac") -> Path:
     return state_directory(target) / "unreachable_until"
 
 
+def mirror_busy_path(repository: str, target: str = "mac") -> Path:
+    """Keep one refusal time for each target and repository."""
+    return state_directory(target) / f"mirror-busy-{quote(repository, safe='')}.until"
+
+
+def read_mirror_busy(now: float, repository: str, target: str = "mac") -> BackoffState:
+    try:
+        until = float(mirror_busy_path(repository, target).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return NO_BACKOFF
+    return ACTIVE_BACKOFF if math.isfinite(until) and until > now else NO_BACKOFF
+
+
+def write_mirror_busy(config: OffloadConfig, repository: str, target: str) -> None:
+    path = mirror_busy_path(repository, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, f"{time.time() + config.mirror_busy_backoff_s:.6f}\n")
+
+
+def mirror_busy_refusal(detail: str) -> bool:
+    return re.search(r"\bcopies: [^\n]+: busy; held by session ", detail) is not None
+
+
 @dataclass(frozen=True)
 class FailedProbe:
     """The target's last completed probe failed."""
@@ -1235,6 +1284,8 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    from scripts.copies import copies
+
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
@@ -1432,6 +1483,8 @@ def linux_version_declined_recently(target: str, repository_name: str, hold_s: f
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     root = Path(__file__).resolve().parents[2]
     listing = controller.capture_copy(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
@@ -1458,7 +1511,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture_copy(["rsync", "-rlptc", "--compress", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
@@ -1666,6 +1719,8 @@ def copy_tree(
     request: OffloadRequest,
     repository: KnownRepository,
 ) -> bool:
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
@@ -1726,6 +1781,46 @@ def expected_instance_generation(target: str) -> str:
     return instance_generation(state_directory(target))
 
 
+def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
+    """Trim the mirror budget before the run releases its lease."""
+    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
+        return "echo mac_cleanup=skipped"
+    budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    program = (
+        'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
+        'config = conf.read("lint"); '
+        'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
+        'config.number(sweep.RECENT_KEY)))'
+    )
+    floor = shlex.quote(f"{config.free_floor_gib:g}")
+    return (
+        f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
+        + 'trim_started=$(date +%s); '
+        + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
+        + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
+        + 'trim_status=0; else trim_status=$?; fi; '
+        + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
+        + f'if trim_size=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + 'trim_size=${trim_size%%[[:space:]]*}; '
+        + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
+        + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
+        + 'else over_budget=unknown; fi; '
+        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
+        + '"$trim_status" "$trim_elapsed" "$over_budget"; '
+        + 'if free_gib=$(df -g "$HOME"); then '
+        + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
+        + 'else free_gib=; fi; '
+        + f'if awk -v free="$free_gib" -v floor={floor} '
+        + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
+        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+        + f'if rm -rf -- "$HOME"/{target}; then '
+        + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
+        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+    )
+
+
 def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
@@ -1756,32 +1851,22 @@ def remote_test_command(
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
     repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
-    elif any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
-        cleanup_command = "echo mac_cleanup=skipped"
     else:
-        target = shlex.quote(mirror_target(repository, request.target, request.slot))
-        floor = shlex.quote(f"{config.free_floor_gib:g}")
-        cleanup_command = (
-            'if free_gib=$(df -g "$HOME"); then '
-            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-            + 'else free_gib=; fi; '
-            + f'if awk -v free="$free_gib" -v floor={floor} '
-            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
-            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + f'if rm -rf -- "$HOME"/{target}; then '
-            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
-        )
+        cleanup_command = remote_cleanup_command(config, request, repository)
+    abandoned_sessions = ""
+    if not custom_target:
+        abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     clear_environment = clear_environment + " && " if clear_environment else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -2088,6 +2173,8 @@ def claimed_run(
     repository: KnownRepository,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     release_allowed = True
     sync_after_release = False
     evidence = controller.attempt_evidence
@@ -2156,6 +2243,7 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        mirror_busy_path(repository.name, request.target).unlink(missing_ok=True)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
             if request.copy
@@ -2173,6 +2261,10 @@ def claimed_run(
                                           remote_test_command(config, request, repository, copied.tree_key)),
             ]
         )
+        if isinstance(remote_status, MirrorUseBusy):
+            release_allowed = True
+            write_mirror_busy(config, repository.name, request.target)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
             remote_status = MISSING_MAC_STATUS
         if not isinstance(remote_status, ReportedMacStatus):
@@ -2193,6 +2285,14 @@ def claimed_run(
         if not linux:
             linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
+        if not linux and isinstance(request.fetch, FetchFolder):
+            cleanup = controller.stream_mac_run([
+                *ssh_prefix(config),
+                copies.remote_use_command(request_mirror(config, request, repository),
+                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
+            ])
+            remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
+                                                          else CleanupUnconfirmed()))
         seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
@@ -2344,6 +2444,8 @@ def run_offload(
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
     if isinstance(eligibility, IneligibleMacStep):
         return declined(eligibility.reason, started)
@@ -2377,12 +2479,17 @@ def run_offload(
                 except copies.BusyRemoteMirror:
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
-            return leased_offload(controller, config, request, repository, started, linux, leases)
+            result = leased_offload(controller, config, request, repository, started, linux, leases)
+            if isinstance(result, DeclinedMacRun) and result.reason == "copy" and mirror_busy_refusal(result.detail):
+                write_mirror_busy(config, repository.name, request.target)
+            return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
 
 
 def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> copies.RemoteMirror:
+    from scripts.copies import copies
+
     scope = request.repository_scope
     if isinstance(scope, copies.AllRepositories):
         scope = copies.SelectedRepository(repository.name)
@@ -2395,6 +2502,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                    repository: KnownRepository, started: float, linux: bool,
                    leases: dict[int, ExitStack]) -> MacOffloadResult:
     if not leases:
+        write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     claim = claim_for_run(controller, config, request, repository, tuple(leases))
     # A transferred reservation can be adopted only once.
@@ -2498,6 +2606,8 @@ def holder_session() -> str:
 
 
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
+    from scripts.copies import copies
+
     words = arguments.nextest_words
     if words[:1] == ["--"]:
         words = words[1:]

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, cast
 import unittest
 from unittest import mock
 from scripts.production import staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 if TYPE_CHECKING:
     from scripts.message.sessions import SessionRecord
@@ -64,7 +64,7 @@ class FileOnlyLabelTests(unittest.TestCase):
         from scripts.message import unit_labels
         from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -103,7 +103,7 @@ class FileOnlyLabelTests(unittest.TestCase):
         from scripts.message import unit_labels
         from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -170,7 +170,7 @@ class FileOnlyLabelTests(unittest.TestCase):
         from scripts.message import unit_labels
         from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -215,7 +215,7 @@ class FileOnlyLabelTests(unittest.TestCase):
         from scripts.message import unit_labels
         from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -253,7 +253,7 @@ import sys
 from unittest import mock
 from scripts.message import unit_labels
 from scripts.production import staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production import session_staff
 
 record = json.loads(sys.stdin.read())

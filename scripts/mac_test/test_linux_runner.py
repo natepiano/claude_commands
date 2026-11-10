@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import chdir, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 import hashlib
@@ -20,11 +20,11 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_support import mirror_use_payload
-from scripts.lint import sweep
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -127,7 +127,7 @@ if tool == "hostname":
 if tool == "rm":
     if os.environ.get("FAKE_RM_FAIL") == "1" and any(argument.endswith("/target") for argument in arguments):
         raise SystemExit(9)
-    os.execv("/bin/rm", ["rm", *arguments])
+    os.execv(os.environ["TEST_REAL_RM"], ["rm", *arguments])
 raise SystemExit("Unexpected fake tool: " + tool)
 '''
 
@@ -150,6 +150,7 @@ class LinuxShellTests(unittest.TestCase):
         self.source = self.root / "rust/phase-copy"
         self.source.mkdir(parents=True)
         self.settings = self.root / "aws.conf"
+        _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.settings,
             "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
@@ -188,8 +189,13 @@ class LinuxShellTests(unittest.TestCase):
                 Path(__file__).resolve().parents[1] / folder, target_is_directory=True)
         self.permission_directory = seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
+        real_rm = shutil.which("rm")
+        if real_rm is None:
+            self.fail("The fixture needs the rm executable")
         self.environment = {
+            **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
+            "TEST_REAL_RM": real_rm,
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
             "CONF_DIR": str(self.root),
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
@@ -238,31 +244,12 @@ class LinuxShellTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
         real_run = subprocess.run
-        real_uses = sweep.process_uses
-        proc = self.root / "proc"
-        proc.mkdir(exist_ok=True)
-
-        def private_uses(targets: Sequence[str]) -> dict[str, sweep.TargetUse]:
-            return real_uses(targets, str(proc))
-
         def child(argv: list[str], *, cwd: Path | str = "", check: bool = False,
                   capture_output: bool = False, text: bool = False, timeout: float = 5,
                   env: dict[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
-            if argv[:2] == [sys.executable, "-c"] and "sweep.sweep_workspace" in argv[2]:
-                if not self.use_real_sweep:
-                    return subprocess.CompletedProcess(argv, 0, "", "")
-                with chdir(os.getcwd()), mock.patch.dict(os.environ, env or {}), \
-                        mock.patch.object(sys, "argv", ["-c", argv[3]]), \
-                        mock.patch.object(sweep, "process_uses", side_effect=private_uses), \
-                        mock.patch.object(time, "time", return_value=1_793_570_400.0):
-                    try:
-                        exec(argv[2], {"__name__": "__main__"})
-                    except SystemExit as stopped:
-                        status = stopped.code if isinstance(stopped.code, int) else 1
-                    else:
-                        status = 0
-                return subprocess.CompletedProcess(argv, status, "", "")
+            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2] and not self.use_real_sweep:
+                return subprocess.CompletedProcess(argv, 0, "", "")
             completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
                                  text=True, timeout=timeout, env=env, pass_fds=pass_fds)
             if not capture_output:
@@ -298,6 +285,54 @@ class LinuxShellTests(unittest.TestCase):
         events = self.events("lint")
         self.assertTrue(events, result.stdout + result.stderr)
         return events[-1]
+
+    def test_step_removes_only_old_abandoned_sessions_before_building(self) -> None:
+        minutes = offload.read_config(self.settings).abandoned_session_minutes
+        cases: tuple[tuple[str, int, bool, tuple[str, ...]], ...] = (
+            ("debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("aarch64-unknown-linux-gnu/debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("debug/incremental/crate/s-new-working", 0, True, ()),
+            ("aarch64-unknown-linux-gnu/debug/incremental/crate/s-new-working", 0, True, ()),
+            ("debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            ("aarch64-unknown-linux-gnu/debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            *((f"debug/{name}/incremental/crate/s-old-working", minutes + 2, True, ())
+              for name in ("deps", "build", ".fingerprint", "examples")),
+            ("deep/triple/debug/incremental/crate/s-old-working", minutes + 2, True, ()),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir", "other-target")),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir=other-target",)),
+            ("", 0, False, ()),
+        )
+        target = self.mirror / "target"
+        for relative, age, keep, words in cases:
+            for status in (0, 42):
+                with self.subTest(session=relative, words=words, status=status):
+                    shutil.rmtree(target, ignore_errors=True)
+                    session = target / relative
+                    lock = session.with_name(session.name.removesuffix("-working") + ".lock")
+                    if relative:
+                        session.mkdir(parents=True)
+                        _ = (session / "compiler-output").write_text("session data")
+                        _ = lock.write_text("session lock")
+                        modified = time.time() - age * 60
+                        os.utime(session, (modified, modified))
+                        os.utime(lock, (modified, modified))
+                    self.environment["FAKE_LINT_STATUS"] = str(status)
+                    previous_steps = len(self.events("lint"))
+
+                    result = self.execute(self.request(words=words))
+
+                    self.assertEqual((result.returncode, result.stderr), (status, ""), result.stdout)
+                    self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("mac_")],
+                                     [f"mac_exit={status}", "mac_cleanup=kept"])
+                    self.assertEqual(len(self.events("lint")), previous_steps + 1)
+                    build_target = self.mirror / "other-target" if words else target
+                    self.assertEqual((build_target / "warm-proof").read_text(), "warm\n")
+                    if relative:
+                        self.assertEqual(session.exists(), keep)
+                        self.assertEqual(lock.exists(), keep)
+                        if keep:
+                            self.assertEqual((session / "compiler-output").read_text(), "session data")
+                            self.assertEqual(lock.read_text(), "session lock")
 
     def test_shell_inputs_exclude_source_build_files_and_private_files(self) -> None:
         self.write_input("target/large-build", "build fixture\n")
@@ -1661,6 +1696,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("config", "user.email", "fixture@example.invalid")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text("targets=aws\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.root / "aws.conf", "host=fake-linux\noffload=on\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),

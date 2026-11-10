@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from collections.abc import Callable
 import io
@@ -132,7 +132,6 @@ class ConversationPauseFixture(unittest.TestCase):
     send_stub: Path = Path()
     activity_log: Path = Path()
     activity_stub: Path = Path()
-    unit_active_root: Path = Path()
     socket_path: Path = Path()
     environment: dict[str, str] = {}
 
@@ -278,8 +277,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
 """
         )
         self.activity_stub.chmod(0o755)
-        self.unit_active_root = self.root / "unit-active"
-        self.unit_active_root.mkdir()
     def bind_environment(self) -> None:
         self.notifier_root = self.root / "notifier"
         self.pause_root = self.root / "conversation-pause"
@@ -294,7 +291,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         self.send_stub = self.root / "send.py"
         self.activity_log = self.root / "auto-silence.args"
         self.activity_stub = self.root / "auto_silence.py"
-        self.unit_active_root = self.root / "unit-active"
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
@@ -319,7 +315,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             # writes one (`record_activity`).
             "AUTO_SILENCE_COMMAND": shutil.which("true") or "/bin/true",
             "AUTO_SILENCE_LOG": str(self.activity_log),
-            "UNIT_ACTIVE_DIR": str(self.unit_active_root),
         }
 
     def showrunner_timer(self, name: str) -> str:
@@ -591,11 +586,8 @@ print("SENT: delivered")
         # under the temporary home, and restore the caller's alarm and stdin.
         with patch.dict(os.environ, environment, clear=True):
             from scripts.message import escalate
-            from scripts.hooks import direct_run
 
         with patch.object(sys, "stdin", io.StringIO(stdin)), patch.object(
             escalate, "STATE", Path(environment["ESCALATE_STATE_DIR"]),
-        ), patch.object(
-            direct_run, "ACTIVE_OVERRIDE", environment["UNIT_ACTIVE_DIR"],
         ), patch.dict(sys.modules, {"__main__": module}):
             return invoke_cli(module, main, arguments, environment, self.root)

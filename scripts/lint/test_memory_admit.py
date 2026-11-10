@@ -1832,6 +1832,8 @@ class RepositoryHistoryTests(unittest.TestCase):
                     ["cargo", "nextest", "run", "run"],
                     ["cargo", "+nightly", "nextest", "run", "-E", "test(one)"],
                     ["cargo", "nextest", "run", "--filterset=test(one)"],
+                    ["cargo", "nextest", "run", "-E", "package(sample)", "--run-ignored", "only"],
+                    ["cargo", "nextest", "run", "-E", "package(sample)", "--run-ignored=only"],
                     ["cargo", "test", "-p", "hana", "one_test"],
                     ["cargo", "test", "--", "--skip", "one_test"])
         for arguments in full:
@@ -4897,7 +4899,7 @@ class ShellTests(unittest.TestCase):
             env={**os.environ, "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                  "BUILD_HOLD_DIR": str(self.admission.root / "holders"),
                  "BUILD_HOLD_RELEASE_DIR": str(self.admission.root / "releases"),
-                 "UNIT_ACTIVE_DIR": str(self.admission.root / "active"), "UNIT_RUN_DIR": "",
+                 "UNIT_RUN_DIR": "",
                  "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": "", **environment},
             capture_output=True, text=True, check=False, timeout=30)
 

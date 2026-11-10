@@ -860,7 +860,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -909,6 +909,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         if not library.is_symlink():
             library.symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         functions = shell_functions(VERIFY,
+            "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "tree_key", "set_verdict_keys", "after_tree_change",
@@ -1118,7 +1119,7 @@ exit 99
     def hold_environment(self, timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None, None, None]:
         with mock.patch.dict(os.environ, {name: self.environment[name] for name in (
             "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
-            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "UNIT_ACTIVE_DIR",
+            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR",
             "BUILDLOG_DIR", "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR")}), \
              mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
                                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": ""}), \

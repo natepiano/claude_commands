@@ -30,6 +30,11 @@ Family resolution and catalog sync read the cache through `scripts/lib/codex_mod
 
 A function with only one family set is pinned to it. Every-function family and agent switches keep its assignment and rows and print `# kept <function> on <family>: its only set` after the switch line. Switching that function alone or editing its row with an agent from the other family is refused. `production` has only `[production.claude]`; `/default_models production.director sonnet:xhigh` changes unit director launches.
 
+Style units use `production.director` for their directors.
+Each assigned ticket gets its own Codex worker through `assign.sh`, using the `direct.impl` row.
+The production document's `Style units` table sets family ownership and ticket capacity.
+These model settings do not set the number of style units or tickets.
+
 ## Switch a function's family
 
 ```text

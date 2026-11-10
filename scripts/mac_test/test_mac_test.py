@@ -23,6 +23,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
 
 from unittest import mock
@@ -30,6 +31,8 @@ from zoneinfo import ZoneInfo
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.mac_test import mac_test
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
@@ -385,11 +388,12 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
+        self.environment.update(interpreter_cache_environment(self.root / "cache"))
         self.children = []
         child_lifetime = self.root / "child-lifetime"
         child_lifetime.mkdir()
@@ -848,15 +852,15 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
     def test_claim_records_worker_owning_session_and_omits_unknown_holder(self) -> None:
         owner = self.start_child()
-        active = self.root / "active"
-        active.mkdir()
         board = str(self.root / "run")
-        _ = (active / "worker-owner").write_text(board)
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            director = fixture_member("showrunner", name="worker-owner")
+            _ = staff.set_run(director.id, staff.OpenRun(Path(board)))
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "",
                        "UNIT_RUN_DIR": board, "UNIT_SESSION_DIR": ""}
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "worker tests",
                                          environment=environment), 0, "claimed\n")
-        self.assertEqual(self.run_state().get("holder_session"), "worker-owner")
+        self.assertEqual(self.run_state().get("holder_session"), director.current_session)
         self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "",
                        "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": ""}
@@ -865,10 +869,10 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertNotIn("holder_session", self.run_state())
 
     def unit_environment(self, session: str) -> dict[str, str]:
-        active = self.root / "active"
-        active.mkdir(exist_ok=True)
         run = str(self.root / "unit-run")
-        _ = (active / session).write_text(run)
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            director = fixture_member("showrunner", name="unit-director", runtime_id=session)
+            _ = staff.set_run(director.id, staff.OpenRun(Path(run)))
         return {**self.environment, "UNIT_RUN_DIR": run,
                 "CLAUDE_CODE_SESSION_ID": "worker-session"}
 
@@ -887,11 +891,11 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
     def test_unit_worker_claim_uses_director_identity_for_block_and_record(self) -> None:
         owner = self.start_child()
-        environment = self.unit_environment("session-a")
-        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
+        environment = self.unit_environment(fixture_runtime_id("session-a"))
+        _ = self.write_block(session=fixture_runtime_id("session-a"), free_message={"kind": "not_needed"})
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unit tests",
                                          environment=environment), 0, "claimed\n")
-        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+        self.assertEqual(self.run_state().get("holder_session"), fixture_runtime_id("session-a"))
 
     def test_block_refuses_other_and_unknown_sessions_without_writing_claims(self) -> None:
         owner = self.start_child()
@@ -930,8 +934,8 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
     def test_free_now_reads_past_own_block_to_free_or_busy(self) -> None:
         self.write_config(offload="on")
-        _ = self.write_block(session="session-a", free_message={"kind": "not_needed"})
-        environment = self.unit_environment("session-a")
+        _ = self.write_block(session=fixture_runtime_id("session-a"), free_message={"kind": "not_needed"})
+        environment = self.unit_environment(fixture_runtime_id("session-a"))
         self.assert_command(self.command("free-now", environment=environment), 0, "free\n")
         other = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-b"}
         self.assert_command(self.command("free-now", environment=other), 1, "blocked\n")
@@ -942,16 +946,16 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertEqual(self.logged_arguments("gh"), [])
 
     def test_unit_block_records_director_session_and_keeps_ci_off(self) -> None:
-        environment = self.unit_environment("session-a")
+        environment = self.unit_environment(fixture_runtime_id("session-a"))
         result = self.command("block", "--holder", "alice", "--for", "unit tests",
                               environment=environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.block_state()["session"], "session-a")
+        self.assertEqual(self.block_state()["session"], fixture_runtime_id("session-a"))
         self.assertEqual(self.read_fixture_variable(), "false")
         owner = self.start_child()
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unit tests",
                                          environment=environment), 0, "claimed\n")
-        self.assertEqual(self.run_state().get("holder_session"), "session-a")
+        self.assertEqual(self.run_state().get("holder_session"), fixture_runtime_id("session-a"))
 
     def test_takeover_keeps_holder_session_and_starts_claim_watcher(self) -> None:
         previous = self.kept_claim()
@@ -1145,7 +1149,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def repository(self, name: str) -> Path:
-        """A folder that sweep.repo_name reads as the named repository."""
+        """A folder that repository.repo_name reads as the named repository."""
         directory = self.root / "repositories" / name
         (directory / ".git").mkdir(parents=True)
         return directory
@@ -1218,6 +1222,17 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         (hana / "crates").mkdir()
         self.write_config(offload="on")
+        path = self.state_directory / "mirror-busy-hana.until"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for value, answer in ((str(time.time() + 120), "busy"), (str(time.time() - 1), "free"),
+                              ("nan", "free"), ("invalid", "free")):
+            with self.subTest(backoff=value):
+                _ = path.write_text(value)
+                self.assert_command(self.command("free-now", "--repo-root", str(hana)),
+                                    1 if answer == "busy" else 0, answer + "\n")
+                self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+        path.unlink()
+        self.assertEqual(self.logged_arguments("ssh"), [])
         owner = self.start_child()
         self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
         self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
@@ -1484,6 +1499,8 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         source = """
 import sys
 from datetime import datetime, timedelta, timezone
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.mac_test import mac_test
 
 class Clock(datetime):

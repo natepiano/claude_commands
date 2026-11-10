@@ -74,12 +74,13 @@ class GateBoxTests(unittest.TestCase):
                  'log': 'https://fixture.invalid/artifacts/attempt/gate.log',
                  'result': 'https://fixture.invalid/artifacts/attempt/result.json'}
         script = gate_box.user_data(links, 'f' * 40, 20, 5, 1800)
+        self.assertIn('set -eu\numask 077\n', script)
         self.assertLess(len(base64.b64encode(script.encode())), 25600)
         self.assertNotIn('test_module_', script)
         self.assertNotIn('"modules"', script)
         self.assertNotIn(base64.b64encode(gate_box.GUEST.encode()).decode(), script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
-        downloads = session[session.index('curl --fail'):session.index('ln -sf')]
+        downloads = session[:session.index('ln -sf')]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _ = (root / 'source.py').write_text(gate_box.GUEST)
@@ -88,15 +89,16 @@ class GateBoxTests(unittest.TestCase):
             _ = curl.write_text('#!/bin/sh\ncase "$6" in *.guest.py) cp "$FIXTURE/source.py" "$8" ;;'
                                 + ' *.json) cp "$FIXTURE/manifest.json" "$8" ;; *) exit 1 ;; esac\n')
             curl.chmod(0o700)
-            result = subprocess.run(['sh', '-ec', downloads],
+            result = subprocess.run(['sh', '-ec', 'umask 077\n' + downloads + 'mkdir "$box_dir/session-directory"\n'],
                 env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'FIXTURE': str(root), 'box_dir': str(root)},
                 text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / 'session-directory').stat().st_mode & 0o777, 0o755)
             self.assertEqual((root / 'guest.py').read_text(), gate_box.GUEST)
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
-        stages = ['boot', 'tools ready', 'source ready', 'tests start']
+        stages = ['boot', 'tools ready', 'tools checked', 'source ready', 'tests start']
         cases = [(False, failure) for failure in ('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start')]
         cases.extend(((True, ''), (True, 'tools ready')))
         for warm, failure in cases:
@@ -163,6 +165,7 @@ elif name == 'useradd':
     (root / 'user').touch()
 elif name == 'git' and args[0] == 'clone':
     fail('source ready')
+    print('Cloning the fixture repository.')
     shutil.copytree(root / 'repo', args[-1])
 elif name == 'git' and 'fetch' in args:
     event('fetch ' + args[-1])
@@ -213,6 +216,9 @@ else:
                     self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
                 if not failure:
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
+                    self.assertEqual(list(ledger.mapping(results[-1]['tools'])),
+                                     ['git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup',
+                                      'cargo-nextest', 'uv', 'sqlite3', 'python_sqlite'])
                     lines = [line for line in log.splitlines() if ' stage=' in line]
                     self.assertEqual([line.split(' stage=', 1)[1] for line in lines], stages)
                     for line in lines:

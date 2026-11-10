@@ -13,7 +13,7 @@ from scripts.production import session_labels, staff
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib import legacy_identity
 from scripts.message import sessions
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.herdr import herdr
 
 

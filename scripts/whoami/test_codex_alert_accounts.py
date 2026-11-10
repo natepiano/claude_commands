@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_models_registry import registry_text, write_registry
 
 
@@ -28,7 +29,7 @@ from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib import models_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
 from scripts.notify.user_action import ActionRequired
@@ -66,7 +67,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "CODEX_CONFIG_FILE": str(self.root / "absent"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "absent"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "synced"),

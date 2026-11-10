@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep Mac claim admission locked while the floor sweep removes idle output."""
+"""Read Mac claims without holding admission locks during a sweep."""
 
 from __future__ import annotations
 try:
@@ -7,9 +7,10 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import hashlib
 from importlib import import_module
 import json
 import os
@@ -17,7 +18,6 @@ from pathlib import Path
 import select
 import shlex
 import subprocess
-import sys
 from typing import Protocol, cast
 
 
@@ -63,6 +63,13 @@ def mirror_lock_path(tree: Path) -> Path:
     return tree.parent / ("." + tree.name + ".copy-lease")
 
 
+def mirror_parent_lock_path(tree: Path) -> Path:
+    """Keep the mirror lease outside a task parent that removal can delete."""
+    real = tree.resolve()
+    identity = hashlib.sha256(str(real).encode()).hexdigest()
+    return real.parent.parent / (".copy-parent-lease-" + identity)
+
+
 def removal_authority_path(tree: Path) -> Path:
     return tree.parent / ("." + tree.name + MIRROR_REMOVAL_SUFFIX)
 
@@ -94,16 +101,15 @@ NO_MIRROR_EXEMPTION = NoMirrorExemption()
 
 
 @dataclass(frozen=True)
-class LockedClaims:
-    """Claims remain valid while every admission lock process remains alive."""
+class ClaimSnapshot:
+    """Claims and mirror leases observed during one read."""
 
     repositories: frozenset[str]
-    processes: tuple[subprocess.Popen[str], ...] = ()
     mirrors: tuple[HeldMirror, ...] = ()
 
     def holds(self, target: str, mirror: Path, *,
               exemption: MirrorIdentity | NoMirrorExemption = NO_MIRROR_EXEMPTION) -> bool:
-        if "*" in self.repositories or any(process.poll() is not None for process in self.processes):
+        if "*" in self.repositories:
             return True
         try:
             path = Path(target).resolve(strict=True)
@@ -135,9 +141,8 @@ class LockedClaims:
             return True
 
 
-@contextmanager
-def locked_claims(timeout: float) -> Generator[LockedClaims]:
-    """Lock local and natedev claim admission; unreadable ownership keeps every target."""
+def read_claims(timeout: float) -> ClaimSnapshot:
+    """Read local and natedev claims; release each admission lock before the caller continues."""
     processes: list[subprocess.Popen[str]] = []
     names: set[str] = set()
     mirrors: list[HeldMirror] = []
@@ -156,12 +161,14 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
     try:
         try:
             for command in commands:
-                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                            stderr=subprocess.DEVNULL, text=True)
                 processes.append(process)
                 if process.stdout is None or not select.select([process.stdout], [], [], timeout)[0]:
                     raise ValueError("claim reply unavailable")
                 value = cast(object, json.loads(cast(str, process.stdout.readline())))
+                if process.wait(timeout=timeout) != 0:
+                    raise ValueError("claim reader failed")
                 if not isinstance(value, dict):
                     raise ValueError("claim reply invalid")
                 reply = cast(dict[str, object], value)
@@ -181,9 +188,8 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
                     if not isinstance(name, str) or (name != "*" and (Path(name).name != name or name in (".", ".."))):
                         raise ValueError("claim scope invalid")
                     names.add(name)
-        except (OSError, ValueError):
+        except (OSError, ValueError, subprocess.TimeoutExpired):
             names = {"*"}
-        yield LockedClaims(frozenset(names), tuple(processes), tuple(mirrors))
     finally:
         for process in processes:
             if process.stdin is not None:
@@ -197,6 +203,7 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
                 _ = process.wait()
             if process.stdout is not None:
                 process.stdout.close()
+    return ClaimSnapshot(frozenset(names), tuple(mirrors))
 
 
 def serve() -> int:
@@ -228,8 +235,8 @@ def serve() -> int:
             if live:
                 name: object = getattr(claim.scope, "name", "*")
                 names.add(name if isinstance(name, str) else "*")
-        print(json.dumps({"repositories": sorted(names), "mirrors": mirrors}), flush=True)
-        _ = sys.stdin.read()
+        reply = {"repositories": sorted(names), "mirrors": mirrors}
+    print(json.dumps(reply), flush=True)
     return 0
 
 

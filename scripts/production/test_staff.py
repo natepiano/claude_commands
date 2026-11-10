@@ -23,7 +23,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import staff
-from scripts.shutdown import shutdown, stop_resume, restart_support
+from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import unit_runs
@@ -103,6 +103,45 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         with redirect_stderr(io.StringIO()):
             staff._transaction(lambda rows: None)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_run_pointer_edits_preserve_other_fields_and_a_newer_run(self) -> None:
+        _, unit, _ = self.tree()
+        old = self.root / "old-run"
+        new = self.root / "new-run"
+        cases = (
+            ("set", old, staff.OpenRun(old)),
+            ("clear", self.root / "other-run", staff.OpenRun(old)),
+            ("set", new, staff.OpenRun(new)),
+            ("clear", old, staff.OpenRun(new)),
+            ("clear", new / ".." / "new-run", staff.NoRun()),
+            ("clear", new, staff.NoRun()),
+        )
+        self.assertIsInstance(unit.run, staff.NoRun)
+        self.assertNotIn("run", unit.to_json())
+        for action, path, expected in cases:
+            with self.subTest(action=action, path=path):
+                result = (staff.set_run(unit.id, staff.OpenRun(path)) if action == "set"
+                          else staff.clear_run(unit.id, path))
+                self.assertEqual(result, replace(unit, run=expected))
+                self.assertEqual(staff.local_by_current_session(unit.current_session), result)
+                self.assertEqual(staff.StaffRow.from_json(result.to_json()), result)
+                self.assertEqual(staff.by_id(unit.id), result)
+                if isinstance(expected, staff.OpenRun):
+                    self.assertEqual(result.to_json()["run"], str(expected.path))
+                else:
+                    self.assertNotIn("run", result.to_json())
+
+    def test_run_pointer_cli_uses_the_current_session_and_reports_missing_rows(self) -> None:
+        _, unit, _ = self.tree()
+        current = staff.native_id(fixture_runtime_id("run-current"))
+        unit = staff.update_current_session(unit.current_session, current)
+        run = self.root / "run"
+        for verb, expected in (("set-run", staff.OpenRun(run)), ("clear-run", staff.NoRun())):
+            with self.subTest(verb=verb):
+                _ = self.cli(verb, current, str(run))
+                self.assertEqual(staff.by_id(unit.id), replace(unit, run=expected))
+                result = self.cli(verb, unit.id, str(run), code=1)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
 
     def test_staff_admission_does_not_read_pane_publications(self) -> None:
         from scripts.herdr import pane_launch
@@ -766,7 +805,7 @@ class StaffTests(StaffCommandTestCase):
     def test_staff_fixture_keeps_registry_paths_under_its_private_folder(self) -> None:
         from scripts.lib.session_paths import sessions_directory
         from scripts.production import showrunners
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         keys = ("SHOWRUNNER_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "HERDR_PANE_RECORD_DIR", "XDG_CONFIG_HOME")
         root = self.root / "registry-fixture"
@@ -2018,7 +2057,7 @@ class StaffTests(StaffCommandTestCase):
 
     def test_explicit_staff_file_is_local_even_on_a_mac(self) -> None:
         with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.mac_file)}), mock.patch(
-            "scripts.shutdown.remote.other_machine", return_value="natedev",
+            "scripts.agents.remote.other_machine", return_value="natedev",
         ):
             row = fixture_member("showrunner", name="private")
             self.assertEqual(staff.snapshot().rows, (row,))

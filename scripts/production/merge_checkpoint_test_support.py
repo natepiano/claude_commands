@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import checkpoint_gate
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
@@ -299,7 +300,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.state = self.root / "stub-state"
         home = self.root / "home"
-        self.env = {**os.environ, "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+        self.env = {**os.environ, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
                     "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),

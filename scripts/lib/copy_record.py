@@ -14,6 +14,7 @@ ROOT_ENV = "SCRATCH_ROOT"
 DEFAULT_ROOT = "/tmp/claude/scratch"
 COPIES_ENV = "SCRATCH_COPIES_ROOT"
 RECORD = ".scratch.json"
+TEMPORARY_GATE_RECORD = ".gate-copy.json"
 TASK = re.compile(r"(?P<kind>run|phase|row|gate|until|landed):(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_./-]+)?)")
 
 
@@ -54,10 +55,15 @@ def copy_folder(path: Path) -> Path | None:
 
 
 def record_path(folder: Path) -> Path | None:
-    """Find the record for a standing copy or a task clone."""
+    """Find the record for an editable copy, a temporary gate, or a task clone."""
     folder = folder.resolve()
     if copy_folder(folder) == folder:
         return folder / RECORD
+    if folder.name == "checkout":
+        path = folder.parent / TEMPORARY_GATE_RECORD
+        record = read_record(path)
+        if isinstance(record, Registered) and record.task.startswith("gate:"):
+            return path
     if folder.name == "checkout" and folder.parent.parent == root().resolve():
         path = folder.parent / RECORD
         record = read_record(path)
@@ -78,3 +84,21 @@ def read_record(path: Path) -> Registered | NotRegistered | UnreadableRecord:
     if not isinstance(task, str) or not TASK.fullmatch(task):
         return UnreadableRecord(f"repair record {path}: invalid task")
     return Registered(task, fields)
+
+
+@dataclass(frozen=True)
+class AllRepositories:
+    """Remove copies from every repository."""
+
+
+@dataclass(frozen=True)
+class SelectedRepository:
+    """Remove copies from one repository identity."""
+
+    name: str
+
+
+RepositoryScope = AllRepositories | SelectedRepository
+
+
+ALL_REPOSITORIES = AllRepositories()

@@ -4,11 +4,12 @@ from __future__ import annotations
 import ast
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 from scripts.production import affected_modules as affected
@@ -28,6 +29,8 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.git("config", "maintenance.auto", "false")
         _ = self.git("config", "user.name", "Selection Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
+        self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
         self.write(".gitignore", "__pycache__/\n")
         # Ten unrelated modules distinguish direct selection from a full selection.
         for index in range(10):
@@ -64,6 +67,92 @@ class AffectedModulesTests(unittest.TestCase):
 
     def cache_dir(self) -> Path:
         return self.repo / ".git" / "gate-state"
+
+    def test_landing_bases_exclude_changes_that_already_passed_the_merge_gate(self) -> None:
+        self.write("scripts/landed/subject.py", "VALUE = 1\n")
+        self.write("scripts/own/subject.py", "VALUE = 1\n")
+        self.add_test("checks/test_landed.py", "import scripts.landed.subject\n")
+        self.add_test("checks/test_own.py", "import scripts.own.subject\n")
+        self.certify()
+        self.write("scripts/landed/subject.py", "VALUE = 2\n")
+        landing = self.commit()
+        _ = self.git("update-ref", "refs/remotes/origin/builds", landing)
+        self.write("scripts/own/subject.py", "VALUE = 2\n")
+        _ = self.commit()
+        result = self.selection()
+        self.assertEqual(result.changed_files, ("scripts/own/subject.py",))
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_own.py",))
+        self.assertEqual(result.base, affected.CertifiedBase(landing, self.git("show", "-s", "--format=%cI", landing)))
+        without_certificate = affected.select_affected(self.repo, affected.NoCertifiedBase(), self.modules, set())
+        self.assertEqual(without_certificate, result)
+
+    def test_a_merge_with_a_landing_branch_keeps_the_units_earlier_changes(self) -> None:
+        self.write("scripts/landed/subject.py", "VALUE = 1\n")
+        self.write("scripts/own/subject.py", "VALUE = 1\n")
+        self.add_test("checks/test_landed.py", "import scripts.landed.subject\n")
+        self.add_test("checks/test_own.py", "import scripts.own.subject\n")
+        self.certify()
+        _ = self.git("switch", "-c", "unit")
+        self.write("scripts/own/subject.py", "VALUE = 2\n")
+        _ = self.commit()
+        _ = self.git("switch", "main")
+        self.write("scripts/landed/subject.py", "VALUE = 2\n")
+        landing = self.commit()
+        _ = self.git("update-ref", "refs/remotes/origin/builds", landing)
+        _ = self.git("switch", "unit")
+        _ = self.git("merge", "--no-ff", "main", "-m", "Merge the landing branch")
+        result = self.selection()
+        self.assertEqual(result.changed_files, ("scripts/own/subject.py",))
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_own.py",))
+        self.assertEqual(result.base.commit, landing)
+
+    def test_a_dirty_file_at_the_landing_tip_is_the_only_changed_path(self) -> None:
+        self.add_test("checks/test_own.py", "VALUE = 1\n")
+        landing = self.commit()
+        _ = self.git("update-ref", "refs/remotes/origin/builds", landing)
+        self.write("scripts/checks/test_own.py", "VALUE = 2\n")
+        result = self.selection()
+        self.assertEqual(result.changed_files, ("scripts/checks/test_own.py",))
+        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_own.py",))
+        self.assertEqual(result.base.commit, landing)
+
+    def test_base_choice_counts_paths_and_preserves_candidate_priority(self) -> None:
+        for name in ("first", "second", "own"):
+            self.add_test(f"checks/test_{name}.py", "VALUE = 0\n")
+        self.certify()
+        self.write("scripts/checks/test_first.py", "VALUE = 1\n")
+        first = self.commit()
+        self.write("scripts/checks/test_second.py", "VALUE = 1\n")
+        second = self.commit()
+        self.write("scripts/checks/test_first.py", "VALUE = 0\n")
+        landing = self.commit()
+        self.write("scripts/checks/test_own.py", "VALUE = 1\n")
+        _ = self.commit()
+        unrelated = self.git("commit-tree", "HEAD^{tree}", "-m", "Unrelated history")
+        for branch, commit in (("main", first), ("builds", second), ("natedev", landing),
+                               ("sdlc", landing), ("stable", self.base.commit), ("unrelated", unrelated)):
+            _ = self.git("update-ref", f"refs/remotes/origin/{branch}", commit)
+        cases = (
+            (self.base, "main", self.base.commit, ("own", "second")),
+            (self.base, "builds", self.base.commit, ("own", "second")),
+            (self.base, "main builds natedev sdlc", landing, ("own",)),
+            (affected.NoCertifiedBase(), "builds stable", second, ("first", "own")),
+            (affected.NoCertifiedBase(), "stable builds", self.base.commit, ("own", "second")),
+            (self.base, "missing unrelated", self.base.commit, ("own", "second")),
+        )
+        for certificate, branches, expected_base, changed in cases:
+            with self.subTest(branches=branches, certificate=certificate):
+                self.write(".git/test-config/merge_gate.conf", f"# text:\nlanding_branches={branches}\n")
+                with mock.patch.object(affected, "git_output", wraps=affected.git_output) as git:
+                    result = affected.select_affected(self.repo, certificate, self.modules, set())
+                self.assertIsInstance(result, affected.AffectedSelection)
+                assert isinstance(result, affected.AffectedSelection)
+                self.assertEqual(result.base.commit, expected_base)
+                expected_paths = tuple(f"scripts/checks/test_{name}.py" for name in changed)
+                self.assertEqual(result.changed_files, expected_paths)
+                self.assertCountEqual(result.modules, tuple(self.repo / path for path in expected_paths))
+                compared = [call.args[-2] for call in git.call_args_list if call.args[1] == "diff"]
+                self.assertEqual(len(compared), len(set(compared)))
 
     def test_cached_and_uncached_graphs_are_equal(self) -> None:
         sources = {
@@ -264,8 +353,7 @@ class AffectedModulesTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.write(path, "# changed\n")
                 _ = self.commit()
-                expected = tuple(self.modules) if path == "scripts/other/conftest.py" else ()
-                self.assertEqual(self.selection().modules, expected)
+                self.assertEqual(self.selection().modules, ())
                 self.certify()
 
     def test_deleted_and_renamed_python_sources_select_direct_importers(self) -> None:
@@ -337,11 +425,23 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_direct.py", "import scripts.component.subject\n")
         self.add_test("checks/test_indirect.py", "import scripts.adapters.adapter\n")
         self.add_test("component/test_neighbor.py", "VALUE = 1\n")
+        self.add_test("component/test_named.py", "SOURCE = 'subject.py'\n")
+        self.add_test("component/test_plain.py", "import subject\n")
+        self.add_test("component/test_comment.py", "# subject\n")
+        self.add_test("component/test_fragment.py", "SOURCE = 'subjects my_subject subject_helper'\n")
+        self.add_test("checks/test_named.py", "SOURCE = 'subject.py'\n")
         self.certify()
         self.write("scripts/component/subject.py", "VALUE = 2\n")
         _ = self.commit()
-        self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_direct.py", "test_neighbor.py"])
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                if removed:
+                    (self.repo / "scripts/component/subject.py").unlink()
+                    _ = self.commit()
+                self.assertCountEqual(self.selection().modules,
+                                      [self.repo / "scripts" / path for path in
+                                       ("checks/test_direct.py", "component/test_named.py",
+                                        "component/test_plain.py", "component/test_comment.py")])
 
     def test_complete_path_tokens_select_only_the_test_that_names_the_path(self) -> None:
         self.write("config/custom.json", "{}\n")
@@ -357,6 +457,28 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
                               ["test_path.py", "test_root_path.py"])
+
+        self.certify()
+        self.write("scripts/component/tool.sh", "true\n")
+        self.write("scripts/component/reader_test_support.py",
+                   'from pathlib import Path\nTOOL = Path(__file__).with_name("tool.sh")\n'
+                   + 'from scripts.component import relay_test_support\n')
+        self.write("scripts/component/relay_test_support.py",
+                   "from scripts.component import reader_test_support\n")
+        self.write("scripts/adapters/path_adapter.py",
+                   "from scripts.component import reader_test_support\n")
+        for path, text in (
+            ("component/test_support_path.py", "from scripts.component import relay_test_support\n"),
+            ("checks/test_folder_path.py", "PARTS = 'component tool.sh'\n"),
+            ("checks/test_basename.py", "NAME = 'tool.sh'\n"),
+            ("checks/test_support_through_production.py", "from scripts.adapters import path_adapter\n"),
+        ):
+            self.add_test(path, text)
+        self.certify()
+        self.write("scripts/component/tool.sh", "false\n")
+        _ = self.commit()
+        self.assertCountEqual([path.name for path in self.selection().modules],
+                              ["test_support_path.py", "test_folder_path.py"])
 
     def test_dirty_paths_include_edits_untracked_files_deletions_and_renames(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")

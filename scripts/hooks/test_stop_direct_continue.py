@@ -14,11 +14,13 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
-SESSION = "fixture-director"
+SESSION = fixture_runtime_id("fixture-director")
 # A 200k window reserves 33k for compaction and 25k for the handoff.
 THRESHOLD = 142_000
 
@@ -27,7 +29,7 @@ THRESHOLD = 142_000
 class DirectorStopFixture:
     root: Path
     run: Path
-    marker: Path
+    staff_file: Path
     transcript: Path
     environment: dict[str, str]
 
@@ -66,24 +68,22 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
             "phase": {"id": "1", "instance_id": "fixture-phase", "status": "active"},
             "pass": {}, "open_phases": [],
         }), encoding="utf-8")
-        active = root / "active"
-        active.mkdir()
-        marker = active / SESSION
-        _ = marker.write_text(str(run), encoding="utf-8")
         config = root / "models.conf"
         _ = write_registry(config, {'claude.context': {'default': '200k'}}, replace_sections=('claude.context',))
         from scripts.lib.atomic_file import write_text_atomic
 
-        write_text_atomic(root / "staff.json", json.dumps({"schema": 1, "rows": []}))
+        row = staff.StaffRow(staff.StaffId(SESSION), "showrunner", "director", staff.StaffRoot(),
+                             current_session=staff.StaffId(SESSION), run=staff.OpenRun(run))
+        write_text_atomic(root / "staff.json", json.dumps({"schema": 2, "rows": [row.to_json()]}))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root),
             "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
-            "XDG_STATE_HOME": str(root / "state"), "UNIT_ACTIVE_DIR": str(active),
+            "XDG_STATE_HOME": str(root / "state"), 
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
             "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k", "STAFF_FILE": str(root / "staff.json"),
         }
-        fixture = DirectorStopFixture(root, run, marker, root / "transcript.jsonl", environment)
+        fixture = DirectorStopFixture(root, run, root / "staff.json", root / "transcript.jsonl", environment)
         fixture.write_usage(160_000)
         yield fixture
 
@@ -153,14 +153,14 @@ class DirectorStopTests(unittest.TestCase):
         with director_stop_fixture() as fixture:
             self.assert_allowed(fixture.call(session_id=""))
 
-    def test_exception_allows_stop_without_output(self) -> None:
-        with director_stop_fixture() as fixture:
-            _ = fixture.marker.write_bytes(b"\xff")
-            self.assert_allowed(fixture.call())
-
     def test_no_active_run_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:
-            fixture.marker.unlink()
+            _ = fixture.staff_file.write_text(json.dumps({"schema": 2, "rows": []}))
+            self.assert_allowed(fixture.call())
+
+    def test_unreadable_staff_allows_stop_without_output(self) -> None:
+        with director_stop_fixture() as fixture:
+            fixture.environment["STAFF_FILE"] = str(fixture.root)
             self.assert_allowed(fixture.call())
 
     def test_declared_user_wait_is_recorded_and_allows_stop(self) -> None:

@@ -122,7 +122,7 @@ Also from 3p: F046 and F048 are superseded in 3p by F058 and F059 (their defect 
 ## F028 (S26)
 
 26. **`scripts/production/worker_admission.py:309`** · `in-phase` (removes a copy, outside the phase)
-    - Change: Add `StopResult` to `scripts/shutdown/stop_results.py`.
+    - Change: Add `StopResult` to `scripts/agents/stop_results.py`.
     - Reason: The union appears at 5 sites, and 4 of them are in `stop_resume.py`. Send those to their owner.
 
 ## F029 (S27)

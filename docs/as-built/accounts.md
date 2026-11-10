@@ -274,7 +274,7 @@ The board sums available machine counts and identifies an unavailable peer.
 `status --stored` reads saved usage, role maps, and peer counts.
 It does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
-The [board design](unit-board.md) owns the display contract and refresh lifecycle.
+The [pane design](accounts-queue-panes.md) owns the display contract and refresh lifecycle.
 
 Account notes use numbered filenames.
 Each note shows its roles and live session count.

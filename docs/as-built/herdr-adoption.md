@@ -2,7 +2,7 @@
 
 ## What it is
 
-Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Workers use interactive Claude or Codex panes under their staff parent. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
+Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Workers use interactive Claude or Codex panes under their staff parent. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/agents/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
 
 ## How it works
 
@@ -21,8 +21,8 @@ Every showrunner, unit director and standalone Claude session uses a tab in the 
 | `scripts/production/add_showrunner.py`, `promote_showrunner.py` | Start a lower showrunner in herdr; turn a unit into one. |
 | `scripts/production/fake_unit_host.py` | Production fixtures over the fake herdr CLI and a fake `/proc`. |
 | `scripts/message/roster.py` | Joins units with session labels and interactive Codex panes into the roster. |
-| `scripts/shutdown/session_types.py` | Host wire types, including the legacy tmux forms. |
-| `scripts/shutdown/inventory.py`, `stop_resume.py`, `restart.py` | Host detection, unit session stop, screen reads, herdr restarts. |
+| `scripts/agents/session_types.py` | Host wire types, including the legacy tmux forms. |
+| `scripts/agents/inventory.py`, `stop_resume.py`, `restart.py` | Host detection, unit session stop, screen reads, herdr restarts. |
 | `scripts/lib/detached.py` | Detached starts on the Mac (herdr server, shutdown conductor, Remote Control fixer). |
 
 Outside this repo, `/etc/nixos/modules/common/shell.nix` defines `herdr-claude` (runs `herdr_sessions.py start "$@"`) and the `hsa` alias. It also guards the `claude` alias with `HERDR_AGENT_PANE`. `/etc/nixos/modules/linux/memory.nix` puts `herdr` in earlyoom's `--avoid` list.
@@ -323,7 +323,7 @@ Old shutdown host records still parse. Their compatibility parsing remains; reco
 
 - `fake_herdr.py`: `HERDR_BIN` points at it. It appends each argv to `FAKE_HERDR_LOG` as a JSON line. It answers from `FAKE_HERDR_RESPONSES`, keyed by the space-joined argv without the executable, else `"default"`. Fields: `stdout`, `code`, `stderr`, `write_files`, `require_paths` (a missing path exits 98) and `remove_paths`. A list replays in order and keeps the last entry. It refuses an `agent start` whose name fails `[a-z][a-z0-9_-]{0,31}` with `invalid_agent_name`. `herdr_listener(proc, pid, name, environment)` gives a fake server the session's listening socket in a fake `/proc/net/unix` plus an fd link.
 - `fake_unit_host.py`: `environment(root)` sets `HERDR_BIN`, `HERDR_PROC`, `FAKE_HERDR_LOG` and `FAKE_HERDR_RESPONSES` for an empty host. `HostedUnit(session, pane, marks, screen)`. `write(env, units)` publishes a server process (pid `991000 + 2i`), its listener, a marked `zsh` pane shell, the session list, and pane reads (`recent` and `recent-unwrapped`; 3, 60 and 400 lines; with and without ANSI). `place_process(env, pid, pane)` puts a registry process under that pane's shell. `calls(env)` returns logged argv. `live_pid(test)` gives a real live pid for registry checks.
-- Darwin cases fake `LAUNCHCTL`, `HERDR_PS`, `HERDR_LSOF`, `SHUTDOWN_OPEN` and `SHUTDOWN_SYSCTL`, and pin `herdr._PLATFORM`. Linux `/proc` cases use `scripts/shutdown/test_support.linux_process_fixture`, which pins `sys.platform` and `herdr._PLATFORM`.
+- Darwin cases fake `LAUNCHCTL`, `HERDR_PS`, `HERDR_LSOF`, `SHUTDOWN_OPEN` and `SHUTDOWN_SYSCTL`, and pin `herdr._PLATFORM`. Linux `/proc` cases use `scripts/agents/test_support.linux_process_fixture`, which pins `sys.platform` and `herdr._PLATFORM`.
 
 Use these fixture rules on Linux and macOS:
 
@@ -346,7 +346,7 @@ The block removes the temporary home when the tests end:
     HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
     PYTHONDONTWRITEBYTECODE=1 ./scripts/lib/py -m unittest \
     scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
-    scripts.shutdown.test_restart scripts.shutdown.test_account_move \
+    scripts.agents.test_restart scripts.agents.test_account_move \
     scripts.production.test_add_unit scripts.production.test_add_unit_accounts \
     scripts.production.test_add_unit_resume scripts.production.test_add_unit_restore \
     scripts.production.test_add_showrunner \

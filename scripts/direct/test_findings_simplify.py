@@ -36,7 +36,7 @@ class SimplifyFindingTests(FindingsLedgerFixture):
 
     def test_held_finding_survives_a_repair_round_and_phase_end(self) -> None:
         environment = self.environment(1_000)
-        environment.update({"UNIT_ACTIVE_DIR": str(self.root / "active"),
+        environment.update({
                             "TZ": "UTC", "USER_ZONE": "UTC"})
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         for arguments in (

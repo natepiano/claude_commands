@@ -78,7 +78,7 @@ with Path(os.environ["FAST_TRACK_TEST_LOCK"]).open("a") as lock:
         held = True
 with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
     output.write(json.dumps({"kind": "types", "args": sys.argv[1:],
-                             "cwd": str(Path.cwd()), "lock_held": held}) + "\\n")
+                             "cwd": str(Path.cwd()), "cache": str(Path("target").resolve()), "lock_held": held}) + "\\n")
 control = Path(os.environ["FAST_TRACK_TEST_CONTROL"])
 move = control / "move-origin"
 if move.exists():
@@ -552,7 +552,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(self.observations("types"), [])
 
     def test_agents_cannot_bypass_the_staff_writer_refusal(self) -> None:
-        path = "scripts/shutdown/shutdown.py"
+        path = "scripts/agents/shutdown.py"
         self.write(self.unit, path, "from add_unit import VALUE\n")
         self.assert_refused(self.fast_track(path), "refused path")
 
@@ -802,18 +802,23 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(self.git("cat-file", "-t", candidate, cwd=self.unit), "commit")
         self.assertIn('VALUE = "after"', self.git("show", f"{candidate}:scripts/sample/item.py", cwd=self.unit))
 
-    def test_repeated_checks_reuse_checkout_and_keep_ignored_target(self) -> None:
+    def test_repeated_checks_replace_checkout_and_keep_ignored_target(self) -> None:
         self.change_module()
         first = self.fast_track()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         tree = Path(str(self.observations("types")[0]["cwd"]))
-        cache = tree / "target" / "warm-cache"
+        cache = Path(str(self.observations("types")[0]["cache"])) / "warm-cache"
         cache.parent.mkdir(exist_ok=True)
         _ = cache.write_text("keep")
-        self.write(self.unit, "scripts/sample/note.txt", "new note\n")
-        second = self.fast_track("scripts/sample/note.txt")
+        self.write(self.unit, "scripts/sample/note.py", "# New module.\n")
+        second = self.fast_track("scripts/sample/note.py")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(Path(str(self.observations("types")[-1]["cwd"])), tree)
+        self.assertEqual(len(self.observations("types")), 2)
+        current = self.observations("types")[-1]
+        self.assertNotEqual(Path(str(current["cwd"])), tree)
+        self.assertFalse(tree.exists())
+        self.assertFalse(Path(str(current["cwd"])).exists())
+        self.assertEqual(Path(str(current["cache"])), cache.parent)
         self.assertEqual(cache.read_text(), "keep")
 
     def test_rerun_recovers_a_push_that_stopped_before_the_review_record(self) -> None:
@@ -1046,7 +1051,7 @@ class FastTrackTests(MergeCheckpointFixture):
         for row in [*tests, *checks]:
             clone = Path(str(row["cwd"]))
             self.assertNotIn(clone, (self.unit, self.checkout, self.promote))
-            self.assertTrue((clone / ".git").is_dir(), "the standing checkout must remain")
+            self.assertFalse(clone.exists(), "The checkout must end with its gate")
         row, = self.records()
         self.assertEqual((row["unit"], row["commit"], row["why"], row["review"]),
                          ("alpha", tip, "repair the sample", "pending"))
@@ -1099,10 +1104,10 @@ class FastTrackTests(MergeCheckpointFixture):
         paths.update({"settings.json", "scripts/hooks/private/check.py", "scripts/lib/py",
                       ".local/state/staff/staff.json", "scripts/production/staff.py",
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
-                      "scripts/production/add_showrunner.py", "scripts/shutdown/shutdown.py",
+                      "scripts/production/add_showrunner.py", "scripts/agents/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/shutdown/shutdown.py",
-                      "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",
+                      "scripts/accounts/moves.py", "scripts/agents/shutdown.py",
+                      "scripts/agents/shutdown.py", "scripts/production/merge_gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",
                       "config/fast_track.conf"})

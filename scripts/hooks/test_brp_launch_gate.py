@@ -81,7 +81,7 @@ class BrpLaunchGateTests(unittest.TestCase):
             "BUILD_TARGETS_SCRIPT": str(HOOK.parent.parent / "build_targets" / "build_targets.py"),
             **fake_memory_readings(self.root),
             "BUILDLOG_MEM_POLL_S": "0.01",
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),

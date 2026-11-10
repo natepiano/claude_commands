@@ -16,7 +16,7 @@ from typing import cast
 
 from scripts.production import staff
 from scripts.message import sessions
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 
 
 @dataclass(frozen=True)
