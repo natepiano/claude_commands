@@ -45,6 +45,8 @@ from scripts.production import stall_watch
 from scripts.production.session_pane import HerdrFailure, read_place, agent_status
 from scripts.hooks import context_usage
 from scripts.message import rca
+from scripts.whoami import account, usage_store
+from scripts.whoami.agent_accounts import UsageReadOutcome
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.test_showrunners import stalled_session_reader
 from scripts.production import unit_lookup
@@ -510,6 +512,9 @@ always=natedev
             return real_run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
 
         with (mock.patch.object(subprocess, "run", run),
+              mock.patch.object(account, "process_config_dir",
+                                return_value=account.ConfiguredClaudeFolder(self.root / ".claude")),
+              mock.patch.object(usage_store, "store_file", return_value=self.root / "usage.json"),
               mock.patch.multiple(stall_watch, STATE_DIR=self.state,
                                   PROJECTS_DIR=self.projects, SESSIONS=self.sessions_script,
                                   SEND=self.bin / "send.py", PS="ps"),
@@ -1954,15 +1959,56 @@ always=natedev
         self.assertEqual(len(self.sent()), 2)
 
     def test_a_resumed_holding_unit_gets_a_fresh_idle_stretch_before_its_bump(self) -> None:
-        self.panes["unit-one"]["pane"] = "holding: paused until the showrunner says resume\n"
-        for at in (START, START + 3600):
-            self.assertEqual(self.tick(at).returncode, 0)
-        self.assertEqual(self.sent(), [])
-        self.panes["unit-one"]["pane"] = "holding: waiting on the unit tests\n"
-        self.assertEqual(self.tick(START + 3601).returncode, 0)
-        self.assertEqual(self.sent(), [])
-        self.assertEqual(self.tick(START + 3901).returncode, 0)
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+        cases = (
+            ("holding: paused until the showrunner says resume\n", "", "waiting"),
+            ("holding: waiting on the unit tests\nLogin reached its time limit\n",
+             "unit-one: the Claude login reached its time limit and needs /login.", "login limit"),
+            ("holding: waiting on the unit tests\nLogin reached its time limit\n", "", "fresh"),
+        )
+        for pane, notice, decision in cases:
+            with self.subTest(decision=decision):
+                self.send_log.unlink(missing_ok=True)
+                self.watches["unit-one"].stretch_path.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = pane
+                if decision == "fresh":
+                    transcript = self.projects / "project" / f"{unit_session('unit-one')}.jsonl"
+                    _ = transcript.write_text(json.dumps({"type": "system", "error": "Login reached its time limit"}) + "\n")
+                    os.utime(transcript, (START - 60, START - 60))
+                    at = datetime.fromtimestamp(START - 1, ZoneInfo("UTC")).isoformat()
+                    _ = (self.root / "usage.json").write_text(json.dumps({
+                        "_directory_logins": {usage_store.directory_key("Claude", str(self.root / ".claude")):
+                                              "fixture@example.invalid"},
+                        "fixture@example.invalid": {"read_outcome": UsageReadOutcome.OK,
+                                                     "weekly": {"left": 50, "resets": "", "at": at}},
+                    }))
+                    result = self.tick(START)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("inspected showrunner/unit-one: fresh", result.stdout)
+                    self.assertEqual(self.sent(), [])
+                    self.assertEqual(self.tick(START + 300).returncode, 0)
+                    resumed = self.sent()
+                    self.assertEqual(len(resumed), 2)
+                    self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in resumed}, {"bump", "tell"})
+                    tell = next(item for item in resumed if item["key"].endswith(":tell"))
+                    self.assertIn("nothing running; bumped", tell["text"])
+                    continue
+                notices = [notice] if notice else []
+                for at in (START, START + 3600):
+                    result = self.tick(at)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"inspected showrunner/unit-one: {decision}", result.stdout)
+                    self.assertEqual([item["text"] for item in self.sent()], notices)
+                if notice:
+                    tell, = self.sent()
+                    self.assertTrue(tell["key"].endswith(":tell"))
+                    self.assertEqual(tell["to"], f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
+                self.panes["unit-one"]["pane"] = pane + "holding: waiting on the unit tests\n"
+                self.assertEqual(self.tick(START + 3601).returncode, 0)
+                self.assertEqual([item["text"] for item in self.sent()], notices)
+                self.assertEqual(self.tick(START + 3901).returncode, 0)
+                resumed = self.sent()[len(notices):]
+                self.assertEqual(len(resumed), 2)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in resumed}, {"bump", "tell"})
 
     def test_status_vocabulary_is_reread_without_restarting_the_watcher(self) -> None:
         self.panes["unit-one"]["pane"] = "holding: budget nap\n"
