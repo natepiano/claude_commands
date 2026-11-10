@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 
 from scripts.mac_test import cargo_manifest
+from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
 
@@ -1829,13 +1830,7 @@ def remote_test_command(
         )
     abandoned_sessions = ""
     if not custom_target:
-        remove_sessions = 'for session do rm -rf -- "$session" "${session%-working}.lock"; done'
-        abandoned_sessions = (
-            f'{{ find "$HOME"/{target} -maxdepth 5 -type d '
-            + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
-            + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
-            + f"-exec sh -c {shlex.quote(remove_sessions)} sh {{}} + >/dev/null 2>&1 || :; }} && "
-        )
+        abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
