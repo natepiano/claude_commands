@@ -2431,7 +2431,7 @@ A whole gate starts 997 interpreter version checks instead of 3,351. At a paired
 `flatten()`, `lock_guard()` and the `style_sync.py lint` record loop start no Python process. The estimated saving is about 42 CPU s per gate on natedev: 28.4 from the two board helpers (paired per-call cost times the Phase 115 whole-gate call counts) and 13.5 from `style/test_style_sync.py` (median 44.0 to 29.5 CPU s in `module_cost.py` pairs).
 
 - `flatten()` in `scripts/direct/board.sh` uses bash parameter expansion. It replaces newline, CR and tab with a space, removes each character outside `[[:print:]]`, and cuts to `MAX_MESSAGE_CHARS` characters. It pins a UTF-8 locale in a `local LC_ALL` (C.UTF-8, then en_US.UTF-8, then UTF-8), so text keeps its non-ASCII characters in a C or empty caller locale.
-- `lock_guard()` opens descriptor 9 in the shell and takes `flock(LOCK_EX|LOCK_NB)` with one perl call; perl exits 75 when the lock is busy. The shell keeps the lock after perl exits. The return codes do not change.
+- `lock_guard()` opens descriptor 9 in the shell and takes `flock(LOCK_EX|LOCK_NB)` with one perl call; perl exits 75 when the lock is busy. The shell keeps the lock after perl exits. The return codes do not change. It finds perl on PATH, then at `/run/current-system/sw/bin/perl` and `/usr/bin/perl`, as `scripts/lib/py` does for python3, so a caller with a cut PATH (`test_verify_lint_tool_failures`) still gets the guard.
 - `style_sync.py lint` opens `style_ledger.open_ledger(repo)` once, only when records exist, and calls `ledger.lint_record` per record. `main` also catches `rule_catalog.RuleValidationError` and `sqlite3.Error`. The `LEDGER` constant and the diagnostic file are gone; `style_ledger.py lint-record` stays.
 
 **Files:**
@@ -2443,3 +2443,41 @@ A whole gate starts 997 interpreter version checks instead of 3,351. At a paired
 **Gotchas:** bash `[[:print:]]` and `${#text}` follow the locale; a launchd job or an `env -i` child has none. perl resolves from the `verify.sh` PATH: `/run/current-system/sw/bin/perl` on natedev, `/usr/bin/perl` on the Mac. The locale rows did not run on the Mac (SSH timed out).
 
 **Ruled out:** a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
+
+### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the builds showrunner, 2026-11-10: go for `progress_history.py` and `plan_history.py` imports, in the Phase 117 delayed-import form; measure in pairs and send the gain with the checkpoint. The sdlc showrunner gave its go with two conditions: type-only imports stay under `TYPE_CHECKING` so basedpyright stays 0/0/0, and the notice reports the paired CPU per start before and after.
+
+**Why:** a whole gate starts `scripts/direct/progress_history.py` about 772 times. Each start spends about 107 ms CPU on imports on natedev, 82.6 CPU s per gate. Most of it is dataclass definitions (about 0.36 ms each) in `staff.py`, `session_staff.py`, `unit_config.py` and `worker_lifecycle.py`, which most verbs never use. A probe with those modules absent cut the import by about 47 ms per start: about 36 CPU s per gate. Director calls get the same gain.
+
+**Goal:** a `progress_history.py` verb that does not use the staff, plan or reservation modules does not import them, and the paired CPU per start drops by about 40 ms.
+
+**Spec:**
+
+1. In `scripts/direct/progress_history.py`, import `plan_history`, `phase_reservation`, `worker_lifecycle`, `staff`, `session_staff`, `unit_config` and `remote` inside each function that uses them, as Phase 117 did for `findings`. Keep each name under `TYPE_CHECKING` for annotations.
+2. In `scripts/direct/plan_history.py`, import `staff`, `session_staff` and `remote` inside each function that uses them, with the same `TYPE_CHECKING` rule.
+3. No behavior change. No test change unless a test patches a moved name.
+4. Prove with `python3 -X importtime` that `import scripts.direct.progress_history` loads none of the seven modules.
+5. Measure the CPU per start in same-load random-order pairs, phase base against the change, for one verb that `verify.sh` calls (`finish-wait`) and for `--help`-free `review-trial`; multiply by 772 for the per-gate estimate.
+
+**Files:**
+- `scripts/direct/progress_history.py` — delayed imports; owner sdlc, go given
+- `scripts/direct/plan_history.py` — delayed imports; owner sdlc, go given
+
+**Workers:** 1 writer; one mechanical change in two files
+- `impl` — all files
+
+**State:** none
+
+**Constraints from prior phases:** Phase 117 form: the import sits at the function that uses it; a test that patches a delayed import patches the package attribute. Shared import costs overlap, so a single-import ranking overstates the saving by about half. Tests use no live state.
+
+**Acceptance gate:**
+- `import scripts.direct.progress_history` loads none of the seven modules.
+- The paired CPU per start, before and after, is reported.
+- The importers of `progress_history.py` and `plan_history.py` pass.
+- `basedpyright` reports 0 errors, 0 warnings, 0 notes for both files.
+- A targeted test on the change passes.
