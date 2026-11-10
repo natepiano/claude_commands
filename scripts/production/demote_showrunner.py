@@ -115,10 +115,16 @@ def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
     if isinstance(marked, unit_lookup.NoSession) or not isinstance(marked.claude, unit_lookup.LiveClaude):
         raise Refusal(f"{name}: cannot read the live pane")
     worktree = child.checkout
-    promote_showrunner.check_director(name, marked, marked.claude, worktree)
     relative_plan = plan.relative_to(child.checkout).as_posix()
-    if add_unit.git(child, "cat-file", "-e", f"{child.merge_branch}:{relative_plan}", check=False).returncode != 0:
-        raise Refusal(f"plan {relative_plan} is missing on {child.merge_branch}")
+    if not plan.is_file():
+        raise Refusal(f"plan {relative_plan} is missing in {child.checkout}")
+    tracked = add_unit.git(child, "ls-files", "--error-unmatch", "--", relative_plan, check=False)
+    if (tracked.returncode == 0
+            and add_unit.git(child, "cat-file", "-e", f"{child.merge_branch}:{relative_plan}", check=False).returncode != 0):
+        branch = add_unit.git(child, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        raise Refusal(f"plan {relative_plan} is committed only on {branch}; "
+                      + f"commit it on {child.merge_branch} or keep it untracked")
+    promote_showrunner.check_director(name, marked, marked.claude, worktree, skip_path=plan)
     check_units(child, record)
     return Demotion(parent, child, marked, marked.claude, worktree, child.merge_branch, plan, port)
 
