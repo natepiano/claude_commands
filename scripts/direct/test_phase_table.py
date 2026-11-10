@@ -2145,6 +2145,22 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(line, "Parallel: none — no phase is waiting")
 
+    def test_parallel_after_the_plan_is_removed_names_ad_hoc_work(self) -> None:
+        self.parallel_plan("### Phase 2 — Parser  · status: todo")
+        self.plan.unlink()
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "parallel", "--session-dir", str(self.session_dir)],
+            env=self.environment(1_100),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, f"Parallel: none — no plan at {self.plan.resolve()}; the run does ad hoc work\n")
+        self.assertEqual(result.stderr, "")
+
     def test_production_json_carries_the_phases_that_could_start(self) -> None:
         self.parallel_plan(
             "### Phase 2 — Parser  · status: todo",

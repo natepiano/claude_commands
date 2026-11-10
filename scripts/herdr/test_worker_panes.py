@@ -2661,10 +2661,15 @@ class WorkerPaneTests(StaffTestCase):
     def test_labelled_shell_is_stopped_and_an_absent_pane_is_closed(self) -> None:
         stopped = self.worker("stopped")
         closed = self.worker("closed")
+        review = self.worker("review")
+        sibling = self.worker(worker_panes.agent_name(self.parent, "review"))
         self.world.add(stopped, "w1:p1", live=False)
+        self.world.add(sibling, "w1:p2")
         found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
         self.assertIsInstance(found[stopped.id], worker_panes.StoppedWorker)
         self.assertIsInstance(found[closed.id], worker_panes.ClosedWorker)
+        self.assertIsInstance(found[review.id], worker_panes.ClosedWorker)
+        self.assertIsInstance(found[sibling.id], worker_panes.OpenWorker)
         self.assertEqual(self.world.commands, [])
 
     def test_duplicate_native_identity_leaves_the_worker_uncertain(self) -> None:

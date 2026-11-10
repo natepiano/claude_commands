@@ -440,8 +440,9 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                         payload = entry.get("payload")
                         if isinstance(payload, dict):
                             message = cast(dict[str, object], payload)
-                            if (entry.get("type") == "event_msg" and message.get("type") in (
-                                    "user_message", "agent_message", "error") or
+                            if (entry.get("type") == "event_msg" and (message.get("type") in (
+                                    "user_message", "agent_message", "error")
+                                    or message.get("type") == "task_complete" and isinstance(message.get("error"), dict)) or
                                     entry.get("type") == "response_item" and message.get("type") == "message"
                                     and message.get("role") in ("user", "assistant")):
                                 return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
@@ -484,9 +485,13 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str
             if not isinstance(payload_value, dict):
                 return NoSessionRefusal()
             payload = cast(dict[str, object], payload_value)
-            if payload.get("type") != "error":
+            error = payload.get("error")
+            if payload.get("type") == "task_complete" and isinstance(error, dict):
+                text = str(cast(dict[str, object], error).get("message", ""))
+            elif payload.get("type") == "error":
+                text = str(payload.get("message", ""))
+            else:
                 return NoSessionRefusal()
-            text = str(payload.get("message", ""))
             entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
         else:
             if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
