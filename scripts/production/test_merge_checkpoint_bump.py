@@ -57,9 +57,11 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         return path
 
     def finish_gate(self, run: BumpGateObservation) -> None:
+        cache = (run.checkout / "target").resolve()
         self.release_bump_gate()
         self.wait_bump_gate_exit(run)
-        self.assertTrue((run.checkout / ".git").is_dir(), "the gate must retain its standing checkout")
+        self.assertFalse(run.checkout.exists(), "The checkout must end with its gate")
+        self.assertTrue(cache.is_dir(), "The cache must remain after its gate")
 
     def test_bump_without_a_build_cache_delivers_the_result_and_removes_its_copy(self) -> None:
         self.prepare_bump_gate()

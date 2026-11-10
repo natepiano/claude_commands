@@ -19,8 +19,9 @@ silence end.
 auto_silence.py turns silence on with the auto marker when the user is idle, and ends only that
 silence when they come back; `on` replaces the marker, so a silence set by hand stays until `off`.
 
-natedev holds the state: on the Mac every subcommand, and pushover.py's check, runs there over
-ssh. NOTIFY_STATE_DIR, when set, names this host's state directory and keeps everything here.
+natedev holds the state: on the Mac every subcommand runs there over ssh, and pushover.py sends
+each Mac push to natedev. NOTIFY_STATE_DIR, when set, names this host's state directory and
+keeps everything here.
 """
 from __future__ import annotations
 try:
@@ -251,18 +252,6 @@ def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
     return done.returncode, done.stdout
 
 
-def keep(push: KeptPush, system: str | None = None, asker: Ask = ask, deliver: Deliver | None = None) -> Kept | NotSilent:
-    """Keep the push when silence is on. On the Mac natedev decides; if it cannot be asked, send."""
-    if not on_mac(system):
-        return keep_here(push, deliver=deliver)
-    code, out = asker([*SSH, f"{REMOTE} keep"], json.dumps(push))
-    if code == 0 and out.strip():
-        return Kept(out.strip())
-    if code != 1:
-        print(f"silence: natedev could not be asked (exit {code}); sending", file=sys.stderr)
-    return NotSilent()
-
-
 def drop(source: str, key: str, system: str | None = None, asker: Ask = ask) -> int:
     """Remove the kept pushes with this source and key; how many. On the Mac natedev removes them."""
     if not on_mac(system):
@@ -433,7 +422,6 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     stop = commands.add_parser("off", help="end silence and post the kept pushes")
     _ = stop.add_argument("--timer", default="", help="end only the silence that names this timer")
     _ = commands.add_parser("status", help="say whether silence is on")
-    _ = commands.add_parser("keep", help="pushover.py: keep the push JSON on stdin when silence is on")
     dropping = commands.add_parser("drop", help="send.py retire: remove the kept pushes with this source and key")
     _ = dropping.add_argument("--source", required=True)
     _ = dropping.add_argument("--key", required=True)
@@ -441,7 +429,7 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     if on_mac(system):
         return remote([*SSH, f"{REMOTE} {shlex.join(arguments)}"])
     command = cast(str, options.command)
-    if command not in ("off", "keep", "drop"):
+    if command not in ("off", "drop"):
         _ = end_if_past(runner)
     if command == "on":
         until_text, span = cast(str | None, options.until), cast(str | None, options.span)
@@ -461,15 +449,6 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
         return on(until, runner)
     if command == "off":
         return off(runner, timer=cast(str, options.timer))
-    if command == "keep":
-        push = parse_push(sys.stdin.read())
-        if push is None:
-            parser.error("keep reads one push as JSON on stdin")
-        kept = keep_here(push)
-        if isinstance(kept, Kept):
-            print(kept.until)
-            return 0
-        return 1
     if command == "drop":
         print(drop_here(cast(str, options.source), cast(str, options.key)))
         return 0

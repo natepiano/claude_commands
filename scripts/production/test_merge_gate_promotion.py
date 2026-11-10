@@ -18,7 +18,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.staff_test_support import isolated_staff_file
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

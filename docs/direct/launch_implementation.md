@@ -71,7 +71,14 @@ completes.
    The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`.
    It keeps the launch exit code and the phase reservation. A failed cleanup child reports its error.
    For other genuine errors, cancel early review under <EarlyReviewArm/> and apply <RetainPhaseReservation/>.
-   Report the dispatch log, record `finish-run --status error`, and run `end_session.sh`.
+   Report the dispatch log and record `finish-run --status error`.
+   Run the end step as one command, without a pipe:
+
+   ```sh
+   bash ~/.claude/scripts/direct/end_session.sh
+   ```
+
+   Report a non-zero exit and the failed step.
    Stop and emit <RunSummary/> for a multi-phase run.
 8. A successful dispatch records worker completion; it does not pass the phase gate.
    Read `${IMPL_SUMMARY}` for commands with running, unread, or absent results.

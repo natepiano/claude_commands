@@ -19,11 +19,11 @@ class UnqueuedStylePlace:
     """A fixture program lifetime without admission or shared state."""
 
     def __init__(self, repo: Path, before_start: Callable[[Path, Sequence[str]], None],
-                 real_startup: bool, before_started: Callable[[], None]) -> None:
+                 real_startup: bool, before_started: Callable[[], None], startup_dir: Path) -> None:
         self.real_startup: bool = real_startup
         self.before_started: Callable[[], None] = before_started
         self.startups: list[queue_place.QueuePlace] = []
-        self.storage: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(prefix="style-startup-")
+        self.startup_dir: Path = startup_dir
         self.repo: Path = repo
         self.before_start: Callable[[Path, Sequence[str]], None] = before_start
         self.arguments: list[tuple[str, ...]] = []
@@ -35,9 +35,9 @@ class UnqueuedStylePlace:
         self.arguments.append(tuple(arguments))
         self.before_start(self.repo, arguments)
         if self.real_startup:
-            sidecar = Path(self.storage.name) / "program.cgroup"
+            sidecar = self.startup_dir / "program.cgroup"
             _ = sidecar.write_text("")
-            place = queue_place.QueuePlace(Path(self.storage.name) / "private.reservation", sidecar,
+            place = queue_place.QueuePlace(self.startup_dir / "private.reservation", sidecar,
                                            configuration=admission_configuration_fixture())
             self.startups.append(place)
             def started() -> None:
@@ -68,7 +68,6 @@ class UnqueuedStylePlace:
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
                     stream.close()
-        self.storage.cleanup()
         self.closed = True
 
 
@@ -94,13 +93,14 @@ class StyleQueueFake:
         self.batch_calls.append((arguments, batch))
         if name in self.refusals:
             raise queue_place.QueuePlaceRefused(self.refusals[name])
-        place = UnqueuedStylePlace(repo, self.before_start, self.real_startup, self.before_started)
-        self.places.append(place)
-        try:
-            yield cast(queue_place.QueuePlace, cast(object, place))
-        finally:
-            place.close()
-            self.after_close()
+        with tempfile.TemporaryDirectory(prefix="style-startup-") as directory:
+            place = UnqueuedStylePlace(repo, self.before_start, self.real_startup, self.before_started, Path(directory))
+            self.places.append(place)
+            try:
+                yield cast(queue_place.QueuePlace, cast(object, place))
+            finally:
+                place.close()
+                self.after_close()
 
 
 @contextmanager

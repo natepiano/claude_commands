@@ -17,6 +17,7 @@ from scripts.copies import copies
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib import unit_runs
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
@@ -29,7 +30,6 @@ REMOVE_RUN_SCRATCH = Path(__file__).with_name("remove_run_scratch.py")
 class EndSessionTests(unittest.TestCase):
     """Run cleanup keeps other directors' files."""
 
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     marker: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -41,8 +41,7 @@ class EndSessionTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.session_dir = self.root / "run"
         self.session_dir.mkdir()
         session_id = fixture_runtime_id(f"end-session:{self.root.name}")
@@ -55,6 +54,7 @@ class EndSessionTests(unittest.TestCase):
         active_root.mkdir()
         self.marker = active_root / session_id
         _ = self.marker.write_text(f"{self.session_dir}\n", encoding="utf-8")
+        _ = (self.session_dir / unit_runs.ACTIVE_MARKER_FILE).write_text(f"{self.marker}\n")
         self.calls = self.root / "calls"
         self.runs = self.root / "runs"
         self.runs.mkdir()
@@ -65,6 +65,8 @@ class EndSessionTests(unittest.TestCase):
         (scripts / "lib").mkdir()
         (scripts / "copies").mkdir()
         (scripts / "copies/copies.py").symlink_to(Path(copies.__file__))
+        (scripts / "astra").mkdir()
+        (scripts / "astra/design_roles.py").symlink_to(END_SESSION.parent.parent / "astra/design_roles.py")
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
@@ -79,7 +81,9 @@ class EndSessionTests(unittest.TestCase):
             + " printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
             + f" exec {sys.executable} \"$@\";; */unit_runs.py)"
             + f" exec {sys.executable} \"$@\";; */copies.py)"
-            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;; esac\n"
+            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;;"
+            + " */design_roles.py) printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
+            + f" exec {sys.executable} \"$@\";; esac\n"
             + "printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\"\n",
             encoding="utf-8",
         )
@@ -89,7 +93,6 @@ class EndSessionTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.marker.unlink(missing_ok=True)
-        self.temporary.cleanup()
 
     def environment(self) -> dict[str, str]:
         environment = {name: value for name, value in os.environ.items()
@@ -106,6 +109,7 @@ class EndSessionTests(unittest.TestCase):
             "UNIT_RUN_ROOT": str(self.runs),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+            "DESIGN_ROLES_STATE": str(self.root / "designs"),
             "SCRATCH_ROOT": str(self.root / "tracked-scratch"),
             "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
@@ -126,16 +130,18 @@ class EndSessionTests(unittest.TestCase):
         with patch.dict(os.environ, environment):
             source = self.seed()
             with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
-                pass
+                cache = (tree / "target").resolve().parent
             with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
-                pass
+                other_cache = (other / "target").resolve().parent
             with copies.workspace(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, "HEAD", name="worker", branch="worker") as workspace:
                 pass
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(tree.exists())
             self.assertFalse(workspace.exists())
-            self.assertTrue(other.exists())
+            self.assertFalse(other.exists())
+            self.assertFalse(cache.exists())
+            self.assertTrue(other_cache.is_dir())
             self.assertFalse(self.marker.exists())
 
     def test_end_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
@@ -146,7 +152,7 @@ class EndSessionTests(unittest.TestCase):
             source = ImmutableGitSeed.create(self.root / "repo", "main", "End Test",
                                              "end@example.invalid", {"file": "content"}).checkout
             with copies.standing(owner, source, copies.CommittedSource("HEAD")) as tree:
-                self.assertTrue(tree.is_relative_to(Path(environment["SCRATCH_ROOT"])))
+                self.assertTrue(tree.is_relative_to(Path(tempfile.gettempdir())))
                 self.assertEqual(copies.owned_trees(owner).standing, ())
                 self.assertTrue((tree / ".git").is_dir())
             self.assertFalse(tree.exists())
@@ -183,7 +189,29 @@ class EndSessionTests(unittest.TestCase):
                                     runtime_id=fixture_runtime_id(director))
         _ = (run / "progress_history_state.json").write_text(
             json.dumps({"owner_staff_id": parent.id}), encoding="utf-8")
+        _ = (run / unit_runs.ACTIVE_MARKER_FILE).write_text(f"{self.marker}\n")
         return run
+
+    def test_failed_role_cleanup_still_ends_only_its_runs_mark(self) -> None:
+        directory = self.root / "designs" / "20000000-0000-4000-8000-000000000001"
+        directory.mkdir(parents=True)
+        _ = (directory / "design.json").write_text(json.dumps({
+            "binding": {"run_directory": str(self.session_dir)},
+            "schema": 1,
+            "placement": {"design_id": directory.name},
+            "roles": [],
+        }))
+        side = self.make_run("run-side", self.session_id)
+        _ = (self.marker.parent / "other-director").write_text("keep another run\n")
+        result = self.run_end(self.environment())
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("design_roles.py unbind-run", result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn(f"unbind-run {side}", calls)
+        self.assertIn("remove_workers.py", calls)
+        self.assertIn("remove_run_scratch.py", calls)
+        self.assertEqual({path.name: path.read_text() for path in self.marker.parent.iterdir()},
+                         {"other-director": "keep another run\n"})
 
     def test_every_run_the_director_holds_is_cleaned_and_no_other(self) -> None:
         marked = self.make_run("run-marked", self.session_id)

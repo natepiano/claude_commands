@@ -19,6 +19,7 @@ import sys
 import tempfile
 from typing import cast
 
+from scripts.lib import conf
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
 
@@ -245,7 +246,7 @@ def blob_texts(repo: Path, blobs: set[str]) -> dict[str, str]:
 
 
 def dirty_paths(repo: Path) -> set[str]:
-    return parse_status_z(git_output(repo, "status", "--porcelain", "-z", "--untracked-files=all"))
+    return parse_status_z(git_output(repo, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all"))
 
 
 def worktree_files(repo: Path, dirty: set[str]) -> tuple[set[str], dict[str, str]]:
@@ -340,10 +341,25 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
                     state_dir: Path | None = None) -> AffectedSelection | FullSuite:
     try:
-        if isinstance(base, NoCertifiedBase):
+        candidates = {base.commit: base} if isinstance(base, CertifiedBase) else {}
+        for branch in conf.read("merge_gate").words("landing_branches"):
+            ancestor = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD",
+                                       f"refs/remotes/origin/{branch}"],
+                                      capture_output=True, text=True, check=False)
+            if ancestor.returncode:
+                continue
+            commit = ancestor.stdout.strip()
+            if commit not in candidates:
+                at = git_output(repo, "show", "-s", "--format=%cI", commit).strip()
+                candidates[commit] = CertifiedBase(commit, at)
+        if not candidates:
             return FullSuite("no certified base")
-        changes = git_output(repo, "diff", "--name-only", "-z", "--no-renames", base.commit, "HEAD")
-        changed = (set(changes.split("\0")) - {""}) | dirty
+        differences: list[tuple[CertifiedBase, set[str]]] = []
+        for candidate in candidates.values():
+            changes = git_output(repo, "diff", "--name-only", "-z", "--no-renames", candidate.commit, "HEAD")
+            differences.append((candidate, set(changes.split("\0")) - {""}))
+        base, committed_changes = min(differences, key=lambda item: len(item[1]))
+        changed = committed_changes | dirty
         paths, blobs = worktree_files(repo, dirty)
         cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
@@ -362,15 +378,23 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
             retained.update(source_blobs(old_paths, old_blobs))
         retain_facts(cache_path, cached, before, retained)
-        folders = {str(Path(path).parent) for path in python if not is_test_module(path)}
+        folder_stems: dict[str, set[str]] = defaultdict(set)
+        for source in python:
+            if not is_test_module(source):
+                folder_stems[str(Path(source).parent)].add(Path(source).stem)
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
             if (path in changed or graph.imports.get(path, set()) & python
                     or old_graph.get(path, set()) & removed or graph.tokens.get(path, frozenset()) & changed
-                    or config_reads.get(path, set()) & configs
-                    or str(Path(path).parent) in folders):
+                    or config_reads.get(path, set()) & configs):
                 selected.append(module)
+                continue
+            stems = folder_stems.get(str(Path(path).parent), set())
+            if stems:
+                text = module.read_text(encoding="utf-8")
+                if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
+                    selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
     except (GraphError, OSError, ValueError, SyntaxError) as error:
         return FullSuite(f"graph error: {error}")

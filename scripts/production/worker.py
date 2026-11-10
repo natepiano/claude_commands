@@ -31,7 +31,7 @@ from scripts.lib import atomic_file, conf, unit_runs
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
-from scripts.production import session_staff, staff, worker_admission
+from scripts.production import display_cells, session_staff, staff, worker_admission
 
 from scripts.herdr import herdr
 
@@ -335,6 +335,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
                    worker_panes.worker_pass(row, session_dir))
             return DispatchSubmission.SUBMITTED
+        if row is not None:
+            owner = staff.snapshot().parent_of(row)
+            if owner is not None:
+                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], None],
+                                   import_module("scripts.herdr.turn_end").finish_late_completion)
+                finish_late(row, owner, hold, completion_actions.held_role)
         if isinstance(started, StartAtDispatch):
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
         else:
@@ -572,18 +578,17 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
 
 
 def end(parent: StaffId, name: WorkerName, *,
-        run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT,
         lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
-        interrupt: bool = False, retire: bool = True) -> ExitCode:
+        retire: bool = True) -> ExitCode:
     with ExitStack() as operations:
-        hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
+        hold = operations.enter_context(worker_panes.worker_lock(parent, name, blocking=True)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.KEPT
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if row is None:
             return ExitCode.OK
-        result = worker_panes.close(parent, name, run=run, lock=hold, interrupt=interrupt)
+        result = worker_panes.close(parent, name, lock=hold)
         if isinstance(result, worker_panes.Kept):
             print(result.blocker, file=sys.stderr)
             return ExitCode.KEPT
@@ -664,7 +669,7 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | Uns
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
     """Supply Claude child launchers and pane dispatch ids to the shared builder."""
-    from scripts.shutdown.inventory import worker_resumes
+    from scripts.agents.inventory import worker_resumes
 
     holder = record.by_id(parent)
     if holder is None:
@@ -947,7 +952,21 @@ def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
     return listing
 
 
-def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str, object]]:
+def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
+    if isinstance(state, worker_panes.OpenWorker):
+        if isinstance(state.row.paused, staff.Paused):
+            return "open", "paused"
+        if isinstance(state.row.exited, staff.Exited):
+            return "open", "exited"
+        return "open", worker_panes.worker_state(state)
+    if isinstance(state, worker_panes.StoppedWorker):
+        return "open", "exited"
+    if isinstance(state, worker_panes.ClosedWorker):
+        return "closed", "-"
+    return "unknown", "-"
+
+
+def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
     with progress_history.dispatch_reads(record, observed.runs):
@@ -958,19 +977,34 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str,
                 fields["activity"] = state.status.value
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 fields["reason"] = state.reason
+            if not as_json:
+                fields["pane"], fields["state"] = _worker_pane_state(state)
             listing.append(fields)
     return listing
 
 
-def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
+def _print_workers(listing: list[dict[str, object]], as_json: bool, record: staff.StaffSnapshot) -> ExitCode:
     if as_json:
         print(json.dumps(listing))
     else:
+        locations: list[str] = []
+        for fields in listing:
+            row = record.by_id(StaffId(str(fields.get("id", ""))))
+            parent = record.parent_of(row) if row is not None else None
+            locations.append(staff.worktree_machine(parent) if parent is not None else "")
+        machines = display_cells.machine_column(locations)
         width = len(str(len(listing)))
         for number, fields in enumerate(listing, 1):
             role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
             account = fields["account"] if isinstance(fields.get("account"), str) else "account unknown"
-            print(f"{number:>{width}} {fields['name']} {role} {account} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
+            pane = fields.get("pane", "-")
+            state = fields["state"]
+            if pane == "-":
+                state = state if state in ("paused", "exited") else "busy" if state == "active" else "idle"
+            elif pane != "open":
+                account = "-"
+            machine = f" {machines[number - 1]}" if machines else ""
+            print(f"{number:>{width}} {fields['name']} {role} {account}{machine} {pane} {state} {fields.get('reason', '')}".rstrip())
     return ExitCode.OK
 
 
@@ -1042,14 +1076,15 @@ def main(arguments: list[str] | None = None) -> int:
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
         if args.command == "list" and args.all:
-            return _print_workers(list_all_workers(staff.local_snapshot()), args.json)
+            record = staff.local_snapshot()
+            return _print_workers(list_all_workers(record), args.json, record)
         record = staff.snapshot()
         owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
         if owner is None or owner.kind not in ("unit", "showrunner"):
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
         if args.command == "list":
-            return _print_workers(list_workers(owner.id, record), args.json)
+            return _print_workers(list_workers(owner.id, record, as_json=args.json), args.json, record)
         if args.command == "check":
             observed = _read_workers(owner, record)
             with progress_history.dispatch_reads(record, observed.runs):
@@ -1065,8 +1100,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "answer":
             code = answer(owner.id, WorkerName.parse(args.name), args.text)
         elif args.command == "end":
-            code = end(owner.id, WorkerName.parse(args.name),
-                run=worker_panes.DispatchRun(Path(args.session_dir)) if args.session_dir else worker_panes.HolderRun.CURRENT)
+            code = end(owner.id, WorkerName.parse(args.name))
         elif args.command == "add":
             result = add(owner.id, cast(WorkerRole, args.role), name=args.name)
             if args.json and isinstance(result, worker_panes.OpenWorker):

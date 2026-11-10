@@ -10,6 +10,7 @@ import argparse
 import json
 from dataclasses import replace
 from datetime import datetime
+from enum import Enum
 import re
 import subprocess
 import sys
@@ -18,10 +19,10 @@ from typing import NamedTuple, cast
 
 
 from scripts.production import session_staff, staff, unit_config
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.lib import main_publish
 from scripts.herdr import worker_panes
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
 from scripts.production.store_owner import showrunner_id
@@ -30,11 +31,11 @@ from scripts.production import showrunner_tree
 from scripts.production import tidy_wrapped
 from scripts.production import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
+from scripts.production.checkpoint_gate import Stop, report
 from scripts.production.merge_checkpoint import (
-                              PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
-                              Stop,
-                              git, good, merged_checkpoints, promote_local_checkout,
-                              pull_mac_checkout, report)
+    PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
+    branch_is_landed, git, good, merged_checkpoints, promote_local_checkout, pull_mac_checkout,
+)
 from scripts.production import production_doc
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
@@ -116,6 +117,42 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
     return ProductionWrapped()
 
 
+def unit_branch(row: staff.StaffRow, resolver: session_staff.RowResolver) -> session_staff.Branch | session_staff.BranchUnreadable | session_staff.LocationUnfilled | session_staff.RetiredFactsUnavailable:
+    """Read the parked branch first, then use the staff location."""
+    parked = unit_config.read_parked(row.id, cleanup=False)
+    if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
+        return session_staff.Branch(parked.retired.branch.value)
+    return resolver.unit_branch(row)
+
+
+class BranchMergeState(Enum):
+    MERGED = "merged"
+    UNMERGED = "unmerged"
+    ABSENT = "absent"
+
+
+def branch_merge_state(production: Production, branch: str) -> BranchMergeState:
+    """Check the local branch, then origin, then absence."""
+    local = git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    if local.returncode == 0:
+        branch_ref = branch
+    elif local.returncode != 1:
+        raise LifecycleStop("worktree", "failed", local.stderr.strip() or f"show-ref exited {local.returncode}")
+    else:
+        remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", branch)
+        if remote.returncode == 2:
+            return BranchMergeState.ABSENT
+        if remote.returncode:
+            raise LifecycleStop("worktree", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
+        branch_ref = f"refs/remotes/origin/{branch}"
+        _ = checked(production.checkout, "worktree", "fetch", "origin", f"+refs/heads/{branch}:{branch_ref}")
+    try:
+        landed = branch_is_landed(production.checkout, branch_ref, production.merge_branch)
+    except Stop as error:
+        raise LifecycleStop("worktree", "failed", error.detail) from error
+    return BranchMergeState.MERGED if landed else BranchMergeState.UNMERGED
+
+
 def units(runner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow, ...]:
     """The runner's unit rows in staff order; a parked retirement names the branch, else git does."""
     resolver = session_staff.RowResolver(record)
@@ -131,14 +168,10 @@ def units(runner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow,
         name = row.name
         if isinstance(row.worktree, staff.WorktreeUnfilled):
             raise LifecycleStop("retire", "held", f"{name}: worktree is unfilled")
-        parked = unit_config.read_parked(row.id, cleanup=False)
-        if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
-            branch = parked.retired.branch.value
-        else:
-            found = resolver.unit_branch(row)
-            if not isinstance(found, session_staff.Branch):
-                raise LifecycleStop("retire", "held", f"{name}: {found.reason}")
-            branch = found.name
+        found = unit_branch(row, resolver)
+        if not isinstance(found, session_staff.Branch):
+            raise LifecycleStop("retire", "held", f"{name}: {found.reason}")
+        branch = found.name
         parsed.append(UnitRow(name, row, row.worktree.path, branch))
     return tuple(parsed)
 
@@ -572,21 +605,11 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
                 worktree_status = checked(unit.worktree, "worktree", "status", "--short")
                 if worktree_status:
                     raise LifecycleStop("worktree", "failed", f"{unit.name} at {unit.worktree} is dirty: {worktree_status}")
-            local = git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}")
-            remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
-            if remote.returncode not in (0, 2):
-                raise LifecycleStop("worktree", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
-            if local.returncode == 0:
-                branch_ref = unit.branch
-            elif remote.returncode == 0:
-                branch_ref = f"refs/remotes/origin/{unit.branch}"
-                _ = checked(production.checkout, "worktree", "fetch", "origin",
-                            f"+refs/heads/{unit.branch}:{branch_ref}")
-            else:
+            merged = branch_merge_state(production, unit.branch)
+            if merged is BranchMergeState.ABSENT:
                 report("worktree", "ok", f"{unit.name} already retired")
                 continue
-            if git(production.checkout, "merge-base", "--is-ancestor", branch_ref,
-                   production.merge_branch).returncode:
+            if merged is BranchMergeState.UNMERGED:
                 raise LifecycleStop("worktree", "held", f"{unit.name} branch {unit.branch} is not merged")
             report("worktree", "ok", f"{unit.name} clean and merged")
         _ = checked(production.checkout, "push", "push", "origin", production.merge_branch)
@@ -611,7 +634,10 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree),
                                expected=unit.member.worktree)
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
-            _ = checked(production.checkout, "retire", "branch", "-d", unit.branch)
+            if not branch_is_landed(production.checkout, unit.branch, production.merge_branch):
+                raise LifecycleStop("retire", "held", f"{unit.branch} has work absent from {production.merge_branch}")
+            # The preparation check also accepts equal patches after a cherry-pick.
+            _ = checked(production.checkout, "retire", "branch", "-D", unit.branch)
             report("retire", "ok", f"deleted local {unit.branch}")
         remote = git(production.checkout, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
         if remote.returncode == 0:

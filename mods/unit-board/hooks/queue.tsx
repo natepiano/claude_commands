@@ -1,4 +1,4 @@
-import type { PaneElements } from './board';
+import type { PaneElements } from './lines';
 import type { QueueLines } from '../types/queue';
 
 /** Layout belongs to Python. Only the recorded countdown changes between reads. */

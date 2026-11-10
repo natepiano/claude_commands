@@ -249,6 +249,7 @@ class RunningGateJob:
     kind: GateJobKind = GateJobKind.TEST_MODULE
     cpu_seconds: float = 0.0
     memory_stopped: bool = False
+    folder_cleanup: ExitStack = field(default_factory=ExitStack)
 
 
 @dataclass(frozen=True)
@@ -806,6 +807,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     shutil.rmtree(job.log.parent)
+    job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -1167,6 +1169,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
@@ -1233,8 +1236,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         slot = cpu_pool
                     request = pending.popleft()
                     suite, path = request.suite, request.path
-                    root = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary)))
+                    folder_cleanup = ExitStack()
+                    _ = module_folders.callback(folder_cleanup.close)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -1249,6 +1254,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                        job.folder_cleanup = folder_cleanup
                         job.cpu_slot = slot
                         running.append(job)
                         job_started = True
@@ -1635,9 +1641,9 @@ def merge_checkpoint(args: GateArguments) -> int:
     if refused := change_review.missing(commits):
         raise GateRefused(f"checkpoint commits without a {change_review.TRAILER} line: "
                           + "; ".join(refused) + "; " + change_review.HELD_NEXT_STEP)
+    producer = change_review.unit_producer(args.unit)
     if review_list is not None:
         try:
-            producer = change_review.unit_producer(args.unit)
             _ = change_review.publication_changes(commits, production, known_producer=producer)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
@@ -1651,7 +1657,6 @@ def merge_checkpoint(args: GateArguments) -> int:
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
         merged = checked_git(repo, "rev-parse", "HEAD")
-        producer = change_review.unit_producer(args.unit)
         if isinstance(producer, str):
             change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer))
         if merged != baseline:
@@ -1682,7 +1687,6 @@ def merge_checkpoint(args: GateArguments) -> int:
     if args.promote:
         promote(args)
     if review_list is not None:
-        producer = change_review.unit_producer(args.unit)
         record_changes(repo, review_list, production, str(args.merge_branch),
                        known_producer=change_review.KnownMergeProducer(merged, producer)
                        if isinstance(producer, str) else producer)
@@ -1730,7 +1734,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, merge_branch
 
 def nightly_owner(args: GateArguments) -> str:
     from scripts.production import session_staff, showrunners, staff, unit_lookup
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     try:
         doc = change_review.production_doc(args.production)

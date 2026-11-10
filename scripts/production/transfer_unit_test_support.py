@@ -19,6 +19,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import transfer_unit
 
@@ -57,8 +58,8 @@ class UnitTransferFixture(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         # Preserve absolute Git worktree and document paths, with private writable copies.
-        _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {"demo": ("alpha", "beta"), "other": ("gamma",)},
                            locations={("demo", "alpha"): self.unit,
@@ -110,7 +111,7 @@ class UnitTransferFixture(StaffTestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "UNIT_SYNC_WRITES": "0",
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
         })
 
@@ -135,7 +136,7 @@ class UnitTransferFixture(StaffTestCase):
         _ = self.git("init", "--bare", str(origin))
         _ = self.git("init", "-b", "demo")
         for key, value in (("user.name", "Unit Transfer Test"), ("user.email", "transfer@example.invalid"),
-                           ("gc.auto", "0"), ("maintenance.auto", "false")):
+                           ("gc.auto", "0")):
             _ = self.git("config", key, value)
         _ = self.git("remote", "add", "origin", str(origin))
         self.write(self.giving / "docs/plans/demo-production.md", self.production_doc("demo", self.giving))

@@ -20,7 +20,7 @@ from scripts.lib.user_zone import user_zone_name  # noqa: E402
 from scripts.production.update_registration import ReportItem as ReportItem, reports_path as reports_path
 from scripts.production.update_registration import QuestionStaff
 from scripts.production import showrunners, staff
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
 

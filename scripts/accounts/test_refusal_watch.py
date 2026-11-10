@@ -30,7 +30,7 @@ from scripts.lib import conf
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -44,16 +44,16 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
-    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    from scripts.shutdown import inventory, shutdown_record, restart_support, pane_record
+    from scripts.agents.unit_staff_test_support import isolated_parents, unit_host
+    from scripts.agents import inventory, shutdown_record, restart_support, pane_record
     from scripts.message import sessions
 else:
-    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    inventory = import_module("scripts.shutdown.inventory")
-    shutdown_record = import_module("scripts.shutdown.shutdown_record")
-    restart_support = import_module("scripts.shutdown.restart_support")
+    from scripts.agents.unit_staff_test_support import isolated_parents, unit_host
+    inventory = import_module("scripts.agents.inventory")
+    shutdown_record = import_module("scripts.agents.shutdown_record")
+    restart_support = import_module("scripts.agents.restart_support")
     sessions = import_module('scripts.message.sessions')
-    pane_record = import_module("scripts.shutdown.pane_record")
+    pane_record = import_module("scripts.agents.pane_record")
 
 
 def setUpModule() -> None:

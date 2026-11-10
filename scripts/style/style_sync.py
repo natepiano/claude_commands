@@ -464,45 +464,45 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip)) as snapshot, signal_mask(signal.SIG_BLOCK):
-        directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent())))
-        try:
-            OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
-            with signal_mask(signal.SIG_UNBLOCK):
-                (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
-                intermediates = snapshot / "target/intermediates"
-                scratch.mark_cargo_cache(intermediates)
-                saved = subprocess.run(
-                    [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
-                    env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
-                    capture_output=True, text=True, check=False,
-                )
-                if saved.returncode:
-                    raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
-                returncode, output = verify_lint(directory)
-                print(output, end="")
-                # Build outputs are retained; only source changes invalidate coverage.
-                rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-                rewritten = rewritten or (snapshot / "target").is_symlink()
-                records = lint_records(output, snapshot)
-                for record in records:
-                    passed = record.passed and not rewritten
-                    diagnostic_file = directory / f"{record.tool}.json"
-                    _ = diagnostic_file.write_text(json.dumps(dict(record.diagnostics), sort_keys=True))
-                    recorded = subprocess.run([
-                        str(PYTHON), str(LEDGER), "lint-record", "--repo", str(repo), "--tip", tip,
-                        "--tool", record.tool, "--passed", str(int(passed)),
-                        "--diagnostics", str(diagnostic_file),
-                    ], capture_output=True, text=True, check=False)
-                    if recorded.returncode:
-                        raise Refusal(recorded.stderr.strip() or f"lint-record exited {recorded.returncode}")
-                if rewritten:
-                    print("style_sync: lint rewrote the checked tree; no successful coverage recorded")
-                return int(returncode != 0 or rewritten
-                           or not all(record.passed and not record.diagnostics for record in records))
-        finally:
-            _ = remove_lint_dir(Path(common_dir), directory)
+    with (stop_signals_raise(),
+          copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip)) as snapshot,
+          signal_mask(signal.SIG_BLOCK),
+          build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+              lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent()))) as directory):
+        OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
+        with signal_mask(signal.SIG_UNBLOCK):
+            (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
+            intermediates = snapshot / "target/intermediates"
+            retained_target = (snapshot / "target").resolve()
+            scratch.mark_cargo_cache(intermediates)
+            saved = subprocess.run(
+                [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
+                env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
+                capture_output=True, text=True, check=False,
+            )
+            if saved.returncode:
+                raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
+            returncode, output = verify_lint(directory)
+            print(output, end="")
+            # Build outputs are retained; only source changes invalidate coverage.
+            rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
+            rewritten = rewritten or (snapshot / "target").resolve() != retained_target
+            records = lint_records(output, snapshot)
+            for record in records:
+                passed = record.passed and not rewritten
+                diagnostic_file = directory / f"{record.tool}.json"
+                _ = diagnostic_file.write_text(json.dumps(dict(record.diagnostics), sort_keys=True))
+                recorded = subprocess.run([
+                    str(PYTHON), str(LEDGER), "lint-record", "--repo", str(repo), "--tip", tip,
+                    "--tool", record.tool, "--passed", str(int(passed)),
+                    "--diagnostics", str(diagnostic_file),
+                ], capture_output=True, text=True, check=False)
+                if recorded.returncode:
+                    raise Refusal(recorded.stderr.strip() or f"lint-record exited {recorded.returncode}")
+            if rewritten:
+                print("style_sync: lint rewrote the checked tree; no successful coverage recorded")
+            return int(returncode != 0 or rewritten
+                       or not all(record.passed and not record.diagnostics for record in records))
 
 
 def runner_value(action: str, name: str) -> str:

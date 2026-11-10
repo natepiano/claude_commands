@@ -594,7 +594,8 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
   Ticket ownership uses the fixed staff id.
   Commands resolve names within their production before calling the ledger.
   A unit rename changes no ticket or sync wait.
-  `board_json.py` joins ticket owners through staff and reads phase records through `phase_table.build_run`.
+  `unit_phases.py` reads staff worktrees for the style table.
+  The style table keeps its ticket, step, ETA, and findings columns.
 - Unit names need no family suffix or production prefix.
   Use staff for the worktree and `RowResolver.unit_branch` for the branch.
 - Every ledger row and `--rule` uses `Rule.rule_id`.

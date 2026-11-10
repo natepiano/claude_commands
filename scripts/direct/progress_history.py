@@ -40,7 +40,7 @@ from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import session_staff, staff, unit_config  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 from scripts.usage import agents_log  # noqa: E402
 
 
@@ -1650,11 +1650,7 @@ def _start_phase(args: argparse.Namespace) -> None:
         if director:
             active_root = os.environ.get("UNIT_ACTIVE_DIR")
             # A temporary run stays within its temporary root unless explicitly configured.
-            marker = unit_runs.marker(director, Path(active_root) if active_root else session_dir.parent / "active")
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
-            _ = temporary.write_text(f"{session_dir}\n", encoding="utf-8")
-            os.replace(temporary, marker)
+            unit_runs.activate(session_dir, director, Path(active_root) if active_root else session_dir.parent / "active")
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     active = _object_dict(state.get("phase"))
@@ -6577,6 +6573,7 @@ def _finish_run(args: argparse.Namespace) -> None:
         _finish_phase(finish_args)
         state = _read_state(session_dir)
     if _string(state.get("status")) != "active":
+        unit_runs.end(session_dir)
         return
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
@@ -6594,6 +6591,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
+    unit_runs.end(session_dir)
     _refresh_phase_table(session_dir)
 
 

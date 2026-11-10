@@ -45,7 +45,10 @@ The service removes the progress files when the reservation ends.
 
 The queue pane and the build page show each cloud gate in the main table.
 A running row shows machine `aws` and its vCPU count.
-The last column shows the state, module count, and failed modules.
+The queue pane's last column shows the state, module count, and failed modules.
+On the build page, a cloud row with a module counter draws the local rows' progress line.
+Small text under the line shows the module count and failed modules.
+The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
 The Head line shows `cloud N of M slots`.
@@ -1115,6 +1118,8 @@ Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and not
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
 Each scratch folder belongs to a task. The task's end removes its folders.
 `scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
+The DONE completion hook ends that task before pane closure. Other workers' folders remain.
 `scratch.py list` shows each folder's task and last change.
 The other commands are `adopt`, `hold`, `release`, `renew` and `end`.
 
@@ -1150,9 +1155,9 @@ The hold record stays in `~/.local/state/scratch/holds.json`.
 `end` removes the held folder unless a repository in it has uncommitted changes, a stash or commits absent from all remotes.
 The folder stays with its hold marked ended.
 
-A folder uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
+A folder made without `--worker` uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
 `--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
-Each folder holds `.scratch.json` with its task, maker session and times.
+Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
 
@@ -1221,13 +1226,28 @@ The message names the Mac when its disk is low.
 A current `sweep.disk_floor` text approval also permits one phone push per episode.
 The push names the machine and recommends one measured folder, or asks for measurements when folder sizes are unavailable.
 Each channel keeps its own receipt; a failed channel can retry without repeating the accepted delivery.
-A reading above the alert line plus `sweep_phone_rearm_gib` rearms both channels.
-Equality with that boundary does not rearm them.
-`config/lint.conf` sets the margin to 5 GiB beside `sweep_phone_floor_gib`.
-With the 150 GiB alert line, free space must exceed 155 GiB before a later crossing can send another alert.
+Every pass must read above the alert line plus `sweep_phone_rearm_gib` for `sweep_phone_rearm_minutes` before the crossing rearms.
+The crossing record keeps the first above-line time under the record lock.
+A reading at or below that boundary restarts the interval.
+`config/lint.conf` sets the margin to 5 GiB and the interval to 60 minutes.
+With the 150 GiB alert line, free space must stay above 155 GiB for 60 minutes.
+Rearm sends one `sweep.disk_floor_recovered` phone push after an accepted fall push.
+The return receipt and its stable key prevent accepted return delivery from repeating.
+A failed return delivery retries above the rearm line.
+A later fall starts a new episode even when the previous return receipt stays pending.
+At recovery, `disk_floor` retires every open crossing's `phone:<identity>` fall key on natedev, which owns the silence queue.
+This includes a crossing whose fall phone receipt stays pending.
+The Mac reaches this retirement through ssh natedev.
+If retirement drops a kept fall push, the fall never reached the user and no return push sends.
+The reported dropped count determines this result even when the retire command exits with an error.
+A retire attempt without a dropped count suppresses the return push in the saved crossing state.
+The next pass retries retirement; a completed retry closes that crossing without a return push.
+Only an accepted fall and a first retire result of zero dropped pushes permit a return push.
+An episode with a pending fall phone receipt gets no return push.
 The same rule applies to natedev and the Mac.
 While text approval is stale, the natedev message still sends and the phone receipt stays pending.
 The phone channel can send that pending episode after the showrunner records the new approval.
+The return text needs its own approval before delivery.
 
 Natedev also records cache sizes, growth and removal accounting. These reports stay outside the Mac path:
 
@@ -1458,12 +1478,16 @@ Only targets with our use stamp, mirror mark, or a registered copy ancestor are 
 Resolved paths must stay inside these roots. The scan does not follow directory symlinks.
 
 The sweep reads the local and natedev Mac claims under their existing admission locks.
-It keeps these locks until deletion ends. A live or kept claim protects its mirror.
+Each reader releases its admission lock before it returns a claim snapshot.
+The sweep holds acquired mirror leases through deletion.
+It reads claims again before each removal group outside those leases.
+A live or kept claim protects its mirror.
 For a marked target without a copy record, the claim check compares each existing claimed mirror path.
 A missing unrelated claimed mirror does not protect the target.
 Other claim read errors still protect the target.
 Remote mirror removal keeps its own lease exemption and still checks sibling leases.
-An unreadable claim reply or a lost lock process protects every target.
+An unreadable claim reply protects every target.
+The claim server prints its reply after it releases the admission lock.
 The Mac uses `lsof` for other process use. Unreadable process use protects every target.
 The sweep checks protection again before each target deletion.
 It takes only the shortfall, in the existing least recently used order.
@@ -1471,7 +1495,7 @@ The result line reports removed bytes, free bytes before and after, and skipped 
 `--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
 The nix-darwin `nate.jobs.disk-floor` job runs this same command every 120 seconds on the Mac.
 `modules/darwin/default.nix` imports the new `modules/darwin/disk-floor.nix` module.
-The job uses the mirror leases and claim locks above, plus the shared floor lock.
+The job uses mirror leases, short claim reads, and the shared floor lock.
 It trims only the shortfall below `sweep_floor_gib`, without an offload request.
 `ensure_mac_disk_floor()` keeps its 100 GiB on-demand trigger.
 
@@ -1488,6 +1512,12 @@ An inode counts once only when every hard link is inside that folder.
 An inode with a link outside the folder counts zero.
 The measurement does not follow directory symlinks.
 The alert lists these folders from largest to smallest.
+It lists only enough folders to cover the shortfall, up to `sweep_alert_folder_count`, which defaults to three.
+Held folder lines count toward this limit, but held bytes do not cover the shortfall.
+Zero-byte folders do not appear.
+Folder paths stay complete; home-relative paths may use `~`.
+When the session text exceeds its limit, the alert lists fewer folders and does not shorten their paths.
+If the full recommendation still exceeds the limit, the session text asks for measurements and names no folder.
 The floor pass carries held target paths separately from folders with no recorded evidence.
 Live process use, Mac claims, mirror leases, build holds, busy judgment locks, and held cargo locks identify held output.
 A folder that contains held output, lies inside held output, or equals held output gets the held label.
@@ -1710,3 +1740,8 @@ It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
 `record.py` stores `test_build_key` only when source stays unchanged during nextest.
 Rows without a key cannot prove a fresh build.
 The broader `BUILDLOG_TREE` field cannot replace this key.
+
+The merge gate and style lint own private folders through `build_folders.temporary_build_folder`.
+The contexts remove these folders after success or an exception.
+Style review keeps its input folder for the review worker and finish command.
+Session TMPDIRs and unit session folders remain for later session commands.

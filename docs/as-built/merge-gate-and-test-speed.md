@@ -331,14 +331,24 @@ A red nightly marker bypasses reuse only in a merge gate.
 An added or removed test folder changes the ledger suite set and prevents reuse of a pass with another suite set.
 
 **Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
-The base is the newest full record on this host with the complete suite set and a commit that is an ancestor of `HEAD`.
+The certified base is the newest full record on this host with the complete suite set and an ancestor of `HEAD`.
+Other candidates are the merge bases of `HEAD` and the origin refs in `landing_branches` in `config/merge_gate.conf`.
+These branches hold commits that passed a merge gate, which runs all modules.
+The selector uses the candidate with the fewest changed paths to `HEAD`.
+A tie keeps the certified base first, then the branch order in the config.
+The selector ignores missing refs and refs without a common ancestor.
+A landing candidate can replace a missing certified base.
 The changed set includes changes from the base to `HEAD`, plus dirty paths.
 A static Python graph selects a test module under four rules:
 
 1. The test module changed.
 2. The test module directly imports a changed Python file.
 3. The test module names a changed path as a complete token.
-4. The test module shares a folder with a changed Python source file that is not a test module.
+4. The test module shares a folder with a changed non-test Python file and names its stem as a whole word.
+
+The fourth rule counts names in imports, strings, and comments.
+Removed source files also count.
+The selector reads that text only when no earlier rule selects the module.
 
 Only test modules have graph rows. All Python paths can resolve imports.
 A removed Python file uses import facts from the base.
@@ -348,7 +358,7 @@ The cache holds imports and complete path tokens for each test-module blob.
 The current and base graphs share one cache read and one cache update.
 A warm selection reads base blobs only when the cache lacks their facts.
 Dirty sources never enter the cache or cause cache writes.
-A targeted test runs all modules only for `--full`, no certified base, or a graph error.
+A targeted test runs all modules only for `--full`, no base candidate, or a graph error.
 The nightly-red marker widens only a merge gate. It does not block targeted test reuse or selection.
 A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
@@ -635,6 +645,13 @@ The fast check uses no full merge gate or queue admission.
 `config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
 Imports of refused repository modules also refuse the fix, including indirect imports.
 
+`GitRunner` is the only place in `fast_track.py` that starts Git.
+It keeps successful reads of objects addressed by full hash for one `reconcile` pass.
+Reads of refs and ancestry stay fresh, because another process can move them.
+Snapshot ref writes and recovery ref deletes use one `update-ref --stdin` batch.
+`copies.refresh_remotes` fetches both mappings in one fetch.
+The change took `test_fast_track` from 7,158 to 6,433 Git processes and the copies tests from 497 to 319 fetches.
+
 A successful check creates a `fast-track(<unit>): <why>` commit with `Fast-Track: <unit>`.
 `main_push_lock` protects its fast-forward push.
 A moved main causes another application and check within `max_push_attempts`.
@@ -734,6 +751,9 @@ It preserves the caller's working directory, interpreter cache, version floor, a
 `module_run.py` and `fast_track.py` load tests by package name.
 The cloud guest bootstrap supplies its own root after a fresh clone.
 The Pillow analysis and Blender entries retain their foreign interpreters and explicit `PYTHONPATH`.
+
+`update_registration.state_block` imports `merged_checkpoints` in its body.
+This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
 
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
@@ -998,3 +1018,8 @@ Only the renewer's sleep may stop; inherited jobs must survive.
 Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swap disabled.
 `step_selection.py` must remain cheap because every target command imports it.
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
+
+The merge gate owns module folders through `temporary_build_folder` contexts.
+The contexts remove folders after success or an exception.
+Style lint uses the same context and keeps its standing Cargo target.
+Style review keeps its input folder because the review worker reads it after preparation exits.

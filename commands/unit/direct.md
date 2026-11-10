@@ -98,6 +98,7 @@ it:
 | <PhaseReservationContract/>, <RetainPhaseReservation/>, <CoordinatePhaseReservation/> | `docs/direct/phase_reservation.md` | — |
 | <VerificationContract/>, <VerificationNarration/> | `docs/direct/verification.md` | — |
 | <UXReview/>, <RunApplicationSmokeTest/> | `docs/direct/ux_review.md` | — |
+| <NoWorkerMode/> | `docs/direct/no_worker_mode.md` | — |
 | <WorkerLaunchFailure/> | `docs/direct/launch_failure.md` | — |
 | <AuthorizationContract/> | `docs/direct/authorization.md` | — |
 | <HeldAstraRoles/> | `docs/direct/held_astra_roles.md` | — |
@@ -125,7 +126,7 @@ The list uses `worker_panes.observe` for open, stopped, closed, unknown, and inc
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
-The worker command selects idle workers and resumes stopped workers in new panes.
+The worker command selects idle workers and resumes a stopped worker in its same pane.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
 Successful prompt delivery returns the launcher.
@@ -155,9 +156,9 @@ The completion hook closes a worker pane after DONE. Shutdown retains the worker
 Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
-Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An account move resumes an open or stopped worker on the new account in its same pane and closes no pane.
 An idle worker's next assign opens its conversation on the current role account.
-Assign, restore, and account moves resume a stopped worker in a new pane.
+A closed worker with no active dispatch has nothing to move. A worker that changes family opens a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
@@ -175,8 +176,8 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   removes each worktree it made when that work ends. In the home worktree, the
   only branch the run may create is the remote branch <PushCheckpoint/> pushes;
   never switch to an existing branch.
-- The unit director does not write implementation code unless the user explicitly
-  asks, except <FastTrack/>. Exceptions: agreed doc-only/trivial post-review fixes.
+- The unit director does not write implementation code unless the user explicitly asks.
+  Exceptions: <FastTrack/>, <NoWorkerMode/>, and agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
   <CheckpointCommit/> and one <ShrinkCommit/> per completed phase, plus the one
   <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
@@ -195,6 +196,15 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   settled by the plan. Do not expose sandbox flags, scripts, status files,
   ledger ids, or other tooling mechanics in user-facing reports.
 </CoreContract>
+
+<NoWorkerMode>
+A no-capacity broadcast turns this mode on until the workers-back notice arrives.
+A real worker launch or turn failure containing `hit your usage limit` also turns this mode on.
+That self-on mode lasts through the current phase; try a normal assign at the next phase start.
+A broadcast-on mode keeps its longer lifetime if both triggers occur.
+Send no assign while this mode is on.
+Read `~/.claude/docs/direct/no_worker_mode.md` in full when this mode turns on.
+</NoWorkerMode>
 
 <ProductionUnit>
 Your staff row identifies your unit and its parent showrunner.
@@ -285,6 +295,7 @@ under that directory. This avoids half-applied durable-state writes.
 
 - Run pane assignments in the foreground. They return after submission.
 - Run `verify.sh final` through its detached verification path.
+- Each folder or file you make on another machine (the Mac) needs automatic removal. Use a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`.
 - Saved run output (traces, captures, logs) stays under a few GB: read each run
   and delete it before the next. A disk-floor sweeper keeps 300 GiB free on `/`
   by deleting only the shortfall, least recently used build output first, never
@@ -306,7 +317,7 @@ Applies to implementation, test, fix, and review assignments.
 
 Submission does not finish a pass or release a held role.
 The hook records completion and runs the saved completion actions.
-It receives Codex `notify` or Claude `Stop` input from the launch line.
+It receives the Codex `Stop` event from `hooks.json` and the Claude `Stop` event from the launch line.
 No launcher shell waits for a worker.
 </DispatchContract>
 

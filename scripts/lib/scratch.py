@@ -6,6 +6,7 @@ them. Sessions run for weeks, so a session end is no cleanup point (user, 2026-1
 scratch folder belongs to a task, and the thing that ends the task removes it:
 
     scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]   make one; prints its path
+    scratch.py new --worker [--name <word>]   make a worker folder under TMPDIR; prints its path
     scratch.py adopt <path> [--task <task> | --until <when>] [--name <word>] [--visible]   move a loose folder in
     scratch.py hold <path> [--task <task> | --until <when>] --reason <why>   keep a folder where it is
     scratch.py release <path>    drop a hold
@@ -19,6 +20,7 @@ A task, and what ends it:
   * `run:<run id>`: end_session.sh, at the run's end;
   * `phase:<unit>/<phase>`: merge_checkpoint.py, when the phase's checkpoint merges;
   * `gate:<id>`: the gate's caller, with `scratch.py end`, when the gate ends;
+  * `gate:worker-<staff id>`: the worker's assignment; the worker close path ends it;
   * `landed:<unit>/<branch>`: the branch is in its recorded land target and all work is saved;
   * `row:<showrunner>-C<n>`: change_review.py verdict;
   * `until:<YYYY-MM-DDTHHMMZ>/<id>`: the hourly temporary sweep ends the task when its time passes.
@@ -28,6 +30,8 @@ A task, and what ends it:
     Old deadline tasks without an id remain valid.
 
 A folder lives in ROOT as `<task>-<word>-<suffix>`; scratch.conf suffix_length sets the suffix length.
+Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
+The holds record indexes their paths, so task removal does not scan TMPDIR.
 `--visible` (rows only) puts it in VISIBLE_ROOT
 as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds copy_record.RECORD with its task, maker and
 times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
@@ -78,7 +82,7 @@ from typing import TypedDict, cast
 from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
-from scripts.lib.build_folders import BuildFolderSpec, build_folder_path  # noqa: E402
+from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, inherited_temporary_parent  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
@@ -649,7 +653,51 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     path = target(task, word, visible, scratch_settings=scratch_settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.mkdir()
-    write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
+    try:
+        write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
+    except BaseException:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+    return path
+
+
+def worker_task(staff_id: str) -> str:
+    """Name the task that owns one worker's assignment folders."""
+    return f"gate:worker-{staff_id}"
+
+
+def new_worker(word: str = "", *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> Path:
+    """Create a private folder for the caller's worker assignment."""
+    from scripts.production import staff
+
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    record = staff.snapshot()
+    worker = record.by_current_session(staff.runtime_id())
+    if worker is None or worker.kind != "worker" or not isinstance(worker.parent, staff.ReportsTo):
+        raise ScratchError("--worker requires the caller's worker staff row")
+    unit = record.by_id(worker.parent.id)
+    if unit is None or unit.kind != "unit" or not isinstance(unit.parent, staff.ReportsTo):
+        raise ScratchError("--worker requires the worker's unit staff row")
+    showrunner = record.by_id(unit.parent.id)
+    if showrunner is None or showrunner.kind != "showrunner":
+        raise ScratchError("--worker requires the unit's showrunner staff row")
+    parts = (showrunner.name, unit.name, worker.name)
+    if any(not WORD.fullmatch(part) for part in (*parts, *([word] if word else []))):
+        raise ScratchError("--worker names must contain letters, digits, - and _")
+    parent = inherited_temporary_parent().resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    path = parent / "-".join((*parts, random_suffix(scratch_settings), *([word] if word else [])))
+    path.mkdir()
+    try:
+        task = worker_task(worker.id)
+        write_record(path, task, time.time(), throwaway=True, scratch_settings=scratch_settings)
+        _ = hold(path, task, "worker assignment folder", scratch_settings=scratch_settings)
+    except BaseException:
+        shutil.rmtree(path)
+        raise
     return path
 
 
@@ -907,7 +955,7 @@ def lifetime(path: Path, now: float | None = None, *,
 
 
 def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Folder]:
-    """Every recorded scratch folder, including interrupted removals, in both roots."""
+    """Read scratch roots and the recorded paths of worker folders."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     candidates: dict[Path, None] = {}
@@ -919,6 +967,8 @@ def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfi
         listed = {path for path in entries if path.is_dir()} | set(marked_folders(entries))
         candidates.update(dict.fromkeys(sorted(listed)))
     candidates.update(dict.fromkeys((*copy_paths(), *pending_copy_paths(copy_record.copies_root()))))
+    candidates.update(dict.fromkeys(Path(path) for path, held in holds(scratch_settings=scratch_settings).items()
+                                    if held["task"].startswith("gate:worker-")))
     found: list[Folder] = []
     for path in candidates:
         record = task_of(path, scratch_settings=scratch_settings) if not path.is_symlink() else copy_record.NotRegistered()
@@ -1163,6 +1213,18 @@ def write_holds(found: dict[str, Hold], *,
     _ = staged.replace(path)
 
 
+@contextmanager
+def locked_holds(*,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> Generator[dict[str, Hold]]:
+    """Keep concurrent task changes from replacing each other's folder records."""
+    path = holds_file(scratch_settings=scratch_settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield holds(scratch_settings=scratch_settings)
+
+
 def hold(path: Path, task: str, reason: str, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
@@ -1176,19 +1238,19 @@ def hold(path: Path, task: str, reason: str, now: float | None = None, *,
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     _ = checked_task(task, False)
-    found = holds(scratch_settings=scratch_settings)
-    found[os.path.realpath(path)] = Hold(task=task, maker=maker(), reason=reason.strip(), made=moment, ended=0.0)
-    write_holds(found, scratch_settings=scratch_settings)
+    with locked_holds(scratch_settings=scratch_settings) as found:
+        found[os.path.realpath(path)] = Hold(task=task, maker=maker(), reason=reason.strip(), made=moment, ended=0.0)
+        write_holds(found, scratch_settings=scratch_settings)
     return task
 
 
 def release(path: Path, *, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> bool:
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    found = holds(scratch_settings=scratch_settings)
-    if found.pop(os.path.realpath(path), None) is None:
-        return False
-    write_holds(found, scratch_settings=scratch_settings)
+    with locked_holds(scratch_settings=scratch_settings) as found:
+        if found.pop(os.path.realpath(path), None) is None:
+            return False
+        write_holds(found, scratch_settings=scratch_settings)
     return True
 
 
@@ -1271,48 +1333,48 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
             else:
                 remove_marked(folder.path, remove, scratch_settings=scratch_settings)
                 removed.append(folder.path)
-    found = holds(scratch_settings=scratch_settings)
-    changed = False
-    for path, record in list(found.items()):
-        if record["task"] != task or keep(Path(path)):
-            continue
-        changed = True
-        held = Path(path)
-        copies = Path(os.path.realpath(copy_record.copies_root()))
-        if copies.is_relative_to(held.resolve()) or held.parent == copies:
-            for copy in list(copy_paths()):
-                if copy.is_relative_to(held) and not keep(copy) and end_copy(copy, task, moment, require_task=False, scratch_settings=scratch_settings):
-                    removed.append(copy)
-            clear_finished_copy_removals(copies, scratch_settings=scratch_settings)
-            remove_empty_copy_pairs(copies)
-            # A container hold never takes recursive deletion through the copies root.
-            if held != copies and held.exists():
-                try:
-                    held.rmdir()
-                except OSError:
+    with locked_holds(scratch_settings=scratch_settings) as found:
+        changed = False
+        for path, record in list(found.items()):
+            if record["task"] != task or keep(Path(path)):
+                continue
+            changed = True
+            held = Path(path)
+            copies = Path(os.path.realpath(copy_record.copies_root()))
+            if copies.is_relative_to(held.resolve()) or held.parent == copies:
+                for copy in list(copy_paths()):
+                    if copy.is_relative_to(held) and not keep(copy) and end_copy(copy, task, moment, require_task=False, scratch_settings=scratch_settings):
+                        removed.append(copy)
+                clear_finished_copy_removals(copies, scratch_settings=scratch_settings)
+                remove_empty_copy_pairs(copies)
+                # A container hold never takes recursive deletion through the copies root.
+                if held != copies and held.exists():
+                    try:
+                        held.rmdir()
+                    except OSError:
+                        record["ended"] = moment
+                        continue
+                if held == copies and any(copy_paths()):
                     record["ended"] = moment
                     continue
-            if held == copies and any(copy_paths()):
+                del found[path]
+                continue
+            if os.path.lexists(held) and copy_record.copy_folder(held) is not None:
+                if end_copy(held, task, moment, scratch_settings=scratch_settings):
+                    removed.append(held)
+                    del found[path]
+                else:
+                    record["ended"] = moment
+                continue
+            if os.path.lexists(held) and unsaved_work(held, scratch_settings=scratch_settings) is not None:
                 record["ended"] = moment
                 continue
-            del found[path]
-            continue
-        if os.path.lexists(held) and copy_record.copy_folder(held) is not None:
-            if end_copy(held, task, moment, scratch_settings=scratch_settings):
+            if os.path.lexists(held):
+                remove_marked(held, remove, scratch_settings=scratch_settings)
                 removed.append(held)
-                del found[path]
-            else:
-                record["ended"] = moment
-            continue
-        if os.path.lexists(held) and unsaved_work(held, scratch_settings=scratch_settings) is not None:
-            record["ended"] = moment
-            continue
-        if os.path.lexists(held):
-            remove_marked(held, remove, scratch_settings=scratch_settings)
-            removed.append(held)
-        del found[path]
-    if changed:
-        write_holds(found, scratch_settings=scratch_settings)
+            del found[path]
+        if changed:
+            write_holds(found, scratch_settings=scratch_settings)
     return removed
 
 
@@ -1411,6 +1473,8 @@ def main(argv: list[str]) -> int:
         ends = command.add_mutually_exclusive_group()
         _ = ends.add_argument("--task", default="")
         _ = ends.add_argument("--until", default="")
+        if name == "new":
+            _ = ends.add_argument("--worker", action="store_true")
         if name == "hold":
             _ = command.add_argument("--reason", required=True)
         else:
@@ -1438,7 +1502,12 @@ def main(argv: list[str]) -> int:
                 clean_cargo_outputs(path, saved)
                 cargo_removal_mark(path).unlink(missing_ok=True)
         elif command == "new":
-            print(new(chosen_task(arguments), cast(str, arguments.name), cast(bool, arguments.visible), scratch_settings=scratch_settings))
+            if cast(bool, arguments.worker):
+                if cast(bool, arguments.visible):
+                    raise ScratchError("--worker does not take --visible")
+                print(new_worker(cast(str, arguments.name), scratch_settings=scratch_settings))
+            else:
+                print(new(chosen_task(arguments), cast(str, arguments.name), cast(bool, arguments.visible), scratch_settings=scratch_settings))
         elif command == "adopt":
             print(adopt(Path(cast(str, arguments.path)), chosen_task(arguments), cast(str, arguments.name),
                         cast(bool, arguments.visible), scratch_settings=scratch_settings))

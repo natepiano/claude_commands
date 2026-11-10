@@ -270,6 +270,11 @@ ENTRIES = (
             "free": "140.0 GiB", "floor": "150.0 GiB",
             "recommendation": "Review ~/old-output first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."})),
         purpose="A low-disk alert recommends one folder for natedev review."),
+    PushText("sweep.disk_floor_recovered", "disk_floor", "note", "{machine} disk space is back", NoActionNeeded(),
+        "{machine} has {free} free, above the {rearm} line. The next fall below {floor} sends one alert.",
+        (PushExample("natedev", {"machine": "natedev", "free": "156.0 GiB", "rearm": "155.0 GiB", "floor": "150.0 GiB"}),
+         PushExample("Mac", {"machine": "Mac", "free": "156.0 GiB", "rearm": "155.0 GiB", "floor": "150.0 GiB"})),
+        purpose="The disk stayed above the rearm line after a delivered low-space alert."),
     # Current disk-floor.nix: alertGib=150, build floor=300 GiB.
     PushText("nixos.disk_low", "disk_floor", "note", "Builds need more disk space",
         ActionTemplate("In a terminal on natedev, delete {shortfall} GiB of personal files you no longer need."),

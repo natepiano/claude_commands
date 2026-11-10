@@ -14,6 +14,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
 from scripts.production import merge_gate
+from scripts.copies import copies as copy_api
 from scripts.production.affected_modules import CertifiedBase, FullSuite
 from scripts.buildlog.store import host_name
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, gate_suites
@@ -257,13 +258,14 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertIn("hooks/test_first.py", message)
         self.assertNotIn(str(checkout), message)
 
-    def test_nightly_reuses_a_standing_checkout_and_marks_and_notifies_only_red(self) -> None:
+    def test_nightly_reuses_a_cache_and_marks_and_notifies_only_red(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
         self.write(self.checkout / "untracked.txt", "keep the caller's edits\n")
         before_head = self.git(self.checkout, "rev-parse", "HEAD")
         before_status = self.git(self.checkout, "status", "--porcelain")
         before_branches = self.git(self.checkout, "show-ref", "--heads")
         copies: list[Path] = []
+        caches: list[Path] = []
         marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
@@ -278,6 +280,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                     self.assertEqual(type_dirs, ["scripts"])
                     self.write(repo / "subject.txt", "only the copy changes\n")
                     copies.append(repo)
+                    caches.append((repo / "target").resolve())
                     return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", int(red), 0, "fixture"),), 0, 0)
 
                 output = io.StringIO()
@@ -291,8 +294,10 @@ class MergeGateLedgerTests(MergeGateFixture):
                 self.assertEqual(self.git(self.checkout, "status", "--porcelain"), before_status)
                 self.assertEqual(self.git(self.checkout, "show-ref", "--heads"), before_branches)
                 self.assertEqual((self.checkout / "subject.txt").read_text(), "base\n")
-                self.assertTrue(all((path / ".git").is_dir() for path in copies))
-                self.assertEqual(len(set(copies)), 1)
+                self.assertFalse(any(path.exists() for path in copies))
+                self.assertEqual(len(set(copies)), len(copies))
+                self.assertEqual(len(set(caches)), 1)
+                self.assertTrue(caches[0].is_dir())
                 if red:
                     record = cast(dict[str, object], json.loads(marker.read_text()))
                     self.assertEqual(record["tree"], self.git(self.checkout, "rev-parse", f"{self.checkpoint}^{{tree}}"))
@@ -308,9 +313,13 @@ class MergeGateLedgerTests(MergeGateFixture):
 
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
         observed: list[Path] = []
+        retained: list[Path] = []
 
         def suite_run(repo: Path, *_args: object, **_kwargs: object) -> merge_gate.GateRun:
             observed.append(repo)
+            retained.append((repo / "target").resolve().parent)
+            self.assertEqual(copy_api.read_record(repo).owner, "configured-nightly")
+            self.assertTrue((repo / ".git").is_dir())
             return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", 0, 0, "fixture"),), 0, 0)
 
         with (mock.patch.dict(os.environ, self.environment),
@@ -322,13 +331,15 @@ class MergeGateLedgerTests(MergeGateFixture):
             code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
         self.assertEqual(code, 0)
         checkout, = observed
-        self.assertEqual(checkout.name, "configured-nightly-gate")
-        self.assertTrue((checkout / ".git").is_dir())
+        self.assertEqual(checkout.name, "checkout")
+        self.assertFalse(checkout.exists())
+        self.assertEqual(retained[0].name, "configured-nightly-gate")
+        self.assertTrue((retained[0] / "target").is_dir())
 
     def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
         from scripts.production import showrunners, staff
         from scripts.production.staff_test_support import fixture_member
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         production = self.checkout / "quiet-production.md"
         self.write(production, "# Quiet production\n")
