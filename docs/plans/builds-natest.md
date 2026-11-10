@@ -2291,3 +2291,127 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - Bytecode work: compiling the whole tree costs 3.4 CPU s, and main-script compile across all starts costs 67.3 CPU s.
 - A preloaded Python start server: tests inspect real process trees, signals and process groups.
 - A test-only path in `verify.sh`: it breaks the one-way rule.
+
+### Phase 115 — Measurements show how much CPU each cheaper Python start saves, and which tests each breaks  · status: done
+
+#### As-built
+
+- This phase is research. No repository file changed for it, and no prototype landed.
+- Each start variant has an estimate: the paired per-start CPU difference of the top 20 commands, multiplied by the start counts of the baseline survey. The estimates cover startup, imports and compile for those 20 commands only.
+
+| Variant | CPU s saved per gate | At cloud factor 1.62 | New failures |
+| --- | ---: | ---: | --- |
+| Preloaded parent | 474.5 | 768.7 | 36 entries, 7 modules missing |
+| `-S` | not established | not established | 49, and two 1,800 s timeouts |
+| `-I` | 7.5 | 12.1 | 130 entries, 16 modules missing |
+| `-I -S` | 26.4 | 42.7 | 139 entries, 15 modules missing |
+| Warm bytecode | 19.1 (14.8 net) | 31.0 | 0 |
+| Thin entry scripts | 80.3 | 130.1 | 136 entries, 2 modules missing |
+| Delayed shared imports | 186.7 | 302.4 | 0, and 1 module incomplete |
+
+- A native survey of 740 of 744 modules records 4,975 CPU s. The interpreter alone costs 13.6 ms per start, 8.6 with `-S`, 12.6 with `-I` and 7.95 with both.
+- The routes that start Python: `lib/py` 22,281 execs, an absolute path, `sys.executable` or a shebang 11,885, Python on `PATH` 2,791, and other absolute paths 1,160.
+- One `progress_history.py` start costs 40 ms for standard-library imports, 140 ms for repository imports and 50.6 ms for main-script compile. Its large dependencies are `plan_history`, `session_staff` and `phase_reservation`.
+- The delayed-imports pilot used the standard-library `LazyLoader` over 309 production modules. It saved 100.5 CPU s across 58 matched passing modules, 1,610.1 to 1,509.6.
+
+**Files:**
+- `docs/plans/builds-natest.md` — this record
+
+**Binds later work:**
+- Delayed shared imports is the only variant that keeps tested behavior and has a large saving. It lands in the small form, with one start path for tests and real use.
+- `scripts/direct/test_review_launcher.py` timed out under the pilot, and its cause is not known.
+- The typing and thread behavior of the pilot's `LazyLoader` are not verified.
+
+**Gotchas:**
+- One whole-gate pair takes 45 minutes and about 10,000 CPU s.
+- The whole-gate confirmation of the preloaded parent stopped with SIGTERM twice, at 94 of 744 modules. The sender is not known.
+- `-S` runs need the startup hook. Without it, a pair shows hook failures, so its raw difference of 131 CPU s is not a saving.
+- One failure entry can be a module import failure and not one test.
+- A process name can hold invalid UTF-8 bytes, so a measurement tool must decode with replacement.
+
+**Ruled out:**
+- A preloaded parent: it breaks process ancestry, PID ownership, signals, process groups, startup hooks and pipe ownership.
+- `-S`, `-I`, `-I -S` and thin entry scripts: 49 to 139 new failures for 7 to 80 CPU s.
+- Warm bytecode: 14.8 CPU s net, which is too small to justify a preparation step.
+
+### Phase 116 — A targeted test run selects every test that reads a changed file as text  · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the builds showrunner, 2026-11-09: "Make targeted_test select tests that read a changed file as text, by one rule at the source."
+
+**Why:** `scripts/direct/test_verify_lint_output.py` reads `scripts/direct/verify.sh` as text and does not import it. The path lives in `scripts/direct/verify_lint_scope_test_support.py` as `Path(__file__).with_name("verify.sh")`. The targeted run did not select the test for a `verify.sh` change, so the rule failed only at the merge gate.
+
+**Goal:** a targeted run selects a test when the test, or a test-support module it imports, names the changed file, and a replay shows how many modules this adds per landing.
+
+**Spec:**
+
+1. In `select_affected` in `scripts/production/affected_modules.py`, replace the complete-path clause `graph.tokens.get(path, frozenset()) & changed` with one rule. A source names a changed file when one of these holds:
+   - A token of the source equals the file's whole path. This is the current behavior.
+   - A token of the source equals the file's base name, and the source sits in the file's folder, or a token of the source equals the name of the file's folder.
+2. The sources for a test module are the test module and each `*_test_support.py` module it reaches through imports, following only test-support modules. Use `graph.imports` and `graph.tokens`. Do not follow production modules: `test_indirect_path.py` in the existing test must stay unselected.
+3. The rule applies to every changed path, Python or not. A changed file at the repository root has no folder name, so only its whole path can match.
+4. Add no new source fact. `extract_facts`, `CACHE_FORMAT_VERSION` and `EXTRACTOR_VERSION` do not change. The selector parses no extra source and adds no Git process.
+5. Do not change the configuration rule. `config_reads` and `configs` stay as they are. A `.conf` token already selects its reader.
+6. Update the selection rules in `docs/as-built/merge-gate-and-test-speed.md`: rule 3 in the numbered list and the summary sentence near line 209.
+7. Replay. In a scratch folder, write a script that builds the graph once from the current tree. Take the last 20 first-parent merges on `origin/builds`, and take the changed paths of each merge from its first parent. For each merge, compute the selection under the old rule and under the new rule. Report the mean and the largest count of added modules per landing, and name the added modules of the largest case. Report also the result for the changed set `{scripts/direct/verify.sh}`: `direct/test_verify_lint_output.py` must be in it.
+8. Report, without a change, how many test modules find repository files by `.glob(`, `.rglob(`, `os.walk(` or `iterdir(` on a repository path. The new rule cannot see those. Name the count and the five largest by module CPU.
+
+**Files:**
+- `scripts/production/affected_modules.py` — the rule
+- `scripts/production/test_affected_modules.py` — new rows in the existing path-token test
+- `docs/as-built/merge-gate-and-test-speed.md` — the rule text
+
+**Workers:** 1 writer; the rule and its test rows are one small change
+- `impl` — all the files above
+
+**State:** none
+
+**Constraints from prior phases:** the selector reuses cached source facts for each blob, and `test_configuration_selection_reuses_all_source_facts` guards that. The user's question about config edits is open, so the config rule stays as it is. A fix adds rows to the existing test of the same behavior.
+
+**Acceptance gate:**
+- New rows in `test_complete_path_tokens_select_only_the_test_that_names_the_path` prove these cases: a test whose imported support module holds `Path(__file__).with_name("tool.sh")` in the file's folder is selected; a test in another folder that holds both tokens `component` and `tool.sh` is selected; a test in another folder that holds only `tool.sh` is not selected; `test_fragment.py` stays unselected.
+- `python3 -m unittest discover -s scripts/production -p 'test_affected_modules.py'` passes, and `test_targeted_test.py` and `scripts/aws_target/test_cloud_gate.py` pass.
+- `basedpyright scripts/production/affected_modules.py scripts/production/test_affected_modules.py` prints `0 errors, 0 warnings, 0 notes`.
+- The replay table and the glob count are in the final reply.
+
+### Phase 117 — Scripts and tests start faster because the heaviest shared imports load only when used  · status: todo
+
+**Depends on:** Phase 116
+
+#### Work Order
+
+**Source:** the builds showrunner, 2026-11-09: "Add-on 1 (delayed shared imports): next. Make it Phase 117 after 116, in the small form: 1. Change only the heaviest shared imports. 2. Resolve the test_review_launcher timeout first. 3. You are the one owner of the switch; tell each file owner before you change it. 4. Prove it with a whole-gate pair; find the SIGTERM source first, so the pair completes."
+
+**Why:** the startup measurements show that the interpreter costs 13.6 ms per start and that repository imports cost most of the rest. A `LazyLoader` prototype over 309 production modules saved an estimated 187 CPU s per gate, 302 s in the cloud, with no new failure and one module timeout. A smaller change in the heaviest imports can keep most of that saving.
+
+**Goal:** the heaviest shared imports load only when a caller uses them, and a completed whole-gate pair at the same load shows the CPU saved with no new failure.
+
+**Spec:**
+
+1. Find the SIGTERM source first. The whole-gate confirmation stopped with SIGTERM twice, at 94 of 744 modules. Use the saved evidence under the Phase 115 run folder, and capture the sender with a signal trace in one scratch run. Name the sender in the final reply. Change no behavior of the sender unless it is a natest tool.
+2. Resolve the timeout of `scripts/direct/test_review_launcher.py` under delayed imports. Name the cause. Fix it where it lives.
+3. Rank the shared imports by CPU per start times the survey count of starts. Use the Phase 115 survey for the counts, and `python3 -X importtime` for the costs. `plan_history`, `session_staff` and `phase_reservation` are the known large dependencies of `progress_history.py`. `verify` owns the `progress_history.py` route after its Phase 42e.
+4. Change only the imports at the top of the ranking, until the next import saves less than 5 CPU s per gate. Use a function-level import at the use, or one small helper if several sites share the need. There is one way to start a script: tests and real use take the same path.
+5. Tell the owning unit director and its showrunner before each file changes.
+6. Prove the change with one whole-gate pair, phase base against the change, at the same load, on the merge-gate module set. One pair costs about 45 minutes and 10,000 CPU s.
+
+**Files:**
+- `scripts/direct/progress_history.py` — heavy imports that the ranking names; the final list follows the ranking
+- `scripts/lib/` — one small helper, only if several sites need it
+
+**Workers:** 1 writer; the ranking, the changes and the proof depend on one another
+- `impl` — all the files the ranking names
+
+**State:** none
+
+**Constraints from prior phases:** interpreter flags, thin entries, the preloaded parent and warm bytecode are ruled out. A test-only start path will not land. Only named owners change their imports; natest is the owner of the switch and tells each file owner first.
+
+**Acceptance gate:**
+- The SIGTERM sender is named, and the whole-gate pair completes.
+- `direct/test_review_launcher.py` passes under the change.
+- The pair shows the CPU saved per gate and no new failure.
+- `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed file.
+- Each changed file's module tests pass.

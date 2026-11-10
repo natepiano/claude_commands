@@ -31,7 +31,8 @@ from scripts.style import coverage_report
 from scripts.style import style_ledger
 from scripts.style import style_proposals
 from scripts.style import unit_plans
-from scripts.style import add_style
+from scripts.style import add_style, style_config
+from scripts.style.ledger_test_support import write_style_units
 from scripts.style import approved_renames
 from scripts.style import style_rules
 from scripts.production import footer_counts
@@ -823,7 +824,9 @@ class StyleProposalsTests(unittest.TestCase):
     def test_an_approved_style_decision_leaves_the_footer_count(self) -> None:
         # The staff row owns the document.
         doc = self.repo / ".git/decision-review.md"
-        _ = doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** main\n- **Proposals:** {self.proposals}\n", encoding="utf-8")
+        _ = doc.write_text(f"# Style\n- **Kind:** style\n- **Branch point:** main\n- **Proposals:** {self.proposals}\n"
+                           + f"- **Merge branch:** style/main\n- **Showrunner checkout:** {self.repo}\n", encoding="utf-8")
+        write_style_units(doc)
         owner = proposal_issue.staff_reference("sample-style", "showrunner")
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         with self.ledger() as ledger:
@@ -869,18 +872,23 @@ class StyleProposalsTests(unittest.TestCase):
 
     always: str = "global:rust/always.md"
 
-    def standing_units(self, *families: str) -> None:
+    def standing_units(self, *families: str, unit_name: str = "", kind: str = "style") -> None:
         """A standing style production with a live unit of each family in staff, and the always approved rule."""
         _ = (self.catalog / "always.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\napproval: always\n---\n# Rule\n")
-        doc = self.root / "sample-style/docs/sample-style-production.md"
-        doc.parent.mkdir(parents=True)
-        _ = doc.write_text("# Style\n")
+        actor = "sample-style" if kind == "style" else "cargo-liner"
+        doc = self.root / f"{actor}/docs/{actor}-production.md"
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        _ = doc.write_text(f"# Style\n- **Kind:** {kind}\n- **Merge branch:** style/main\n"
+                           + f"- **Branch point:** main\n- **Showrunner checkout:** {self.repo}\n")
+        assignments = (style_config.StyleUnitAssignment(unit_name, add_style.FAMILIES),) if unit_name else tuple(
+            style_config.StyleUnitAssignment(f"sample-style-{family}", (family,)) for family in add_style.FAMILIES)
+        write_style_units(doc, assignments)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         for family in families:
-            _ = recorded_unit("sample-style", f"sample-style-{family}", self.root / family, doc,
+            _ = recorded_unit(actor, unit_name or f"sample-style-{family}", self.root / actor / family, doc,
                               plan=f"docs/style-production/units/{family}-unit.md")
-        standing = add_style.StandingStyleProduction(self.repo, "sample-style", doc.parent.parent, doc, "main")
-        _ = self.enterContext(mock.patch.object(style_proposals, "standing_style_production", return_value=standing))
+        standing = add_style.StandingStyleProduction(self.repo, actor, doc.parent.parent, doc, "main")
+        _ = self.enterContext(mock.patch.object(style_proposals, "configured_style_production", return_value=standing))
         _ = self.enterContext(mock.patch.object(style_proposals, "unit_file_holders", return_value={}))
         scopes: dict[str, unit_plans.PilotScope] = {family: unit_plans.AllCrates() for family in families}
         _ = self.enterContext(mock.patch.object(style_proposals, "family_pilot_scopes", return_value=scopes))
@@ -1069,6 +1077,24 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertIn(f"approved {issue}: rule {self.always} is always approved", lines)
             self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
             self.assertEqual(self.waiting(), [])
+
+    def test_combined_owner_uses_the_route_actor_for_approval_and_proposer(self) -> None:
+        for kind, actor in (("style", "sample-style"), ("product", "cargo-liner")):
+            with self.subTest(kind=kind):
+                self.standing_units("names", unit_name="cargo-liner-style", kind=kind)
+                with self.ledger() as ledger:
+                    _ = self.hold(ledger, rule=self.always, line=1 if kind == "style" else 2)
+                    result, _ = self.file_lines(ledger)
+                    issue, = result.filed
+                    fields = frontmatter(issue)
+                    owner = proposal_issue.staff_reference(f"{actor}/cargo-liner-style", "unit").id
+                    self.assertEqual(fields["unit"], [owner])
+                    self.assertEqual(fields["approved_in"], [proposal_issue.staff_reference(actor, "showrunner").id])
+                    self.assertEqual(fields["proposed_by"], [proposal_issue.staff_reference(actor, "showrunner").id])
+                    doc = self.root / f"{actor}/docs/{actor}-production.md"
+                    self.assertEqual(set(style_proposals.family_units(doc).values()), {owner})
+                    self.assertEqual(set(style_proposals.family_units(doc)), set(add_style.FAMILIES))
+                    issue.unlink()
 
     def test_a_rule_without_approval_files_a_decision_that_waits_for_the_user(self) -> None:
         self.standing_units("names")
@@ -1995,9 +2021,10 @@ class StyleProposalsTests(unittest.TestCase):
             def record(path: Path, text: str) -> None:
                 written.append(path)
                 original(path, text)
-            with (mock.patch.object(style_proposals, "standing_style_production", return_value=standing),
+            with (mock.patch.object(style_proposals, "configured_style_production", return_value=standing),
                   mock.patch.object(style_proposals, "unit_file_holders", return_value=holders),
                   mock.patch.object(style_proposals, "family_pilot_scopes", return_value={}),
+                  mock.patch.object(style_proposals, "family_units", return_value={}),
                   mock.patch.object(proposal_issue, "write_issue", side_effect=record)):
                 with redirect_stdout(io.StringIO()):
                     style_proposals.migrate(ledger, self.proposals, "parent")
@@ -2420,8 +2447,9 @@ class StyleProposalsTests(unittest.TestCase):
                                                       self.root / "sample-style/docs/production.md", "main")
         with self.ledger() as ledger:
             finding = self.hold(ledger)
-            with (mock.patch.object(style_proposals, "standing_style_production", return_value=standing),
+            with (mock.patch.object(style_proposals, "configured_style_production", return_value=standing),
                   mock.patch.object(style_proposals, "family_pilot_scopes", return_value={}),
+                  mock.patch.object(style_proposals, "family_units", return_value={}),
                   mock.patch.object(style_proposals, "unit_file_holders", return_value={"product": frozenset({finding.path})}) as holders):
                 issue = self.file(ledger)[0]
                 holders.assert_called_once_with(self.repo, standing.doc, ledger)

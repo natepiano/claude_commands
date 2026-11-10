@@ -14,7 +14,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable, Mapping, MutableMapping
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import cached_property
 from multiprocessing.connection import Connection
@@ -30,7 +30,7 @@ from scripts.copies.remote_test_support import local_remote_transport
 from scripts.herdr import herdr, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.lib import process_group, atomic_file, conf
+from scripts.lib import process_group, process_start, atomic_file, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
@@ -724,24 +724,98 @@ class RetireUnitTests(unittest.TestCase):
         child = self.orphan_child(DIRECTOR)
         self.claude = []
         unit = shutdown.retirement_find_unit("alpha", "alpha")
-        with (mock.patch.object(process_group, "send_process_group") as send,
-              mock.patch.object(shutdown, "retirement_alive", return_value=False)):
-            self.assertEqual(shutdown.retirement_stop_orphan(unit, child.pid, DIRECTOR, settings=conf.read("production")), [])
-        send.assert_called_once_with(child.pid, signal.SIGTERM)
-        self.assertIsNone(child.poll(), "the test patches the signal; the child still runs")
+        settings = conf.read("production")
+        for platform, ps_status in (("linux", 0), ("darwin", 0), ("darwin", 1)):
+            with self.subTest(platform=platform, ps_status=ps_status), ExitStack() as reads:
+                if platform == "darwin":
+                    _ = reads.enter_context(mock.patch.object(sys, "platform", platform))
+                    _ = reads.enter_context(mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError(2, "No such file or directory", "/proc/TEST/environ")))
+                    _ = reads.enter_context(mock.patch.object(Path, "read_text", side_effect=FileNotFoundError(2, "No such file or directory", "/proc/TEST/stat")))
+                    _ = reads.enter_context(mock.patch.object(pane_record, "process_parent", return_value=123))
+                    _ = reads.enter_context(mock.patch.object(herdr, "darwin_process_environment", return_value={"CLAUDE_CODE_SESSION_ID": DIRECTOR}))
+                    _ = reads.enter_context(mock.patch.object(shutdown, "retirement_proc_start", return_value="TEST-start"))
+                    _ = reads.enter_context(mock.patch.object(shutdown, "retirement_run", return_value=subprocess.CompletedProcess(
+                        ["ps"], ps_status, f"{child.pid}\n", "TEST-incomplete process list" if ps_status else "")))
+                    _ = reads.enter_context(mock.patch.object(unit_move, "processes_inside", return_value=[child.pid]))
+                    _ = reads.enter_context(mock.patch.object(process_start, "process_start", return_value=process_start.Started("TEST-start")))
+                with (mock.patch.object(process_group, "send_process_group") as send,
+                      mock.patch.object(shutdown, "retirement_alive", return_value=False)):
+                    left = shutdown.retirement_stop_orphan(unit, child.pid, DIRECTOR, settings=settings)
+                if ps_status:
+                    send.assert_not_called()
+                    self.assertEqual(len(left), 1, left)
+                    self.assertIn(f"unowned process {child.pid}", left[0])
+                    self.assertIn("ps -axo pid=: TEST-incomplete process list", left[0])
+                else:
+                    self.assertEqual(left, [])
+                    send.assert_called_once_with(child.pid, signal.SIGTERM)
+                self.assertIsNone(child.poll(), "the test patches the signal; the child still runs")
 
     def test_unowned_or_live_sessions_process_is_named_and_never_signalled(self) -> None:
         unit = shutdown.retirement_find_unit("alpha", "alpha")
-        for session_id, live_owner in ((SEAT, False), (DIRECTOR, True)):
-            with self.subTest(session_id=session_id, live_owner=live_owner):
-                child = self.orphan_child(session_id)
-                self.claude = [session(DIRECTOR, "alpha", 4101)] if live_owner else []
-                with mock.patch.object(process_group, "send_process_group") as send:
-                    left = shutdown.retirement_stop_orphan(unit, child.pid, DIRECTOR, settings=conf.read("production"))
-                send.assert_not_called()
-                self.assertEqual(len(left), 1, left)
-                for detail in (f"unowned process {child.pid}, parent ", "command ", "start ", str(self.worktree)):
-                    self.assertIn(detail, left[0])
+        settings = conf.read("production")
+        for platform in ("linux", "darwin"):
+            for session_id, live_owner in ((SEAT, False), (DIRECTOR, True)):
+                with self.subTest(platform=platform, session_id=session_id, live_owner=live_owner), ExitStack() as reads:
+                    child = self.orphan_child(session_id)
+                    self.claude = [session(DIRECTOR, "alpha", 4101)] if live_owner else []
+                    if platform == "darwin":
+                        _ = reads.enter_context(mock.patch.object(sys, "platform", platform))
+                        _ = reads.enter_context(mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError(2, "No such file or directory", "/proc/TEST/environ")))
+                        _ = reads.enter_context(mock.patch.object(Path, "read_text", side_effect=FileNotFoundError(2, "No such file or directory", "/proc/TEST/stat")))
+                        _ = reads.enter_context(mock.patch.object(pane_record, "process_parent", return_value=123))
+                        _ = reads.enter_context(mock.patch.object(herdr, "darwin_process_environment", return_value={"CLAUDE_CODE_SESSION_ID": session_id}))
+                        _ = reads.enter_context(mock.patch.object(shutdown, "retirement_proc_start", return_value="TEST-start"))
+                        _ = reads.enter_context(mock.patch.object(shutdown, "retirement_run", return_value=subprocess.CompletedProcess(
+                            ["ps"], 0, "TEST-shell\n", "")))
+                    with mock.patch.object(process_group, "send_process_group") as send:
+                        left = shutdown.retirement_stop_orphan(unit, child.pid, DIRECTOR, settings=settings)
+                    send.assert_not_called()
+                    self.assertEqual(len(left), 1, left)
+                    for detail in (f"unowned process {child.pid}, parent ", "command ", "start ", str(self.worktree)):
+                        self.assertIn(detail, left[0])
+                    if platform == "darwin":
+                        self.assertNotIn("Errno 2", left[0])
+                        self.assertIn("parent 123, command TEST-shell, start TEST-start", left[0])
+                        self.assertEqual(shutdown.retirement_process_session(child.pid), session_id)
+                        self.assertEqual(shutdown.retirement_command_name(child.pid), "TEST-shell")
+
+        for at_shell, pane in ((True, "w1:p1"), (False, "w1:p1"), (True, "w1:p3")):
+            with self.subTest(at_shell=at_shell, pane=pane):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    row = case.move_to_other_machine()
+                    case.pane_world.add(row, "w1:p1", live=False)
+                    if pane != "w1:p1":
+                        case.pane_world.add(row, pane, live=False, label="TEST-visitor")
+                    shell = pane_record.pane_shell_pid(HerdrPlace("agents", pane))
+                    closes = at_shell and pane == "w1:p1"
+                    if not at_shell:
+                        case.pane_world.activate("TEST-visitor", "w1:p1", "claude")
+                    def inside(worktree: Path) -> list[int]:
+                        case.assertEqual(worktree, case.worktree)
+                        return [shell] if pane in case.pane_world.locations else []
+                    with (mock.patch.object(unit_move, "processes_inside", side_effect=inside),
+                          mock.patch.object(shutdown, "retirement_process_session", return_value=""),
+                          mock.patch.object(shutdown, "retirement_proc_start", return_value="TEST-start"),
+                          mock.patch.object(process_group, "send_process_group") as send):
+                        code, output = case.retire()
+                    send.assert_not_called()
+                    case.assertEqual(case.pane_world.signals, [])
+                    case.assertEqual(code, 0 if closes else 1, output)
+                    case.assertEqual(case.pane_world.closed, [("w1:p1", "terminal-w1:p1")] if closes else [])
+                    if closes:
+                        case.assertNotIn("anomaly:", output)
+                        case.assertFalse(case.worktree.exists())
+                        case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                    else:
+                        case.assertIn(f"unowned process {shell}", output)
+                        case.assertIn("refused: live holds or processes remain", output)
+                        case.assertTrue(case.worktree.is_dir())
+                        case.assertEqual(staff.by_id(row.id), row)
+                finally:
+                    case.doCleanups()
 
     def test_orphan_start_time_change_before_signal_refuses_without_sending(self) -> None:
         child = self.orphan_child(DIRECTOR)

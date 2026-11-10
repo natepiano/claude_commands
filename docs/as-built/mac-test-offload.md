@@ -280,6 +280,12 @@ Declined, lost, and invalid results return the step to its waiting state.
   The runner prints `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`.
   Nextest exit 4 becomes `NoTestMatchedOnMac` and runner exit 75.
   The runner prints `mac_test: no test matched on the Mac; running on natedev instead`.
+- **Abandoned compiler sessions.** Before a Mac build, the step removes old abandoned compiler sessions and their locks from its mirror target.
+  `abandoned_session_minutes` sets the minimum age.
+  The bounded walk skips `deps`, `build`, `.fingerprint`, and `examples`.
+  It preserves recent sessions and finished sessions.
+  An explicit `--target-dir` skips this removal.
+  A missing target or a failed removal does not stop the build.
 - **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
 - **Markers.** Output streams as it arrives. `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
 - `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.

@@ -18,7 +18,8 @@ from collections.abc import Generator
 from unittest import mock
 
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, ticket_owner_id, write_style_units
+from scripts.style.style_config import StyleUnitAssignment
 
 from scripts.style import approved_renames
 from scripts.style import style_footprint
@@ -238,6 +239,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = parent.write_text(self.production("main", self.repo, ""))
         self.doc.parent.mkdir(parents=True)
         _ = self.doc.write_text(self.production("style/main", self.style, str(parent)))
+        self.style_units()
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
         self.plan.parent.mkdir(parents=True)
         _ = self.plan.write_text(self.plan_header())
@@ -250,6 +252,16 @@ class StylePlanFixture(unittest.TestCase):
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
             "- **Log:** docs/log.md", "- **Branch point:** main", "- **Kind:** style", "",
         ])
+
+    def style_units(self, assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> None:
+        """Write assignments and create staff rows for any specified unit names."""
+        owner = recorded_showrunner("sample-style", self.doc, "sample")
+        for assignment in assignments:
+            members = staff.initial_snapshot().find(kind="unit", parent=owner.id)
+            if not any(row.name == assignment.unit for row in members):
+                _ = fixture_member("unit", name=assignment.unit, parent=owner.id,
+                    worktree=staff.RemovedWorktree("natedev", self.root / ("unused-" + assignment.unit)))
+        write_style_units(self.doc, assignments)
 
     def unit_plan_config(self, worktree: Path, plan_name: str) -> None:
         """Name the unit's standing plan file in its `.unit.toml`."""
