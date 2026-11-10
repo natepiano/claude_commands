@@ -950,6 +950,9 @@ class ProcessController:
                         print(line, end="", flush=True)
                     cleanup = CleanupUnconfirmed()
                     continue
+                if marker.startswith("mac_trim="):
+                    print(line, end="", flush=True)
+                    continue
                 if marker.startswith("mac_cleanup="):
                     cleanup = parse_cleanup(marker.removeprefix("mac_cleanup="))
                     continue
@@ -1806,6 +1809,46 @@ def expected_instance_generation(target: str) -> str:
     return instance_generation(state_directory(target))
 
 
+def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
+    """Trim the mirror budget before the run releases its lease."""
+    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
+        return "echo mac_cleanup=skipped"
+    budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    program = (
+        'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
+        'config = conf.read("lint"); '
+        'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
+        'config.number(sweep.RECENT_KEY)))'
+    )
+    floor = shlex.quote(f"{config.free_floor_gib:g}")
+    return (
+        f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
+        + 'trim_started=$(date +%s); '
+        + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
+        + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
+        + 'trim_status=0; else trim_status=$?; fi; '
+        + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
+        + f'if trim_size=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + 'trim_size=${trim_size%%[[:space:]]*}; '
+        + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
+        + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
+        + 'else over_budget=unknown; fi; '
+        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
+        + '"$trim_status" "$trim_elapsed" "$over_budget"; '
+        + 'if free_gib=$(df -g "$HOME"); then '
+        + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
+        + 'else free_gib=; fi; '
+        + f'if awk -v free="$free_gib" -v floor={floor} '
+        + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
+        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+        + f'if rm -rf -- "$HOME"/{target}; then '
+        + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
+        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+    )
+
+
 def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
@@ -1840,22 +1883,8 @@ def remote_test_command(
     custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
-    elif custom_target:
-        cleanup_command = "echo mac_cleanup=skipped"
     else:
-        floor = shlex.quote(f"{config.free_floor_gib:g}")
-        cleanup_command = (
-            'if free_gib=$(df -g "$HOME"); then '
-            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-            + 'else free_gib=; fi; '
-            + f'if awk -v free="$free_gib" -v floor={floor} '
-            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
-            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + f'if rm -rf -- "$HOME"/{target}; then '
-            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
-        )
+        cleanup_command = remote_cleanup_command(config, request, repository)
     abandoned_sessions = ""
     if not custom_target:
         abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
@@ -2284,6 +2313,14 @@ def claimed_run(
         if not linux:
             linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
+        if not linux and isinstance(request.fetch, FetchFolder):
+            cleanup = controller.stream_mac_run([
+                *ssh_prefix(config),
+                copies.remote_use_command(request_mirror(config, request, repository),
+                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
+            ])
+            remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
+                                                          else CleanupUnconfirmed()))
         seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,

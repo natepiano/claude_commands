@@ -553,9 +553,8 @@ phase's gates pass. Follow its order through the next turn boundary.
 <PrepareSession>
 Run `bash ~/.claude/scripts/direct/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
-creates the run-active marker; every exit must
-eventually run `end_session.sh`
-through <RunSummary/> or single-mode completion.
+records the open run in the director's staff row.
+Run `end_session.sh` through <RunSummary/> or single-mode completion for every exit.
 
 When the plan header carries a `> **Issues:**` line, mark each issue it names
 as being built:

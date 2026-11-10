@@ -21,11 +21,11 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/production/unit_status.sh` | The showrunner's per-unit status script; prints `TICKS FAILING (…)`. |
 
 
-| `scripts/direct/prepare_session.sh` | Run start: writes the run-active marker, then creates the instance. |
+| `scripts/direct/prepare_session.sh` | Run start: records the run in the director's staff row. |
 
-| `scripts/direct/end_session.sh` | Attempts run cleanup, then removes each run's recorded mark through `unit_runs.end`. |
+| `scripts/direct/end_session.sh` | Attempts run cleanup, then clears each matching run pointer through `staff.py clear-run`. |
 
-| `scripts/hooks/direct_run.py` | `check` CLI: the unit instance's check. Also a library the worker hooks import. |
+| `scripts/hooks/direct_run.py` | Supplies the open run and current work to worker hooks. |
 
 | `scripts/direct/progress_history.py` | `progress` restarts the unit's instance on every call, refused ones included, and names its next tick in the report's clock line. |
 
@@ -123,9 +123,10 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 
 `production_check.sh <staff id>` reads the document through the showrunner's staff row. It reads `Status: PRODUCTION — <word>` and exits 0 for `running`, 2 for `wrapped`, or 1 otherwise. A missing document or status line also exits 1. For a running production, the check first runs `log_backup.py <staff id>` with the same argument. That command keeps dated copies of the production's LOG; see LOG backups in `docs/as-built/showrunner-automation.md`. A failed copy prints to stderr and does not change the check's exit code.
 
-`direct_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/unit/active/<id>` (or `/tmp/claude/delegate/active/<id>` for a run started before the folder rename) is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight includes a worker's `*_status*` file with `running`, `implementing`, or `reviewing`.
-The reader checks the run directory and each phase directory.
-It also checks `progress_history_state.json` for an active activity.
+`direct_run.active_run(session_id)` reads the director's open run from staff.
+It returns no run when the row has no pointer or the run has no recent writes.
+`running_work()` identifies work in progress.
+Worker status values `running`, `implementing`, and `reviewing` indicate work in progress.
 
 ### Hold and restarting the clock
 
@@ -158,7 +159,11 @@ A unit run has no notifier instance (user, 2026-10-19). `/unit:report` runs only
 - `/showrunner:report_interval [minutes]` edits the doc's `**Updates:**` line and the `every N minutes` text in `PROMPT_FILE`, runs `notifier.sh interval UPDATES <minutes>`, commits the doc, logs the old and new interval, and tells the user the next tick in `ZONE` and UTC. No argument reports status only.
 ### TICKS FAILING
 
-For each unit with a live Claude, `unit_status.sh` takes its session id from `unit_lookup.py list` (column 6), reads the marker `<session id>` from `UNIT_ACTIVE_DIR` when set, else the first of `/tmp/claude/unit/active` and `/tmp/claude/delegate/active` that holds one, and, whenever the marker names a session directory, runs `zsh notifier.sh health <instance>` (`unit-<run id>`, or `worker-<run id>` for a directory under `/tmp/claude/delegate/`; run id = that directory's basename), idle or working. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
+`unit_status.sh` reads each unit's open run from its staff row.
+It runs `zsh notifier.sh health <instance>` when the unit has a live session and a recorded run.
+The instance is `unit-<run id>`, or `delegate-<run id>` for a run under the former root.
+Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`.
+A row without a run produces no health check.
 
 ## Invariants
 
@@ -184,16 +189,16 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 
 - Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`) (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Nothing is called "delegate" (user, 2026-10-20): the directories are `scripts/direct/` and `docs/direct/`, the config is `config/direct.conf`, the variables are `UNIT_*`, the hook module is `scripts/hooks/direct_run.py`, a run's directory is the "unit session directory" (the session-start hook prints `Unit session directory:`), and the agent that receives the work is a "worker". Stored data moves to new names: the history folder is `~/.local/state/unit-history` and the run archive `usage-model/unit-archive` once `unit_runs.py move-history` moves them on each machine; the buildlog field is `unit_session`, renamed in the log files on their next index read; findings record `--caught-by worker`. Until then, and for records already written, these readers keep the old word: the `plan-delegate` and `delegate-archive` folder names, the `plan-delegate` skill in old events, the `delegate_session` field rename, `--caught-by delegate` (accepted and stored as `worker`, and counted in old history), the `delegate.` task names in the history ledger, a phase's `delegated_phase_reservation_state.json`, `/tmp/claude/delegate` and the `delegate-` notifier prefix. The last three go with the old run folder. Two more keep it for good: the old command name `/unit:delegate`, which the model study and the roles audit match in old transcripts and text, and the dated review `docs/direct_footprint_review.md`. The check: `git grep -niwE 'delegates?' -- scripts commands docs ':!docs/plans'`; any hit outside that list breaks the rule.
 
-- **Run folders and marks.** Current runs use `/tmp/claude/unit/<run id>/` and `/tmp/claude/unit/active/<session id>`.
-  `scripts/lib/unit_runs.py` retains the supported `delegate` root fallback for earlier runs.
-  `activate` records the mark path in the run's `active_marker` file. `end` removes it only while it still names that run.
-  A sibling `active.lock` serializes mark publication and removal. No unit notifier instance is created or removed.
-  `unit_runs.py removal-check` must prove that no running session owns a former-root mark before the fallback can be removed.
+- **Run folders and staff.** Current runs use `/tmp/claude/unit/<run id>/`.
+  `scripts/lib/unit_runs.py` reads the former `delegate` root for earlier run folders.
+  The director's staff row stores the open run in `run`.
+  `prepare_session.sh` sets the pointer.
+  `end_session.sh` clears the pointer only while it still names that run.
 
 - `prepare_session.sh`'s last line is `Session ready at <dir>`; the `next_due=` or `notifier instance not created:` line comes before it.
 
-- `end_session.sh` attempts role, worker, and scratch cleanup before it calls `unit_runs.end` for each selected run.
-  A failed cleanup step does not prevent mark removal. The script reports the step and returns nonzero.
+- `end_session.sh` attempts role, worker, and scratch cleanup before it clears each selected run pointer.
+  A failed cleanup step does not prevent pointer cleanup. The script reports the step and returns nonzero.
   `copies.py remove` can keep a busy copy without failing the end step.
 
 - `progress` restarts the instance before it reads state or can refuse, so every call, refused ones included, restarts the clock. The restart never fails a report; any failure falls back.
@@ -210,7 +215,7 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 
 - **Interval cost.** Each report costs the unit director about 40 s of generation. Keep the interval at or above the median review, about 5 minutes.
 - **Showrunner interval.** 15 minutes when the doc has no `**Updates:**` line.
-- **On demand (user, 2026-10-10).** A doc whose `**Updates:**` line reads `on demand` gets a stopped `showrunner-<staff id>` instance: `register` (`update_schedule` → `UpdatesOnDemand`) runs `new` at the default 15 minutes, then `stop`, and prints `on demand: no scheduled dailies`. The staff row records the showrunner. The stopped instance preserves the update schedule. A stopped instance never fires, a conversation pause records only enabled instances, and `/shutdown` restarts only the instances it stopped itself. `new` keeps an existing instance's state, so `/showrunner:report_interval` turning an on-demand doc back to `every N minutes` runs `register` and then `start`. `dailies_input.py` runs no `status` or `restart` and leaves `next_run` out, so the footer reads `no dailies scheduled`. `UNIT_PROGRESS_UPDATES=on-demand` in `direct.conf` puts units on demand: `unit_notifier.sh` with no mode makes no `unit-<run id>` (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains) and prints `progress updates on demand: …`, which `prepare_session.sh` passes on; `on` makes the instance when there is none. The repo's `direct.conf` went back to `scheduled` the same day, hourly.
+- **On demand (user, 2026-10-10).** A doc whose `**Updates:**` line reads `on demand` gets a stopped `showrunner-<staff id>` instance: `register` (`update_schedule` → `UpdatesOnDemand`) runs `new` at the default 15 minutes, then `stop`, and prints `on demand: no scheduled dailies`. The staff row records the showrunner. The stopped instance preserves the update schedule. A stopped instance never fires, a conversation pause records only enabled instances, and `/shutdown` restarts only the instances it stopped itself. `new` keeps an existing instance's state, so `/showrunner:report_interval` turning an on-demand doc back to `every N minutes` runs `register` and then `start`. `dailies_input.py` runs no `status` or `restart` and leaves `next_run` out, so the footer reads `no dailies scheduled`. `UNIT_PROGRESS_UPDATES=on-demand` in `direct.conf` puts units on demand: `unit_notifier.sh` with no mode makes no `unit-<run id>` and prints `progress updates on demand: …`, which `prepare_session.sh` passes on; `on` makes the instance when there is none. The repo's `direct.conf` went back to `scheduled` the same day, hourly.
 - **Quiet by default (user, 2026-10-13).** New productions get no timer unless asked; unit runs get none at all since 2026-10-19. A doc with no `**Updates:**` line is on demand too; only `every N minutes` schedules. Until 2026-10-18 `register` also turned a new production's reply footer off; the footer is gone (user: "i want footers gone for good"). `direct.conf` ships `on-demand`, and `unit_notifier.sh` reads a missing line as `on-demand`. An on-demand start that finds the run's instance runs `new` on it, which retargets it and keeps its clock and `ENABLED` (until 2026-10-13 it stopped the instance), so existing runs keep what they have. Unit directors have no reply footer.
 - **Timing.** `next_due` is a whole minute; the tick that sends it lands within about 15 s after. On natedev a slow tick pushes the next one back (the interval counts from the end of the run); on the Mac an overlapping tick finds `.tick.lock` held and exits at once.
 - **A skip uses its slot.** An idle unit, a missing session or a hold skips the whole interval, not 15 s.
@@ -218,8 +223,9 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 - **Health window.** `.last_tick` older than 120 s means the job is not running; `health` reports it even for a stopped instance.
 - **Inherited identities.** A worker can inherit its director's `CLAUDE_CODE_SESSION_ID`.
   Run preparation and cleanup select `CODEX_THREAD_ID` first, like `staff.runtime_id()`. Tests use fresh identities and fixture run roots.
-- **`UNIT_ACTIVE_DIR`.** Run preparation and cleanup use this override for fixture marks.
-  Without an override, readers support the current `unit` root and the retained `delegate` root.
+- **Run ownership.** The director's staff row stores the open run path.
+  Tests use `STAFF_FILE` and private run roots.
+  Run folders can remain under the current `unit` root or the former `delegate` root.
 - **`progress` cost.** Every `progress` call, refused ones included, spawns one zsh for the restart, even for a run with no instance. Because the restart comes before any refusal, a call that exits with `No active phase to report` or a missing cap stage still moves the next tick one interval out.
 - **`fire`** moves the clock and skips the hold, but a failing check or a missing session still skips it.
 
@@ -255,24 +261,24 @@ Production registration creates the showrunner update and the run-only
 stall-watch job. Session names come from herdr; there is no name-refresh job.
 Existing retired jobs are removed by their production's showrunner.
 
-### Other sessions' run markers (2026-10-29)
+### Open runs in staff
 
-`unit_runs.marker_must_stay(path)` protects another session's marker. It uses the
-marker filename as the session id and delegates to
-`scripts/message/sessions.py:session_liveness`, which reads the session registry
-and checks the saved process identity (or an older record's socket). A live
-session or unknown liveness keeps the marker, regardless of its age or whether
-its run folder still exists. Tests redirect that registry with
-`NOTIFIER_SESSIONS_DIR` or patch the shared liveness observation.
+`StaffRow.run` holds `OpenRun(path)` or `NoRun`.
+`unit_runs.open_run(session_id)` reads the row for the current session.
+Readers use this pointer without an age check or a session liveness check.
 
-`unit_runs.py removal-check` does not offer the former `delegate` folder for
-removal while any marker has a live or unknown owner, including owners absent
-from the initial running-session listing. Confirmed-gone owners retain the
-previous behavior. The automatic temp sweep already retains both `active/`
-directories and every marker in them; the folder audit excludes the run roots.
+The automatic temp sweep retains run folders named by staff rows.
+It also retains runs with workers that have not ended.
+The removed mark folders have no special protection.
 
-A session's own lifecycle is separate. `finish-run` and `end_session.sh` call `unit_runs.end` to remove the run's recorded mark.
-A repeated finish also attempts removal. `prepare_session.sh` calls `unit_runs.activate` to publish its new mark and remove its former mark. This prevents an obsolete former
-marker from pointing the mover at an old run. `direct_run.active_run` still uses
-its unchanged 12-hour run-content age rule for the hook's own session; that rule
-controls turn continuation and does not authorize deletion.
+The staff JSON key `run` holds the path string. An absent key reads as `NoRun`.
+
+`prepare_session.sh` publishes the pointer through `staff.py set-run`.
+A session with no staff row prints one line and continues. An unreadable staff record stops the script.
+`progress_history.py start-run` and its reopen path publish the pointer before they write the `active` status.
+A rerun after a failed write therefore publishes the pointer.
+`finish-run` and `end_session.sh` clear matching pointers for every staff row kind.
+A repeated finish also attempts to clear matching pointers.
+An old run cannot clear a pointer that names a newer run.
+`direct_run.active_run` keeps its 12-hour rule for recent writes in the run folder.
+That rule controls turn continuation and does not permit deletion.

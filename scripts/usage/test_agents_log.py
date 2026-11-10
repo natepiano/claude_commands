@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
-import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -64,6 +62,16 @@ class AgentsLogTests(unittest.TestCase):
         return [cast("dict[str, object]", json.loads(line))
                 for line in self.log_path.read_text(encoding="utf-8").splitlines()]
 
+    def director_run(self, label: str, run: Path) -> None:
+        identity = staff.native_id(fixture_runtime_id(label))
+        row = staff.StaffRow(identity, "showrunner", label, staff.StaffRoot(),
+                             current_session=identity, run=staff.OpenRun(run))
+        path = self.root / "staff.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        rows = cast(list[object], fields["rows"])
+        rows.append(row.to_json())
+        _ = path.write_text(json.dumps(fields))
+
     def backfill_fixture(self) -> tuple[Path, Path]:
         rows: list[staff.StaffRow] = []
         for identity, role in ((ARCHIVED_THREAD, "review"), (LIVE_THREAD, "test"),
@@ -97,13 +105,7 @@ class AgentsLogTests(unittest.TestCase):
         _ = (live_run / "mesh_roster.json").write_text(json.dumps({
             "project-impl": {"staff_id": LIVE_THREAD, "status": "done"},
         }), encoding="utf-8")
-        active = live / "active"
-        active.mkdir()
-        _ = (active / "director-session").write_text(f"{live_run}\n", encoding="utf-8")
-        # active/ is metadata, never another run to scan.
-        _ = (active / "mesh_roster.json").write_text(json.dumps({
-            "fake": {"thread_id": "not-a-run", "role": "impl"},
-        }), encoding="utf-8")
+        self.director_run("director-session", live_run)
         return archive, live
 
     def test_rerun_assignment_survives_cli_append_and_show(self) -> None:
@@ -543,34 +545,6 @@ for index in range(20):
         self.assertTrue(all(record["role"] == "worker" for record in records))
         self.assertEqual(agents_log.assignments(self.log_path).problems, ())
 
-    def test_backfill_recovers_director_when_staff_is_unreadable(self) -> None:
-        staff_file = self.root / "staff.json"
-        _ = staff_file.write_bytes(b"\xff")
-        live = self.root / "live"
-        run = live / "run"
-        run.mkdir(parents=True)
-        active = live / "active"
-        active.mkdir()
-        marker = active / "director-session"
-        _ = marker.write_text(f"{run}\n", encoding="utf-8")
-        os.utime(marker, (AT.timestamp(), AT.timestamp()))
-        errors = io.StringIO()
-
-        with patch.dict(os.environ, {"STAFF_FILE": str(staff_file)}), \
-                patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as snapshot, \
-                redirect_stderr(errors):
-            added = agents_log.backfill(self.root / "archive", live)
-
-        snapshot.assert_called_once_with()
-        self.assertEqual(added, 1)
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn(str(staff_file), errors.getvalue())
-        log = agents_log.assignments(self.log_path)
-        self.assertEqual(log.problems, ())
-        self.assertEqual(log.assignments, {
-            "director-session": (agents_log.Assignment(AT, "director", None, True),),
-        })
-
     def test_backfill_reads_runs_and_directors_under_both_run_folder_names(self) -> None:
         archive, live = self.backfill_fixture()
         former = self.root / "former"
@@ -579,16 +553,15 @@ for index in range(20):
         _ = (former_run / "mesh_roster.json").write_text(json.dumps({
             "project-fix": {"staff_id": FORMER_THREAD, "status": "done"},
         }), encoding="utf-8")
-        (former / "active").mkdir()
-        _ = (former / "active" / "former-director").write_text(f"{former_run}\n", encoding="utf-8")
+        self.director_run("former-director", former_run)
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live), "--live", str(former))
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         log = agents_log.assignments(self.log_path)
         self.assertEqual(log.assignments[FORMER_THREAD][0].role, "fix")
-        self.assertEqual(log.assignments["former-director"][0].role, "director")
-        self.assertEqual(log.assignments["director-session"][0].role, "director")
+        self.assertEqual(log.assignments[fixture_runtime_id("former-director")][0].role, "director")
+        self.assertEqual(log.assignments[fixture_runtime_id("director-session")][0].role, "director")
 
     def test_remote_role_reader_loads_without_a_worker_checkout(self) -> None:
         program = """import sys, types
@@ -642,14 +615,14 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
 
     def test_backfill_skips_worker_and_director_ids_with_exact_history(self) -> None:
         archive, live = self.backfill_fixture()
-        for agent_id in (LIVE_THREAD, "director-session"):
+        for agent_id in (LIVE_THREAD, fixture_runtime_id("director-session")):
             agents_log.append(agent_id, "showrunner", None, AT)
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         log = agents_log.assignments(self.log_path)
-        for agent_id in (LIVE_THREAD, "director-session"):
+        for agent_id in (LIVE_THREAD, fixture_runtime_id("director-session")):
             self.assertEqual(log.assignments[agent_id], (
                 agents_log.Assignment(AT, "showrunner", None, False),
             ))
@@ -735,7 +708,7 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         log = agents_log.assignments(self.log_path)
         self.assertEqual(len(log.problems), 1)
         self.assertEqual(set(log.assignments), {
-            "exact-thread", ARCHIVED_THREAD, LIVE_THREAD, "director-session",
+            "exact-thread", ARCHIVED_THREAD, LIVE_THREAD, fixture_runtime_id("director-session"),
         })
         self.assertEqual(len(log.assignments[ARCHIVED_THREAD]), 1)
         before = self.log_path.read_bytes()

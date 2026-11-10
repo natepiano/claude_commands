@@ -858,7 +858,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.sleeps = 0
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "BUILD_TARGETS_POLL_S": "0.01",
             "BUILDLOG_HOLD_WAIT_FILE": str(self.root / "wait-seconds"),

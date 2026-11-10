@@ -29,7 +29,6 @@ from urllib.parse import quote
 
 
 from scripts.build_hold import override_guard
-from scripts.mac_test import offload
 from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import (
     CiSwitch as CiSwitch,
@@ -88,11 +87,11 @@ from scripts.lib import process_start as process_identity
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
-from scripts.buildlog import sync as buildlog_sync
 
 if TYPE_CHECKING:
     from scripts.build_hold import build_hold
     from scripts.build_queue.placement import SubmittingSession
+    from scripts.mac_test import offload
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -323,10 +322,14 @@ class CliArguments(argparse.Namespace):
 
 
 def config_path(target: str = "") -> Path:
+    from scripts.mac_test import offload
+
     return offload.configured_ssh_target(target).settings if target else conf.path("mac_test")
 
 
 def read_config(target: str = "") -> MacTestConfig:
+    from scripts.mac_test import offload
+
     settings = config_path(target)
     config = conf.read(settings)
     values = config.values()
@@ -622,6 +625,8 @@ def copy_gives_way(run: RunRecord) -> bool:
 
 def claim_scope(worktree: str) -> ClaimScope:
     """The repository a claim covers: the one its worktree is in, else the whole Mac."""
+    from scripts.mac_test import offload
+
     repository = offload.repository_identity(Path(worktree))
     if isinstance(repository, offload.KnownRepository):
         return RepositoryScope(repository.name, repository.key)
@@ -629,6 +634,8 @@ def claim_scope(worktree: str) -> ClaimScope:
 
 
 def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
+    from scripts.mac_test import offload
+
     if isinstance(scope, RepositoryScope):
         key = offload.KnownRepository(scope.name, scope.key).path_key if scope.key else quote(scope.name, safe="")
         suffix = f".slot-{scope.slot}" if scope.slot else ""
@@ -653,6 +660,8 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
+    from scripts.mac_test import offload
+
     return paths.affinity / f"{offload.KnownRepository(scope.name, scope.key).path_key}.json"
 
 
@@ -1270,6 +1279,8 @@ def start_claim_watcher(paths: StatePaths) -> None:
 
 def mac_activity_script() -> str:
     """Count the user's mirror work and build executables without sending signals."""
+    from scripts.mac_test import offload
+
     return offload.mirror_selector_script(offload.ALL_MIRRORS) + r'''
 mirror_pids=$(select_leftovers) || exit 1
 process_records=$(ps -axww -o pid=,uid=,comm=) || exit 1
@@ -1297,6 +1308,8 @@ printf 'active=%s\nwork=%s\nrc=0\n' "$active_count" "$work_count"
 
 
 def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
+    from scripts.buildlog import sync as buildlog_sync
+
     arguments = ["ssh", "-o", "BatchMode=yes", "-o",
                  f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script()]
     try:
@@ -1350,6 +1363,8 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     user's Mac work, since a build process cannot be traced to a repository,
     so a claim is idle only while the Mac runs nothing at all.
     """
+    from scripts.buildlog import sync as buildlog_sync
+
     with locked(paths.lock):
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
     if not claims:
@@ -1379,6 +1394,8 @@ def watch_claim(
     paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
 ) -> bool:
     """Apply one activity answer to one claim; return whether it is still watched."""
+    from scripts.buildlog import sync as buildlog_sync
+
     run = claim.record
     with locked(paths.lock):
         current = read_run(claim.path)
@@ -1726,6 +1743,8 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
 
 def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
     """Bind new AWS work without changing retained claim evidence."""
+    from scripts.mac_test import offload
+
     if target_config.is_aws_target(offload.configured_ssh_target(paths.target)):
         generation = offload.expected_instance_generation(paths.target)
         if generation:
@@ -1919,6 +1938,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
 def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
                        session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
     """Reserve a slot for a live local wait without starting remote work."""
+    from scripts.mac_test import offload
+
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = offload.read_config(settings)
     if isinstance(offload.mac_step_eligibility(config, Path(args.repo_root), args.package,
@@ -2009,6 +2030,7 @@ def free_now(
     claim gives way to a new test, so it holds the scope only for another copy
     (`copy`).
     """
+    from scripts.mac_test import offload
     from scripts.buildlog import repository
 
     if not offload.read_config(settings).enabled:
@@ -2051,6 +2073,8 @@ def free_now(
 
 
 def command_free_now(args: CliArguments, paths: StatePaths) -> int:
+    from scripts.mac_test import offload
+
     settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
     if not args.settings and args.target:
         settings = config_path(args.target)
@@ -2279,6 +2303,8 @@ def print_switch_without_block(config: MacTestConfig) -> None:
 
 
 def command_status(paths: StatePaths, config: MacTestConfig) -> int:
+    from scripts.mac_test import offload
+
     with locked(paths.control_lock):
         outcome = full_settle(paths, config)
         lift_failure = outcome.expired_block_lift_failure
@@ -2335,6 +2361,8 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
 
 def command_target_status(paths: StatePaths) -> int:
     """Show recorded target state without locks, probes or cleanup."""
+    from scripts.mac_test import offload
+
     try:
         block = read_claim_block(paths)
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
@@ -2504,6 +2532,8 @@ class StoppedInstanceEvidence:
 
 
 def release_host(paths: StatePaths, generation: str) -> str:
+    from scripts.mac_test import offload
+
     configured = offload.configured_ssh_target(paths.target)
     if not target_config.is_aws_target(configured) or not generation:
         raise StateReadError('instance evidence cannot release these claims')

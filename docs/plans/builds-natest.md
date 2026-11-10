@@ -1638,12 +1638,12 @@ The verify hold and token wait fixtures keep every run root inside the test root
 
 - A test reads the mirrors that the claim reply carries.
 - `test_claim_server_keeps_a_second_admission_waiting_until_release` shows that a second admission waits while the lock is held.
-- `RemoteEntryTests.setUp` sets `UNIT_ACTIVE_DIR` inside the test root before `warm_claim_servers()`, so admission reads no live active marker.
+- `RemoteEntryTests.setUp` sets a private `STAFF_FILE` inside the test root before `warm_claim_servers()`, so admission reads no live run pointer.
 
 **Files:**
 - `scripts/copies/test_review_remote_copies.py` — the module
 
-**Gotchas:** an inherited `UNIT_RUN_DIR` moves the active folder outside the test root unless `UNIT_ACTIVE_DIR` is set.
+**Gotchas:** without a private `STAFF_FILE`, admission reads the live staff record and its run pointers.
 
 **Ruled out:** a CPU claim; the before and after samples ran under different loads.
 
@@ -2351,47 +2351,21 @@ Replay over the last 20 first-parent merges on `origin/builds`, one graph from t
 
 **Ruled out:** following production modules for names, because `test_indirect_path.py` must stay unselected; a new source fact or cache version.
 
-### Phase 117 — Scripts and tests start faster because the heaviest shared imports load only when used  · status: todo
+### Phase 117 — Scripts and tests start faster because the heaviest shared imports load only when used  · status: done
 
-**Depends on:** Phase 116
+#### As-built
 
-#### Work Order
-
-**Source:** the builds showrunner, 2026-11-09: "Add-on 1 (delayed shared imports): next. Make it Phase 117 after 116, in the small form: 1. Change only the heaviest shared imports. 2. Resolve the test_review_launcher timeout first. 3. You are the one owner of the switch; tell each file owner before you change it. 4. Prove it with a whole-gate pair; find the SIGTERM source first, so the pair completes."
-
-**Why:** the startup measurements show that the interpreter costs 13.6 ms per start and that repository imports cost most of the rest. A `LazyLoader` prototype over 309 production modules saved an estimated 187 CPU s per gate, 302 s in the cloud, with no new failure and one module timeout. A smaller change in the heaviest imports can keep most of that saving.
-
-**Goal:** the heaviest shared imports load only when a caller uses them, and a completed whole-gate pair at the same load shows the CPU saved with no new failure.
-
-**Spec:**
-
-1. Find the SIGTERM source first. The whole-gate confirmation stopped with SIGTERM twice, at 94 of 744 modules. The run folders of Phase 115 no longer exist, and they held no signal trace. Recreate the pilot in one scratch folder with `tools/prepare.py` and its retained helpers from the evidence root, and capture the sender with a signal trace. Name the sender in the reply. Change no behavior of the sender unless it is a natest tool.
-2. Reproduce the timeout of `scripts/direct/test_review_launcher.py` under delayed imports before any production import changes. Name the cause. Fix it where it lives.
-3. Rank the shared imports by removable CPU. `python3 -X importtime` reports elapsed time, so use it only to identify dependencies. Measure the removable process CPU of each candidate in paired command runs, and multiply the difference by the start count in `survey.json`. Calculate each candidate again after each earlier change, because shared import costs overlap: `plan_history.py` already imports `session_staff.py`. `plan_history`, `session_staff` and `phase_reservation` are the known large dependencies of `progress_history.py`. `verify` owns the `progress_history.py` route after its Phase 42e.
-4. Change only the imports at the top of the ranking, until the next import saves less than 5 CPU s per gate. Use a function-level import at the use, or one small helper if several sites share the need. There is one way to start a script: tests and real use take the same path.
-5. Name each file to change, its owner and any added repair file in a first reply, after items 1 to 3 and before any production edit. The director tells the owning unit director and its showrunner, then sends the go.
-6. Prove the change with one whole-gate pair, phase base against the change, at the same load, on the merge-gate module set. One pair costs about 45 minutes and 10,000 CPU s. Keep the revisions, load, filesystem roots, bytecode conditions, signal evidence and complete results outside the disposable copies.
+Four shared imports load at the function that uses them: `unit_lookup` in `read_production` of `scripts/direct/phase_table.py`, `findings` in `_review_trial` of `scripts/direct/progress_history.py`, and `offload` and `buildlog.sync` in each function of `scripts/mac_test/mac_test.py` that uses them. `mac_test.py` keeps `offload` under `TYPE_CHECKING` for its annotations. A whole-gate pair at the same load, phase base against the change, measured 5161.3 to 5122.7 CPU s: 38.7 CPU s saved per gate, above a modeled noise of 26.6 s. Both sides ran 746 modules and 18,556 tests with no missing result and no signal stop.
 
 **Files:**
-- `scripts/direct/phase_table.py` — delayed `unit_lookup` import; owner devtools-unit
-- `scripts/direct/progress_history.py` — delayed `findings` import; owner verify-unit
-- `scripts/mac_test/mac_test.py` — delayed `offload` and `buildlog.sync` imports; owner verify-unit
-- `scripts/copies/test_review_remote_copies.py` — the patch target of `offload` moves with the delayed import
+- `scripts/direct/phase_table.py` — delayed `unit_lookup` import
+- `scripts/direct/progress_history.py` — delayed `findings` import
+- `scripts/mac_test/mac_test.py` — delayed `offload` and `buildlog.sync` imports
+- `scripts/copies/test_review_remote_copies.py` — patches `scripts.mac_test.offload`, the package import target
 
-**Workers:** 1 writer; the ranking, the changes and the proof depend on one another
-- `impl` — all the files the ranking names
+**Gotchas:** A test that patches a delayed import patches the package attribute, not the old module-level name. Shared import costs overlap, so a ranking by single-import CPU overstates the saving by about half. Readiness-deadline tests can error under whole-gate load on either side of a pair. The SIGTERM that stopped earlier whole-gate runs came from the user systemd manager, through the preloaded design's scope cleanup.
 
-**State:** none
-
-**Constraints from prior phases:** interpreter flags, thin entries, the preloaded parent and warm bytecode are ruled out. A test-only start path will not land. Only named owners change their imports; natest is the owner of the switch and tells each file owner first. Evidence root: the Phase 115 session folder holds `survey.json`, `per_start.csv`, `weight_audit.json`, `result.md` and `tools/`. A targeted run also selects each test whose text or test-support modules name a changed file.
-
-**Acceptance gate:**
-- The SIGTERM sender is named, and the whole-gate pair completes.
-- `direct/test_review_launcher.py` passes under the change.
-- Every discovered module completes on both sides of the pair, with matching test identities and outcomes.
-- The pair shows the CPU saved per gate and no new failure. A missing result, a timeout, a signal stop or a new skip counts as no saving.
-- `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed file.
-- Each changed file's module tests pass.
+**Ruled out:** a repair for the `test_review_launcher.py` timeout, because it did not reproduce; deferral of imports below 5 CPU s per gate.
 
 ### Phase 118 — The test_times report tests pass on every date  · status: done
 
@@ -2405,3 +2379,45 @@ Replay over the last 20 first-parent merges on `origin/builds`, one graph from t
 **Gotchas:** A patch of `show.datetime` in the parent does not reach a child process; every child report needs `TEST_REPORT_EPOCH`. A fixed fixture date with the seven-day `TOP_MAX_AGE_DAYS` window fails seven days after that date when the clock is real.
 
 **Ruled out:** fast track for this file, because it refuses Python files that import `scripts/production/staff.py`.
+
+### Phase 119 — A targeted test with no selected module ends at once and starts no cloud box  · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the builds showrunner, 2026-11-10: "a targeted test with no changed paths selected 0 modules (gate d2f28b, builds-resources e442a075f) and still launched a 32-CPU cloud box that ran nothing. Make a targeted test with an empty selection return at once, before any route to a box. Fix it where the selection is made, one rule. If the route call is in queue's code, tell queue the line. Send me the hash."
+
+**Why:** `run_gate_suites` in `scripts/production/merge_gate.py` calls `cloud_gate.route` before any selection. `cloud_gate.prepare` then makes its own copy of the targeted selection, and `run_service` starts a box for an empty module list. The local path in `run_suites` holds a second copy of the same selection.
+
+**Goal:** a targeted test selects its modules once, before the cloud route, and an empty selection returns a passed run with no box, no reservation and no bundle.
+
+**Spec:**
+
+1. One function in `merge_gate.py` makes the targeted selection: the tested tree, the passed-tree ledger, `select_affected` and `report_selection`. `run_suites` and the cloud path both use it. Remove the copy in `cloud_gate.prepare`.
+2. `run_gate_suites` makes the selection before `cloud.route` when the mode is `SuiteMode.TARGETED_TEST` and `full` is false.
+3. When that selection is an `AffectedSelection` with no modules, `run_gate_suites` returns `GateRun((), 0.0, 0.0, selection_certified=True)` at once. Requested type directories still run locally, as they do after a cloud run. Only a selection with no affected test passes this way. A requested type directory that does not exist stays an error. A targeted test takes no package name and no filter.
+4. A non-empty selection goes to the route as `SelectedModules`, and `prepare` uses those paths. The selection runs once per targeted test.
+5. The cloud route keeps its local fallback. A fallback run uses the same selected modules.
+6. A merge gate and `--full` keep the full suite and the current route.
+7. Add rows to the existing tests. Do not add a new test module.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the one selection function, the empty return before the route; owner devtools-unit (sdlc)
+- `scripts/aws_target/cloud_gate.py` — `prepare` and `route` take the selected modules; owner builds-aws (builds)
+- `scripts/production/test_merge_gate_suites.py` — rows: an empty targeted selection calls no route; a non-empty selection reaches the route once
+- `scripts/aws_target/test_cloud_gate.py` — rows: `prepare` uses the given modules and selects nothing itself
+
+**Workers:** 1 writer; the selection function and its two callers depend on one another
+- `impl` — all files
+
+**State:** none
+
+**Constraints from prior phases:** a targeted run also selects each test whose text or test-support modules name a changed file. There is one way to start a script; a test-only path will not land. Tests use no live state and no live unit.
+
+**Acceptance gate:**
+- A targeted test with no changed path prints the selection, ends with exit 0 and starts no cloud box.
+- `select_affected` runs once per targeted test.
+- The module tests of each changed file pass.
+- `basedpyright` reports 0 errors, 0 warnings, 0 notes for each changed file.
+- A targeted test on the change passes.

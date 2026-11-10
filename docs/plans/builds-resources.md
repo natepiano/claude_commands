@@ -2143,3 +2143,20 @@ With the Mac state folder present, `eligible` loads no `sweep` or `copies` modul
 **Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
 
 **Ruled out:** a comparison of unpaired start-cost runs.
+
+### Phase 99 — The Mac mirror target keeps its size bound, and the floor offers only build output  · status: done
+
+#### As-built
+
+Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<repo>` (else `mac_budget_gib`). The trim runs `sweep.sweep_workspace()` on the Mac, in the foreground, under the mirror lease. A fetch run trims after `fetch_folder()`, in a second ssh call. The run prints `mac_trim=status=<exit> elapsed_seconds=<s> over_budget=yes|no|unknown`, and `stream_mac_run()` keeps that line and the run status. The free-space floor (a full target remove below `free_floor_gib`) runs after every trim, whatever its status. The disk floor offers a folder only when it is Cargo output (an output root or `is_cargo_target()`) and holds no `Cargo.toml` and no `.git`.
+
+**Files:**
+- `scripts/mac_test/offload.py` — `remote_cleanup_command()`, its use in `remote_test_command()` and `claimed_run()`, the `mac_trim=` branch in `stream_mac_run()`.
+- `scripts/mac_test/test_offload_cleanup.py` — trim, over-budget and failed-trim rows, in sh and zsh.
+- `scripts/mac_test/test_offload_forward.py` — byte-equal command and fetch order rows.
+- `scripts/lint/sweep.py` — the `folder_choices()` candidate rule.
+- `scripts/lint/test_sweep.py` — checkout rows for both machines.
+
+**Gotchas:** `sweep()` exits 0 when unmatched output stays over budget, so read `over_budget=` in the trim line, not the status. `LINT_SKIP_SWEEP=1` stays, because a background sweep can outlive the run and its lease. `is_cargo_target()` keeps its meaning; the checkout exclusion lives only in `folder_choices()`.
+
+**Ruled out:** a full target remove when the trim leaves the target over budget, because it empties the warm cache; `sweep.py --target-dir` as the Mac entry, because `main()` also runs the host floor by hostname.

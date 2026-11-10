@@ -223,19 +223,19 @@ def _run_assignments(run: Path, membership: staff.StaffSnapshot) -> Iterator[tup
         _report_problem(f"{roster_path}: {exc}")
 
 
-def _recover_directors(live: Path, recovered: list[tuple[str, Assignment]]) -> None:
-    """Add a director assignment for each marker that names a run folder under `live`."""
-    active = live / "active"
-    if not active.is_dir():
-        return
-    for marker in sorted(active.iterdir()):
-        if not marker.is_file():
+def _recover_directors(live: Path, membership: staff.StaffSnapshot,
+                       recovered: list[tuple[str, Assignment]]) -> None:
+    """Add a director assignment for each staff run under the live root."""
+    from scripts.production import staff
+
+    for row in membership.rows:
+        if not isinstance(row.run, staff.OpenRun) or not row.current_session:
             continue
+        run = row.run.path
         try:
-            run_text = marker.read_text(encoding="utf-8").strip()
-            if run_text and Path(run_text).is_dir() and Path(run_text).resolve().parent == live.resolve():
-                stamp = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc)
-                recovered.append((marker.name, Assignment(stamp, "director", None, True)))
+            if run.is_dir() and run.resolve().parent == live.resolve():
+                stamp = datetime.fromtimestamp(run.stat().st_mtime, timezone.utc)
+                recovered.append((row.current_session, Assignment(stamp, "director", None, True)))
         except (OSError, ValueError) as exc:
             _report_problem(exc)
 
@@ -251,15 +251,15 @@ def backfill(archive: Path, *live: Path) -> int:
             if not root.exists():
                 continue
             for run in sorted(root.iterdir()):
-                if run.is_dir() and run.name != "active":
+                if run.is_dir():
                     try:
                         recovered.extend(_run_assignments(run, membership))
                     except (OSError, ValueError) as exc:
                         _report_problem(exc)
+        for root in live:
+            _recover_directors(root, membership, recovered)
     except (OSError, ValueError) as exc:
         _report_problem(f"{staff.record_path()}: {exc}")
-    for root in live:
-        _recover_directors(root, recovered)
     path = state_dir() / "agents.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     added = 0

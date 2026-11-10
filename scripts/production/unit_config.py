@@ -5,6 +5,7 @@ import fcntl
 import json
 import re
 import os
+import socket
 from subprocess import run as run_taplo
 import tempfile
 import tomllib
@@ -16,7 +17,7 @@ from pathlib import Path
 from threading import RLock
 from typing import cast
 
-from scripts.lib import atomic_file, git_exclude
+from scripts.lib import atomic_file, conf, git_exclude
 from scripts.production.staff import StaffId
 from scripts.production import staff
 
@@ -69,6 +70,72 @@ class AppPort:
 @dataclass(frozen=True)
 class NoAppPort:
     pass
+
+
+@dataclass(frozen=True)
+class PlanDefault:
+    """The request needs the unit's default plan."""
+
+
+def default_port(worktree: Path, selected: AppPort | NoAppPort) -> AppPort | NoAppPort:
+    """Keep an explicit port or choose the lowest available Hana port."""
+    if isinstance(selected, AppPort):
+        return selected
+    manifest = worktree / "Cargo.toml"
+    package = cast(dict[str, object], tomllib.loads(manifest.read_text()).get("package", {})) if manifest.is_file() else {}
+    if not (worktree / "crates/hana/Cargo.toml").is_file() and package.get("name") != "hana":
+        return selected
+    settings = conf.read("production")
+    first, last = settings.whole("unit_port_first"), settings.whole("unit_port_last")
+    reserved = {settings.whole("mac_run_port"), settings.whole("smoke_port")}
+    for row in staff.snapshot().rows:
+        if row.kind != "unit":
+            continue
+        configurations = [read_parked(row.id, cleanup=False)]
+        if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
+            configurations.append(read(row.worktree.path, cleanup=False))
+        reserved.update(config.port.number for config in configurations
+                        if isinstance(config, UnitConfig) and isinstance(config.port, AppPort))
+    for number in range(first, last + 1):
+        if number in reserved:
+            continue
+        with socket.socket() as listener:
+            try:
+                listener.bind(("127.0.0.1", number))
+            except OSError:
+                continue
+        return AppPort(number)
+    raise ConfigRefused(f"port default is unavailable; no free port in {first}..{last}")
+
+
+def default_plan(worktree: Path, document: Path, unit: str = "") -> PlanFile | StandbyPlan | PermanentPlan:
+    """Read a saved configuration or the owner's existing plan record."""
+    from scripts.production.production_doc import cell_value, optional_field, FieldPresent
+
+    saved = read(worktree, cleanup=False)
+    if isinstance(saved, UnitConfig):
+        return saved.plan
+    lines = document.read_text().splitlines()
+    if unit:
+        headers: list[str] = []
+        for line in lines:
+            if not line.startswith("|"):
+                headers = []
+                continue
+            cells = [cell_value(cell.strip()) for cell in line.strip("|").split("|")]
+            if "Unit" in cells and "Plan" in cells:
+                headers = cells
+            elif headers and len(cells) == len(headers) and cells[headers.index("Unit")] == unit:
+                value = cells[headers.index("Plan")]
+                if value and value not in ("—", "-"):
+                    return StandbyPlan() if value == "standby" else PermanentPlan() if value == "permanent" else PlanFile(Path(value))
+    else:
+        field = optional_field(lines, "Plan")
+        if isinstance(field, FieldPresent):
+            return PlanFile(Path(cell_value(field.text)))
+        if document.is_relative_to(worktree):
+            return PlanFile(document.relative_to(worktree))
+    raise ConfigRefused(f"plan default is missing; looked in {worktree / '.unit.toml'} and {document}")
 
 
 def parse_port_cell(raw: str) -> AppPort | NoAppPort:
