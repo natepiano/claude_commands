@@ -2143,3 +2143,36 @@ With the Mac state folder present, `eligible` loads no `sweep` or `copies` modul
 **Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
 
 **Ruled out:** a comparison of unpaired start-cost runs.
+
+### Phase 99 — The Mac mirror target keeps its size bound, and the floor offers only build output  · status: done
+
+**Depends on:** none. Source: builds, 2026-11-10, from two natedev reports. The Mac floor tripped at 148.7 GiB free (floor 150).
+
+#### Work Order
+
+**Goal:** The hana Mac test mirror target stays inside its size bound, and the disk floor never offers a source checkout for deletion.
+
+**Spec:**
+
+1. **Mirror bound.** The hana mirror grew from 156 to 205 GiB, and the cleanup freed nothing. `config/mac_test.conf` sets `mac_budget_gib=24` and `mac_budget_gib.hana=56`; the bound did not act.
+   Find why from the code and from read-only Mac reads. Make the mirror target bound itself at the writer, in `scripts/mac_test/offload.py`. Use one way only, and add no guard beside it.
+   Change no config value. A needed value change goes to builds first.
+2. **Floor candidates.** The floor job (`sweep.py --floor-only --host mac`) recommended deleting `~/rust/cargo-liner`, a source checkout, as a folder whose use is unknown.
+   A source checkout is never a cleanup candidate; only our build output is. Fix the candidate rule where `scripts/lint/sweep.py` builds its folder choices. Add no second check beside that rule.
+3. **Mac rules.** Reads on the Mac are read-only, with sentinels. Run no gc, no cleanup and no delete on the Mac. Start no Mac test. Change no Mac setting.
+4. **Proof.** Each defect gets a table row in its existing test, or a new test only when no test covers the behavior.
+
+**Files:**
+- `scripts/mac_test/offload.py`
+- `scripts/mac_test/test_offload_cleanup.py`
+- `scripts/mac_test/test_offload_forward.py`
+- `scripts/lint/sweep.py`
+- `scripts/lint/test_sweep.py`
+
+**Workers:** `2 writers`
+- `impl` owns the mirror bound: `scripts/mac_test/offload.py` and its tests under `scripts/mac_test/`.
+- `test` owns the floor candidates: `scripts/lint/sweep.py` and `scripts/lint/test_sweep.py`.
+
+**Gate:** the targeted test; the changed test modules pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** The disk floor alert offers no source checkout | Read the next Mac floor alert | It names only build output, and the hana mirror target stays near its bound.
