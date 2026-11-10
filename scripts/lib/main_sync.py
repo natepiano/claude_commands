@@ -107,21 +107,17 @@ def _matches_file(checkout: Path, name: str, entry: GitFileState) -> bool:
     return hashed.returncode == 0 and hashed.stdout.decode("ascii").strip() == entry.object_id
 
 
-def _blocking_error(result: subprocess.CompletedProcess[str]) -> str:
-    return (result.stderr.strip() or result.stdout.strip() or f"git exited with status {result.returncode}").splitlines()[0]
-
-
 def _has_untracked_update(checkout: Path, blocking_details: list[str]) -> bool:
     untracked = _git(checkout, "ls-files", "--others", "-z")
     if untracked.returncode:
-        blocking_details.append(_blocking_error(untracked))
+        blocking_details.append(_first_line(untracked))
         return False
     if not untracked.stdout:
         return False
     added = _git(checkout, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z",
                  "HEAD", "origin/main", "--")
     if added.returncode:
-        blocking_details.append(_blocking_error(added))
+        blocking_details.append(_first_line(added))
         return False
     added_paths = set(added.stdout.split("\0")) - {""}
     return bool(set(untracked.stdout.split("\0")) & added_paths)
@@ -139,7 +135,7 @@ def _finish_interrupted_update(checkout: Path, blocking_details: list[str]) -> b
     ]
     for result in queries:
         if result.returncode:
-            blocking_details.append(_blocking_error(result))
+            blocking_details.append(_first_line(result))
             return False
     trees: list[dict[str, GitFileState]] = []
     for result in queries[:2]:
@@ -192,7 +188,7 @@ def _finish_interrupted_update(checkout: Path, blocking_details: list[str]) -> b
             restored = _git(checkout, "--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree",
                             "--", *restore)
             if restored.returncode:
-                blocking_details.append(_blocking_error(restored))
+                blocking_details.append(_first_line(restored))
                 return False
     except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
         blocking_details.append(str(error) or type(error).__name__)
@@ -231,7 +227,7 @@ def sync(checkout: Path) -> Outcome:
     interrupted = False
     blocking_details: list[str] = []
     if status.returncode:
-        blocking_details.append(_blocking_error(status))
+        blocking_details.append(_first_line(status))
     elif status.stdout.strip() or _has_untracked_update(checkout, blocking_details):
         interrupted = _finish_interrupted_update(checkout, blocking_details)
     if blocking_details:
