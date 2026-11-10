@@ -2291,3 +2291,42 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - Bytecode work: compiling the whole tree costs 3.4 CPU s, and main-script compile across all starts costs 67.3 CPU s.
 - A preloaded Python start server: tests inspect real process trees, signals and process groups.
 - A test-only path in `verify.sh`: it breaks the one-way rule.
+
+### Phase 115 — Measurements show how much CPU each cheaper Python start saves, and which tests each breaks  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the builds showrunner, 2026-11-09: "A, prototype only, in a scratch copy. Condition: what lands must be one way to start a script, the same for tests and real use. A test-only fast start is a second path and will not land. So measure two things side by side: (1) your preloaded start, (2) cheaper interpreter start for every script with no second path (interpreter flags such as -S or -I where safe, bytecode state, the heaviest shared imports). Report CPU saved per whole gate and the tests that break for each." The user, 2026-11-09: "our goal is dramatically reduced cpu time".
+
+**Why:** a whole gate is 3,056 CPU s over 739 modules, about 4,950 CPU s in the cloud. Python child processes are 1,743 CPU s over 35,362 starts, 49 ms each on average. Test-only sites are near their floor: halving the top ten `python -c` sites saves about 20 CPU s. Interpreter and import start is up to about 740 CPU s, the one lever large enough to change the cost of a gate.
+
+**Goal:** one result table gives, for each cheaper start, the CPU saved per whole gate and the tests that break, against a baseline run at the same load.
+
+**Spec:**
+1. Work only in scratch copies. Make each copy with `copies.py run --repo <worktree> --commit HEAD -- bash <script> '{tree}'`. Change no file in the worktree. Make no commit. Nothing from this phase lands.
+2. Measure with the phase's whole-gate tools in `<phase dir>/tools`: `gatewide.sh`, `gatewide_patch.py`, `gatewide_probe.py`, `gatewide_list.py`, `gatewide_one.py` and `gatewide_sum.py`. Give each variant its own output folder under `<phase dir>/runs/<variant>`.
+3. Run the baseline and a variant at the same time, so both have the same load. Use at most 24 parallel modules in total across both. One whole-gate pair takes 45 minutes and about 10,000 CPU s, so each variant first gets two cheaper measures: per-start CPU of the top 20 commands in same-load pairs, multiplied by the survey's start counts for the CPU saved per gate, and a paired run of the 60 modules with the most Python starts for the tests that break. Only the variant with the largest valid saving gets a whole-gate pair, and that pair confirms its CPU and its full list of broken tests.
+4. Survey the baseline first. Name the routes that start Python (`python3 script`, `lib/py`, `sys.executable`, shebang) and the starts each route takes. Separate interpreter start, shared standard-library imports, repository imports and main-script compile. Use `-X importtime` on the top commands of the whole-gate data.
+5. Variant 1, the preloaded start: a parent process holds the common imports and forks one child per Python start. It serves every script start, for tests and for real use, through one path. Report every difference in process tree, signals, process groups, environment, working directory and standard streams that a test detects.
+6. Variant 2, interpreter flags: measure `-S`, `-I`, and both together, applied to every Python start. Where a flag needs a launcher, use a compiled exec launcher or subtract the launcher's measured CPU. State which it was.
+7. Variant 3, bytecode state: measure a tree with every `.pyc` present before the first test. Measure thin entry scripts, so a large main script such as `progress_history.py` is loaded from bytecode. Earlier measures: whole-tree compile 3.4 CPU s, main-script compile 67.3 CPU s per gate.
+8. Variant 4, the heaviest shared imports: remove or delay the imports that the survey ranks highest, in production code, with the same code for tests and real use.
+9. For each variant, list only the tests that fail in the variant and pass in the baseline of the same pair.
+10. Write `<phase dir>/result.md`. It holds one row per variant: CPU saved per whole gate, the same number at the cloud factor 1.62, the failing tests, and the one-path change that would land with the files and their owners. End with one recommendation.
+11. Add no check. A test-only path is not a candidate.
+
+**Files:**
+- `docs/plans/builds-natest.md` — the director records the result; the worker edits no repository file
+
+**Workers:** 1 writer; one writer holds the prototype and its measurements, and there is no test lane
+- `impl` — the scratch copies and `<phase dir>/result.md`
+
+**Constraints from prior phases:**
+- Phase 114: blanket no-op helpers in `verify.sh` make every test red, and a test-only path in `verify.sh` breaks the one-way rule.
+- Tests never read or write live state. `build_hold.py` stays frozen.
+
+**Acceptance gate:**
+- `result.md` has a row for each of the four variants, measured as Spec item 3 states, and the best variant's row comes from a whole-gate run paired with a baseline at the same load. A row that cannot be measured names why.
+- The worktree is unchanged and every scratch copy is removed.
