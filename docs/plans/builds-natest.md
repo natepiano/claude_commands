@@ -2395,29 +2395,13 @@ Replay over the last 20 first-parent merges on `origin/builds`, one graph from t
 
 ### Phase 118 — The test_times report tests pass on every date  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Source:** the builds showrunner, 2026-11-10: "top priority, before 117 and 118. scripts.test_times.test_show fails 4 of 33 tests on natedev at main 0ab15ffc4, and on the cloud box... It blocks every full merge gate... Fix the cause, run the module, send me the hash and ETA now."
-
-**Why:** four process tests in `scripts/test_times/test_show.py` start the report in a child process. The parent pins the report clock to the fixture time, but the child used the real clock. The fixture rows date from 2026-11-03, and `TOP_MAX_AGE_DAYS=7` dropped them after 2026-11-10 14:30 UTC, so the report printed `no modules recorded yet`.
-
-**Goal:** the report child uses the same fixed clock as the in-process tests, so the module passes on every date.
-
-**Spec:**
-
-1. `REPORT_PROCESS` replaces the report module's `datetime` with a subclass whose `now` returns the time in `TEST_REPORT_EPOCH`.
-2. `report_process` sets `TEST_REPORT_EPOCH` to `EPOCH + 300`, the time the in-process `ReportTime` returns.
-3. The first-report test expects the same-day stamp `rows as of 09:30 EST`, because the fixed report time and the index update fall on the same day. The other-day stamp keeps its coverage in the module-report stamp test.
+`REPORT_PROCESS` in `scripts/test_times/test_show.py` replaces the report module's `datetime` with a subclass whose `now` returns the time in `TEST_REPORT_EPOCH`. `report_process` sets `TEST_REPORT_EPOCH` to `EPOCH + 300`, the time the in-process `ReportTime` returns. The report child and the in-process tests use the same fixed clock, so the module passes 33 of 33 tests on every date. The first-report test expects the same-day stamp `rows as of 09:30 EST`; the module-report stamp test keeps the other-day stamp.
 
 **Files:**
-- `scripts/test_times/test_show.py` — the report child's clock; owner natest-unit
+- `scripts/test_times/test_show.py` — the report child's fixed clock
 
-**Workers:** none; the director made this small test fix while `impl` runs the Phase 117 pair
+**Gotchas:** A patch of `show.datetime` in the parent does not reach a child process; every child report needs `TEST_REPORT_EPOCH`. A fixed fixture date with the seven-day `TOP_MAX_AGE_DAYS` window fails seven days after that date when the clock is real.
 
-**State:** none
-
-**Acceptance gate:**
-- `scripts/test_times/test_show.py` passes 33 of 33 tests.
-- `basedpyright` reports 0 errors, 0 warnings, 0 notes for the changed file.
+**Ruled out:** fast track for this file, because it refuses Python files that import `scripts/production/staff.py`.
