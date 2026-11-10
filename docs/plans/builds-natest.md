@@ -2493,28 +2493,18 @@ Three test-support files load their heavy imports at the function that uses them
 **Ruled out:** a dataclass code cache in the module runner, because it replaces a private stdlib name; a delayed `pane_record` import in `staff_test_support.py`, because its isolation patches `RECORD_DIR` only when that module is already loaded.
 
 ### Phase 125 — Message sends and test modules start faster because roster, pane records and unit lookup load the herdr client only when they call it  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `roster.py`, `pane_record.py` and `unit_lookup.py` load no `scripts.herdr.herdr` at import. About 10-14 CPU s less per merge gate, and a faster `send.py` start.
-
-**Spec:**
-1. New `scripts/herdr/herdr_types.py` holds the one definition of `HerdrFailure`, `HerdrMissing` and `NATIVE_ID_MARKS`. `herdr.py` imports and re-exports them as the same objects, like `HerdrPlace` from `place.py`.
-2. The three callers drop the module-level `herdr` import. `HerdrPlace` comes from `scripts.herdr.place`. Annotation-only names (`HerdrProcess`, `PaneIdentity`) go under `TYPE_CHECKING`.
-3. A function that calls the herdr client imports `herdr` as its first statement (the phase 117 form).
-4. A function that only catches `HerdrFailure` or reads `NATIVE_ID_MARKS` uses `herdr_types`, so it loads no client.
-5. Tests that read `unit_lookup.herdr` use the new names. Patches of `scripts.herdr.herdr.<name>` keep working.
+New `scripts/herdr/herdr_types.py` holds the one definition of `HerdrFailure`, `HerdrMissing` and `NATIVE_ID_MARKS`; `herdr.py` re-exports the same objects. `roster.py`, `pane_record.py` and `unit_lookup.py` take `HerdrPlace` from `place.py`, keep annotation-only names under `TYPE_CHECKING`, and import `herdr` in each function that calls the client. Importing any of the three loads no `scripts.herdr.herdr`. A paired import scan of 745 gate test modules found 201 modules that load less, and the classes built fell from 322,685 to 304,696. Those modules saved 8.3 and 5.8 CPU s, about 7 CPU s per gate. A roster read, which each `send.py` roster lookup pays, saved 31-41 ms of a 258-302 ms median at host load above 40.
 
 **Files:**
-- `scripts/herdr/herdr_types.py` (new), `scripts/herdr/herdr.py`
-- `scripts/message/roster.py`, `scripts/agents/pane_record.py`, `scripts/production/unit_lookup.py`
-- `scripts/production/test_unit_lookup.py`
+- `scripts/herdr/herdr_types.py` — new; failure types and native ID marks
+- `scripts/herdr/herdr.py` — re-exports the moved names
+- `scripts/message/roster.py`, `scripts/agents/pane_record.py`, `scripts/production/unit_lookup.py` — delayed `herdr` imports
+- `scripts/herdr/test_herdr.py`, `scripts/production/unit_status_test_support.py` — isolated-copy lists add `herdr_types.py`
+- `scripts/production/test_unit_lookup.py` — reads `unit_lookup.HerdrPlace`
 
-**Workers:** No-worker mode (Codex quota). The director writes the edits.
+**Gotchas:** A test that copies `herdr.py` to an isolated folder must also copy `herdr_types.py`. `send.py` loads `roster` lazily, so its bare start does not change. The `-X importtime` self cost overstated the gain by about half, because other paths still load part of the same closure.
 
-**Acceptance gate:**
-1. Importing each of the three callers loads no `scripts.herdr.herdr`.
-2. basedpyright reports 0 errors, 0 warnings and 0 notes on every changed file.
-3. The test modules that import the changed files pass, and the targeted gate passes.
-4. Paired measures, phase base against the change: import CPU of all gate test modules, and `send.py` start time.
+**Ruled out:** a split of `admission_records.py` now, because alone it is under the bar and the queue unit has phases there; it is in the next items.
