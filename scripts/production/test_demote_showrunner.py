@@ -240,6 +240,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                 _ = self.git("-C", str(self.child_tree), "switch", "-c", "without-plan")
                 _ = self.git("-C", str(self.child_tree), "rm", "--", str(self.plan_relative))
                 _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "remove the plan from the current branch")
+                write_text_atomic(self.plan, "# Plan kept only in the checkout\n")
             for plan in (self.plan, self.plan_relative):
                 with self.subTest(current_has_plan=current_has_plan, plan=plan):
                     self.assertEqual(self.run_command("--check", "--plan", str(plan))[0], 0)
@@ -258,6 +259,13 @@ class DemoteShowrunnerTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         self.assertEqual(self.run_command()[0], 2)
         self.assert_no_actions(before)
+        for plan in (self.plan, self.child_tree / "untracked-plan.md"):
+            with self.subTest(plan=plan):
+                write_text_atomic(plan, "changed plan\n")
+                code, _, errors = self.run_command("--check", "--plan", str(plan))
+                self.assertEqual(code, 2, errors)
+                self.assertIn("has uncommitted work; it checkpoints first", errors)
+                self.assert_no_actions(before)
 
     def test_refuses_busy_forms_prompts_and_drafts(self) -> None:
         before = self.staff_file.read_bytes()
@@ -268,35 +276,71 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(self.run_command()[0], 2)
         self.assert_no_actions(before)
 
-    def test_refuses_an_uncommitted_plan(self) -> None:
+    def test_accepts_existing_plans_without_a_merge_branch_commit(self) -> None:
         before = self.staff_file.read_bytes()
         original = self.plan.read_text()
         untracked = self.child_tree / "untracked-plan.md"
         branch_only = self.child_tree / "temporary-plan.md"
+        ignored = self.child_tree / "ignored-plan.md"
+        exclude = Path(self.git("rev-parse", "--git-path", "info/exclude"))
+        if not exclude.is_absolute():
+            exclude = self.checkout / exclude
+        write_text_atomic(exclude, exclude.read_text() + "\nignored-plan.md\n")
+        missing = self.child_tree / "missing-plan.md"
         _ = self.git("-C", str(self.child_tree), "switch", "-c", "temporary-plan-branch")
         write_text_atomic(branch_only, "# Temporary plan\n")
         _ = self.git("-C", str(self.child_tree), "add", "--", branch_only.name)
         _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "commit the temporary plan")
         for plan in (self.plan, untracked, self.checkout / self.plan_relative,
-                     self.child_tree / ".." / "parent" / self.plan_relative, branch_only):
+                     self.child_tree / ".." / "parent" / self.plan_relative, branch_only, ignored, missing):
             with self.subTest(plan=plan):
-                if plan in (self.plan, untracked):
+                if plan in (self.plan, untracked, ignored):
                     write_text_atomic(plan, "changed\n")
                 try:
-                    for flags in ((), ("--check",)):
+                    accepted = plan in (self.plan, untracked, ignored)
+                    for flags in (("--check",),) if accepted else ((), ("--check",)):
                         with self.subTest(flags=flags):
                             code, _, errors = self.run_command(*flags, "--plan", str(plan))
-                            self.assertEqual(code, 2)
-                            if plan == branch_only:
-                                self.assertIn(f"plan {branch_only.name} is missing on {self.child_branch}", errors)
-                            elif plan not in (self.plan, untracked):
+                            self.assertEqual(code, 0 if accepted else 2, errors)
+                            if accepted:
+                                self.assertEqual(errors, "")
+                            elif plan == branch_only:
+                                self.assertEqual(errors,
+                                    f"demote_showrunner: plan {branch_only.name} is committed only on temporary-plan-branch; "
+                                    + f"commit it on {self.child_branch} or keep it untracked\n")
+                            elif plan == missing:
+                                self.assertEqual(errors,
+                                    f"demote_showrunner: plan {missing.name} is missing in {self.child_tree}\n")
+                            else:
                                 self.assertIn("plan must be inside the child checkout", errors)
                             self.assert_no_actions(before)
                 finally:
                     if plan == self.plan:
                         write_text_atomic(self.plan, original)
-                    elif plan == untracked:
-                        untracked.unlink()
+                    elif plan in (untracked, ignored):
+                        plan.unlink()
+
+        self.plan = untracked
+        self.plan_relative = untracked.relative_to(self.child_tree)
+        content = "# Untracked plan kept across the branch switch\n"
+        write_text_atomic(untracked, content)
+
+        def launch_with_plan(args: list[str]) -> int:
+            self.assertTrue(untracked.is_file())
+            self.assertEqual(untracked.read_text(), content)
+            self.assertEqual(args[args.index("--plan") + 1], str(self.plan_relative))
+            return self.start_unit(args)
+
+        self.start.side_effect = launch_with_plan
+        with self.subTest(plan=untracked, full_demote=True):
+            code, _, errors = self.run_command()
+            self.assertEqual(code, 0, errors)
+            self.start.assert_called_once()
+            self.assertEqual(self.git("-C", str(self.child_tree), "branch", "--show-current"), self.child_branch)
+            self.assertTrue(untracked.is_file())
+            self.assertEqual(untracked.read_text(), content)
+            self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
+            self.assertFalse(self.journal().exists())
 
     def test_refuses_live_units_and_accepts_retired_units(self) -> None:
         rows = [fixture_member("unit", name=name, parent=self.child.id) for name in ("alpha", "beta")]
