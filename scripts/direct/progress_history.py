@@ -1842,19 +1842,33 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
     return MatchedDispatch(_string(active.get("worker_name")), _string(active.get("instance_id")))
 
 
+def launch_slot(session_dir: Path, slot: str, launcher_command: list[str]) -> str:
+    """Name the slot whose pass this launcher command started, or the given slot."""
+    if not _state_path(session_dir).is_file():
+        return slot
+    return _launch_slot(_pass_slots(_read_state(session_dir)), slot, launcher_command)
+
+
+def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_command: list[str]) -> str:
+    return next((name for name, passed in passes.items()
+                 if launcher_command and passed.get("launcher_command") == launcher_command), slot)
+
+
 def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                     prompt: Path, launcher_command: list[str]) -> MatchedDispatch | NoMatchedDispatch:
     """Find the worker for this dispatch retry without changing recorder state."""
     if not _state_path(session_dir).is_file():
         return NoMatchedDispatch()
     state = _read_state(session_dir)
+    passes = _pass_slots(state)
+    slot = _launch_slot(passes, slot, launcher_command)
     recorded_phase = _open_phase_named(state, phase)
     if recorded_phase is None:
-        recorded_phase = _object_dict(_pass_slots(state).get(slot, {}).get("phase"))
+        recorded_phase = _object_dict(passes.get(slot, {}).get("phase"))
         if recorded_phase is None or _string(recorded_phase.get("id")) != phase:
             return NoMatchedDispatch()
     return _dispatch_match(
-        _pass_slots(state).get(slot), recorded_phase,
+        passes.get(slot), recorded_phase,
         {"kind": role, "prompt_file": str(prompt), "launcher_command": launcher_command},
         launcher_command, dispatch_owned=True,
     )
