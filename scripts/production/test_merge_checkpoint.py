@@ -122,8 +122,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
         _ = config.write_text((checkout / "config/staff.conf").read_text())
-        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config),
-                         "CLAUDE_PYTHON": sys.executable})
+        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         library = Path(self.env["HOME"]) / ".claude/scripts/lib"
         library.symlink_to(checkout / "scripts/lib", target_is_directory=True)
         _ = self.git("remote", "set-head", "origin", "production")

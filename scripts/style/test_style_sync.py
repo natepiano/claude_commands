@@ -41,6 +41,7 @@ from scripts.message import send_budget, session_send
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 
 
 class RecordedCall(TypedDict):
@@ -147,6 +148,7 @@ class StyleSyncTests(unittest.TestCase):
             _ = (rule_root / "rust" / f"{tool}.md").write_text(f"---\ntier: A\nmechanism: {tool}\n---\n# {tool}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root / "gate-home"),
+            **interpreter_cache_environment(self.root / "cache"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
@@ -154,6 +156,7 @@ class StyleSyncTests(unittest.TestCase):
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
             "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
         })))
+        _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(style_staff_fixture(self.root, self.repo))
         owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
         assert isinstance(owner.doc, staff.LiveDoc)

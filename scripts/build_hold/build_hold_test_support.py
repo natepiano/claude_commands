@@ -20,6 +20,7 @@ from typing import ClassVar, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_hold import build_hold
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.lib import test_hang_guard
@@ -141,6 +142,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         self.lifetime_writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.scratch),
+            **interpreter_cache_environment(self.scratch / "cache"),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
             "BUILD_HOLD_DIR": str(self.scratch / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
