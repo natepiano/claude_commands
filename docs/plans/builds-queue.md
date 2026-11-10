@@ -1424,21 +1424,52 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
 
-### Phase 10g — The queue decides where every step runs  · status: todo
-**Depends on:** verify-unit's Phase 27 hotfix on builds (the Work Order follows it), 10z and 10x (it changes the admission request and the queue service).
-**Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
+### Phase 10g — The queue records each placement and gives one launch permission  · status: done
 
-**Outline (the Work Order follows at phase start, after verify's Phase 27 hotfix lands):**
-1. A step's admission request carries its eligible hosts (natedev, the Mac, SSH slots) and each host's exclusion reason.
-2. The queue service places each step on the first host that is free for it, and decides again on every pass while the step waits (Mac free, Mac disk over the floor, slot free).
-3. `verify.sh` and the offload path run the step where the queue says; they make no host choice.
-4. `build_targets.py` eligibility, slot reserve and the spending-guard exclusion move behind the queue decision.
-5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
-6. Runs beside 10f where the file sets are disjoint.
-7. **Slots per host (architect review, 2026-11-05).** A local 10z slot cannot stand for memory kept on the Mac or an SSH target. Define placement, reservation and departure states per host. Tests: a move to another host releases the local claim, and a local claim is never reused on a remote host.
-8. **Machine column (Phase 24).** `/build:queue` (`queue_view.py`, `queue_card.py`) and the memory page feed read one `scripts.buildlog.store.host_name()` for every running row. When a step runs on another host, the service reply carries that host on its row, and both views show it in the Machine column. Tests: a running row placed on the Mac shows the Mac's name in the view, the card and the page.
-9. **Host-scoped run identity (architect review of 18, 2026-11-06).** Two hosts can give the same pid and start time; `running_builds()` groups runs by `run_owner(pid, start_time)` today. One named run identity carries the host through placement, sampling, grouping and release. Test: a mixed-host fixture with the same pid and start time on two hosts keeps two runs, with separate accounting and the right Machine labels.
-10. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
+#### As-built
+
+- `scripts/build_queue/placement.py` holds the placement types: `SubmittingOwner`, `SubmittingSession`, `PlacementConstraints`, `HostSelection`, `PlacementAssignment`, `AssignmentState`, `LaunchPermission`, `ProviderClaimReference`, `ExecutionIdentity`, `ExecutionEvidence`, `HostEvidence`, `HostEligibility`.
+- The admission service saves one `PlacementAssignment` per episode and attempt before it replies. The first valid consumption moves `PermissionAvailable` to `PermissionConsumed` durably, and only its first response authorizes execution. A repeated, unknown or closed consumption returns `DispatchStatus` only; ledger pruning never makes a new permission.
+- Version 3 wire messages carry placement. Version 1 and 2 requests decode as before and keep their reply shapes. No caller changes its route: `route_test`, `_cloud_pass` and every existing client keep their behavior.
+- `HostEvidenceReader` reads host evidence in the background, in the pattern of `OperatingSystemReader`. Evidence goes stale on the existing poll interval; no network call or waiting lock runs in the service loop.
+- Each Mac and SSH claim record carries `claim_id`, `episode`, `attempt` and `submitting_session`. Release, release-wait and adoption match that exact identity under the target lock, never the pid alone. `submitting_session` names the current owner: `take_over_kept_claim(..., session=)` sets it with `pid` and `proc_start`, and `holder_session` keeps the original job evidence. `adopt_wait_claim` requires strict session equality, exact identity and a live process start.
+- Hold and claim policy take `SubmittingSession` explicitly; cached eligibility keys include it. `wait_claim_identity` recovers the identity for the session that owns the claim now. `verify.sh` and `offload.py` carry that identity to release and adoption; `mac_run.sh` releases by the exact claim; `/build:mac` prints a manual claim's identity and its release takes `--claim-id`, `--episode` and `--attempt`.
+- Claim records, run.json and admission state are decoded strictly.
+
+**Files:**
+- `scripts/build_queue/placement.py` — placement types and decision records.
+- `scripts/build_queue/admission_wire.py`, `admission_protocol.py`, `admission_client.py` — version 3 messages, decoding and client calls.
+- `scripts/build_queue/admission_service.py`, `admission_records.py`, `admission_code.py` — assignments, consumption, background evidence, restart; `placement.py` in the service code paths.
+- `scripts/mac_test/claim_state.py`, `scripts/mac_test/mac_test.py` — exact claim identity, takeover session, strict adoption and release.
+- `scripts/build_targets/build_targets.py` — explicit session, `wait_claim_identity`, `cleanup_refused_claims(..., session=)`.
+- `scripts/mac_test/offload.py`, `scripts/direct/verify.sh` — identity hand-off (verify-unit owns both).
+- `scripts/production/mac_run.sh`, `commands/build/mac.md` — exact manual claim and release.
+- `scripts/build_queue/test_placement.py` and rows in the admission, claim, target and verify tests; `docs/as-built/build-memory-admission.md` — messages and records.
+
+**Binds later work:** the verify, merge-gate and view cutovers build on `PlacementAssignment`, the single launch permission, `HostEvidenceReader` and the exact claim identity. `submitting_session` is the current claim owner; `wait_claim_identity` replaces `owns_wait_claim`.
+
+**Gotchas:** a merge that changes a strictly decoded record is a deploy. Stop `build-admission.service` and `.socket`, `build-memory-feed.service` and the claim writers; run the conversion program (outside the repository) on admission state, `~/.local/state/mac-test` and `~/.local/state/build-targets/aws`; merge; then start. Live services restart on main at once.
+
+**Ruled out:** a cleanup-pending bypass of the adoption session check, because it let an unrelated session adopt a live claim.
+
+### Phase 44 — Every verify step runs where the queue places it  · status: todo
+**Depends on:** 10g. Checkpoint 2 of section 8 in `docs/plans/builds-queue-placement.md`. This phase first fixes the 14:04 disk-decline defect. verify-unit has the function list. The Work Order follows at phase start.
+
+**Constraints from 10g (architect review of 10g, 2026-11-10).** The Work Order settles each item below before work is divided.
+1. **Queue policy.** `_read_host_evidence` excludes the local and scaler providers, and `_placement_pass` orders requests without the priority rank. Integrate local admission, priority, continuation release and retry deadlines through the existing planner. Tests: competing waiters; a priority change; a remote-to-local retry that charges local memory once.
+2. **Coordinator and claim holder.** `admission_service.py:2149` requires the adopted claim owner to equal the assignment owner. Adoption today moves ownership from the verify pid to the offload pid. Add a semantic claim-holder identity, separate from the coordinator. Test: a real verify-to-offload handoff that keeps the coordinator death check.
+3. **Completion and retry.** `_handle_placement` keeps execution evidence in memory only, ignores `ExecutionReport.outcome` and never closes a consumed assignment. Define terminal reports, a safe replacement attempt, and rebuild from provider evidence after a restart. Keep unstarted execution separate from unavailable evidence. Tests: lost response, restart, pending-launch barrier, safe replacement. Phase 45 reuses this contract.
+4. **Claim ownership.** `submitting_session` names the current claim owner. A takeover changes it with `pid` and `proc_start`; `holder_session` keeps the original job evidence. Use `wait_claim_identity`, not `owns_wait_claim`. Exact release and the offload identity hand-off already exist. Keep the interrupted-publication and unrelated-session refusal tests.
+5. **Deploy.** Claim records, run.json and admission state are decoded strictly. A phase that changes one of them names in its Work Order: the writers to stop (`build-admission.service` and `.socket`, `build-memory-feed.service`, the claim writers), how restart is prevented, the conversion roots (`~/.local/state/mac-test`, `~/.local/state/build-targets/aws`, admission state), the interrupted-conversion check, and the stop, convert, merge, start order. The showrunner holds the merge until the conversion runs.
+6. **Views.** Converted paths show correct host accounting and the Machine label of the host that runs the step.
+
+### Phase 45 — Merge gates take their route from the queue  · status: todo
+**Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
+
+**Constraints from 10g (architect review of 10g, 2026-11-10).** aws-unit's repair is commit `0ab15ffc4` (on builds and main): it keeps `GateLaunchPending` after an uncertain launch and adds reconciliation tests. Build on it and keep its tests through the scaler cutover. Reuse Phase 44's completion and retry contract and its claim ownership and deploy constraints (Phase 44 items 3 to 5).
+
+### Phase 46 — Every view names the machine a step runs on, and the old route code is gone  · status: todo
+**Depends on:** 45. Checkpoint 4 of section 8 in `docs/plans/builds-queue-placement.md`. The Work Order follows at phase start. It switches the remaining readers first and deletes the old selectors only after their last caller switches. Phase 44 item 4 (claim ownership) applies.
 
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 
