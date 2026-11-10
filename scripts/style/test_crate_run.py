@@ -468,17 +468,20 @@ class CrateRunTests(CargoProjectTests):
         from scripts.style import style_sync as owner_resolver
         self.freeze(paths=("src/lib.rs",))
         observed: set[Path] = set()
+        observed_caches: set[Path] = set()
         resolver = owner_resolver.gate_owner
         with mock.patch.object(owner_resolver, "gate_owner", side_effect=resolver) as calls:
             batch = crates.CrateRun(self.authority, self.batch.run_id)
             def commands(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
                 observed.add(repo)
+                observed_caches.add((repo / "target").resolve().parent)
                 return self.commands(repo, arguments)
             _ = batch.advance("bulk_sample", renamed, commands, available, fixture_execute)
         self.assertEqual([call.args for call in calls.call_args_list], [(self.repo,)])
         gates = list((copies.gates_root() / self.repo.name).iterdir())
         self.assertEqual({path.name for path in gates}, {"sample-style-gate", "sample-style-gate-2"})
-        self.assertTrue(any(path in observed for path in gates))
+        self.assertTrue(any(path in observed_caches for path in gates))
+        self.assertTrue(any(not path.exists() for path in observed))
 
     def test_worker_names_separate_run_and_package_at_the_last_dot(self) -> None:
         self.freeze()
@@ -495,11 +498,12 @@ class CrateRunTests(CargoProjectTests):
         self.assertNotEqual(paths[0], paths[1])
         self.assertEqual([Path(path).name for path in paths], ["crate-first-beta.gamma", "crate-first.beta-gamma"])
 
-    def test_crate_trees_have_registered_ownership_and_use_two_standing_checkouts(self) -> None:
+    def test_crate_trees_keep_ownership_and_use_two_standing_caches(self) -> None:
         self.freeze()
         original = self.git("rev-parse", "HEAD")
         manifest = self.batch.read()
         with self.batch.frozen_checkout(manifest) as frozen:
+            frozen_owner = copies.read_record(frozen).owner
             self.assertEqual(copies.read_record(frozen).source, str(self.repo))
             with scratch.busy_locks(frozen, create=False) as idle:
                 self.assertFalse(idle)
@@ -507,8 +511,8 @@ class CrateRunTests(CargoProjectTests):
 
         def registered(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
             observed.add(repo)
-            if repo.is_relative_to(copies.gates_root()):
-                self.assertEqual(copies.read_record(repo).owner, copies.read_record(frozen).owner)
+            if (repo / copies.GATE_RECORD).is_file():
+                self.assertEqual(copies.read_record(repo).owner, frozen_owner)
             else:
                 record = scratch.task_of(repo)
                 self.assertIsInstance(record, copy_record.Registered)
@@ -524,9 +528,11 @@ class CrateRunTests(CargoProjectTests):
             self.assertIn(worker, list(scratch.copy_paths()))
             self.assertIsInstance(scratch.task_of(worker), copy_record.Registered)
             self.assertIsNone(scratch.unsaved_work(worker))
-        gates = list(frozen.parent.iterdir())
-        self.assertEqual(sorted(tree.name for tree in gates), [frozen.name, frozen.name + "-2"])
-        self.assertIn(frozen.with_name(frozen.name + "-2"), observed)
+        gates = list((copies.gates_root() / self.repo.name).iterdir())
+        self.assertEqual({tree.name for tree in gates}, {"sample-style-gate", "sample-style-gate-2"})
+        self.assertTrue(all((tree / "target").is_dir() for tree in gates))
+        self.assertFalse(frozen.exists())
+        self.assertTrue(any(not path.exists() for path in observed))
         self.assertEqual(self.git("rev-parse", "HEAD"), original)
 
     @property

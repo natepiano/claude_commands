@@ -43,11 +43,11 @@ from scripts.whoami.quota_alert import (RefusedAt, _refusal_window, blocked_next
                          TargetAccountUnavailable as TargetAccountUnavailable)
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory as inventory_module
+    from scripts.agents import inventory as inventory_module
     from scripts.herdr import herdr
     from scripts.message import sessions
 else:
-    inventory_module = import_module("scripts.shutdown.inventory")
+    inventory_module = import_module("scripts.agents.inventory")
     sessions = import_module('scripts.message.sessions')
     herdr = import_module("scripts.herdr.herdr")
 
@@ -716,7 +716,7 @@ def _set_transition(state: WatchState, session_id: str, entry_id: str, transitio
 
 def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered | ContinuationNotDelivered:
     # Shutdown imports this watcher for its hold and cancellation; resolve its delivery boundary at use.
-    messenger = cast(LiveSessionMessenger, cast(object, import_module("scripts.shutdown.restart_support")))
+    messenger = cast(LiveSessionMessenger, cast(object, import_module("scripts.agents.restart_support")))
     try:
         delivery = messenger.send_message(f"session:{session_id}", "Quota wait ended", "Continue where you stopped.",
             key=f"quota-continue-{session_id}-{entry_id}")

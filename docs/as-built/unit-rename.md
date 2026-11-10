@@ -33,6 +33,6 @@ The shared restart path can resume a previously live unit without an older launc
 
 ## Tests
 
-`scripts/shutdown/test_shutdown_cli.py` covers row names, display repair, moves, and stopped-session recovery.
+`scripts/agents/test_shutdown_cli.py` covers row names, display repair, moves, and stopped-session recovery.
 The `test_unit_move.py` module covers interruption recovery across the folder and branch operations.
 Tests use private staff records and fake process and terminal evidence.

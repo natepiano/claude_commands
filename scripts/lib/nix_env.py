@@ -3,7 +3,7 @@
 
 Envrc files below ~/rust, ~/worktrees or ~/.claude*, and in linked worktrees
 registered by repositories below those roots, are allowed automatically.
-Registered scratch copies also qualify when their regular top-level envrc
+Registered scratch copies and temporary gates also qualify when their regular top-level envrc
 matches the recorded source commit in a repository below those roots.
 Other directories keep direnv's explicit approval boundary.
 No envrc means the caller's environment is retained, without running direnv.

@@ -19,10 +19,6 @@ from scripts.buildlog import index, cgroup_capture, store
 from scripts.buildlog.cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-from scripts.build_queue import queue_snapshot
-from scripts.build_queue.queue_evidence import room_text
-from scripts.lint import memory_admit as gate
-
 from scripts.lib import conf
 
 GIB = 2**30
@@ -366,10 +362,15 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
 
 
 def window_report(connection: sqlite3.Connection, start: datetime, end: datetime) -> str:
+    from scripts.build_queue import queue_snapshot
+
     lines = [f"Memory, {local_time(start, with_date=True)} to {local_time(end, with_date=True)}"]
     recorded = queue_snapshot.read_queue_snapshot(store.root() / "admission")
     cap_line = ""
     if isinstance(recorded, queue_snapshot.QueueSnapshot) and start.timestamp() <= recorded.written_at < end.timestamp():
+        from scripts.build_queue.queue_evidence import room_text
+        from scripts.lint import memory_admit as gate
+
         cap_line = room_text(gate.inputs_room(recorded.inputs, recorded.policy))
     lines.append(cap_line or "Cap: no recorded admission pass in this window")
     early = earlyoom_kills(start, end)

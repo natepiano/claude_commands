@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.production import checkpoint_gate
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff

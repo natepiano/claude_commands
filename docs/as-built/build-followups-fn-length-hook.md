@@ -246,7 +246,7 @@ Run files keep staff references instead of copied native identities.
 
 - **Effort.** A Claude worker launched without `--effort` inherits `~/.claude/settings.json` (`modelSettings` → model → `effortLevel`, `xhigh` for Sonnet 5.5), so a pane line reading `thinking with xhigh effort` on a `sonnet:low` worker means the launch dropped the effort, not that the pane misleads.
 
-- **`/unit:report off`.** `unit_notifier.sh` exit 1 covers both no active run and a missing notifier instance; only the message says which, so the command relays it as printed. `off` persists in the notifier instance until `on` or `end_session.sh`. `<ProgressContract/>` in `commands/unit/direct.md` names `/unit:report off` and `/unit:report on` for a Claude unit.
+- **`/unit:report`.** Reports run on request and create no notifier instance. The command accepts only the optional `tables` argument.
 
 - **Live checks need a person.** The permission classifier refuses an automated bare `claude --bg` probe. A person must check the worker effort. Register a Claude worker as `sonnet:low`. Start it through `assign.sh --role implement`. Check that its pane shows `low effort`, not `xhigh`.
 

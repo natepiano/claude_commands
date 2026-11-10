@@ -123,7 +123,7 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
               first_eta, moves, eta_trail: [[target, stated_at]], finished_at, delta_minutes, fix_rounds, findings}
 ```
 
-The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`; the Markdown shows it as `after G<k>`. The unit board reads `build_plan`'s record, not this JSON.
+The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`; the Markdown shows it as `after G<k>`. The Units table reads `build_plan` records for progress and ETA facts.
 
 `current.repair_rounds_since_first_stated_eta` is the `FirstStatedEtaTarget`'s count when a first stated target exists, else `null`, and is present even when `current.eta` is `null`. The Markdown shows no count.
 
@@ -152,7 +152,7 @@ A plan outside a production writes no note.
 - **Hook.** `_refresh_phase_table(session_dir)` follows phase, progress, finish and ETA records.
   It skips a plan with no staff unit. Otherwise it runs `phase_table.py refresh`.
   A failure prints `phase table not written: <reason>` and keeps the recorder's result.
-- **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row and gate, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish, `after G<k>` under an untimed gate). `scripts/direct/board_json.py` builds the unit board from the same record ([unit board](unit-board.md)).
+- **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row and gate, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish, `after G<k>` under an untimed gate). `scripts/production/unit_phases.py` builds the Units table from the same record.
 - **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`, with `history_root`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME` and `PlanPhase`. Tests patch `plan_history.now_epoch` for the clock.
 - **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `<ProgressContract>` in `commands/unit/direct.md` records every ETA the unit director states before stating it (`--phase-id` for a phase other than the active one) and states the recorder's printed time. `docs/direct/phase_end.md` step 2 and `docs/production_format.md` item 3 record the next phase's ETA with `--phase-id <next> --basis checkpoint` before the checkpoint notice. `commands/unit/eta.md` records the ETA, range and `--basis eta-command` before the answer is sent, as `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command on every answer, with the bullets' last end time and no range.
 
@@ -245,3 +245,42 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - **A projection writes its own `why`.** The renderer refuses an ETA move of 15 minutes or more with no reason. Refusing the build instead would bring back hand-typed reasons.
 - **The builder checks against the renderer's own parser.** The range and stated-moment rules live in the renderer, so the builder writes only what `parse_range_end` reads back. `RecordEtaRangeOmitted` stays reachable for an end more than a day from its ETA.
 - **Older `eta_seen.json` text is adopted, not parsed.** Adoption keeps `first_seen` and `requested`, so a held unit is not asked twice.
+
+
+## Recording ETAs and chained predictions
+
+`progress_history.py eta` records the promise before the director states it.
+Use `--time`, `--basis`, and an optional `--phase-id`.
+A range needs both `--earliest` and `--latest` and must contain the promise.
+Short times mean today in the user zone; later dates need `YYYY-MM-DDTHH:MM`.
+The command refuses past times and local times that the clock skips.
+It prints `ETA recorded: HH:MM <zone>`.
+
+The `eta_stated` event names the target through `eta_phase_id`.
+`phase_id` names the phase active when the director recorded the promise.
+The basis is `checkpoint`, `eta-command`, or `stated`.
+An ETA recorded before its phase starts still belongs to that phase.
+
+`build_plan` combines phase headings, durable run events, and stated promises.
+History follows each phase's title family across instances.
+It excludes retired work under a reused phase number.
+`eta_trail` holds actual promises; `schedule_end` holds the prediction used for later phases.
+A passed promise remains visible as late, while the schedule advances for future work.
+Typical completed-phase durations and gaps predict the remaining phases.
+The Units table only formats these facts.
+
+## The short report
+
+`progress_history.py progress` prints the clocks table, phase heading, ETA line, stage, and worker lines.
+`--tables` adds the round table and its earlier-work line.
+Verification gate lines appear in both report forms.
+The ETA line shows the latest promise, its first value, moves, repair rounds, and overdue time.
+It reports unavailable ETA facts explicitly.
+Worker lines use each worker's live window or newest finished window.
+The clocks table uses the predicted plan finish for Project ETA.
+The legacy layout keeps its existing form and adds the ETA line.
+
+`/unit:report [tables|on|off]` presents the report and copies the clocks table without changes.
+`tables` adds the round table after the clocks table.
+Delegation launch and result replies end with this short report.
+Use `/showrunner:units` for the production's Units table.

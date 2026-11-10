@@ -92,7 +92,7 @@ Everything below is the contract.
    verification gate lines byte for byte. Worker narration supplies step 7;
    never paste the `- **Agent N**` lines themselves.
 6. Present sections in this order: phase and stage, ETA line, summary table,
-   worker table, summary sentences, then `See /showrunner:unit_board for the board.`
+   worker table, and summary sentences.
    For `tables`, put the round table after the summary table. If early review
    is armed, say the writer and reviewer are working at once.
 

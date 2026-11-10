@@ -2,10 +2,11 @@
 
 `scripts/copies/copies.py` is the single place that makes gate, review, merge,
 and landing checkouts.
-`standing` calls `keeps_build_cache(source, base)` to select the copy lifetime.
+`standing` calls `keeps_build_cache(source, base)` to select cache storage.
 The function runs `git cat-file -e <base>:Cargo.toml`.
-A root manifest in the selected commit selects a standing copy.
-Other commits select a fresh copy, including commits with only nested Cargo manifests.
+Every gate uses a private temporary checkout under TMPDIR.
+A root Cargo manifest selects a retained cache slot.
+Other commits keep no gate cache, including commits with only nested Cargo manifests.
 
 ## Configuration, place, and names
 
@@ -24,13 +25,13 @@ below is required; the implementation has no fallback values.
 
 These values come from configuration.
 `owner.nightly=nightly`, `owner.style=style`, and `owner.verify=verify` supply owners when production context is unavailable.
-Each owner and repository with a root Cargo manifest has two standing checkout slots.
+Each owner and repository with a root Cargo manifest has two standing cache slots.
 
 The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
 paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
-Standing trees live below `<root>/<repo>/`.
+Standing cache folders live below `<root>/<repo>/`.
 `StaffOwner(row_id)` identifies a staff row. `RoleOwner(name)` identifies a fixed role without a staff row.
 The records hold the row id or the role name.
 A new folder uses the current staff name or the role name, followed by `-gate`.
@@ -49,8 +50,9 @@ A cycle of local origins is an error.
 A repository without an origin uses its main checkout's folder name.
 Linked worktrees and local clones use the same identity.
 `~/.claude` has no root Cargo manifest and uses fresh copies.
-Its nested proof crate does not select a standing copy.
-The root under `~/worktrees` belongs to the existing trusted direnv root.
+Its nested proof crate does not select a standing cache.
+The cache root under `~/worktrees` belongs to the existing trusted direnv root.
+The temporary checkout uses a separate record for direnv trust.
 
 The CLI reads the calling session's local staff row.
 A worker uses its parent unit's row id.
@@ -59,38 +61,44 @@ Text owners enter through one boundary as staff row ids or fixed role names.
 
 ## Fresh copies
 
-`fresh_tree(owner)` creates a scratch task folder with the default task and the word `<current staff name>-gate` or `<role>-gate`.
-It creates a `checkout` folder inside the task folder and yields a `GateLease`.
-The task folder's busy lock protects the copy throughout preparation and caller use.
+`fresh_tree(owner)` creates one `TemporaryDirectory` under TMPDIR for every gate.
+Its prefix contains the current staff name or role name and `-gate`.
+It creates a `checkout` folder inside that temporary folder and yields a `GateLease`.
+The temporary folder's busy lock protects preparation and caller use.
 Command children inherit the lease descriptors.
-Fresh copies do not use the standing pool or register as editable workspaces.
-Overlapping callers receive separate folders without waiting for another caller.
+The checkout does not register as an editable workspace or a scratch task.
+Preparation writes `.gate-copy.json` beside `checkout/`, outside the tracked tree.
+The record contains `task`, `source_path`, and the selected `source_commit`.
+`copy_record.record_path(checkout)` finds this record in another process.
+`nix_env.registered_copy()` requires a regular `.envrc` whose blob matches that commit in the trusted source.
+A changed `.envrc` or an untrusted source receives no automatic approval.
+The temporary folder removes the record when the gate ends.
+The standing cache keeps its separate `.gate.json` record.
+Cargo gates also hold a standing cache lease.
+Other gates receive separate folders without waiting for a cache slot.
 
 Preparation fetches the selected commit and applies the requested source and merge policies.
-The context removes the task folder after success, a caller exception, or a preparation failure.
+The context removes the temporary folder after success, a caller exception, or a preparation failure.
 A failed removal raises `PostUseError` and retains the caller's exception in `caller_error`.
-A killed process leaves the folder for the scratch sweep.
-`fresh_tree` sets the scratch record's `throwaway` mark because code creates the folder and no person edits it.
-The sweep skips the Git work check for a marked folder.
-The busy lock, expiry, and other keep rules still apply.
-An absent mark means false, so other folders keep their Git work protection.
-No command-line option sets the mark.
-Fresh copies skip the metadata and cache refresh after use.
+TMPDIR cleanup at reboot removes folders left by killed processes.
+Non-Cargo gates skip the metadata and cache refresh after use.
 
 ## Reset and build output
 
-The first standing use makes a clone with its own `.git` directory.
+Each gate makes a clone with its own `.git` directory.
 The clone borrows objects from the last available store in the source's single-path alternates chain.
 A missing store, repeated store, or alternates file with multiple lines ends the chain.
 A source with no chain keeps its own objects as the borrowed store.
 When the last store belongs to a registered scratch copy, the clone copies objects without an alternates file.
 The existing refresh fetches the source's own objects.
-Task clones and editable workspaces clone the source with `--shared`.
+Task clones and editable workspaces normally clone the source with `--shared`.
+A copy made from an active temporary gate uses `--no-local` to keep its own objects after that gate ends.
 They retain commits that exist only in the source, including detached commits.
 The gate then works after intermediate clones or the registered scratch source are removed.
 It never copies a linked worktree's `.git` pointer or changes the source's branches.
-The clone's Git metadata starts inside the locked directory.
-The code then installs this metadata without releasing the lock.
+The clone stages only Git metadata inside a `TemporaryDirectory` within the locked checkout.
+The code moves `.git` into the checkout before the staging context ends.
+The context removes staging files after a clone failure.
 
 The copy's `origin` URL equals the source repository's `origin` URL.
 Each use refreshes `refs/remotes/origin/*` from the source's matching remote refs.
@@ -103,26 +111,31 @@ Each copy also has a `source` remote with the local source path as its URL.
 Its `refs/remotes/source/*` track the source's local branches.
 The copy sweep uses these refs to detect commits saved in the source.
 Preparation refreshes both remotes with local fetches.
-Standing copies also refresh both remotes after use.
+Cargo gates and editable workspaces also refresh both remotes after use.
 A source without an `origin` remote keeps the local source URL and local branch mapping.
 These copies also keep `source`, so all copies use the same refresh rule.
 Legacy adoption resolves each local origin URL from its own repository before comparison.
 
-Each use fetches the selected commit from the source, checks it out with
-`checkout --force --detach`, and runs `clean -ffdq`. It keeps ignored files,
-including `target/`. Git updates changed files while preserving unchanged file
-modification times, allowing the next build to remain incremental. There is no
-seed copy or shared build directory.
+Each use fetches the selected commit and prepares a new detached checkout.
+A Cargo checkout's `target` symlink points to its standing cache's `target` folder.
+Callers continue to use `<checkout>/target`.
+The standing folder retains only `target/`, `.gate.json`, and `.claude-busy` after deploy removes legacy checkout files.
+The code does not remove legacy checkout files.
 
-`scratch.mark_cargo_cache` marks and refreshes `target/`. The existing floor
-sweep can reclaim idle build output; a later gate rebuilds it. The checkout's
-busy mark also protects its target while a caller uses the tree.
-Cache refresh never follows a `target` symlink planted by a caller. The next
-use removes that link and restores a local cache without changing its target.
+The cache's `.gate.json` stores each tracked path's blob identity and modification time in nanoseconds.
+After preparation, a path with the same blob identity receives its saved time.
+A changed blob retains its new checkout time.
+This preserves unchanged source times across temporary checkouts.
+Cargo gates refresh source remotes and both gate records after use.
+
+`scratch.mark_cargo_cache` marks and refreshes the standing cache's `target/`.
+The floor sweep can reclaim idle build output; a later gate rebuilds it.
+The cache's busy mark protects its target while a gate holds the lease.
+Cache marking does not follow a caller's replacement target symlink.
 
 ## Acquisition and cleanup
 
-A standing use holds `scratch.busy_locks(tree, create=True)` throughout preparation and the entire command or Python context. The mark is the existing `.claude-busy`
+A Cargo gate holds `scratch.busy_locks(cache, create=True)` throughout preparation and caller use. The mark is the existing `.claude-busy`
 flock. There is no second lock implementation or central registry.
 
 Standing acquisition tries both trees in order without waiting. If both trees are
@@ -135,7 +148,7 @@ preparation and failed commands release the lock.
 Git runs automatic maintenance synchronously because its children inherit the busy lock.
 This also releases the lock after a failed metadata refresh.
 
-Each prepared tree has one `.gate.json` record:
+Each prepared checkout and standing cache has a `.gate.json` record:
 
 ```json
 {
@@ -151,7 +164,7 @@ Each prepared tree has one `.gate.json` record:
 The record contains the most recent commit, use time, and holder pid. An idle
 tree retains its last holder pid; the lock determines whether it is busy.
 Records are written atomically under the busy lock. Git's `info/exclude` ignores
-`/.gate.json`, `/.claude-busy`, and `/target/`.
+`/.gate.json`, `/.claude-busy`, and `/target`, including the cache symlink.
 
 ## Commands and Python API
 
@@ -175,14 +188,15 @@ The command's exit status is returned, and its output passes through.
 not ignored files. It commits on top of the selected commit with `--no-verify`
 and subject `gate: uncommitted <worktree> at <short sha>`. It reads the source
 without changing it. For `--merge origin/<branch>`, copies.py first fetches the
-branch from the source's origin into the standing checkout, then merges it, so a
-stale source tracking ref cannot select an old merge. Other merge refs are fetched from the
+branch from the source's origin into the temporary checkout.
+It then merges the fetched commit.
+A stale source tracking ref cannot select an old merge. Other merge refs are fetched from the
 source repository. Local origin paths resolve relative to the source repository;
 remote URLs keep their original form. Source refs stay unchanged. The merge uses `--no-ff --no-edit`.
 Failed application or a merge conflict exits 3,
 names the affected files, and releases the lease.
 A fresh copy is deleted.
-The next standing use resets its tree.
+The next gate prepares another temporary checkout.
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py list
@@ -191,7 +205,10 @@ The next standing use resets its tree.
 ```
 
 `list` prints a tab-separated header, then numbered local trees followed by remote mirrors sorted by host and path. The header is `number owner repository host path session commit state holder_pid target`.
-Local host values come from `socket.gethostname()`.
+Local gate rows and `localhost` mirror rows display `socket.gethostname()`.
+Stored mirror host names and registry keys retain `localhost`.
+List and sweep reads remove registry rows whose local checkout is gone.
+A lease with `create=False` does not create a parent folder.
 An unreadable `.gate.json` keeps a numbered row with state `unreadable` and owner `unavailable`.
 Its repository comes from the parent folder, unavailable fields use `-`, and stderr names the error. The owner column shows the current
 staff name, a role name, or `unavailable`. A local row shows its commit, busy
@@ -211,8 +228,7 @@ The Python API accepts only a `RepositoryScope` value for `repo`.
 `copies.remove_trees(owner)` uses `AllRepositories()` by default.
 `copies.remove_trees(owner, SelectedRepository(name))` limits removal to one repository identity.
 The API refuses raw strings and paths, including an empty string.
-Removal includes standing checkouts, registered editable copies, and adopted
-legacy workers.
+Removal includes standing caches, registered editable copies, and adopted legacy workers.
 A workspace record saves `repository_identity` during registration.
 Repository removal reads this field without using the source checkout.
 Editable copies retain scratch's checks for unsaved work and active tasks.
@@ -224,7 +240,7 @@ A tombstone has no owner because removal has already condemned it.
 After it releases the locks, it reports each failure on a separate line and exits 2.
 A retry completes interrupted removal. Repeated removal succeeds when the trees are gone.
 
-Unit retirement and run end remove the unit's idle standing trees and workspaces.
+Unit retirement and run end remove the unit's idle standing caches and workspaces.
 A busy local tree prints one line and does not stop retirement or run end.
 A remote mirror failure refuses retirement and keeps the unit worktree for a retry.
 A retirement retry repeats cleanup. The existing cleanup also removes idle trees.
@@ -233,7 +249,7 @@ before it deletes production state. A refusal keeps the state for a retry.
 
 Success exits 0; invalid owners, invalid configuration, and other refused
 operations exit 2. Apply and merge failures exit 3. `run` returns its command's
-status. Repeating a standing use resets the same checkout and retains its build files.
+status. Each gate uses a new checkout and retains its selected Cargo cache.
 The last-use record and cache-use stamp are refreshed.
 A fresh use creates another checkout.
 
@@ -309,16 +325,16 @@ An unset source or Git path inside interpreter text can also pass when its top-l
 
 | Allowed creator | Reason |
 | --- | --- |
-| `scripts/copies/copies.py` | Creates fresh checkouts, standing checkouts, remote mirrors, and registered test clones. |
+| `scripts/copies/copies.py` | Creates temporary gate checkouts, standing caches, remote mirrors, and registered test clones. |
 | `scripts/production/add_unit.py` | Creates original unit worktrees. |
-| `scripts/shutdown/shutdown.py` | Restores original unit worktrees. |
+| `scripts/agents/shutdown.py` | Restores original unit worktrees. |
 | `scripts/style/add_style.py` | Creates a unit's original checkout, like `add_unit.py`. |
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
 
-Standing comparisons run in sequence in one tree or use the second tree.
-More than two standing builds for one owner and repository wait.
-The existing floor sweep handles old copies under `/tmp`.
+Cargo gates use the first available cache slot.
+More than two Cargo gates for one owner and repository wait.
+TMPDIR cleanup at reboot removes checkouts left by killed gate processes.
 
 ## Remote mirrors
 
@@ -330,14 +346,17 @@ Neither caller has a copy-creation exception.
 `remote_lease_path(mirror)` names the lease beside the mirror's registry record.
 The claim service reads `/proc/locks` once and reports held mirrors by host, path, and session.
 A busy lease reads only its own registry record.
-The mirror lease precedes the floor claim lock, which precedes the copy-record lock.
-`mirror_metadata_locks` holds the claim and record locks inside the mirror lease.
-The remote command starts after these metadata locks close.
+The mirror lease covers the claim read and the copy-record lock.
+`read_claims` returns a snapshot after each short admission lock closes.
+`mirror_metadata_locks` holds only the copy-record lock inside the mirror lease.
+The remote command starts after the record lock closes.
 It retains the mirror lease until it ends.
 
 `mark_mirror` writes the record, session, and mark.
 `floor_claims.read_mirror_record` reads a record path, including removal authority.
-`floor_claims` owns the metadata names and the sibling lock paths.
+`floor_claims` owns the metadata names and mirror lock paths.
+An outside mirror lease survives task parent removal.
+The existing sibling lease remains in use for compatibility with live old leases.
 Content removal deletes metadata last, with the record after the session and mark.
 `remote_rsync` protects these names through explicit exclusions.
 Receive recovery keeps the existing owner and preserves a complete replacement record.
@@ -351,7 +370,11 @@ It accepts no source repository path.
 `unit_owner` preserves recorded names, including underscores, and appends one `-unit` suffix.
 
 Mirror checks use `tmp_sweep.process_paths` on Linux and `tmp_sweep.lsof_paths` on the Mac.
-A working directory, open file, or mapped file below the mirror keeps it busy.
+A working directory, mapped file, or file open for writing below the mirror keeps it busy.
+A file open only for reading does not keep the mirror busy.
+Linux reads descriptor flags from `/proc`; lsof includes the `a` access field.
+Named constants describe these uses.
+Temporary sweeps still protect folders with any open file and keep their existing report text.
 A path with only the same text prefix does not keep the mirror busy.
 `mirror_lease_set` takes candidate leases before one shared process scan.
 It classifies mirrors while it holds these leases.

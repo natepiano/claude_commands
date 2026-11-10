@@ -23,7 +23,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 
 | `scripts/direct/prepare_session.sh` | Run start: writes the run-active marker, then creates the instance. |
 
-| `scripts/direct/end_session.sh` | Run end: removes the instance, then the session's own marker. |
+| `scripts/direct/end_session.sh` | Attempts run cleanup, then removes each run's recorded mark through `unit_runs.end`. |
 
 | `scripts/hooks/direct_run.py` | `check` CLI: the unit instance's check. Also a library the worker hooks import. |
 
@@ -33,7 +33,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 
 | `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
 
-| `scripts/shutdown/restart.py`, `restart_support.py` | Legacy record-driven restart restores the recorded notifier state. The shared session stop leaves notifier state unchanged. |
+| `scripts/agents/restart.py`, `restart_support.py` | Legacy record-driven restart restores the recorded notifier state. The shared session stop leaves notifier state unchanged. |
 
 | `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:report_interval` retimes the showrunner instance. |
 
@@ -184,11 +184,17 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 
 - Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`) (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Nothing is called "delegate" (user, 2026-10-20): the directories are `scripts/direct/` and `docs/direct/`, the config is `config/direct.conf`, the variables are `UNIT_*`, the hook module is `scripts/hooks/direct_run.py`, a run's directory is the "unit session directory" (the session-start hook prints `Unit session directory:`), and the agent that receives the work is a "worker". Stored data moves to new names: the history folder is `~/.local/state/unit-history` and the run archive `usage-model/unit-archive` once `unit_runs.py move-history` moves them on each machine; the buildlog field is `unit_session`, renamed in the log files on their next index read; findings record `--caught-by worker`. Until then, and for records already written, these readers keep the old word: the `plan-delegate` and `delegate-archive` folder names, the `plan-delegate` skill in old events, the `delegate_session` field rename, `--caught-by delegate` (accepted and stored as `worker`, and counted in old history), the `delegate.` task names in the history ledger, a phase's `delegated_phase_reservation_state.json`, `/tmp/claude/delegate` and the `delegate-` notifier prefix. The last three go with the old run folder. Two more keep it for good: the old command name `/unit:delegate`, which the model study and the roles audit match in old transcripts and text, and the dated review `docs/direct_footprint_review.md`. The check: `git grep -niwE 'delegates?' -- scripts commands docs ':!docs/plans'`; any hit outside that list breaks the rule.
 
-- **Run folders renamed (user, 2026-10-15).** A run started on or after 2026-10-15 keeps its folder in `/tmp/claude/unit/<run id>/`, its marker in `/tmp/claude/unit/active/<session id>` and its notifier instance in `~/.local/state/notifier/unit-<run id>/`. A run started before keeps `/tmp/claude/delegate/` and `worker-<run id>` until it ends; nothing moves a live run's folder, and finished runs' folders stay where they are. `scripts/lib/unit_runs.py` holds both roots, new first: every Python reader takes its roots, markers and instance names from it, and the shell readers (`unit_notifier.sh`, `end_session.sh`, `unit_status.sh`) check both folders the same way. A sweep `--root` naming either real root covers both, so one root's sweep never takes the other root's live servers for unused ones. **Removal step, on or after 2026-10-22.** The former name stops being read only in its own change, and only once no running session owns a marker under `/tmp/claude/delegate/active/`: the date alone never ends it, since runs such as two-accounts' and screenshot's stay open past it. `unit_runs.py removal-check` exits 0 when none does and 1 naming each owner (session name, id and run folder); on 2026-10-15 it named 18. The step runs it first and stops on 1, then drops `FORMER_RUN_ROOT` and the shell fallbacks, and clear the 17 stale markers that ended runs left in `/tmp/claude/delegate/active/` (dating from 2026-10-05).
+- **Run folders and marks.** Current runs use `/tmp/claude/unit/<run id>/` and `/tmp/claude/unit/active/<session id>`.
+  `scripts/lib/unit_runs.py` retains the supported `delegate` root fallback for earlier runs.
+  `activate` records the mark path in the run's `active_marker` file. `end` removes it only while it still names that run.
+  A sibling `active.lock` serializes mark publication and removal. No unit notifier instance is created or removed.
+  `unit_runs.py removal-check` must prove that no running session owns a former-root mark before the fallback can be removed.
 
 - `prepare_session.sh`'s last line is `Session ready at <dir>`; the `next_due=` or `notifier instance not created:` line comes before it.
 
-- `end_session.sh` removes the instance before the marker, ignoring errors.
+- `end_session.sh` attempts role, worker, and scratch cleanup before it calls `unit_runs.end` for each selected run.
+  A failed cleanup step does not prevent mark removal. The script reports the step and returns nonzero.
+  `copies.py remove` can keep a busy copy without failing the end step.
 
 - `progress` restarts the instance before it reads state or can refuse, so every call, refused ones included, restarts the clock. The restart never fails a report; any failure falls back.
 
@@ -210,8 +216,10 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 - **A skip uses its slot.** An idle unit, a missing session or a hold skips the whole interval, not 15 s.
 - **Timeouts.** `TIMEOUT` (120 s default) bounds both the check and the relay. One relay takes about 9 s; a postmaster delivery about 1 s. `tick` waits for every instance's subshell before it releases `.tick.lock`, so a check must stay fast.
 - **Health window.** `.last_tick` older than 120 s means the job is not running; `health` reports it even for a stopped instance.
-- **Workers inherit `CLAUDE_CODE_SESSION_ID`.** A worker can inherit the unit director's id, so `prepare_session.sh` or `end_session.sh` run from a worker or a test acts on the unit director's marker and instance. Tests run them only with a fresh id and a temp `NOTIFIER_STATE_DIR`; `end_session.sh`'s `remove` inherits that variable.
-- **`UNIT_ACTIVE_DIR`** is set by tests for a checkout's scripts; installed build scripts refuse to run with it set. `direct_run.py`, `unit_status.sh` and `end_session.sh` read it (unset, they read `/tmp/claude/unit/active` and then `/tmp/claude/delegate/active`). `prepare_session.sh` writes under the fixed `/tmp/claude/unit/active`, so a live build caller leaves it unset.
+- **Inherited identities.** A worker can inherit its director's `CLAUDE_CODE_SESSION_ID`.
+  Run preparation and cleanup select `CODEX_THREAD_ID` first, like `staff.runtime_id()`. Tests use fresh identities and fixture run roots.
+- **`UNIT_ACTIVE_DIR`.** Run preparation and cleanup use this override for fixture marks.
+  Without an override, readers support the current `unit` root and the retained `delegate` root.
 - **`progress` cost.** Every `progress` call, refused ones included, spawns one zsh for the restart, even for a run with no instance. Because the restart comes before any refusal, a call that exits with `No active phase to report` or a missing cap stage still moves the next tick one interval out.
 - **`fire`** moves the clock and skips the hold, but a failing check or a missing session still skips it.
 
@@ -263,9 +271,8 @@ from the initial running-session listing. Confirmed-gone owners retain the
 previous behavior. The automatic temp sweep already retains both `active/`
 directories and every marker in them; the folder audit excludes the run roots.
 
-A session's own lifecycle is separate: `end_session.sh` removes its own marker
-when ending its run, and `prepare_session.sh` removes its own former `delegate`
-marker after writing its new `unit` marker. This prevents an obsolete former
+A session's own lifecycle is separate. `finish-run` and `end_session.sh` call `unit_runs.end` to remove the run's recorded mark.
+A repeated finish also attempts removal. `prepare_session.sh` calls `unit_runs.activate` to publish its new mark and remove its former mark. This prevents an obsolete former
 marker from pointing the mover at an old run. `direct_run.active_run` still uses
 its unchanged 12-hour run-content age rule for the hook's own session; that rule
 controls turn continuation and does not authorize deletion.
