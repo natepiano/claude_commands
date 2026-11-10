@@ -350,7 +350,8 @@ umask 077
 box_dir=${{GATE_BOX_DIR:-/var/lib/gate-trial}}
 export box_dir GATE_BOX_DIR="$box_dir"
 mkdir -p "$box_dir"
-exec > "$box_dir/boot.log" 2>&1
+: > "$box_dir/boot.log"
+exec >> "$box_dir/boot.log" 2>&1
 export PATH=$PATH:/run/current-system/sw/bin
 {boot_trap(links)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 {log_upload(links)}

@@ -165,6 +165,7 @@ elif name == 'useradd':
     (root / 'user').touch()
 elif name == 'git' and args[0] == 'clone':
     fail('source ready')
+    print('Cloning the fixture repository.')
     shutil.copytree(root / 'repo', args[-1])
 elif name == 'git' and 'fetch' in args:
     event('fetch ' + args[-1])
