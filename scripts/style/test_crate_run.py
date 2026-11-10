@@ -126,6 +126,8 @@ class CrateRunTests(CargoProjectTests):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
+        # Each test has fixed copies settings and keeps its own settings dictionary.
+        _ = self.enterContext(mock.patch.object(copies, "config_settings", return_value=copies.config_settings()))
         _ = self.base
         _ = self.authority
 
@@ -1010,15 +1012,36 @@ class CrateRunTests(CargoProjectTests):
 
     def test_two_crates_integrate_serially_without_reselecting(self) -> None:
         self.freeze()
-        first = self.advance("bulk_sample")
+        with (mock.patch.object(copies, "standing", wraps=copies.standing) as standing,
+              mock.patch.object(run, "validate", wraps=run.validate) as validate):
+            first = self.advance("bulk_sample")
         first_record = first["crates"]["bulk_sample"]
         self.assertTrue(Path(first_record["result_path"]).exists())
         checkpoint = self.batch.result(first_record)["commit"]
-        with mock.patch.object(run, "select", side_effect=AssertionError("must not reselect")):
+        assert "integration" in first_record
+        first_candidate = first_record["integration"]["commit"]
+        first_sources = [call.args[2] for call in standing.call_args_list]
+        first_checkout = cast(run.WorkspaceEdits, validate.call_args_list[-1].args[0]).repo
+        with (mock.patch.object(run, "select", side_effect=AssertionError("must not reselect")),
+              mock.patch.object(copies, "standing", wraps=copies.standing) as standing,
+              mock.patch.object(run, "validate", wraps=run.validate) as validate):
             result = self.advance("beta")
         second_record = result["crates"]["beta"]
         self.assertTrue(Path(second_record["result_path"]).exists())
         second = self.batch.result(second_record)["commit"]
+        assert "integration" in second_record
+        second_candidate = second_record["integration"]["commit"]
+        second_sources = [call.args[2] for call in standing.call_args_list]
+        second_checkout = cast(run.WorkspaceEdits, validate.call_args_list[-1].args[0]).repo
+        for record, candidate, sources, checkout, reused in (
+            (first_record, first_candidate, first_sources, first_checkout, True),
+            (second_record, second_candidate, second_sources, second_checkout, False),
+        ):
+            with self.subTest(directory=record["directory"]):
+                self.assertEqual(copies.CommittedSource(candidate) not in sources, reused)
+                self.assertEqual(checkout == Path(record["checkout"]), reused)
+                self.assertEqual(self.git("rev-parse", candidate + "^{tree}")
+                                 == self.batch.result(record)["tree"], reused)
         self.assertEqual(result["crates"]["beta"]["stage"], crates.CrateStage.INTEGRATED)
         for commit in (checkpoint, second):
             self.assertEqual(self.git("merge-base", commit, self.destination), commit)
@@ -2085,6 +2108,33 @@ class CrateRunTests(CargoProjectTests):
         self.assert_pending(record)
         assert "integration" in record
         self.assertEqual(record["integration"]["stage"], crates.IntegrationStage.PREPARED)
+        worker = Path(record["checkout"])
+        source = worker / "src/lib.rs"
+        original = source.read_text()
+        commit = self.batch.result(record)["commit"]
+        for prepared, edit in ((True, "dirty"), (False, "head")):
+            with self.subTest(prepared=prepared, edit=edit):
+                if not prepared:
+                    manifest = self.batch.read()
+                    _ = manifest["crates"]["bulk_sample"].pop("integration", None)
+                    self.batch.save(manifest)
+                moved = commit
+                if edit == "dirty":
+                    _ = source.write_text(original + "// private edit\n")
+                else:
+                    moved = run.git(worker, "commit-tree", self.batch.result(record)["tree"],
+                                    "-p", commit, "-m", "private worker commit")
+                    _ = run.git(worker, "update-ref", record["branch"], moved, commit)
+                with mock.patch.object(run, "test_tree", side_effect=failed):
+                    with self.assertRaisesRegex(bulk.BulkRenameError, "combined-tree proof failed"):
+                        _ = self.advance("bulk_sample")
+                self.assert_pending(self.batch.read()["crates"]["bulk_sample"])
+                if edit == "dirty":
+                    self.assertEqual(source.read_text(), original + "// private edit\n")
+                    _ = source.write_text(original)
+                else:
+                    self.assertEqual(run.git(worker, "rev-parse", "HEAD"), moved)
+                    _ = run.git(worker, "update-ref", record["branch"], commit, moved)
         self.assertEqual(self.advance("bulk_sample")["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
 
     def test_exact_union_mismatch_retains_pending_claims_and_refs(self) -> None:
@@ -2230,11 +2280,14 @@ class CrateRunTests(CargoProjectTests):
         old_candidate = before["integration"]["commit"]
         moved = self.git("commit-tree", self.tree, "-p", self.base, "-m", "destination moved")
         _ = self.git("update-ref", self.destination, moved, self.base)
-        with mock.patch.object(run, "test_tree", wraps=run.test_tree) as proving:
+        with (mock.patch.object(run, "test_tree", wraps=run.test_tree) as proving,
+              mock.patch.object(copies, "standing", wraps=copies.standing) as standing):
             result = self.advance("bulk_sample")
         self.assertEqual(proving.call_count, 1)
         record = result["crates"]["bulk_sample"]
         assert "integration" in record
+        self.assertIn(copies.CommittedSource(record["integration"]["commit"]),
+                      [call.args[2] for call in standing.call_args_list])
         self.assertNotEqual(record["integration"]["commit"], old_candidate)
         self.assertEqual(self.git("rev-parse", self.destination + "^1"), moved)
         self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
