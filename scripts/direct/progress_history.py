@@ -1565,6 +1565,7 @@ def _start_run(args: argparse.Namespace) -> None:
     owner = unit_runs.run_owner(state, record)
     if isinstance(owner, staff.StaffRow):
         state[unit_runs.OWNER_FIELD] = owner.id
+        _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
     _write_state(session_dir, state)
     _append_event(state, _event(state, "run_started", now))
     print(history_file)
@@ -1638,6 +1639,12 @@ def _start_phase(args: argparse.Namespace) -> None:
     except phase_reservation.StateRefused as refused:
         raise SystemExit(str(refused)) from refused
     if _string(state.get("status")) != "active" and "finished_at" in state:
+        director = unit_runs.director(session_dir) or _string(
+            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
+        if director:
+            row = staff.by_current_session(director)
+            if row is not None:
+                _ = staff.set_run(row.id, staff.OpenRun(session_dir))
         previous_status = _string(state.get("status"))
         state["status"] = "active"
         _ = state.pop("finished_at", None)
@@ -1645,12 +1652,6 @@ def _start_phase(args: argparse.Namespace) -> None:
         reopened.update({"previous_status": previous_status, "cause": "start-phase", "phase_id": phase_id})
         _append_event(state, reopened)
         _write_state(session_dir, state)
-        director = unit_runs.director(session_dir) or _string(
-            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
-        if director:
-            active_root = os.environ.get("UNIT_ACTIVE_DIR")
-            # A temporary run stays within its temporary root unless explicitly configured.
-            unit_runs.activate(session_dir, director, Path(active_root) if active_root else session_dir.parent / "active")
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     active = _object_dict(state.get("phase"))
@@ -6561,6 +6562,12 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     _refresh_phase_table(session_dir)
 
 
+def _clear_run_pointer(session_dir: Path) -> None:
+    for row in staff.initial_snapshot().rows:
+        if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == session_dir.resolve():
+            _ = staff.clear_run(row.id, session_dir)
+
+
 def _finish_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -6573,7 +6580,7 @@ def _finish_run(args: argparse.Namespace) -> None:
         _finish_phase(finish_args)
         state = _read_state(session_dir)
     if _string(state.get("status")) != "active":
-        unit_runs.end(session_dir)
+        _clear_run_pointer(session_dir)
         return
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
@@ -6591,7 +6598,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
-    unit_runs.end(session_dir)
+    _clear_run_pointer(session_dir)
     _refresh_phase_table(session_dir)
 
 

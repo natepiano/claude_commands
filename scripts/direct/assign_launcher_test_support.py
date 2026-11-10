@@ -151,7 +151,7 @@ class AssignLauncherFixture(unittest.TestCase):
         self.registry = self.native.fixture.root / "conf/models.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "UNIT_HISTORY_DIR": str(self.history), "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
+            "UNIT_HISTORY_DIR": str(self.history), 
             "UNIT_RUN_ROOT": str(self.session_dir.parent), "ROSTER_RUN_ROOT": str(self.session_dir.parent),
             "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
             "PYTHONPATH": str(ROOT), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),

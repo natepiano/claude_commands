@@ -98,7 +98,7 @@ class DemoteShowrunnerTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()))
         self.observed = self.enterContext(mock.patch.object(unit_lookup, "observed_session_labels", side_effect=self.session_labels))
         _ = self.enterContext(mock.patch.object(promote_showrunner, "_session_status", return_value="idle"))
-        _ = self.enterContext(mock.patch.object(promote_showrunner, "run_marker", return_value=self.root / "run-marker"))
+        _ = staff.set_run(self.parent.id, staff.OpenRun(self.root / "parent-run"))
         _ = self.enterContext(mock.patch.object(promote_showrunner, "read_place", return_value="fixture pane"))
         _ = self.enterContext(mock.patch.object(unit_effort, "verdict", return_value=unit_effort.Ready()))
         self.detach = self.enterContext(mock.patch.object(showrunners, "main", side_effect=self.detach_child))
@@ -258,6 +258,16 @@ class DemoteShowrunnerTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         self.assertEqual(self.run_command()[0], 2)
         self.assert_no_actions(before)
+
+    def test_refuses_a_child_with_an_open_run(self) -> None:
+        _ = staff.set_run(self.child.id, staff.OpenRun(self.root / "child-run"))
+        before = self.staff_file.read_bytes()
+        for flags in ((), ("--check",)):
+            with self.subTest(flags=flags):
+                code, _, errors = self.run_command(*flags)
+                self.assertEqual(code, 2)
+                self.assertIn("has a /unit:direct run open", errors)
+                self.assert_no_actions(before)
 
     def test_refuses_busy_forms_prompts_and_drafts(self) -> None:
         before = self.staff_file.read_bytes()

@@ -84,7 +84,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
             "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": "",
             "BUILDLOG_PEAK": "", "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_HOLD_DIR": str(self.root / "holds"), "BUILD_HOLD_RELEASE_DIR": str(self.root / "releases"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "HOME": str(self.root)}
         from scripts.lint.test_memory_admit import write_memory_config
         write_memory_config(self.root / "build_admission.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")

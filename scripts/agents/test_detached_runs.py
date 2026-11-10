@@ -758,9 +758,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                              for line in path.read_text().splitlines()) + "\n")
         self.run_dir.mkdir()
         write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
-        marker = unit_runs.marker(self.fixture.parent.current_session)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(marker, str(self.run_dir) + "\n")
+        _ = staff.set_run(self.fixture.parent.id, staff.OpenRun(self.run_dir))
         server_run = self.fixture.world.run
 
         def input_line(*arguments: str, deadline: float = math.inf) -> str:
@@ -844,8 +842,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         other_run = self.fixture.root / "other-run"
         other_run.mkdir()
         write_text_atomic(other_run / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
-        # The run root's marker names the parent's current run among its two runs.
-        write_text_atomic(unit_runs.marker(self.fixture.parent.current_session, self.fixture.root / "active"), str(self.run_dir) + "\n")
+        # The staff row names the current run.
+        _ = staff.set_run(self.fixture.parent.id, staff.OpenRun(self.run_dir))
         runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         for requested_run in (self.run_dir, other_run):
             with self.subTest(session_dir=requested_run):

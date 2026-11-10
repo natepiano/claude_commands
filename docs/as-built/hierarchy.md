@@ -177,14 +177,14 @@ Tab reconciliation follows the notice. A failed tab move does not reverse the me
 `herdr.tab_order` keeps saved tabs in order and inserts new tabs after the last compatible position.
 The showrunner comes first, then unit directors alphabetically, then other tabs alphabetically.
 
-`unit_runs.activate(run, session_id, active_override=None)` writes the mark and records its path in `<run>/active_marker`.
-`unit_runs.end(run) -> None` removes only a recorded mark that still names that run.
-A sibling `active.lock` serializes publication and removal.
-`progress_history.py finish-run` calls this function even for an already finished run.
-`end_session.sh` calls it after attempting role, worker, and run-scratch cleanup.
-Those failures print their step and produce a nonzero exit without preventing mark removal.
+`staff.set_run(identity, OpenRun(run))` records the director's open run in its staff row.
+`unit_runs.open_run(session_id)` reads the row whose `current_session` matches the session.
+`staff.clear_run(identity, run)` clears the pointer only while it still names that run.
+`progress_history.py finish-run` clears the pointer even for an already finished run.
+`end_session.sh` clears it after role, worker, and run scratch cleanup.
+A cleanup failure prints its step and returns nonzero.
+The failure does not prevent pointer cleanup.
 A busy repository copy can remain through the separate `copies.py remove` step.
-The marker cleanup has no old-record search.
 
 Workers create private work folders with `scratch.py new --worker [--name <word>]`.
 Names have the form `<showrunner>-<unit>-<worker>-<suffix>[-<word>]` under `TMPDIR`.

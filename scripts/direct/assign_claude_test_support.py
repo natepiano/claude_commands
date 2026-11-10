@@ -404,7 +404,6 @@ class AssignClaudeLauncherFixture(LauncherFixture):
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
-        environment["UNIT_ACTIVE_DIR"] = str(self.root / "active")
         environment["UNIT_RUN_ROOT"] = str(self.root / "runs")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         return environment

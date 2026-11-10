@@ -92,7 +92,7 @@ def grant_call(path: Path) -> None:
     with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
+        "STAFF_FILE": str(release.parent / "staff.json"),
     }), mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
          mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
         holders = build_hold.read_holders(build_hold.holder_directory())
@@ -105,7 +105,7 @@ def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> 
     with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
+        "STAFF_FILE": str(release.parent / "staff.json"),
     }), build_hold.release_lock():
         cycle = build_hold.read_cycle()
         assert cycle is not None
@@ -280,7 +280,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-            "UNIT_ACTIVE_DIR": str(root / "active"),
+            "STAFF_FILE": str(root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "UNIT_TEAM_ROLE": "", "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),

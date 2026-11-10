@@ -110,7 +110,7 @@ class RosterTests(unittest.TestCase):
         self.runs = self.root / "runs"
         binaries = self.root / "bin"
         for directory in (
-            self.home, self.sessions, self.notifier, self.runs / "active", binaries,
+            self.home, self.sessions, self.notifier, self.runs, binaries,
             self.root / "history" / "runs",
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -340,9 +340,7 @@ class RosterTests(unittest.TestCase):
         self.director_run.mkdir()
         _ = (self.director_run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: unit.id}),
                                                                encoding="utf-8")
-        _ = (self.runs / "active" / "17e44ec4-3e24-5ae1-b10d-5cf30de9455b").write_text(
-            str(self.director_run) + "\n", encoding="utf-8",
-        )
+        _ = staff.set_run(unit.id, staff.OpenRun(self.director_run))
         _ = (self.director_run / "workers").write_text(
             "12345678\talpha-test\n", encoding="utf-8",
         )
@@ -376,9 +374,8 @@ class RosterTests(unittest.TestCase):
 
         solo_run = self.runs / "solo-run"
         solo_run.mkdir()
-        _ = (self.runs / "active" / "22135b22-7da2-5f04-8840-738da7f248ba").write_text(
-            str(solo_run) + "\n", encoding="utf-8",
-        )
+        solo = fixture_member("agent", name="solo-director", runtime_id="22135b22-7da2-5f04-8840-738da7f248ba")
+        _ = staff.set_run(solo.id, staff.OpenRun(solo_run))
 
         orphan_run = self.runs / "orphan-run"
         self._write_pane_workers(orphan_run, {
@@ -397,9 +394,8 @@ class RosterTests(unittest.TestCase):
                 "launcher_pid": os.getpid(),
             },
         })
-        _ = (self.runs / "active" / "dead-director").write_text(
-            str(stale_run) + "\n", encoding="utf-8",
-        )
+        dead = fixture_member("agent", name="dead-director")
+        _ = staff.set_run(dead.id, staff.OpenRun(stale_run))
 
         dead_server_run = self.runs / "dead-server-run"
         self._write_pane_workers(dead_server_run, {
@@ -2588,7 +2584,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         self.runs = self.root / "runs"
         self.registry = self.root / "sessions"
         notifier = self.root / "notifier"
-        for directory in (self.runs / "active", self.registry, notifier, self.root / "home"):
+        for directory in (self.registry, notifier, self.root / "home"):
             directory.mkdir(parents=True)
         self.environment = {
             **os.environ, "HOME": str(self.root / "home"),
@@ -2656,7 +2652,9 @@ class CodexHolderLabelsTests(unittest.TestCase):
         ]
         self.addCleanup(pane_patches.clear)
         self.addCleanup(self.pane_world.process_directory.cleanup)
-        _ = (self.runs / "active" / self.director_id).write_text(str(run) + "\n")
+        row = staff.local_snapshot().by_current_session(self.director_id)
+        assert row is not None
+        _ = staff.set_run(row.id, staff.OpenRun(run))
 
     def process(self, pid: int, parent: int, argv: list[str], environment: str = "") -> None:
         directory = self.root / "proc" / str(pid)

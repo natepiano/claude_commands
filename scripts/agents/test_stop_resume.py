@@ -732,14 +732,13 @@ class StopResumeTests(unittest.TestCase):
                      {"type": "response_item", "payload": {"type": "message", "role": "user",
                          "content": [{"type": "input_text", "text": text}]}})
             atomic_file.write_text_atomic(worker_admission.transcript_source(child, backend), json.dumps(event) + "\n")
-        from scripts.lib import unit_runs as owned_runs
         with (patch("scripts.lib.unit_runs.run_roots", return_value=(runs,)),
-              patch.object(owned_runs, "held", return_value=[str(run)]),
+              patch.object(unit_runs, "held", return_value=[str(run)]),
               patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}),
               patch.object(staff, "initial_snapshot", return_value=staff.local_snapshot()),
               patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start):
-            owned_runs.activate(run, owner.current_session)
-            self.assertEqual(owned_runs.director(run), owner.current_session)
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
+            self.assertEqual(unit_runs.director(run), owner.current_session)
             result = stop_resume.resume(owner.current_session, why="account move", to="claude4")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         message = cast(str, start.call_args.args[3])
