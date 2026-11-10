@@ -7,6 +7,7 @@ import os
 from typing import cast
 import json
 from io import StringIO
+from pathlib import Path
 from unittest import mock
 
 from scripts.agents import worker_lifecycle
@@ -20,6 +21,32 @@ from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_worker_directory_reports_only_unavailable_worktree_states(self) -> None:
+        fixture = self.row_production()
+        checkout = fixture.doc.parents[1]
+        write_text_atomic(fixture.doc, "# Production\n"
+                          + f"- **Repository:** `{checkout}`\n"
+                          + f"- **Showrunner checkout:** `{checkout}`\n"
+                          + "- **Merge branch:** `merge-from-git`\n"
+                          + "- **Log:** `production.log`\n")
+        retired = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree))
+        unfilled = replace(fixture.unit, worktree=staff.WorktreeUnfilled())
+        show_worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
+        cases = (
+            ("retired-worker", (retired, fixture.worker), fixture.worker, Path.cwd(), ""),
+            ("missing-parent", (fixture.worker,), fixture.worker, Path.cwd(), "staff worktree is unavailable"),
+            ("unfilled-worker", (unfilled, fixture.worker), fixture.worker, Path.cwd(), "staff worktree is unavailable"),
+            ("present-worker", (fixture.unit, fixture.worker), fixture.worker, fixture.worktree, ""),
+            ("showrunner-worker", (fixture.runner, show_worker), show_worker, checkout, ""),
+            ("retired-unit", (retired,), retired, Path.cwd(), "staff worktree is unavailable"),
+        )
+        before = self.staff_state()
+        for state, rows, row, expected, anomaly in cases:
+            with self.subTest(state=state), labels.anomalies() as lines:
+                self.assertEqual(labels.worker_directory(staff.StaffSnapshot(rows), row.id), expected)
+                self.assertEqual(lines, [f"anomaly: {row.id}: {anomaly}"] if anomaly else [])
+        self.assertEqual(self.staff_state(), before)
+
     def test_missing_roster_read_creates_nothing_and_a_writer_creates_the_folder(self) -> None:
         path = self.root / "missing/run/mesh_roster.json"
         self.assertEqual(labels.read_worker_roster(path), {})
