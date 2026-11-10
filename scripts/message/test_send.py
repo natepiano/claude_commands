@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from typing import TextIO, cast, final, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
@@ -5497,8 +5498,8 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             _ = blocked.write_text("#!/bin/sh\necho 'unexpected external tool' >&2\nexit 91\n")
             blocked.chmod(0o755)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
-            "CLAUDE_PYTHON": sys.executable,
             "CONF_DIR": str(self.root / "config"),
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),

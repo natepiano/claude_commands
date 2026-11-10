@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, source_environment
@@ -47,6 +48,7 @@ class DailiesHoldTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, interpreter_cache_environment(self.scratch / "cache"))))
         _ = self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.scratch / "sources"))))
         _ = fixture_member("showrunner", name="fixture")

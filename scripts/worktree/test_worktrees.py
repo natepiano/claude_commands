@@ -9,11 +9,13 @@ import os
 from pathlib import Path
 import socket
 import subprocess
-import sys
 import tempfile
 from typing import NamedTuple, TypedDict, cast, override
 import unittest
 from uuid import uuid4
+
+
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -95,7 +97,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "STAFF_CONFIG": str(config), "STAFF_FILE": str(staff_file),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
-            "CLAUDE_PYTHON": sys.executable, "PYTHONPATH": str(CHECKOUT),
+            **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT),
             "HERDR_BIN": "/nonexistent/herdr",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",

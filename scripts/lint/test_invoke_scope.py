@@ -8,13 +8,14 @@ import os
 import select
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from dataclasses import dataclass
 from typing import cast
+from unittest.mock import patch
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lib import test_hang_guard
 
@@ -32,7 +33,7 @@ class VerifyTemporaryParentTests(NixFixture):
         _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         missing = self.root / "session with spaces" / "tmp"
         _ = self.envrc(self.work)
-        self.env.update({"TMPDIR": str(missing), "CLAUDE_PYTHON": sys.executable})
+        self.env.update({"TMPDIR": str(missing), **interpreter_cache_environment(self.root / "cache")})
         self.script(self.bin / "direnv", '''import os, sys
 from pathlib import Path
 if sys.argv[1] == "allow":
@@ -105,6 +106,12 @@ def require_score_below_500(test: unittest.TestCase) -> None:
         test.skipTest(f"{OOM_SCORE_ADJ} is unavailable")
     if int(Path(OOM_SCORE_ADJ).read_text(encoding="utf-8")) >= 500:
         test.skipTest("this process already runs at oom_score_adj 500 or more, so a 500 in the step proves nothing")
+
+
+def setUpModule() -> None:
+    cache_home = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="invoke-cache-")))
+    _ = cast(object, unittest.enterModuleContext(patch.dict(
+        os.environ, interpreter_cache_environment(cache_home))))
 
 
 class BuildOomScoreAdjReaderTests(unittest.TestCase):

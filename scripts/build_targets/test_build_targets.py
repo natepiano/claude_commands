@@ -19,6 +19,7 @@ from unittest import mock
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
@@ -55,6 +56,11 @@ def pacific_zone() -> Generator[None, None, None]:
             yield
     finally:
         time.tzset()
+
+
+def setUpModule() -> None:
+    cache_home = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="targets-cache-")))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, interpreter_cache_environment(cache_home))))
 
 
 class FolderInvocationTests(NotificationGuardedTestCase):

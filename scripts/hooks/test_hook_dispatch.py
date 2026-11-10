@@ -12,6 +12,7 @@ import textwrap
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from typing import NamedTuple, cast, override
@@ -162,7 +163,7 @@ class IsolatedHookTests(unittest.TestCase):
         # Start afresh: never inherit a director's active run, state, pane or log paths.
         self.environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
         self.environment.update({
-            "HOME": str(self.home), "TMPDIR": str(temp), "USER_ZONE": "UTC",
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home), "TMPDIR": str(temp), "USER_ZONE": "UTC",
             "XDG_STATE_HOME": str(self.home / ".local/state"),
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
             "CLAUDE_CONTEXT_HOOK_DEBUG": "0", "CLAUDE_CONTEXT_HOOK_MODE": "dynamic",
