@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Mapping, MutableMapping
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import io
 import json
@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.copies import copies
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import copy_record, scratch
+from scripts.lib import conf, copy_record, scratch
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.mac_test import floor_claims
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -934,6 +934,107 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
 
+    def test_configuration_reads_reuse_only_unchanged_valid_files(self) -> None:
+        other = self.base / "other-copies.conf"
+        other_root = self.base / "other-gates"
+        _ = other.write_text("".join(f"{key}={value}\n" for key, value in {
+            **self.settings, "root": str(other_root), "owner.verify": "other-owner",
+        }.items()))
+        self.write_config({**self.settings, "owner.verify": "first-owner",
+                           "guard_choice_limit": "17", "allow.fixture.py": "original"})
+        with mock.patch.object(conf, "read", wraps=conf.read) as parsed:
+            host_rows = {"host first": "first", "host second": "second", "host overridden": "third"}
+            for change in ("first read", "unchanged", "edit", "path", "CONF_DIR", "HOME", "inode", *host_rows):
+                host = mock.patch("socket.gethostname", return_value=host_rows[change]) if change in host_rows else nullcontext()
+                with self.subTest(change=change), host:
+                    expected_root = Path(self.settings["root"])
+                    expected_owner = "first-owner"
+                    if change == "edit":
+                        self.write_config({**self.settings, "root": str(other_root),
+                                           "owner.verify": "edited-owner", "guard_choice_limit": "17"})
+                    if change == "path":
+                        os.environ["COPIES_CONFIG"] = str(other)
+                    if change == "CONF_DIR":
+                        os.environ["CONF_DIR"] = str(self.base / "config")
+                    if change == "HOME":
+                        os.environ["HOME"] = str(self.base / "another-home")
+                    if change == "inode":
+                        replacement = self.base / "replacement.conf"
+                        metadata = other.stat()
+                        _ = replacement.write_text(other.read_text().replace("other-owner", "final-owner"))
+                        os.utime(replacement, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                        _ = replacement.replace(other)
+                    if change == "host first":
+                        _ = other.write_text("".join(f"{key}={value}\n" for key, value in {
+                            **self.settings, "root": str(other_root), "owner.verify": "first-owner",
+                            "owner.verify.first": "first-owner", "owner.verify.second": "second-owner",
+                            "owner.verify.third": "third-owner",
+                        }.items()))
+                    if change == "host overridden":
+                        _ = other.write_text(other.read_text() + "# New file version.\n")
+                    if change == "edit":
+                        expected_root, expected_owner = other_root, "edited-owner"
+                    elif change in {"path", "CONF_DIR", "HOME", "inode"}:
+                        expected_root = other_root
+                        expected_owner = "final-owner" if change == "inode" else "other-owner"
+                    if change in host_rows:
+                        expected_root = other_root
+                        expected_owner = host_rows[change] + "-owner"
+                    before = parsed.call_count
+                    result = copies.load_config()
+                    self.assertEqual(result.root, expected_root)
+                    self.assertEqual(copies.fallback_owner("verify"), expected_owner)
+                    self.assertEqual(parsed.call_count - before, 0 if change == "unchanged" else 1)
+                    self.assertEqual(copies.load_config(), result)
+                    self.assertEqual(parsed.call_count - before, 0 if change == "unchanged" else 1)
+                    if change == "first read":
+                        self.assertEqual(copies.guard_choice_limit(), 17)
+                        with self.assertRaises(TypeError):
+                            cast(MutableMapping[str, str], result.allow_list)["fixture.py"] = "changed"
+                        self.assertEqual(copies.load_config().allow_list["fixture.py"], "original")
+
+    def test_recovered_configuration_values_follow_git_history_even_when_the_text_matches(self) -> None:
+        _ = self.git(self.base, "init", "-q")
+        live = "".join(f"{key}={value}\n" for key, value in self.settings.items())
+        live += "# one of: other\nowner.verify=verify\n"
+        with mock.patch.object(conf, "read", wraps=conf.read) as parsed:
+            for owner in ("verify", "updated"):
+                with self.subTest(owner=owner):
+                    self.write_config({**self.settings, "owner.verify": owner})
+                    _ = self.git(self.base, "add", "copies.conf")
+                    _ = self.git(self.base, "commit", "-qm", "Update the configured owner")
+                    _ = self.configuration.write_text(live)
+                    # Keep the live file version fixed while its Git history changes.
+                    os.utime(self.configuration, ns=(1_000_000_000, 1_000_000_000))
+                    before = parsed.call_count
+                    with conf.diagnostics(report=False) as warnings:
+                        for attempt in range(2):
+                            with self.subTest(attempt=attempt):
+                                self.assertEqual(copies.fallback_owner("verify"), owner)
+                    self.assertEqual(parsed.call_count - before, 2)
+                    self.assertEqual(len(warnings), 2)
+
+    def test_guard_limit_reuses_and_refreshes_the_repository_fallback(self) -> None:
+        repository = self.base / "repository-copies.conf"
+        for limit in (23, 0, 31):
+            with self.subTest(limit=limit):
+                _ = repository.write_text("".join(f"{key}={value}\n" for key, value in {
+                    **self.settings, "guard_choice_limit": str(limit),
+                }.items()))
+                with mock.patch.object(copies, "COPIES_REPOSITORY_CONFIG", repository), \
+                        mock.patch.object(conf, "read", wraps=conf.read) as parsed:
+                    if limit == 0:
+                        for attempt in range(2):
+                            with self.subTest(attempt=attempt), self.assertRaisesRegex(
+                                copies.CopyError, "guard_choice_limit must be positive",
+                            ):
+                                _ = copies.guard_choice_limit()
+                    else:
+                        self.assertEqual(copies.guard_choice_limit(), limit)
+                        first_reads = parsed.call_count
+                        self.assertEqual(copies.guard_choice_limit(), limit)
+                        self.assertEqual(parsed.call_count, first_reads)
+
     def test_missing_or_invalid_required_configuration_refuses_before_clone(self) -> None:
         variants = [
             {**self.settings, key: value}
@@ -946,9 +1047,16 @@ class StandingTests(unittest.TestCase):
         for settings in variants:
             with self.subTest(settings=settings):
                 self.write_config(settings)
+                with mock.patch.object(conf, "read", wraps=conf.read) as parsed:
+                    for attempt in range(2):
+                        with self.subTest(attempt=attempt), self.assertRaises(copies.CopyError):
+                            _ = copies.load_config()
+                    self.assertEqual(parsed.call_count, 1)
                 result = self.run_cli()
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.gates.exists())
+                self.write_config(self.settings)
+                self.assertEqual(copies.load_config().wait_seconds, float(self.settings["wait_seconds"]))
 
     def test_linked_source_uses_canonical_repository_folder_name(self) -> None:
         linked = self.base / "linked-worktree"

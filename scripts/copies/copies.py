@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 from threading import Event, Thread
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
@@ -350,17 +351,52 @@ class CopiesConfiguration:
     wait_seconds: float
     git_timeout_seconds: float
     guard_timeout_seconds: float
-    allow_list: dict[str, str]
+    allow_list: Mapping[str, str]
 
 
-def config_settings() -> tuple[Path, dict[str, str]]:
-    path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
-    path = path.expanduser()
-    return path, conf.read(path).values()
+COPIES_REPOSITORY_CONFIG = Path(__file__).resolve().parents[2] / "config/copies.conf"
 
 
-def load_config() -> CopiesConfiguration:
-    path, values = config_settings()
+@dataclass(frozen=True)
+class CopiesSettingsVersion:
+    environment: tuple[tuple[str, str], ...]
+    host: str
+    inode: int
+    size: int
+    mtime_ns: int
+
+
+_CONFIG_SETTINGS_CACHE: dict[Path, tuple[CopiesSettingsVersion, Mapping[str, str]]] = {}
+
+
+def _read_config_settings(path: Path) -> Mapping[str, str]:
+    """Reuse live values while their file, environment and host stay the same."""
+    path = path.absolute()
+    try:
+        metadata = path.stat()
+    except OSError:
+        return conf.read(path).values()
+    version = CopiesSettingsVersion(
+        tuple((name, os.environ[name]) for name in ("COPIES_CONFIG", "CONF_DIR", "HOME") if name in os.environ),
+        socket.gethostname(), metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+    )
+    cached = _CONFIG_SETTINGS_CACHE.get(path)
+    if cached is not None and cached[0] == version:
+        return cached[1]
+    reader = conf.read(path)
+    values = MappingProxyType(reader.values())
+    # Recovered settings can depend on Git history. Read them again at each use.
+    if reader.uses_only_live_values():
+        _CONFIG_SETTINGS_CACHE[path] = version, values
+    return values
+
+
+def config_settings() -> tuple[Path, Mapping[str, str]]:
+    path = Path(os.environ.get("COPIES_CONFIG") or COPIES_REPOSITORY_CONFIG).expanduser()
+    return path, _read_config_settings(path)
+
+
+def _copies_configuration(path: Path, values: Mapping[str, str]) -> CopiesConfiguration:
     try:
         root = Path(values["root"]).expanduser()
         delay = float(values["wait_seconds"])
@@ -372,17 +408,21 @@ def load_config() -> CopiesConfiguration:
             raise ValueError("wait_seconds, git_timeout_seconds and guard_timeout_seconds must be finite and positive")
     except (KeyError, ValueError) as error:
         raise CopyError(f"{path}: invalid copies configuration: {error}") from error
-    allow_list = {key.removeprefix("allow."): reason for key, reason in values.items()
-                  if key.startswith("allow.") and reason}
+    allow_list = MappingProxyType({key.removeprefix("allow."): reason for key, reason in values.items()
+                                  if key.startswith("allow.") and reason})
     return CopiesConfiguration(root.resolve(), delay, git_timeout, guard_timeout, allow_list)
+
+
+def load_config() -> CopiesConfiguration:
+    return _copies_configuration(*config_settings())
 
 
 def guard_choice_limit() -> int:
     """Read the branch limit, using the repository setting for older configuration files."""
     path, values = config_settings()
     if "guard_choice_limit" not in values:
-        path = Path(__file__).resolve().parents[2] / "config/copies.conf"
-        values = conf.read(path).values()
+        path = COPIES_REPOSITORY_CONFIG
+        values = _read_config_settings(path)
     try:
         limit = int(values["guard_choice_limit"])
         if limit <= 0:

@@ -174,15 +174,13 @@ class ConfigRead:
         result: dict[str, str] = {}
         for key in keys:
             setting = _setting(keys, key)
-            if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
-                result[key] = setting.value
-                continue
-            try:
-                _limits(setting)
-                result[key] = setting.value
-            except ValueError:
-                result[key] = self.text(key)
+            result[key] = setting.value if _uses_stored_value(setting) else self.text(key)
         return result
+
+    def uses_only_live_values(self) -> bool:
+        """Return whether every selected value needs no recovery from another source."""
+        settings = self.settings
+        return isinstance(settings, dict) and all(_uses_stored_value(_setting(settings, key)) for key in settings)
 
     def _recover_file(self, fault: _UnreadableFile) -> dict[str, Setting]:
         if fault.missing and self.repository_allowed and isinstance(self.file, str):
@@ -252,6 +250,17 @@ def _setting(settings: dict[str, Setting], key: str) -> Setting:
         if candidate in settings:
             return settings[candidate]
     raise _MissingKey("key is missing")
+
+
+def _uses_stored_value(setting: Setting) -> bool:
+    """Accept an optional empty value or a value that meets its stored limits."""
+    if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+        return True
+    try:
+        _limits(setting)
+    except ValueError:
+        return False
+    return True
 
 
 def _limits(setting: Setting) -> None:
