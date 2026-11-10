@@ -1837,7 +1837,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Ruled out:**
 - A timing comparison on a shared Mac: timing runs need a Mac with no interactive demo and the same power source. That is outside this code.
 
-### Phase 81 — A Mac test build never links stale objects from an old build  · status: todo
+### Phase 81 — The Mac link failure is diagnosed and parked, with no tooling change  · status: done
 **Depends on:** none. Merge `origin/builds` first.
 
 **Approved:** builds showrunner, 2026-11-08 ("a Mac build fault from hana, as your next phase now").
@@ -1871,8 +1871,11 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
   4. Sequential case: build one revision, change only the generic body or the caller, and rebuild with the completed incremental history. Its control builds the same changed revision in a new empty target.
   5. Interrupted case: interrupt an intermediate compile, and then finish the build. Its control runs the same intermediate compile with no interrupt.
   6. Reduce the source while the same promoted-symbol failure stays.
-- builds decided on 2026-11-08 that the reproduction uses one private target at a time. One case needs about 89.06 GiB (source and one debug target). Before the source copy, the script reads the deployed `sweep_floor_gib` and requires `free - (source_size + debug_size) >= floor`. Record each build's result, then remove that private target before the next case or control starts.
-- The 150 GiB Mac floor stays. So a case needs about 239 GiB free before it starts. The Mac had 238.71 GiB free after the 2026-11-08 core cleanup. Start a case only when the room is there and builds approves the start.
+- builds decided on 2026-11-08 that the reproduction uses one private target at a time. builds decided on 2026-11-09 that the budget is the small case's own size, not the whole hana target.
+- One completed build of the small case on natedev (2026-11-09, `phases/81/small_case_size.md`) measures 0.320 GiB for source and target, in 55.7 seconds. That is a Linux number and an estimate of the Mac size.
+- The budget for one case is 2 GiB: the measured 0.320 GiB and a margin of 1.68 GiB for the Mac object and debug formats, the incremental rebuild and the reduction rounds. Log the free room before each case or control. Record each build's result, then remove that private target before the next case or control starts.
+- The 150 GiB Mac floor stays. builds approved the start on 2026-11-09, and a case may start below 152 GiB free. The floor job trims about 2 GiB of the least recently used output, and it never trims a target that a build holds.
+- If the small case does not reproduce the failure, stop. Send builds the larger crate set and its measured size before any start.
 - Keep sccache and the hana test mirror. Run no gc command on the Mac.
 - New evidence, 2026-11-09 (Phase 92 retrospective): a Mac hana link failed at 11:56 UTC with the same signature, undefined `.llvm.<hash>` symbols in `libhana_conduit`.
   - The Mac build log shows the builds in series under the mirror lease, with no overlap.
@@ -1880,7 +1883,6 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
   - hana sets `[profile.dev.package.hana_conduit] opt-level = 3` and `[profile.dev.package."*"] opt-level = 3`. The earlier failures (hana_diegetic, hana_catalyst) were also workspace members above opt-level 0. Incremental compilation plus local ThinLTO promotes `.llvm.<hash>` names in such members.
   - Separate the package profile settings in hana's `Cargo.toml` from the effective profile of the generated instance the Mac builds. Read the instance's real profile before you name a cause.
   - builds approved one `cargo clean -p hana_conduit` in the Mac mirror. It finished at 12:08 UTC on 2026-11-09. That approval is used; it permits no other cleanup.
-- The reproduction hold and the start approval stay: start no reproduction case until builds approves its start.
 
 **Files:**
 - `scripts/mac_test/offload.py` — the Mac copy, target and cleanup, when the cause is there.
