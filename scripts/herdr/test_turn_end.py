@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import io
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -180,8 +179,6 @@ class TurnEndTests(unittest.TestCase):
         row = self.case.agent.row(self.case.agent.submitted[-1][0])
         backend = staff.backend(row)
         assert isinstance(backend, staff.CodexBackend)
-        active = progress_history.active_dispatch(row.id, self.case.run_dir)
-        assert isinstance(active, progress_history.ActiveDispatch)
         account = agent_accounts.KnownCodexAccount(backend.codex_home, "worker@example.com", "codex1")
         refused_at = "2026-11-10T19:30:38.842000+00:00"
         with (patch.object(quota_alert, "blocked", return_value=["workers moved"]) as blocked,
@@ -199,8 +196,7 @@ class TurnEndTests(unittest.TestCase):
                 self.assertEqual(turn_end.report_quota_refusals(), [])
         blocked.assert_called_once_with([], account, window=refusals.UnknownWindow(),
             refused_at=quota_alert.RefusedAt(datetime.fromisoformat(refused_at)),
-            stopped=quota_alert.StoppedWorkerCommand(str(self.case.fixture.parent.current_session), row.name,
-                                                     shlex.join(active.launcher_command)))
+            stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
         opened = self.case.opened()
