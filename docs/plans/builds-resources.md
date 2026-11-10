@@ -2146,33 +2146,17 @@ With the Mac state folder present, `eligible` loads no `sweep` or `copies` modul
 
 ### Phase 99 — The Mac mirror target keeps its size bound, and the floor offers only build output  · status: done
 
-**Depends on:** none. Source: builds, 2026-11-10, from two natedev reports. The Mac floor tripped at 148.7 GiB free (floor 150).
+#### As-built
 
-#### Work Order
-
-**Goal:** The hana Mac test mirror target stays inside its size bound, and the disk floor never offers a source checkout for deletion.
-
-**Spec:**
-
-1. **Mirror bound.** The hana mirror grew from 156 to 205 GiB, and the cleanup freed nothing. `config/mac_test.conf` sets `mac_budget_gib=24` and `mac_budget_gib.hana=56`; the bound did not act.
-   Find why from the code and from read-only Mac reads. Make the mirror target bound itself at the writer, in `scripts/mac_test/offload.py`. Use one way only, and add no guard beside it.
-   Change no config value. A needed value change goes to builds first.
-2. **Floor candidates.** The floor job (`sweep.py --floor-only --host mac`) recommended deleting `~/rust/cargo-liner`, a source checkout, as a folder whose use is unknown.
-   A source checkout is never a cleanup candidate; only our build output is. Fix the candidate rule where `scripts/lint/sweep.py` builds its folder choices. Add no second check beside that rule.
-3. **Mac rules.** Reads on the Mac are read-only, with sentinels. Run no gc, no cleanup and no delete on the Mac. Start no Mac test. Change no Mac setting.
-4. **Proof.** Each defect gets a table row in its existing test, or a new test only when no test covers the behavior.
+Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<repo>` (else `mac_budget_gib`). The trim runs `sweep.sweep_workspace()` on the Mac, in the foreground, under the mirror lease. A fetch run trims after `fetch_folder()`, in a second ssh call. The run prints `mac_trim=status=<exit> elapsed_seconds=<s> over_budget=yes|no|unknown`, and `stream_mac_run()` keeps that line and the run status. The free-space floor (a full target remove below `free_floor_gib`) runs after every trim, whatever its status. The disk floor offers a folder only when it is Cargo output (an output root or `is_cargo_target()`) and holds no `Cargo.toml` and no `.git`.
 
 **Files:**
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/test_offload_cleanup.py`
-- `scripts/mac_test/test_offload_forward.py`
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
+- `scripts/mac_test/offload.py` — `remote_cleanup_command()`, its use in `remote_test_command()` and `claimed_run()`, the `mac_trim=` branch in `stream_mac_run()`.
+- `scripts/mac_test/test_offload_cleanup.py` — trim, over-budget and failed-trim rows, in sh and zsh.
+- `scripts/mac_test/test_offload_forward.py` — byte-equal command and fetch order rows.
+- `scripts/lint/sweep.py` — the `folder_choices()` candidate rule.
+- `scripts/lint/test_sweep.py` — checkout rows for both machines.
 
-**Workers:** `2 writers`
-- `impl` owns the mirror bound: `scripts/mac_test/offload.py` and its tests under `scripts/mac_test/`.
-- `test` owns the floor candidates: `scripts/lint/sweep.py` and `scripts/lint/test_sweep.py`.
+**Gotchas:** `sweep()` exits 0 when unmatched output stays over budget, so read `over_budget=` in the trim line, not the status. `LINT_SKIP_SWEEP=1` stays, because a background sweep can outlive the run and its lease. `is_cargo_target()` keeps its meaning; the checkout exclusion lives only in `folder_choices()`.
 
-**Gate:** the targeted test; the changed test modules pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
-
-**Change-Review:** The disk floor alert offers no source checkout | Read the next Mac floor alert | It names only build output, and the hana mirror target stays near its bound.
+**Ruled out:** a full target remove when the trim leaves the target over budget, because it empties the warm cache; `sweep.py --target-dir` as the Mac entry, because `main()` also runs the host floor by hostname.
