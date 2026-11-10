@@ -1360,7 +1360,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     )
     runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
-    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
+    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems, record=membership)
     workers = _ledger_workers(runs, records, problems, membership)
     production_places: dict[str, _ProductionPlace] = {}
     try:

@@ -9,6 +9,7 @@ except FileNotFoundError:
 from collections.abc import Sequence
 from contextlib import ExitStack
 import ctypes
+from dataclasses import dataclass
 from functools import partial
 import os
 from pathlib import Path
@@ -35,6 +36,11 @@ GLOBAL_VALUES = frozenset({"-C", "--config", "-Z", "--color", "--manifest-path",
                           "-F", "--features", "--profile", "--message-format", "--artifact-dir", "--out-dir"})
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+@dataclass(frozen=True)
+class JobTemporaryFolder:
+    """Put counter files in the job's default temporary folder."""
 
 
 def building_call(arguments: Sequence[str]) -> bool:
@@ -90,7 +96,7 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
-def run_cargo(command: str, arguments: Sequence[str], child_path: str) -> int:
+def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_folder: Path | JobTemporaryFolder) -> int:
     pid = os.getpid()
     start = records.process_start_time(pid)
     if start is None:
@@ -99,7 +105,8 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str) -> int:
     repository, worktree = step_estimator.git_identity(argv, os.getcwd())
     width = records.test_threads(argv)
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
-    with tempfile.TemporaryDirectory(prefix=f"build-admission-ci-{os.getuid()}-") as folder:
+    with tempfile.TemporaryDirectory(prefix=f"build-admission-ci-{os.getuid()}-",
+                                     dir=shared_folder if isinstance(shared_folder, Path) else None) as folder:
         directory = Path(folder)
         directory.chmod(0o755)
         sidecar = directory / "cargo.cgroup"
@@ -157,9 +164,13 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     explicit = ""
+    shared_folder: Path | JobTemporaryFolder = JobTemporaryFolder()
     front = Path(__file__)
     if arguments[:1] == ["--front"]:
         front, arguments = Path(arguments[1]), arguments[2:]
+    # The admission service must read the counter files, and `nix develop` makes TMPDIR private.
+    if arguments[:1] == ["--shared-folder"]:
+        shared_folder, arguments = Path(arguments[1]), arguments[2:]
     if arguments[:1] == ["--cargo"]:
         explicit, arguments = arguments[1], arguments[2:]
     if arguments[:1] == ["--"]:
@@ -169,7 +180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.execve(command, [command, *arguments], dict(os.environ, PATH=child_path))
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         _ = signal.signal(number, cancel)
-    return run_cargo(command, arguments, child_path)
+    return run_cargo(command, arguments, child_path, shared_folder)
 
 
 if __name__ == "__main__":

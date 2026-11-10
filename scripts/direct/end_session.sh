@@ -3,14 +3,9 @@
 #
 # Usage: end_session.sh
 #
-# Removes the run-active marker written by prepare_session.sh. Until it is gone,
-# stop-direct-continue.py refuses to let the turn end near the auto-compaction
-# threshold, on the assumption that the run still has phases to go.
-#
-# Acts on every run folder this session directs (`unit_runs.py held`): the
-# marker names one, and phases run side by side each keep their own folder,
-# which records its director. A run of another director is never touched.
-#
+# Clears the run pointer that prepare_session.sh stores in staff.
+# Cleans each run folder that this session directs.
+
 # Keeps workers and app-servers while their unit director is live. Otherwise,
 # pauses Codex workers and stops this run's servers after preserving queues.
 # Removes only Claude workers no longer held by a unit or live director.
@@ -53,24 +48,19 @@ cleanup() {
   fi
 }
 
-# The marker is under unit/, or delegate/ for a run started before the rename.
-if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
-  MARKER="${UNIT_ACTIVE_DIR}/${DIRECTOR_SESSION_ID}"
-else
-  MARKER="/tmp/claude/unit/active/${DIRECTOR_SESSION_ID}"
-  if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${DIRECTOR_SESSION_ID}" ]]; then
-    MARKER="/tmp/claude/delegate/active/${DIRECTOR_SESSION_ID}"
-  fi
-fi
+# Read the current pointer before and after cleanup.
+read_run_pointer() {
+  "$PY" -c 'import sys; from scripts.lib import unit_runs; run = unit_runs.open_run(sys.argv[1]); print(run if run is not None else "")' "${DIRECTOR_SESSION_ID}"
+}
 
-# The marker holds the run folder.
+# Keep the open run available if the run scan fails.
 SESSION_DIR=""
-if [[ -f "${MARKER}" ]]; then
-  SESSION_DIR="$(head -n 1 "${MARKER}")"
+if SESSION_DIR="$(read_run_pointer)"; then
+  :
+else
+  echo "end_session: failed: read run pointer" >&2
+  STATUS=1
 fi
-
-# The marker's run first, kept even when the scan fails, then every other run
-# this session directs.
 RUNS=()
 if [[ -n "${SESSION_DIR}" ]]; then
   RUNS+=("${SESSION_DIR}")
@@ -78,9 +68,6 @@ fi
 HELD_ARGS=(held "${DIRECTOR_SESSION_ID}")
 if [[ -n "${UNIT_RUN_ROOT:-}" ]]; then
   HELD_ARGS+=(--root "${UNIT_RUN_ROOT}")
-fi
-if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
-  HELD_ARGS+=(--active "${UNIT_ACTIVE_DIR}")
 fi
 if HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}")"; then
   :
@@ -106,19 +93,24 @@ if (( ${#RUNS[@]} > 0 )); then
   cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}"
   # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
   for run in "${RUNS[@]}"; do
-    cleanup "$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" end "${run}"
+    cleanup "$PY" "${SCRIPT_DIR}/../production/staff.py" clear-run "${DIRECTOR_SESSION_ID}" "${run}"
   done
 fi
 
 "$PY" "${SCRIPT_DIR}/../copies/copies.py" remove || true
 
 if [[ -n "${SESSION_DIR}" ]]; then
-  if [[ ! -e "${MARKER}" ]]; then
-    echo "Unit run ended; marker cleared."
+  if CURRENT_RUN="$(read_run_pointer)"; then
+    if [[ -z "${CURRENT_RUN}" ]]; then
+      echo "Unit run ended; run pointer cleared."
+    else
+      echo "Unit run pointer remains."
+    fi
   else
-    echo "Unit run marker remains."
+    echo "end_session: failed: read run pointer" >&2
+    STATUS=1
   fi
 else
-  echo "No active unit run marker for this session."
+  echo "No active unit run pointer for this session."
 fi
 exit "${STATUS}"

@@ -317,7 +317,9 @@ def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_p
     downloads = download('guest', 'guest.py')
     if 'request' in links:
         downloads += download('request', 'request.json')
-    session = '''printf '%s stage=tools ready\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    # The boot script's 077 protects its files; tests expect the normal umask.
+    session = '''umask 022
+printf '%s stage=tools ready\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 ''' + downloads + f'''ln -sf "$(command -v bash)" /bin/bash
 ln -sf "$(command -v zsh)" /bin/zsh
 mkdir -p "$box_dir/tool-profile"

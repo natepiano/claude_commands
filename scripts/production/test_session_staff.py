@@ -315,7 +315,7 @@ class StatusDiscoveryTests(StaffTestCase):
 
 
 class WorkerRunDiscoveryTests(StaffTestCase):
-    def test_run_index_keeps_the_owner_marker_without_a_worker_record(self) -> None:
+    def test_run_index_keeps_the_staff_run_without_a_worker_record(self) -> None:
         owner = unit_membership("show", "owner")
         worker = fixture_worker("worker", owner.id)
         runs = self.root / "runs"
@@ -323,7 +323,7 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         run.mkdir(parents=True)
         with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
               mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
-            unit_runs.activate(run, owner.current_session)
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
             record = staff.local_snapshot()
             found = labels.worker_run_index(record)
             entries = labels.worker_run_entries(record, (worker,))
@@ -331,7 +331,7 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         self.assertNotIn(worker.id, entries)
 
 
-    def test_run_index_reads_workers_without_writing_to_the_marker_folder(self) -> None:
+    def test_run_index_reads_workers_without_writing_staff(self) -> None:
         owner = unit_membership("show", "owner")
         worker = fixture_worker("worker", owner.id)
         runs = self.root / "runs"
@@ -339,30 +339,10 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         run.mkdir(parents=True)
         with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
               mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
-            unit_runs.activate(run, owner.current_session)
-            markers = runs / "active"
-            before = {path.name: path.read_bytes() for path in markers.iterdir()}
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
+            before = staff.record_path().read_bytes()
             found = labels.worker_run_index(staff.local_snapshot())
-            after = {path.name: path.read_bytes() for path in markers.iterdir()}
+            after = staff.record_path().read_bytes()
         self.assertEqual(found[worker.id], (run,))
         self.assertEqual(after, before)
 
-    def test_unreadable_owner_marker_reports_one_anomaly_and_keeps_other_workers_runs(self) -> None:
-        broken = unit_membership("show", "broken")
-        healthy = unit_membership("show", "healthy")
-        first = fixture_worker("broken-worker", broken.id)
-        second = fixture_worker("healthy-worker", healthy.id)
-        runs = self.root / "runs"
-        run = runs / "healthy-run"
-        run.mkdir(parents=True)
-        errors = StringIO()
-        with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
-              mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
-            unit_runs.activate(run, healthy.current_session)
-            _ = unit_runs.marker(broken.current_session).write_bytes(b"\xff")
-            with redirect_stderr(errors):
-                found = labels.worker_run_index(staff.local_snapshot())
-        self.assertEqual(found[second.id], (run,))
-        self.assertNotIn(first.id, found)
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn(f"anomaly: {broken.name}:", errors.getvalue())

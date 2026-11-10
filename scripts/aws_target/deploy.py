@@ -10,7 +10,8 @@ import argparse
 import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 import gzip
@@ -22,6 +23,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Literal, cast, final
 from uuid import uuid4
@@ -39,6 +41,49 @@ from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
+
+
+UP_STAGE_LABELS = {
+    'price': 'reading the Spot price',
+    'bootstrap': 'preparing the boot script',
+    'stacks': 'updating the stack',
+    'scaler-key': 'preparing the scaler credentials',
+    'tailscale-policy': 'checking the Tailscale policy',
+    'box-join': 'joining the box to Tailscale',
+    'box-configuration': 'configuring the box',
+    'checks': 'checking the box',
+    'image': 'preparing the box image',
+    'idle-stop': 'configuring the idle timer',
+    'activation': 'activating the builder',
+    'routing-proof': 'checking the build route',
+}
+
+
+@contextmanager
+def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generator[None]:
+    """Show progress until the operation ends."""
+    interval = conf.read(settings).number('deploy_progress_interval_s')
+    stream = sys.stdout
+    started = time.monotonic()
+    stopped = threading.Event()
+    start = f'{text} ({hint})' if hint else text
+    print(f'{command}: {start}', file=stream, flush=True)
+
+    def heartbeat() -> None:
+        while not stopped.wait(interval):
+            minutes = int((time.monotonic() - started) / 60)
+            print(f'{command}: still {text}, {minutes} min', file=stream, flush=True)
+
+    worker = threading.Thread(target=heartbeat, name='deployment-progress', daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join()
+        elapsed = time.monotonic() - started
+        print(f'{command}: {text} done in {elapsed:.0f} s', file=stream, flush=True)
+
 
 
 class DeploymentRefused(ValueError):
@@ -253,7 +298,8 @@ class Deployment:
             saved['stack_id'] = ledger.text(reply, 'StackId')
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
             _ = api.call('wait', 'change-set-create-complete', '--stack-name', ledger.text(saved, 'stack_id'),
-                         '--change-set-name', change_name, service='cloudformation')
+                         '--change-set-name', change_name, service='cloudformation',
+                         timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
         except (AwsUnavailable, subprocess.SubprocessError) as error:
             stack_id = str(saved.get('stack_id') or settings.stack_name)
             try:
@@ -564,7 +610,8 @@ class Deployment:
             wait_error: Exception | None = None
             try:
                 _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_id,
-                             '--change-set-name', name, service='cloudformation')
+                             '--change-set-name', name, service='cloudformation',
+                             timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
             except (AwsUnavailable, subprocess.SubprocessError) as error:
                 wait_error = error
             change = api.call('describe-change-set', '--stack-name', stack_id, '--change-set-name', name,
@@ -602,7 +649,8 @@ class Deployment:
                 self._record_compute_request(settings, parameters)
             _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name, service='cloudformation')
             executed = True
-            _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
+            _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation',
+                         timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
         except (ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             if not change:
                 try:
@@ -918,7 +966,8 @@ class Deployment:
             raise DeploymentRefused('the scaler key works; IAM could not remove every old key') from None
 
     def _box_stages(self) -> tuple[UpStage, ...]:
-        setup = box.BoxSetup(self.settings_path, self.directory, self._start_box, execute=self.execute, admin=self.admin)
+        setup = box.BoxSetup(self.settings_path, self.directory, self._start_box, execute=self.execute,
+                             tailnet=box.tailnet_request, admin=self.admin)
         return (
             UpStage('tailscale-policy', setup.policy_present, setup.policy),
             UpStage('box-join', setup.join_present, setup.join),
@@ -961,9 +1010,11 @@ class Deployment:
             for stage in stages:
                 started = int(self.clock())
                 try:
-                    present = stage.check()
-                    if not present or stage.refresh:
-                        _ = stage.action()
+                    with step('up', UP_STAGE_LABELS[stage.name], self.settings_path,
+                              hint='can take several minutes' if stage.name == 'stacks' else ''):
+                        present = stage.check()
+                        if not present or stage.refresh:
+                            _ = stage.action()
                     result = StageResult('present' if present else 'done', started, int(self.clock()))
                 except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                     reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else self.admin.redact(str(error))
@@ -1053,29 +1104,32 @@ class Deployment:
                                     reply = api.call('run-instances', '--cli-input-json', json.dumps(arguments))
                                     instance = ledger.text(ledger.rows(reply, 'Instances')[0], 'InstanceId')
                                     book.resolve_gate(attempt, ledger.GateRunning(instance))
-                                while True:
-                                    check_time()
-                                    if worker.download(ledger.text(deployment, 'bucket'), result_key, pending / 'result.json'):
-                                        result = remote.read_record(pending / 'result.json')
-                                        if result.get('status') != 0:
-                                            raise DeploymentRefused('Gate image tool preparation failed')
-                                        break
-                                    self.pause(values.number('result_poll_s'))
+                                with step('gate-image', 'waiting for tool preparation', self.settings_path):
+                                    while True:
+                                        check_time()
+                                        if worker.download(ledger.text(deployment, 'bucket'), result_key, pending / 'result.json'):
+                                            result = remote.read_record(pending / 'result.json')
+                                            if result.get('status') != 0:
+                                                raise DeploymentRefused('Gate image tool preparation failed')
+                                            break
+                                        self.pause(values.number('result_poll_s'))
                                 with gate_trial.blocked_trial_signals():
                                     record = box.create_saved_image(api, pending, instance,
                                         name='cloud-claude-gate-' + key[:16] + '-' + uuid4().hex[:8],
                                         tags=[*tags, {'Key': gate_box.GATE_IMAGE_OWNER_TAG, 'Value': 'true'}],
                                         identity={'inputs': key, **inputs})
-                                while True:
-                                    check_time()
-                                    image = box.saved_image(api, pending)
-                                    if image.get('State') == 'available':
-                                        break
-                                    if image.get('State') == 'failed':
-                                        raise DeploymentRefused('The gate image failed to become available')
-                                    self.pause(values.number('result_poll_s'))
+                                with step('gate-image', 'waiting for the gate image', self.settings_path):
+                                    while True:
+                                        check_time()
+                                        image = box.saved_image(api, pending)
+                                        if image.get('State') == 'available':
+                                            break
+                                        if image.get('State') == 'failed':
+                                            raise DeploymentRefused('The gate image failed to become available')
+                                        self.pause(values.number('result_poll_s'))
                             finally:
-                                with gate_trial.blocked_trial_signals():
+                                with (gate_trial.blocked_trial_signals(),
+                                      step('gate-image', 'stopping the temporary box', self.settings_path)):
                                     instances = [instance] if instance else [ledger.text(row, 'InstanceId')
                                         for group in ledger.rows(api.call('describe-instances', '--filters',
                                             'Name=client-token,Values=' + attempt), 'Reservations')
@@ -1084,27 +1138,31 @@ class Deployment:
                                         worker.terminate(attempt, temporary)
                                     if not instances:
                                         book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
-                        while True:
-                            check_time()
-                            image = box.saved_image(api, pending)
-                            if image.get('State') == 'available':
-                                break
-                            if image.get('State') == 'failed':
-                                raise DeploymentRefused('The gate image failed to become available')
-                            self.pause(cloud_gate.settings().number('result_poll_s'))
+                        with step('gate-image', 'waiting for the gate image', self.settings_path):
+                            while True:
+                                check_time()
+                                image = box.saved_image(api, pending)
+                                if image.get('State') == 'available':
+                                    break
+                                if image.get('State') == 'failed':
+                                    raise DeploymentRefused('The gate image failed to become available')
+                                self.pause(cloud_gate.settings().number('result_poll_s'))
                 except BaseException:
                     with gate_trial.blocked_trial_signals():
                         if (pending / 'image.json').exists():
                             failed = remote.read_record(pending / 'image.json')
                             if failed.get('image_id') != deployment.get('image'):
-                                box.delete_saved_image(api, box.saved_image(api, pending))
-                            (pending / 'image.json').unlink()
+                                with step('gate-image', 'deleting the failed image', self.settings_path):
+                                    box.delete_saved_image(api, box.saved_image(api, pending))
+                            with step('gate-image', 'deleting the pending image record', self.settings_path):
+                                (pending / 'image.json').unlink()
                     raise
                 write_text_atomic(directory / 'image.json', json.dumps(record, sort_keys=True) + '\n')
             if (pending / 'image.json').exists():
                 pending_record = remote.read_record(pending / 'image.json')
                 if pending_record.get('image_id') == image.get('ImageId'):
-                    (pending / 'image.json').unlink()
+                    with step('gate-image', 'deleting the pending image record', self.settings_path):
+                        (pending / 'image.json').unlink()
             stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
             body = api.call('get-template', '--stack-name', stack_id, service='cloudformation')['TemplateBody']
             template_body = ledger.mapping(cast(object, json.loads(body))) if isinstance(body, str) else ledger.mapping(body)
@@ -1124,7 +1182,8 @@ class Deployment:
                     {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
                     for row in ledger.rows(stack, 'Parameters') if row['ParameterKey'] != 'GateImage']
                 changes.append({'ParameterKey': 'GateImage', 'ParameterValue': ledger.text(image, 'ImageId')})
-                self._gate_change(api, stack_id, template, changes)
+                with step('gate-image', 'updating the stack', self.settings_path, hint='can take several minutes'):
+                    self._gate_change(api, stack_id, template, changes)
                 deployment['version'] = self._stack(settings)['GateLaunchVersion']
             deployment.update(image=ledger.text(image, 'ImageId'), revision=inputs['revision'])
             write_text_atomic(self.directory / 'gate-deployment.json', json.dumps(deployment, sort_keys=True) + '\n')
@@ -1136,8 +1195,10 @@ class Deployment:
                                             service='cloudformation'), 'Stacks')[0]
                 changes = [{'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
                            for row in ledger.rows(stack, 'Parameters')]
-                self._gate_change(api, stack_id, template, changes)
-            box.cleanup_images(api, image, gate_box.GATE_IMAGE_OWNER_TAG)
+                with step('gate-image', 'updating the stack', self.settings_path, hint='can take several minutes'):
+                    self._gate_change(api, stack_id, template, changes)
+            with step('gate-image', 'deleting older gate images', self.settings_path):
+                box.cleanup_images(api, image, gate_box.GATE_IMAGE_OWNER_TAG)
             size = sum(ledger.instant(ledger.mapping(row['Ebs']), 'VolumeSize')
                        for row in ledger.rows(image, 'BlockDeviceMappings') if 'Ebs' in row)
             monthly = money(str(conf.read(self.settings_path).number('gate_image_snapshot_usd_per_gib_month'))) * size
@@ -1164,7 +1225,8 @@ class Deployment:
                          service='cloudformation')
             try:
                 _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_id,
-                             '--change-set-name', name, service='cloudformation')
+                             '--change-set-name', name, service='cloudformation',
+                             timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
             except AwsUnavailable:
                 pass
             change = api.call('describe-change-set', '--stack-name', stack_id,
@@ -1185,7 +1247,8 @@ class Deployment:
                 executed = True
                 print('cloud-gate: applying the change (several minutes)', flush=True)
                 try:
-                    _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
+                    _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation',
+                                 timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
                 except AwsUnavailable:
                     events = ledger.rows(api.call('describe-stack-events', '--stack-name', stack_id,
                                                   '--max-items', '60', service='cloudformation'), 'StackEvents')
@@ -1242,7 +1305,8 @@ class Deployment:
             self.output.mkdir(parents=True, exist_ok=True)
             template = self.output / 'gate-template.json'
             write_bytes_atomic(template, TEMPLATE.read_bytes())
-            self._gate_change(api, stack_id, template, changes)
+            with step('up', 'updating the stack', self.settings_path, hint='can take several minutes'):
+                self._gate_change(api, stack_id, template, changes)
             outputs = self._stack(settings)
             manifest: dict[str, object] = {
                 'deployment_id': ledger.text(saved, 'deployment_id'), 'region': settings.region,
@@ -1265,14 +1329,17 @@ class Deployment:
         removal = teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
             api, self.execute, tailnet=box.tailnet_request, clock=self.clock, builder_only=True)
         with control_lock(self.directory / 'up'):
-            _ = removal.verify()
+            with step('remove-builder', 'checking the deployment', self.settings_path):
+                _ = removal.verify()
             removal.remember()
-            _ = removal.routing()
+            with step('remove-builder', 'disabling builder routing', self.settings_path):
+                _ = removal.routing()
             paths = mac_test.state_paths('aws')
             with mac_test.locked(paths.lock), control_lock(self.directory):
                 if box.running_claims(paths):
                     raise DeploymentRefused('AWS claims remain live; retry after their completion')
-                _ = removal.devices()
+                with step('remove-builder', 'removing the builder from Tailscale', self.settings_path):
+                    _ = removal.devices()
                 stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
                 stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
                                             service='cloudformation'), 'Stacks')[0]
@@ -1289,8 +1356,10 @@ class Deployment:
                 parameters = {ledger.text(row, 'ParameterKey'): str(row.get('ParameterValue', ''))
                               for row in ledger.rows(stack, 'Parameters')}
                 if needs_update:
-                    self._update_stack(settings, parameters, compute=False, remove_builder=True)
-                _ = removal.data_volume()
+                    with step('remove-builder', 'updating the stack', self.settings_path, hint='can take several minutes'):
+                        self._update_stack(settings, parameters, compute=False, remove_builder=True)
+                with step('remove-builder', 'deleting builder storage', self.settings_path):
+                    _ = removal.data_volume()
                 now = int(self.clock())
                 book = ledger.CostLedger(self.directory)
                 book.observe(ledger.InstanceObservation(now, 'terminated', 'confirmed builder removal'), confirms_transition=True)
@@ -1305,8 +1374,9 @@ class Deployment:
                 saved = deployment_record(self.directory)
                 saved.update(outputs=self._stack(settings), data_volume_id='')
                 write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
-                for name in ('up.json', 'box-tools.json', 'box-shell.json'):
-                    (self.directory / name).unlink(missing_ok=True)
+                with step('remove-builder', 'deleting local builder records', self.settings_path):
+                    for name in ('up.json', 'box-tools.json', 'box-shell.json'):
+                        (self.directory / name).unlink(missing_ok=True)
         print('remove-builder: done; gate resources and gate-deployment.json kept')
         return True
 
@@ -1316,8 +1386,9 @@ class Deployment:
             return True
         self._check_credentials()
         settings = read_deployment_settings(self.settings_path, self.directory)
-        return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
-                                      self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
+        with step('down', 'removing local and cloud resources', self.settings_path):
+            return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
+                self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
     def _start_box(self) -> object:
         settings = read_deployment_settings(self.settings_path, self.directory)
@@ -1434,7 +1505,9 @@ class DeploymentArguments(argparse.Namespace):
 def main() -> int:
     if sys.argv[1:2] == ['gate-trial']:
         from scripts.aws_target import gate_trial
-        return gate_trial.main(sys.argv[2:], conf.path('aws_target'), target_config.ssh_target_state_directory('aws'))
+        settings_path = conf.path('aws_target')
+        with step('gate-trial', 'running the trial', settings_path):
+            return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'remove-builder', 'gate-image', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--workload', choices=('rust', 'merge-gates'), default='rust')
@@ -1447,7 +1520,8 @@ def main() -> int:
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
         if args.command == 'secrets':
-            admin_secrets.configure(args.settings)
+            with step('secrets', 'saving encrypted credentials', args.settings):
+                admin_secrets.configure(args.settings)
         elif args.command == 'up':
             action = deploy.gate_up if args.workload == 'merge-gates' else deploy.up
             return 0 if action(approve_resources=args.approve_resources) else 1

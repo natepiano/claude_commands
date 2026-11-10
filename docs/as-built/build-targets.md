@@ -74,7 +74,12 @@ Without a matching row, `target_platform` returns no answer and status 1.
 
 ### Hold checks and release
 
-- `owning_session() -> OwningSession(session_id) | NoOwningSession` names the session a call's build is credited to: the session whose active-run marker under `/tmp/claude/unit/active` or `/tmp/claude/delegate/active` (`UNIT_ACTIVE_DIR` replaces both) holds the call's run (`UNIT_RUN_DIR`, else `UNIT_SESSION_DIR`, compared as an exact string, newest marker first), else `CLAUDE_CODE_SESSION_ID`, else none. The marker comes first because a Codex worker's shell carries the id of the session that started its Codex server, and that id goes stale when the session restarts.
+- `owning_session() -> OwningSession(session_id) | NoOwningSession` reads the staff row whose `run` matches the call's run folder.
+  It uses `UNIT_RUN_DIR`, then `UNIT_SESSION_DIR`, with exact path text.
+  The matching row supplies `current_session`.
+  Without a match, it uses `CLAUDE_CODE_SESSION_ID`.
+  Without either session, it returns `NoOwningSession`.
+  A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
 - After the last holder file is gone, each recipient gets one release notice. No answer or allocation is awaited. The result names failed or unconfirmed deliveries: `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
@@ -150,7 +155,12 @@ It saves no pass because a saved pass describes this machine.
 
 ### Installed-script guard: `scripts/build_hold/override_guard.sh` and `override_guard.py`
 
-- An installed script stops with one line on stderr and exit 2 when any of `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `MAC_TEST_STATE_DIR`, `MAC_TEST_CONFIG`, `BUILD_TARGETS_SCRIPT`, `BUILD_TARGETS_CONFIG`, `BUILD_TARGETS_NOW`, `UNIT_ACTIVE_DIR` is in the environment (an empty value included), or when `HOME` is set and is not the password database's home. A checkout's script runs with them, so tests keep their overrides.
+- An installed script writes one line to stderr and exits 2 when a guarded override is set, including an empty value.
+  The guard checks `ADMISSION_SOCKET`, `CONF_DIR`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `MAC_TEST_STATE_DIR`, and `MAC_TEST_CONFIG`.
+  It also checks `BUILD_TARGETS_SCRIPT`, `BUILD_TARGETS_CONFIG`, and `BUILD_TARGETS_NOW`.
+  It refuses a `HOME` value that differs from the account home.
+  A checkout's script accepts the overrides for tests.
+  Run ownership comes from the staff row's `run` field.
 - "Installed" means the same file (device and inode, links followed) as `<home>/.claude/scripts/<fixed path>`, where `<home>` comes from the password database, never from `HOME`. Shell uses `[[ a -ef b ]]`, Python `os.path.samefile`.
 - The line: `<file>: <NAME> is set to '<value>'; the installed scripts under <home>/.claude/scripts do not run with it. Unset it and run again.` The shell guard also refuses every script when `HOME` is read-only in the shell.
 - `override_guard.sh` is sourced, bash 3.2 syntax, builtins only. `verify.sh` and `memory_gate.sh` source it first, above any line that reads `HOME`, and call `build_override_refusal "${BASH_SOURCE[0]}" <path under scripts/> || exit 2`. Status 2 is also how a PreToolUse hook blocks its tool call, so the launch hook blocks with no code of its own.
@@ -454,7 +464,19 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - Remote commands use a non-login SSH shell outside the development checkout. They must set `MACOSX_DEPLOYMENT_TARGET` explicitly.
 - Below macOS 12.0, Swift concurrency linkage can fail at load. A changed deployment target requires a rebuild.
 - Guard limits: a checkout or any other copy of the scripts accepts the variables, so a worker that runs a copy still passes a hold. Report-only programs and variables outside the list (`VERIFY_MAC_RUNNER`, `LINT_CONFIG_READER`, `MAC_TEST_SESSIONS`, `MAC_TEST_SEND`, the `BUILDLOG_HOLD_*` files) are not guarded. A shell caller started through a link outside `scripts/` looks for `override_guard.sh` beside the link and stops with status 2.
-- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Shared test support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import. From the installed scripts it raises one error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` The home comes from the account database and links are followed. Run the suites from a worktree; the check does not skip tests. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
+- Tests use private `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `STAFF_FILE`, and run folders.
+  They clear `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`.
+  A fixture that reaches installed scripts through the real `HOME` can change the live release record.
+  Shared support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import.
+  Installed scripts raise this error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.`
+  The guard gets the home from the account database and follows links.
+  Run the suites from a worktree.
+  The guard does not skip tests.
+  Tests change `cycle.json` under `release_lock()` through `change_cycle`.
+  Tests that write hold events use a private `BUILDLOG_DIR`.
+  They wait for the detached recorder before they check that no further event appears.
+  The complete `scripts/direct` suite takes about 12.5 minutes.
+  It also checks sibling imports when tests import a module as `scripts.<dir>.<file>`.
 - The test stand-in for `mac_run.sh` answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the bundle-path cases depend on that.
 
 ## Why

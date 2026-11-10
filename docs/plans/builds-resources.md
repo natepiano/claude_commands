@@ -1925,7 +1925,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 ### Phase 88 — The hana CI margin key goes after the runner activation  · status: todo
 
-**Depends on:** queue's 10d, natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
+**Depends on:** Phase 100, queue's 10d (landed 2026-11-10, e9fe34ff1), natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
 
 #### Work Order
 
@@ -2143,3 +2143,72 @@ With the Mac state folder present, `eligible` loads no `sweep` or `copies` modul
 **Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
 
 **Ruled out:** a comparison of unpaired start-cost runs.
+
+### Phase 99 — The Mac mirror target keeps its size bound, and the floor offers only build output  · status: done
+
+#### As-built
+
+Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<repo>` (else `mac_budget_gib`). The trim runs `sweep.sweep_workspace()` on the Mac, in the foreground, under the mirror lease. A fetch run trims after `fetch_folder()`, in a second ssh call. The run prints `mac_trim=status=<exit> elapsed_seconds=<s> over_budget=yes|no|unknown`, and `stream_mac_run()` keeps that line and the run status. The free-space floor (a full target remove below `free_floor_gib`) runs after every trim, whatever its status. The disk floor offers a folder only when it is Cargo output (an output root or `is_cargo_target()`) and holds no `Cargo.toml` and no `.git`.
+
+**Files:**
+- `scripts/mac_test/offload.py` — `remote_cleanup_command()`, its use in `remote_test_command()` and `claimed_run()`, the `mac_trim=` branch in `stream_mac_run()`.
+- `scripts/mac_test/test_offload_cleanup.py` — trim, over-budget and failed-trim rows, in sh and zsh.
+- `scripts/mac_test/test_offload_forward.py` — byte-equal command and fetch order rows.
+- `scripts/lint/sweep.py` — the `folder_choices()` candidate rule.
+- `scripts/lint/test_sweep.py` — checkout rows for both machines.
+
+**Gotchas:** `sweep()` exits 0 when unmatched output stays over budget, so read `over_budget=` in the trim line, not the status. `LINT_SKIP_SWEEP=1` stays, because a background sweep can outlive the run and its lease. `is_cargo_target()` keeps its meaning; the checkout exclusion lives only in `folder_choices()`.
+
+**Ruled out:** a full target remove when the trim leaves the target over budget, because it empties the warm cache; `sweep.py --target-dir` as the Mac entry, because `main()` also runs the host floor by hostname.
+
+### Phase 100 — Each hana CI cargo build waits in the build admission queue  · status: todo
+
+**Depends on:** Phase 101 on main, queue's 10d (landed 2026-11-10, e9fe34ff1, on main). **Approved:** builds showrunner, 2026-11-10 ("(a), current. Add the phase before Phase 88 and start now."). Source: natedev, 2026-11-10: modules/linux/hana-runners.nix (nixos main ef7b41c) has no ci_cargo_front, ADMISSION_SOCKET, socket group or BindPaths.
+
+#### Work Order
+
+**Goal:** The NixOS activation that queue's 10d names is written: each hana CI runner calls cargo through the packaged cargo front, and the front reaches the build admission socket.
+
+**Spec:**
+
+1. **Where.** Work in the nixos worktree `/home/natepiano/worktrees/nixos-resources-ci-front`, branch `resources-ci-front`, made from nixos main ef7b41c. Never edit `/etc/nixos`, never push and never rebuild. natedev reviews, commits to main, pushes and hands the user the rebuild.
+2. **The package.** Package the front from the `claude-commands` flake input, as the sweep in `modules/linux/hana-runners.nix` already does. Put no client code copy in the nixos repository. The package has `bin/cargo`: it runs a store Python with `-I <input>/scripts/build_queue/ci_cargo_front.py --front "$0" --shared-folder <runner folder> -- "$@"`. It exports no `PYTHONPATH`, so cargo and its build scripts keep the job environment. Move the `claude-commands` lock to an origin/main commit whose front takes `--shared-folder`; move no other input.
+3. **The runner PATH.** The front's `bin` comes before the cargo-tile shim on each runner's PATH, and the shim comes before the real cargo. A non-building call (`cargo --version`) passes through to the real cargo.
+4. **The socket.** `systemd.sockets.build-admission` uses group `build-admission` and mode `0660`. The group holds natepiano and each hana runner account. The runner reaches `/run/build-admission` through `BindPaths` where its sandbox hides `/run`. `RuntimeDirectoryPreserve=yes` keeps that folder across a socket restart, so a running runner keeps its path to the new listener. Each runner starts after the socket unit. Set `ADMISSION_SOCKET` only for a socket path that is not the default.
+5. **Shared files.** The admission service reads each runner's `/proc` records and its temporary counter files. `nix develop` sets `TMPDIR` to a private `0700` folder, so `TMPDIR` cannot name these files. The front takes `--shared-folder <folder>` for them and leaves `TMPDIR` to the job. Each runner has a runner-owned folder at `/run/hana-ci-admission/<runner>` with mode `0755`, outside the socket's folder. The runner `TMPDIR` is not set. `systemd-tmpfiles` removes entries older than one day, for a front that was killed.
+6. **Limits.** `hana-ci.slice` keeps `MemoryMax=34G` and `MemorySwapMax=2G`. `ci_memory_margin_gib` stays until "The hana CI margin key goes after the runner activation".
+7. **Proof.** The system configuration of natedev evaluates and builds from the worktree, with no switch. Show from the evaluated configuration: the runner PATH order, the socket group and mode, the group members, each `BindPaths` entry, `RuntimeDirectoryPreserve`, and the absence of a runner `TMPDIR`. The built `bin/cargo --version` prints the real cargo version.
+
+**Files:**
+- `/home/natepiano/worktrees/nixos-resources-ci-front/modules/linux/hana-runners.nix`
+- `/home/natepiano/worktrees/nixos-resources-ci-front/modules/linux/development.nix`
+- `/home/natepiano/worktrees/nixos-resources-ci-front/flake.lock`
+
+**Workers:** `1 writer`
+- `impl` owns the three nixos files.
+
+**Gate:** the natedev system configuration builds from the worktree with no switch; the evaluated values in Spec 7 hold; `bin/cargo --version` passes through; natedev accepts the patch.
+
+**Change-Review:** A hana CI build shows in the build queue | On natedev, open the queue view while a hana CI job builds | It has a row named `hana CI · <runner> · <job>`.
+
+### Phase 101 — The CI cargo front takes a shared folder for its counter files  · status: done
+
+#### As-built
+
+- `scripts/build_queue/ci_cargo_front.py` takes `--shared-folder <folder>` after `--front`. `run_cargo` makes its temporary counter folder inside that folder. Without the argument, `JobTemporaryFolder` selects the default temporary folder.
+- The argument changes no environment variable. Cargo receives the job's `TMPDIR` and `PYTHONPATH`.
+- The packaged form is `python3 -I <root>/scripts/build_queue/ci_cargo_front.py --front "$0" --shared-folder <folder> -- "$@"`, with no `PYTHONPATH` from the wrapper. `scripts/lib/package_root.py`, executed at the top of the front, puts the checkout root on `sys.path`.
+- `test_packaged_wrapper_selects_the_next_cargo_and_admits_once` runs this form with and without the argument. It asserts the counter location, the job's `TMPDIR` and `PYTHONPATH`, empty folders after release and one history row.
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py` — the argument and the folder choice.
+- `scripts/build_queue/test_ci_cargo_front.py` — the packaged wrapper test.
+- `docs/as-built/build-memory-admission.md` — the shared folder, the private `TMPDIR`, the runner folder and the age rule.
+
+**Binds later work:** the runner activation pins a `claude-commands` commit on main that holds `--shared-folder`.
+
+**Gotchas:**
+- `nix develop` replaces `TMPDIR` with a private `nix-shell.*` folder at mode 0700, so `TMPDIR` cannot name files the admission service reads.
+- `~/.claude/scripts/lib/py -m` imports the installed main. Run checkout-only test support with the checkout's `scripts/lib/py`.
+
+**Ruled out:** a runner `TMPDIR` for the counter files, because `nix develop` replaces it; `python3 -m` for the packaged form, because hana has a top-level `scripts/` folder and cwd comes first.

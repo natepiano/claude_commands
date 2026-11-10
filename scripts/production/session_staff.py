@@ -168,18 +168,14 @@ class WorkerRunEvidence(NamedTuple):
 
 
 def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) -> dict[staff.StaffId, WorkerRunEvidence]:
-    """Read records and marker associations once, with one anomaly for each failed read."""
+    """Read records and staff run associations once."""
     from scripts.lib import unit_runs
     rows = tuple(rows)
     owners = {owner.current_session: owner for row in rows if (owner := record.parent_of(row)) is not None}
     marked: dict[Path, set[staff.StaffId]] = {}
     for owner in owners.values():
-        try:
-            marker = unit_runs.marker(owner.current_session)
-            if marker.is_file():
-                marked.setdefault(Path(marker.read_text().strip()), set()).update(row.id for row in rows if row.parent == staff.ReportsTo(owner.id))
-        except (OSError, ValueError) as error:
-            report_anomaly(f"{owner.name}: {error}")
+        if isinstance(owner.run, staff.OpenRun):
+            marked.setdefault(owner.run.path, set()).update(row.id for row in rows if row.parent == staff.ReportsTo(owner.id))
     paths = [*marked, *unit_runs.run_folders()]
     if current := unit_runs.environ("RUN_DIR"):
         paths.append(Path(current))
