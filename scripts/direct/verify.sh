@@ -548,15 +548,16 @@ verify_helper() {
         input=${VERIFY_CALLS[1]:-}
         output=${VERIFY_CALLS[0]:-}
         [[ -n "$input" && -n "$output" ]] || return 0
-        if ! { exec {VERIFY_HELPER_INPUT}>&"$input" {VERIFY_HELPER_OUTPUT}<&"$output"; } 2>/dev/null; then
-            unset VERIFY_HELPER_INPUT VERIFY_HELPER_OUTPUT
-            return 0
+        # Bash places coprocess and process-substitution descriptors at 63 and below, so the helper uses 70-73.
+        if { exec 70>&"$input" 71<&"$output"; } 2>/dev/null; then
+            VERIFY_HELPER_INPUT=70
+            VERIFY_HELPER_OUTPUT=71
+            eval "exec $input>&- $output<&-"
         fi
-        exec {input}>&- {output}<&-
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry lock forwarded_fd
+    local input="" has_input=0 status output errors entry
     local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
         shift
@@ -568,8 +569,8 @@ verify_helper() {
         if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" ]]; then
             while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do forwarded+=("$entry"); done
         fi
-        exec {lock}>"$VERIFY_HELPER_LOCK"
-        if flock -x "$lock" 2>/dev/null && (
+        exec 72>"$VERIFY_HELPER_LOCK"
+        if flock -x 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
             env -0
             printf '\0%s\0' "$input"
@@ -579,19 +580,19 @@ verify_helper() {
             && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then
-            exec {lock}>&-
+            exec 72>&-
             if [[ "$status" =~ ^[0-9]+$ ]]; then
                 printf '%s' "$output"
                 printf '%s' "$errors" >&2
                 return "$status"
             fi
         else
-            exec {lock}>&-
+            exec 72>&-
         fi
     fi
     if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" && ${#forwarded[@]} -gt 0 ]]; then
-        exec {forwarded_fd}< <(printf '%s\0' "${forwarded[@]}")
-        export VERIFY_RESULT_ENVIRONMENT_FD="$forwarded_fd"
+        exec 73< <(printf '%s\0' "${forwarded[@]}")
+        export VERIFY_RESULT_ENVIRONMENT_FD=73
     fi
     if [[ "$has_input" == 1 ]]; then
         printf '%s' "$input" | "$PY" "$@"
