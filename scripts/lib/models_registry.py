@@ -561,6 +561,7 @@ def main() -> int:
                 configuration = RegistryEditBase(*_snapshot({}, "", arguments.registry))
             print(configuration_shell(configuration), end="")
             return 0
+        conf_reads.record("models")
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":

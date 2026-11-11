@@ -33,7 +33,7 @@ from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet, write_aws_claim
 from scripts.buildlog import sync
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -3122,7 +3122,11 @@ else: raise AssertionError(args)
         source = self.settings.read_text().replace('# range: 0.001..\nidle_stop_minutes=',
                                                    '# range: 10..20\nidle_stop_minutes=')
         _ = self.settings.write_text(source)
-        self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
+        reads = self.root / 'config-reads'
+        _ = reads.write_text('')
+        with conf_reads.record_reads(reads):
+            self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
+        self.assertEqual(reads.read_text().splitlines(), [self.settings.stem] * 2)
 
     def fake_commands(self, source: str, *names: str) -> None:
         for name in names:
