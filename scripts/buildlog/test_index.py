@@ -207,7 +207,7 @@ def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]
         records = cast(list[sqlite3.Row],
                        connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
         return [{name: cast(object, row[name]) for name in row.keys()
-                 if not (table == "gate_modules" and name == "config_reads" and row[name] is None)}
+                 if not (table == "gate_modules" and name in {"config_reads", "folder_scans"} and row[name] is None)}
                 for row in records]
 
 
@@ -304,14 +304,18 @@ class IndexTests(unittest.TestCase):
     def test_gate_config_reads_store_sorted_empty_and_missing_records(self) -> None:
         template = gate_run()["modules"][0]
         run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "config-reads", "host": "mac",
-                       "modules": [{**template, "module": "test_empty.py", "config_reads": []},
+                       "modules": [{**template, "module": "test_empty.py", "config_reads": [], "folder_scans": []},
                                    {**template, "module": "test_missing.py"},
-                                   {**template, "module": "test_read.py", "config_reads": ["z", "a", "z"]}]}
+                                   {**template, "module": "test_read.py", "config_reads": ["z", "a", "z"],
+                                    "folder_scans": ["scripts/", "docs", "scripts/"]}]}
         self.write(self.host_file, run)
         _ = index.update()
         self.assertIn("config_reads", [row[1] for row in self.rows("PRAGMA table_info(gate_modules)")])
         self.assertEqual(self.rows("SELECT module, config_reads FROM gate_modules ORDER BY module"),
                          [("test_empty.py", "[]"), ("test_missing.py", None), ("test_read.py", '["a", "z"]')])
+        self.assertEqual(self.rows("SELECT module, folder_scans FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["docs", "scripts/"]')])
 
     def test_update_enables_the_configured_spill_threshold(self) -> None:
         spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")

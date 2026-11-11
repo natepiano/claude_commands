@@ -62,6 +62,11 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
   - Submit any selector change with its coverage cases for separate approval.
   - Keep the Phase 37 estimates and Phase 112 replay counts as history. Phase 127's replay (17,861 to 10,042 CPU s over 19 merges) is an estimate from one current graph, one set of config records and saved module CPU. Compare it with measured selection time and executed test CPU. The merge gate continues to run all modules.
   - Revealed by: Phases 111-116.
+- [ ] **A folder scan in a child process selects its test.**
+  - Target: `scripts/test_times/module_run.py` and the selector in `scripts/production/affected_modules.py`.
+  - Why needed: Phase 130 records folder listings only in the test process. A test that starts a tool which lists repository folders records nothing, so a change in those folders does not select it. Git listing commands other than `ls-files` are not recorded either.
+  - Completion condition: name the tests whose child processes list repository folders, with their CPU, and record those listings or report why each cannot be recorded.
+  - Revealed by: Phase 130 design. Builds showrunner, 2026-11-11: keep it as a named item.
 - [ ] **Architecture proposal: the assign launcher starts fewer child processes**
   - Target: `scripts/direct/assign.py` for recorder coordination, owned by sdlc. Target: `scripts/lib/models_registry.py:launch_settings` and `scripts/agents/models_config.sh` for resolver cost, owned by the models unit. Retain the comparable-build measurements across all four launcher modules. The Phase 89 prototype gain of 14.9% is one pair, measured before the port onto builds.
   - Why needed: the current coordinator starts recorder commands and a shell resolver. The codex_mesh deletion removes the follow commands from the Phase 54 profile. Phase 99's adapter changes test execution only. Profile the current production commands before using the historical gain estimates.

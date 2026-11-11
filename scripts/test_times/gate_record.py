@@ -26,6 +26,7 @@ class TestTime(TypedDict):
 
 class ModuleTimes(TypedDict):
     config_reads: NotRequired[list[str]]
+    folder_scans: NotRequired[list[str]]
     wall_s: float
     cpu_s: float
     tests_s: float
@@ -42,6 +43,7 @@ TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 class ModuleRun(TypedDict):
     config_reads: NotRequired[list[str]]
+    folder_scans: NotRequired[list[str]]
     suite: str
     module: str
     attempt: int
@@ -126,6 +128,34 @@ def config_read_record(value: object) -> RecordedConfigReads | NoConfigReadRecor
 
 
 @dataclass(frozen=True)
+class RecordedFolderScans:
+    """The module recorded its repository listings, including an empty set."""
+
+    folders: frozenset[str]
+
+
+@dataclass(frozen=True)
+class NoFolderScanRecord:
+    """The module has no usable record of its repository listings."""
+
+
+@dataclass(frozen=True)
+class ModuleReadRecord:
+    config_reads: RecordedConfigReads | NoConfigReadRecord
+    folder_scans: RecordedFolderScans | NoFolderScanRecord
+
+
+def module_read_record(configs: object, folders: object) -> ModuleReadRecord:
+    """Read both fields without treating an absent field as an empty record."""
+    config_record = config_read_record(configs)
+    if folders is None:
+        return ModuleReadRecord(config_record, NoFolderScanRecord())
+    if not isinstance(folders, list) or not all(isinstance(path, str) for path in cast(list[object], folders)):
+        raise ValueError("expected a list of scanned folders")
+    return ModuleReadRecord(config_record, RecordedFolderScans(frozenset(cast(list[str], folders))))
+
+
+@dataclass(frozen=True)
 class TimingNotApplicable:
     """The type-check job runs no tests and writes no timing file."""
 
@@ -194,9 +224,11 @@ def read_module_times(path: Path) -> ModuleTimes | NoModuleTimes:
             "skipped": _count(fields["skipped"]),
             "tests": [_test_time(test) for test in cast(list[object], tests)],
         }
-        reads = config_read_record(fields.get("config_reads"))
-        if isinstance(reads, RecordedConfigReads):
-            times["config_reads"] = sorted(reads.stems)
+        reads = module_read_record(fields.get("config_reads"), fields.get("folder_scans"))
+        if isinstance(reads.config_reads, RecordedConfigReads):
+            times["config_reads"] = sorted(reads.config_reads.stems)
+        if isinstance(reads.folder_scans, RecordedFolderScans):
+            times["folder_scans"] = sorted(reads.folder_scans.folders)
         return times
     except (OSError, UnicodeError, ValueError, KeyError, OverflowError, RecursionError) as error:
         return NoModuleTimes(f"{path}: {str(error).replace(chr(10), ' ')}")
@@ -232,9 +264,11 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
         }
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
             times = job.times
-            reads = config_read_record(times.get("config_reads"))
-            if isinstance(reads, RecordedConfigReads):
-                module["config_reads"] = sorted(reads.stems)
+            reads = module_read_record(times.get("config_reads"), times.get("folder_scans"))
+            if isinstance(reads.config_reads, RecordedConfigReads):
+                module["config_reads"] = sorted(reads.config_reads.stems)
+            if isinstance(reads.folder_scans, RecordedFolderScans):
+                module["folder_scans"] = sorted(reads.folder_scans.folders)
             module.update(tests_run=times["tests_run"], failures=times["failures"],
                           errors=times["errors"], skipped=times["skipped"], tests_s=times["tests_s"],
                           tests=kept_tests(times, slow_test_s))
