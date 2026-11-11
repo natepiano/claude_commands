@@ -20,6 +20,8 @@
 # Numeric settings set limits and adjustments, not check states.
 
 LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
 
 # Canonical order. Each entry is `name|what it runs|where it applies`. A key in
 # the config that is not listed here is rejected as unknown.
@@ -73,6 +75,8 @@ _lint_config_field() {
 _lint_config_raw_into() {
     local _lint_want="$1" _lint_output="$2" _lint_presence_output="$3"
     local _lint_line _lint_key _lint_value
+    local _lint_stem="${LINT_CONFIG_FILE##*/}"
+    conf_record "${_lint_stem%.conf}"
     printf -v "$_lint_output" '%s' ''
     printf -v "$_lint_presence_output" '%s' absent
     [[ -f "$LINT_CONFIG_FILE" && -r "$LINT_CONFIG_FILE" ]] || return 0
@@ -177,6 +181,7 @@ lint_config_skip_notice() {
 
 _lint_config_set() {
     local op="$1" value="$2" tmp
+    local stem="${LINT_CONFIG_FILE##*/}"
     if ! _lint_config_is_op "$op"; then
         _lint_config_unknown "$op"
         return 1
@@ -195,6 +200,7 @@ _lint_config_set() {
     fi
 
     tmp="$LINT_CONFIG_FILE.tmp.$$"
+    conf_record "${stem%.conf}"
     if ! awk -v op="$op" -v val="$value" '
         {
             line = $0

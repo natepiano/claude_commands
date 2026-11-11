@@ -2525,39 +2525,80 @@ A private copy of the git index now keeps the mtime of the bytes it copies, so g
 **Gotchas:** `shutil.copy2` is not enough. It stats the path again after the read, and git replaces the index by rename, so a rewrite between the two gives old bytes with a newer mtime. Do not copy a git index with `cp` or `shutil.copyfile`; use `git_index.private_copy`. The macOS run of the `validate_ci.sh` regression is not verified.
 
 ### Phase 127 — A config edit selects only the tests that really read that config file  · status: done
-**Depends on:** none
+
+#### As-built
+
+Config reads are recorded at run time. When the environment has `CONF_READ_LOG`, each read through `conf.py` or `conf.sh` appends the config stem to that file with one append write; without the variable, the readers do no added work. `module_run.py` sets the log per module, so child processes inherit it, and writes the sorted stems to the module's times file as `config_reads`. The gate record and the build log index (schema 37, `gate_modules.config_reads`) carry them. A module with no times file has no record (NULL), which is different from an empty list.
+
+`affected_modules.select_affected` selects, for each changed `config/<name>.conf`:
+- the modules that recorded `<name>` in the newest full, non-aborted gate with at least one config record (`latest_config_reads`); a newer gate without records does not replace it;
+- the modules with no record in that gate;
+- the modules whose own text names the file (direct `SourceFacts.config_reads`).
+
+The transitive config closure is deleted. An index read error gives `FullSuite` with a reason. On 19 builds merges, the estimate is targeted CPU 17,861 to 10,042 CPU s (median 280 to 126 per merge); selection takes under 3 s.
+
+**Files:**
+- `scripts/lib/conf_reads.py` — new; the recorder (`record`, `read_text`), standard library only
+- `scripts/lib/conf.py`, `scripts/lib/conf.sh` — record each read
+- `scripts/test_times/module_run.py`, `scripts/test_times/gate_record.py`, `scripts/buildlog/index.py` — carry the records
+- `scripts/production/affected_modules.py` — `latest_config_reads`, `select_affected`
+- Nine direct config readers read through `conf_reads.read_text`
+
+**Gotchas:**
+- `conf_reads.py` binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not catch the record.
+- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`. The Mac context-economy payload ships both.
+- Nine raw readers do not record: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, the `models_registry.py` edit snapshots and `deploy.py`.
+- A new reader is missed until the next full gate records it.
+
+**Ruled out:** the transitive closure rule of Phase 96 — one `merge_gate.conf` edit selected 429 of 743 modules.
+
+### Phase 128 — Test runs start no background Git upkeep  · status: done
+**Depends on:** Phase 127
+
+#### As-built
+
+- No repository change. The trial gained 2.8 CPU s on the 21 most Git-heavy modules, far under the 30 CPU s bar, and did not land.
+- The trial: `module_run.py` appended `maintenance.auto=false` and `gc.auto=0` through `GIT_CONFIG_COUNT`, one fixture helper kept those settings, and nine per-fixture copies were removed. Review closed four findings, and the full gate passed (748 modules).
+- Measure: `module_cost.py --commands` on 21 Git-heavy modules, base and change side by side. Command CPU 451.3 to 448.5 CPU s, Git CPU 92.1 to 90.2 CPU s, Git starts 82,028 to 79,432 (3%). No measured row was a detached `gc` or `maintenance` task.
+- Floor: the per-fixture copies already turned off most upkeep. The Work Order estimate (about 50 CPU s on 12 modules) did not hold on this base.
+
+**Ruled out:** a runner-wide Git upkeep setting for speed. Keep the per-fixture copies; several of them are race guards for fixture removal.
+
+### Phase 129 — Every config reader records its read, so a config edit selects its tests  · status: done
+**Depends on:** Phase 128
 
 #### Work Order
 
-**Goal:** A targeted test for a changed `config/<name>.conf` selects only the test modules that read that file in the last full merge gate, plus modules with no record and modules that name the file in their own text.
+**Goal:** Each of the nine raw config readers that Phase 127 named records the config stem in `CONF_READ_LOG`, so a full gate records the modules that read that config.
 
-**Decision:** User answer "B" (via the builds showrunner, 2026-11-10): each full merge gate records which config files each test module reads at run time; a targeted test selects only those modules, plus modules with no record and modules that name the file in their own text.
-
-**Cause:** The approved transitive rule (phase 96) selects every module whose import closure reaches a `conf.<fn>("<name>")` reader. One `merge_gate.conf` edit selects 429 of 743 modules. In the phase 112 replay, this rule was 86% of targeted CPU.
+**Decision:** Builds showrunner, 2026-11-10: after Phase 128, route the nine raw readers through `conf.py` or `conf.sh`; where a reader cannot use them, state why in the plan; get each owner's go.
 
 **Spec:**
-1. Record reads in the two config readers. When the environment has `CONF_READ_LOG` (a file path), each read appends the config stem and a newline to that file with one append write.
-   - `scripts/lib/conf.py`: record in the one function that every reader goes through to resolve a config file. Over-recording is safe; a missed read is not.
-   - `scripts/lib/conf.sh` `conf_value`: append `$file` with a shell builtin; start no process.
-   - Without the variable, the readers do no added work.
-   - Search `scripts/` for other readers of `config/*.conf` (direct `open`, `read_text`, `jq`, `grep`, `sed`). Route each through `conf` where it is a plain value read. List the rest in the reply; a module that runs one of them must still be selected (see 4c).
-   - As built: the recorder is `scripts/lib/conf_reads.py` (standard library only). It binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not see the record. Nine raw readers stay routed through `conf_reads.read_text`. Raw readers kept: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, `models_registry.py` edit snapshots, `deploy.py`. Fixture copies of `conf.py` and the Mac context-economy payload carry `conf_reads.py`.
-2. `scripts/test_times/module_run.py`: set `CONF_READ_LOG` to a private file for the module run, so child processes inherit it. Write the sorted set of read stems into the module's times file as `config_reads`.
-3. `scripts/test_times/gate_record.py` and `scripts/production/merge_gate.py`: carry `config_reads` into each `ModuleRun` of the gate record. `scripts/buildlog/index.py`: store it on `gate_modules` (raise `SCHEMA_VERSION`). A module without a times file has no record.
-4. `scripts/production/affected_modules.py` `select_affected`, for each changed `config/<name>.conf`, selects a module when:
-   a. the newest full (`selection == "full"`), not aborted, gate run in the local build log index with at least one `config_reads` row ran the module and recorded `<name>` for it. A newer gate from a branch without records does not replace it; or
-   b. that gate run has no `config_reads` row for the module (new module, missing times file, or no full gate with records yet); or
-   c. the module's own text names the file: its own direct `SourceFacts.config_reads` (not the transitive closure) contains `<name>`.
-   Delete `transitive_config_reads` and every use of the transitive config closure. One rule only.
-5. A read error of the index gives `FullSuite` with a reason, as other graph errors do.
-6. Tests: one row each in the existing test files (`test_conf.py`, `test_conf_sh.py`, `test_module_run.py`, `test_gate_record.py`, the index test, `test_affected_modules.py`). Each new row fails on the old code. Use temporary repositories and a temporary build log; no live state; no committed test project.
+1. `scripts/lib/conf.sh`: add `conf_record <stem>`. It appends the stem to `CONF_READ_LOG` when the variable is set and does nothing otherwise. `conf_value` calls it in place of its own append. One recorder for shell readers.
+2. Python readers record through `scripts/lib/conf_reads.py`: `conf_reads.read_text(path)` for a text read, `conf_reads.record(stem)` before any other read of the file (bytes, a hash, a line loop). Do not add a second recorder.
+3. Record at each raw config read in these files:
+   - `scripts/statusline/statusline.sh`: `statusline.conf` and `user_zone.conf`. Source `conf.sh` or call `conf_record`; keep the status line start time (no added process).
+   - `scripts/lint/lint_config.sh`: `lint.conf`.
+   - `scripts/direct/progress_history.py`: `direct.conf` in `_config_digest`.
+   - `scripts/direct/verify.sh`: `lint.conf` in `lint_code_key`, and each other raw read of a `config/*.conf` file.
+   - `scripts/accounts/new_account.py`: `statusline.conf` in `statusline_color_step`.
+   - `scripts/lib/zone.py`: `user_zone.conf` reads.
+   - `scripts/lib/tune.py`: the source read at `:103`.
+   - `scripts/lib/models_registry.py`: the edit snapshots (`before`, `after`) record `models`.
+   - `scripts/aws_target/deploy.py`: each raw `config/*.conf` read.
+   A read of a file that is not under `config/` gets no record. A reader that cannot record gets one plan line that says why.
+4. Search `scripts/` for other raw `config/*.conf` reads that do not record (outside `conf.py`, `conf.sh`, `conf_reads.py`). List them in the reply; do not change them.
+5. Tests: one row in `scripts/lib/test_conf_sh.py` for `conf_record` (log set and unset). For each changed reader, add a row to its existing test module only where that module already runs the read path; the row sets `CONF_READ_LOG` and checks the stem. Name each reader without a row in the reply. The rows fail on the old code.
 
 **Files:**
-- `scripts/lib/conf.py`, `scripts/lib/conf.sh` — record reads
-- `scripts/test_times/module_run.py`, `scripts/test_times/gate_record.py`, `scripts/production/merge_gate.py`, `scripts/buildlog/index.py` — carry the reads into the gate record
-- `scripts/production/affected_modules.py` — select by recorded reads
-- `scripts/lib/test_conf.py`, `scripts/lib/test_conf_sh.py`, `scripts/test_times/test_module_run.py`, `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_index.py`, `scripts/production/test_affected_modules.py` — one new row each
-**Workers:** 1 writer (the record format joins all files).
+- `scripts/lib/conf.sh` — `conf_record`
+- `scripts/statusline/statusline.sh`, `scripts/lint/lint_config.sh`, `scripts/direct/progress_history.py`, `scripts/direct/verify.sh`, `scripts/accounts/new_account.py`, `scripts/lib/zone.py`, `scripts/lib/tune.py`, `scripts/lib/models_registry.py`, `scripts/aws_target/deploy.py` — one recorder line at each read
+- `scripts/lib/test_conf_sh.py` — the `conf_record` row
+- `scripts/statusline/test_statusline.py`, `scripts/lib/test_zone.py`, `scripts/lib/test_tune.py`, `scripts/accounts/test_new_account.py`, `scripts/direct/test_progress_history.py`, `scripts/aws_target/test_deploy.py`, `scripts/lib/test_models_registry.py`, `scripts/direct/test_verify_lint_cache_versions.py`, `scripts/lint/test_invoke_scope.py` — one row each where the read path already runs
+
+**Workers:** 1 writer. Each edit is one recorder line, and each test row follows its read path, so the work does not split.
 - impl: all files.
 
-**Acceptance gate:** targeted tests for the changed files pass; basedpyright 0/0/0 and ShellCheck clean on the changed files. The director runs one full local gate on the review copy, checks that its record holds `config_reads` for each module, and replays the phase 112 selections with the new rule. Report the median modules and CPU of a config edit before and after.
+**Goes:** sdlc, builds and natedev (root showrunner), 2026-11-11, for all files. Keep each edit to one recorder line at each read: open branches change `verify.sh` (builds-queue, natedev-verify), `progress_history.py` (build-followups-hierarchies, sdlc-devtools-readers3t, sdlc-roles) and `models_registry.py` (devtools producers).
+
+**Acceptance gate:** every changed module passes through `module_run.py`; basedpyright 0/0/0 and shellcheck clean on the changed files. A full gate on a cloud box records the new stems: `statusline`, `user_zone`, `lint`, `direct`, `models` appear for the modules that run those readers. The phase is not a speed phase; its proof is the recorded stems.

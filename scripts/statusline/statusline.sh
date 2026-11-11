@@ -1,6 +1,12 @@
+# shellcheck shell=sh
 # Source this file from the statusLine command with statusline set to this folder.
 # Read the account, colors, zone, quota labels, and cached counts with shell builtins.
 # assignment.py reads the staff row and unit configuration, then replaces itself with jq.
+
+if [ -n "${CONF_READ_LOG:-}" ]; then
+  # shellcheck source=/dev/null
+  . "$statusline/../lib/conf_record.sh"
+fi
 
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 account=
@@ -21,13 +27,17 @@ labels="$HOME/.local/state/agent-notes/by-label.json"
 
 colors="$statusline/../../config/statusline.conf"
 [ -r "$colors" ] || colors=/dev/null
+[ -z "${CONF_READ_LOG:-}" ] || [ "$colors" = /dev/null ] || conf_record statusline
 
 zone=${USER_ZONE:-}
 if [ -z "$zone" ]; then
+  zone_conf=${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}
+  zone_stem=${zone_conf##*/}
+  [ -z "${CONF_READ_LOG:-}" ] || conf_record "${zone_stem%.conf}"
   {
     while IFS= read -r line; do
       case $line in zone=*) zone=${line#zone=}; break ;; esac
-    done < "${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}"
+    done < "$zone_conf"
   } 2>/dev/null
 fi
 export TZ="${zone:-America/New_York}"
