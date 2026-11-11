@@ -76,7 +76,8 @@ class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
     def test_busy_claim_what_reaches_call_holder_through_the_real_offload_result(self) -> None:
         state = Path(self.environment["MAC_TEST_STATE_DIR"])
         state.mkdir()
-        record: BusyClaimRecord = {"pid": os.getpid(), "proc_start": build_hold.process_start_time(os.getpid()),
+        record: BusyClaimRecord = {"claim_id": "busy-claim", "episode": "busy-episode", "attempt": "busy-attempt",
+                  "submitting_session": "", "pid": os.getpid(), "proc_start": build_hold.process_start_time(os.getpid()),
                   "what": "render checks", "worktree": str(self.root),
                   "since": datetime.now(timezone.utc).isoformat()}
         _ = (state / "run.json").write_text(json.dumps(record))

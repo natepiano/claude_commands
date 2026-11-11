@@ -17,9 +17,10 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -29,10 +30,12 @@ from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final
 
 from scripts.build_hold import override_guard
+from scripts.mac_test import claim_state
 
 
 if TYPE_CHECKING:
     from scripts.build_hold import build_hold
+    from scripts.build_queue.placement import SubmittingSession
     from scripts.mac_test import mac_test, offload
     from scripts.message import roster
     from scripts.build_targets.targets import (
@@ -64,6 +67,11 @@ class CliArguments(argparse.Namespace):
         self.recover_only: bool = False
         self.mac_only: bool = False
         self.remote_kinds_file: str = ""
+        self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
+        self.claim_identity_file: str = ""
+        self.claim_id: str = ""
+        self.episode: str = ""
+        self.attempt: str = ""
 
 
 def positive_pid(value: str) -> int:
@@ -82,6 +90,7 @@ def parser() -> argparse.ArgumentParser:
     _ = reserve.add_argument("--kind", required=True)
     _ = reserve.add_argument("--pid", type=positive_pid, required=True)
     _ = reserve.add_argument("--reservation-file", required=True)
+    _ = reserve.add_argument("--claim-identity-file", default="")
     _ = reserve.add_argument("--target", default="")
     _ = reserve.add_argument("--recover-only", action="store_true")
     _ = reserve.add_argument("--new-step", action="store_true")
@@ -93,6 +102,15 @@ def parser() -> argparse.ArgumentParser:
     _ = recovery.add_argument("--recovery-fd", type=int, required=True)
     release = commands.add_parser("release-wait")
     _ = release.add_argument("--pid", type=positive_pid, required=True)
+    for field in ("claim-id", "episode", "attempt"):
+        _ = release.add_argument("--" + field, default="")
+
+    def parsed_session(value: str) -> SubmittingSession:
+        from scripts.build_hold.build_hold import NoOwningSession, OwningSession
+
+        return OwningSession(value) if value else NoOwningSession()
+
+    _ = release.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
     status = commands.add_parser("status")
     _ = status.add_argument("--probe", action="store_true")
     eligible = commands.add_parser("eligible")
@@ -453,10 +471,12 @@ CAPACITY_NOT_READ = CapacityNotRead()
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing, *,
                            answer: mac_test.FreeNowAnswer | CapacityNotRead = CAPACITY_NOT_READ,
+                           session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            ) -> EligibleTarget | ExcludedTarget:
 
     from scripts.mac_test import mac_test, offload
 
+    session = claim_state.submitting_session(session)
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
     try:
@@ -473,7 +493,9 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             if isinstance(policy, offload.IneligibleMacStep):
                 return ExcludedTarget(target, policy.reason)
         if isinstance(answer, CapacityNotRead):
-            answer = mac_test.free_now(mac_test.state_paths(name), config.source, repo_root)
+            answer = mac_test.free_now(mac_test.state_paths(name), config.source, repo_root, session=session)
+        if answer == "blocked":
+            return ExcludedTarget(target, answer)
         if answer == "bad":
             return EligibleTarget(target)
         controller = offload.ProcessController()
@@ -484,7 +506,9 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             return ExcludedTarget(target, "unreachable")
         if isinstance(probe, offload.InterruptedTargetStatus):
             return ExcludedTarget(target, "busy")
-        with offload.interrupt_handlers(controller):
+        handlers = (offload.interrupt_handlers(controller)
+                    if threading.current_thread() is threading.main_thread() else nullcontext())
+        with handlers:
             disk = offload.ensure_mac_disk_floor(controller, config, eligibility, probe, name)
         if isinstance(disk, offload.SweepFailed):
             print(f"build targets: Mac disk exclusion: {disk.cause}", file=sys.stderr)
@@ -498,19 +522,21 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
-                           kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False
+                           kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False,
+                           session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
 
     from scripts.build_targets import target_config
     from scripts.mac_test import mac_test, offload
 
+    session = claim_state.submitting_session(session)
     if target.platform == "macos" or isinstance(routing, LocalRequired):
-        answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root)
+        answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session)
         if new_step and not isinstance(selection, Pinned) and answer == "bad":
             start_probe_recovery(target, repo_root, package, kind)
         if target.platform == "macos":
-            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer)
+            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer, session=session)
         return ExcludedTarget(target, cast(LocalRequired, routing).reason)
     config = ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
@@ -527,7 +553,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
             return ExcludedTarget(target, "starting")
         if control.get("state") == "refused":
             return ExcludedTarget(target, str(control.get("reason", "controller refused")))
-    answer = mac_test.free_now(paths, target.settings, repo_root)
+    answer = mac_test.free_now(paths, target.settings, repo_root, session=session)
     if new_step and not isinstance(selection, Pinned) and answer == "bad":
         start_probe_recovery(target, repo_root, package, kind)
     if answer not in ("free", "bad"):
@@ -610,27 +636,31 @@ def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
         return 2
 
 
-def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> bool:
-    """Find the same process's reservation, including retained cleanup ownership."""
+def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int,
+                    *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
+    """Find the exact reservation for this process and session."""
     from scripts.lib import process_start as process_identity
     from scripts.mac_test import mac_test
 
+    session = claim_state.submitting_session(session)
     start = process_identity.process_start(pid)
     if not isinstance(start, process_identity.Started):
-        return False
+        return claim_state.NO_CLAIM_IDENTITY
     try:
         scope = mac_test.target_claim_scope(paths, repo_root)
-        block = mac_test.blocking_claim_block(paths)
-        return any(mac_test.scopes_overlap(claim.scope, scope)
-                   and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
-                   and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
-                   and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)
-                   for claim in mac_test.read_claims(paths))
+        block = mac_test.blocking_claim_block(paths, session)
+        return next((claim_state.claim_identity(claim.record) for claim in mac_test.read_claims(paths)
+                     if mac_test.scopes_overlap(claim.scope, scope)
+                     and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
+                     and claim.record["submitting_session"] == claim_state.session_id(session)
+                     and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                     and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)),
+                    claim_state.NO_CLAIM_IDENTITY)
     except (OSError, mac_test.StateReadError):
-        return False
+        return claim_state.NO_CLAIM_IDENTITY
 
 
-def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
+def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: SubmittingSession) -> None:
     """Recover retained cleanup ownership without granting permission to execute."""
 
     from scripts.lib import conf, process_start as process_identity
@@ -663,7 +693,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
             if mac_test.read_run(claim.path) != claim.record or "remote_host" not in claim.record:
                 continue
             with redirect_stdout(io.StringIO()):
-                attempt = mac_test.take_over_kept_claim(owner, claim, claim.record)
+                attempt = mac_test.take_over_kept_claim(owner, claim, claim.record, session=session)
             if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
                 continue
         try:
@@ -679,12 +709,24 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
                     claim.path.unlink(missing_ok=True)
 
 
+def publish_wait_reservation(args: CliArguments, target: SshTarget,
+                             identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity,
+                             session: SubmittingSession) -> None:
+    """Publish the target and the exact identity for release and handoff."""
+    from scripts.lib.atomic_file import write_text_atomic
+
+    write_text_atomic(Path(args.reservation_file), f"{target.name}\t{target.settings}\n")
+    if args.claim_identity_file and isinstance(identity, claim_state.ClaimIdentity):
+        write_text_atomic(Path(args.claim_identity_file),
+                          f"{identity.claim_id}\t{identity.episode}\t{identity.attempt}\t{claim_state.session_id(session)}\n")
+
+
 def command_reserve(args: CliArguments) -> int:
     """Reserve before a queue leave; the wait process owns the reservation."""
 
     from scripts.build_targets import target_config
-    from scripts.lib.atomic_file import write_text_atomic
 
+    session = claim_state.submitting_session(claim_state.CALLING_SESSION)
     destination = Path(args.reservation_file)
     if destination.exists():
         name, separator, settings = destination.read_text().strip().partition("\t")
@@ -699,7 +741,9 @@ def command_reserve(args: CliArguments) -> int:
                     from scripts.mac_test import mac_test
 
                     paths = mac_test.state_paths(name)
-                    if owns_wait_claim(paths, args.repo_root, args.pid):
+                    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+                    if isinstance(identity, claim_state.ClaimIdentity):
+                        publish_wait_reservation(args, target, identity, session)
                         return 0
         destination.unlink(missing_ok=True)
     if args.kind not in ("test", "check", "doc", "lint", "example", "build", "final"):
@@ -714,21 +758,21 @@ def command_reserve(args: CliArguments) -> int:
         config = ssh_target_config(target)
         if isinstance(config, ExcludedTarget):
             if config.reason != "off":
-                cleanup_refused_claims(target, args)
+                cleanup_refused_claims(target, args, session=session)
             continue
         if not config.enabled:
             continue
         paths = mac_test.state_paths(target.name)
-        owned = owns_wait_claim(paths, args.repo_root, args.pid)
-        if not owned:
-            answer = mac_test.free_now(paths, target.settings, Path(args.repo_root))
+        identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+        if isinstance(identity, claim_state.NoClaimIdentity):
+            answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session)
             if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
                 continue
         policy = offload.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
         if isinstance(policy, offload.IneligibleMacStep):
             continue
-        if owned:
-            write_text_atomic(destination, f"{target.name}\t{target.settings}\n")
+        if isinstance(identity, claim_state.ClaimIdentity):
+            publish_wait_reservation(args, target, identity, session)
             return 0
         if args.recover_only:
             scope = mac_test.target_claim_scope(paths, args.repo_root)
@@ -744,25 +788,30 @@ def command_reserve(args: CliArguments) -> int:
         claim = mac_test.CliArguments()
         claim.pid, claim.target, claim.repo_root = args.pid, target.name, args.repo_root
         claim.settings, claim.package, claim.verb = str(target.settings), args.package, verb
-        with redirect_stdout(io.StringIO()):
-            status = mac_test.command_claim_wait(claim, paths, kind=args.kind)
+        claim.identity = True
+        with redirect_stdout(io.StringIO()) as output:
+            status = mac_test.command_claim_wait(claim, paths, kind=args.kind, session=session)
+        identity = claim_state.reply_claim_identity(output.getvalue())
         if status not in (0, 13):
             if status == 11 and target.platform == "macos":
                 busy_mac = True
             continue
         try:
-            write_text_atomic(destination, f"{target.name}\t{target.settings}\n")
+            publish_wait_reservation(args, target, identity, session)
         except BaseException:
-            _ = command_release_wait(args.pid)
+            _ = command_release_wait(args.pid, identity=identity, session=session)
             raise
         return 0
     return 11 if busy_mac else 1
 
 
-def command_release_wait(pid: int) -> int:
+def command_release_wait(pid: int, *,
+                         identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
+                         session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
     """Release only process-bound reservations; remote claims retain ownership."""
     from scripts.lib import process_start as process_identity
 
+    session = claim_state.submitting_session(session)
     start = process_identity.process_start(pid)
     if not isinstance(start, process_identity.Started):
         return 0
@@ -773,12 +822,12 @@ def command_release_wait(pid: int) -> int:
 
         if not target_config.ssh_target_state_directory(target.name).exists():
             continue
-        from scripts.mac_test import claim_state
-
         paths = claim_state.state_paths(target.name)
         with claim_state.locked(paths.lock):
             for claim in claim_state.read_claims(paths):
                 if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
+                        and claim.record["submitting_session"] == claim_state.session_id(session)
+                        and claim_state.claim_identity(claim.record) == identity
                         and "remote_host" not in claim.record):
                     claim.path.unlink(missing_ok=True)
     return 0
@@ -919,7 +968,8 @@ def command_register_local(_call_id: str, *, pid: int) -> int:
     return command_check_local("verify")
 
 
-def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", caller: str = "") -> int:
+def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", caller: str = "",
+                       session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
     """Wait until no hold applies. An empty caller is verify.sh; any other caller is a lint step."""
 
     from scripts.build_hold import build_hold
@@ -972,7 +1022,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             holds = build_hold.natedev_holds(directory)
             if not holds.in_force:
                 return 0
-            blocking = hold_waited_on(holds, build_hold.owning_session(), directory)
+            session = claim_state.submitting_session(session)
+            blocking = hold_waited_on(holds, session, directory)
             if isinstance(blocking, NoBlockingHold):
                 return 0
             if not isinstance(state, Held):
@@ -1043,7 +1094,8 @@ def command_interrupt_local(call_id: str, signal_name: str) -> int:
         return 12
 
 
-def command_check_local(caller: str = "") -> int:
+def command_check_local(caller: str = "", *,
+                        session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
 
     from scripts.build_hold import build_hold
     from scripts.build_targets.targets import Held, StateUnreadable
@@ -1058,7 +1110,7 @@ def command_check_local(caller: str = "") -> int:
         holds = build_hold.natedev_holds(directory)
         if not holds.in_force:
             return 0
-        owner = build_hold.owning_session()
+        owner = claim_state.submitting_session(session)
         blocking = hold_waited_on(holds, owner, directory)
         if isinstance(blocking, NoBlockingHold):
             return 0
@@ -1121,7 +1173,10 @@ def main() -> int:
         from scripts.build_targets import target_config
 
         with target_config.command_configuration():
-            return command_release_wait(args.pid) if args.command == "release-wait" else command_eligibility(args)
+            if args.command == "release-wait":
+                return command_release_wait(args.pid, identity=claim_state.ClaimIdentity(
+                    args.claim_id, args.episode, args.attempt), session=args.session)
+            return command_eligibility(args)
     if args.command == "register-local":
         return command_register_local(args.call_id, pid=args.pid)
     if args.command == "wait-local":

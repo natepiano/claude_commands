@@ -56,7 +56,7 @@ The sole holder may build. `verify.sh test` and non-building calls pass. The hel
 - `free`: start your work through its normal gate. `running`: let that job finish; a natedev hold stops tests and builds outside its allow rules, including work already running; a Mac block lets its running job finish.
 - `held`: wait for that holder's release, or release your own hold. For a Mac block past its expiry, use `/build:mac unblock`; it stays held until the block file is removed.
 - `unreachable`: use `/build:status --probe`; wait for a working connection before trying Mac work.
-- `state unreadable`: use the named path to identify the record. A natedev holder file under `~/.local/state/build-hold/` is repaired by its holder repeating `hold --for '<why>'`; the holder can instead remove its hold with `release`. For `~/.local/state/build-hold-release/current` or its `cycle.json`, `/build:hold release` sets the damaged record aside and ends the hold. A Mac `block.json` or `run.json` under `~/.local/state/mac-test/` needs its damaged file repaired or removed after checking the holder and any job still running; then use `/build:mac block` or `unblock` for the block, or `mac_test.py release --pid <pid>` for a readable kept claim.
+- `state unreadable`: inspect the named path. A natedev holder can repair its record with `hold --for <why>` or remove its hold with `release`. `/build:hold release` sets a damaged release record aside. For a damaged Mac claim file, check its holder and any running job before you repair or remove it. Use `/build:mac block` or `unblock` for a block. Release a readable kept claim with `mac_test.py release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`.
 
 ## Installed-script refusals
 

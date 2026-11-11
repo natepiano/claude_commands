@@ -140,7 +140,8 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                            if part.startswith("Detached run: ")}
                 received.update(results)
                 if (text in (line.strip(), script_prompt(line).strip()) if isinstance(line, str) else
-                        any(f"End your final reply with DONE {identity}." in text for identity in
+                        any(f"End your final reply with DONE {identity}." in text
+                            or f"End your final reply with this line alone: DONE {identity}\n" in text for identity in
                             (line.dispatch_id, worker_panes.stage_two_completion_id(line.dispatch_id)))):
                     submitted = True
                     responding = True
@@ -148,7 +149,8 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                 elif isinstance(completion, FinalReply):
                     responding = False
                     reply = DispatchSubmitted()
-                elif "Read the unchanged prompt file" in text and "End your final reply with DONE " in text:
+                elif "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
+                        "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
                     responding = False
                 elif submitted and responding and results:
                     reply = DispatchAwaitingReply(
@@ -159,10 +161,10 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                 if isinstance(completion, FinalReply):
                     complete = bool(text.strip())
                 else:
-                    endings = {f"DONE {completion.dispatch_id}"}
+                    complete = worker_admission.reply_ends_dispatch(text, completion.dispatch_id)
                     if isinstance(line, DispatchPrompt):
-                        endings.add(f"DONE {worker_panes.stage_two_completion_id(completion.dispatch_id)}")
-                    complete = bool(text.rstrip().splitlines()[-1:] and text.rstrip().splitlines()[-1] in endings)
+                        complete = complete or worker_admission.reply_ends_dispatch(
+                            text, worker_panes.stage_two_completion_id(completion.dispatch_id))
                 if complete and isinstance(line, DispatchPrompt):
                     submitted = True
                 if not (isinstance(line, DispatchPrompt) and isinstance(reply, DispatchComplete)):
@@ -361,7 +363,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         saved = progress_history.dispatch_delivery(worker_panes.worker_pass(started.row, session_dir))
         if not saved.line:
             dispatch_id = dispatch_id or instance
-            line = (f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}. "
+            line = (f"Read the unchanged prompt file {json.dumps(str(prompt))}. "
+                    f"End your final reply with this line alone: DONE {dispatch_id}\n"
                     "A reply that waits on a detached run is not final.")
             handoff = worker_admission.dispatch_record(session_dir, name.value)
             if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT):

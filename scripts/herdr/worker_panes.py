@@ -583,8 +583,8 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
         messages = [entry for entry in entries if isinstance(entry, str) and entry]
         if (not isinstance(dispatch, str) or not dispatch or not messages
                 or not messages[-1].startswith("assistant:\n")
-                or messages[-1].rstrip().splitlines()[-1] not in
-                (f"DONE {dispatch}", f"DONE {stage_two_completion_id(dispatch)}")):
+                or not any(worker_admission.reply_ends_dispatch(messages[-1], identity)
+                           for identity in (dispatch, stage_two_completion_id(dispatch)))):
             return Kept("last turn does not end with the dispatch DONE line")
     except (OSError, ValueError) as error:
         return Kept(f"completion evidence is unavailable: {error}")
@@ -1036,6 +1036,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     environment = launch_environment(policy, account, row is not None and not switching)
     if isinstance(environment, StartRefused):
         return environment
+    launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
+                   if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
     if owner.kind == "unit":
         environment["UNIT_RUN_DIR"] = str(allowed.run)
@@ -1157,14 +1159,15 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if switching:
             request = hashlib.sha256(f"{row.current_session if row else ''}:{policy.settings.kind}".encode()).hexdigest()
             published = worker_admission.switch_worker(allowed, policy.settings.kind, start=start,
-                dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request)
+                dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request,
+                launch_home=launch_home)
             row = published.row
         else:
             identity = start(worker_admission.NoFamilyHandoff())
             if row is not None and identity != row.current_session:
                 return _uncertain(row, "launch proves another native session; pane retained")
             if row is None:
-                row = worker_admission.publish(allowed, identity).row
+                row = worker_admission.publish(allowed, identity, launch_home=launch_home).row
                 lock.bind(row)
     except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if not launches:

@@ -70,9 +70,8 @@ Local execution still uses the existing memory reservation and process control.
 Scaler dispatch uses its existing durable attempt reservation instead of an SSH claim.
 Its unresolved launch remains charged by that provider.
 
-The claim binds a unique claim id, episode, attempt, target and scope.
-Adoption keeps that claim identity, binds the remote host and generation, and can move the local holder.
-Verify hands its claim to its offload child, so `ClaimHolderIdentity` names the holder and `SubmittingOwner` stays the coordinator.
+The claim binds a unique claim id, episode, attempt, target, scope and local holder identity.
+Adoption preserves that identity while binding the remote host and generation.
 A provider release compares that exact claim under the target lock.
 A PID alone cannot identify a release.
 Cleanup takeover preserves the original claim identity and grants no execution permission.
@@ -181,7 +180,6 @@ Do not encode unstarted execution and unavailable evidence with the same optiona
 | Type | Meaning |
 | --- | --- |
 | `SubmittingOwner` | Coordinator host, local PID and start time; only this identity reaches a local pidfd. |
-| `ClaimHolderIdentity` | Host, PID and start time of the local adapter that holds the provider claim. It can differ from `SubmittingOwner`. |
 | `SubmittingSession` | The caller's existing hold identity: `OwningSession` or `NoOwningSession`. |
 | `PlacementConstraints` | Fixed source, command, session and permitted destination constraints. |
 | `HostSelection` | `ConfiguredOrder`, `PinnedHost` or the existing `ScalerGateOrder`. |
@@ -351,7 +349,7 @@ Unchanged transport, runner, copy, cleanup and lifecycle functions remain outsid
 | `offload.leased_offload` | Lease only the assigned scope and slot; report refusal instead of trying another slot. |
 | `offload.claim_arguments`, `read_claim_answer`, `claim_for_run` | Bind acquisition and remote-bound adoption to the exact assignment and claim identity. |
 | `offload.claimed_run` | Consume permission after adoption and before remote execution; report outcomes through its existing cleanup path. |
-| `offload.release_claim` | Keep the exact claim identity from Phase 10g; return a typed confirmed or unconfirmed result. |
+| `offload.release_claim` | Send the exact claim identity instead of releasing by PID alone. |
 | `copy_watch.Watch.try_copy`, `newest_candidate` | Submit candidates to queue copy policy instead of choosing available remote capacity. |
 | `copy_watch.start_copy` | Dispatch only the assigned speculative attempt. |
 
@@ -372,7 +370,7 @@ No placement adapter restores sender timestamps for changed content.
 | `build_targets.py::ssh_target_eligibility`, `mac_target_eligibility` | Supply refreshed evidence with explicit submitting-session policy. |
 | `build_targets.py::command_kind_eligible`, `command_pinned_eligible`, `command_eligible` | Return queue eligibility for converted execution callers; retain diagnostic use. |
 | `build_targets.py::command_reserve` | Claim only the assignment's scope; remove destination and slot fallback. |
-| `build_targets.py::wait_claim_identity`, `command_release_wait` | Match exact claims and the explicit submitting session. |
+| `build_targets.py::owns_wait_claim`, `command_release_wait` | Match exact claims and the explicit submitting session. |
 | `build_targets.py::caller_holds_only_own`, `command_check_local`, `command_wait_local` | Accept caller identity at the policy boundary; remove host selection from converted hold waits. |
 | `mac_test.blocking_claim_block`, `claim_once`, `adopt_wait_claim`, `command_claim_wait`, `command_claim` | Use explicit session identity and exact scope; persist exact attempt identity before dispatch. |
 | `mac_test.command_release` and its argument boundary | Release only the matching claim under the existing target lock. |
@@ -507,8 +505,7 @@ A replacement for existing local, SSH and cloud capacity stores is unnecessary.
 
 These verdicts follow direct source reads at the baseline.
 They are not results from executed tests.
-Both defects affected required placement guarantees.
-Both are now repaired: Phase 10g fixed PID-only release, and aws-unit commit `0ab15ffc4` fixed the uncertain cloud launch.
+Both defects affect required placement guarantees.
 The review also named two defects in the older AWS builder's release code (`stopping` as departure and any generation mismatch).
 aws-unit removes that builder outside this work, so no placement path builds on that code.
 

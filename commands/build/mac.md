@@ -14,17 +14,17 @@ Run `block`, `unblock`, and `status` with the sandbox off; they write state, cal
 ## State and recovery
 
 - `free` with no block: start work through its normal claim. `running`: let the job finish; do not remove a live job's claim.
-- A kept claim means the claiming process died but its remote work may remain. `status` prints `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`. Confirm the remote work ended, then run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py release --pid <pid>` to clear it by hand. The offload runner checks and ends leftovers before releasing a taken-over claim.
+- A kept claim means the claiming process died, but its remote work can remain. `status` shows the host, time, and PID. Confirm that the remote work ended. Read `claim_id`, `episode`, and `attempt` from the claim record. Run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`. The offload runner ends remote work before it releases a claim that it takes over.
 - `blocked` or `block pending`: wait for the holder's release or free message; `unblock` removes your own block. If CI can still use the Mac, run `github-warmup`, then repeat `block`. An expiry with a failed CI restore needs `github-warmup`, then `unblock`.
 - `unreachable`: use `/build:status --probe`; restore the connection before remote work.
-- `state unreadable`: inspect the named `~/.local/state/mac-test/block.json`, `run.json` or `claims/<repo>.json`. Repair it, or remove that damaged file only after checking its holder and any job still running. Then repeat `block` or `unblock` for a block; use `release --pid <pid>` for a readable kept claim. A natedev holder or release record reported by `/build:status` is handled by `/build:hold`.
+- `state unreadable`: inspect the named `~/.local/state/mac-test/block.json`, `run.json`, or `claims/<repo>.json`. Check the holder and any running job before you repair or remove a damaged file. Repeat `block` or `unblock` for a block. Release a readable kept claim with `release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`. Use `/build:hold` for a natedev holder or release record.
 
 ## Taking the Mac for a job of your own
 
 Start the job on natedev. `verify.sh test` and `mac_run.sh` create their own claims.
 Use `verify.sh test [<package>] --mac "<why>"` for a test that must run on macOS. Do not create a separate claim.
 
-Before the first remote command, run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<job>' --worktree <repo dir> --wait <seconds>`. The claim is that repository's (`--worktree` defaults to the current directory; outside any repository it claims the whole Mac): another repository's job can run beside it, a second job of the same repository cannot. Continue only after exit 0: 10 means blocked, 11 means busy, and 12 means state unreadable; use the recovery above. When done, run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py release --pid $$`, which removes every claim that pid holds.
+Before the first remote command, run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<job>' --worktree <repo dir> --wait <seconds> --identity`. It prints `claim_identity=` with the `claim_id`, `episode` and `attempt` of the claim. The claim is that repository's (`--worktree` defaults to the current directory; outside any repository it claims the whole Mac): another repository's job can run beside it, a second job of the same repository cannot. Continue only after exit 0: 10 means blocked, 11 means busy, and 12 means state unreadable; use the recovery above. When done, run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py release --pid $$ --claim-id <claim_id> --episode <episode> --attempt <attempt>`, which removes only that claim.
 
 A claim with nothing running on the Mac for 15 minutes is released and its holder is told, so claim right before remote work and claim again after a release.
 

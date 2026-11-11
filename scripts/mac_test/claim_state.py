@@ -16,6 +16,9 @@ from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
     from scripts.buildlog import sync as buildlog_sync
+    from scripts.build_hold.build_hold import NoOwningSession, OwningSession
+
+    SubmittingSession = OwningSession | NoOwningSession
 
 CiSwitch = Literal[
     "off_by_this_block",
@@ -150,9 +153,74 @@ class ClaimStateUnreadable(StateReadError):
         self.path: Path = path
 
 
+@dataclass(frozen=True)
+class ClaimIdentity:
+    """The identity retained through adoption and exact release."""
+
+    claim_id: str
+    episode: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class NoClaimIdentity:
+    """No successful claim response supplied an identity."""
+
+
+NO_CLAIM_IDENTITY = NoClaimIdentity()
+
+
+@dataclass(frozen=True)
+class CallingSession:
+    """Resolve the submitting session at the existing caller boundary."""
+
+
+CALLING_SESSION = CallingSession()
+
+
+def submitting_session(session: SubmittingSession | CallingSession) -> SubmittingSession:
+    from scripts.build_hold import build_hold
+
+    return build_hold.owning_session() if isinstance(session, CallingSession) else session
+
+
+def session_id(session: SubmittingSession) -> str:
+    from scripts.build_hold import build_hold
+
+    return session.session_id if isinstance(session, build_hold.OwningSession) else ""
+
+
+def claim_identity(record: ClaimOwnerRecord) -> ClaimIdentity:
+    return ClaimIdentity(record["claim_id"], record["episode"], record["attempt"])
+
+
+def reply_claim_identity(output: str) -> ClaimIdentity | NoClaimIdentity:
+    lines = [line.removeprefix("claim_identity=") for line in output.splitlines()
+             if line.startswith("claim_identity=")]
+    if len(lines) != 1:
+        return NO_CLAIM_IDENTITY
+    try:
+        value = cast(object, json.loads(lines[0]))
+    except json.JSONDecodeError:
+        return NO_CLAIM_IDENTITY
+    if not isinstance(value, dict):
+        return NO_CLAIM_IDENTITY
+    fields = cast(dict[str, object], value)
+    claim_id, episode, attempt = (fields.get(field) for field in ("claim_id", "episode", "attempt"))
+    if not isinstance(claim_id, str) or not isinstance(episode, str) or not isinstance(attempt, str):
+        return NO_CLAIM_IDENTITY
+    if not claim_id or not episode or not attempt:
+        return NO_CLAIM_IDENTITY
+    return ClaimIdentity(claim_id, episode, attempt)
+
+
 class ClaimOwnerRecord(TypedDict):
     """Both claim types retain the process identity and job details."""
 
+    claim_id: str
+    episode: str
+    attempt: str
+    submitting_session: str
     pid: int
     proc_start: str
     what: str
@@ -290,7 +358,14 @@ def read_run(path: Path) -> RunState:
     ):
         raise StateReadError(f"{path} has an invalid run record")
     _ = aware_timestamp(since, path, "since")
+    identity = ClaimIdentity(*(required_string(values, field, path) for field in ("claim_id", "episode", "attempt")))
+    if not identity.claim_id or not identity.episode or not identity.attempt:
+        raise StateReadError(f"{path} has an invalid claim identity")
     record: ProcessBoundClaim = {
+        "claim_id": identity.claim_id,
+        "episode": identity.episode,
+        "attempt": identity.attempt,
+        "submitting_session": required_string(values, "submitting_session", path),
         "pid": pid,
         "proc_start": proc_start,
         "what": what,
@@ -362,14 +437,22 @@ def required_string(values: dict[str, object], key: str, path: Path) -> str:
 
 
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
-    from scripts.mac_test import offload
+    from scripts.buildlog import repository, store
 
-    repository = offload.repository_identity(Path(worktree))
-    if not isinstance(repository, offload.KnownRepository):
+    name = repository.repo_name(worktree)
+    common = repository.git_common_dir(worktree)
+    if name is None or common is None:
         return WHOLE_MAC
     if target_config.uses_legacy_mac_layout(paths.platform):
-        return RepositoryScope(repository.legacy_mirror_name)
-    return RepositoryScope(repository.policy_name, repository.key)
+        return RepositoryScope(name)
+    source = Path(repository.source_git_dir(common))
+    if not (source / "config").is_file():
+        return RepositoryScope(name)
+    key = repository.repository_key(str(source.parent))
+    if key == store.UNKNOWN_IDENTITY:
+        return RepositoryScope(name)
+    policy_name = key.rsplit("/", 1)[-1] if key and not key.startswith("git-root:") else name
+    return RepositoryScope(policy_name, key)
 
 
 def claim_files(paths: StatePaths) -> tuple[Path, ...]:
