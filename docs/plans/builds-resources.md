@@ -2231,32 +2231,23 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 105 — The Mac floor alert lists the build output inside each Mac test copy  · status: done
 
-**Depends on:** Phase 99 (the Mac floor offers only build output); done.
+#### As-built
 
-**Source:** builds 2026-11-11, from the user's check of C1327. The Mac floor alert, rendered from live data with a test floor, says `Folder sizes are unknown`. `mac_folder_measurement` (`scripts/lint/sweep.py:3762`) measures only the direct children of `/tmp`, `~/rust` and `~/.local/state/mac-test/mirror`. The large children are `mirror/hana` (58.2 GiB) and `mirror/cargo-liner` (23.9 GiB). Each holds a `Cargo.toml`, so `folder_choices` (:3307) drops it as a source tree, and no one measures the `target` folders inside them.
-
-#### Work Order
-
-**Goal:** When the Mac disk falls below the alert line, the alert measures each Mac cargo target, lists the largest ones with their sizes in GiB, marks held ones, and recommends the largest one that is not held.
-
-**Spec:**
-
-1. **The list.** The floor pass already finds the Mac cargo targets: `target_dirs(roots, …)` filtered by `policy.allows` (:4236–4243). `FloorOutcome` (:3818) carries that filtered list to `notify_floor_problem`. `mac_folder_measurement(policy, targets)` measures each listed target that still exists with `mac_folder_reclaimable_bytes`, beside the root children it measures now. Do not scan the roots a second time.
-2. **The choices.** `folder_choices` keeps its filters: a measured target is a candidate, a source tree is not. A target inside held output gets the held label as now. Keep the existing alert limits: `folder_choice_lines` stops at the shortfall, `sweep_alert_folder_count` and `sweep_message_limit`. Keep `HeldOnlyFolderChoices` and `InsufficientFolderChoices`: when every target is held, or the largest free one cannot cover the shortfall, the alert says so as now.
-3. **Proof.** Add a row to the existing Mac floor alert test in `scripts/lint/test_sweep.py` (`test_crossing_recommends_one_measured_choice_that_frees_the_shortfall`, :4248, which patches `mac_folder_measurement` near :4317): a root child with a `Cargo.toml` and a cargo `target` inside it. The alert names `<child>/target` with its size and recommends it; a held target gets the held label and is not recommended.
-4. **Docs.** `docs/as-built/build-memory-admission.md` (the Mac measurement paragraph, :1548): the Mac measurement reads each root's direct children and each cargo target the floor pass found.
+- When the Mac disk falls below the alert line, the alert lists each Mac cargo target with its size in GiB, marks held ones, and recommends the largest target that is not held.
+- `mac_folder_measurement(policy: MacFloor, targets: Sequence[str])` measures each root's direct children and each target in `targets` with `mac_folder_reclaimable_bytes`. It skips targets that no longer exist and symlinked targets. It does not scan the roots again.
+- `FloorOutcome.targets` holds `SearchedFloorTargets` (the target list `_hold_floor_pass` found, filtered by `policy.allows`; a search with no targets gives an empty one) or `FloorTargetsNotSearched`.
+- A Mac crossing alert sends only after a pass that searched for targets. Failure alerts and natedev alerts do not wait for a search.
+- `folder_choice_lines` lists no choice that is inside, or holds, an earlier listed choice.
+- `folder_choices` keeps the Phase 99 rule: a folder with a `Cargo.toml` or `.git` is not a choice.
 
 **Files:**
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
-- `docs/as-built/build-memory-admission.md`
+- `scripts/lint/sweep.py` — the Mac measurement, `SearchedFloorTargets`, `FloorTargetsNotSearched`, the crossing gate and the choice overlap rule.
+- `scripts/lint/test_sweep.py` — rows for nested, held nested and symlinked targets, overlapping targets, and passes that end before the search.
+- `docs/as-built/build-memory-admission.md` — the Mac measurement paragraph.
 
-**Workers:** `1 writer`
-- `impl` owns all three files.
+**Gotchas:** when the Mac `sweep_floor_gib` falls below `sweep_phone_floor_gib`, a pass with free space between the two values returns before the search, so the Mac crossing alert never sends. Both values are 150 today.
 
-**Gate:** the targeted test; `scripts/lint/test_sweep.py` passes; `basedpyright` 0 errors and 0 warnings on the changed files. After the checkpoint, render the Mac alert from live data with a test floor (no send, no state change) and confirm it lists `~/.local/state/mac-test/mirror/hana/target` with its size.
-
-**Change-Review:** The Mac disk alert lists the build folders inside the Mac test copies | On natedev, read the Mac disk alert in the natedev Claude session the next time the Mac disk falls below its alert line | The alert lists ~/.local/state/mac-test/mirror/hana/target and the other Mac build folders with their sizes in GiB and recommends one
+**Ruled out:** a second root scan in the alert path.
 
 ### Phase 106 — The hold module has no import cycle  · status: todo
 
