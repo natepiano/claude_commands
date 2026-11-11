@@ -2768,7 +2768,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 #### Work Order
 
-**Goal:** A recorder start costs less CPU, and the gate modules that start the recorder save at least 30 CPU s in sum, with the same tests.
+**Goal:** A recorder start costs less CPU, and the gate modules that start the recorder use less CPU in sum, with the same tests. User, 2026-11-11: any measured saving ships.
 
 **Decision:** Director, 2026-11-11, from the Phase 137 research: deferred imports saved 16.4 CPU s in `direct/test_verify_wait_holder.py` alone. Savings may join across modules.
 
@@ -2797,7 +2797,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - basedpyright reports zero errors and zero warnings on the three files and their callers.
 - The direct and production suites pass.
-- An aws paired trial, 3 rounds, over the named modules with the most recorder starts gives a summed paired median saving of at least 30 CPU s, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
+- An aws paired trial, 3 rounds, over the named modules with the most recorder starts gives a summed paired median saving greater than zero, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
 
 ### Phase 139 — Find where the fast-track test module spends its CPU  · status: done
 **Depends on:** none
@@ -2805,20 +2805,32 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - Research only; no repository file changed. `production/test_fast_track.py` measures 45.7 CPU s, 8,618 processes and 52 tests at `bcda46a2e`. Git commands use 13.9 CPU s in 7,703 starts; repeated setup uses 1.0 CPU s.
-- The module is at its Git floor. devtools-unit owns the Git read path.
+- No absolute CPU floor is established. Git and required children dominate. devtools-unit owns the Git read path. Phase 143 asks which of these Git calls the tests need.
 
 **Gotchas:** One local pair on natedev can vary by more than 10 CPU s. Check process and exec counts before trusting a local saving.
 
 **Ruled out:** direct fixture calls (-2.6 CPU s alone); retained immutable Git reads (-4.9 CPU s alone); both together remove only 16 of 8,618 processes.
 
-### Phase 140 — Find where the style sync test module spends its CPU  · status: todo
+### Phase 140 — Find where the style sync test module spends its CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed. `style/test_style_sync.py` measures 46.3 CPU s, 4,218 processes and 70 tests. Git uses 3.6 CPU s in 3,263 starts.
+- Three test-only candidates, one pair each: private sender CLIs in process (11.6 CPU s), the scratch `cargo-save` CLI in process (7.6 CPU s), and a seeded initial Git repository (7.5 CPU s). Together they save 19.5 CPU s. Phase 142 implements them.
+
+**Gotchas:** A harness that patches the unqualified test module counts nothing; the runner loads the qualified module. Check each candidate counter before trusting a pair.
+
+**Kept:** signal, lock, verifier, lint driver and workspace integration processes stay real.
+
+### Phase 141 — Find where the crate run test module spends its CPU  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A measured report names where `style/test_style_sync.py` (median 47.7 CPU s, 70 tests) spends its CPU, and which changes save CPU with the same tests.
+**Goal:** A measured report names where `style/test_crate_run.py` (median 47.6 CPU s) spends its CPU, and which changes save CPU with the same tests.
 
-**Decision:** Director, 2026-11-11: the next module in the descending sort, beside the Phase 139 research. Research first, as in Phases 137 and 139.
+**Decision:** Director, 2026-11-11: the next unstudied module in the descending sort, beside the Phase 140 research. Research first, as in Phases 137, 139 and 140.
 
 **Spec:**
 1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
@@ -2829,7 +2841,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 6. Edit no repository file.
 
 **Files:**
-- `scripts/style/test_style_sync.py` — read only.
+- `scripts/style/test_crate_run.py` — read only.
 
 **Workers:** 1 writer; research only.
 - impl: the report.
@@ -2837,8 +2849,81 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Constraints from prior phases:**
 - Phase 137: Phase 138 defers recorder and staff imports. Do not count that saving again here.
 - Phase 134: `run_style_command` in `scripts/style/style_plan_test_support.py` runs style plan commands in process; reuse it where it fits.
+- Phase 140: it studies `style/test_style_sync.py`. Name each candidate that both modules share, and do not count its saving twice.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report at `phases/140/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
+- The report at `phases/141/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
+
+### Phase 142 — The wait holder and style sync test modules use less CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_wait_holder.py` and `style/test_style_sync.py` use less CPU per gate, with the same tests and assertions.
+
+**Decision:** User, 2026-11-11: "there is no minimum speed change required - anything is helpful - but i want you to always work on the worst case scenarios". Any measured saving ships. This phase takes the measured test-only candidates of Phases 137 and 140 for the first and third slowest modules.
+
+**Spec:**
+1. `scripts/direct/verify_hold_wait_test_support.py` (Phase 137 candidate B, 2.2 CPU s in one pair): the fixture environment at line 281 stops setting `CLAUDE_PYTHON` to `sys.executable`, so the real launcher uses the seeded interpreter cache. The two observer cases near line 543 keep their explicit overrides.
+2. `scripts/style/test_style_sync.py` (Phase 140, 19.5 CPU s together in one pair):
+   1. Run the fixture's private `address.py`, `send.py` and `roster.py` sources in process through `invoke_cli` (`scripts/production/cli_fixture.py:91`). Keep their file writes, argument reads, output and exit result. Return `CompletedProcess` results with the same check behavior. Keep the observer mocks.
+   2. Route the supported style commands through `run_style_command` (`scripts/style/style_plan_test_support.py:73`). Unknown commands and Python probes keep their subprocesses.
+   3. Run the fixture's synchronous scratch `cargo-save` command in process through `invoke_cli` with `scratch.main`. Keep `CARGO_BUILD_BUILD_DIR`. Driver-process scratch calls stay real.
+   4. Build the initial Git repository (init, two identity settings, add, first commit) once in a class fixture seed, and copy only its `.git` into each case. Every later Git call stays real.
+3. Keep every test and assertion. Signal, lock, verifier, lint driver and workspace integration processes stay real.
+
+**Files:**
+- `scripts/direct/verify_hold_wait_test_support.py`
+- `scripts/style/test_style_sync.py`
+
+**Workers:** 1 writer; the two files are small, separate changes.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 134: `run_style_command` runs style plan commands in process; reuse it without change.
+- Phase 137: the recorder and staff import change belongs to Phase 138. Do not change `progress_history.py`, `plan_history.py` or `session_staff.py` here.
+- Phase 140: the research harness used a frame check to limit the Git seed to `setUp`. Use an explicit class fixture seed instead.
+
+**State:** none.
+
+**Acceptance gate:**
+- basedpyright reports 0 errors and 0 warnings on both files.
+- Both modules pass all tests.
+- An aws paired trial (3 rounds, both modules) shows a summed CPU saving greater than zero.
+
+### Phase 143 — Find which Git calls the slowest test modules do not need  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A measured report gives each slow test module's Git starts by source and purpose, and names the Git calls a test does not need, with their CPU.
+
+**Decision:** User, 2026-11-11: "why do we need all of those git calls in our tests - maybe they're not necessary". Phases 139, 140 and 141 found Git the largest process cost in the fast-track, style sync and crate run modules. Research first.
+
+**Spec:**
+1. Run `scripts/test_times/module_cost.py --commands 15` on the twelve slowest live modules. Rank them by Git starts and Git CPU.
+2. For the five modules with the most Git starts, record each Git call with its subcommand and its caller: fixture setup, code under test, or test assertion. Use a counting wrapper in a scratch copy, not a change to repository files.
+3. Name each Git call a test does not need. Examples: setup that each case repeats and a class seed could copy; reads that one `git cat-file --batch` or one `for-each-ref` call could replace; assertions that could read a file or a value already in hand; Git where the test proves no Git behavior.
+4. Measure one local pair for each candidate and one pair for the candidates together. A test that proves Git behavior keeps its real Git.
+5. For each candidate in shared code, count the other test modules it reaches. Name a shared seeded-repository fixture where several modules repeat the same setup.
+6. Name the owning unit of each file a change would touch. Edit no repository file.
+
+**Files:**
+- `scripts/production/test_fast_track.py` — read only.
+- `scripts/style/test_crate_run.py` — read only.
+- `scripts/style/test_style_sync.py` — read only.
+
+**Workers:** 1 writer; research only.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 139: the fast-track module's parent process alone made 744 `rev-parse`, 320 `update-ref`, 251 `ls-tree` and 146 `cat-file` calls. devtools-unit owns the Git read path in `scripts/production/fast_track.py`.
+- Phase 142: it seeds the initial Git repository of `style/test_style_sync.py`. Do not count that saving again.
+- Phase 141: read its report for the crate run Git calls, and do not count its candidates twice.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report at `phases/143/research_report.md` in the unit session gives the Git census, each candidate with its saving and reach, and the owners.

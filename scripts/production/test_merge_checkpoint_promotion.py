@@ -317,6 +317,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             pass
 
         self.prepare_bump_gate()
+        gate_command = self.bin / "checkpoint-test"
+        self.executable(gate_command, gate_command.read_text() + '''
+(state / "detached-lock-marker").write_text(os.environ.get("MAIN_PUSH_LOCK_HELD", ""))
+''')
         self.promotions = str(self.promote)
         self.production_doc()
         checkpoint = self.checkpoint()
@@ -354,6 +358,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), first["tip"])
         self.release_bump_gate()
         self.assertEqual(self.wait_bump_result(first["tip"])["result"], "green")
+        self.assertEqual((self.state / "detached-lock-marker").read_text(), "")
 
     def assert_gate_notices_follow_local_promotion(self, *, launch_failure: bool) -> None:
         self.prepare_bump_gate(red=True)
@@ -509,6 +514,61 @@ class MergeCheckpointTests(MergeCheckpointFixture):
 
     def test_handoff_retry_integrates_main_fix_before_finishing_promotion(self) -> None:
         self.assert_interrupted_promotion_keeps_new_main_fix(handoff=True)
+
+    def test_handoff_retest_blocks_main_push_until_promotion_finishes(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        with mock.patch.object(merge_checkpoint, "promote", side_effect=checkpoint_gate.Stop(
+                "promote", "failed", "interrupted promotion", "retry")):
+            failed = self.run_handoff(checkpoint)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        test_events = self.events("checkpoint-test")
+        fix = self.push_main_change("fast-fix.txt", "keep this main fix\n")
+        writer = self.root / "retest-writer"
+        _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        original_tests = merge_checkpoint.checkpoint_tests
+        competing_tips: list[str] = []
+
+        def try_main_push() -> None:
+            with (common / "main-push.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                _ = self.git("fetch", "origin", "main", cwd=writer)
+                _ = self.git("reset", "--hard", "origin/main", cwd=writer)
+                self.write(writer, "during-retest.txt", "the competing main change\n")
+                _ = self.git("add", "during-retest.txt", cwd=writer)
+                _ = self.git("-c", "user.name=Checkpoint Test", "-c", "user.email=checkpoint@example.invalid",
+                             "commit", "-m", "competing main change", cwd=writer)
+                _ = self.git("push", "origin", "main", cwd=writer)
+                competing_tips.append(self.git("rev-parse", "HEAD", cwd=writer))
+
+        def retest(production: Production, paths: tuple[str, ...], checkpoint: str,
+                   merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], scratch: Path,
+                   merge_head: str, flaky_tests: frozenset[str], *, before_merge_tip: str = "") -> str:
+            result = original_tests(production, paths, checkpoint, merge_tests, flakes, scratch,
+                                    merge_head, flaky_tests, before_merge_tip=before_merge_tip)
+            if not competing_tips:
+                try_main_push()
+            return result
+
+        with mock.patch.object(merge_checkpoint, "checkpoint_tests", side_effect=retest):
+            resumed = self.run_handoff(checkpoint)
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(self.events("checkpoint-test"), [*test_events, []])
+        tip = self.git("rev-parse", "main", cwd=self.origin)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+        self.assertEqual(self.git("merge-base", "--is-ancestor", fix, tip), "")
+        self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tip), "")
+        try_main_push()
+        competing_tip, = competing_tips
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), competing_tip)
+        self.assertEqual(self.git("merge-base", "--is-ancestor", tip, competing_tip, cwd=self.origin), "")
 
     def test_fast_main_push_waits_until_checkpoint_promotion_push_finishes(self) -> None:
         self.promotions = str(self.promote)
