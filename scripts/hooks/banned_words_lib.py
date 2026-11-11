@@ -1,4 +1,8 @@
 """Shared banned-words detection."""
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -11,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
+
+from scripts.lib import conf_reads
 
 try:
     import fcntl
@@ -49,7 +55,7 @@ def hooks_enabled() -> bool:
     the moment it happens.
     """
     try:
-        text = HOOK_CONFIG.read_text(encoding="utf-8")
+        text = conf_reads.read_text(HOOK_CONFIG)
     except OSError:
         return True
     for line in text.splitlines():

@@ -532,20 +532,19 @@ def child_policy(peer_python: Mapping[str, str] = NO_PEER_PYTHON) -> tuple[Trust
     def identity(args: tuple[str, ...]) -> tuple[str, ...]:
         return args
     def remote_read(args: tuple[str, ...]) -> bool:
-        return (len(args) == 6 and args[:3] == ("-o", "BatchMode=yes", "-o")
-            and args[3] in {"ConnectTimeout=5", "ConnectTimeout=10"}
-            and args[4] in peer_python and args[5] in REMOTE_PYTHON_READS
-            and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args[4])))
+        return (len(args) == 4 and args[:2] == ("-o", "BatchMode=yes")
+            and args[2] in peer_python and args[3] in REMOTE_PYTHON_READS
+            and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args[2])))
     def remote_argv(args: tuple[str, ...]) -> tuple[str, ...]:
-        interpreter = peer_python[args[4]]
+        interpreter = peer_python[args[2]]
         # A store path is immutable and has no shell syntax. The director pins it.
         if not re.fullmatch(r"/nix/store/[A-Za-z0-9.+_-]+/bin/python3(?:\.[0-9]+)?", interpreter):
             raise OSError("profile: supply the peer's canonical Nix Python path")
         command = ("PYTHONDONTWRITEBYTECODE=1 GIT_OPTIONAL_LOCKS=0 " + interpreter
-                   + " -B -I -S " + REMOTE_PYTHON_READS[args[5]])
+                   + " -B -I -S " + REMOTE_PYTHON_READS[args[3]])
         return ("-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "PermitLocalCommand=no",
-                "-o", "ProxyCommand=none", *args[:5], command)
+                "-o", "ProxyCommand=none", *args[:-1], command)
     unmarked = (
         *(name for name in environment if name.startswith("SHOWRUNNER_")),
         "NIX_HEAL_PREPARED_SESSION", "NIX_HEAL_PREPARED_DIRECTORY",

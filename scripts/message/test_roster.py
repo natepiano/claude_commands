@@ -375,7 +375,7 @@ class RosterTests(unittest.TestCase):
 
         solo_run = self.runs / "solo-run"
         solo_run.mkdir()
-        solo = fixture_member("agent", name="solo-director", runtime_id="22135b22-7da2-5f04-8840-738da7f248ba")
+        solo = fixture_member("producer", name="solo-director", runtime_id="22135b22-7da2-5f04-8840-738da7f248ba")
         _ = staff.set_run(solo.id, staff.OpenRun(solo_run))
 
         orphan_run = self.runs / "orphan-run"
@@ -395,7 +395,7 @@ class RosterTests(unittest.TestCase):
                 "launcher_pid": os.getpid(),
             },
         })
-        dead = fixture_member("agent", name="dead-director")
+        dead = fixture_member("producer", name="dead-director")
         _ = staff.set_run(dead.id, staff.OpenRun(stale_run))
 
         dead_server_run = self.runs / "dead-server-run"
@@ -1959,7 +1959,7 @@ class RosterTests(unittest.TestCase):
 
     def test_codex_pane_without_a_session_report_uses_its_process_identity(self) -> None:
         world = self.pane_world
-        row = fixture_member("agent", name="process-pane")
+        row = fixture_member("producer", name="process-pane")
         world.add(row, "w1:p5", family="codex")
         responses = self._herdr_sessions()
         responses["--session native agent list"]["stdout"] = json.dumps({"result": {"agents": [
@@ -2368,7 +2368,7 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(all(row.machine != "mac" for row in result.entries[:-1]))
         commands = self.ssh_calls()
         self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0][:4], ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+        self.assertEqual(commands[0][:2], ["-o", "BatchMode=yes"])
         self.assertIn("--here --snapshot", commands[0][-1])
         self.assertIn('"$HOME/.claude/scripts/lib/py"', commands[0][-1])
 

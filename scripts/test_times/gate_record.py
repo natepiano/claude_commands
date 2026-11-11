@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import sys
 import time
-from typing import Final, Literal, TypedDict, cast, get_args
+from typing import Final, Literal, NotRequired, TypedDict, cast, get_args
 
 from scripts.lib import conf
 
@@ -25,6 +25,7 @@ class TestTime(TypedDict):
 
 
 class ModuleTimes(TypedDict):
+    config_reads: NotRequired[list[str]]
     wall_s: float
     cpu_s: float
     tests_s: float
@@ -40,6 +41,7 @@ TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 
 class ModuleRun(TypedDict):
+    config_reads: NotRequired[list[str]]
     suite: str
     module: str
     attempt: int
@@ -104,6 +106,26 @@ class NoModuleTimes:
 
 
 @dataclass(frozen=True)
+class RecordedConfigReads:
+    """The module recorded its reads, including a known empty set."""
+
+    stems: frozenset[str]
+
+
+@dataclass(frozen=True)
+class NoConfigReadRecord:
+    """The module has no usable record of its config reads."""
+
+
+def config_read_record(value: object) -> RecordedConfigReads | NoConfigReadRecord:
+    if value is None:
+        return NoConfigReadRecord()
+    if not isinstance(value, list) or not all(isinstance(stem, str) for stem in cast(list[object], value)):
+        raise ValueError("expected a list of config stems")
+    return RecordedConfigReads(frozenset(cast(list[str], value)))
+
+
+@dataclass(frozen=True)
 class TimingNotApplicable:
     """The type-check job runs no tests and writes no timing file."""
 
@@ -162,7 +184,7 @@ def read_module_times(path: Path) -> ModuleTimes | NoModuleTimes:
         tests = fields["tests"]
         if not isinstance(tests, list):
             raise ValueError("expected a list of test times")
-        return {
+        times: ModuleTimes = {
             "wall_s": _seconds(fields["wall_s"]),
             "cpu_s": _seconds(fields["cpu_s"]),
             "tests_s": _seconds(fields["tests_s"]),
@@ -172,6 +194,10 @@ def read_module_times(path: Path) -> ModuleTimes | NoModuleTimes:
             "skipped": _count(fields["skipped"]),
             "tests": [_test_time(test) for test in cast(list[object], tests)],
         }
+        reads = config_read_record(fields.get("config_reads"))
+        if isinstance(reads, RecordedConfigReads):
+            times["config_reads"] = sorted(reads.stems)
+        return times
     except (OSError, UnicodeError, ValueError, KeyError, OverflowError, RecursionError) as error:
         return NoModuleTimes(f"{path}: {str(error).replace(chr(10), ' ')}")
 
@@ -206,6 +232,9 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
         }
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
             times = job.times
+            reads = config_read_record(times.get("config_reads"))
+            if isinstance(reads, RecordedConfigReads):
+                module["config_reads"] = sorted(reads.stems)
             module.update(tests_run=times["tests_run"], failures=times["failures"],
                           errors=times["errors"], skipped=times["skipped"], tests_s=times["tests_s"],
                           tests=kept_tests(times, slow_test_s))

@@ -54,6 +54,7 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
   - Classify matches against repository files separately from names used only by fake commands.
   - Preserve selection of `direct/test_verify_lint_output.py`.
   - Audit the 26 direct repository scanners and actual scan use through the four identified support modules. The 493 importers do not prove 493 executed scans.
+  - Known miss (sdlc, 2026-11-10): hierarchies added `scripts/message/failed_lookup.py`, which imports staff. The targeted test did not select `production/test_staff_accessors.py`, which checks that `docs/as-built/staff-accessors.md` lists every staff importer. The full merge gate caught it. A new or changed file whose text matches a scanner's pattern must select that scanner.
   - Document `targeted_test.py --full` as the available full-coverage check for scan-dependent changes.
   - Completion condition: after a day on builds, report missed failures, confirmed unnecessary selections and their measured CPU.
   - Submit any selector change with its coverage cases for separate approval.

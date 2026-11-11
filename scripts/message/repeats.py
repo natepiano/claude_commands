@@ -117,7 +117,7 @@ def main() -> int:
         command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/repeats.py"'
                    + " --here --snapshot --day " + shlex.quote(day))
         try:
-            result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", host, command],
                                     capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20, check=False)
             if result.returncode != 0:
                 raise ValueError(result.stderr.strip() or f"exit {result.returncode}")

@@ -194,6 +194,27 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(world.commands[0][:3], ("agent", "prompt", "w1:p1"))
         self.assertIn("Explain the result.", world.commands[0][3])
 
+        for allowed in (True, False):
+            with self.subTest(target_allowed=allowed):
+                events: list[str] = []
+                def check(*_arguments: object, **_options: object) -> bool:
+                    events.append("check")
+                    return allowed
+                def send(*_arguments: object, **_options: object) -> str:
+                    self.assertEqual(events, ["check", "callback"])
+                    events.append("send")
+                    return ""
+                with (patch.object(herdr, "check_target", side_effect=check),
+                      patch.object(world, "run", side_effect=send)):
+                    if allowed:
+                        world.prompt("w1:p1", "Continue the work.", target="TEST-session",
+                                     on_submission=lambda: events.append("callback"))
+                    else:
+                        with self.assertRaisesRegex(herdr_types.HerdrFailure, "unproved target"):
+                            world.prompt("w1:p1", "Continue the work.", target="TEST-session",
+                                         on_submission=lambda: events.append("callback"))
+                self.assertEqual(events, ["check", "callback", "send"] if allowed else ["check"])
+
     def test_codex_native_process_refuses_an_unheld_thread_from_environment(self) -> None:
         identity = fixture_runtime_id("unheld-thread")
         proc = self.root / "unheld-proc"
@@ -247,7 +268,7 @@ class NativePaneSessionTests(StaffTestCase):
                 _ = client.codex_launch("w1:p1", arguments)
 
     def test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread(self) -> None:
-        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "agent", "bare-client",
+        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "producer", "bare-client",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("bare-client-thread")))
         client = herdr.Herdr("agents")
         with (codex_launch_evidence(self.root, ["codex"]) as info,
@@ -2490,7 +2511,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_one_codex_foreground_process_uses_its_session_report_without_a_rollout(self) -> None:
         current = fixture_runtime_id("reported-current")
-        row = staff.StaffRow(staff.native_id(fixture_runtime_id("reported-fixed")), "agent", "probe",
+        row = staff.StaffRow(staff.native_id(fixture_runtime_id("reported-fixed")), "producer", "probe",
                              staff.StaffRoot(), current_session=staff.native_id(current))
         membership = staff.StaffSnapshot((row,))
         pane = {"pane_id": "w1:p1", "workspace_id": "w1", "terminal_id": "report-terminal",
@@ -2511,7 +2532,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_stale_report_cannot_claim_a_shell_a_claude_pane_or_two_foreground_processes(self) -> None:
         current = fixture_runtime_id("stale-pane-report")
-        row = staff.StaffRow(staff.native_id(fixture_runtime_id("stale-fixed")), "agent", "probe",
+        row = staff.StaffRow(staff.native_id(fixture_runtime_id("stale-fixed")), "producer", "probe",
                              staff.StaffRoot(), current_session=staff.native_id(current))
         membership = staff.StaffSnapshot((row,))
         pane: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "agent_session": {"value": current}}
@@ -2535,7 +2556,7 @@ class HerdrTests(unittest.TestCase):
         other = fixture_runtime_id("stale-report-loser")
 
         def configure(report: str, info: dict[str, object]) -> tuple[staff.StaffSnapshot, dict[str, object]]:
-            rows = tuple(staff.StaffRow(staff.native_id(fixture_runtime_id("fixed-" + value)), "agent", name,
+            rows = tuple(staff.StaffRow(staff.native_id(fixture_runtime_id("fixed-" + value)), "producer", name,
                                        staff.StaffRoot(), current_session=staff.native_id(value))
                          for name, value in (("native", current), ("reported", other)))
             pane: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "terminal_id": "terminal",
@@ -4902,7 +4923,7 @@ class HerdrTests(unittest.TestCase):
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         unit = unit_membership("production", "unit")
-        codex = fixture_member("agent", name="codex-pane")
+        codex = fixture_member("producer", name="codex-pane")
 
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)

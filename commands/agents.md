@@ -64,7 +64,7 @@ See `docs/accounts.md` for account checks and refusals.
 
 Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.
-Stop and restart select the same live local staff rows, including freestanding agents.
+Stop and restart select the same live local staff rows, including producers.
 Stop saves each row ID before its stop. It starts nothing.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 Restart keeps only row IDs whose starts fail.

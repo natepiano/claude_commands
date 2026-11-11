@@ -159,7 +159,7 @@ class CodexSnapshotTests(RestartTestCase):
         self.proc = self.root / "proc"
         self.proc.mkdir()
         self.rows = tuple(
-            staff.StaffRow(staff.StaffId(f"row-{index}"), "agent", identity, staff.STAFF_ROOT,
+            staff.StaffRow(staff.StaffId(f"row-{index}"), "producer", identity, staff.STAFF_ROOT,
                 current_session=staff.StaffId(identity), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
             for index, identity in enumerate(("claude-a", "codex-a", "claude-b", "codex-b")))
         self.claude = {"claude-a", "claude-b", "claude-orphan"}
@@ -502,7 +502,7 @@ class RecordedResumeTests(RestartTestCase):
                 "plugin_directories": ["/plugins/first", "/plugins/second plugin"], "written_at": "fixture"}
 
     def resumed_arguments(self, entry: pane_record.PaneLaunch) -> list[str]:
-        row = staff.StaffRow(staff.StaffId("row"), "agent", "current-name", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("row"), "producer", "current-name", staff.StaffRoot(),
                             current_session=staff.StaffId("current-id"),
                             worktree=staff.PresentWorktree(remote.local_machine(), self.folder))
         with (patch.object(pane_record, "launch_for_session", return_value=entry),
@@ -1658,7 +1658,7 @@ class RestartTests(RestartTestCase):
 
     def test_start_row_without_a_role_uses_units_unless_the_target_is_explicit(self) -> None:
         self.running.clear()
-        row = replace(self.rows[0], kind="agent")
+        row = replace(self.rows[0], kind="producer")
         source, target = self.root / ".claude3", self.root / ".claude2"
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(source)}, ["claude", "--resume", str(row.current_session)])
@@ -1746,8 +1746,8 @@ class RestartTests(RestartTestCase):
         trust.assert_not_called()
         self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(target))
 
-    def test_dry_run_names_a_morty_agent_with_an_unproved_native_identity(self) -> None:
-        row = replace(self.rows[0], kind="agent", name="morty", worktree=staff.WORKTREE_UNFILLED)
+    def test_dry_run_names_a_morty_producer_with_an_unproved_native_identity(self) -> None:
+        row = replace(self.rows[0], kind="producer", name="morty", worktree=staff.WORKTREE_UNFILLED)
         self.rows = (row,)
         record = staff.StaffSnapshot(self.rows)
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
@@ -1767,7 +1767,7 @@ class RestartTests(RestartTestCase):
         self.rows = (replace(self.rows[0], name="unit"),
             replace(self.rows[1], kind="worker", name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
                     worktree=staff.WORKTREE_UNFILLED),
-            replace(self.rows[2], kind="agent", name="morty", parent=staff.StaffRoot(),
+            replace(self.rows[2], kind="producer", name="morty", parent=staff.StaffRoot(),
                     worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc(remote.local_machine(), self.root / "morty.md")))
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"name": "old", "seen": 1, "row_id": str(self.rows[1].id)}]}]}
@@ -1801,7 +1801,7 @@ class RestartTests(RestartTestCase):
                 staff.StaffSnapshot(self.rows)), (remote.local_machine(), self.root / "own"))
 
     def test_codex_dry_run_uses_the_newest_pane_record_and_reports_rows_without_a_tab(self) -> None:
-        self.rows = (replace(self.rows[0], kind="agent", name="morty"), *self.rows[1:])
+        self.rows = (replace(self.rows[0], kind="producer", name="morty"), *self.rows[1:])
         row = self.rows[0]
         older: pane_record.PaneLaunch = {"kind": "codex", "pane_id": "w1:p2", "session_id": str(row.id),
             "config_dir": "/account", "cwd": str(self.root), "name": row.name, "model": "",
@@ -1819,7 +1819,7 @@ class RestartTests(RestartTestCase):
                 self.assertEqual(restart.restart(stop_all=True, dry_run=True), 0)
             launches.assert_called_once_with()
             self.assertEqual(output.getvalue().splitlines(), [
-                f"{row.name}: {row.id}, agent, workspace live, tab 1 ({row.name})",
+                f"{row.name}: {row.id}, producer, workspace live, tab 1 ({row.name})",
                 *[f"{other.name}: {other.id}, {other.kind}, no tab" for other in self.rows[1:]]])
 
     def test_row_panes_keeps_session_matches_and_ignores_an_absent_recorded_pane(self) -> None:
@@ -1902,7 +1902,7 @@ class RestartTests(RestartTestCase):
         self.running.clear()
         parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "production", staff.STAFF_ROOT,
                                 current_session=staff.StaffId("parent-session"))
-        owner = staff.StaffRow(staff.StaffId("owner"), "agent", "owner", staff.ReportsTo(parent.id),
+        owner = staff.StaffRow(staff.StaffId("owner"), "producer", "owner", staff.ReportsTo(parent.id),
                                current_session=staff.StaffId("owner-session"))
         row = replace(self.rows[0], parent=staff.ReportsTo(owner.id))
         record = staff.StaffSnapshot((parent, owner, row))
@@ -2115,8 +2115,8 @@ class RestartTests(RestartTestCase):
         self.assertCountEqual(self.stops, [str(row.id) for row in self.rows])
         self.assertEqual(self.launches, [])
 
-    def test_stop_all_keeps_a_freestanding_agent_for_its_saved_tab(self) -> None:
-        row = replace(self.rows[0], kind="agent", name="TEST-agent", worktree=staff.WORKTREE_UNFILLED)
+    def test_stop_all_keeps_a_producer_for_its_saved_tab(self) -> None:
+        row = replace(self.rows[0], kind="producer", name="TEST-agent", worktree=staff.WORKTREE_UNFILLED)
         self.rows = (row,)
         record = staff.StaffSnapshot(self.rows)
         with patch.object(staff, "initial_snapshot", return_value=record):
@@ -2138,7 +2138,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
-        row = replace(self.rows[0], kind="agent", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
+        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
         self.rows = (row,)
         self.running.clear()
         pane = {"pane_id": "w1:p0", "workspace_id": "w1", "tab_id": "w1:t0",

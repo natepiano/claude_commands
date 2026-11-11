@@ -539,6 +539,7 @@ def emit_mac(request: dict[str, object]) -> None:
 def _mac_payload(since: datetime, until: datetime) -> str:
     root = Path(__file__).resolve().parents[2]
     modules = {name: (root / path).read_text(encoding="utf-8") for name, path in (
+        ("scripts.lib.conf_reads", "scripts/lib/conf_reads.py"),
         ("scripts.lib.conf", "scripts/lib/conf.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.context_economy_read", "scripts/usage/context_economy_read.py"),
@@ -557,8 +558,7 @@ def _mac_command() -> list[str]:
     if configured:
         return [*(_wire_text(value) for value in _wire_list(cast(object, json.loads(configured)))), program]
 
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=1", os.environ.get("CONTEXT_ECONOMY_MAC_HOST", MAC_HOST),
+    return ["ssh", "-o", "BatchMode=yes", os.environ.get("CONTEXT_ECONOMY_MAC_HOST", MAC_HOST),
             shlex.join(("python3", "-c", program))]
 
 

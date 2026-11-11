@@ -268,7 +268,7 @@ Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.
 
 `agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
-The selection includes freestanding agents, such as brain and morty.
+The selection includes producers, such as brain and morty.
 It saves each row ID before its stop. It starts nothing.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
@@ -310,7 +310,7 @@ The record stores no session facts, progress, claims, recovery states, or pane p
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.
-A freestanding agent without a recorded folder uses the home folder.
+A producer without a recorded folder uses the home folder.
 The native pane reader identifies Codex sessions from their resume arguments or pane reports.
 Callers without a report read the process's own pane through the same reader.
 No thread identity comes from an open rollout file.
