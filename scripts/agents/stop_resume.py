@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
-from io import StringIO
+from io import StringIO, TextIOWrapper
 from importlib import import_module
 from threading import Event, Lock
 from time import monotonic
@@ -39,6 +39,7 @@ from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_send
 from scripts.agents import member_account, pane_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
@@ -1068,7 +1069,7 @@ def _codex_name_ids(name: str) -> list[str]:
 
 def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionNotFound:
     """Read the native resume arguments and the folder from the rollout metadata."""
-    path = next((agent_accounts.codex_home() / "sessions").glob(f"**/rollout-*{identity}.jsonl"), None)
+    path = next(iter(transcript_paths(agent_accounts.codex_home() / "sessions", f"**/rollout-*{identity}.jsonl")), None)
     if path is None:
         return SessionNotFound(identity)
     restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
@@ -1078,8 +1079,8 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
         return SessionNotFound(identity)
     if kind != "codex":
         return SessionNotFound(identity)
-    with path.open(encoding="utf-8") as stream:
-        meta = herdr.json_object(cast(object, json.loads(stream.readline())), "Codex rollout metadata")
+    with open_transcript(path) as stream, TextIOWrapper(stream, encoding="utf-8") as transcript:
+        meta = herdr.json_object(cast(object, json.loads(transcript.readline())), "Codex rollout metadata")
     folder = herdr.json_text(herdr.json_object(meta.get("payload"), "Codex session metadata").get("cwd"), "Codex rollout cwd")
     return pane_record.launch("", identity, folder, environment, [kind, *arguments], kind=kind)
 

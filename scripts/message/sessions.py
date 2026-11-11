@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.session_paths import sessions_directory
+from scripts.lib.transcripts import transcript_paths
 from scripts.production import staff
 
 from scripts.message.process_identity import process_start as process_start
@@ -404,12 +405,12 @@ def config_dirs() -> list[Path]:
 def transcript_locations(session_id: str) -> list[Path]:
     """Return distinct transcript paths across the Claude accounts."""
     return sorted({path.resolve() for directory in config_dirs()
-                   for path in (directory / "projects").glob(f"*/{session_id}.jsonl")})
+                   for path in transcript_paths(directory / "projects", f"*/{session_id}.jsonl")})
 
 
 def latest_transcript(session_id: str, projects: Path) -> Path | None:
     """The session's transcript under the Claude projects folder: the newest one, when a resume left several."""
-    transcripts = sorted(projects.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
+    transcripts = sorted(transcript_paths(projects, f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
     return transcripts[-1] if transcripts else None
 
 

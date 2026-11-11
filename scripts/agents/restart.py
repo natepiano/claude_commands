@@ -30,6 +30,7 @@ from scripts.production import staff, session_staff
 from scripts.accounts import accounts
 from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcripts import transcript_paths
 from scripts.agents import member_account, shutdown_record, pane_record
 from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.agents.codex_trust import trust_arguments
@@ -212,13 +213,13 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
     if entry is not None:
         return _saved_launch(entry, identity, name)
     for directory in sessions.config_dirs():
-        if any((directory / "projects").glob(f"*/{identity}.jsonl")):
+        if transcript_paths(directory / "projects", f"*/{identity}.jsonl"):
             return "claude", named_account_environment(directory), ["--resume", identity, "--name", name]
     homes = list(Path.home().glob(".codex*"))
     if home := os.environ.get("CODEX_HOME"):
         homes.insert(0, Path(home))
     for directory in homes:
-        if any((directory / "sessions").glob(f"**/rollout-*{identity}.jsonl")):
+        if transcript_paths(directory / "sessions", f"**/rollout-*{identity}.jsonl"):
             return "codex", {"CODEX_HOME": str(directory)}, ["resume", identity]
     raise OSError(f"no transcript for {identity}")
 

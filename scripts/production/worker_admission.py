@@ -18,6 +18,7 @@ from typing import cast
 from scripts.agents import worker_lifecycle
 from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
+from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from scripts.production import staff, session_staff
 from scripts.agents.stop_results import ReleaseSource, SourceReleased
 
@@ -199,7 +200,7 @@ def member(run: Path, name: str, record: staff.StaffSnapshot | None = None) -> s
 def codex_transcript_source(thread_id: str, home: Path) -> Path:
     """Find the newest transcript for the named Codex thread and account."""
     paths = [path for folder in ("sessions", "archived_sessions")
-             for path in (home / folder).rglob(f"*{thread_id}.jsonl")]
+             for path in transcript_paths(home / folder, f"**/*{thread_id}.jsonl")]
     if not paths:
         raise ValueError("no source transcript found")
     return max(paths, key=lambda path: path.stat().st_mtime)
@@ -259,7 +260,7 @@ class TornTranscriptRecord:
 
 
 def transcript_entries(source: Path, changed: set[str]) -> Generator[str | TornTranscriptRecord]:
-    with source.open(encoding="utf-8") as transcript:
+    with open_transcript(source) as stream, io.TextIOWrapper(stream, encoding="utf-8") as transcript:
         for line in transcript:
             try:
                 fields = cast(object, json.loads(line))
@@ -302,6 +303,7 @@ def extract_transcript(row: staff.StaffRow, run: Path, backend: staff.ClaudeBack
                 messages.append(entry)
         if not messages:
             raise ValueError("source transcript has no assignments or final replies")
+        source = uncompressed_path(source)
         run.mkdir(parents=True, exist_ok=True)
         extract = handoff_path(run, row)
         from scripts.lib.atomic_file import write_text_atomic
@@ -446,7 +448,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
             extract = handoff_path(allowed.run, row)
             try:
                 with extract.open(encoding="utf-8") as saved:
-                    source = Path(saved.readline().removeprefix(HANDOFF_SOURCE_PREFIX).strip())
+                    source = uncompressed_path(Path(saved.readline().removeprefix(HANDOFF_SOURCE_PREFIX).strip()))
                 handoff = TranscriptHandoff(extract, source)
             except OSError as error:
                 print(f"anomaly: {row.name}: transcript extract: {error}".replace("\n", " "), file=sys.stderr)

@@ -14,12 +14,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from io import TextIOWrapper
 from pathlib import Path
 from typing import cast
 
 from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, nix_env
+from scripts.lib.transcripts import open_transcript
 from scripts.message import sessions
 from scripts.production import staff, worker_admission
 from scripts.usage import agents_log
@@ -244,7 +246,9 @@ def _transcript_count(native_id: str) -> int:
     count = 0
     if paths:
         try:
-            for line in paths[0].read_text().splitlines():
+            with open_transcript(paths[0]) as stream, TextIOWrapper(stream) as text:
+                lines = text.read().splitlines()
+            for line in lines:
                 try:
                     row = cast(object, json.loads(line))
                 except ValueError:

@@ -41,6 +41,7 @@ from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import shutdown_record, stop_resume, pane_record
 from scripts.lib import file_lock, unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member
@@ -430,16 +431,36 @@ class SessionLaunchTests(RestartTestCase):
         project = config / "projects" / "project"
         project.mkdir(parents=True)
         (project / f"{identity}.jsonl").touch()
-        output = io.StringIO()
-        with (patch.object(pane_record, "RECORD_DIR", records),
-              patch("scripts.agents.restart.sessions.config_dirs", return_value=[config]),
-              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
-              redirect_stderr(output)):
-            kind, environment, arguments = restart.session_launch(identity, "current-name")
-        self.assertEqual(kind, "claude")
-        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
-        self.assertEqual(arguments, ["--resume", identity, "--name", "current-name"])
-        self.assertEqual(output.getvalue(), "")
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    _ = compressed_copy(project / f"{identity}.jsonl")
+                output = io.StringIO()
+                with (patch.object(pane_record, "RECORD_DIR", records),
+                      patch("scripts.agents.restart.sessions.config_dirs", return_value=[config]),
+                      patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
+                      redirect_stderr(output)):
+                    kind, environment, arguments = restart.session_launch(identity, "current-name")
+                self.assertEqual(kind, "claude")
+                self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
+                self.assertEqual(arguments, ["--resume", identity, "--name", "current-name"])
+                self.assertEqual(output.getvalue(), "")
+
+    def test_restart_reads_a_codex_transcript_without_a_pane_launch_record(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        identity = "saved-codex"
+        home = root / ".codex"
+        source = home / "sessions/2026/10/01" / f"rollout-{identity}.jsonl"
+        write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    _ = compressed_copy(source)
+                with (patch.object(pane_record, "RECORD_DIR", root / "panes"),
+                      patch("scripts.agents.restart.sessions.config_dirs", return_value=[]),
+                      patch.dict(os.environ, {"CODEX_HOME": str(home)})):
+                    self.assertEqual(restart.session_launch(identity, "current-name"),
+                                     ("codex", {"CODEX_HOME": str(home)}, ["resume", identity]))
 
     def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

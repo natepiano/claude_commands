@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.message import sessions
 from scripts.message import process_identity
@@ -83,6 +84,22 @@ class SessionLookupTests(ShutdownTestCase):
             env={**os.environ, "NOTIFIER_SESSIONS_DIR": str(self.sessions)},
             capture_output=True, text=True, check=False,
         )
+
+    def test_transcript_lookup_keeps_account_paths_and_newest_mtime(self) -> None:
+        projects = self.root / ".claude/projects"
+        older = projects / "older/saved.jsonl"
+        newest = projects / "newest/saved.jsonl"
+        other = self.root / ".claude2/projects/other/saved.jsonl"
+        for path, modified in ((older, 10), (newest, 30), (other, 20)):
+            path.parent.mkdir(parents=True)
+            _ = path.write_text('{"type":"assistant"}\n')
+            os.utime(path, (modified, modified))
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    older, newest, other = (compressed_copy(path) for path in (older, newest, other))
+                self.assertEqual(sessions.transcript_locations("saved"), sorted((older, newest, other)))
+                self.assertEqual(sessions.latest_transcript("saved", projects), newest)
 
     def test_session_process_count_includes_every_record_for_the_id(self) -> None:
         self.record("first.json", session_id="attached")

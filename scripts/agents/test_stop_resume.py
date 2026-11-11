@@ -31,6 +31,7 @@ from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
 from scripts.agents import restart, stop_resume, stop_results
 from scripts.lib import agent_program, atomic_file, conf, operation_deadline, unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
 from scripts.agents.stop_results import ClaudeStartState, StopResult
 
@@ -920,34 +921,38 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("observer anomaly:", errors)
 
     def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
-        identity = self.saved_codex_name()
-        source = self.root / ".codex2"
-        for target in (None, "codex3"):
-            expected = target or "codex1"
-            with (self.subTest(target=target), patch.dict(os.environ, {"CODEX_HOME": str(source)}),
-                  patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
-                      "codex1", self.root / ".codex1")) as role,
-                  patch.object(self.client, "open_tab", return_value="w1:p2"),
-                  patch.object(self.client, "prompt") as prompt,
-                  patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
-                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
-                      self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
-                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
-                      "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
-                result = stop_resume.resume("saved-worker", to=target)
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                assert isinstance(result, stop_resume.ClaudeUp)
-                self.assertEqual((result.session_id, result.account), (identity, expected))
-                self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
-                self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
-                self.assertEqual(launch.call_args.args[3], "codex")
-                self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
-                prompt.assert_not_called()
-                self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
-                if target is None:
-                    role.assert_called_once_with("workers")
-                else:
-                    role.assert_not_called()
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                identity = self.saved_codex_name()
+                source = self.root / ".codex2"
+                if compressed:
+                    _ = compressed_copy(source / "sessions" / f"rollout-{identity}.jsonl")
+                for target in (None, "codex3"):
+                    expected = target or "codex1"
+                    with (self.subTest(target=target), patch.dict(os.environ, {"CODEX_HOME": str(source)}),
+                          patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                              "codex1", self.root / ".codex1")) as role,
+                          patch.object(self.client, "open_tab", return_value="w1:p2"),
+                          patch.object(self.client, "prompt") as prompt,
+                          patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
+                          patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                              self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
+                          patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                              "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
+                        result = stop_resume.resume("saved-worker", to=target)
+                        self.assertIsInstance(result, stop_resume.ClaudeUp)
+                        assert isinstance(result, stop_resume.ClaudeUp)
+                        self.assertEqual((result.session_id, result.account), (identity, expected))
+                        self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
+                        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
+                        self.assertEqual(launch.call_args.args[3], "codex")
+                        self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
+                        prompt.assert_not_called()
+                        self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
+                        if target is None:
+                            role.assert_called_once_with("workers")
+                        else:
+                            role.assert_not_called()
 
     def test_unknown_codex_process_does_not_block_a_stopped_thread_without_a_pane(self) -> None:
         identity = self.saved_codex_name()
