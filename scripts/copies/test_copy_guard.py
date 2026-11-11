@@ -4,7 +4,6 @@ from __future__ import annotations
 import ast
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import cache
 import json
 import os
 from pathlib import Path
@@ -241,7 +240,6 @@ class CopyGuardTests(unittest.TestCase):
     root: Path = Path()
     repo: Path = Path()
     seed: ClassVar[ImmutableGitSeed]
-    transitional: ClassVar[frozenset[str]] = frozenset({"mac_test/offload.py", "production/mac_run.sh", "direct/verify.sh"})
 
     @classmethod
     @override
@@ -249,15 +247,6 @@ class CopyGuardTests(unittest.TestCase):
         root = Path(cls.enterClassContext(tempfile.TemporaryDirectory())).resolve()
         cls.seed = ImmutableGitSeed.create(root, "main", "Guard Tests", "guard@example.invalid",
                                            {"tracked": "source\n"})
-
-    @classmethod
-    @cache
-    def repository_findings(cls) -> tuple[copy_guard.TreeCreation, ...]:
-        """Share the strict scan of the unchanged repository between both policy tests."""
-        scripts = Path(__file__).resolve().parents[1]
-        settings = copies.load_config()
-        return tuple(copy_guard.scan_scripts(scripts, allow_list={
-            path: reason for path, reason in settings.allow_list.items() if path not in cls.transitional}))
 
     @override
     def setUp(self) -> None:
@@ -1089,21 +1078,6 @@ git_at(repo, "show", "clone")
                     expected[name] = case.expected
         findings = copy_guard.scan_scripts(scripts, allow_list={})
         self.assertEqual({finding.path.name: finding.operation for finding in findings}, expected)
-
-    def test_repository_scripts_use_the_single_checkout_service(self) -> None:
-        scripts = Path(__file__).resolve().parents[1]
-        # The shared service loader owns both gate settings and the allow-list data.
-        settings = copies.load_config()
-        findings = [finding for finding in self.repository_findings()
-                    if finding.path.relative_to(scripts).as_posix() not in settings.allow_list]
-        self.assertEqual(findings, [], "\n".join(str(finding) for finding in findings))
-
-    def test_repository_build_copy_makers_have_no_transitional_exemptions(self) -> None:
-        settings = copies.load_config()
-        transitional = self.transitional
-        findings = list(self.repository_findings())
-        self.assertEqual(findings, [], "\n".join(str(finding) for finding in findings))
-        self.assertEqual(set(settings.allow_list) & transitional, set())
 
 
 if __name__ == "__main__":

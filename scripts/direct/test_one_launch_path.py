@@ -103,11 +103,6 @@ def forbidden_launches(root: Path) -> list[str]:
 
 
 class OneLaunchPathTests(unittest.TestCase):
-
-    def test_only_assign_starts_or_follows_workers(self) -> None:
-        found = forbidden_launches(ROOT)
-        self.assertFalse(found, "Worker launch commands must use assign.sh:\n" + "\n".join(found))
-
     def test_scan_catches_each_worker_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
