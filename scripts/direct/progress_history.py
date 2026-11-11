@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, cast
 
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import findings, phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs  # noqa: E402
@@ -1565,6 +1565,7 @@ def _start_run(args: argparse.Namespace) -> None:
     owner = unit_runs.run_owner(state, record)
     if isinstance(owner, staff.StaffRow):
         state[unit_runs.OWNER_FIELD] = owner.id
+        _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
     _write_state(session_dir, state)
     _append_event(state, _event(state, "run_started", now))
     print(history_file)
@@ -1638,6 +1639,12 @@ def _start_phase(args: argparse.Namespace) -> None:
     except phase_reservation.StateRefused as refused:
         raise SystemExit(str(refused)) from refused
     if _string(state.get("status")) != "active" and "finished_at" in state:
+        director = unit_runs.director(session_dir) or _string(
+            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
+        if director:
+            row = staff.by_current_session(director)
+            if row is not None:
+                _ = staff.set_run(row.id, staff.OpenRun(session_dir))
         previous_status = _string(state.get("status"))
         state["status"] = "active"
         _ = state.pop("finished_at", None)
@@ -1645,12 +1652,6 @@ def _start_phase(args: argparse.Namespace) -> None:
         reopened.update({"previous_status": previous_status, "cause": "start-phase", "phase_id": phase_id})
         _append_event(state, reopened)
         _write_state(session_dir, state)
-        director = unit_runs.director(session_dir) or _string(
-            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
-        if director:
-            active_root = os.environ.get("UNIT_ACTIVE_DIR")
-            # A temporary run stays within its temporary root unless explicitly configured.
-            unit_runs.activate(session_dir, director, Path(active_root) if active_root else session_dir.parent / "active")
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     active = _object_dict(state.get("phase"))
@@ -1841,19 +1842,33 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
     return MatchedDispatch(_string(active.get("worker_name")), _string(active.get("instance_id")))
 
 
+def launch_slot(session_dir: Path, slot: str, launcher_command: list[str]) -> str:
+    """Name the slot whose pass this launcher command started, or the given slot."""
+    if not _state_path(session_dir).is_file():
+        return slot
+    return _launch_slot(_pass_slots(_read_state(session_dir)), slot, launcher_command)
+
+
+def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_command: list[str]) -> str:
+    return next((name for name, passed in passes.items()
+                 if launcher_command and passed.get("launcher_command") == launcher_command), slot)
+
+
 def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                     prompt: Path, launcher_command: list[str]) -> MatchedDispatch | NoMatchedDispatch:
     """Find the worker for this dispatch retry without changing recorder state."""
     if not _state_path(session_dir).is_file():
         return NoMatchedDispatch()
     state = _read_state(session_dir)
+    passes = _pass_slots(state)
+    slot = _launch_slot(passes, slot, launcher_command)
     recorded_phase = _open_phase_named(state, phase)
     if recorded_phase is None:
-        recorded_phase = _object_dict(_pass_slots(state).get(slot, {}).get("phase"))
+        recorded_phase = _object_dict(passes.get(slot, {}).get("phase"))
         if recorded_phase is None or _string(recorded_phase.get("id")) != phase:
             return NoMatchedDispatch()
     return _dispatch_match(
-        _pass_slots(state).get(slot), recorded_phase,
+        passes.get(slot), recorded_phase,
         {"kind": role, "prompt_file": str(prompt), "launcher_command": launcher_command},
         launcher_command, dispatch_owned=True,
     )
@@ -2142,6 +2157,11 @@ def dispatch_completed(run: Path, slot: str, instance_id: str) -> bool:
 def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> None:
     """Record a notice only after its message succeeds."""
     _update_dispatch(session_dir, instance_id, "hook_notice", notice)
+
+
+def record_quota_refusal(session_dir: Path, instance_id: str, refusal_id: str) -> None:
+    """Record a reported quota refusal so the timer reports it once."""
+    _update_dispatch(session_dir, instance_id, "quota_refusal", refusal_id)
 
 
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
@@ -6561,6 +6581,12 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     _refresh_phase_table(session_dir)
 
 
+def _clear_run_pointer(session_dir: Path) -> None:
+    for row in staff.initial_snapshot().rows:
+        if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == session_dir.resolve():
+            _ = staff.clear_run(row.id, session_dir)
+
+
 def _finish_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -6573,7 +6599,7 @@ def _finish_run(args: argparse.Namespace) -> None:
         _finish_phase(finish_args)
         state = _read_state(session_dir)
     if _string(state.get("status")) != "active":
-        unit_runs.end(session_dir)
+        _clear_run_pointer(session_dir)
         return
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
@@ -6591,7 +6617,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
-    unit_runs.end(session_dir)
+    _clear_run_pointer(session_dir)
     _refresh_phase_table(session_dir)
 
 
@@ -6644,6 +6670,8 @@ def _review_trial(args: argparse.Namespace) -> None:
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
     Each time rounds to the nearest whole minute.
     """
+    from scripts.direct import findings
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _optional_arg(args, "phase_id")

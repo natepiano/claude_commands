@@ -9,11 +9,13 @@ import os
 from pathlib import Path
 import socket
 import subprocess
-import sys
 import tempfile
 from typing import NamedTuple, TypedDict, cast, override
 import unittest
 from uuid import uuid4
+
+
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -95,7 +97,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "STAFF_CONFIG": str(config), "STAFF_FILE": str(staff_file),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
-            "CLAUDE_PYTHON": sys.executable, "PYTHONPATH": str(CHECKOUT),
+            **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT),
             "HERDR_BIN": "/nonexistent/herdr",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
@@ -264,11 +266,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual((tree / "code.txt").read_text(), "unlanded work\n")
 
     def test_dirty_and_staff_held_trees_preserve_all_items(self) -> None:
-        for reason in ("dirty", "staff-held", "switched", "detached", "no-commit"):
+        for reason in ("dirty", "staff-held", "switched", "detached", "no-commit", "target-merge-only"):
             with self.subTest(reason=reason):
                 tree = self.trees / reason
                 self.make(tree, reason)
-                if reason != "no-commit":
+                if reason not in ("no-commit", "target-merge-only"):
                     _ = self.commit(tree, f"{reason}.txt", "landed work\n")
                     self.publish(tree, reason)
                     self.land(reason)
@@ -290,6 +292,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 elif reason == "detached":
                     _ = self.git(tree, "checkout", "--detach")
                     _ = self.commit(tree, f"{reason}-work.txt", "unlanded replacement work\n")
+                elif reason == "target-merge-only":
+                    _ = self.commit(self.merge_tree, "target.txt", "new target work\n")
+                    self.publish(self.merge_tree, "integration")
+                    _ = self.git(tree, "fetch", "origin", "integration")
+                    _ = self.git(tree, "merge", "--no-ff", "origin/integration", "-m", "Merge the target")
                 before = self.repository_state()
                 tip = self.git(tree, "rev-parse", "HEAD")
 
@@ -302,6 +309,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
                 if reason == "no-commit":
                     self.assertEqual(selected["detail"], "no commit of its own")
+                elif reason == "target-merge-only":
+                    self.assertEqual(selected["detail"], "only merges of the target outside it")
                 else:
                     self.assertEqual((tree / f"{reason}.txt").read_text(), "landed work\n")
                 if reason == "dirty":

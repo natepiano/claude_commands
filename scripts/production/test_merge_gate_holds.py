@@ -41,7 +41,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
         super().setUp()
         hold_environment = {name: os.environ[name] for name in (
             "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "MAC_TEST_STATE_DIR",
-            "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID", "UNIT_ACTIVE_DIR",
+            "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
         )}
         self.addCleanup(self.gate.doCleanups)

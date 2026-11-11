@@ -141,6 +141,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 from scripts.herdr.place import HerdrPlace
+from scripts.herdr import herdr_types
 from scripts.lib import process_group
 from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start
@@ -3283,7 +3284,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 _prompt_pane(HerdrPlace(herdr.shared_session(), state.pane), text,
                              target=str(worker.current_session), timeout=timeout)
                 return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-            except (herdr.HerdrFailure, OSError) as error:
+            except (herdr_types.HerdrFailure, OSError) as error:
                 reason = str(error)
         elif state is None:
             reason = "worker observation is unavailable"
@@ -3421,12 +3422,10 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
     elif isinstance(route, CodexPaneRecipient):
-        from scripts.herdr import herdr
-
         try:
             _prompt_pane(route.place, agent_text(message), target=route.thread_id, timeout=options.timeout)
             result = Result("sent", f"{route.address} at {route.place.session}:{route.place.pane}")
-        except (herdr.HerdrFailure, OSError) as error:
+        except (herdr_types.HerdrFailure, OSError) as error:
             result = Result("failed", str(error))
     elif isinstance(route, QueuedStaffRecipient):
         result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"

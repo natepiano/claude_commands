@@ -29,6 +29,8 @@ from types import SimpleNamespace
 from typing import TextIO, cast, final, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.herdr import herdr_types
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
@@ -5497,8 +5499,8 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             _ = blocked.write_text("#!/bin/sh\necho 'unexpected external tool' >&2\nexit 91\n")
             blocked.chmod(0o755)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
-            "CLAUDE_PYTHON": sys.executable,
             "CONF_DIR": str(self.root / "config"),
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),
@@ -5742,14 +5744,12 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual([command[2] for command in prompts], ["w2:p1", "w2:p1"])
 
     def test_codex_pane_failure_reports_the_herdr_error(self) -> None:
-        from scripts.herdr import herdr
-
         row, observed = self.codex_agent()
         pane_run = self.fixture.world.run
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             if arguments[:2] == ("agent", "prompt"):
-                raise herdr.HerdrFailure("agent_prompt_stalled: private pane did not start", code="agent_prompt_stalled")
+                raise herdr_types.HerdrFailure("agent_prompt_stalled: private pane did not start", code="agent_prompt_stalled")
             return pane_run(*arguments, deadline=deadline)
 
         output = io.StringIO()
@@ -5782,15 +5782,13 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
 
     def test_stalled_prompt_routes_the_message_and_reason_to_the_holder(self) -> None:
-        from scripts.herdr import herdr
-
         message = "Detached run: stalled-run\nResult: PASS"
         pane_run = self.fixture.world.run
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             output = pane_run(*arguments, deadline=deadline)
             if arguments[:2] == ("agent", "prompt"):
-                raise herdr.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
+                raise herdr_types.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
             return output
 
         with mock.patch.object(self.fixture.world, "run", side_effect=run):

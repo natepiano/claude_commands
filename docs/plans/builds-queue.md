@@ -1237,7 +1237,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - `InheritedTemporaryParent` reads `TMPDIR` at allocation. `ExplicitBuildParent` preserves the supplied parent. `SystemTemporaryParent` selects `/tmp`. `UnitRunParent` uses `unit_runs.run_roots()`. The merge gate requires `/dev/shm` without a disk fallback.
 - `FOLDER_PREFIXES` defines build names. `MKDTEMP_SUFFIX_PATTERN` defines eight-character allocator suffixes. `temporary_build_folder(request: UniqueBuildFolder) -> Generator[Path]` uses standard-library cleanup and permission repair. Callers retain ownership records and cleanup order.
 - The CLI prints one path. Forms are `unique --kind KIND [--owner TEXT] [--parent PATH | --system-temp]` and `unique --prefix TEXT [--parent PATH | --system-temp]`. Stable forms are `stable --name NAME (--parent PATH | --unit-root)`, `stable --path PATH`, and `stable --run-temp RUN`. `run-temp-path RUN` only names the path.
-- `scratch.new()` and `scratch.target()` retain registration and task naming. `copy_record.root()` and `copy_record.copies_root()` retain root authority. `unit_runs.RUN_TEMP_NAME` names run temporary folders. `unit_runs.activate()` maintains current and former markers.
+- `scratch.new()` and `scratch.target()` retain registration and task naming. `copy_record.root()` and `copy_record.copies_root()` retain root authority. `unit_runs.RUN_TEMP_NAME` names run temporary folders. `staff.set_run()` stores the open run in the director's staff row.
 - `memory_admit.is_fresh_test()` reads `tmp_sweep.state_dir()` at use. `tmp_sweep.TARGET_DELETES_NAME` names the shared deletion record. Private sweep roots select private copies folders. Admission state and snapshots remain outside temporary build folders.
 
 **Files:**
@@ -2069,6 +2069,19 @@ Contact no live service, session, Mac, or AWS account.
 
 ### Phase 46 — Every view names the machine a step runs on, and the old route code is gone  · status: todo
 **Depends on:** 45. Checkpoint 4 of section 8 in `docs/plans/builds-queue-placement.md`. The Work Order follows at phase start. It switches the remaining readers first and deletes the old selectors only after their last caller switches. Phase 44 item 4 (claim ownership) applies.
+
+### Phase 43a — A gate copy at a new path rebuilds what holds its manifest path  · status: done
+
+#### As-built
+
+`copies.standing` restores the saved file time of each tracked file with an unchanged blob, except a file whose content names `CARGO_MANIFEST_DIR`. `copies.manifest_path_files(tree)` finds those files with one `git grep --no-color -l -z -F` in the checkout. Those files keep their write time from the new checkout, so Cargo rebuilds their crates and the dependents. Every other unchanged file keeps its saved time, so a same-commit gate stays a cache hit for the other crates. `standing` is the only path in `copies.py` that restores saved times.
+
+**Files:**
+- `scripts/copies/copies.py` — `manifest_path_files` and the restore rule in `standing`.
+- `scripts/copies/test_copies.py` — rows in the repeated-gate test, with forced Git color.
+- `docs/as-built/gate-checkouts.md` — the rule and its limit.
+
+**Gotchas:** Cargo does not track `CARGO_MANIFEST_DIR`, because Cargo sets it for rustc. A dependency macro that reads the variable at expansion, in a caller without that text, stays outside this rule.
 
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 

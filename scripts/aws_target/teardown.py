@@ -39,6 +39,12 @@ remove-builder keeps admin.gpg, and the box image.
 remove-builder resolves builder accounting and keeps the spending history.
 Run deploy.py remove-builder --approve-destroy to remove only the builder.'''
 
+IMAGES_DRY_RUN = '''remove-images would switch the gate stack to the official NixOS image.
+remove-images would keep the old image launchable until gate-deployment.json names the official image.
+remove-images would delete the saved gate image, its snapshot, and its cost row.
+remove-images would delete the former builder image, its snapshot, and image.json.
+Run deploy.py remove-images --approve-destroy to stop the snapshot charges.'''
+
 
 @dataclass(frozen=True)
 class RemovalIdentity:
@@ -95,7 +101,7 @@ class TargetRemoval:
 
     def routing(self) -> bool:
         changed = box.close_routing(self.settings)
-        paths = mac_test.state_paths('aws')
+        paths = box.builder_state_paths()
         enabled = self._local(['systemctl', '--user', 'is-enabled', 'aws-target.service'])
         active = self._local(['systemctl', '--user', 'is-active', 'aws-target.service'])
         if enabled.stdout.strip() not in ('disabled', 'not-found') or active.stdout.strip() not in ('inactive', 'unknown'):
@@ -401,20 +407,7 @@ class TargetRemoval:
         return changed
 
     def gate_image(self) -> bool:
-        directory = self.directory / 'gate-image'
-        if not directory.exists():
-            return False
-        from scripts.aws_target.gate_box import GATE_IMAGE_OWNER_TAG
-        box.cleanup_images(self.api, {}, GATE_IMAGE_OWNER_TAG)
-        book = ledger.CostLedger(self.directory)
-        inventories = book.read_snapshot().inventories
-        if inventories and any(item.name == 'gate-image' for item in inventories[-1].resources):
-            previous = inventories[-1]
-            book.record_inventory(ledger.ResourceInventory(int(self.clock()),
-                tuple(item for item in previous.resources if item.name != 'gate-image'), 'gate image removed',
-                builder_removed=previous.builder_removed))
-        shutil.rmtree(directory)
-        return True
+        return remove_gate_images(self.api, self.directory, self.clock)
 
     def _kept_image(self) -> None:
         path = self.directory / 'image.json'
@@ -440,7 +433,7 @@ class TargetRemoval:
                 try:
                     if name == 'tailscale-device':
                         # Keep claims and controller actions excluded throughout resource removal.
-                        paths = mac_test.state_paths('aws')
+                        paths = box.builder_state_paths()
                         _ = locks.enter_context(mac_test.locked(paths.lock))
                         _ = locks.enter_context(control_lock(self.directory))
                         if box.running_claims(paths):
@@ -453,3 +446,31 @@ class TargetRemoval:
                     return False
         self._kept_image()
         return True
+
+
+def remove_gate_images(api: AwsCli, directory: Path, clock: Callable[[], float]) -> bool:
+    """Delete the saved gate images before their snapshots and drop their cost row."""
+    folder = directory / 'gate-image'
+    if not folder.exists():
+        return False
+    from scripts.aws_target.gate_box import GATE_IMAGE_OWNER_TAG
+    _ = box.cleanup_images(api, {}, GATE_IMAGE_OWNER_TAG)
+    book = ledger.CostLedger(directory)
+    inventories = book.read_snapshot().inventories
+    if inventories and any(item.name == 'gate-image' for item in inventories[-1].resources):
+        previous = inventories[-1]
+        book.record_inventory(ledger.ResourceInventory(int(clock()),
+            tuple(item for item in previous.resources if item.name != 'gate-image'), 'gate image removed',
+            builder_removed=previous.builder_removed))
+    shutil.rmtree(folder)
+    return True
+
+
+def remove_builder_image(api: AwsCli, directory: Path) -> bool:
+    """Delete the former builder's saved images before their snapshots, then its image record."""
+    removed = box.cleanup_images(api, {}, box.IMAGE_OWNER_TAG)
+    record = directory / 'image.json'
+    if record.exists():
+        record.unlink()
+        removed = True
+    return removed

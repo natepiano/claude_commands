@@ -294,7 +294,7 @@ found = staff_sources.member(staff_sources.UnitMember('old', 'alpha'), record)
 assert isinstance(found, staff_sources.NoSuchMember)
 
 marked = unit_lookup.LabeledSession('alpha', unit_lookup.ClaudeNotRunning(),
-                                unit_lookup.herdr.HerdrPlace('agents', 'w1:p1'),
+                                unit_lookup.HerdrPlace('agents', 'w1:p1'),
                                 identity=unit_lookup.LiveSession(record.find(kind='unit')[0].current_session))
 grouped = unit_lookup.group_labeled_sessions([marked], record=record)
 assert list(grouped.units['receiving']) == ['alpha']
@@ -969,28 +969,30 @@ print(observed.row.id)
         assert isinstance(found, unit_lookup.HeldRun)
         self.assertEqual((found.path, found.worktree), (history, self.root / "tree"))
 
-    def test_recorded_replacement_director_owns_the_run_even_with_a_stale_marker(self) -> None:
+    def test_recorded_replacement_director_owns_the_run_even_with_a_stale_staff_pointer(self) -> None:
         history = self.record("run", self.root / "tree", 1.0)
         lines = history.read_text().splitlines()
         first = cast(dict[str, object], json.loads(lines[0]))
         first["main_agent"] = {"session_id": fixture_runtime_id("original")}
         _ = history.write_text(json.dumps(first) + "\n")
         folder = self.held_folder(history, fixture_runtime_id("replacement"))
-        active = self.root / "held/active"
-        active.mkdir()
-        _ = (active / fixture_runtime_id("original")).write_text(str(folder) + "\n")
+        owner = staff.local_snapshot().by_current_session(fixture_runtime_id("original"))
+        if owner is None:
+            owner = fixture_member("showrunner", name="original", runtime_id=fixture_runtime_id("original"))
+        _ = staff.set_run(owner.id, staff.OpenRun(folder))
         runs = unit_lookup.HeldRunLookup()
         self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("replacement")), unit_lookup.HeldRun)
         self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("original")), unit_lookup.NoUnfinishedRun)
 
-    def test_held_run_order_skips_finished_marker_and_keeps_an_older_open_run(self) -> None:
+    def test_held_run_order_skips_finished_staff_pointer_and_keeps_an_older_open_run(self) -> None:
         open_run = self.record("open-run", self.root / "tree", 1.0)
         latest = self.record("finished-run", self.root / "tree", 2.0, "run_finished")
         _ = self.held_folder(open_run, fixture_runtime_id("director"))
         finished_folder = self.held_folder(latest, fixture_runtime_id("director"))
-        active = self.root / "held/active"
-        active.mkdir()
-        _ = (active / fixture_runtime_id("director")).write_text(str(finished_folder) + "\n")
+        owner = staff.local_snapshot().by_current_session(fixture_runtime_id("director"))
+        if owner is None:
+            owner = fixture_member("showrunner", name="director", runtime_id=fixture_runtime_id("director"))
+        _ = staff.set_run(owner.id, staff.OpenRun(finished_folder))
         runs = unit_lookup.HeldRunLookup()
         found = runs.unfinished_held_run(fixture_runtime_id("director"))
         self.assertIsInstance(found, unit_lookup.HeldRun)
@@ -1019,14 +1021,15 @@ print(observed.row.id)
                 self.assertEqual(runs.unfinished_held_run(fixture_runtime_id("director")), found)
         self.assertIsInstance(unit_lookup.HeldRunLookup().unfinished_held_run(fixture_runtime_id("director")), unit_lookup.HeldRunUnknown)
 
-    def test_unfinished_marker_run_precedes_an_alphabetically_earlier_run(self) -> None:
+    def test_unfinished_staff_pointer_run_precedes_an_alphabetically_earlier_run(self) -> None:
         first = self.record("a-run", self.root / "a-tree", 1.0)
         marked = self.record("z-run", self.root / "z-tree", 2.0)
         _ = self.held_folder(first, fixture_runtime_id("director"))
         folder = self.held_folder(marked, fixture_runtime_id("director"))
-        active = self.root / "held/active"
-        active.mkdir()
-        _ = (active / fixture_runtime_id("director")).write_text(str(folder) + "\n")
+        owner = staff.local_snapshot().by_current_session(fixture_runtime_id("director"))
+        if owner is None:
+            owner = fixture_member("showrunner", name="director", runtime_id=fixture_runtime_id("director"))
+        _ = staff.set_run(owner.id, staff.OpenRun(folder))
         found = unit_lookup.HeldRunLookup().unfinished_held_run(fixture_runtime_id("director"))
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)

@@ -19,7 +19,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory`. With the tripwire set it resolves `$meminfo` and refuses a live path through `memory_admit.py tripwire <path>`. Then it reads `MemAvailable` itself from `${BUILDLOG_MEMINFO:-/proc/meminfo}` and starts `memory_admit.py check`. A checker that exits non-zero is refused with its last output line (`buildlog_memory_refuse`). On darwin with `BUILDLOG_MEMINFO` unset it grants at once and reads nothing.
   - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — sources `memory_gate.sh` and calls `buildlog_wait_for_memory` with no arguments (a launch: no reservation).
   - `scripts/hooks/test_brp_launch_gate.py` — `setUp` :53 takes `BUILDLOG_MEMINFO`, `BUILDLOG_MEMORY_PRESSURE` and `BUILDLOG_LIVE_MEMORY_TRIPWIRE` from `fake_memory_readings(self.root)` (:74). `test_low_memory_wait_leaves_old_release_record_unchanged` :159 writes its low value to the returned `meminfo` file.
-  - `scripts/production/merge_gate.py` — `test_module_environment` :514 gives each test module a private `BUILDLOG_DIR` and the build-tool tripwires (`cargo`, `rustc`, `rustdoc`, `rustup`, `cargo-nextest` first on `PATH`, each appends its argv to `<root>/build-tool-calls.jsonl` and exits 99). `finish_gate_job` reads that file, appends `a test started real <tool>: <args>` to the output, and sets status 1 and `GateJobResult.tripwire_tripped`. The gate never reruns a tripped module alone. Not in any unit's Owns cell: natedev showrunner's file.
+  - `scripts/production/merge_gate.py` — `test_module_environment` :755 gives each test module a private `BUILDLOG_DIR` and the build-tool tripwires (`cargo`, `rustc`, `rustdoc`, `rustup`, `cargo-nextest` first on `PATH`, each appends its argv to `<root>/build-tool-calls.jsonl` and exits 99). `finish_gate_job` reads that file, appends `a test started real <tool>: <args>` to the output, and sets status 1 and `GateJobResult.tripwire_tripped`. The gate never reruns a tripped module alone. Not in any unit's Owns cell: natedev showrunner's file.
   - `scripts/production/affected_modules.py` — affected-only module selection follows import edges (natedev c495a0b2): a change to a test helper selects every module that imports it. There is no `SHARED_TEST_HELPERS` list. natedev showrunner's file.
   - `scripts/production/test_merge_gate_suites_tripwires.py` — tests of the gate's build-tool tripwire: `test_module_tool_calls_fail_even_when_its_tests_pass` :22 (asserts `a test started real <tool>: <args>` and no `Rerun alone:`), `test_module_can_put_its_own_build_tool_stub_first` :35. Resource, admission, signal and `types` coverage live in `test_merge_gate_suites_resources.py`, `_admission.py`, `_signals.py` and `_types.py`. natedev 367da4f1 split `test_merge_gate.py` by subject into this module, `test_merge_gate_holds.py` and `test_merge_gate_ledger.py`. natedev showrunner's file.
   - Import idiom for a test helper: `from scripts.lib.nix_env_test_support import NixFixture` (`scripts/direct/test_verify_nix_shell.py` :13); the gate runs each module with the repo root as working directory.
@@ -36,7 +36,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   Run it from `~/.claude` main after a merge of `origin/builds`.
   Check `build_hold.py status` first.
   Run no tests during a natedev build hold that this unit does not hold.
-- **Lint:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <files>` from the worktree root. `<files>` is what the acceptance gate names; with no list, `scripts/lint scripts/hooks scripts/build_hold scripts/production` plus the directory of every other changed module. The interpreter is the merge gate's type-check venv (`merge_gate.py` `typecheck_python()` :574, pinned pillow and fake-bpy-module), so `bpy` and `PIL` resolve; a bare `basedpyright` reports false import errors. If the venv is absent, a merge gate run builds it. Every `basedpyright` line in an acceptance gate below means this form. Pass is its `0 errors, 0 warnings, 0 notes` line (exit status says nothing). `bash -n scripts/lint/memory_gate.sh`.
+- **Lint:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <files>` from the worktree root. `<files>` is what the acceptance gate names; with no list, `scripts/lint scripts/hooks scripts/build_hold scripts/production` plus the directory of every other changed module. The interpreter is the merge gate's type-check venv (`merge_gate.py` `typecheck_python()` :622, pinned pillow and fake-bpy-module), so `bpy` and `PIL` resolve; a bare `basedpyright` reports false import errors. If the venv is absent, a merge gate run builds it. Every `basedpyright` line in an acceptance gate below means this form. Pass is its `0 errors, 0 warnings, 0 notes` line (exit status says nothing). `bash -n scripts/lint/memory_gate.sh`.
 - **Invariants:**
   - Admission and hold check errors stop the step; only an explicit admission answer starts it (`docs/as-built/build-memory-admission.md` → Invariants).
   - Outside a test the tripwire does nothing: it acts only when `BUILDLOG_LIVE_MEMORY_TRIPWIRE` is set, and no installed caller sets it. A live session's gate behaves as before, byte for byte in its output.
@@ -199,8 +199,6 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **User decision (2026-11-05, via the builds showrunner):** "A. Build Phase 8 with the refusals." The question was whether to add the installed-copy write guards; the user's 2026-11-05 rule sends a new check to the user first.
 
-**Approved:** showrunner 2026-10-29. The edit to `docs/plans/builds-production.md` is approved.
-
 #### Work Order
 
 **Goal:** only the installed copy under `~/.claude/scripts` writes shared build state. Tests use private state.
@@ -232,8 +230,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
-   `read_cycle()` (`build_hold.py:978`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:967`) returns `Path | None`, for the same no-current-cycle state.
-   Return the existing `NoCycle` (`build_hold.py:84`) from both in place of `None`. Add no second type for this state.
+   `read_cycle()` (`build_hold.py:969`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:958`) returns `Path | None`, for the same no-current-cycle state.
+   Return the existing `NoCycle` (`build_hold.py:83`) from both in place of `None`. Add no second type for this state.
    Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
    Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
    Replace each one with `assert not isinstance(cycle, build_hold.NoCycle)`. `HoldCycle` is a `TypedDict`, so `isinstance` against it raises `TypeError`. This change keeps the assertion's intent.
@@ -241,9 +239,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call near line 895) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1170) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
-   Update the two caller-plan examples to name the installed merge gate with `--checkout <tree>`.
 6. Keep repository and step fields separate in service snapshots and queue queries.
    Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
    Show repository and step separately in the queue overview and cards. Show a missing repository as `—`.
@@ -282,7 +279,6 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
 - `scripts/production/dailies_render.py` — `NoCycle` from `read_cycle()` in the hold lines.
 - `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py` — hold line tests.
-- `docs/plans/builds-production.md`, `docs/plans/build-followups-worker-seats.md` — installed merge-gate examples.
 - `docs/as-built/build-memory-admission.md` — installed-copy rule and separate row fields.
 
 **Workers:** `1 writer + 1 tester`
@@ -1925,7 +1921,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 ### Phase 88 — The hana CI margin key goes after the runner activation  · status: todo
 
-**Depends on:** queue's 10d, natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
+**Depends on:** Phase 100, queue's 10d (landed 2026-11-10, e9fe34ff1), natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
 
 #### Work Order
 
@@ -1936,12 +1932,15 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
 2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:68`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
    The readers of the room's `ci_keep_aside` lose their CI keep-aside text: `scripts/build_queue/queue_evidence.py` (lines 118 and 223-224) and `scripts/build_queue/memory_feed.py` (lines 555 and 828).
+   `memory_feed.py` line 556 prints `CI builds do not wait in the queue yet.` Remove that line, because the runner activation makes it false.
    The key also leaves the test fixture `scripts/lint/fixtures/build_admission.conf` (line 17).
 3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
 4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove or change the tests of the mixed rule only with an approved assertion change. Three modules hold such tests:
    - `scripts/lint/test_memory_admit.py`.
    - `scripts/build_queue/test_queue_evidence.py`: `test_release_advice_retains_the_running_ci_keep_aside` (line 481) expects the running CI margin to keep the head held and the room to fall from 15 GiB to 8 GiB.
    - `scripts/build_queue/test_queue_view.py`: `test_running_ci_names_its_keep_aside_in_the_view_and_card` (line 608) expects `CI keep-aside 7.0 GiB` in the view and the card.
+
+   Add a row to the `hana CI` page test in `scripts/build_queue/test_memory_feed.py`: the page has no `CI builds do not wait in the queue yet.` line, and it counts the CI job once.
 
 **Files:**
 - `config/build_admission.conf`
@@ -1952,18 +1951,19 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 - `scripts/build_queue/queue_evidence.py`
 - `scripts/build_queue/memory_feed.py`
 - `scripts/build_queue/test_queue_view.py`
+- `scripts/build_queue/test_memory_feed.py`
 - `scripts/lint/fixtures/build_admission.conf`
 - `docs/as-built/build-memory-admission.md`
 
 **Workers:** `1 writer + 1 tester`
 - `impl` owns `config/build_admission.conf`, `admission_records.py`, `memory_admit.py`, `queue_evidence.py`, `memory_feed.py` and the as-built doc.
-- `test` owns `test_memory_admit.py`, `test_queue_evidence.py`, `test_queue_view.py` and `scripts/lint/fixtures/build_admission.conf`.
+- `test` owns `test_memory_admit.py`, `test_queue_evidence.py`, `test_queue_view.py`, `test_memory_feed.py` and `scripts/lint/fixtures/build_admission.conf`.
 
-**Gate:** the targeted test; `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py` and `scripts/build_queue/test_queue_view.py` pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
+**Gate:** the targeted test; `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_view.py` and `scripts/build_queue/test_memory_feed.py` pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
 
 **Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
 
-Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6010`).
+Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6012`).
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
@@ -2143,3 +2143,66 @@ With the Mac state folder present, `eligible` loads no `sweep` or `copies` modul
 **Gotchas:** `claim_state.record_after_unlock` finds `start_hold_recorder` by name at the call, so that module does not load `mac_test`. A start-cost comparison alternates its two sides in one run and gives each side its own bytecode cache, because machine load changes a separate run by a factor of two.
 
 **Ruled out:** a comparison of unpaired start-cost runs.
+
+### Phase 99 — The Mac mirror target keeps its size bound, and the floor offers only build output  · status: done
+
+#### As-built
+
+Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<repo>` (else `mac_budget_gib`). The trim runs `sweep.sweep_workspace()` on the Mac, in the foreground, under the mirror lease. A fetch run trims after `fetch_folder()`, in a second ssh call. The run prints `mac_trim=status=<exit> elapsed_seconds=<s> over_budget=yes|no|unknown`, and `stream_mac_run()` keeps that line and the run status. The free-space floor (a full target remove below `free_floor_gib`) runs after every trim, whatever its status. The disk floor offers a folder only when it is Cargo output (an output root or `is_cargo_target()`) and holds no `Cargo.toml` and no `.git`.
+
+**Files:**
+- `scripts/mac_test/offload.py` — `remote_cleanup_command()`, its use in `remote_test_command()` and `claimed_run()`, the `mac_trim=` branch in `stream_mac_run()`.
+- `scripts/mac_test/test_offload_cleanup.py` — trim, over-budget and failed-trim rows, in sh and zsh.
+- `scripts/mac_test/test_offload_forward.py` — byte-equal command and fetch order rows.
+- `scripts/lint/sweep.py` — the `folder_choices()` candidate rule.
+- `scripts/lint/test_sweep.py` — checkout rows for both machines.
+
+**Gotchas:** `sweep()` exits 0 when unmatched output stays over budget, so read `over_budget=` in the trim line, not the status. `LINT_SKIP_SWEEP=1` stays, because a background sweep can outlive the run and its lease. `is_cargo_target()` keeps its meaning; the checkout exclusion lives only in `folder_choices()`.
+
+**Ruled out:** a full target remove when the trim leaves the target over budget, because it empties the warm cache; `sweep.py --target-dir` as the Mac entry, because `main()` also runs the host floor by hostname.
+
+### Phase 100 — Each hana CI cargo build waits in the build admission queue  · status: done
+
+#### As-built
+
+- Each hana runner calls cargo through its own store package. `bin/cargo` runs `python3 -I <claude-commands>/scripts/build_queue/ci_cargo_front.py --front "$0" --shared-folder /run/hana-ci-admission/<runner> -- "$@"`. The package is first on the runner PATH. The runner sets no `TMPDIR`, and the wrapper exports no `PYTHONPATH`.
+- `build-admission.socket` uses group `build-admission`, mode `0660` and `RuntimeDirectoryPreserve=yes`. The group holds natepiano and each hana runner account. Each runner orders after the socket and wants it.
+- Each runner binds `/run/build-admission` and its counter folder `/run/hana-ci-admission/<runner>`. The counter folder is runner-owned at `0755`, and `systemd-tmpfiles` removes entries older than one day.
+- The `claude-commands` lock pins a main commit whose front takes `--shared-folder`. `hana-ci.slice` keeps `MemoryMax=34G` and `MemorySwapMax=2G`.
+- The change takes effect at the natedev rebuild.
+
+**Files:** (nixos repository)
+- `modules/linux/hana-runners.nix` — the front package, the runner PATH, order, binds and counter folder.
+- `modules/linux/development.nix` — the socket group, mode and preserved folder.
+- `flake.lock` — the `claude-commands` pin.
+
+**Binds later work:** "The hana CI margin key goes after the runner activation" waits for natedev's confirmation that the runners are active after the rebuild.
+
+**Gotchas:**
+- `nix develop` replaces `TMPDIR` with a private `nix-shell.*` folder at mode 0700, so `TMPDIR` cannot name files the admission service reads.
+- `python3 -m` puts the job's working folder first on `sys.path`, and hana has a top-level `scripts/` folder. The wrapper runs the store path with `-I`.
+- A socket unit removes `RuntimeDirectory` on stop unless it is preserved. A running namespace keeps the old bound inode, and `BindPaths` with an absent source fails namespace setup.
+
+**Ruled out:** a runner `TMPDIR` for the counter files, because `nix develop` replaces it.
+
+### Phase 101 — The CI cargo front takes a shared folder for its counter files  · status: done
+
+#### As-built
+
+- `scripts/build_queue/ci_cargo_front.py` takes `--shared-folder <folder>` after `--front`. `run_cargo` makes its temporary counter folder inside that folder. Without the argument, `JobTemporaryFolder` selects the default temporary folder.
+- The argument changes no environment variable. Cargo receives the job's `TMPDIR` and `PYTHONPATH`.
+- The packaged form is `python3 -I <root>/scripts/build_queue/ci_cargo_front.py --front "$0" --shared-folder <folder> -- "$@"`, with no `PYTHONPATH` from the wrapper. `scripts/lib/package_root.py`, executed at the top of the front, puts the checkout root on `sys.path`.
+- `test_packaged_wrapper_selects_the_next_cargo_and_admits_once` runs this form with and without the argument. It asserts the counter location, the job's `TMPDIR` and `PYTHONPATH`, empty folders after release and one history row.
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py` — the argument and the folder choice.
+- `scripts/build_queue/test_ci_cargo_front.py` — the packaged wrapper test.
+- `docs/as-built/build-memory-admission.md` — the shared folder, the private `TMPDIR`, the runner folder and the age rule.
+
+**Binds later work:** the runner activation pins a `claude-commands` commit on main that holds `--shared-folder`.
+
+**Gotchas:**
+- `nix develop` replaces `TMPDIR` with a private `nix-shell.*` folder at mode 0700, so `TMPDIR` cannot name files the admission service reads.
+- `~/.claude/scripts/lib/py -m` imports the installed main. Run checkout-only test support with the checkout's `scripts/lib/py`.
+
+**Ruled out:** a runner `TMPDIR` for the counter files, because `nix develop` replaces it; `python3 -m` for the packaged form, because hana has a top-level `scripts/` folder and cwd comes first.

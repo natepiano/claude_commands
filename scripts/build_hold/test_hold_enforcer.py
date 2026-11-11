@@ -58,9 +58,9 @@ class HoldEnforcerTests(unittest.TestCase):
             "BUILD_HOLD_CGROUP_ROOT": str(self.root / "cgroup"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
         }))
         self.write_holder()

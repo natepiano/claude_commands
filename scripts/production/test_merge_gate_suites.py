@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import affected_modules, merge_gate
 from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, install_test_runner
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
@@ -19,6 +19,115 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @gate_suites("hooks", "message")
+    def test_targeted_selection_precedes_the_route_and_survives_fallback(self) -> None:
+        from scripts.aws_target import cloud_gate
+        from scripts.production import targeted_test
+
+        subject, base = self.prepare_affected_subject()
+        first = self.run_gate("--tests-only", type_dirs=())
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        rows = (
+            ("unchanged", False, (), False, 0),
+            ("document", False, (), False, 0),
+            ("subject", False, (), False, 0),
+            ("subject", True, (), False, 0),
+            ("committed-subject", False, ("scripts",), False, 1),
+            ("document", False, ("scripts",), False, 0),
+            ("document", False, ("missing-types",), False, 1),
+            ("document", False, ("scripts",), True, 1),
+            ("fallback-edit", True, (), False, 1),
+            ("fallback-commit", True, (), False, 1),
+            ("fallback-full", True, (), False, 1),
+        )
+        for change, fallback, type_dirs, red_types, status in rows:
+            with self.subTest(change=change, fallback=fallback, type_dirs=type_dirs, red_types=red_types):
+                _ = self.git(self.checkout, "reset", "--hard", base)
+                (self.checkout / "scripts/hooks/test_second.py").unlink(missing_ok=True)
+                if change in ("subject", "committed-subject") or change.startswith("fallback-"):
+                    self.write(subject, "VALUE = 2\n")
+                    if change == "committed-subject":
+                        _ = self.commit(self.checkout, "Change the subject")
+                elif change == "document":
+                    self.write(self.checkout / "subject.txt", "unrelated document\n")
+                self.clear_gate_events()
+                (self.state / "types-red").unlink(missing_ok=True)
+                if red_types:
+                    self.write(self.state / "types-red", "red")
+                if change == "fallback-full":
+                    (Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl").unlink()
+                    for ref in self.git(self.checkout, "for-each-ref", "--format=%(refname)", "refs/remotes/origin").splitlines():
+                        _ = self.git(self.checkout, "update-ref", "-d", ref)
+                expected_tree = cloud_gate.working_tree(self.checkout)[0]
+                routed: list[merge_gate.AllModules | merge_gate.TreeSelection] = []
+
+                def route(repo: Path, *, mode: merge_gate.SuiteMode, full: bool,
+                          module_time_limit_s: float,
+                          selected: merge_gate.AllModules | merge_gate.TreeSelection = merge_gate.ALL_MODULES
+                          ) -> merge_gate.GateRun | str:
+                    self.assertEqual(repo, self.checkout)
+                    self.assertEqual(mode, merge_gate.SuiteMode.TARGETED_TEST)
+                    self.assertFalse(full)
+                    self.assertEqual(module_time_limit_s, merge_gate.DEFAULT_MODULE_TIME_LIMIT_S)
+                    routed.append(selected)
+                    if change.startswith("fallback-"):
+                        added = self.checkout / "scripts/hooks/test_second.py"
+                        self.write(added, SUITE_MODULE)
+                        self.write(added, added.read_text() + '\nclass NewFailure(unittest.TestCase):\n'
+                                   + '    def test_new_failure(self):\n        self.fail("new failing module")\n')
+                        if change in ("fallback-commit", "fallback-full"):
+                            _ = self.commit(self.checkout, "Add a failing test during the route")
+                    if fallback:
+                        return "fixture cloud unavailable"
+                    return merge_gate.GateRun((merge_gate.GateJobResult(
+                        "hooks", "test_first.py", int(change == "committed-subject"), 1, ""),), 1, 0)
+
+                arguments = ["--repo", str(self.checkout), *(["--type-dirs", *type_dirs] if type_dirs else [])]
+                with (mock.patch.dict(os.environ, self.environment),
+                      mock.patch.object(cloud_gate, "route", side_effect=route),
+                      mock.patch.object(merge_gate, "select_affected", wraps=affected_modules.select_affected) as select,
+                      contextlib.redirect_stdout(io.StringIO()) as output,
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    result = targeted_test.main(arguments)
+                self.assertEqual(result, status, output.getvalue() + errors.getvalue())
+                if type_dirs == ("missing-types",):
+                    self.assertIn("type dirs not found", errors.getvalue())
+                    self.assertEqual(routed, [])
+                    continue
+                local_selection = fallback or bool(type_dirs) and change != "committed-subject"
+                self.assertEqual(select.call_count, 2 if local_selection else 1)
+                if change in ("subject", "committed-subject") or change.startswith("fallback-"):
+                    selected, = routed
+                    self.assertIsInstance(selected, merge_gate.TreeSelection)
+                    assert isinstance(selected, merge_gate.TreeSelection)
+                    self.assertEqual(selected.tree, expected_tree)
+                    if change == "fallback-full":
+                        self.assertCountEqual(selected.paths, ("scripts/hooks/test_first.py", "scripts/message/test_first.py"))
+                        self.assertEqual(output.getvalue().splitlines().count("full suite: no certified base"), 2)
+                    else:
+                        self.assertEqual(selected.paths, ("scripts/hooks/test_first.py",))
+                        self.assertIn("affected: 1 of 2 modules", output.getvalue())
+                else:
+                    self.assertEqual(routed, [])
+                    self.assertIn("affected: 0 of 2 modules", output.getvalue())
+                    self.assertIn("(none)", output.getvalue())
+                starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+                if change.startswith("fallback-"):
+                    expected = {("hooks", "test_first.py"), ("hooks", "test_second.py")}
+                    if change == "fallback-full":
+                        expected.add(("message", "test_first.py"))
+                    self.assertEqual(set(starts), expected)
+                    self.assertIn("new failing module", output.getvalue())
+                    self.assertFalse(any(record["tree"] == cloud_gate.working_tree(self.checkout)[0]
+                                         for record in self.pass_records()))
+                else:
+                    self.assertEqual(starts, [("hooks", "test_first.py")] if fallback else [])
+                self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), int(bool(type_dirs)))
+                if change == "committed-subject":
+                    tree = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
+                    self.assertFalse(any(record["tree"] == tree and record["kind"] == "full"
+                                         and record["suites"] == list(self.suites) for record in self.pass_records()))
+
     @gate_suites("hooks", "direct")
     def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
         path = self.state / "module_seconds.json"

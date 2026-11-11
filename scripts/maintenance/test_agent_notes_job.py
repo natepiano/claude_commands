@@ -37,6 +37,7 @@ class JobTests(unittest.TestCase):
     def test_refusal_part_hands_moves_to_the_detached_batch_before_stopping(self) -> None:
         from scripts.accounts import refusal_watch, moves
         from scripts.agents import stop_resume
+        from scripts.herdr import turn_end
 
         def refusal_pass(**_options: object) -> list[str]:
             results = stop_resume.move_sessions(["member"], "claude5", why="auto: head", cause="auto",
@@ -48,8 +49,10 @@ class JobTests(unittest.TestCase):
               patch.object(refusal_watch, "run", side_effect=refusal_pass),
               patch.object(stop_resume, "_detach") as detach,
               patch.object(stop_resume, "_stop") as stop,
-              patch.object(moves, "append_move") as append):
+              patch.object(moves, "append_move") as append,
+              patch.object(turn_end, "report_quota_refusals", return_value=[]) as quota_refusals):
             self.assertEqual(job._perform(Part.REFUSALS), 0)  # pyright: ignore[reportPrivateUsage]
+        quota_refusals.assert_called_once_with()
         stop.assert_not_called()
         append.assert_not_called()
         detach.assert_called_once_with(["batch", "--target", "claude5", "--why", "auto: head", "--cause", "auto",

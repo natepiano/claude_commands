@@ -53,7 +53,7 @@ class RepoRootImportTests(unittest.TestCase):
         cases = (
             ("message/send.py", ("sessions.py", "relay_identity.py", "process_identity.py")),
             ("notify/auto_silence.py", ("../lib/user_zone.py",)),
-            ("build_hold/build_hold.py", ("../lib/unit_runs.py",)),
+            ("build_hold/build_hold.py", ("override_guard.py",)),
             ("mac_test/audit.py", ("cargo_manifest.py",)),
         )
         source = """

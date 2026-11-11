@@ -19,6 +19,7 @@ from unittest import mock
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
@@ -35,8 +36,6 @@ from scripts.lib import test_hang_guard
 SHIPPED_STATUS = "\n".join((
     "mac: free",
     "natedev: free",
-    "aws: unavailable; evidence unavailable; month unavailable / $400.00",
-    "  spending unavailable; decision unavailable; no controller evidence; a priced resource inventory is required before spending",
     "",
 ))
 
@@ -55,6 +54,11 @@ def pacific_zone() -> Generator[None, None, None]:
             yield
     finally:
         time.tzset()
+
+
+def setUpModule() -> None:
+    cache_home = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="targets-cache-")))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, interpreter_cache_environment(cache_home))))
 
 
 class FolderInvocationTests(NotificationGuardedTestCase):
@@ -559,11 +563,9 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(output.getvalue(), (
             "mac: unreachable — ssh timed out\n"
             "natedev: held by hana since 13:05 PDT — render checks\n"
-            "aws: unreachable — ssh timed out\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
-                                  targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
@@ -820,7 +822,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.sleeps = 0
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "BUILD_TARGETS_POLL_S": "0.01",
             "BUILDLOG_HOLD_WAIT_FILE": str(self.root / "wait-seconds"),

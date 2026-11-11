@@ -20,10 +20,10 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
+from scripts.herdr import herdr_types
 from scripts.whoami import account
 from scripts.agents import remote
 from scripts.lib.probe_session import PROBE_ENV
-from scripts.lib import unit_runs
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.message.sessions import process_start as _process_start
@@ -271,10 +271,6 @@ def _notifier_state_dir() -> Path:
     return Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")))
 
 
-def _run_roots() -> tuple[Path, ...]:
-    return unit_runs.run_roots(os.environ.get("SHUTDOWN_RUN_ROOT"))
-
-
 def _session_file(record: sessions.SessionRecord) -> SessionFile:
     """Add fields that the shared routing reader deliberately does not retain."""
     data = cast(dict[str, object], cast(object, record)).copy()
@@ -423,21 +419,9 @@ def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, Uni
 def _active_run_directories() -> dict[str, list[Path]]:
     """Every director-to-run mapping, including directors that have already exited."""
     found: dict[str, list[Path]] = {}
-    mappings: list[Path] = []
-    for root in _run_roots():
-        try:
-            mappings.extend(sorted((root / "active").iterdir()))
-        except OSError:
-            continue
-    for mapping in mappings:
-        if not mapping.is_file():
-            continue
-        try:
-            lines = mapping.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError):
-            continue
-        if lines and lines[0].strip():
-            found.setdefault(mapping.name, []).append(Path(lines[0].strip()).expanduser())
+    for row in staff.local_snapshot().rows:
+        if isinstance(row.run, staff.OpenRun):
+            found.setdefault(row.current_session, []).append(row.run.path.expanduser())
     return found
 
 
@@ -481,7 +465,7 @@ def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         try:
             return herdr.darwin_process_environment(pid)
-        except (herdr.HerdrFailure, subprocess.TimeoutExpired):
+        except (herdr_types.HerdrFailure, subprocess.TimeoutExpired):
             return {}
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
@@ -782,7 +766,7 @@ def _launcher_command(pid: int) -> list[str]:
             if any(Path(arg).name in WORKER_LAUNCHERS for arg in argv):
                 return argv
             pid = parent
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError, herdr.HerdrFailure):
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError, herdr_types.HerdrFailure):
         return []
     return []
 

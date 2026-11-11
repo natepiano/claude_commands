@@ -23,6 +23,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
+from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
@@ -780,40 +781,126 @@ class RetireUnitTests(unittest.TestCase):
                         self.assertEqual(shutdown.retirement_process_session(child.pid), session_id)
                         self.assertEqual(shutdown.retirement_command_name(child.pid), "TEST-shell")
 
-        for at_shell, pane in ((True, "w1:p1"), (False, "w1:p1"), (True, "w1:p3")):
-            with self.subTest(at_shell=at_shell, pane=pane):
+        rows = [("mac", True, "w1:p1", True, False), ("mac", False, "w1:p1", True, False),
+                ("mac", True, "w1:p3", True, False), (remote.local_machine(), False, "w1:p1", True, False)]
+        rows.extend((machine, at_shell, "w1:p1", inside_worktree, removal_fails)
+                    for machine in (remote.local_machine(), "mac")
+                    for at_shell, inside_worktree, removal_fails in ((True, False, False),
+                                                                    (False, False, False), (True, True, True)))
+        for machine, at_shell, pane, inside_worktree, removal_fails in rows:
+            with self.subTest(machine=machine, at_shell=at_shell, pane=pane,
+                              inside_worktree=inside_worktree, removal_fails=removal_fails):
                 case = RetireUnitTests()
                 case.setUp()
                 try:
-                    row = case.move_to_other_machine()
+                    if machine == remote.local_machine():
+                        row = staff.by_id(case.unit_staff_id)
+                        assert row is not None
+                    else:
+                        row = case.move_to_other_machine()
                     case.pane_world.add(row, "w1:p1", live=False)
                     if pane != "w1:p1":
                         case.pane_world.add(row, pane, live=False, label="TEST-visitor")
                     shell = pane_record.pane_shell_pid(HerdrPlace("agents", pane))
-                    closes = at_shell and pane == "w1:p1"
+                    succeeds = not removal_fails and (not inside_worktree or at_shell and pane == "w1:p1")
+                    closes = succeeds and at_shell and pane == "w1:p1"
                     if not at_shell:
                         case.pane_world.activate("TEST-visitor", "w1:p1", "claude")
                     def inside(worktree: Path) -> list[int]:
                         case.assertEqual(worktree, case.worktree)
-                        return [shell] if pane in case.pane_world.locations else []
+                        return [shell] if inside_worktree and pane in case.pane_world.locations else []
+                    close = case.pane_world.close_retained_pane
+                    def close_last(identity: str, *, terminal: str = "") -> bool:
+                        case.assertEqual(remote.local_machine(), machine)
+                        case.assertFalse(case.worktree.exists())
+                        case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                        return close(identity, terminal=terminal)
+                    remove = shutdown.retirement_remove
+                    def remove_worktree(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+                        return ["TEST-removal failed"] if removal_fails else remove(unit, settings=settings)
                     with (mock.patch.object(unit_move, "processes_inside", side_effect=inside),
                           mock.patch.object(shutdown, "retirement_process_session", return_value=""),
                           mock.patch.object(shutdown, "retirement_proc_start", return_value="TEST-start"),
+                          mock.patch.object(shutdown, "retirement_remove", side_effect=remove_worktree),
+                          mock.patch.object(case.pane_world, "close_retained_pane", side_effect=close_last),
                           mock.patch.object(process_group, "send_process_group") as send):
                         code, output = case.retire()
+                        if succeeds:
+                            rerun_code, rerun_output = case.retire()
+                            case.assertEqual(rerun_code, 0, rerun_output)
+                            case.assertNotIn("pane close failed", rerun_output)
+                            if closes:
+                                case.assertNotIn("anomaly:", rerun_output)
                     send.assert_not_called()
                     case.assertEqual(case.pane_world.signals, [])
-                    case.assertEqual(code, 0 if closes else 1, output)
+                    case.assertEqual(code, 0 if succeeds else 1, output)
                     case.assertEqual(case.pane_world.closed, [("w1:p1", "terminal-w1:p1")] if closes else [])
-                    if closes:
-                        case.assertNotIn("anomaly:", output)
+                    if succeeds:
+                        if closes:
+                            case.assertNotIn("anomaly:", output)
+                        else:
+                            case.assertEqual(output.count("anomaly:"), 1, output)
+                            case.assertIn("alpha:w1:p1: foreground work keeps the pane open", output)
+                            case.assertIn("w1:p1", case.pane_world.locations)
                         case.assertFalse(case.worktree.exists())
                         case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                     else:
-                        case.assertIn(f"unowned process {shell}", output)
-                        case.assertIn("refused: live holds or processes remain", output)
+                        if removal_fails:
+                            case.assertIn("TEST-removal failed", output)
+                        else:
+                            case.assertIn(f"unowned process {shell}", output)
+                            case.assertIn("refused: live holds or processes remain", output)
                         case.assertTrue(case.worktree.is_dir())
                         case.assertEqual(staff.by_id(row.id), row)
+                finally:
+                    case.doCleanups()
+
+        for machine, journal_retry in ((remote.local_machine(), False), ("mac", False), ("mac", True)):
+            with self.subTest(machine=machine, journal_retry=journal_retry):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    if machine == remote.local_machine():
+                        row = staff.by_id(case.unit_staff_id)
+                        assert row is not None
+                    else:
+                        row = case.move_to_other_machine()
+                    case.pane_world.add(row, "w1:p1", live=False)
+                    assert isinstance(row.parent, staff.ReportsTo)
+                    other = fixture_member("unit", name="TEST-other", parent=row.parent.id,
+                                           runtime_id=fixture_runtime_id("TEST-other"))
+                    replacement = pane_record.launch("w1:p1", other.current_session, str(case.root),
+                                                    {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
+                    remove = shutdown.retirement_remove
+                    def replace_after_cleanup(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+                        result = remove(unit, settings=settings)
+                        case.assertEqual(result, [])
+                        case.pane_world.locations["w1:p1"]["terminal_id"] = "TEST-new-terminal"
+                        case.pane_world.locations["w1:p1"]["label"] = other.name
+                        pane_record.write("alpha", replacement)
+                        return result
+                    with (mock.patch.object(shutdown, "retirement_remove", side_effect=replace_after_cleanup),
+                          mock.patch.object(process_group, "send_process_group") as send):
+                        if journal_retry:
+                            unit = shutdown.retirement_find_unit("alpha", str(row.id))
+                            result = shutdown.unit_remote_command("retire", row, staff.snapshot(),
+                                                                  merge_branch=unit.production.merge_branch,
+                                                                  zone=unit.production.zone.key)
+                            case.assertEqual(result["code"], 0, result["output"])
+                            _ = staff.set_worktree(row.id, staff.RemovedWorktree(machine, case.worktree), expected=row.worktree)
+                            journal = case.root / "remote-shutdown/retire-worktrees" / f"{row.id}.json"
+                            case.assertTrue(journal.exists())
+                        code, output = case.retire()
+                    send.assert_not_called()
+                    case.assertEqual(code, 0, output)
+                    case.assertEqual(case.pane_world.closed, [])
+                    case.assertEqual(pane_record.read("alpha").get("w1:p1"), replacement)
+                    case.assertEqual(case.pane_world.locations["w1:p1"]["terminal_id"], "TEST-new-terminal")
+                    case.assertEqual(output.count("anomaly:"), 1, output)
+                    case.assertIn("alpha:w1:p1: pane close failed", output)
+                    case.assertIn("terminal identity changed", output)
+                    case.assertFalse(case.worktree.exists())
+                    case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                 finally:
                     case.doCleanups()
 
@@ -929,7 +1016,7 @@ class RetireUnitTests(unittest.TestCase):
 
 
     def test_remote_retirement_retries_failed_steps_without_retiring_the_staff_row(self) -> None:
-        for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "journal", "journal removal"):
+        for failure in ("stop", "remove", "branch", "origin", "ssh", "answer", "hold", "copy", "journal", "journal removal"):
             with self.subTest(failure=failure):
                 case = RetireUnitTests()
                 case.setUp()
@@ -954,7 +1041,10 @@ class RetireUnitTests(unittest.TestCase):
                     with (mock.patch.object(shutdown, "retirement_remove", side_effect=blocked_remove),
                           mock.patch.object(stop_resume, "stop", side_effect=stop),
                           mock.patch.object(shutdown, "run_remote", side_effect=case.remote_call) as ssh,
+                          mock.patch.object(copies, "remove_trees", wraps=copies.remove_trees) as trees,
                           mock.patch.object(shutdown, "retirement_holds", wraps=shutdown.retirement_holds) as holds):
+                        if failure == "copy":
+                            trees.side_effect = copies.CopyError("TEST copy removal failed")
                         if failure in ("ssh", "answer"):
                             ssh.side_effect = None
                             ssh.return_value = (255, "") if failure == "ssh" else (0, "unreadable answer")
@@ -992,6 +1082,8 @@ class RetireUnitTests(unittest.TestCase):
                             continue
                         code, output = case.retire()
                     case.assertNotEqual(code, 0, output)
+                    if failure == "copy":
+                        case.assertIn("anomaly: TEST copy removal failed", output)
                     case.assertNotIn("alpha retired", output)
                     case.assertEqual(staff.by_id(row.id), row)
                     case.assertIsInstance(unit_config.read_parked(row.id, cleanup=False), unit_config.ConfigMissing)
@@ -1770,7 +1862,7 @@ class WorkerRenameTests(StaffTestCase):
                     del tab
                     if pane in failed_panes:
                         failed_panes.remove(pane)
-                        raise herdr.HerdrFailure("fixture retitle failed")
+                        raise herdr_types.HerdrFailure("fixture retitle failed")
                     changed = fixture.world.locations[pane]["label"] != title
                     fixture.world.locations[pane]["label"] = title
                     return changed
@@ -1832,7 +1924,7 @@ class WorkerRenameTests(StaffTestCase):
         unit = fixture_member("unit", name="TEST-unit", parent=owner.id)
         row = fixture_worker("TEST-worker", unit.id)
         arguments = ["rename", str(row.id), "TEST-renamed"]
-        with mock.patch.object(herdr.Herdr, "retitle_row", side_effect=herdr.HerdrFailure("pane unavailable")):
+        with mock.patch.object(herdr.Herdr, "retitle_row", side_effect=herdr_types.HerdrFailure("pane unavailable")):
             result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments, dict(os.environ), CHECKOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(staff.by_id(row.id), replace(row, name="TEST-renamed"))
@@ -1858,7 +1950,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         row = self.production_row()
         displays = support.RenameDisplays(row)
         with (displays.installed(), mock.patch.object(herdr.Herdr, "panes",
-                side_effect=herdr.HerdrFailure("display unavailable"))):
+                side_effect=herdr_types.HerdrFailure("display unavailable"))):
             result = self.run_command(row.name, row.name)
         self.assert_success(result)
         self.assertEqual(result.stderr.strip(), "anomaly: set_displays: display unavailable")

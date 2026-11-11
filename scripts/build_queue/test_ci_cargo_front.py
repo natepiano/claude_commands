@@ -93,35 +93,47 @@ with mock.patch.object(records, 'read_memory_config', side_effect=PermissionErro
 
 class CargoLifetimeTests(unittest.TestCase):
     def test_packaged_wrapper_selects_the_next_cargo_and_admits_once(self) -> None:
-        with AdmissionFixture() as fixture, fixture.serving():
-            front_dir = fixture.root / "front-bin"
-            cargo_dir = fixture.root / "cargo-bin"
-            front_dir.mkdir()
-            cargo_dir.mkdir()
-            wrapper = front_dir / "cargo"
-            _ = wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable)
-                + ' -m scripts.build_queue.ci_cargo_front --front "$0" -- "$@"\n')
-            wrapper.chmod(0o755)
-            cargo = cargo_dir / "cargo"
-            calls = fixture.root / "cargo-calls"
-            _ = cargo.write_text(FAKE_CARGO.replace("descendant = 0", "with open(" + repr(str(calls))
-                + ", 'a') as output:\n    output.write(os.environ['PATH'] + '\\n')\ndescendant = 0"))
-            cargo.chmod(0o755)
-            environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
-                "PATH": os.pathsep.join((str(front_dir), str(cargo_dir), os.environ["PATH"]))}
-            child = subprocess.Popen([str(wrapper), "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, env=environment, cwd=fixture.root)
-            self.addCleanup(self.stop_front, child)
-            data = self.started(child)
-            self.supply_front_memory(fixture, child)
-            os.kill(int(str(data["pid"])), signal.SIGUSR1)
-            output, errors = child.communicate(timeout=8)
-            self.assertEqual(child.returncode, 0, output + errors)
-            paths, = calls.read_text().splitlines()
-            self.assertNotIn(str(front_dir), paths.split(os.pathsep))
-            self.assertEqual(len(fixture.history()), 1)
-            with fixture.loop_turn():
-                self.assertFalse(fixture.server.reservations)
+        for use_shared in (False, True):
+            with self.subTest(use_shared=use_shared), AdmissionFixture() as fixture, fixture.serving():
+                front_dir = fixture.root / "front-bin"
+                cargo_dir = fixture.root / "cargo-bin"
+                shared = fixture.root / "admission-shared"
+                job_temporary = fixture.root / "job-temporary"
+                for folder in (front_dir, cargo_dir, shared, job_temporary):
+                    folder.mkdir()
+                wrapper = front_dir / "cargo"
+                script = Path(__file__).with_name("ci_cargo_front.py")
+                shared_argument = " --shared-folder " + shlex.quote(str(shared)) if use_shared else ""
+                _ = wrapper.write_text("#!/bin/sh\nexec " + shlex.join((sys.executable, "-I", str(script)))
+                    + ' --front "$0"' + shared_argument + ' -- "$@"\n')
+                wrapper.chmod(0o755)
+                cargo = cargo_dir / "cargo"
+                calls = fixture.root / "cargo-calls"
+                _ = cargo.write_text(FAKE_CARGO.replace("descendant = 0", "with open(" + repr(str(calls))
+                    + ", 'a') as output:\n    output.write('\\n'.join(os.environ[name] for name in"
+                    + " ('PATH', 'TMPDIR', 'PYTHONPATH')) + '\\n')\ndescendant = 0"))
+                cargo.chmod(0o755)
+                environment = {**os.environ, "PYTHONPATH": "job-module-path", "TMPDIR": str(job_temporary),
+                    "PATH": os.pathsep.join((str(front_dir), str(cargo_dir), os.environ["PATH"]))}
+                child = subprocess.Popen([str(wrapper), "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=environment, cwd=fixture.root)
+                self.addCleanup(self.stop_front, child)
+                data = self.started(child)
+                self.supply_front_memory(fixture, child)
+                with fixture.loop_turn():
+                    record, = fixture.server.reservations.values()
+                    self.assertEqual(Path(record.sidecar).parent.parent, shared if use_shared else job_temporary)
+                os.kill(int(str(data["pid"])), signal.SIGUSR1)
+                output, errors = child.communicate(timeout=8)
+                self.assertEqual(child.returncode, 0, output + errors)
+                paths, temporary, module_path = calls.read_text().splitlines()
+                self.assertNotIn(str(front_dir), paths.split(os.pathsep))
+                self.assertEqual((temporary, module_path), (str(job_temporary), "job-module-path"))
+                self.assertEqual(list(shared.iterdir()), [])
+                self.assertEqual(list(job_temporary.iterdir()), [])
+                self.assertEqual(len(fixture.history()), 1)
+                with fixture.loop_turn():
+                    self.assertFalse(fixture.server.reservations)
 
     def test_killing_the_front_also_kills_its_cargo_process(self) -> None:
         with AdmissionFixture() as fixture, fixture.serving():

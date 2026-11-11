@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.review_links import review_link, serve
 
 
@@ -134,7 +135,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.env = {
             **os.environ,
             "HOME": str(home),
-            "CLAUDE_PYTHON": sys.executable,
+            **interpreter_cache_environment(self.root / "cache"),
             "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
             "CLAUDE_CODE_SESSION_ID": "12345678-abcd-4321-abcd-123456789abc",
         }

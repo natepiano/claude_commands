@@ -23,6 +23,7 @@ import sys
 from typing import Literal, cast, final
 
 from scripts.agents import detached_runs, worker_lifecycle
+from scripts.herdr import herdr_types
 from scripts.accounts import accounts
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
@@ -229,7 +230,7 @@ def _client() -> herdr.Herdr:
 def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "") -> None:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
-        raise herdr.HerdrFailure(f"{worker.row.name}: dispatch target is unproved", "wrong_target")
+        raise herdr_types.HerdrFailure(f"{worker.row.name}: dispatch target is unproved", "wrong_target")
     arguments = ["agent", "prompt" if action == "compact" else action, worker.pane]
     if action == "prompt":
         arguments.append(script_prompt(line))
@@ -263,7 +264,7 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
         _agent_command(client, current, "compact")
         ended = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
         if isinstance(ended, herdr.WaitTimedOut):
-            raise herdr.HerdrFailure("compaction did not finish before the settle bound", "timeout")
+            raise herdr_types.HerdrFailure("compaction did not finish before the settle bound", "timeout")
 
 
 def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCode:
@@ -405,7 +406,7 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
                     return _blocked_question(client, observed)
             print(f"{error}; no prompt sent", file=sys.stderr)
             return ExitCode.UNCERTAIN
-        except (OSError, herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+        except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
             print(f"{error}; no prompt sent", file=sys.stderr)
             return ExitCode.UNCERTAIN
         if not isinstance(observed, worker_panes.OpenWorker):
@@ -425,7 +426,7 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         return ExitCode.BUSY
     try:
         _compact_before_dispatch(client, current)
-    except (OSError, herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
         print(f"{current.row.name}: compaction failed: {error}; no prompt sent", file=sys.stderr)
         return ExitCode.UNCERTAIN
     try:
@@ -433,7 +434,7 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
     except OSError as error:
         reason = " ".join(str(error).splitlines())
         raise OSError(f"{reason}; prompt delivered to pane {current.pane}") from error
-    except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
         if isinstance(error, herdr.AgentBlocked) and codex:
             return _blocked_question(client, current, delivered_to=current.pane)
         reason = " ".join(str(error).splitlines())
@@ -446,7 +447,7 @@ def _blocked_question(client: herdr.Herdr, worker: worker_panes.OpenWorker, *, d
     print(f"question: {worker.row.name} pane {worker.pane}", file=sys.stderr)
     try:
         question = client.read(worker.pane, 40, joined=False, ansi=False)
-    except (herdr.HerdrFailure, OSError, subprocess.SubprocessError) as error:
+    except (herdr_types.HerdrFailure, OSError, subprocess.SubprocessError) as error:
         reason = f"anomaly: {worker.row.name}: {' '.join(str(error).splitlines())}"
         if delivered_to:
             reason += f"; prompt delivered to pane {delivered_to}"
@@ -553,7 +554,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             completion_actions = replace(completion_actions, summary_file=str(target))
         if isinstance(reply, Path):
             reply = progress_history.worker_artifact(reply, slot, chosen.value)
-    return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=slot,
+    return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=chosen.value,
         phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
         fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
         completion_actions=completion_actions)
@@ -770,10 +771,13 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if isinstance(started_panes, dict):
                             started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
                         changed = True
-                    code = _resume_launcher(state.row, active)
+                        row = cast(worker_panes.OpenWorker, result).row
+                    else:
+                        row = state.row
+                    code = _resume_launcher(row, active)
                     if code != ExitCode.OK:
                         outcome = code
-            except (herdr.HerdrFailure, OSError, ValueError) as error:
+            except (herdr_types.HerdrFailure, OSError, ValueError) as error:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
     if outcome == ExitCode.OK:
@@ -849,10 +853,8 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, Wo
     runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
     for parent in parents.values():
         runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
-        try:
-            runs.append(Path(unit_runs.marker(parent.current_session).read_text().strip()))
-        except FileNotFoundError:
-            pass
+        if isinstance(parent.run, staff.OpenRun):
+            runs.append(parent.run.path)
     if current := unit_runs.environ("RUN_DIR"):
         runs.append(Path(current))
     found: dict[StaffId, WorkerDispatchRecord] = {}
@@ -1125,7 +1127,7 @@ def main(arguments: list[str] | None = None) -> int:
         elif code == ExitCode.OK:
             print("done")
         return code
-    except (staff.StaffUnreadable, staff.StaffRefused, herdr.HerdrFailure, OSError, ValueError) as error:
+    except (staff.StaffUnreadable, staff.StaffRefused, herdr_types.HerdrFailure, OSError, ValueError) as error:
         print(f"anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return ExitCode.UNCERTAIN
 
