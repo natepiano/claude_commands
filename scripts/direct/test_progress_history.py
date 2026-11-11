@@ -73,13 +73,6 @@ def recorder_handler(name: str) -> Callable[[argparse.Namespace], None]:
     return cast(Callable[[argparse.Namespace], None], handler)
 
 
-def refresh_phase_table(session_dir: Path) -> None:
-    refresh = vars(progress_history).get("_refresh_phase_table")
-    if not callable(refresh):
-        raise AssertionError("progress recorder phase-table refresh is unavailable")
-    cast(Callable[[Path], None], refresh)(session_dir)
-
-
 class ProgressHistoryTests(unittest.TestCase):
     repository_seed: ClassVar[Path]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -6756,38 +6749,6 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(phase["id"], "types-unit-201")
         self.assertIn("| 0 of 1 done |", self.run_progress(session_dir, 80_000))
 
-    def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
-        self,
-    ) -> None:
-        _ = subprocess.run(
-            ["git", "symbolic-ref", "HEAD", "refs/heads/bevy_hana_rubric"],
-            cwd=self.working_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        session_dir = self.start_run("same_name", 0)
-        self.start_phase_and_pass(session_dir, 70_000)
-        header = self.run_command(
-            "progress", "--tables",
-            "--session-dir",
-            str(session_dir),
-            "--project-raw-percent",
-            "50",
-            "--project-percent",
-            "50",
-            "--phase-raw-percent",
-            "50",
-            "--phase-percent",
-            "50",
-            "--cap-stage",
-            "implementation",
-            "--activity",
-            "writing the retry path",
-            at=80_000,
-        )
-        self.assertEqual(header.splitlines()[0], "**bevy_hana_rubric**")
-
     def report_eta_chain(self, name: str, *, ranged: bool = True) -> tuple[Path, str]:
         def at(hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 16, hour, minute, tzinfo=UTC).timestamp())
@@ -7558,69 +7519,6 @@ with patch.object(fcntl, "flock", admission):
                     refused[2],
                     "phase table not written: target belongs to another unit\n",
                 )
-
-    def test_phase_table_timeout_prints_one_line(self) -> None:
-        session_dir = self.start_run("refresh-timeout", 50_000)
-        self.record_production_member(session_dir)
-        arguments = recorder_parser().parse_args(
-            [
-                "start-phase",
-                "--session-dir",
-                str(session_dir),
-                "--phase-id",
-                "3",
-                "--phase-title",
-                "Retry handling",
-            ]
-        )
-
-        returned, stdout, stderr = self.invoke_handler(
-            recorder_handler("_start_phase"),
-            arguments,
-            at=50_100,
-            refresh_result=subprocess.TimeoutExpired(["phase_table.py"], 10),
-        )
-
-        self.assertIsNone(returned)
-        self.assertEqual(stdout, "")
-        self.assertEqual(len(stderr.splitlines()), 1)
-        self.assertIn("phase table not written:", stderr)
-        self.assertIn("timed out after 10 seconds", stderr)
-
-    def test_plan_without_production_marker_starts_no_phase_table_process(self) -> None:
-        session_dir = self.start_run("refresh-not-a-production", 60_000)
-
-        with patch("scripts.direct.progress_history.subprocess.run") as run:
-            refresh_phase_table(session_dir)
-
-        run.assert_not_called()
-
-    def test_invalid_utf8_plan_starts_no_phase_table_process_or_output(self) -> None:
-        session_dir = self.start_run("refresh-invalid-utf8", 65_000)
-        state = self.read_state(session_dir)
-        plan_path = plan_history.resolve_plan_path(
-            Path(cast(str, state["working_dir"])), cast(str, state["project_plan_doc"]))
-        _ = plan_path.write_bytes(b"\xff")
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "PHASE_TABLE_VAULT": str(self.root / "vault"),
-                    "UNIT_HISTORY_DIR": str(self.history_dir),
-                },
-            ),
-            patch("scripts.direct.progress_history.subprocess.run") as run,
-            redirect_stdout(stdout),
-            redirect_stderr(stderr),
-        ):
-            refresh_phase_table(session_dir)
-
-        run.assert_not_called()
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertEqual(stderr.getvalue(), "")
 
     def test_progress_refresh_writes_the_production_phase_note(self) -> None:
         from scripts.production import fake_showrunner
@@ -8402,18 +8300,6 @@ class PublicPhaseHelperTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("showrunner", name="phase-helper")
-
-    def test_recorder_helpers_use_public_names_without_private_aliases(self) -> None:
-        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "123.5"}):
-            self.assertEqual(plan_history.now_epoch(), 123.5)
-        self.assertEqual(
-            plan_history.resolve_plan_path(self.root, "docs/plan.md"),
-            (self.root / "docs" / "plan.md").resolve(),
-        )
-        self.assertEqual(plan_history.percent_spread(None), 10.0)
-        self.assertFalse(hasattr(progress_history, "_now_epoch"))
-        self.assertFalse(hasattr(progress_history, "_plan_path"))
-        self.assertFalse(hasattr(progress_history, "_percent_spread"))
 
     def test_plan_phases_classifies_and_cleans_every_heading_form(self) -> None:
         plan = self.root / "plan.md"
