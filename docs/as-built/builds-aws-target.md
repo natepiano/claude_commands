@@ -162,6 +162,13 @@ An interruption marker reports the instance generation.
   The section shows uptime, steps, estimated queue wait saved, costs, the account bill, and daily gate spend.
   `aws_report.estimate_wait_saved` compares natedev steps from the same day, kind, and repository.
   The report shows one AWS section before the Mac copies section.
+  The worker records `mode` in each launch, refusal, and finish event in `cloud-gate-launches.jsonl`.
+  After result validation, the worker records `gate_s` in the finish event.
+  The cost matrix separates machine types, merge gates, targeted tests, and totals over `gate_type_window_days` UTC days (default: 14).
+  Daily cost splits by box seconds; costs per run use billed days only.
+  Counts include all finished runs in the window.
+  A daily table shows median test time, median box time, and cost per run, newest day first.
+  Runs use their UTC completion day; the source line counts old rows without a run kind.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 

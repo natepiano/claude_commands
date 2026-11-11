@@ -12,7 +12,7 @@ from typing import cast, override
 from unittest import mock
 import unittest
 
-from scripts.buildlog import index
+from scripts.buildlog import aws_report, index
 from scripts.buildlog import mac_outcome
 from scripts.buildlog import report
 from scripts.buildlog import record
@@ -190,6 +190,95 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("0.00 h of queue wait saved", output)
         self.assertIn("unavailable per saved hour", output)
 
+    def test_gate_type_comparison_uses_finished_times_and_billed_days_in_the_window(self) -> None:
+        numeric_settings(self.settings, {'gate_type_window_days': '2'})
+        launches: list[dict[str, object]] = []
+        for attempt, size, mode, at, box_s, gate_s in (
+            ('merge-m', 'm7a.8xlarge', 'merge-gate', MIDNIGHT - 3600, 100, 60),
+            ('target-m', 'm7a.8xlarge', 'targeted-test', MIDNIGHT - 3600, 200, 30),
+            ('merge-c', 'c7a.8xlarge', 'merge-gate', MIDNIGHT - 3600, 300, 180),
+            ('target-c', 'c7a.8xlarge', 'targeted-test', MIDNIGHT - 3600, 100, 90),
+            ('unbilled-m', 'm7a.8xlarge', 'merge-gate', NOW, 600, 120),
+            ('unbilled-c', 'c7a.8xlarge', 'targeted-test', NOW, 400, 150),
+            ('old', 'old.8xlarge', 'merge-gate', MIDNIGHT - 86401, 100, 90),
+            ('future', 'future.8xlarge', 'targeted-test', MIDNIGHT + 86400, 100, 90),
+        ):
+            launches.extend((
+                {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched'},
+                {'time': at, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'finished', 'gate_s': gate_s}))
+        launches.extend((
+            {'time': NOW, 'instance_type': 'legacy.8xlarge', 'result': 'finished', 'gate_s': 10},
+            {'time': NOW, 'attempt': 'orphan', 'instance_type': 'orphan.8xlarge', 'mode': 'merge-gate', 'result': 'finished', 'gate_s': 30},
+            {'time': NOW - 60, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'result': 'launched'},
+            {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 30},
+            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'targeted-test', 'result': 'refused'}))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in reversed(launches)))
+        charges = self.state / 'charges'
+        charges.mkdir(exist_ok=True)
+        usage = (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.20'), Decimal('.25'), 'Hrs'),
+                 ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('.10'), Decimal('.25'), 'Hrs'),
+                 ledger.UsageTypeCost('USE2-SpotUsage:c7a.8xlarge', Decimal('.90'), Decimal('.5'), 'Hrs'),
+                 ledger.UsageTypeCost('USE2-SpotUsage:excluded.8xlarge', Decimal('10'), Decimal('5'), 'Hrs'))
+        for days_ago in (1, 2):
+            at = MIDNIGHT - days_ago * 86400
+            day = datetime.fromtimestamp(at, UTC).date().isoformat()
+            reading = ledger.ChargeRead(day, NOW, at, at + 86400, Decimal('11.20'), Decimal(0), Decimal(0), usage)
+            _ = (charges / f'{day}.json').write_text(json.dumps(ledger.charge_record(reading)))
+        output = self.render()
+        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', output)
+        self.assertIn('| m7a.8xlarge | $0.1000 per run (2) | $0.2000 per run (1) | $0.1500 per run (3) |', output)
+        self.assertIn('| c7a.8xlarge | $0.6750 per run (1) | $0.2250 per run (2) | $0.4500 per run (3) |', output)
+        self.assertIn('| All types | $0.3875 per run (3) | $0.2125 per run (3) | $0.3000 per run (6) |', output)
+        self.assertIn('Median test time: c7a.8xlarge merge gates: 3m 0s; c7a.8xlarge targeted tests: 2m 0s; '
+                      + 'm7a.8xlarge merge gates: 1m 30s; m7a.8xlarge targeted tests: 0m 30s.', output)
+        self.assertIn('| 2026-01-15 | 1 | 2m 0s | 10m 0s | 1 | 2m 30s | 6m 40s | not billed yet |', output)
+        self.assertIn('| 2026-01-14 | 2 | 2m 0s | 3m 20s | 2 | 1m 0s | 2m 30s | $0.3000 |', output)
+        self.assertLess(output.index('| 2026-01-15 |'), output.index('| 2026-01-14 |'))
+        for size in ('legacy.8xlarge', 'old.8xlarge', 'future.8xlarge', 'refused.8xlarge', 'orphan.8xlarge', 'excluded.8xlarge'):
+            self.assertNotIn(f'| {size} |', output)
+        self.assertIn('Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC 2026-01-14 through 2026-01-15 (2 days)', output)
+        self.assertIn('billed days only; 4 rows omitted with no kind or matching launch; Spot cost can include the older builder.', output)
+
+    def test_gate_type_comparison_shows_unbilled_and_empty_cells_for_one_type(self) -> None:
+        launches = [
+            {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'launched'},
+            {'time': NOW, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 60}]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
+        lines = aws_report.gate_type_lines(self.state, DAY, 14)
+        self.assertIn('| m7a.8xlarge | — | not billed yet (1) | not billed yet (1) |', lines)
+        self.assertFalse(any(line.startswith('| All types |') for line in lines))
+        self.assertIn('| 2026-01-15 | 0 | — | — | 1 | 1m 0s | 2m 0s | not billed yet |', lines)
+
+    def test_gate_type_comparison_uses_shared_files_without_a_steps_query(self) -> None:
+        with read_only_evidence(self, self.root):
+            lines = aws_report.gate_type_lines(self.state, DAY, 14)
+        self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', lines)
+        self.assertTrue(any('UTC 2026-01-02 through 2026-01-15 (14 days)' in line for line in lines))
+
+    def test_gate_type_comparison_with_malformed_evidence_preserves_the_report(self) -> None:
+        self.write_records(self.local_step('comparison-evidence', 60, 10))
+        launched = {'time': NOW - 60, 'attempt': 'missing-time', 'instance_type': 'm7a.8xlarge',
+                    'mode': 'merge-gate', 'result': 'launched'}
+        finished = {**launched, 'time': NOW, 'result': 'finished'}
+        missing_time = json.dumps(launched) + '\n' + json.dumps(finished) + '\n'
+        for filename, content, reason in (
+            (f'charges/{DAY}.json', '{bad json\n', 'Expecting property name enclosed in double quotes'),
+            ('cloud-gate-launches.jsonl', '{bad json\n', 'Expecting property name enclosed in double quotes'),
+            ('cloud-gate-launches.jsonl', missing_time, "'gate_s'"),
+        ):
+            with self.subTest(filename=filename, reason=reason):
+                path = self.state / filename
+                path.parent.mkdir(exist_ok=True)
+                _ = path.write_text(content)
+                output = self.render()
+                self.assertIn(f'Gate type comparison unavailable: {reason}', output)
+                self.assertEqual(output.count('Gate type comparison unavailable:'), 1)
+                self.assertIn('### AWS\n', output)
+                self.assertIn('AWS: up ', output)
+                self.assertIn('Mac copies: none started.', output)
+                self.assertIn('### Summary: all', output)
+                path.unlink()
+
     def test_report_prices_pending_requests_without_confirmed_uptime_and_keeps_resolved_costs(self) -> None:
         request = self.pending_request()
         output = self.render()
@@ -216,6 +305,7 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW, 'instance_type': 'm7a.8xlarge', 'result': 'launched'},
             {'time': NOW, 'instance_type': 'm7a.4xlarge', 'result': 'launched'},
             {'time': NOW, 'instance_type': 'm7a.4xlarge', 'result': 'refused'},
+            {'time': NOW, 'instance_type': 'm7a.8xlarge', 'result': 'finished', 'gate_s': 10},
             {'time': MIDNIGHT + 86400, 'instance_type': 'm7a.4xlarge', 'result': 'launched'},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
