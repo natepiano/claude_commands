@@ -32,7 +32,7 @@ from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
 from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
 from scripts.herdr import worker_panes
-from scripts.herdr.test_worker_panes import PaneWorld
+from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
@@ -219,7 +219,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual([event["status"] for event in events if event["event_type"] == "phase_finished"],
                          ["completed", "completed"])
         self.assertEqual(sum(event["event_type"] == "run_started" for event in events), 1)
-        self.assertEqual(state["status"], "active")
+        self.assertNotIn("status", state)
         self.assertIn("The work is complete.", second_reply.read_text())
         instance = design.roles[1]
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
@@ -244,8 +244,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(len(self.panes.world.launches), 2)
         with stop_once(design_roles, "_recorder_command", when="before"), self.assertRaises(InjectedStop):
             _ = design_roles.end(design.placement.design_id + "/reviewer")
-        self.assertEqual(worker_lifecycle.read_worker_state(directory / "progress_history_state.json")["status"],
-                         "active")
+        self.assertNotIn("status", worker_lifecycle.read_worker_state(directory / "progress_history_state.json"))
         ended = design_roles.end(design.placement.design_id + "/reviewer")
         self.assertIsInstance(ended.roles[1].lifecycle, design_roles.RoleEnded)
         self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
@@ -270,7 +269,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(self.panes.command_case.agent.submitted, [])
         self.assertEqual(recorder_state.read_open_phase_ids(directory), [])
         state = worker_lifecycle.read_worker_state(directory / "progress_history_state.json")
-        self.assertEqual(state["status"], "active")
+        self.assertNotIn("status", state)
         history = Path(cast(str, state["history_file"]))
         events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([event["status"] for event in events if event["event_type"] == "phase_finished"], ["error"])
@@ -573,6 +572,8 @@ class DurableRolesTests(HeldRolePaneCase):
     def assign_command(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         result = self.panes.assign(arguments)
         if "--new-worker" in arguments and result.returncode == 0:
+            for row in staff.snapshot().find(kind="worker", parent=self.panes.command_case.fixture.parent.id):
+                idle_transcript(row)
             if self.lose_creation_ack:
                 self.lose_creation_ack = False
                 raise TimeoutError("creation acknowledgement lost")

@@ -6,12 +6,10 @@ Show whether build changes reduce Hana phase time and recorded build costs.
 Phase time remains the score.
 The user approved this view on 2026-11-03 with “go”.
 
-`buildlog charts` writes a standalone page, publishes it with `review_link.py`, and prints the tailnet link.
-The default window covers seven days; `--days 30` selects thirty days.
-The page uses `~/.cache/buildlog/charts/latest.html`.
-The command prints the link and no file path. A failed publish prints one stderr line and exits non-zero.
-A browser opens only with a local display and no ssh session. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` keep the browser closed.
-The page needs no server, network request, or external library.
+The charts live on the shared build page.
+`/build:page` prints its link.
+`charts.page_data` supplies the charts and ranked costs from one index snapshot.
+The page offers seven-day and thirty-day windows.
 `/build:report` remains retired. `buildlog report` remains available.
 
 ## Three charts
@@ -80,7 +78,7 @@ Long labels retain their full text in legends, tooltips, and tables.
 
 Window, machine, cause, unit, and theme controls share one row above the charts.
 The row wraps on narrow screens.
-The window control names the command for another window; it does not change the recorded data.
+The window control selects the displayed window without changing the recorded data.
 Each chart has a shared date crosshair and a tooltip containing every series at that date.
 The whole plot accepts pointer input; the reader need not hit a marker.
 Keyboard focus shows the same tooltip. Arrow keys select adjacent dates.
@@ -111,7 +109,7 @@ Partial buckets show thin. Today's bucket never includes future hours.
 5. Sweep candidate waits, Mac executions, holds, and source coverage continuously.
 6. Assign event costs to buckets and split interval spans at bucket edges.
 
-`buildlog costs` and `buildlog charts` use the same cost reader and definitions.
+`charts.page_data` uses the shared cost reader and definitions.
 The reader reuses the outcome, previous-run, passed-tree, cold-build, candidate, and machine rules.
 No chart runs a separate daily SQL query.
 
@@ -238,7 +236,7 @@ No timer, background collector, or persistent series cache is required.
 
 ## Approved decisions
 
-1. Use a standalone page that opens in the default browser.
+1. Show the charts on the shared build page.
 2. Use daily buckets with a seven-day default and a thirty-day option.
 3. Keep start-based costs beside interval-based Mac idle.
 4. Use the validated palette, shared controls, table views, and Auto theme selection.

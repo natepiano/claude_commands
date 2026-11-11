@@ -1,5 +1,20 @@
 # Unit progress history
 
+Staff records a unit's open run through `OpenRun(path)` or `NoRun`.
+`unit_runs.run_is_open(folder)` checks the owner's staff pointer for unit run folders.
+Hooks and displays use the local staff record by default.
+Lifecycle commands supply a record from `staff.initial_snapshot()`.
+`unit_runs.is_unit_run(folder)` tests whether the folder is under a root from `run_roots()`.
+Run state has no `status` while the run is open.
+After closure, `status` records `completed`, `error`, `stopped`, `interrupted`, or `ended`, with `finished_at`.
+Every folder outside those roots is a helper run with no staff pointer.
+Their state has no outcome while their run is open.
+History events retain outcomes and durations.
+Readers select the current unit run from staff.
+`start-phase` reopens a closed run or a run whose state still has an outcome.
+It removes `status` and `finished_at`, records `reopened`, and writes the state before it claims the staff pointer.
+
+
 Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
 remain only for the pending archive cleanup; they do not dispatch new reviews.

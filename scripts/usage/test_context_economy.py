@@ -135,7 +135,8 @@ class ContextEconomyTests(unittest.TestCase):
             + "files = commands/unit/direct.md\n"
             + f"# whole: 1..\nmin_requests = {min_requests}\n"
             + f"# whole: 1..\nactive_gap_seconds = {active_gap_seconds}\n"
-            + "# whole: 1..\nhourly_recent_hours = 1\n# whole: 1..\nhourly_baseline_days = 1\n", encoding="utf-8")
+            + "# whole: 1..\nhourly_recent_hours = 1\n# whole: 1..\nhourly_baseline_days = 1\n"
+            + "# whole: 1..\ncache_max_megabytes = 512\n# whole: 1..\nprogress_seconds = 1\n", encoding="utf-8")
 
     def report(self, sessions: list[Session], timeline: list[SettingsSet], *, by: Literal["settings", "week"] = "settings",
                role: str = "") -> economy.Report:

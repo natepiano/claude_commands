@@ -59,7 +59,7 @@ Every command checks holds through `target_state`. The sole holder may run its o
 | `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `; a held or running part whose holder session resolves adds ` (showrunner <name>, unit <name>)` after `since <HH:MM>`, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
 | `eligible --repo-root <p> --package <n> [--local <why>] [--kind <kind>] [--target <name>]` | Each target row has five tab-separated fields: name, eligibility, reason, settings path and platform. Eligibility is `eligible` or `excluded`. An eligible target has reason `-`. An SSH target has its settings path and platform (`macos` or `linux`). A local target has `-` for settings and platform. Errors print `build targets: <error>` and exit 2. |
 | `register-local --call-id <id> --pid <pid>` | A nonblocking hold check for routing. Stores no call record. |
-| `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force; release events wake it at once, with 15 s polling as a fallback. Prints the holder once and the 2 h notice once. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
+| `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force. Release events wake it at once; polling checks every 15 s as a fallback. Prints the holder once and the 2 h notice once. An unmatched run adds `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.` Without a session, it adds `<speaker>: build has no session; waits on <holder> hold for <purpose>.` It prints this line once and sends the same line to the holder once. `hold_sender_timeout_seconds` limits the send to 30 seconds by default. A failed send prints `<speaker>: could not tell <holder>: <reason>` and the wait continues. A timeout reason names the limit in seconds. Invalid sender bytes use replacement characters. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
 | `check-local [--caller <name>]` | A nonblocking hold check. Without a caller, records a refused launch session for its release notice. |
 | `interrupt-local --call-id <id> [--signal INT\|TERM]` | Signals a running `wait-local` for that call, checked by pid and process-start identity. |
 
@@ -88,11 +88,14 @@ Without a matching row, `target_platform` returns no answer and status 1.
 
 ### Hold checks and release
 
-- `owning_session() -> OwningSession(session_id) | NoOwningSession` reads the staff row whose `run` matches the call's run folder.
-  It uses `UNIT_RUN_DIR`, then `UNIT_SESSION_DIR`, with exact path text.
-  The matching row supplies `current_session`.
-  Without a match, it uses `CLAUDE_CODE_SESSION_ID`.
-  Without either session, it returns `NoOwningSession`.
+- `run_resolution(environment) -> RunOwner(session_id) | NoRunNamed | RunNotInStaff(run: Path)` reads the staff row whose open run matches the call's run folder.
+  It checks `UNIT_RUN_DIR`, `PLAN_DELEGATE_BOARD_DIR`, `UNIT_SESSION_DIR`, and `PLAN_DELEGATE_SESSION_DIR` in that order, with exact path text.
+  A matching row with `current_session` returns `RunOwner`.
+  No run variable returns `NoRunNamed`.
+  An unmatched run or an unreadable staff snapshot returns `RunNotInStaff`.
+  `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
+  A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
+  Without either session, `owning_session` returns `NoOwningSession`.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
 - After the last holder file is gone, each recipient gets one release notice. No answer or allocation is awaited. The result names failed or unconfirmed deliveries: `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
@@ -204,7 +207,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:queue bump <selector>`, `clear`, `admit-head <why>` | `build_queue.py` | Changes unit priority or permits the head to exceed the budget when free memory permits. Use `/build:page` for the queue view. The unit-board pane retains its `--json` view and selected cards. Plain view requests exit 3 and name `/build:page`. |
-| Build page | `buildlog charts [--days 7\|30] [--no-open]` | Prints the shared build page link, the same link as `/build:page`. Use the `buildlog` CLI for detailed records. |
+| `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
 Each command shows its script's output unchanged; each script answers in about a second. There are no stubs at the old names `/builds`, `/build_hold` or `/mac_test`.

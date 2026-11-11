@@ -662,7 +662,7 @@ class RosterTests(unittest.TestCase):
     def test_stopped_run_uses_the_display_staff_record(self) -> None:
         owner = unit_membership("alpha", "unit-one")
         write_text_atomic(self.director_run / unit_runs.STATE_FILE, json.dumps({
-            unit_runs.OWNER_FIELD: owner.id, "status": "active",
+            unit_runs.OWNER_FIELD: owner.id,
         }))
         (self.sessions / "director.json").unlink()
         (self.director_run / "heartbeat.log").touch()

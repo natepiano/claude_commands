@@ -589,7 +589,7 @@ def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
     return row.role.value if isinstance(row.role, staff.KnownWorkerRole) else WorkerRoleUnavailable("dispatch role is unavailable")
 
 
-def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kept:
+def _transcript_messages(row: staff.StaffRow) -> list[str] | Kept:
     try:
         backend = staff.backend(row)
         if isinstance(backend, staff.BackendUnavailable):
@@ -598,14 +598,29 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
         entries = list(worker_admission.transcript_entries(source, set()))
         if any(isinstance(entry, worker_admission.TornTranscriptRecord) for entry in entries):
             return Kept("worker transcript has incomplete records")
-        messages = [entry for entry in entries if isinstance(entry, str) and entry]
-        if (not isinstance(dispatch, str) or not dispatch or not messages
-                or not messages[-1].startswith("assistant:\n")
-                or not any(worker_admission.reply_ends_dispatch(messages[-1], identity)
-                           for identity in (dispatch, stage_two_completion_id(dispatch)))):
-            return Kept("last turn does not end with the dispatch DONE line")
+        return [entry for entry in entries if isinstance(entry, str) and entry]
     except (OSError, ValueError) as error:
         return Kept(f"completion evidence is unavailable: {error}")
+
+
+def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kept:
+    messages = _transcript_messages(row)
+    if isinstance(messages, Kept):
+        return messages
+    if (not isinstance(dispatch, str) or not dispatch or not messages
+            or not messages[-1].startswith("assistant:\n")
+            or not any(worker_admission.reply_ends_dispatch(messages[-1], identity)
+                       for identity in (dispatch, stage_two_completion_id(dispatch)))):
+        return Kept("last turn does not end with the dispatch DONE line")
+    return CloseAllowed()
+
+
+def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
+    messages = _transcript_messages(row)
+    if isinstance(messages, Kept):
+        return messages
+    if not messages or not messages[-1].startswith("assistant:\n"):
+        return Kept("last turn does not end with an assistant reply")
     return CloseAllowed()
 
 
@@ -628,19 +643,30 @@ class ReleasedWorkerPass(Enum):
 WorkerDispatchState = DispatchHoldsWorker | CompletedWorkerPass | ReleasedWorkerPass
 
 
+def check_worker_lock(row: staff.StaffRow,
+                      lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+    """Check the worker lock without creating a file."""
+    if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
+        path = _worker_lock_path(row.id)
+        try:
+            with path.open("r") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return Kept("dispatch lock is held")
+        except FileNotFoundError:
+            pass
+    return CloseAllowed()
+
+
 def worker_dispatch_state(row: staff.StaffRow, run: Path,
                           lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> WorkerDispatchState:
     """Classify the pass through its status, worker lock, submission, and detached runs."""
     from scripts.direct import progress_history
 
-    if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
-        path = _worker_lock_path(row.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return DispatchHoldsWorker("dispatch lock is held")
+    locked = check_worker_lock(row, lock)
+    if isinstance(locked, Kept):
+        return DispatchHoldsWorker(locked.blocker)
     live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
     if live_runs(run / "detached_runs", row.name):
         return DispatchHoldsWorker("a detached run is live")
@@ -700,14 +726,26 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     directory = run.directory if isinstance(run, DispatchRun) else worker_run(worker.row, record=record)
     if isinstance(worker, (StoppedWorker, ClosedWorker)):
         return _idle_checks(worker.row, directory, lock)
-    if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-        return Kept(f"agent state is {worker.status.value}")
     state = worker_dispatch_state(worker.row, directory, lock)
     if isinstance(state, DispatchHoldsWorker):
         return Kept(state.blocker)
     if isinstance(state, CompletedWorkerPass):
-        return _completed_turn(worker.row, state.dispatch_id)
-    return CloseAllowed()
+        completion = _completed_turn(worker.row, state.dispatch_id)
+    elif state is ReleasedWorkerPass.ENDED:
+        from scripts.direct import progress_history
+
+        passed = worker_pass(worker.row, directory)
+        hook = progress_history.hook_completion(passed)
+        if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "done":
+            completion = _completed_turn(worker.row, passed.get("instance_id"))
+        else:
+            return _final_reply(worker.row)
+    else:
+        return _final_reply(worker.row)
+    if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+        if isinstance(completion, Kept):
+            return Kept(f"agent state is {worker.status.value}")
+    return completion
 
 
 def launch_policy(role: WorkerRole) -> LaunchPolicy:
@@ -1240,14 +1278,20 @@ def close(parent: StaffId, name: WorkerName, *,
             _layout(parent, _evidence(parent, record, client))
             return Closed()
         with staff.row_operation(str(row.id)):
-            panes = [dict(pane) for pane in client.panes()]
-            read = PaneRead(panes, client.scan_row_panes(record, panes), {})
+            read = _read_panes(record, client)
+            if isinstance(read, PaneReadUnavailable):
+                return _uncertain(row, read.reason)
             evidence = _parent_evidence(parent, record, read,
                                         selection=SelectedWorkers(frozenset({name.value})))
             observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
             if isinstance(observed, UncertainWorker):
                 return observed
-            if isinstance(observed, (OpenWorker, StoppedWorker, ProcessUnknownWorker)):
+            if isinstance(observed, ProcessUnknownWorker):
+                return _uncertain(row, observed.reason)
+            if isinstance(observed, (OpenWorker, StoppedWorker)):
+                permission = can_close(observed, lock=held)
+                if isinstance(permission, Kept):
+                    return permission
                 if not client.close_terminal_pane(observed.pane, observed.terminal):
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)

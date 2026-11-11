@@ -39,6 +39,41 @@ from scripts.direct import progress_history
 from scripts.agents import detached_run_process
 
 
+def final_reply(row: staff.StaffRow, message: str = "The conversation is complete.") -> None:
+    """Give an idle worker its final transcript reply."""
+    backend = staff.backend(row)
+    assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
+    source = worker_admission.transcript_source(row, backend)
+    entry = ({"type": "event_msg", "payload": {"type": "agent_message", "message": message}}
+             if isinstance(backend, staff.CodexBackend) else
+             {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": message}]}})
+    write_text_atomic(source, json.dumps(entry) + "\n")
+
+
+def idle_transcript(row: staff.StaffRow) -> None:
+    """Add a final reply when the idle fixture has no conversation yet."""
+    backend = staff.backend(row)
+    if isinstance(backend, staff.BackendUnavailable):
+        return
+    source = worker_admission.transcript_source(row, backend)
+    if not any(worker_admission.transcript_entries(source, set())):
+        final_reply(row)
+
+
+@contextmanager
+def live_detached_run(run: Path, row: staff.StaffRow) -> Generator[None]:
+    """Keep one scratch run live through its real supervisor evidence."""
+    path = run / "detached_runs" / (row.name + ".json")
+    with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                          stdin=subprocess.PIPE, text=True) as supervisor:
+        write_text_atomic(path, json.dumps({"worker": row.name, "staff_id": row.id,
+                                           "status": "running", "pid": supervisor.pid}))
+        try:
+            yield
+        finally:
+            _ = supervisor.communicate()
+
+
 @final
 class PaneWorld(herdr.Herdr):
     """A private pane server supplies process facts to the real shared scan."""
@@ -473,6 +508,7 @@ class WorkerPaneTests(StaffTestCase):
         current = staff.native_id(fixture_runtime_id("current-" + name))
         result = staff.update_current_session(row.current_session, current)
         fixture_session(current, backend)
+        final_reply(result)
         return result
 
     def observation(self, row: staff.StaffRow) -> worker_panes.WorkerPane:
@@ -516,7 +552,10 @@ class WorkerPaneTests(StaffTestCase):
 
     def start(self, name: str = "impl2", role: staff.WorkerRole | worker_panes.WorkerRoleUnavailable = "impl",
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount | accounts.AccountSelection = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
-        return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
+        result = worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
+        if isinstance(result, worker_panes.OpenWorker):
+            idle_transcript(result.row)
+        return result
 
     def test_new_worker_admission_completes_the_started_pane_home(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
@@ -665,6 +704,21 @@ class WorkerPaneTests(StaffTestCase):
                         runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
                 prompt.assert_not_called()
 
+        for live in (True, False):
+            with self.subTest(cause="idle worker has no active dispatch", live=live):
+                idle = self.worker("idle-restore-" + str(live))
+                pane = "w1:p-idle-" + str(live)
+                self.world.add(idle, pane, live=live)
+                launches = list(self.world.launches)
+                with patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt:
+                    self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(), only=frozenset({idle.id}),
+                        runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
+                prompt.assert_not_called()
+                self.assertNotIn(pane, self.world.locations)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
+                self.assertEqual(self.world.launches, launches)
+                self.assertEqual(staff.by_id(idle.id), idle)
+
     def test_restore_checks_the_transcript_before_offering_an_unsubmitted_assignment(self) -> None:
         from scripts.production import worker
         _row, _source, dispatch = self.resume_fixture()
@@ -737,14 +791,7 @@ class WorkerPaneTests(StaffTestCase):
         self.reply_to_dispatch(row, "dispatch-" + row.name)
 
     def reply_to_dispatch(self, row: staff.StaffRow, dispatch_id: str) -> None:
-        backend = staff.backend(row)
-        assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
-        source = worker_admission.transcript_source(row, backend)
-        message = "The task is complete.\nDONE " + dispatch_id
-        entry = ({"type": "event_msg", "payload": {"type": "agent_message", "message": message}}
-                 if isinstance(backend, staff.CodexBackend) else
-                 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": message}]}})
-        write_text_atomic(source, json.dumps(entry) + "\n")
+        final_reply(row, "The task is complete.\nDONE " + dispatch_id)
 
     def record_command(self, *arguments: str, at: int) -> None:
         with (patch.dict(os.environ, {"UNIT_PASS_OWNER": "launcher", "UNIT_TEAM_ROLE": "impl",
@@ -823,7 +870,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_close_waits_for_the_worker_lock_and_closes_without_quit(self) -> None:
         row = self.worker(family="codex")
         self.world.add(row, "w1:p1", family="codex")
-        self.world.locations["w1:p1"]["agent_status"] = "working"
+        self.world.locations["w1:p1"]["agent_status"] = "idle"
         attempted = Event()
         worker_lock = worker_panes.worker_lock
 
@@ -939,7 +986,8 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
         write_text_atomic(worker_admission.transcript_source(row, backend), "")
         progress_history.save_hook_completion(directory, "dispatch-" + row.name, progress_history.HookCompletion("done", ""))
-        self.assertIsInstance(worker_panes.can_close(observed, run=worker_panes.DispatchRun(directory)), worker_panes.CloseAllowed)
+        self.assertEqual(worker_panes.can_close(observed, run=worker_panes.DispatchRun(directory)),
+                         worker_panes.Kept("last turn does not end with the dispatch DONE line"))
 
     def test_a_showrunner_workers_completed_pass_allows_closure(self) -> None:
         self.parent_id = fixture_member("showrunner", name="close-owner").id
@@ -1051,10 +1099,28 @@ class WorkerPaneTests(StaffTestCase):
         transcript = source.read_text()
         observed = self.observation(row)
         assert isinstance(observed, worker_panes.OpenWorker)
-        for suffix in ("", "."):
-            with self.subTest(suffix=suffix):
-                write_text_atomic(source, transcript.replace(f"DONE dispatch-{row.name}", f"DONE dispatch-{row.name}-2{suffix}"))
-                self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+        cases = (("", False, herdr.AgentStatus.IDLE, False), (".", False, herdr.AgentStatus.IDLE, False),
+                 ("", True, herdr.AgentStatus.WORKING, False), ("", True, herdr.AgentStatus.IDLE, False),
+                 ("", False, herdr.AgentStatus.IDLE, True), ("", True, herdr.AgentStatus.IDLE, True),
+                 ("", True, herdr.AgentStatus.WORKING, True))
+        for suffix, user_after, status, hook_done in cases:
+            with self.subTest(suffix=suffix, user_after=user_after, status=status, hook_done=hook_done):
+                self.dispatch(row, "review", completed=True)
+                if hook_done:
+                    progress_history.save_hook_completion(self.root / "run", "dispatch-" + row.name,
+                                                          progress_history.HookCompletion("done", ""))
+                content = transcript.replace(f"DONE dispatch-{row.name}", f"DONE dispatch-{row.name}-2{suffix}")
+                if user_after:
+                    content += json.dumps({"type": "event_msg", "payload": {
+                        "type": "user_message", "message": "The run result needs another turn."}}) + "\n"
+                write_text_atomic(source, content)
+                state = replace(observed, status=status)
+                if user_after:
+                    reason = ("agent state is working" if status is herdr.AgentStatus.WORKING
+                              else "last turn does not end with the dispatch DONE line")
+                    self.assertEqual(worker_panes.can_close(state), worker_panes.Kept(reason))
+                else:
+                    self.assertIsInstance(worker_panes.can_close(state), worker_panes.CloseAllowed)
                 self.assertEqual(self.world.closed, [])
 
     def test_close_holder_keeps_the_fixed_id_locked_until_row_retirement(self) -> None:
@@ -1658,6 +1724,27 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertNotIn(pane, self.world.locations)
                 self.assertNotIn(pane, self.world.foreground)
 
+        for status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.WORKING):
+            with self.subTest(status=status, cause="input after the final reply"):
+                row = self.worker("no-pass-" + status.value)
+                pane = "w1:no-pass-" + status.value
+                self.world.add(row, pane)
+                observed = self.observation(row)
+                assert isinstance(observed, worker_panes.OpenWorker)
+                observed = replace(observed, status=status)
+                self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+                backend = staff.backend(row)
+                assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+                source = worker_admission.transcript_source(row, backend)
+                with source.open("a") as stream:
+                    _ = stream.write(json.dumps({"type": "user", "message": {
+                        "role": "user", "content": "The next task needs a reply."}}) + "\n")
+                self.assertEqual(worker_panes.can_close(observed),
+                                 worker_panes.Kept("last turn does not end with an assistant reply"))
+                source.unlink()
+                self.assertIsInstance(worker_panes.can_close(observed), worker_panes.Kept)
+                self.assertIn(pane, self.world.locations)
+
     def test_stale_active_pass_allows_close_without_rewriting_the_pass(self) -> None:
         opened = self.start()
         assert isinstance(opened, worker_panes.OpenWorker)
@@ -1749,14 +1836,21 @@ class WorkerPaneTests(StaffTestCase):
             finally:
                 _ = launcher.communicate("release")
 
-    def test_close_ignores_a_live_detached_run(self) -> None:
-        opened = self.start()
-        assert isinstance(opened, worker_panes.OpenWorker)
-        self.dispatch(opened.row, "impl")
-        with patch("scripts.agents.detached_runs.live_runs", return_value=[object()]):
-            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
-            self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name)), worker_panes.Closed)
-        self.assertEqual(self.world.closed, [(opened.pane, opened.terminal)])
+    def test_close_keeps_a_worker_with_a_live_detached_run(self) -> None:
+        for live in (True, False):
+            with self.subTest(live=live):
+                row = self.worker("live" if live else "stopped")
+                pane = "w1:p-" + row.name
+                self.world.add(row, pane, live=live)
+                self.completed_dispatch(row, "impl")
+                observed = self.observation(row)
+                assert isinstance(observed, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
+                with live_detached_run(self.root / "run", row):
+                    self.assertEqual(worker_panes.can_close(observed), worker_panes.Kept("a detached run is live"))
+                    self.assertEqual(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)),
+                                     worker_panes.Kept("a detached run is live"))
+                self.assertEqual(self.world.closed, [])
+                self.assertIn(pane, self.world.locations)
 
     def test_worker_name_does_not_select_the_dispatch_role(self) -> None:
         result = self.start("impl2", "review")
@@ -1852,6 +1946,11 @@ class WorkerPaneTests(StaffTestCase):
                                                           progress_history.NO_COMPLETION_ACTIONS))
                 else:
                     self.completed_dispatch(row, "impl")
+                if status == "working":
+                    source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+                    with source.open("a") as stream:
+                        _ = stream.write(json.dumps({"type": "user", "message": {
+                            "role": "user", "content": "Continue the task."}}) + "\n")
                 source_run = self.root / "run"
                 if earlier:
                     source_run = self.worker_run("z-source", "unit", self.parent.current_session,
@@ -2413,6 +2512,7 @@ class WorkerPaneTests(StaffTestCase):
         row = self.worker()
         self.world.add(row, "w1:p1")
         self.world.locations["w1:p1"]["agent_status"] = "working"
+        self.completed_dispatch(row, "impl")
         before = self.staff_state()
         with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
             code, _, errors = self.command("close", row.name)
@@ -2637,9 +2737,10 @@ class WorkerPaneTests(StaffTestCase):
         run = self.run_state()
         for family in ("codex", "claude"):
             _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
-            for live, busy in ((False, False), (True, False), (True, True)):
-                with self.subTest(family=family, live=live, busy=busy):
-                    name = f"move-{family}-{live}-{busy}"
+            for live, busy, passed in ((False, False, "none"), (True, False, "none"), (True, True, "none"),
+                                       (True, False, "stale active"), (True, False, "completed")):
+                with self.subTest(family=family, live=live, busy=busy, passed=passed):
+                    name = f"move-{family}-{live}-{busy}-{passed.replace(' ', '-')}"
                     if live:
                         opened = self.start(name)
                         assert isinstance(opened, worker_panes.OpenWorker)
@@ -2653,6 +2754,14 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertEqual(row.role, staff.KnownWorkerRole("impl"))
                     if busy:
                         self.world.locations[pane]["agent_status"] = "working"
+                    if passed == "stale active":
+                        self.dispatch(row, "impl")
+                        path = run / "progress_history_state.json"
+                        state = cast(dict[str, object], json.loads(path.read_text()))
+                        cast(dict[str, dict[str, object]], state["pass"])[name]["launcher_command"] = ["assign.sh"]
+                        write_text_atomic(path, json.dumps(state))
+                    elif passed == "completed":
+                        self.completed_dispatch(row, "impl")
                     target = self.root / (family + "2")
                     move = pane_moves.WorkerMove(row, self.parent.id, family, family + "2", "", run, self.world)
                     common = moves.MoveCommon(at="2026-11-09T00:00:00+00:00", tool=family,
@@ -2673,6 +2782,9 @@ class WorkerPaneTests(StaffTestCase):
                           patch.object(worker_panes, "close", wraps=worker_panes.close) as close,
                           patch.object(self.world, "close_tab_confirmed", side_effect=AssertionError("no close check")),
                           patch.object(self.world, "pane_activity", side_effect=AssertionError("no activity check"))):
+                        if passed != "none":
+                            self.assertIsInstance(pane_moves.preview_worker(row, staff.snapshot(), family + "2", "", run),
+                                                  accounts.IdleWorkerPaneClose)
                         result = pane_moves.move_worker(row, staff.snapshot(), family + "2", "", run)
                     if busy:
                         self.assertIsInstance(result, stop_results.ClaudeUp)
@@ -2778,6 +2890,11 @@ class WorkerPaneTests(StaffTestCase):
         notes = errors.getvalue().splitlines()
         self.assertEqual(len(notes), 1, notes)
         self.assertIn("w1:p1", notes[0])
+        with redirect_stderr(io.StringIO()):
+            closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+        self.assertIsInstance(closed, worker_panes.UncertainWorker)
+        self.assertEqual(self.world.closed, [])
+        self.assertIn("w1:p1", self.world.locations)
 
     def test_unknown_foreign_pane_does_not_hide_a_proved_worker(self) -> None:
         known = self.worker("known")

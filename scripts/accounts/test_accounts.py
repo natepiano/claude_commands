@@ -7511,11 +7511,13 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def worker(self, name: str = "implementer", *, family: Literal["claude", "codex"] = "claude", live: bool = True) -> staff.StaffRow:
         from scripts.lib.test_models_registry import write_registry
+        from scripts.herdr.test_worker_panes import idle_transcript
 
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
         row = fixture_worker(name, self.owner.id, backend=staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / ".codex1"))
         pane = "w1:p" + str(len(self.world.locations))
         self.world.add(row, pane, family=family, live=live)
+        idle_transcript(row)
         return row
 
     def dispatch(self, row: staff.StaffRow, role: str = "impl", status: str = "active") -> None:
@@ -7526,6 +7528,22 @@ class PaneWorkerMoveTests(unittest.TestCase):
             "pass": {row.name: {"worker_name": row.name, "team_slot": row.name, "kind": role,
                                  "status": status, "started_at": time.time(), "instance_id": "dispatch-" + row.name,
                                  "launcher_command": ["assign.sh", "--to", row.name]}}}))
+        if status == "active":
+            from scripts.direct import progress_history
+            from scripts.production import worker_admission
+
+            instance = "dispatch-" + row.name
+            line = (f'Read the unchanged prompt file "{self.root / "prompt.md"}". '
+                    f"End your final reply with this line alone: DONE {instance}\n"
+                    "A reply that waits on a detached run is not final.")
+            progress_history.save_dispatch_delivery(self.run_dir, instance,
+                progress_history.DispatchDelivery(line, instance, str(self.root / "reply.md")))
+            backend = staff.backend(row)
+            assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+            entry = ({"type": "event_msg", "payload": {"type": "user_message", "message": line}}
+                     if isinstance(backend, staff.CodexBackend) else
+                     {"type": "user", "message": {"role": "user", "content": line}})
+            atomic_file.write_text_atomic(worker_admission.transcript_source(row, backend), json.dumps(entry) + "\n")
         if status == "completed":
             from scripts.production import worker_admission
 
@@ -7715,7 +7733,15 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.stop.assert_not_called()
 
     def test_worker_move_preview_lists_actions_and_refusals_and_counts_empty_rows(self) -> None:
+        from scripts.accounts import pane_moves
+        from scripts.lib.test_models_registry import write_registry
+        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.herdr import worker_panes
+
         opened = self.worker("open", family="codex")
+        kept = self.worker("kept", family="codex")
+        kept = staff.set_worker_role(kept.id, staff.KnownWorkerRole("impl"))
+        locked = self.worker("locked", family="codex")
         stopped = self.worker("stopped", family="codex", live=False)
         unknown = self.worker("unassigned", family="codex", live=False)
         closed = fixture_worker("closed", self.owner.id, backend=staff.CodexBackend(self.root / ".codex1"))
@@ -7726,13 +7752,21 @@ class PaneWorkerMoveTests(unittest.TestCase):
         record = staff.local_snapshot()
         record = replace(record, rows=tuple(replace(row, current_session=staff.StaffId(""))
                                            if row.id == empty.id else row for row in record.rows))
-        before = self.fixture.staff_state()
         role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture selection", datetime.now(timezone.utc).isoformat()))
-        with patch.object(staff, "local_snapshot", return_value=record):
+        with (patch.object(staff, "local_snapshot", return_value=record), live_detached_run(self.run_dir, kept),
+              worker_panes.worker_lock(self.owner.id, staff.WorkerName.parse(locked.name)) as hold):
+            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+            before = self.fixture.staff_state()
             result = accounts.move_workers("codex2", dry_run=True)
+            refused = pane_moves.move_worker(locked, record, "codex2", "quota", self.run_dir)
+            self.assertEqual(refused, accounts.SessionMoveRefused(locked.id, "dispatch lock is held"))
+            self.assertEqual(self.fixture.staff_state(), before)
         assert isinstance(result, accounts.GroupMoveDryRun)
         self.assertEqual(sorted(result.lines), sorted((
             f"{opened.name} ({opened.id}): would close its idle pane; the next assign resumes it on codex2",
+            f"{kept.name} ({kept.id}): kept open: a detached run is live; "
+            + "would stop and resume the same conversation on codex2 in its worker pane",
+            f"{locked.name} ({locked.id}): not moved: dispatch lock is held",
             f"{stopped.name} ({stopped.id}): would close its idle pane; the next assign resumes it on codex2",
             f"{unknown.name} ({unknown.id}): would close its idle pane; the next assign resumes it on codex2",
             "2 workers: nothing to move",
@@ -7743,6 +7777,15 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(self.world.stops, [])
         self.assertEqual(self.world.launches, [])
         self.assertEqual(self.world.requests, [])
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "codex"}}, update=True)
+        pane = next(pane for pane, process in self.world.foreground.items()
+                    if self.world.processes[process[0]].current_identity == kept.current_session)
+        with live_detached_run(self.run_dir, kept):
+            moved = pane_moves.move_worker(kept, record, "codex2", "quota", self.run_dir)
+        self.assertIsInstance(moved, stop_results.ClaudeUp)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.launches, [herdr.ExistingPane(pane, "terminal-" + pane)])
+        self.assertEqual(self.world.stops, [kept.current_session])
 
     def test_move_workers_catches_the_worker_panes_herdr_failure(self) -> None:
         from scripts.herdr import worker_panes
@@ -7858,9 +7901,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         from scripts.direct import progress_history
 
         row = self.worker()
-        _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
-        with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
-              patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatch("saved-pass", ("assign.sh",)))):
+        self.dispatch(row)
+        with patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()):
             result = self.move("claude2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.world.requests[-1][2]["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))

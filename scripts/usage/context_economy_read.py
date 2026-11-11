@@ -1,4 +1,4 @@
-"""Read context events and tracked settings without writing state."""
+"""Read cached context events and tracked settings without changing transcripts."""
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -15,10 +15,16 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import sys
+import threading
 from typing import Literal, cast
 
 from scripts.lib import conf
-from scripts.usage.rollouts import decode_rollout, is_compaction, parse_timestamp, timestamp_of, token_usage
+from scripts.usage.context_economy_cache import (
+    FileProgress, ParseCheckpoint, SummaryUnavailable, TranscriptCache,
+    TranscriptReadSettings, TranscriptSettingsSource, read_settings,
+)
+from scripts.usage.rollouts import complete_lines as complete_lines, decode_rollout, is_compaction, parse_timestamp, timestamp_of, token_usage
 
 
 _CLI_VERSION = re.compile(rb'"version"\s*:\s*"([^"\\]*)"')
@@ -91,6 +97,14 @@ class SettingsUnknown:
     """The timeline has no settings set at or before this start."""
 
 
+class ReportSettingsTimeline(list[SettingsSet]):
+    """Keep resolved start settings for one report's timeline."""
+
+    def __init__(self, entries: Sequence[SettingsSet]) -> None:
+        super().__init__(entries)
+        self.by_start: dict[datetime, SettingsSet | SettingsUnknown] = {}
+
+
 @dataclass(frozen=True)
 class MacSessions:
     sessions: list[Session]
@@ -157,13 +171,34 @@ def _compaction(record: dict[str, object], at: datetime) -> CompactionEvent:
         "precomputed" if values.get("precomputed") is True else "normal")
 
 
-def _read_transcript(path: Path, since: datetime, until: datetime, history: _SessionRecords) -> None:
-    previous_version = b""
-    with path.open("rb") as source:
-        for number, line in enumerate(source):
-            version_match = _CLI_VERSION.search(line)
+def _cached_session(checkpoint: ParseCheckpoint) -> tuple[dict[str, object], Session]:
+    state = _object(cast(object, json.loads(checkpoint.payload)))
+    empty = Session("", "claude", "", "", [], [], [])
+    session = _wire_session(_wire_object(state["session"])) if state else empty
+    return state, session
+
+
+def _read_transcript(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint:
+    state, session = _cached_session(checkpoint)
+    previous_version = _text(state.get("previous_version")).encode()
+    number = _count(state.get("lines"))
+    keys = [_wire_text(value) for value in _wire_list(state.get("start_keys", []))]
+    starts = dict(zip(keys, session.starts))
+    request_keys = _wire_list(state.get("request_keys", []))
+    completed = checkpoint.offset
+    first = session.first_record_at
+    with path.open("rb", buffering=1024 * 1024) as source:
+        completed = source.seek(checkpoint.offset)
+        for offset, line in complete_lines(source):
+            position = number
+            number += 1
+            completed = offset + len(line)
+            version_position = line.find(b'"version"')
+            version_match = _CLI_VERSION.match(line, version_position) if version_position >= 0 else None
+            if version_position >= 0 and version_match is None:
+                version_match = _CLI_VERSION.search(line, version_position)
             version_changed = version_match is not None and version_match[1] != previous_version
-            first_timestamp = isinstance(history.first_record_at, SessionBeginningUnknown) and b'"timestamp"' in line
+            first_timestamp = isinstance(first, SessionBeginningUnknown) and b'"timestamp"' in line
             if not (first_timestamp or version_changed
                     or b'"usage"' in line and b'"assistant"' in line
                     or b'"compact_boundary"' in line
@@ -176,8 +211,8 @@ def _read_transcript(path: Path, since: datetime, until: datetime, history: _Ses
             at = parse_timestamp(record.get("timestamp"))
             if at is None:
                 continue
-            if isinstance(history.first_record_at, SessionBeginningUnknown):
-                history.first_record_at = at
+            if isinstance(first, SessionBeginningUnknown):
+                first = at
             version = _version(record)
             restart = bool(version and previous_version and version.encode() != previous_version)
             if version:
@@ -190,35 +225,53 @@ def _read_transcript(path: Path, since: datetime, until: datetime, history: _Ses
                 if (attachment.get("type") == "hook_success" and attachment.get("hookEvent") == "SessionStart"
                         and name in ("SessionStart:startup", "SessionStart:resume")):
                     source_name = "startup" if name == "SessionStart:startup" else "resume"
-                    hook = str(attachment.get("toolUseID", record.get("toolUseID", (path, number))))
-                    if hook not in history.starts:
-                        history.starts[hook] = Start(at, source_name, version)
+                    hook = str(attachment.get("toolUseID", record.get("toolUseID", (path, position))))
+                    if hook not in starts:
+                        starts[hook] = Start(at, source_name, version)
                         explicit_start = True
             if restart and not explicit_start:
-                history.starts[f"version:{path}:{number}"] = Start(at, "resume", version)
-            if not since <= at < until:
-                continue
+                starts[f"version:{path}:{position}"] = Start(at, "resume", version)
             message = _object(record.get("message"))
             if (kind == "assistant" and message.get("model") != "<synthetic>"
                     and isinstance(message.get("usage"), dict)):
-                key = (_text(message.get("id")), _text(record.get("requestId")))
-                history.requests[key] = _request(record, at)
+                request_keys.append([_text(message.get("id")), _text(record.get("requestId"))])
+                session.requests.append(_request(record, at))
             elif kind == "system" and record.get("subtype") == "compact_boundary":
-                history.compactions.append(_compaction(record, at))
+                session.compactions.append(_compaction(record, at))
+    saved = Session("", "claude", "", "", session.requests, session.compactions, list(starts.values()), first)
+    return ParseCheckpoint(completed, json.dumps({"session": _session_data(saved), "request_keys": request_keys,
+        "start_keys": list(starts), "previous_version": previous_version.decode(), "lines": number}, separators=(",", ":")))
 
 
-def read_claude(projects_root: Path, since: datetime, until: datetime, machine: str) -> list[Session]:
-    """Read main sessions and subagents whose files can contain events in the window."""
+def read_claude(projects_root: Path, since: datetime, until: datetime, machine: str, *,
+                settings: TranscriptReadSettings | TranscriptSettingsSource = TranscriptSettingsSource.LOCAL_CONFIG,
+                ) -> list[Session]:
+    """Read cached main sessions and subagents; apply the window after loading each summary."""
     since, until = _utc(since), _utc(until)
     histories: dict[tuple[str, str], _SessionRecords] = {}
-    paths = sorted({*projects_root.glob("*/*.jsonl"), *projects_root.glob("*/*/subagents/*.jsonl")})
-    for path in paths:
-        if path.stat().st_mtime < since.timestamp():
-            continue
-        session_id = path.parent.parent.name if path.parent.name == "subagents" else path.stem
-        agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else session_id
-        history = histories.setdefault((session_id, agent_id), _SessionRecords())
-        _read_transcript(path, since, until, history)
+    found = sorted({*projects_root.glob("*/*.jsonl"), *projects_root.glob("*/*/subagents/*.jsonl"),
+                    *projects_root.glob("*/*.jsonl.zst"), *projects_root.glob("*/*/subagents/*.jsonl.zst")})
+    settings = read_settings(settings)
+    with closing(TranscriptCache(settings)) as cache:
+        paths = cache.paths("claude", [projects_root], found, since.timestamp())
+        progress = FileProgress(machine, "claude", len(paths), settings)
+        for path in paths:
+            checkpoint = cache.read(path, "claude", _read_transcript)
+            progress.advance(skipped=isinstance(checkpoint, SummaryUnavailable))
+            if isinstance(checkpoint, SummaryUnavailable):
+                continue
+            state, parsed = _cached_session(checkpoint)
+            session_id = path.parent.parent.name if path.parent.name == "subagents" else path.stem
+            agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else session_id
+            history = histories.setdefault((session_id, agent_id), _SessionRecords())
+            if isinstance(history.first_record_at, SessionBeginningUnknown):
+                history.first_record_at = parsed.first_record_at
+            for key, request in zip(_wire_list(state["request_keys"]), parsed.requests):
+                pair = _wire_list(key)
+                if since <= request.at < until:
+                    history.requests[(_wire_text(pair[0]), _wire_text(pair[1]))] = request
+            history.compactions.extend(event for event in parsed.compactions if since <= event.at < until)
+            history.starts.update(zip((_wire_text(key) for key in _wire_list(state["start_keys"])), parsed.starts))
     sessions: list[Session] = []
     for (session_id, agent_id), history in histories.items():
         starts = sorted((start for start in history.starts.values() if start.at < until), key=lambda start: start.at)
@@ -231,17 +284,24 @@ def read_claude(projects_root: Path, since: datetime, until: datetime, machine: 
     return sessions
 
 
-def _read_codex_file(path: Path, since: datetime, until: datetime, machine: str) -> list[Session]:
-    identity, model = "", ""
-    version: str | None = None
-    first: datetime | SessionBeginningUnknown = SessionBeginningUnknown.UNRECORDED
-    requests: list[Request] = []
-    compactions: list[CompactionEvent] = []
-    starts: dict[datetime, Start] = {}
-    previous_total: dict[str, object] = {}
-    with path.open(encoding="utf-8") as stream:
-        for line in stream:
-            record = decode_rollout(line)
+def _read_codex_file(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint:
+    state, session = _cached_session(checkpoint)
+    identity, model = session.session_id, _text(state.get("model"))
+    version = _version(state)
+    first = session.first_record_at
+    requests, compactions = session.requests, session.compactions
+    starts = {start.at: start for start in session.starts}
+    previous_total = _object(state.get("previous_total"))
+    completed = checkpoint.offset
+    with path.open("rb", buffering=1024 * 1024) as stream:
+        completed = stream.seek(checkpoint.offset)
+        for offset, line in complete_lines(stream):
+            completed = offset + len(line)
+            if not isinstance(first, SessionBeginningUnknown) and not any(marker in line for marker in (
+                    b'"session_meta"', b'"turn_context"', b'"token_count"',
+                    b'"compacted"', b'"contextCompaction"', b'\\u')):
+                continue
+            record = decode_rollout(line.decode("utf-8"))
             if record is None:
                 continue
             payload = _object(cast(object, record.get("payload")))
@@ -264,29 +324,44 @@ def _read_codex_file(path: Path, since: datetime, until: datetime, machine: str)
                 repeated = bool(total) and total == previous_total
                 if total:
                     previous_total = total
-            if at is None or not since <= at < until:
+            if at is None:
                 continue
             if usage is not None and not repeated:
                 requests.append(Request(at, model, version, usage.uncached_input, usage.cached_input,
                                         0, 0, usage.output))
             if is_compaction(record):
                 compactions.append(CompactionEvent(at, None, SizeNotReported(), SizeNotReported(), "unknown"))
-    earlier = [start for start in starts.values() if start.at < since]
-    in_window = [start for start in starts.values() if since <= start.at < until]
-    retained = [*sorted(earlier, key=lambda start: start.at)[-1:], *sorted(in_window, key=lambda start: start.at)]
-    if not identity or not (requests or compactions or in_window):
-        return []
-    return [Session(machine, "codex", identity, identity, requests, compactions, retained, first)]
+    saved = Session("", "codex", identity, identity, requests, compactions, list(starts.values()), first)
+    return ParseCheckpoint(completed, json.dumps({"session": _session_data(saved), "model": model,
+        "version": version, "previous_total": previous_total}, separators=(",", ":")))
 
 
-def read_codex(sessions_roots: Sequence[Path], since: datetime, until: datetime, machine: str) -> list[Session]:
-    """Read each resolved rollout once, also when numbered homes link the same sessions."""
+def read_codex(sessions_roots: Sequence[Path], since: datetime, until: datetime, machine: str, *,
+               settings: TranscriptReadSettings | TranscriptSettingsSource = TranscriptSettingsSource.LOCAL_CONFIG,
+               ) -> list[Session]:
+    """Read each logical rollout once, including retained summaries without a source file."""
     since, until = _utc(since), _utc(until)
-    paths = sorted({path.resolve() for root in sessions_roots for path in root.rglob("*.jsonl")})
+    found = sorted({path.resolve() for root in sessions_roots
+                    for pattern in ("*.jsonl", "*.jsonl.zst") for path in root.rglob(pattern)})
     sessions: list[Session] = []
-    for path in paths:
-        if path.stat().st_mtime >= since.timestamp():
-            sessions.extend(_read_codex_file(path, since, until, machine))
+    settings = read_settings(settings)
+    with closing(TranscriptCache(settings)) as cache:
+        paths = cache.paths("codex", sessions_roots, found, since.timestamp())
+        progress = FileProgress(machine, "codex", len(paths), settings)
+        for path in paths:
+            checkpoint = cache.read(path, "codex", _read_codex_file)
+            progress.advance(skipped=isinstance(checkpoint, SummaryUnavailable))
+            if isinstance(checkpoint, SummaryUnavailable):
+                continue
+            parsed = _cached_session(checkpoint)[1]
+            requests = [request for request in parsed.requests if since <= request.at < until]
+            compactions = [event for event in parsed.compactions if since <= event.at < until]
+            earlier = [start for start in parsed.starts if start.at < since]
+            in_window = [start for start in parsed.starts if since <= start.at < until]
+            retained = [*sorted(earlier, key=lambda start: start.at)[-1:], *sorted(in_window, key=lambda start: start.at)]
+            if parsed.session_id and (requests or compactions or in_window):
+                sessions.append(Session(machine, "codex", parsed.session_id, parsed.agent_id,
+                                        requests, compactions, retained, parsed.first_record_at))
     return sessions
 
 
@@ -359,8 +434,14 @@ def settings_timeline(checkout: Path, since: datetime, until: datetime) -> list[
 
 def settings_for(session_start: datetime, timeline: Sequence[SettingsSet]) -> SettingsSet | SettingsUnknown:
     """Select the latest settings; later timeline entries win equal times."""
-    eligible = [entry for entry in timeline if entry.at <= _utc(session_start)]
-    return max(reversed(eligible), key=lambda entry: entry.at) if eligible else SettingsUnknown()
+    session_start = _utc(session_start)
+    if isinstance(timeline, ReportSettingsTimeline) and session_start in timeline.by_start:
+        return timeline.by_start[session_start]
+    eligible = [entry for entry in timeline if entry.at <= session_start]
+    resolved = max(reversed(eligible), key=lambda entry: entry.at) if eligible else SettingsUnknown()
+    if isinstance(timeline, ReportSettingsTimeline):
+        timeline.by_start[session_start] = resolved
+    return resolved
 
 
 def label(current: SettingsSet, previous: SettingsSet | SettingsUnknown) -> str:
@@ -527,8 +608,12 @@ def emit_mac(request: dict[str, object]) -> None:
     projects = _wire_text(request["projects_root"])
     checkout = _wire_text(request["checkout"])
     roots = [Path(_wire_text(value)) for value in _wire_list(request["codex_roots"])]
-    sessions = read_claude(Path(projects) if projects else Path.home() / ".claude/projects", since, until, "mac")
-    sessions.extend(read_codex(roots or sorted(Path.home().glob(".codex*/sessions")), since, until, "mac"))
+    settings = TranscriptReadSettings(_wire_count(request["cache_max_megabytes"]),
+                                      _wire_count(request["progress_seconds"]))
+    sessions = read_claude(Path(projects) if projects else Path.home() / ".claude/projects", since, until, "mac",
+                           settings=settings)
+    sessions.extend(read_codex(roots or sorted(Path.home().glob(".codex*/sessions")), since, until, "mac",
+                              settings=settings))
     timeline = settings_timeline(Path(checkout) if checkout else configured_checkout(), timeline_start(sessions, since), until)
     print(json.dumps({"type": "timeline", "entries": [
         {"at": entry.at.isoformat(), "commit": entry.commit, "values": entry.values} for entry in timeline]}), flush=True)
@@ -537,14 +622,17 @@ def emit_mac(request: dict[str, object]) -> None:
 
 
 def _mac_payload(since: datetime, until: datetime) -> str:
+    settings = read_settings()
     root = Path(__file__).resolve().parents[2]
     modules = {name: (root / path).read_text(encoding="utf-8") for name, path in (
         ("scripts.lib.conf_reads", "scripts/lib/conf_reads.py"),
         ("scripts.lib.conf", "scripts/lib/conf.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
+        ("scripts.usage.context_economy_cache", "scripts/usage/context_economy_cache.py"),
         ("scripts.usage.context_economy_read", "scripts/usage/context_economy_read.py"),
     )}
     return json.dumps({"modules": modules, "since": since.isoformat(), "until": until.isoformat(),
+        "cache_max_megabytes": settings.cache_max_megabytes, "progress_seconds": settings.progress_seconds,
         "projects_root": os.environ.get("CONTEXT_ECONOMY_MAC_PROJECTS_ROOT", ""),
         "codex_roots": _wire_list(cast(object, json.loads(os.environ.get("CONTEXT_ECONOMY_MAC_CODEX_ROOTS", "[]")))),
         "checkout": os.environ.get("CONTEXT_ECONOMY_MAC_CHECKOUT", "")})
@@ -562,12 +650,45 @@ def _mac_command() -> list[str]:
             shlex.join(("python3", "-c", program))]
 
 
+def _run_mac(command: list[str], payload: str) -> subprocess.CompletedProcess[str]:
+    """Forward remote progress while collecting only the result document."""
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=write_descriptor, text=True, encoding="utf-8")
+    except BaseException:
+        os.close(read_descriptor)
+        raise
+    finally:
+        os.close(write_descriptor)
+    errors: list[str] = []
+
+    def relay() -> None:
+        with os.fdopen(read_descriptor, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                errors.append(line)
+                print(line, end="", file=sys.stderr, flush=True)
+
+    forwarding = threading.Thread(target=relay)
+    forwarding.start()
+    try:
+        with process:
+            try:
+                output = process.communicate(payload,
+                    timeout=conf.read("context_economy").whole("mac_timeout_seconds"))[0]
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output = process.communicate()[0]
+                raise
+    finally:
+        forwarding.join()
+    return subprocess.CompletedProcess(command, process.returncode, output, "".join(errors))
+
+
 def read_mac(since: datetime, until: datetime) -> MacRead:
     """Use one remote process and return a failure without discarding local sessions."""
     try:
-        result = subprocess.run(_mac_command(), input=_mac_payload(since, until),
-                                capture_output=True, text=True, encoding="utf-8", check=False,
-                                timeout=conf.read("context_economy").whole("mac_timeout_seconds"))
+        result = _run_mac(_mac_command(), _mac_payload(since, until))
         if result.returncode:
             return MacReadFailed(result.stderr.strip() or f"remote reader exited {result.returncode}")
         return _mac_reply(result.stdout)
