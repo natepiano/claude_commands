@@ -553,6 +553,16 @@ Launch state, launch logs, and reservations retain the box region.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
 Status, termination, and expired-launch searches use that region.
 The controller searches every configured region for an expired reservation without a recorded region.
+After a valid final result, the controller books the box end at the result receipt time.
+It still requests termination and requires AWS to confirm termination before it books that time.
+A box without a valid final result uses the termination confirmation time.
+Reconciliation and the expiry sweep retain their existing end times.
+Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
+Each timestamp is a UTC epoch time from the box.
+Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
+It omits `instance_running_at` when the cache is absent or invalid.
+The current source checkout occurs after `nix_ready_at`, so results omit `source_ready_at`.
 All regions use one spend ledger and the existing caps.
 Gate costs use bill rates for the recorded region and UTC day.
 A day with its own completed bill keeps that day's rate when newer bills arrive.
