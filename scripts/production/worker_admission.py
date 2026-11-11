@@ -215,6 +215,13 @@ def transcript_source(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.
     return max(paths, key=lambda path: path.stat().st_mtime)
 
 
+def reply_ends_dispatch(reply: str, dispatch_id: str) -> bool:
+    """Accept a final DONE line with at most one period after the dispatch id."""
+    lines = reply.rstrip().splitlines()
+    marker = f"DONE {dispatch_id}"
+    return bool(lines and lines[-1] in (marker, marker + "."))
+
+
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
     if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
         return ""
@@ -222,6 +229,8 @@ def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
     if not isinstance(raw, dict):
         return ""
     message = cast(dict[str, object], raw)
+    if fields.get("type") == "response_item" and message.get("type") == "agent_message":
+        return ""
     role = message.get("role", fields.get("type"))
     if message.get("type") in ("user_message", "agent_message"):
         role = "user" if message["type"] == "user_message" else "assistant"
