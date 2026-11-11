@@ -19,6 +19,14 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.test_times import module_cost, task_cpu
 
 
+def install_runner(tree: Path) -> None:
+    source = Path(module_cost.__file__).resolve().parents[2]
+    for relative in ("scripts/test_times/module_run.py", "scripts/lib/package_root.py", "scripts/lib/descendants.py"):
+        destination = tree / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copyfile(source / relative, destination)
+
+
 class ModuleCostTests(unittest.TestCase):
     def test_groups_interpreter_commands_by_the_script_or_module(self) -> None:
         samples = [
@@ -46,6 +54,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
             }))
+            install_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_stop.py").write_text(
@@ -149,6 +158,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
             }))
+            install_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             modules = ["test_first.py", "test_second.py"]
@@ -183,6 +193,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
             }))
+            install_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_cpu.py").write_text(
@@ -211,6 +222,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
             }))
+            install_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             pids = tree / "pids"
@@ -247,6 +259,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
             }))
+            install_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             heavy = tree / "heavy.py"
@@ -264,6 +277,7 @@ class ModuleCostTests(unittest.TestCase):
                 "import subprocess, sys, unittest\n"
                 + "class Commands(unittest.TestCase):\n"
                 + "    def test_heavy(self):\n"
+                + f"        self.assertEqual(sys.modules['__main__'].__file__, {str(tree / 'scripts/test_times/module_run.py')!r})\n"
                 + f"        subprocess.run([sys.executable, {str(heavy)!r}], check=True)\n"
                 + "    def test_light(self):\n"
                 + f"        subprocess.run([sys.executable, {str(light)!r}], check=True)\n", encoding="utf-8")
@@ -287,6 +301,7 @@ class ModuleCostTests(unittest.TestCase):
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
             }))
+            install_runner(tree)
             folder = tree / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "test_children.py").write_text(

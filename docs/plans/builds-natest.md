@@ -2612,7 +2612,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Ruled out:** selecting a lister on a content change in its listed folder, because 288 modules list `config/` and the rule selected all of them for each config edit.
 
-### Phase 131 — A test that reads the files it finds in a folder runs when one of those files changes  · status: todo
+### Phase 131 — A test that reads the files it finds in a folder runs when one of those files changes  · status: done
 **Depends on:** Phase 130
 
 #### Work Order
