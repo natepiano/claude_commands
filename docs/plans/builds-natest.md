@@ -2935,7 +2935,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:** a removal can leave a helper in a shared `*_test_support.py` file with no user. List each module's support files under Files in a sweep phase.
 
-### Phase 148 — Three lint test modules keep only the tests that pay their way  · status: todo
+### Phase 148 — Three lint test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
 #### Work Order
