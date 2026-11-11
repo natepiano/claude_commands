@@ -1,6 +1,7 @@
 """Prove branch selection and deletion with scratch records and a bare origin."""
 from __future__ import annotations
 
+import html
 import json
 import os
 import shutil
@@ -100,6 +101,7 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
             ("TEST-keep", "unit", "natedev", "fixed"),
             ("TEST-rejected", "unit", "natedev", "fixed"),
             ("TEST-live", "unit", "natedev", "fixed"),
+            ("TEST-active<&", "unit", "natedev", "fixed"),
             ("TEST-production", "unit", "natedev", "fixed"),
             ("TEST-unmerged", "unit", "natedev", "fixed"),
             ("TEST-no-unit", "unit", "natedev", "none"),
@@ -122,6 +124,7 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
                 continue
             identity = staff.StaffId(str(uuid5(NAMESPACE_URL, str(root / name))))
             tree = (staff.PresentWorktree(machine, fixture.live_worktree) if name == "TEST-live"
+                    else staff.PresentWorktree(machine, root / "active") if name == "TEST-active<&"
                     else staff.RemovedWorktree(machine, foreign if evidence == "foreign-fallback"
                                               else repository if evidence in ("foreign", "owner-fallback") else root / "removed" / name))
             row = staff.StaffRow(identity, "showrunner" if kind == "showrunner" else "unit", name,
@@ -155,6 +158,7 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
         _ = fixture.command("commit", "-m", "Retain former unit rows")
         _ = fixture.staff_file.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}), encoding="utf-8")
         _ = fixture.command("worktree", "add", str(fixture.live_worktree), "TEST-live")
+        _ = fixture.command("worktree", "add", "-b", "TEST-current<&", str(root / "active"), "main")
         _ = fixture.command("push", "origin", "--all")
         with (patch.dict(os.environ, {"STAFF_FILE": str(fixture.staff_file), "UNIT_HISTORY_DIR": str(history),
                                       "REVIEW_LINKS_ROOT": str(root / "reviews"), "REVIEW_LINKS_HOST": "127.0.0.1"}),
@@ -195,7 +199,8 @@ class BranchPageTests(unittest.TestCase):
                     fixture.merges["TEST-merged"] = fixture.command("-C", str(clone), "rev-parse", "HEAD")
                     _ = fixture.command("-C", str(clone), "push", "origin", "main", "TEST-merged")
                 rows = fixture.rows()
-                expected = {"TEST-merged", "TEST-keep", "TEST-rejected", "TEST-legacy", "TEST-owner-fallback", "TEST-history-only"}
+                expected = {"TEST-merged", "TEST-keep", "TEST-rejected", "TEST-legacy", "TEST-owner-fallback",
+                            "TEST-history-only", "TEST-active<&"}
                 self.assertEqual({row.name for row in rows}, expected)
                 page = branch_page.BranchPage(fixture.repository, rows, "test-token")
                 form = BranchForm()
@@ -211,6 +216,14 @@ class BranchPageTests(unittest.TestCase):
                     self.assertEqual(row.merge_date, fixture.command("show", "-s", "--format=%cI", row.merge))
                     self.assertIn(row.merge[:12], content)
                     self.assertIn(row.merge_date, content)
+                    if row.name == "TEST-active<&":
+                        current_branch = fixture.command("-C", str(fixture.root / "active"), "branch", "--show-current")
+                        self.assertNotEqual(row.name, current_branch)
+                        self.assertEqual(row.unit_status, branch_page.ActiveUnitBranch(current_branch))
+                        self.assertIn(f"Unit: {html.escape(row.unit)} — active, now on branch {html.escape(current_branch)}", content)
+                    else:
+                        self.assertEqual(row.unit_status, branch_page.InactiveUnit())
+                        self.assertIn(f"Unit: {html.escape(row.unit)} — not active", content)
 
     def test_delete_reports_each_result_and_keeps_unchecked_branches(self) -> None:
         for state in ("unchanged", "advanced"):
@@ -256,8 +269,10 @@ class BranchPageTests(unittest.TestCase):
             _ = hook.write_text('#!/bin/sh\nif [ "$1" = refs/heads/TEST-rejected ]; then\n'
                                 + '  echo "TEST deletion refused" >&2\n  exit 1\nfi\n', encoding="utf-8")
             hook.chmod(0o755)
+            rows = fixture.rows()
             url = branch_page.publish(fixture.repository)
             root = fixture.root / "reviews"
+            self.assertEqual(branch_page.page_at(root, urlsplit(url).path).rows, rows)
             _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
             address = serve.tailscale_ip()
             with serve.ReviewLinksServer((address, 0), root) as server:
