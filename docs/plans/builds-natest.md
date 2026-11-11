@@ -2799,7 +2799,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The direct and production suites pass.
 - An aws paired trial, 3 rounds, over the named modules with the most recorder starts gives a summed paired median saving of at least 30 CPU s, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
 
-### Phase 139 — Find where the fast-track test module spends its CPU  · status: todo
+### Phase 139 — Find where the fast-track test module spends its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -2829,3 +2829,37 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Acceptance gate:**
 - The report at `phases/139/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
+
+**Result:** No change. Baseline 45.7 CPU s, 8,618 processes, 52 tests; Git commands use 13.9 CPU s in 7,703 starts, and repeated setup uses 1.0 CPU s. Direct fixture calls and retained immutable Git reads each measured slower alone (-2.6 and -4.9 CPU s); together they removed only 16 of 8,618 processes, so the 10.1 and 13.0 CPU s combined readings are host noise. The module is at its Git floor; devtools-unit owns the Git read path.
+
+### Phase 140 — Find where the style sync test module spends its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A measured report names where `style/test_style_sync.py` (median 47.7 CPU s, 70 tests) spends its CPU, and which changes save CPU with the same tests.
+
+**Decision:** Director, 2026-11-11: the next module in the descending sort, beside the Phase 139 research. Research first, as in Phases 137 and 139.
+
+**Spec:**
+1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
+2. Name each fixed cost: interpreter starts, imports, real sleeps or wait intervals, subprocess trees, repeated setup.
+3. Measure one local pair for each candidate change in a scratch copy, and one pair for the candidates together. A test that proves a process boundary keeps its process.
+4. For each candidate in shared code, count the other test modules it reaches.
+5. Name the owning unit of each file a change would touch.
+6. Edit no repository file.
+
+**Files:**
+- `scripts/style/test_style_sync.py` — read only.
+
+**Workers:** 1 writer; research only.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 137: Phase 138 defers recorder and staff imports. Do not count that saving again here.
+- Phase 134: `run_style_command` in `scripts/style/style_plan_test_support.py` runs style plan commands in process; reuse it where it fits.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report at `phases/140/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
