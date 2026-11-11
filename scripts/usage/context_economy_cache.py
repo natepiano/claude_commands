@@ -12,6 +12,7 @@ import time
 from typing import Literal, cast, final
 
 from scripts.lib import conf
+from scripts.lib.transcripts import open_transcript, uncompressed_path
 
 Family = Literal["claude", "codex"]
 
@@ -50,7 +51,7 @@ class SummaryUnavailable:
 
 def logical_path(path: Path) -> Path:
     resolved = path.resolve()
-    return resolved.with_suffix("") if resolved.suffix == ".zst" else resolved
+    return uncompressed_path(resolved)
 
 
 ANCHOR_BYTES = 4096
@@ -65,7 +66,7 @@ class PrefixAnchor:
 
 def prefix_anchor(path: Path, offset: int) -> PrefixAnchor:
     """Read at most two fixed-size blocks before the saved offset."""
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         first = source.read(min(offset, ANCHOR_BYTES))
         _ = source.seek(max(0, offset - ANCHOR_BYTES))
         last = source.read(min(offset, ANCHOR_BYTES))
@@ -122,11 +123,17 @@ class TranscriptCache:
         held = (ParseCheckpoint(cast(int, row["offset"]), cast(str, row["payload"]))
                 if row is not None else ParseCheckpoint())
         if not path.exists():
-            if row is None:
+            if row is not None:
+                self.mark_final(path)
+                self.touch(path)
+                return held
+            compressed = path.with_suffix(path.suffix + ".zst")
+            if not compressed.exists():
                 return SummaryUnavailable()
-            self.touch(path)
-            return held
-        stat = path.stat()
+            source = compressed
+        else:
+            source = path
+        stat = source.stat()
         resumed = (row is not None and cast(int, row["device"]) == stat.st_dev
                    and cast(int, row["inode"]) == stat.st_ino and stat.st_size >= held.offset
                    and stat.st_size >= cast(int, row["size"]))
@@ -138,14 +145,14 @@ class TranscriptCache:
         if resumed and row is not None:
             resumed = prefix_anchor(path, held.offset) == PrefixAnchor(
                 cast(str, row["first_hash"]), cast(str, row["last_hash"]))
-        parsed = parse(path, held if resumed else ParseCheckpoint())
+        parsed = parse(source, held if resumed else ParseCheckpoint())
         anchor = prefix_anchor(path, parsed.offset)
         with self.database:
             _ = self.database.execute("""INSERT OR REPLACE INTO summaries
                 (path, family, device, inode, size, mtime, ctime, offset, payload, accessed, final, first_hash, last_hash)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(path), family, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
-                 parsed.offset, parsed.payload, time.time_ns(), 0, anchor.first, anchor.last))
+                 parsed.offset, parsed.payload, time.time_ns(), int(source.suffix == ".zst"), anchor.first, anchor.last))
         _ = self.accessed.pop(str(path), 0)
         return parsed
 
@@ -176,7 +183,7 @@ class TranscriptCache:
                 if size <= self.limit:
                     break
                 path = Path(cast(str, row["path"]))
-                if path.exists() or path.with_suffix(path.suffix + ".zst").exists():
+                if path.exists():
                     _ = self.database.execute("DELETE FROM summaries WHERE path = ?", (str(path),))
                     size -= cast(int, row["bytes"])
                     removed = True
