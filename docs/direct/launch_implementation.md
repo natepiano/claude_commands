@@ -35,7 +35,7 @@ completes.
    both carry the inline Three Gods sentence and the Type Design Contract or
    its allowed pointer.
 5. Apply <LongLivedWorkers/> and launch both workers together, `impl` first, under <ToolingContract/>.
-   Inspect `worker.py list`.
+   Inspect `worker.py list all`.
    Omit `--to` for automatic selection, or pass a retained worker's short name.
    The worker command reuses idle or stopped workers and retains their native conversations.
    It refuses selection when all suitable workers are busy.
