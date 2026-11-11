@@ -976,40 +976,15 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - A separate module for the `disk.py` writers needs caller and test edits and saves no more.
 
 ### Phase 47 — buildlog charts is removed; /build:page is the one way to the build page · status: done
-**Depends on:** none.
 
-From the builds showrunner (not the user), 2026-11-11, with the user's words on change C1317: "this is ridiculous to have this". `buildlog charts` only prints the `/build:page` link, so it is a duplicate. Remove the subcommand. Keep `charts.page_data`, which the build page feed calls.
+#### As-built
 
-#### Work Order
-
-**Goal:** `buildlog charts` no longer exists. `/build:page` is the one way to get the shared build page link. The build page data does not change.
-
-**Spec:**
-- `scripts/buildlog/cli.py` has no `charts` branch, and its usage text has no `buildlog charts` line. `buildlog charts` then takes the unknown-command path: the usage text on stderr and exit 2, as `buildlog costs` does since Phase 26.
-- `scripts/buildlog/charts.py` loses `main`, `local_display`, `MEMORY_FEED`, and every import that only they use. `page_data` and the code it calls stay, with the same output.
-- `scripts/buildlog/test_charts.py` loses the tests of `charts.main`, `local_display` and `cli.main(["charts", ...])`. The `page_data` tests stay.
-- `scripts/buildlog/test_costs.py`: the removed-command test gets `charts` as a second row, with the same assertions as `costs`.
-- Docs say how things are now. `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md` and `docs/as-built/mac-test-offload.md` name `/build:page` and do not name `buildlog charts`. `docs/plans/builds-report-charts-design.md` states that the charts live on the shared build page, that `/build:page` prints its link, and that `charts.page_data` feeds it. It names no `buildlog charts` command, `--no-open`, `BUILDLOG_CHARTS_NO_OPEN` or `latest.html`.
-- `scripts/build_queue/test_memory_feed.py` keeps its `charts` import case: the module stays.
-- The director updates the current-state lines of `docs/plans/builds-report.md`. The worker does not edit it.
+- `buildlog charts` is removed. It takes the unknown-command path: the usage text on stderr and exit 2, as `buildlog costs` does.
+- `/build:page` is the one way to the shared build page link. `charts.page_data` stays and feeds that page, with the same output.
+- `charts.main`, `local_display` and `MEMORY_FEED` are removed with their tests.
+- The as-built docs and the charts design name `/build:page`.
 
 **Files:**
-- `scripts/buildlog/cli.py`
-- `scripts/buildlog/charts.py`
-- `scripts/buildlog/test_charts.py`
-- `scripts/buildlog/test_costs.py`
-- `docs/as-built/build-report-session.md`
-- `docs/as-built/build-targets.md`
-- `docs/as-built/mac-test-offload.md`
-- `docs/plans/builds-report-charts-design.md`
-
-**Workers:** `1 writer`
-- writer — all files and the tests.
-
-**State:** none.
-
-**Acceptance gate:**
-- `buildlog charts` prints the usage text to stderr and exits 2, by the `test_costs` row.
-- `grep -rn "buildlog charts"` over `scripts`, `commands`, `config` and `docs`, without `docs/plans/builds-report.md` and `docs/plans/builds-report-rounds.md`, finds nothing.
-- `scripts.buildlog.test_charts`, `test_costs` and `scripts.build_queue.test_memory_feed` pass.
-- `basedpyright` reports 0 errors and 0 warnings on the four Python files.
+- `scripts/buildlog/cli.py` — the command list and usage text.
+- `scripts/buildlog/charts.py` — `page_data` and the chart series.
+- `scripts/buildlog/test_costs.py` — the removed-command test, with rows for `costs` and `charts`.
