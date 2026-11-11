@@ -95,6 +95,12 @@ def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
     return (Path(override),) if override else (RUN_ROOT, FORMER_RUN_ROOT)
 
 
+def is_unit_run(folder: Path) -> bool:
+    """Test whether the folder is under a unit run root."""
+    folder = folder.resolve()
+    return any(folder.is_relative_to(root.resolve()) for root in run_roots())
+
+
 def run_temp_path(run: Path) -> Path:
     """Name the temporary folder that shares the run's lifetime."""
     return run / RUN_TEMP_NAME
@@ -122,6 +128,31 @@ def open_run(session_id: str, *,
     row = (staff.local_by_current_session(session_id) if isinstance(record, RunStaffAtUse)
            else record.by_current_session(session_id))
     return row.run.path if row is not None and isinstance(row.run, staff.OpenRun) else None
+
+
+def run_is_open(folder: Path, *, record: staff.StaffSnapshot | None = None) -> bool:
+    """Read a unit's staff pointer or a helper's unfinished state."""
+    from scripts.production import staff
+
+    folder = folder.resolve()
+    try:
+        raw = cast(object, json.loads((folder / STATE_FILE).read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    fields = cast(dict[str, object], raw)
+    if not is_unit_run(folder):
+        return "status" not in fields
+    record = staff.local_snapshot() if record is None else record
+    reference = fields.get(OWNER_FIELD)
+    agent = fields.get("main_agent")
+    identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
+    identity = identity or fields.get("owner_session") or fields.get("director_session")
+    owner = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str)
+             else record.by_member_reference(identity) if isinstance(identity, str) else None)
+    return (isinstance(owner, staff.StaffRow) and isinstance(owner.run, staff.OpenRun)
+            and owner.run.path.resolve() == folder)
 
 
 def history_root() -> Path:

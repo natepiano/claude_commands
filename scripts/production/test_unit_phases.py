@@ -99,6 +99,7 @@ class UnitPhasesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         config = self.root / "table-conf"
         _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
@@ -135,16 +136,22 @@ class UnitPhasesTests(unittest.TestCase):
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         plan = self.root / "outside-plan.md"
         _ = plan.write_text("# Plan\n### Phase 1 — Planned work · status: todo\n")
+        owner = fixture_member("showrunner", name="outside")
+        member = fixture_member("unit", name="outside", parent=owner.id,
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         history = self.root / "history" / "runs"
         history.mkdir(parents=True)
         _ = (history / "outside.jsonl").write_text("\n".join([
             json.dumps({"event_type": "run_started", "working_dir": str(self.root),
+                        "run_id": "outside", "owner_staff_id": member.id,
                         "plan_doc": plan.name, "run_started_at": 1}),
             json.dumps({"event_type": "phase_started", "phase_id": "ad-hoc", "phase_title": "Other work",
                         "phase_instance_id": "outside-instance", "phase_started_at": 2, "timestamp_epoch": 2})]) + "\n")
-        run_folder = self.root / "outside-run"
-        run_folder.mkdir()
-        _ = (run_folder / plan_history.STATE_FILENAME).write_text(json.dumps({"working_dir": str(self.root), "plan_doc": plan.name}))
+        run_folder = self.root / "runs" / "outside"
+        run_folder.mkdir(parents=True)
+        _ = staff.set_run(member.id, staff.OpenRun(run_folder))
+        _ = (run_folder / plan_history.STATE_FILENAME).write_text(json.dumps({"owner_staff_id": member.id,
+            "working_dir": str(self.root), "plan_doc": plan.name}))
         outside = cast(dict[str, object], json.loads(phase_table.show(run_folder, ZoneInfo("UTC"), json_output=True)))
         self.assertIsInstance(outside["current"], dict)
         cases: list[tuple[object, str]] = [
@@ -229,6 +236,16 @@ class UnitPhasesTests(unittest.TestCase):
                 json.dumps(header), event("phase_started", phase_id=phase),
                 event("pass_started", phase_id=phase, pass_instance_id="p1", pass_kind="impl",
                       pass_activity=f"write {name}"), *tail]) + "\n")
+            folder = self.root / "runs" / name
+            folder.mkdir(parents=True, exist_ok=True)
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": director.id}))
+            if any(cast(dict[str, object], json.loads(line)).get("event_type") == "run_finished" for line in tail):
+                current = staff.snapshot().by_id(director.id)
+                assert current is not None
+                if isinstance(current.run, staff.OpenRun):
+                    _ = staff.clear_run(director.id, current.run.path)
+            else:
+                _ = staff.set_run(director.id, staff.OpenRun(folder))
             return path
 
         _ = run("older", member, "outside-a", 1)
@@ -448,7 +465,7 @@ class UnitPhasesTests(unittest.TestCase):
         now = datetime(2026, 10, 16, 18, 10, tzinfo=UTC).timestamp()
         for index, plan in enumerate((older, newest), 1):
             events: list[dict[str, object]] = [{"event_type": "run_started",
-                "owner_staff_id": str(member.id), "working_dir": str(self.root), "plan_doc": plan.name,
+                "owner_staff_id": str(member.id), "run_id": f"run-{index}", "working_dir": str(self.root), "plan_doc": plan.name,
                 "run_started_at": index},
                 {"event_type": "phase_started", "phase_id": "1", "phase_title": "Done work",
                  "phase_instance_id": f"done-{index}", "phase_started_at": now - 600},
@@ -470,6 +487,13 @@ class UnitPhasesTests(unittest.TestCase):
                 (False, True, "█▓ 1/2", "18:30 · ends 18:30", "—")):
             with self.subTest(finished=finished, missing=missing):
                 _ = run.write_text(open_events + (event("run_finished") + "\n" if finished else ""))
+                folder = self.root / "runs" / "run-2"
+                folder.mkdir(parents=True, exist_ok=True)
+                _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
+                if finished:
+                    _ = staff.clear_run(member.id, folder)
+                else:
+                    _ = staff.set_run(member.id, staff.OpenRun(folder))
                 if missing:
                     newest.unlink()
                 with (patch.object(display_cells, "run_events", wraps=display_cells.run_events) as reads,

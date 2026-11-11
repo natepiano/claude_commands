@@ -122,7 +122,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
     def assert_run_active(self, result: subprocess.CompletedProcess[str], code: int = 2) -> None:
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         self.assertEqual(self.open_run(), self.session_dir)
-        self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "active")
+        self.assertNotIn("status", read_object(self.session_dir / "progress_history_state.json"))
         self.assertEqual([event for event in self.events() if event.get("event_type") == "run_finished"], [])
 
     def test_a_codex_directors_only_failed_worker_ends_its_run(self) -> None:
@@ -255,7 +255,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
         self.assertEqual(self.open_run(), self.session_dir)
-        self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "active")
+        self.assertNotIn("status", read_object(self.session_dir / "progress_history_state.json"))
         diagnostics = [line for line in result.stderr.splitlines() if "unable to end failed run" in line]
         self.assertEqual(len(diagnostics), 1, result.stderr)
         self.assertIn("recursion", diagnostics[0])
@@ -346,6 +346,8 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.fixture.fixture.root))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.fixture.fixture.root)})))
         _ = self.enterContext(assignment_helpers())
         self.ready = self.fixture.run_dir / "final.ready"
         self.phase = self.fixture.run_dir / "phases/8"
@@ -571,7 +573,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         root = case.fixture.fixture.root
                         state_path = case.fixture.run_dir / unit_runs.STATE_FILE
                         state = read_object(state_path)
-                        state["status"] = "active"
+                        _ = state.pop("status", None)
                         write_text_atomic(state_path, json.dumps(state))
                         arguments = ["--role", "review", "--to", name, "--cwd", str(root), "--phase", "8",
                                      "--session-dir", str(case.fixture.run_dir), "--prompt", str(case.fixture.prompt),
@@ -582,7 +584,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
                         self.assertIn("role change blocked by active work: submitted pass awaits completion",
                                       (case.phase / "impl_agent_1.log").read_text())
-                        self.assertEqual(read_object(state_path)["status"], "active")
+                        self.assertNotIn("status", read_object(state_path))
                         self.assertEqual(unit_runs.open_run(staff.runtime_id()), case.fixture.run_dir)
                         self.assertEqual((case.phase / "impl_status_1").read_text(), "error\n")
                     else:

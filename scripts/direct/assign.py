@@ -217,7 +217,12 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
     phase = args.phase or text(stored_phase.get("id")) or "1"
     if phase != "ad hoc" and (not re.fullmatch(r"[A-Za-z0-9_.-]+", phase) or phase in (".", "..")):
         refuse(f"invalid phase id: {phase}")
-    if worker_lifecycle.finished_run_status(str(run)) or not stored_phase:
+    try:
+        run_open = unit_runs.run_is_open(run)
+    except staff.StaffUnreadable as error:
+        print(f"assign.sh: {error}", file=sys.stderr)
+        raise SystemExit(3) from error
+    if not run_open or not stored_phase:
         identity = next((match for line in prompt.read_text().splitlines()
                          if (match := re.match(r"^Phase (\S+) — (.*)$", line))), None)
         title = identity.group(2).strip() if identity else text(stored_phase.get("title")) or "Assignment"
