@@ -53,7 +53,7 @@ from scripts.notify import push_reference
 PY = Path.home() / ".claude/scripts/lib/py"
 SILENCE = Path.home() / ".claude/scripts/notify/silence.py"
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/silence.py"'
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "natedev"]
+SSH = ["ssh", "-o", "BatchMode=yes", "natedev"]
 UNTIL_OFF = "until off"
 UNTIL_BACK = "until you are back"
 SPAN_UNITS = {"d": 86400, "day": 86400, "days": 86400, "h": 3600, "hour": 3600, "hours": 3600,

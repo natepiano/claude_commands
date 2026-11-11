@@ -310,10 +310,13 @@ with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
             row = dict(kind="hold_build", action="stopped", call_id="call", boot_id="boot",
                        pid=42, proc_start="123", id="stop-id")
             _ = (log / "hold-builds-test.jsonl").write_text("\n".join(json.dumps(value) for value in (
-                {**row, "call_id": "other"}, {**row, "boot_id": "old"}, row)))
+                {**row, "call_id": "other"}, {**row, "boot_id": "old"},
+                {**row, "id": "pending-stop", "stop_status": "requested"},
+                {**row, "id": "cancelled-stop", "stop_status": "not_stopped"}, row)))
             with patch.dict(os.environ, {"BUILDLOG_DIR": str(root / "log"), "VERIFY_PROC_ROOT": str(root / "proc")}):
                 consumed = root / "consumed"
                 self.assertTrue(steps.consume_stopped_build("call", consumed))
+                self.assertEqual(consumed.read_text(), "stop-id\n")
                 self.assertFalse(steps.consume_stopped_build("call", consumed))
                 self.assertFalse(steps.consume_stopped_build("unrelated", root / "unused"))
 

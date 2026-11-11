@@ -115,7 +115,7 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
         ("natedev", expected.natedev if isinstance(expected, ExpectedSystems) else "",
          ["realpath", "/run/current-system"]),
         ("mac", expected.mac if isinstance(expected, ExpectedSystems) else "",
-         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", settings.ssh, "realpath /run/current-system"]),
+         ["ssh", "-o", "BatchMode=yes", settings.ssh, "realpath /run/current-system"]),
     ):
         running = run(command)
         if system_path(path) and system_path(running) and running != path:

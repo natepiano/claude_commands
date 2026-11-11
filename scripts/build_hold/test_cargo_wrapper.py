@@ -236,12 +236,18 @@ class CargoWrapperTest(unittest.TestCase):
         # A hidden entry must also cause a hold check.
         _ = (self.hold / ".holder").write_text("held")
         self.env["HOLD_EXIT"] = "1"
-        done = self.invoke("test")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stderr, "cargo stderr\n")
-        self.assertTrue(self.hold_log.exists())
-        self.assert_cargo(["test"])
-        self.assert_scope(["test"])
+        for cgroup in (
+            "0::/user.slice/app-agents.slice/session.scope\n",
+            "0::/user.slice/builds.slice/builds-detached.slice/run-42.scope\n",
+        ):
+            with self.subTest(cgroup=cgroup):
+                _ = self.cgroup.write_text(cgroup)
+                done = self.invoke("test")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stderr, "cargo stderr\n")
+                self.assertTrue(self.hold_log.exists())
+                self.assert_cargo(["test"])
+                self.assert_scope(["test"])
 
     def test_unreadable_hold_prints_one_note_and_builds(self) -> None:
         _ = (self.hold / "holder").write_text("held")

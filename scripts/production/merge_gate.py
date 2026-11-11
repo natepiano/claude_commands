@@ -469,7 +469,7 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = bool(holds.in_force) and not build_targets.caller_holds_only_own()
+            held = build_targets.caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:
@@ -1569,7 +1569,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
               f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
-        result = subprocess.run([args.ssh, "-o", "ConnectTimeout=10", args.mac_host, remote],
+        result = subprocess.run([args.ssh, args.mac_host, remote],
                                 cwd=main_repo, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, check=False, timeout=25)
     except (GateRefused, KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:

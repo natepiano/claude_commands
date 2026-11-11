@@ -189,7 +189,7 @@ def push(checkout: Path, *, time_limit: CommandTimeLimit | NoTimeLimit = UNLIMIT
 def ssh(remote: str, *, ssh_program: str, host: str = "mac",
         time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> subprocess.CompletedProcess[str] | str:
     """Run a remote command; a string describes why it could not run."""
-    command = [ssh_program, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote]
+    command = [ssh_program, "-o", "BatchMode=yes", host, remote]
     try:
         return subprocess.run(command, capture_output=True, text=True, timeout=time_limit.seconds, check=False)
     except subprocess.TimeoutExpired as error:

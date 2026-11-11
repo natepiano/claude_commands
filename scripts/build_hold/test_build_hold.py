@@ -933,21 +933,25 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
 
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            path = folder / "slot-one"
-            fields = cast(dict[str, object], json.loads(path.read_text()))
-            self.assertEqual(fields["holder"], "slot one")
-            self.assertEqual(fields["for"], "the focused test")
-            self.assertEqual(fields["release_eta"], "unknown")
-            self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
-            status = self.run_cli(folder, "status")
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertIn("slot one", status.stdout)
-            self.assertIn("the focused test", status.stdout)
-            self.assertIn("unknown", status.stdout)
+        for options in ((), ("--drain",)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as scratch, \
+                 mock.patch.object(hold_enforcer, "claimed_processes", return_value=frozenset()):
+                folder = Path(scratch)
+                result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test", *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                path = folder / "slot-one"
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(fields["holder"], "slot one")
+                self.assertEqual(fields["for"], "the focused test")
+                self.assertEqual(fields["release_eta"], "unknown")
+                self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
+                if options:
+                    self.assertEqual(result.stdout.splitlines()[-1], "drained")
+                status = self.run_cli(folder, "status")
+                self.assertEqual(status.returncode, 0, status.stderr)
+                self.assertIn("slot one", status.stdout)
+                self.assertIn("the focused test", status.stdout)
+                self.assertIn("unknown", status.stdout)
 
     def test_hold_message_tells_recipient_verify_waits_without_registering(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -2436,12 +2440,15 @@ class BuildAuditTests(IsolatedBuildHoldTest):
 
     def test_build_scope_marks_admission_without_memory_reservation(self) -> None:
         directory = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "verified"})
-        _ = (directory / "cgroup").write_text("0::/user.slice/user-1000.slice/builds.slice/run-123.scope\n")
-        build, = self.builds()
-        self.assertEqual(build.classification, "admitted")
-        _ = (directory / "cgroup").write_text("0::/user.slice/not-builds.slice/run-123.scope\n")
-        build, = self.builds()
-        self.assertEqual(build.classification, "other_session")
+        for cgroup, classification in (
+            ("0::/user.slice/user-1000.slice/builds.slice/run-123.scope\n", "admitted"),
+            ("0::/user.slice/not-builds.slice/run-123.scope\n", "other_session"),
+            ("0::/user.slice/user-1000.slice/builds.slice/builds-detached.slice/run-123.scope\n", "other_session"),
+        ):
+            with self.subTest(cgroup=cgroup):
+                _ = (directory / "cgroup").write_text(cgroup)
+                build, = self.builds()
+                self.assertEqual(build.classification, classification)
 
     def test_two_passes_record_once_per_build_per_hold_and_new_pid_lifetime(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "holder"})

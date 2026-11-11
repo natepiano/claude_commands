@@ -2368,7 +2368,7 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(all(row.machine != "mac" for row in result.entries[:-1]))
         commands = self.ssh_calls()
         self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0][:4], ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+        self.assertEqual(commands[0][:2], ["-o", "BatchMode=yes"])
         self.assertIn("--here --snapshot", commands[0][-1])
         self.assertIn('"$HOME/.claude/scripts/lib/py"', commands[0][-1])
 

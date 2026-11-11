@@ -2988,7 +2988,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
              mock.patch.object(send, "machine", return_value="macbook"):
             code, lines = self.clear_check()
         command = cast(list[str], channel.call_args.args[0])
-        self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "natedev"])
+        self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "natedev"])
         self.assertEqual(command[-1], f"{send.REMOTE} retire --to user --from hana --key github-cold")
         self.assertEqual((code, lines), (0, ["retired: github-cold from hana: its check passed; on natedev:"
                                              + " cancelled: the emergency push for github-cold stopped"]))

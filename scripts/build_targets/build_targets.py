@@ -938,7 +938,7 @@ class NoBlockingHold:
 def hold_waited_on(holds: build_hold.NatedevHolds,
                    owner: build_hold.OwningSession | build_hold.NoOwningSession,
                    directory: Path) -> build_hold.Holder | NoBlockingHold:
-    """Choose the oldest hold in force that the caller does not own."""
+    """Choose the oldest hold that applies to the caller and belongs to another session."""
     from scripts.build_hold import build_hold
 
     own_key = ""
@@ -947,27 +947,19 @@ def hold_waited_on(holds: build_hold.NatedevHolds,
             own_key = build_hold.holder_path(directory, owner.session_id).name
         except ValueError:
             pass
+    lineage = (build_hold.caller_processes(build_hold.PROC_ROOT, os.getpid())
+               if any(holder.keep for holder in holds.in_force) else frozenset[build_hold.ProcessIdentity]())
     for holder in holds.in_force:
-        if holder.key != own_key:
+        if holder.key != own_key and not lineage.intersection(holder.keep):
             return holder
     return NoBlockingHold()
 
 
-def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
+def caller_waits_on_hold(holds: build_hold.NatedevHolds, directory: Path) -> bool:
+    """Check whether a hold makes the calling session wait."""
     from scripts.build_hold import build_hold
 
-    holds = build_hold.natedev_holds(directory)
-    return bool(holds.in_force) and isinstance(hold_waited_on(holds, owner, directory), NoBlockingHold)
-
-
-def caller_holds_only_own(
-    session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
-) -> bool:
-    """Check whether the submitting session owns every active hold."""
-    from scripts.build_hold import build_hold
-
-    owner = claim_state.submitting_session(session)
-    return isinstance(owner, build_hold.OwningSession) and holds_only_own(owner, build_hold.holder_directory())
+    return isinstance(hold_waited_on(holds, build_hold.owning_session(), directory), build_hold.Holder)
 
 
 def command_register_local(_call_id: str, *, pid: int) -> int:
