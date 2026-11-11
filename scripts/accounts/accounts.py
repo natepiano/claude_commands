@@ -2386,6 +2386,18 @@ def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[st
                  and settings.kind == family)
 
 
+def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
+    """Select admitted local producers without a pause or an exit request."""
+    from scripts.production import staff
+
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffAbsent:
+        return ()
+    members = eligible_producers(membership, "claude") + eligible_producers(membership, "codex")
+    return tuple(row for row in members if not isinstance(row.exited, staff.Exited))
+
+
 @settings_report_scope()
 def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple[staff.StaffRow, ...]]:
     """Keep verified accounts and retain eligible members without account proof."""
