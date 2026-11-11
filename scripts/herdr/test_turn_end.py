@@ -116,6 +116,7 @@ class TurnEndTests(unittest.TestCase):
                      for transcript in ("no final reply", "older reply"))
         cases.append(("codex", "scratch", "current"))
         cases.append(("codex", "closed", "trailing period"))
+        cases.extend((family, "working", "current") for family in ("codex", "claude"))
         cases.append(("codex", "held-lock", "current"))
         for family, close, transcript in cases:
             with self.subTest(family=family, close=close, transcript=transcript):
@@ -149,6 +150,8 @@ class TurnEndTests(unittest.TestCase):
                     "stop_hook_active": False, "last_assistant_message": self.case.agent.replies[-1]}
                 if family == "codex":
                     payload.update({"turn_id": "turn-1", "cwd": str(self.case.fixture.root), "model": "sol"})
+                if close == "working":
+                    self.case.fixture.world.locations[pane]["agent_status"] = "working"
                 if close == "setup":
                     self.case.fixture.world.foreground[pane] = (998598, "direnv", ["direnv", "export", "zsh"])
                 elif close == "outside":
@@ -167,6 +170,11 @@ class TurnEndTests(unittest.TestCase):
                                          turn_end.TurnOutcome.DONE)
                 else:
                     self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
+                    if transcript != "current":
+                        self.assertNotIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
+                        self.assertIn(pane, self.case.fixture.world.locations)
+                        self.case.agent.append(pane, "assistant", self.case.agent.replies[-1])
+                        self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
                 self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.IGNORED)
                 self.assertEqual(len(self.case.agent.notices), notices + 1)
                 self.assertIn(f"{name}: phase 8: done; reply {self.case.reply}", self.case.agent.notices[-1])

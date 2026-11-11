@@ -541,7 +541,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 - `buildlog charts` publishes no page of its own. `charts.main` runs `scripts/build_queue/memory_feed.py link` (the `/build:page` command) from the same checkout and prints its one URL line. It opens the URL when a local display exists and `--no-open` is absent. `--days 7|30` stays.
 - No link prints `buildlog charts: <reason>` to stderr and exits 1. No link means: a non-zero exit, a missing command, or stdout that is not one printable `http`/`https` URL with a valid port. The reason is the command's stderr when it gave one.
-- `buildlog costs` is gone: the CLI prints its unknown-command usage and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
+- `buildlog costs` is gone: the CLI takes its unknown-command path and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
 - `render_html`, `publish`, `PAGE`, `chart_data` and the cost text output are gone. Calculation tests read the typed `ChartSet`.
 - The cost Definitions are sentences in `docs/as-built/buildlog-memory-stalls.md`. `build-report-session.md`, `build-targets.md` and `mac-test-offload.md` name `buildlog charts`.
 - Live check, 2026-11-09, from this branch: `buildlog charts --no-open` printed `http://100.103.14.30:8765/h7uj5c/memory_live.html`, the same line as `/build:page`.
@@ -979,7 +979,7 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 #### As-built
 
-- `buildlog charts` is removed. It takes the unknown-command path: the usage text on stderr and exit 2, as `buildlog costs` does.
+- `buildlog charts` is removed. It takes the unknown-command path and exits 2, as `buildlog costs` does.
 - `/build:page` is the one way to the shared build page link. `charts.page_data` stays and feeds that page, with the same output.
 - `charts.main`, `local_display` and `MEMORY_FEED` are removed with their tests.
 - The as-built docs and the charts design name `/build:page`.
@@ -988,3 +988,15 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/buildlog/cli.py` — the command list and usage text.
 - `scripts/buildlog/charts.py` — `page_data` and the chart series.
 - `scripts/buildlog/test_costs.py` — the removed-command test, with rows for `costs` and `charts`.
+
+### Phase 48 — buildlog names a wrong command in one line · status: done
+
+#### As-built
+
+- An unknown `buildlog` command prints one line to stderr and exits 2: `buildlog: unknown command '<word>'; type buildlog to see the commands`. It prints no help page.
+- `buildlog` with no command prints the help page and exits 2. `help`, `-h` and `--help` print it and exit 0.
+- `test_unknown_commands_and_help_do_not_read_the_index` is one table: `costs`, `charts`, a word that never was a command, no command, and the three help forms. No row opens the index.
+
+**Files:**
+- `scripts/buildlog/cli.py` — the unknown-command line at the end of `main`.
+- `scripts/buildlog/test_costs.py` — the unknown-command and help table.
