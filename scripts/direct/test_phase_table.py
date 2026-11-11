@@ -631,6 +631,20 @@ class PhaseTableTests(unittest.TestCase):
         self.assertIsInstance(record.plan_finish, phase_table.PredictedFinish)
         assert isinstance(record.plan_finish, phase_table.PredictedFinish)
         self.assert_epoch(record.plan_finish.at, 1_400)
+        run = self.history_dir / "runs" / "current.jsonl"
+        before_promises = run.read_text()
+        for phase_id, instance_id, expected in (("2", "", 1_900), ("1", "one", 2_800)):
+            with self.subTest(promised_phase=phase_id):
+                promises = [self.phase_event("eta_stated", phase_id, instance_id, at,
+                    eta_phase_id=phase_id, eta_at=target, basis="checkpoint")
+                    for at, target in ((1_110, 2_000), (1_120, 1_900))]
+                _ = run.write_text(before_promises + "\n".join(map(json.dumps, promises)) + "\n")
+                promised = self.build(1_150)
+                row = promised.phases[int(phase_id) - 1]
+                self.assertEqual([(int(target.timestamp()), int(stated.timestamp()))
+                                  for target, stated in row.eta_trail], [(2_000, 1_110), (1_900, 1_120)])
+                assert isinstance(promised.plan_finish, phase_table.PredictedFinish)
+                self.assert_epoch(promised.plan_finish.at, expected)
 
     def test_legacy_stated_eta_wins_over_a_later_progress_report(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
@@ -713,12 +727,19 @@ class PhaseTableTests(unittest.TestCase):
         record(1_000, "start-phase", "--phase-id", "2", "--phase-title", "Current delivery")
         record(1_050, "eta", "--phase-id", "3", "--time", "00:30", "--basis", "checkpoint")
 
-        previous = self.build(1_060).current
+        before_start = self.build(1_060)
+        previous = before_start.current
 
         assert isinstance(previous, phase_table.OpenPhase)
         self.assertEqual(previous.phase, "2")
         self.assertIsInstance(previous.eta, phase_table.EtaUnavailable)
         self.assertIsInstance(previous.first_stated, phase_table.EtaNeverStated)
+        checkpoint = before_start.phases[1]
+        assert isinstance(checkpoint, phase_table.TodoPhase)
+        self.assertEqual([(int(target.timestamp()), int(stated.timestamp()))
+                          for target, stated in checkpoint.eta_trail], [(1_800, 1_050)])
+        assert isinstance(before_start.plan_finish, phase_table.PredictedFinish)
+        self.assert_epoch(before_start.plan_finish.at, 1_800)
 
         record(1_100, "finish-phase", "--status", "completed")
         record(1_150, "start-phase", "--phase-id", "3", "--phase-title", "Next delivery")
@@ -733,6 +754,43 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(current.eta.basis, "checkpoint")
         assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
         self.assert_epoch(current.first_stated.time, 1_800)
+
+        self.history_dir = self.root / "reused-phase-history"
+        self.write_plan(plan_text("### Phase 3 — Replacement delivery · status: todo"))
+        self.write_state(None)
+        for name, has_previous, closed_run, stated_at, expected_trail in (
+                ("first checkpoint", False, False, 1_050, [(1_800, 1_050)]),
+                ("retired promise", True, False, 1_050, []),
+                ("checkpoint after completion", True, False, 1_150, [(1_800, 1_150)]),
+                ("checkpoint after closed run", True, True, 1_150, [(1_800, 1_150)])):
+            with self.subTest(promise=name):
+                earlier = ([
+                    self.phase_event("phase_started", "3", "retired", 1_000,
+                                     phase_title="Retired delivery"),
+                    self.phase_event("phase_finished", "3", "retired", 1_100,
+                                     status="completed", phase_elapsed_seconds=100)] if has_previous else [])
+                if closed_run:
+                    _ = self.write_run("retired-closed", 900, earlier[0],
+                        self.phase_event("eta_stated", "3", "retired", 1_025,
+                                         eta_phase_id="3", eta_at=2_700, basis="retired promise"),
+                        {"event_type": "run_finished", "timestamp_epoch": 1_100})
+                    earlier = []
+                promise = self.phase_event("eta_stated", "2", "checkpoint-source", stated_at,
+                                           eta_phase_id="3", eta_at=1_800, basis="checkpoint")
+                events = sorted([*earlier, promise], key=lambda item: cast(int, item["timestamp_epoch"]))
+                _ = self.write_run("reused", 900, *events)
+                reused = self.build(1_200)
+                replacement = reused.phases[0]
+                assert isinstance(replacement, phase_table.TodoPhase)
+                self.assertEqual(replacement.title, "Replacement delivery")
+                self.assertEqual([(int(target.timestamp()), int(stated.timestamp()))
+                                  for target, stated in replacement.eta_trail], expected_trail)
+                self.assertIsInstance(reused.current, phase_table.NoOpenPhase)
+                if expected_trail:
+                    assert isinstance(reused.plan_finish, phase_table.PredictedFinish)
+                    self.assert_epoch(reused.plan_finish.at, 1_800)
+                else:
+                    self.assertIsInstance(reused.plan_finish, phase_table.UnknownFinish)
 
     def test_passed_stated_eta_ends_at_now_and_keeps_first(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))

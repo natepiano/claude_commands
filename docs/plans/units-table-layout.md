@@ -59,7 +59,7 @@ The user's words, from the sdlc showrunner on 2026-11-11:
 
 **Gotchas:** `scripts/agents/test_shutdown_cli.py` pins the units header; each header change updates it. The three bar characters have East Asian Width `W`; a narrow character breaks the Markdown alignment.
 
-### Phase 2 — ETA Next and ETA Plan  · status: todo
+### Phase 2 — ETA Next and ETA Plan  · status: done
 
 **Depends on:** Phase 1
 

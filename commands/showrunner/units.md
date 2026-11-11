@@ -22,7 +22,8 @@ Both tables add a **Machine** column after **Status** only when a row runs on an
 The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
 
 For units outside the `Style units` table in a production without `Kind: style`, the table is:
-`| Unit | Status | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |`.
+`| Unit | Status | Progress | Phase | Notes | ETA Next | ETA Plan | Workers | Non-Phase Work | Queued |`.
+ETA Plan appears only when at least one row has unfinished plan phases.
 
 1. **Progress** shows only a bar: `🟩` done, `🟨` open, and `⬜` not started.
    It uses one cell per phase, or 20 equal groups above 20 phases.
@@ -30,29 +31,33 @@ For units outside the `Style units` table in a production without `Kind: style`,
    All three characters use the same display width.
    With no recorded phases, Progress gives `—`.
 2. **Phase** shows `<done>/<total>` from the same phases as Progress, or `—` with no phases.
-   When the plan has no phases, an open run supplies Progress, Phase, and ETA from its recorded phases.
+   When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its recorded phases.
    A finished newest run supplies no fallback.
 3. **Notes** shows `phase <id> — <step>: <task>` for the open phase.
    The newest run supplies the open step; no step uses the phase title.
    Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
    Repair rounds append ` · fix rounds <n>[ + 1 running]` when the count exceeds zero.
-4. **ETA** shows the latest stated promise, with ` · late <elapsed>` after that promise passes.
-   An open phase without a promise shows `no ETA`.
-   A predicted plan finish appends ` · ends <time>`.
-   A completed plan adds no finish fact.
+4. **ETA Next** shows the latest promise for the open plan phase first.
+   Without an open plan phase, it uses the newest open phase outside the plan.
+   Without open work, it uses the next not-started plan phase with a promise.
+   A passed promise adds ` · late <elapsed>`.
+   Open work without a promise shows `no ETA`; no open work or promised phase gives `—`.
    Times use the production zone: `HH:MM` today, `Sat 18:41` within six days, otherwise `24 Oct`.
-5. **Workers** lists workers with runs before workers that are working.
+5. **ETA Plan** shows the predicted plan finish in the same time form, without `ends`.
+   It never precedes the latest promise of any open or not-started plan phase.
+   A row without an unfinished plan shows `—`.
+6. **Workers** lists workers with runs before workers that are working.
    Run states are `waiting on run: <label> <elapsed>`, `result queued: <label>`, and `run gone: <label>`.
    Idle workers append ` +<n> idle` to a nonempty cell.
    Closed workers and workers on another machine add nothing.
-6. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
-7. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
+7. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
+8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
    Each part adds ` +<n> more` for later items.
    Plan work includes every phase that is neither done nor open.
    It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 
-Notes, ETA, and Workers use at most 80 characters per cell, with `…` for omitted text.
+Notes, ETA Next, ETA Plan, and Workers use at most 80 characters per cell, with `…` for omitted text.
 The Progress bar has no text cut.
 Queued limits each item or title to 80 characters and keeps its count suffix after the cut.
 Empty cells show `—`.

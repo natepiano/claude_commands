@@ -629,7 +629,8 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `| Unit | Status | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |`.
+  - **Phase productions:** `| Unit | Status | Progress | Phase | Notes | ETA Next | ETA Plan | Workers | Non-Phase Work | Queued |`.
+    ETA Plan appears only when at least one row has unfinished plan phases.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
     Both tables add a **Machine** column after **Status** only when a row runs on another machine.
@@ -645,12 +646,16 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
     Notes limits text to 80 characters and ends longer text with `…`.
-    When the plan has no phases, an open run supplies Progress, Phase, and ETA from its full event history.
-    This fallback changes neither Notes, Non-Phase Work, nor Queued.
+    When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
+    Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
+    The fallback does not change Non-Phase Work or Queued.
     A finished newest run supplies no fallback.
-    ETA uses the latest stated promise from `eta_trail`, never `schedule_end`.
-    Passed promises add `late <elapsed>`; open phases without promises show `no ETA`.
-    A predicted plan finish adds `ends <time>`.
+    ETA Next uses the open plan phase's latest promise from `eta_trail`, never `schedule_end`.
+    Otherwise, it uses the newest open phase outside the plan, then the next not-started plan phase with a promise.
+    Passed promises add `late <elapsed>`; open work without a promise shows `no ETA`.
+    With no open work or promised phase, ETA Next shows `—`.
+    ETA Plan shows the predicted plan finish without `ends`; a row without unfinished plan phases shows `—`.
+    The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
     Workers uses `worker_runs` to show waiting runs, queued results, missing runs, and working workers.
     Run workers appear first; idle workers append a count, and closed workers add nothing.
