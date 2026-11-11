@@ -1335,35 +1335,77 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 for path in paths[3:]:
                     self.assertEqual(sum(finding.path == path for finding in live), 3)
 
-    def test_test_file_folding_uses_the_shared_narrow_declaration_rule(self) -> None:
-        for other, eligible in (
-                ("", True),
-                ('#[cfg_attr(all(), path = "widget_tests.rs")] mod alias;', False),
-                ('#[path = "."] mod alias { mod widget_tests; }', False),
-                ("mod alias { mod widget_tests; }", False),
-                ("mod;", False)):
-            with self.subTest(other=other):
+    def test_test_file_folding_resolves_the_supported_live_forms(self) -> None:
+        for parent, declaration, source in (
+                ("census/herdr.rs", '#[cfg(test)] #[path = "herdr_tests.rs"] mod tests;', "census/herdr_tests.rs"),
+                ("census/hierarchy.rs", '#[cfg(test)] #[path = "hierarchy_file_tests.rs"] mod file_tests;',
+                 "census/hierarchy_file_tests.rs"),
+                ("render/mod.rs", '#[cfg(test)] #[path = "accounts_grid_tests.rs"] mod accounts_grid_tests;',
+                 "render/accounts_grid_tests.rs"),
+                ("render/mod.rs", '#[path = "drawn_frame_tests.rs"] #[cfg(test)] mod drawn_frame_tests;',
+                 "render/drawn_frame_tests.rs"),
+                ("render/mod.rs", "#[cfg(test)] mod word_contrast_tests;", "render/word_contrast_tests.rs"),
+                ("census/worker_dispatch/mod.rs", "#[cfg(test)] mod prompt_opening_tests;",
+                 "census/worker_dispatch/prompt_opening_tests.rs"),
+                ("owner.rs", "#[cfg(test)] mod plain_tests;", "owner/plain_tests.rs"),
+                ("lib.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs"),
+                ("main.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs")):
+            with self.subTest(parent=parent, declaration=declaration):
                 case = StyleLedgerFindingsTests()
                 case.setUp()
                 try:
-                    rule = case.rule("test-move-paths", "tier: D\nfamily: modules\ninput_scope: file\n")
-                    path = "crates/alpha/src/widget_tests.rs"
-                    root = "crates/alpha/src/lib.rs"
-                    case.write(root, "#[cfg(test)] mod widget_tests;\n" + ("mod other;\n" if other else ""))
+                    rule = case.rule("test-move-forms", "tier: D\nfamily: modules\ninput_scope: file\n")
+                    root = "crates/alpha/src/"
+                    case.write(root + "lib.rs", "mod census;\nmod render;\nmod owner;\n")
+                    case.write(root + "census/mod.rs", "mod herdr;\nmod hierarchy;\nmod worker_dispatch;\n")
+                    if parent == "main.rs":
+                        _ = (case.repo / root / "lib.rs").unlink()
+                    case.write(root + parent, declaration + "\n")
+                    path = root + source
                     case.write(path, "fn moved_fixture() {}\n")
+                    _ = case.commit("Declare a supported sibling test module")
+                    ledger = case.ledger()
+                    for line in (1, 2):
+                        _ = ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
+                                        "Inline the whole test file.", case.blob(rule), "outside")
+                    folded, = ledger.fold_test_files()
+                    live, = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
+                    self.assertEqual(folded.path, path)
+                    self.assertEqual(folded.declaring_file, root + parent)
+                    self.assertIn(root + parent, live.after)
+                finally:
+                    case.doCleanups()
+
+    def test_test_file_folding_keeps_unsupported_and_ambiguous_findings(self) -> None:
+        for declaration, other in (
+                ("mod widget_tests;", ""),
+                ("#[cfg(test)] pub mod widget_tests;", ""),
+                ('#[cfg(test)] #[path = "../widget_tests.rs"] mod tests;', ""),
+                ('#[cfg(test)] #[path = r"widget_tests.rs"] mod tests;', ""),
+                ('#[cfg(test)] #[path = 17] mod tests;', ""),
+                ('#[cfg(test)] #[path = "widget_tests.rs"] #[path = "other.rs"] mod tests;', ""),
+                ("#[cfg(test)] #[allow(dead_code)] mod widget_tests;", ""),
+                ('#[cfg_attr(all(), path = "widget_tests.rs")] mod tests;', ""),
+                ("#[cfg(test)] mod widget_tests;",
+                 '#[cfg(test)] #[path = "widget_tests.rs"] mod shared_tests;')):
+            with self.subTest(declaration=declaration, other=other):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    rule = case.rule("test-move-unsupported", "tier: D\nfamily: modules\ninput_scope: file\n")
+                    path = "crates/alpha/src/widget_tests.rs"
+                    case.write("crates/alpha/src/lib.rs", declaration + "\n" + ("mod other;\n" if other else ""))
                     if other:
                         case.write("crates/alpha/src/other.rs", other + "\n")
-                    _ = case.commit("Declare the sibling test module")
+                    case.write(path, "fn moved_fixture() {}\n")
+                    _ = case.commit("Declare an unsupported or ambiguous test module")
                     ledger = case.ledger()
                     originals = tuple(ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
                                                   "Inline the whole test file.", case.blob(rule), "outside")
                                       for line in (1, 2))
-                    folded = ledger.fold_test_files()
+                    self.assertEqual(ledger.fold_test_files(), ())
                     live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
-                    self.assertEqual(len(folded), int(eligible))
-                    self.assertEqual(len(live), 1 if eligible else 2)
-                    if not eligible:
-                        self.assertEqual({item.finding_id for item in live}, {item.finding_id for item in originals})
+                    self.assertEqual({item.finding_id for item in live}, {item.finding_id for item in originals})
                 finally:
                     case.doCleanups()
 

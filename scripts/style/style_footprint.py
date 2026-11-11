@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
@@ -3033,181 +3033,9 @@ def prove_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> 
     new one or adds or removes a `use` line the move needs. The proof refuses whenever it is not sure.
     """
     try:
-        if any(change.status == FileStatus.DELETED for change in changes):
-            return proven_test_file_inlining(changes, sources)
         return proven_item_moves(changes, sources)
     except MoveRefused as refusal:
         return NoItemMoves(str(refusal))
-
-
-@dataclass(frozen=True)
-class VerifiedModuleContext:
-    """The Cargo root and source directory proved by the existing plain-module walk."""
-
-    root: str
-    directory: str
-
-
-@dataclass(frozen=True)
-class NoModuleContext:
-    """The existing plain-module walk does not prove a context for this file."""
-
-
-def verified_module_context(file: str, sources: RevisionTree) -> VerifiedModuleContext | NoModuleContext:
-    """Use the item-move reach check to prove the declaring file's context."""
-    try:
-        crate = sources.crate(file)
-        manifest = crate_manifest(sources, crate)
-        package = manifest.get("package")
-        if not isinstance(package, dict):
-            return NoModuleContext()
-        _ = crate_edition(sources, crate, manifest)
-        source_dir = PurePosixPath(crate) / "src"
-        binary_dir = source_dir / "bin"
-        roots = {str(source_dir / name) for name in ("lib.rs", "main.rs")}
-        roots.update(path for path in sources.paths if PurePosixPath(path).parent == binary_dir and path.endswith(".rs"))
-        roots.update(path for path in sources.paths if PurePosixPath(path).parent.parent == binary_dir
-                     and PurePosixPath(path).name == "main.rs")
-        contexts: list[VerifiedModuleContext] = []
-        for root in sorted(roots & sources.paths):
-            directory = PurePosixPath(root).parent
-            module = () if file == root else crate_module(file, directory)
-            if isinstance(module, OutsideCrate) or (not module and file != root):
-                continue
-            if module_chain(module, sources, crate, {}, root_file=root) is None:
-                child_dir = (PurePosixPath(file).parent if file == root or PurePosixPath(file).name == "mod.rs"
-                             else PurePosixPath(file).with_suffix(""))
-                contexts.append(VerifiedModuleContext(root, str(child_dir)))
-        return contexts[0] if len(contexts) == 1 else NoModuleContext()
-    except (MoveRefused, FootprintError, UnicodeError, IndexError, ValueError):
-        return NoModuleContext()
-
-
-@dataclass(frozen=True)
-class EligibleTestFileDeclaration:
-    """One exclusive private test declaration that the crate-root walk reaches."""
-
-    file: str
-    item: SourceItem
-    path: str
-
-
-def eligible_test_file_declarations(sources: RevisionTree) -> tuple[EligibleTestFileDeclaration, ...]:
-    """Apply the shared narrow rule for folding findings and proving whole-file moves."""
-    candidates: list[EligibleTestFileDeclaration] = []
-    loaders: Counter[str] = Counter()
-    unresolved: set[str] = set()
-    for file in sorted(sources.paths):
-        if not file.endswith(".rs"):
-            continue
-        crate = sources.crate(file)
-        try:
-            spans = token_spans(sources.text(file))
-            if any(span.token.kind == "unknown" for span in spans):
-                unresolved.add(crate)
-                continue
-            words = tuple(span.token.value for span in spans)
-            items = source_items(words)
-            if items is None:
-                unresolved.add(crate)
-                continue
-            modules = {item.keyword: item for item in items if item.kind == "mod"}
-            owners = attribute_owners(words)
-            if any(words[begin + 2:begin + 3] in (("path",), ("r#path",), ("cfg_attr",), ("r#cfg_attr",))
-                   and words[owners.get(begin, -1):owners.get(begin, -1) + 1] == ("mod",)
-                   for begin, _ in attribute_spans(words)):
-                unresolved.add(crate)
-                continue
-            # A nested external declaration has no supported source directory.
-            if any(word == "mod" and index not in modules and words[index + 2:index + 3] == (";",)
-                   for index, word in enumerate(words)):
-                unresolved.add(crate)
-                continue
-            if not modules:
-                continue
-            context = verified_module_context(file, sources)
-            if isinstance(context, NoModuleContext):
-                continue
-            for item in modules.values():
-                if words[item.keyword + 2:item.end] != (";",):
-                    continue
-                path = str(PurePosixPath(context.directory) / (item.name + ".rs"))
-                loaders[path] += 1
-                if (PurePosixPath(file).name in {"mod.rs", "lib.rs"} and not item.visibility
-                        and item.name.endswith("_tests") and path in sources.paths
-                        and words[item.start:item.keyword] == ("#", "[", "cfg", "(", "test", ")", "]")):
-                    candidates.append(EligibleTestFileDeclaration(file, item, path))
-        except (MoveRefused, FootprintError, CheckCouldNotRun, UnicodeError, IndexError, ValueError):
-            unresolved.add(crate)
-    return tuple(candidate for candidate in candidates
-                 if sources.crate(candidate.file) not in unresolved and loaders[candidate.path] == 1)
-
-
-def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:
-    """Prove that complete sibling test files replace their private test module declarations."""
-    crates = {sources.crate(change.path) for change in changes}
-    if len(crates) != 1:
-        raise MoveRefused("the change crosses crates")
-    crate = crates.pop()
-    manifest = crate_manifest(sources, crate)
-    keywords = edition_keywords(crate_edition(sources, crate, manifest))
-    library = library_name(manifest)
-    befores = {change.path: move_text(change.path, False, change.before, file_module(change.path, crate, sources), library)
-               for change in changes}
-    afters = {change.path: move_text(change.path, True, change.after, file_module(change.path, crate, sources), library)
-              for change in changes}
-    standard = (STANDARD_CRATES & dependency_names(manifest)
-                | bound_standard_names(sources, crate, STANDARD_CRATES, befores, afters))
-    refuse_binding_macros(sources, crate, befores, afters, standard, keywords)
-    moves: list[ItemMove] = []
-    module_lines: list[FileSpan] = []
-    parents: set[str] = set()
-    anchored_declarations = eligible_test_file_declarations(sources)
-    for change in changes:
-        if change.status != FileStatus.DELETED:
-            continue
-        declarations = tuple(declaration for declaration in anchored_declarations if declaration.path == change.path)
-        if len(declarations) != 1:
-            raise MoveRefused(f"{change.path}: not one complete sibling test file move")
-        declared_at = declarations[0]
-        parent, declared = declared_at.file, declared_at.item
-        if parent not in befores:
-            raise MoveRefused(f"{change.path}: its module declaration does not change")
-        if parent in parents:
-            raise MoveRefused(f"{change.path}: not one complete sibling test file move")
-        source = befores[change.path]
-        expansion = item_level_expansion(source.words, frozenset(), keywords)
-        if expansion is not None:
-            raise MoveRefused(f"{change.path} has {expansion}")
-        if any(word == "mod" and source.words[index + 2:index + 3] == (";",)
-               for index, word in enumerate(source.words)):
-            raise MoveRefused(f"{change.path}: an external child module changes its source directory")
-        old, new = befores[parent], afters[parent]
-        attributes = old.words[declared.start:declared.keyword]
-        candidates = [item for item in new.items if item.kind == "mod" and item.name == declared.name and not item.visibility
-                      and new.words[item.start:item.keyword] == attributes
-                      and new.words[item.keyword + 2:item.keyword + 3] == ("{",)]
-        declaration = word_span(old, declared.start, declared.end)
-        matched = False
-        for item in candidates:
-            body = FileSpan(parent, True, new.spans[item.keyword + 2].end, new.spans[item.end - 1].start)
-            wrapper = word_span(new, item.start, item.end)
-            if region_shape(change_text(new, body)) != region_shape(change.before):
-                continue
-            expected = edited_text(old.text, (replace(declaration, text=change_text(new, wrapper)),))
-            if region_shape(expected) != region_shape(new.text):
-                continue
-            moves.append(ItemMove("mod", declared.name, FileSpan(change.path, False, 0, len(change.before)), wrapper, None))
-            module_lines.append(declaration)
-            parents.add(parent)
-            matched = True
-            break
-        if not matched:
-            raise MoveRefused(f"{change.path}: the complete test file does not replace its module declaration")
-    if not moves or any(change.path not in parents and change.path not in {move.source.path for move in moves}
-                        or change.path in parents and change.status != FileStatus.MODIFIED for change in changes):
-        raise MoveRefused("the change contains edits outside the test file moves")
-    return ItemMoves(tuple(moves), (), (), tuple(module_lines), ())
 
 
 def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:
@@ -3821,7 +3649,7 @@ def configured(words: tuple[str, ...], start: int, end: int, inner: bool) -> boo
 
 
 def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
-                 texts: Mapping[str, MoveText], root_file: str = "") -> str | None:
+                 texts: Mapping[str, MoveText]) -> str | None:
     """Why the crate does not compile the module's file plainly in the tree of texts, or None.
 
     Each module on the path from the crate root needs a `mod <name>;` line in its parent's file whose attributes are
@@ -3830,10 +3658,6 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
     """
     files = crate_files(sources, crate, tuple())
     files.update({path: text.scope.module for path, text in texts.items()})
-    if root_file:
-        directory = PurePosixPath(root_file).parent
-        files = {path: () if path == root_file else crate_module(path, directory) for path in files}
-        files = {path: owner for path, owner in files.items() if owner != () or path == root_file}
     for size in range(len(module) + 1):
         declared = False
         for path, file_module in files.items():

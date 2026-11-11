@@ -710,6 +710,58 @@ class SeparateItemMove:
     """The repository has no single declaration for the sibling test file."""
 
 
+def sibling_test_file_destinations(sources: style_footprint.RevisionTree) -> dict[str, TestFileDestination]:
+    """Find test files with one supported declaration in the reached source files."""
+    destinations: dict[str, list[TestFileDestination]] = {}
+    test_attribute = ("#", "[", "cfg", "(", "test", ")", "]")
+    for file in sorted(sources.paths):
+        if not file.endswith(".rs"):
+            continue
+        try:
+            spans = style_footprint.token_spans(sources.text(file))
+            if any(span.token.kind == "unknown" for span in spans):
+                continue
+            words = tuple(span.token.value for span in spans)
+            items = style_footprint.source_items(words)
+            if items is None:
+                continue
+            modules = tuple(item for item in items if item.kind == "mod")
+            if not modules:
+                continue
+            crate = sources.crate(file)
+            module = style_footprint.file_module(file, crate, sources)
+            if (isinstance(module, style_footprint.OutsideCrate)
+                    or style_footprint.module_chain(module, sources, crate, {}) is not None):
+                continue
+            parent = PurePosixPath(file)
+            for item in modules:
+                if item.visibility or words[item.keyword + 2:item.end] != (";",):
+                    continue
+                attributes = words[item.start:item.keyword]
+                parts = tuple(attributes[begin:end] for begin, end in style_footprint.attribute_spans(attributes))
+                if (len(parts) not in (1, 2) or parts.count(test_attribute) != 1
+                        or tuple(word for part in parts for word in part) != attributes):
+                    continue
+                paths = tuple(part for part in parts if part != test_attribute)
+                if paths:
+                    part = paths[0]
+                    literal = (re.fullmatch(r'"([^"/\\]+)"', part[4])
+                               if len(part) == 6 and part[:4] == ("#", "[", "path", "=") and part[-1] == "]" else None)
+                    if literal is None:
+                        continue
+                    source = parent.parent / literal[1]
+                else:
+                    directory = parent.parent if parent.name in {"mod.rs", "lib.rs", "main.rs"} else parent.with_suffix("")
+                    source = directory / (item.name + ".rs")
+                path = str(source)
+                if source.name.endswith("_tests.rs") and path in sources.paths:
+                    destinations.setdefault(path, []).append(TestFileDestination(file, item.name))
+        except (style_footprint.MoveRefused, style_footprint.FootprintError, style_footprint.CheckCouldNotRun,
+                UnicodeError, IndexError, ValueError):
+            continue
+    return {path: choices[0] for path, choices in destinations.items() if len(choices) == 1}
+
+
 @dataclass(frozen=True)
 class FoldedTestFile:
     rule: str
@@ -4938,10 +4990,7 @@ class Ledger:
         tip = self._tip(anchor or "HEAD")
         if tip.commit not in self._test_file_destinations:
             tree = style_footprint.RevisionTree(self.repo, tip.commit)
-            self._test_file_destinations[tip.commit] = {
-                declaration.path: TestFileDestination(declaration.file, declaration.item.name)
-                for declaration in style_footprint.eligible_test_file_declarations(tree)
-            }
+            self._test_file_destinations[tip.commit] = sibling_test_file_destinations(tree)
         return self._test_file_destinations[tip.commit].get(finding.path, SeparateItemMove())
 
     def _fold_test_file_group(self, findings: tuple[HeldFinding, ...]) -> tuple[FoldedTestFile, ...]:

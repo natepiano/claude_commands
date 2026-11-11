@@ -178,17 +178,15 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 
 Filing folds modules findings from a sibling `*_tests.rs` file under one rule.
 The repository tree supplies the declaring file and module name.
-The fold and the proof share `eligible_test_file_declarations`.
-An eligible file has one private `#[cfg(test)] mod x_tests;` declaration with no other attribute.
-The declaration is a top-level item in a reached `mod.rs` or `lib.rs`.
-The existing crate-root walk proves reach.
-The plain module rule selects the sibling file.
-The scan reads every Rust file in the crate and module declarations at every depth.
-A module with `path` or `cfg_attr` makes the crate unresolved.
-A nested external module or an unreadable file also makes the crate unresolved.
-An unresolved crate gives no source.
-The item findings remain for normal review.
-The proof keeps the same private header, module name, complete body, and other declaring-file content.
+The ledger resolves top-level private `#[cfg(test)] mod name;` declarations in files that the crate-root walk reaches.
+A declaration can also have one `#[path = "filename"]` attribute.
+The literal names a file in the declaring file's directory.
+No other attribute is allowed.
+Without `path`, `mod.rs`, `lib.rs`, and `main.rs` use their own directory.
+Another declaring file `foo.rs` uses the `foo/` directory.
+The fold needs exactly one supported declaration of the sibling test file.
+Other forms give no source and keep their item findings.
+A whole-file move gives no item-move proof and requires normal review.
 The ledger reads the finding's anchor commit, or HEAD when no anchor exists.
 The finding prose does not select the destination.
 The ledger stores one whole-file move and keeps the item rows as withdrawn duplicates.

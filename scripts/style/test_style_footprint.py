@@ -1996,16 +1996,16 @@ class StyleFootprintTests(unittest.TestCase):
         assert isinstance(result, style_footprint.NoItemMoves)
         self.assertIn(reason, result.reason)
 
-    def test_a_whole_sibling_test_file_moves_into_its_parent_inline_module(self) -> None:
+    def test_whole_sibling_test_file_moves_require_normal_review(self) -> None:
         source = "// Keep the fixture comment.\nuse super::*;\nconst LIMIT: usize = 3;\n"
         source += "#[test]\nfn first() { assert_eq!(LIMIT, 3); }\n#[test]\nfn second() { assert!(LIMIT > 0); }\n"
-        for name, edit, proven in (("widget_tests", "", True), ("tests", "", False),
-                                    ("widget_tests", "body", False), ("widget_tests", "parent", False),
-                                    ("widget_tests", "cfg", False), ("tests", "reference", False),
-                                    ("tests", "existing", False), ("file_tests", "path", False),
-                                    ("file_tests", "path-first", False), ("widget_tests", "plain", False),
-                                    ("widget_tests", "attributes", False), ("file_tests", "path-child", False),
-                                    ("file_tests", "path-nested-child", False)):
+        for name, edit in (("widget_tests", ""), ("tests", ""),
+                                    ("widget_tests", "body"), ("widget_tests", "parent"),
+                                    ("widget_tests", "cfg"), ("tests", "reference"),
+                                    ("tests", "existing"), ("file_tests", "path"),
+                                    ("file_tests", "path-first"), ("widget_tests", "plain"),
+                                    ("widget_tests", "attributes"), ("file_tests", "path-child"),
+                                    ("file_tests", "path-nested-child"), ("widget_tests", "other-loader")):
             with self.subTest(name=name, edit=edit):
                 case = StyleFootprintTests()
                 case.setUp()
@@ -2035,6 +2035,10 @@ class StyleFootprintTests(unittest.TestCase):
                         content = source.replace("use super::*;", "use super::Thing;")
                         parent += "pub struct Thing;\n#[cfg(test)]\nmod tests {\nuse super::Thing;\nfn previous() {}\n}\n"
                     case.write("src/lib.rs", "mod widget;\n")
+                    if edit == "other-loader":
+                        case.write("other/Cargo.toml", '[package]\nname = "other"\nversion = "0.1.0"\nedition = "2021"\n')
+                        case.write("other/src/lib.rs",
+                                   '#[cfg(test)] #[path = "../../src/widget/widget_tests.rs"] mod shared_tests;\n')
                     case.write(parent_path, parent)
                     case.write("src/widget/widget_tests.rs", content)
                     base = case.commit()
@@ -2054,78 +2058,10 @@ class StyleFootprintTests(unittest.TestCase):
                     changes = style_footprint.changes_between(case.repo, base, head)
                     tree = style_footprint.RevisionTree(case.repo, base)
                     result = style_footprint.prove_item_moves(changes, tree)
-                    if proven:
-                        self.assertIsInstance(result, style_footprint.ItemMoves, result)
-                        self.assertEqual(style_footprint.moved_files(changes, tree),
-                                         frozenset({"src/widget/widget_tests.rs", parent_path}))
-                    else:
-                        self.assertIsInstance(result, style_footprint.NoItemMoves, result)
-                finally:
-                    case.doCleanups()
-
-    def test_test_file_inlining_uses_one_narrow_declaration_rule(self) -> None:
-        header = "#[cfg(test)] "
-        for declaration, parent, other, visibility, proven in (
-                (header + "mod widget_tests;", "src/widget/mod.rs", "", "", True),
-                (header + "mod widget_tests;", "src/lib.rs", "", "", True),
-                (header + "mod widget_tests;", "src/widget.rs", "", "", False),
-                ("mod widget_tests;", "src/lib.rs", "", "", False),
-                (header + "pub mod widget_tests;", "src/lib.rs", "", "", False),
-                (header + "mod widget_tests;", "src/lib.rs", "", "pub ", False),
-                (header + "mod widget_tests;", "src/lib.rs", "", "pub(crate) ", False),
-                (header + "mod widget_tests;", "src/lib.rs",
-                 '#[cfg_attr(all(), path = "widget_tests.rs")] mod alias;', "", False),
-                (header + "mod widget_tests;", "src/lib.rs",
-                 '#[path = "."] mod alias { mod widget_tests; }', "", False),
-                (header + "mod widget_tests;", "src/lib.rs", "mod alias { mod widget_tests; }", "", False),
-                (header + "mod widget_tests;", "src/lib.rs", "mod widget_tests;", "", True),
-                (header + "mod widget_tests;", "src/lib.rs", "mod;", "", False),
-                (header + '#[path = "widget_tests.rs"] mod widget_tests;', "src/lib.rs", "", "", False),
-                ('#[cfg_attr(all(), path = "other_tests.rs")] mod widget_tests;', "src/lib.rs", "", "", False),
-                ('#[path = "widget_tests.rs"] #[path = "other.rs"] mod widget_tests;', "src/lib.rs", "", "", False),
-                ('#[path = 17] mod widget_tests;', "src/lib.rs", "", "", False)):
-            with self.subTest(declaration=declaration, parent=parent, other=other, visibility=visibility):
-                case = StyleFootprintTests()
-                case.setUp()
-                try:
-                    content = "fn moved_fixture() {}\n"
-                    if parent != "src/lib.rs":
-                        case.write("src/lib.rs", "mod widget;\n")
-                    case.write(parent, declaration + "\n" + ("mod other;\n" if other else ""))
-                    if other:
-                        case.write("src/other.rs", other + "\n")
-                    source = "src/widget/widget_tests.rs" if parent != "src/lib.rs" else "src/widget_tests.rs"
-                    case.write(source, content)
-                    base = case.commit()
-                    tree = style_footprint.RevisionTree(case.repo, base)
-                    declarations = style_footprint.eligible_test_file_declarations(tree)
-                    eligible = proven or bool(visibility)
-                    self.assertEqual(any(item.path == source for item in declarations), eligible)
-                    _ = case.git("rm", source)
-                    case.write(parent, header + visibility + "mod widget_tests {\n" + content + "}\n"
-                               + ("mod other;\n" if other else ""))
-                    head = case.commit()
-                    changes = style_footprint.changes_between(case.repo, base, head)
-                    result = style_footprint.prove_item_moves(changes, tree)
-                    self.assertIsInstance(result, style_footprint.ItemMoves if proven else style_footprint.NoItemMoves, result)
-                finally:
-                    case.doCleanups()
-
-    def test_test_file_eligibility_excludes_binary_and_unreached_declarations(self) -> None:
-        for package_setting in ("", "autobins = false\n"):
-            with self.subTest(package_setting=package_setting):
-                case = StyleFootprintTests()
-                case.setUp()
-                try:
-                    case.write("Cargo.toml", '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n' + package_setting)
-                    case.write("src/lib.rs", "")
-                    case.write("src/bin/tool.rs", "#[cfg(test)] mod widget_tests;\n")
-                    case.write("src/bin/widget_tests.rs", "fn binary_fixture() {}\n")
-                    case.write("src/orphan/mod.rs", "#[cfg(test)] mod orphan_tests;\n")
-                    case.write("src/orphan/orphan_tests.rs", "fn orphan_fixture() {}\n")
-                    base = case.commit()
-                    tree = style_footprint.RevisionTree(case.repo, base)
-                    self.assertEqual(style_footprint.eligible_test_file_declarations(tree), ())
+                    self.assertIsInstance(result, style_footprint.NoItemMoves, result)
+                    self.assertEqual(style_footprint.moved_files(changes, tree), frozenset())
+                    if not edit and name == "widget_tests":
+                        _ = case.assert_review(base, head)
                 finally:
                     case.doCleanups()
 
