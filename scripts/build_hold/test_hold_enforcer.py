@@ -172,7 +172,7 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(row["stopped_run"], {"pid": 10, "proc_start": "11000"})
         self.assertEqual(row["session"], "waiting-owner")
 
-        def notify(entry: build_hold.ReleaseEntry, socket: str) -> build_hold.ReleaseDelivered:
+        def notify(entry: build_hold.ReleaseEntry, socket: str, _notice: str) -> build_hold.ReleaseDelivered:
             self.assertEqual(socket, "/private/socket")
             notices.append(entry["session_id"])
             return build_hold.ReleaseDelivered()
