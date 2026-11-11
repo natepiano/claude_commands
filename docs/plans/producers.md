@@ -113,53 +113,26 @@ dwight=claude:fable:high
 
 **Depends on:** Phase 3
 
-Moved out of phase 3 by the hard landing rule (repair rounds 6 and 7), with sdlc's go [03774015]. Findings F009, F014, F015, F017 and F018 of phase 3.
+#### As-built
 
-#### Work Order
-
-**Goal:** a repeated group move or workers swap starts every producer that the first run stopped and did not bring up, also when the producer exited early after its `home` was written.
-
-**Spec:**
-
-1. Today the move writes the target `home` before the move confirms the start. A producer that exits in that window keeps the target `home`, so a rerun skips it and reports success with zero sessions.
-2. A rerun selects each eligible stopped producer, also when its saved `home` already matches the target. It skips only a producer verified live on the target account. Unknown liveness is an explicit failure. Keep the pause and machine limits. `home` is account data, not proof that a move finished.
-3. Producers use the same selection code as units and showrunners. Only the family and model come from `[producers]`.
-4. Correct the `source unavailable` row in `RestartTests.test_saved_tab_reuses_only_the_targets_shell_and_splits_beside_a_sibling` (`scripts/agents/test_restart.py`). Its destination-close mock always returns False. Make the callback record and perform the fixture close. Require zero destination close calls when the source is unavailable.
-5. Add a row to the existing group move test in `scripts/agents/test_account_move.py`: the first move writes the target `home`, then start confirmation fails; a repeated move makes another start attempt. Keep the Codex swap row in `scripts/accounts/test_accounts.py` as a control. Each new row fails on the phase 3 code.
-6. Delete the producer-only branches that the shared path can carry (F017):
-   - `stop_resume.py` move check (near line 1235): a unit or showrunner with no matching tab skips the target-account check and reaches `_stop`; only a producer gets the check. Use one rule for all rows.
-   - `member_account.py` `repair_home` (near line 41) repairs only producer homes.
-   - `stop_resume.py` (near line 921) keeps a producer-only `home` write condition.
-   - `restart.py` `producer_resume` (near line 186) repeats the saved policy, remote-control and plugin handling of `pane_record.resume_arguments`.
-   Only the family and model come from `[producers]`. Add rows to the existing tests for units and showrunners with no matching tab.
-7. Correct the Codex row in `StopResumeTests.test_own_empty_pane_executes_the_saved_launch` (`scripts/agents/test_stop_resume.py`). Its fake `os.execvpe` publishes a binding, and its `SystemExit` runs the contract cleanup; a real exec does neither. Model a successful exec with no launch publication and no Python cleanup after the exec. Verify the next resume from the state that the real exec leaves (F018).
-
-**Constraints from prior phases:**
-- `home` records an account. It does not prove that a start finished.
-- `pane_launch.write` owns retained producer bindings.
-- `pane_launch.producer_start` owns start-contract writes.
-- Keep the source and destination session qualification during a pane close.
-- Keep a committed destination when the source inspection or close fails.
+- A repeated group move or workers swap selects each eligible stopped producer, also when its `home` already names the target. It skips a member only when the member is verified live on the target account.
+- `stop_resume.LiveAccountUnproved` (a `ResumeFailed`) marks a live process whose account cannot be read. A move turns it into `StopFailed` ("live process account is unreadable") with no stop, no start and no `home` change.
+- Live units and showrunners keep their earlier group-move selection. `eligible_producers` limits only producers.
+- Producers, units and showrunners share one move check, one `member_account.repair_home` and one `home` write rule. `set_home` runs only when the home changes.
+- `restart.producer_resume` takes only the family and model from `[producers]` and builds the rest with `pane_record.configured_resume_arguments`. `pane_launch` reads `--effort` as an option with a value.
 
 **Files:**
-- `scripts/accounts/accounts.py` — rerun selection
-- `scripts/agents/stop_resume.py` — move start confirmation, `home` write order, the shared move check
-- `scripts/agents/member_account.py` — shared `repair_home`
-- `scripts/agents/restart.py` — shared resume arguments
-- `scripts/agents/pane_record.py` — shared `resume_arguments`
-- `scripts/herdr/pane_launch.py` — existing publication and start-contract ownership
-- `scripts/agents/test_stop_resume.py` — rows and the exec fixture
-- `scripts/agents/test_account_move.py` — rows
-- `scripts/accounts/test_accounts.py` — rows
-- `scripts/agents/test_restart.py` — the F007 row
-- `scripts/agents/test_pane_record.py` — retained argument rows
-- `scripts/herdr/test_pane_launch.py` — publication rows, when `pane_launch.py` changes
+- `scripts/accounts/accounts.py` — `group_move_members` selection
+- `scripts/agents/stop_resume.py` — `LiveAccountUnproved`, the shared move check, `home` writes on change only
+- `scripts/agents/member_account.py` — `repair_home` for every row kind
+- `scripts/agents/restart.py`, `scripts/agents/pane_record.py` — shared resume arguments
+- `scripts/herdr/pane_launch.py` — `--effort` value flag
 
-**Workers:** 1 writer.
+**Binds later work:** `stop_resume.resume` returns `LiveAccountUnproved` for a live Codex producer whose process account cannot be read; that producer is live.
 
-**State:** the existing row `home`, the retained launch binding and the transient start contract. Add no new persistent state.
-
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
+**Gotchas:**
+- A test row for a live member needs process evidence in the fake herdr. A unit row needs a parent showrunner row.
+- A fake `os.execvpe` runs the exit callback only in the forked child; the parent fails on a second exec.
 
 ### Phase 4 — A herdr restart and a reboot bring the producers back  · status: pending
 
@@ -183,6 +156,7 @@ Moved out of phase 3 by the hard landing rule (repair rounds 6 and 7), with sdlc
 
 **Constraints from prior phases:**
 - Phase 3 gives the account choice, the `[producers]` launch settings, the same conversation and the producer tab. Phase 3a gives the one shared resume and move path. Add the automatic start through that path only.
+- `stop_resume.resume` returns `LiveAccountUnproved` (a `ResumeFailed`) for a live Codex producer whose process account cannot be read. The producer is live: report it and start nothing. A resume in the same pane on an unchanged account writes no staff `home`.
 - Start admitted staff rows only. Phase 5 owns a first start.
 - Keep the difference between a stopped and an unknown liveness. Reuse the existing liveness evidence and launch functions.
 - Add no new checks and no stored failure record.
