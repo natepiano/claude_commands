@@ -119,6 +119,19 @@ class OwningSessionTests(IsolatedBuildHoldTest):
         }):
             self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
 
+    def test_run_resolution_names_the_owner_or_the_missing_run(self) -> None:
+        identity = fixture_runtime_id("run-owner")
+        self.owner(identity, self.unit_run)
+        missing = self.scratch / "missing-run"
+        cases: tuple[tuple[dict[str, str], build_hold.RunOwner | build_hold.NoRunNamed | build_hold.RunNotInStaff], ...] = (
+            ({"UNIT_RUN_DIR": str(self.unit_run)}, build_hold.RunOwner(identity)),
+            ({}, build_hold.NoRunNamed()),
+            ({"UNIT_RUN_DIR": str(missing)}, build_hold.RunNotInStaff(missing)),
+        )
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                self.assertEqual(build_hold.run_resolution(environment), expected)
+
     def test_no_run_uses_shell_session_without_staff_lookup(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):

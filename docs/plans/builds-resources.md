@@ -1923,6 +1923,10 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Depends on:** Phase 100, queue's 10d (landed 2026-11-10, e9fe34ff1), natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
 
+**Answers (2026-11-11):**
+- Runner activation: builds reported at 08:03 EST that the user ran `restart_admission_socket.sh`. The socket is `natepiano:build-admission 0660`, the admission health check is valid, and `hana-linux-1` and `hana-linux-2` connect.
+- Key deletion: the user, via builds: "yes — delete the hana CI memory margin key ci_memory_margin_gib."
+
 #### Work Order
 
 **Goal:** A registered CI job is charged only through its reservation. The fixed CI margin is gone.
@@ -2219,3 +2223,66 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_hold/test_hold_enforcer.py` — the stop test with earlier log lines.
 
 **Gotchas:** an open through `/proc/<pid>/fd/N` makes a new open file description at offset 0; only `O_APPEND` puts a write at the end of a regular file.
+
+### Phase 103 — A build that cannot name its run says so while it waits on a hold  · status: done
+
+**Depends on:** none. Source: builds on 2026-11-11, from a hana request. On 11-11 an fps worker build (`verify.sh`) waited 51 min on fps's own natedev hold. The fps staff row had lost its open-run pointer, so the wait found no owning session, and nothing told anyone. sdlc hierarchies fixes the pointer loss; this phase makes the next loss visible.
+
+#### Work Order
+
+**Goal:** When `wait-local` waits on a hold and cannot resolve the build's run or session, it says so in one line, once per wait, to the build's caller and to the holder.
+
+**Spec:**
+
+1. **The run resolution, in one place.** `build_hold.owning_session(environment)` (`scripts/build_hold/build_hold.py:360`) reads the run folder from `UNIT_RUN_DIR`, `PLAN_DELEGATE_BOARD_DIR`, `UNIT_SESSION_DIR` or `PLAN_DELEGATE_SESSION_DIR`, finds the staff row whose `OpenRun` path matches, and else falls back to `CLAUDE_CODE_SESSION_ID`. Move the run half into a new `run_resolution(environment) -> RunOwner | NoRunNamed | RunNotInStaff` beside it: `RunOwner(session_id)` for a matched row, `NoRunNamed()` when no run variable is set, `RunNotInStaff(run: Path)` when a run is named and no staff row holds it (an unreadable staff snapshot counts as no row, as now). `owning_session` calls it and keeps its return type and behavior byte for byte. Use frozen dataclasses, like `OwningSession`.
+2. **The unresolved cases.** In `command_wait_local` (`scripts/build_targets/build_targets.py:971`), when `blocking` is a `Holder` (line 1026), the build is unresolved when `run_resolution()` is `RunNotInStaff`, or when the owner is `NoOwningSession`. A resolved owner prints nothing new.
+3. **The line.** Print it once per wait, on stderr, right after the existing `natedev is held by …` announcement:
+   - `RunNotInStaff`: `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.`
+   - `NoOwningSession` with no run named: `<speaker>: build has no session; waits on <holder> hold for <purpose>.`
+   `<speaker>` is `speaker(caller)`. Pass names and the run path through `display_field`, as the announcement does.
+4. **The holder.** Send the same line, once per wait, to the holder: `session_send.send_argv("--to", f"session:{blocking.key}", "--text", <line>)` (the release notice's path, `build_hold.py` `send_release`). The send is best-effort: a failed or refused send prints one stderr line `<speaker>: could not tell <holder>: <reason>` and the wait goes on. A send never ends the wait or changes its exit status.
+5. **Proof.** One test row per case:
+   - `scripts/build_hold/test_build_hold.py`: next to `test_no_matching_staff_run_falls_back_to_shell_session` (:114), assert `run_resolution` for a matched run, no run, and an unmatched run (`RunNotInStaff(run)`). The existing `owning_session` tests stay unchanged and pass.
+   - `scripts/build_targets/test_build_targets.py`: with a hold in force by another session, run `wait-local` (the pattern of `test_holder_session_verify_waits_while_another_hold_is_in_force`, :1274) with `UNIT_RUN_DIR` set to a run that no staff row holds. Assert the stderr line once across two polls, and one send to `session:<holder key>` with the same text (patch the send at its call boundary). A second row: a resolved owner prints no such line and sends nothing. A third row: a failed send prints the `could not tell` line and the wait still returns 0 at the release.
+6. **Docs.** `docs/as-built/build-targets.md`: add the line to the `wait-local` row (:62) and name `run_resolution` beside `owning_session` (:91).
+
+**Files:**
+- `scripts/build_hold/build_hold.py`
+- `scripts/build_hold/test_build_hold.py`
+- `scripts/build_targets/build_targets.py`
+- `scripts/build_targets/test_build_targets.py`
+- `docs/as-built/build-targets.md`
+
+**Workers:** `1 writer`
+- `impl` owns all five files.
+
+**State:** none.
+
+**Gate:** the targeted test; `scripts/build_hold/test_build_hold.py` and `scripts/build_targets/test_build_targets.py` pass; and `basedpyright` 0/0/0 on the four Python files and each caller module of `owning_session` (`scripts/mac_test/claim_state.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/mac_test.py`).
+
+**Change-Review:** A build that waits on a natedev hold and cannot name its run says so | In any session on natedev, run a test through verify.sh from a worker whose run has no staff pointer while another session holds natedev | verify.sh prints `build has no run pointer (...); waits on <holder> hold for <purpose>.` once, and the holder gets the same line
+
+### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: todo
+
+**Source:** builds 2026-11-11, from natedev. fps took and released three holds from 12:33 to 12:56 UTC. Each release sent the same text, `/build:hold: the build hold has been released …`, to session dea51c3e. The send-repeat guard held the later copies, so a stopped session can miss its release.
+
+#### Work Order
+
+**Goal:** Each release notice is a distinct message: it names the hold's purpose and its start time.
+
+**Spec:**
+
+1. **The text.** `send_release` (`scripts/build_hold/build_hold.py:1469`) and `send_release_broadcast` (:1483) add the released hold to `RELEASE_NOTICE`: `<holder> hold for <purpose>, from <HH:MM zone>`. The time is in the user zone (`scripts/lib/user_zone.py`). A cycle with more than one holder names each one.
+2. **The record.** The hold cycle keeps each holder's purpose beside `since` (`HoldCycle.holders`, :69; written at :1405 and in the recovery at :1348), because the holder file is gone at release. A cycle saved before this change has no purpose: the notice then names the holder and its start time only.
+3. **Proof.** Add rows to the existing release notice tests in `scripts/build_hold/test_build_hold.py` (:1197): two releases of two holds in one session give two different texts; each text names the purpose and start time; an old cycle with no purpose still sends.
+
+**Files:**
+- `scripts/build_hold/build_hold.py`
+- `scripts/build_hold/test_build_hold.py`
+- `docs/as-built/build-targets.md` (the release notice text)
+
+**Workers:** `1 writer`.
+
+**Gate:** the targeted test; `scripts/build_hold/test_build_hold.py` passes; `basedpyright` 0 warnings on the changed files (the import cycles go in their own phase).
+
+**Change-Review:** Two hold releases in a row both reach a waiting session | Take and release two natedev holds with different purposes while a session waits | The session gets two release notices, each naming its hold's purpose and start time
