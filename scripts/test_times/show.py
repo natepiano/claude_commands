@@ -367,7 +367,7 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
                 output, f"no tests recorded matching {text}")
 
 
-TREND_CACHE_VERSION = 2
+TREND_CACHE_VERSION = 3
 TREND_CACHE_NAME = "gate-trend.json"
 TREND_HEADERS = ["day", "runs", "CPU mean", "CPU p95", "wall mean", "wall p95",
                  "cost mean", "cost p95", "cost total"]
@@ -383,7 +383,7 @@ class TrendRun:
     cpu_s: float
     wall_s: float
     modules: int
-    cost: Decimal | CostNotRecorded
+    run_id: str
 
 
 @dataclass(frozen=True)
@@ -391,7 +391,7 @@ class TrendDay:
     place: str
     selection: str
     cells: tuple[str, ...]
-    uncosted_runs: int = 0
+    run_ids: tuple[str, ...]
 
 
 @dataclass
@@ -410,7 +410,7 @@ def read_trend_cache() -> TrendCache:
         days = cast(dict[str, list[dict[str, object]]], document["days"])
         return TrendCache(zone, float(str(document["completed_refresh_started_at"])), {
             day: [TrendDay(str(row["place"]), str(row["selection"]),
-                           tuple(cast(list[str], row["cells"])), int(str(row["uncosted_runs"]))) for row in rows]
+                           tuple(cast(list[str], row["cells"])), tuple(cast(list[str], row["run_ids"]))) for row in rows]
             for day, rows in days.items()})
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return TrendCache(zone)
@@ -420,7 +420,7 @@ def write_trend_cache(cache: TrendCache) -> None:
     write_text_atomic(store.root() / TREND_CACHE_NAME, json.dumps({
         "version": TREND_CACHE_VERSION, "zone": cache.zone,
         "completed_refresh_started_at": cache.completed_refresh_started_at,
-        "days": {day: [{"place": row.place, "selection": row.selection, "cells": row.cells, "uncosted_runs": row.uncosted_runs}
+        "days": {day: [{"place": row.place, "selection": row.selection, "cells": row.cells, "run_ids": row.run_ids}
                        for row in rows] for day, rows in cache.days.items()},
     }, sort_keys=True) + "\n")
 
@@ -475,23 +475,17 @@ def trend_day(connection: sqlite3.Connection, day: date,
             continue
         host = str(row["host"])
         place = "aws" if str(row["id"]) in costs or host.startswith("ip-") or "compute.internal" in host else host
-        cost = costs.get(str(row["id"]), CostNotRecorded()) if place == "aws" else CostNotRecorded()
         groups[place, str(row["selection"])].append(TrendRun(
-            float(str(row["cpu_s"])), float(str(row["wall_s"])), int(str(row["modules_run"])), cost))
+            float(str(row["cpu_s"])), float(str(row["wall_s"])), int(str(row["modules_run"])), str(row["id"])))
     output: list[TrendDay] = []
     for (place, selection), runs in sorted(groups.items()):
         cpu = [run.cpu_s for run in runs]
         wall = [run.wall_s for run in runs]
-        charged = [run.cost for run in runs if isinstance(run.cost, Decimal)]
-        costs_text = ["—", "—", "—"]
-        if charged:
-            total = sum(charged, Decimal(0))
-            costs_text = [f"${total / len(charged):.3f}", f"${nearest_rank(charged):.3f}", f"${total:.3f}"]
         cells = [day.isoformat(), str(len(runs)), f"{statistics.mean(cpu):.0f}", f"{nearest_rank(cpu):.0f}",
-                 f"{statistics.mean(wall):.0f}", f"{nearest_rank(wall):.0f}", *costs_text]
+                 f"{statistics.mean(wall):.0f}", f"{nearest_rank(wall):.0f}"]
         if selection == "affected":
             cells.append(f"{statistics.median(run.modules for run in runs):g}")
-        output.append(TrendDay(place, selection, tuple(cells), len(runs) - len(charged) if place == "aws" else 0))
+        output.append(TrendDay(place, selection, tuple(cells), tuple(run.run_id for run in runs)))
     return output
 
 
@@ -523,8 +517,19 @@ def trend(connection: sqlite3.Connection, days: int) -> None:
     for (place, selection), daily_rows in sorted(groups.items()):
         print(f"{place} {selection}")
         headers = TREND_HEADERS + (["median modules run"] if selection == "affected" else [])
-        print_table(headers, [row.cells for row in daily_rows])
-        uncosted = sum(row.uncosted_runs for row in daily_rows)
+        rendered: list[tuple[str, ...]] = []
+        uncosted = 0
+        for row in daily_rows:
+            charged = [cost for run_id in row.run_ids
+                       if place == "aws" and isinstance(cost := costs.get(run_id), Decimal)]
+            costs_text = ("—", "—", "—")
+            if charged:
+                total = sum(charged, Decimal(0))
+                costs_text = (f"${total / len(charged):.3f}", f"${nearest_rank(charged):.3f}", f"${total:.3f}")
+            if place == "aws":
+                uncosted += len(row.run_ids) - len(charged)
+            rendered.append((*row.cells[:6], *costs_text, *row.cells[6:]))
+        print_table(headers, rendered)
         if uncosted:
             print(f"{uncosted} of {sum(int(row.cells[1]) for row in daily_rows)} runs have no cost record.")
 
