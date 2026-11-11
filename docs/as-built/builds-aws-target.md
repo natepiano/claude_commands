@@ -566,6 +566,22 @@ The minimum charge applies once per lifetime.
 The older builder and paired trials use the same daily rate rule.
 Reservations without a region use the highest configured regional rate.
 A region without a usable bill rate uses the configured rate ceiling.
+Completed gates also use bill rates for non-compute costs.
+Public IPv4 and gp3 root storage use regional rates over the gate's actual box hours.
+The root charge uses `root_gib` and the number of hours in the bill's month.
+S3 requests, storage, and outbound transfer use the bill day's totals divided by its gate launch count.
+The ledger charges the S3 share once per gate.
+The hourly charges use each UTC day's rate across midnight.
+These rates use the same bill day rule as compute rates.
+The ledger stores the selected cost and its bill source.
+Paired trials use this booked cost for completed gates.
+Open reservations retain `attempt_allowance_usd`.
+Admission includes these allowances when bills exist.
+An own-day bill corrects saved estimates that still include configured allowances.
+The bill remains the minimum cost for its reconciliation period.
+Missing cost rows contribute zero.
+The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
+The spending limits do not change.
 
 The prices command prints regional Spot prices without resource identities.
 `down` searches configured regions and regions in the saved manifest and stack records.
