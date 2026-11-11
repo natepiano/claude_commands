@@ -14,7 +14,7 @@ __unittest = True
 
 import json
 import os
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -51,8 +51,14 @@ class NoOpenTest:
 
 
 @dataclass(frozen=True)
+class NoConfigReadLog:
+    """The isolated project has no config reader to record its reads."""
+
+
+@dataclass(frozen=True)
 class TimesOutput:
     path: Path
+    config_log: Path | NoConfigReadLog
 
 
 @dataclass(frozen=True)
@@ -296,7 +302,7 @@ def fixture_label(label: str) -> str:
 
 
 def write_times(path: Path, result: TimedResult, wall_s: float,
-                fixtures: list[FixtureMeasure]) -> None:
+                fixtures: list[FixtureMeasure], config_reads: Sequence[str] | NoConfigReadLog) -> None:
     """Replace the output file without changing the test result on failure."""
     temporary = ""
     try:
@@ -320,6 +326,8 @@ def write_times(path: Path, result: TimedResult, wall_s: float,
             "tests": tests,
             "fixtures": fixtures,
         }
+        if not isinstance(config_reads, NoConfigReadLog):
+            times["config_reads"] = sorted(set(config_reads))
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=f".{path.name}.", delete=False) as handle:
             temporary = handle.name
@@ -347,17 +355,37 @@ class TimedRunner(unittest.TextTestRunner):
             result = super().run(test)
         wall_s = time.perf_counter() - _STARTED_AT
         if isinstance(self.destination, TimesOutput):
-            write_times(self.destination.path, cast(TimedResult, result), wall_s, fixtures)
+            log = self.destination.config_log
+            reads = log.read_text(encoding="utf-8").splitlines() if isinstance(log, Path) else log
+            write_times(self.destination.path, cast(TimedResult, result), wall_s, fixtures, reads)
         return result
 
 
 def main() -> None:
+    try:
+        from scripts.lib import conf_reads
+    except ImportError:
+        from importlib.util import find_spec
+
+        if find_spec("scripts.lib.conf_reads") is not None:
+            raise
+        run_module(NoConfigReadLog())
+        return
+
+    with tempfile.TemporaryDirectory(prefix="config-reads-") as temporary:
+        log = Path(temporary) / "reads"
+        log.touch()
+        with conf_reads.record_reads(log):
+            run_module(log)
+
+
+def run_module(config_log: Path | NoConfigReadLog) -> None:
     if len(sys.argv) != 3:
         print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
         sys.exit(2)
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
-    TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output))
+    TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
     try:
         names: list[str] = []
         for path in sorted(Path(start_dir).resolve().glob(pattern)):

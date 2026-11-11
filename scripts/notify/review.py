@@ -33,7 +33,7 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-from scripts.lib import nix_env
+from scripts.lib import conf_reads, nix_env
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -57,7 +57,7 @@ EXPIRY_KEYS_FILE = Path.home() / ".config/pushover/env"
 def review_timeout_seconds() -> float:
     """Read the reviewer limit once; configuration faults use the 60 s default."""
     try:
-        contents = NOTIFY_CONFIG.read_text(encoding="utf-8")
+        contents = conf_reads.read_text(NOTIFY_CONFIG)
         for line in contents.splitlines():
             key, separator, value = line.partition("#")[0].partition("=")
             if separator and key.strip() == "REVIEW_TIMEOUT_SECONDS":
