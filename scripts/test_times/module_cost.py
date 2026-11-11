@@ -87,9 +87,13 @@ class ModuleCost:
                 seconds(self.wall_s), status]
 
 
-def measure(tree: Path, module: str, strace: str) -> ModuleCost:
+def runner_command(tree: Path, module: str) -> list[str]:
     folder, filename = module.rsplit("/", 1)
-    command = [sys.executable, str(Path(__file__).with_name("module_run.py")), f"scripts/{folder}", filename]
+    return [sys.executable, str(tree / "scripts/test_times/module_run.py"), f"scripts/{folder}", filename]
+
+
+def measure(tree: Path, module: str, strace: str) -> ModuleCost:
+    command = runner_command(tree, module)
     environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
     with tempfile.TemporaryDirectory(prefix="module-cost-") as temporary:
         root = Path(temporary)
@@ -163,9 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
         _ = environment.pop("TEST_TIMES_OUT", None)
         for cost in costs:
-            folder, filename = cost.module.rsplit("/", 1)
-            command = [sys.executable, str(Path(__file__).with_name("module_run.py")),
-                       f"scripts/{folder}", filename]
+            command = runner_command(request.tree.resolve(), cost.module)
             tasks = task_cpu.measure(command, cwd=request.tree.resolve(), environment=environment)
             print_table([cost.module + " command", "starts", "CPU s"],
                         [[row.command, str(row.starts), seconds(row.cpu_s)]

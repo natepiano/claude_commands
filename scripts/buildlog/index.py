@@ -30,9 +30,12 @@ from urllib.parse import quote
 from scripts.buildlog import store, parse
 
 from scripts.lib import conf
-from scripts.test_times.gate_record import TYPE_CHECK_JOB, RecordedConfigReads, RecordedFolderScans, module_read_record
+from scripts.test_times.gate_record import (
+    TYPE_CHECK_JOB, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
+    folder_scan_strings, module_read_record,
+)
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 
 # These indexes support repeated queries over the current schema.
@@ -231,6 +234,7 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("tests_s", "REAL", "sum of all test times"),
     ("config_reads", "TEXT", "sorted JSON config stems; [] records no reads, NULL means no record"),
     ("folder_scans", "TEXT", "sorted JSON repository folders; [] records no scans, NULL means no record"),
+    ("content_reads", "TEXT", "sorted JSON repository file reads; [] records no reads, NULL means no record"),
 ]
 
 GATE_TEST_COLUMNS: list[Column] = [
@@ -953,11 +957,12 @@ def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src:
     for suite_row in entries(record, "suites"):
         insert(connection, "gate_suites", pick({**suite_row, **parent}, GATE_SUITE_COLUMNS))
     for module in module_rows:
-        reads = module_read_record(module.get("config_reads"), module.get("folder_scans"))
+        reads = module_read_record(module.get("config_reads"), module.get("folder_scans"), module.get("content_reads"))
         config_reads = json.dumps(sorted(reads.config_reads.stems)) if isinstance(reads.config_reads, RecordedConfigReads) else None
-        folder_scans = json.dumps(sorted(reads.folder_scans.folders)) if isinstance(reads.folder_scans, RecordedFolderScans) else None
+        folder_scans = json.dumps(folder_scan_strings(reads.folder_scans)) if isinstance(reads.folder_scans, RecordedFolderScans) else None
+        content_reads = json.dumps(sorted(reads.content_reads.paths)) if isinstance(reads.content_reads, RecordedContentReads) else None
         insert(connection, "gate_modules", pick({**module, **parent, "config_reads": config_reads,
-                                                "folder_scans": folder_scans}, GATE_MODULE_COLUMNS))
+                                                "folder_scans": folder_scans, "content_reads": content_reads}, GATE_MODULE_COLUMNS))
         owner: GateTestOwner = {
             **parent,
             "suite": module.get("suite"),

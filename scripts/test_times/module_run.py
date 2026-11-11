@@ -23,6 +23,7 @@ from inspect import currentframe
 from pathlib import Path
 import resource
 import signal
+import stat
 import sys
 import tempfile
 from types import FrameType, MethodType, TracebackType
@@ -58,12 +59,13 @@ class NoConfigReadLog:
 
 
 @final
-class RepositoryFolderScans:
-    """Record listings in this checkout without observing child processes."""
+class RepositoryReadAudit:
+    """Record repository listings and file reads in this process."""
 
-    def __init__(self, root: Path, folders: set[str]) -> None:
+    def __init__(self, root: Path, folders: set[str], contents: set[str]) -> None:
         self.roots = tuple(dict.fromkeys((os.path.realpath(root), os.path.abspath(root))))
         self.folders = folders
+        self.contents = contents
         self.process_id = os.getpid()
         self.current_process = os.getpid
         self.decode = os.fsdecode
@@ -74,6 +76,9 @@ class RepositoryFolderScans:
         self.descriptor_path_command = cast(int, getattr(fcntl, "F_GETPATH", 50))
         self.platform = sys.platform
         self.current_frame = currentframe
+        self.file_status = os.stat
+        self.is_regular = stat.S_ISREG
+        self.write_flags = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC | os.O_EXCL
 
     def absolute_path(self, path: str, cwd: str) -> str:
         return self.normalize(path if path.startswith("/") else cwd + "/" + path)
@@ -156,14 +161,31 @@ class RepositoryFolderScans:
         return folders
 
     def __call__(self, event: str, arguments: tuple[object, ...]) -> None:
-        if event not in {"os.scandir", "os.listdir", "subprocess.Popen"}:
+        if event not in {"os.scandir", "os.listdir", "subprocess.Popen", "open"}:
             return
         if self.current_process() != self.process_id:
             return
         try:
-            folders = (self.git_folders(arguments) if event == "subprocess.Popen"
-                       else self.listed_folder(arguments[0], self.current_directory()))
-            if not folders:
+            target = self.folders
+            if event == "open":
+                mode, flags = arguments[1:3]
+                if (not isinstance(flags, int) or flags & self.write_flags
+                        or isinstance(mode, str) and (not mode.startswith("r") or "+" in mode)):
+                    return
+                paths = self.listed_folder(arguments[0], self.current_directory())
+                paths = {path for path in paths if path not in {".", "/"}
+                         and not path.startswith("config/") and "__pycache__" not in path.split("/")}
+                if not paths:
+                    return
+                # Use the original spelling for the existing-file check.
+                if not self.is_regular(self.file_status(cast(str | bytes | os.PathLike[str] | os.PathLike[bytes] | int,
+                                                            arguments[0])).st_mode):
+                    return
+                target = self.contents
+            else:
+                paths = (self.git_folders(arguments) if event == "subprocess.Popen"
+                         else self.listed_folder(arguments[0], self.current_directory()))
+            if not paths:
                 return
             frame: FrameType | None = self.current_frame()
             try:
@@ -173,7 +195,7 @@ class RepositoryFolderScans:
                     frame = frame.f_back
             finally:
                 del frame
-            self.folders.update(folders)
+            target.update(paths)
         except (OSError, ValueError):
             # Observation cannot change a test's result.
             return
@@ -453,6 +475,7 @@ def write_times(path: Path, result: TimedResult, wall_s: float,
         if not isinstance(config_reads, NoConfigReadLog):
             times["config_reads"] = sorted(set(config_reads))
         times["folder_scans"] = sorted(TimedRunner.scanned_folders)
+        times["content_reads"] = sorted(TimedRunner.read_contents)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=f".{path.name}.", delete=False) as handle:
             temporary = handle.name
@@ -474,6 +497,7 @@ class TimedRunner(unittest.TextTestRunner):
     resultclass: Callable[[TestOutput, bool, int], TimedResult] = TimedResult
     destination: ClassVar[TimesOutput | NoTimesOutput] = NoTimesOutput()
     scanned_folders: ClassVar[set[str]] = set()
+    read_contents: ClassVar[set[str]] = set()
 
     @override
     def run(self, test: unittest.TestSuite | unittest.TestCase) -> unittest.TextTestResult:
@@ -525,7 +549,9 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
         if isinstance(TimedRunner.destination, TimesOutput):
             TimedRunner.scanned_folders = set()
-            sys.addaudithook(RepositoryFolderScans(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders))
+            TimedRunner.read_contents = set()
+            sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
+                                                TimedRunner.read_contents))
         suite = unittest.defaultTestLoader.loadTestsFromNames(names)
         result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
         sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
