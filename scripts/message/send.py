@@ -2512,11 +2512,6 @@ def relay(message: Message, timeout: float) -> Result:
     if claude is None:
         return Result("queued", "no claude binary found")
     tools = "SendMessage" if message.to.startswith("uds:") else "SendMessage,ListAgents"
-    command = [claude, "-p", "--model", MODEL, "--permission-mode", PERMISSION_MODE, "--permission-prompts", "none",
-               "--tools", tools, "--allowedTools", tools,
-               "--setting-sources", "user", "--settings", json.dumps({"disableAllHooks": True}),
-               "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
-               "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
@@ -2530,6 +2525,12 @@ def relay(message: Message, timeout: float) -> Result:
         return Result("queued", str(error))
     if not isinstance(selected, accounts.LegacyHomeLaunch):
         env.update(named_account_environment(selected.dir))
+    model = models_registry.claude_model(MODEL, env)
+    command = [claude, "-p", "--model", model, "--permission-mode", PERMISSION_MODE, "--permission-prompts", "none",
+               "--tools", tools, "--allowedTools", tools,
+               "--setting-sources", "user", "--settings", json.dumps({"disableAllHooks": True}),
+               "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
+               "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
     # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
     token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"
