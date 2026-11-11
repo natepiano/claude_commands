@@ -3067,7 +3067,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The report gives process starts, Git starts and local CPU, before and after.
 - Three aws paired rounds show a CPU saving.
 
-### Phase 159 — Eight merge checkpoint test modules keep only the tests that pay their way  · status: todo
+### Phase 159 — Eight merge checkpoint test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
 #### Work Order
