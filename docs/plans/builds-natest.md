@@ -3087,3 +3087,38 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Each listed test module passes; basedpyright reports 0 errors and 0 warnings on each edited file.
 - `phases/156/removed_tests.md` lists every removed test with its reason, and the counts.
 - Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+
+### Phase 157 — The Mac-only verify tests start fewer processes and the offload fixture scans `/proc` once on a clean exit  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_mac_only.py` starts fewer processes, and each test that uses the Mac offload fixture scans `/proc` once fewer on a clean exit. Every test and assertion stays.
+
+**Decision:** Phase 154 research. verify-unit go, 2026-11-11, with one condition on item 2. builds go, 2026-11-11: both items count only when aws pairs show a gain.
+
+**Spec:**
+1. In `scripts/direct/test_verify_mac_only.py`, change `test_mac_failure_keeps_runner_status` (line 306) and `test_missing_runner_refuses_instead_of_running_locally` (line 409) to use the existing `mac_result` helper (line 77). Keep every assertion and the runner process boundary. The phase 154 trial removed 256 process starts and 167 execs.
+2. In `assert_nothing_outlives` (`scripts/direct/verify_mac_offload_test_support.py`), skip the `reap()` call only when `wait_for_marker_exit` returns an empty set. Always run the `wait_for_marker_exit` scan: it is the leak check. A non-empty result still calls `reap()` and fails the test with `processes outlived the test`. This is verify's condition.
+3. Add one row to an existing test that proves item 2: a test leaves a marked process behind, and `assert_nothing_outlives` still fails with `processes outlived the test`. Use no new module.
+4. Change no production script.
+5. Measure local CPU with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <tree> direct/test_verify_mac_only.py`. The director runs the aws pairs on this module and two other fixture users; only aws pairs decide.
+
+**Files:**
+- `scripts/direct/test_verify_mac_only.py` — items 1 and 3.
+- `scripts/direct/verify_mac_offload_test_support.py` — hub: item 2.
+
+**Workers:** 1 writer; item 3 tests item 2, and the two files are small.
+- impl4: both files. It ran the phase 154 trials.
+
+**Constraints from prior phases:**
+- Phase 154: local pairs on the shared host varied from 33.7 to 52.8 CPU s for the same tree. Shell version probes cost more and are rejected.
+- verify-unit owns both files. Its go covers only items 1 to 3.
+
+**State:** none.
+
+**Acceptance gate:**
+- `direct/test_verify_mac_only.py` passes with its test count plus the item 3 row, if that row is a new test.
+- Two other modules that use the fixture pass.
+- basedpyright on both files: 0 errors, 0 warnings, 0 notes.
+- aws pairs show a CPU gain; with no gain, the phase lands nothing.
