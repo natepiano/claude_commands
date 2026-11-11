@@ -96,6 +96,9 @@ Without a matching row, `target_platform` returns no answer and status 1.
   `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
   A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
   Without either session, `owning_session` returns `NoOwningSession`.
+  `scripts.build_hold.owning_session` defines both session types and imports no repository module.
+  All callers import the types from this module.
+  `placement.SubmittingSession` uses their union directly.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
 - After the last holder file is gone, each recipient gets one release notice.

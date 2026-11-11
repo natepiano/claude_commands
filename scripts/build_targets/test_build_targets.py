@@ -20,6 +20,7 @@ from unittest import mock
 import unittest
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
@@ -48,7 +49,7 @@ REAL_SUBPROCESS_POPEN = subprocess.Popen
 REAL_PROCESS_START_TIME = build_hold.process_start_time
 REAL_RECORD_HOLD_EVENT = build_hold.record_hold_event
 REAL_BUILDLOG_ROOT = Path.home() / ".local/state/buildlog"
-WAITING_SESSION = build_hold.OwningSession("waiting-session")
+WAITING_SESSION = OwningSession("waiting-session")
 
 
 @contextmanager
@@ -842,14 +843,14 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
     def test_explicit_session_keeps_the_block_exemption_out_of_the_environment(self) -> None:
         self.write_block()
         target = targets.SshTarget("mac", "macos", self.settings)
-        for session in (build_hold.OwningSession("hana-session"), build_hold.OwningSession("other-session"),
-                        build_hold.NoOwningSession(), build_hold.OwningSession("hana-session")):
+        for session in (OwningSession("hana-session"), OwningSession("other-session"),
+                        NoOwningSession(), OwningSession("hana-session")):
             with self.subTest(session=session), \
                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "service-session"}), \
                  mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture-mac")):
                 result = build_targets.ssh_target_eligibility(
                     target, self.root, "portable", "test", targets.AnyEligibleTarget(), session=session)
-            if session == build_hold.OwningSession("hana-session"):
+            if session == OwningSession("hana-session"):
                 self.assertEqual(result, targets.EligibleTarget(target))
             else:
                 self.assertEqual(result, targets.ExcludedTarget(target, "blocked"))
@@ -884,7 +885,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.sleeps += 1
         _ = build_hold.release_cycle(self.holders, "hana")
 
-    def wait(self, *, session: build_hold.OwningSession | build_hold.NoOwningSession | claim_state.CallingSession
+    def wait(self, *, session: OwningSession | NoOwningSession | claim_state.CallingSession
              = WAITING_SESSION) -> tuple[int, str, str]:
         output = io.StringIO()
         errors = io.StringIO()
@@ -996,7 +997,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
              mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN), \
              redirect_stdout(io.StringIO()), redirect_stderr(errors):
             code = build_targets.command_wait_local("call-a", pid=os.getpid(), leave_hook=leave_hook,
-                                                    session=build_hold.OwningSession("waiting-session"))
+                                                    session=OwningSession("waiting-session"))
         return code, errors.getvalue()
 
     def count_sleep(self, _seconds: float) -> None:

@@ -338,7 +338,7 @@ It imports live reservations, saved intents, waiter places, token handoffs, prio
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
-`build_hold` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
+`hold_enforcer` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
 Importing `build_hold` or `build_targets` does not load the admission service.
 `ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
@@ -1545,7 +1545,12 @@ The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor
 Nix-darwin activation deploys the job definition and its PATH.
 The Mac floor finalizer uses the shared crossing path above and saves its receipts on the Mac.
 Its session message goes to natedev; its phone title and body name `Mac`.
-When a crossing delivery is pending, the Mac measures each direct folder child under its floor roots.
+When a crossing delivery is pending, the Mac measures each root's direct folder children and each cargo target the floor pass found.
+The target list contains only targets the Mac floor policy allows.
+The Mac crossing alert waits for a pass that searched for targets.
+A completed search with no targets still permits the alert.
+Failure alerts do not wait for the target search.
+The measurement skips targets that no longer exist and does not search the roots again.
 Each size estimates the file blocks that deleting that folder alone frees.
 An inode counts once only when every hard link is inside that folder.
 An inode with a link outside the folder counts zero.

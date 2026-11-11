@@ -124,7 +124,8 @@ class UpkeepTests(unittest.TestCase):
         launches: dict[str, tuple[Literal["claude", "codex"], str, dict[str, str]]] = {}
         fail = True
         slow = False
-        clock = ProducerRestoreClock(time.monotonic())
+        # Use an integer origin to keep deadline arithmetic exact.
+        clock = ProducerRestoreClock(0)
         outside_clock_reads = 0
 
         def restore(name: str, timeout_ms: int, *, session_kind: herdr.SecuritySession
