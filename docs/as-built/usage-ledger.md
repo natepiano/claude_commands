@@ -206,6 +206,7 @@ Lower is better for all four measures. A change under `changes_min_percent` is n
 The verdicts are better, worse, mixed (named measures moved both ways), no clear change, and too few sessions.
 Roles with too few sessions share one `not judged` line. Other settings, model and CLI changes in the window, and file edits grouped per file, share one `also changed` line.
 By default only settings changes are listed; `--files` adds tracked file edits. `--detail` prints every measure with its sample counts.
+The `/context_economy` command does not print this report by default. It writes a short summary: one table per settings change, the other changes, a trust line and a next step. `--raw` prints the report unchanged.
 The verdicts describe observed movement, not proven cause.
 `hourly` reads only the ledger, so it lags by up to one collection. It shows active unit directors and weighted cost for the last `hourly_recent_hours` complete hours. Its normal and busy rows are the median and p75 of the `hourly_baseline_days` before those hours.
 The default window covers the last seven days.
