@@ -2699,45 +2699,21 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - A one-process run that keeps every tree in memory: 31 to 36 CPU s slower, with a 3.5 GB peak.
 - Any shared-parse or shared-walk design across the scan modules: at most 18.3 CPU s.
 
-### Phase 134 — The next slowest test module uses at least 30 CPU s less  · status: todo
+### Phase 134 — The next slowest test module uses at least 30 CPU s less  · status: done
 **Depends on:** Phase 133
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_standing_checkpoint.py` and `production/test_merge_checkpoint.py` together use at least 30 CPU s less per gate in paired runs, with the same tests and assertions.
-
-**Decision:** Builds showrunner, 2026-11-11: go with both changes under a joined 30 CPU s bar (the bar is per full gate; savings may join). The owner goes come from sdlc through builds; the writers start only after builds relays them. Paired trials run on isolated AWS gate boxes in parallel, one box for each module, never on natedev (user point, 2026-11-11). The aws unit builds the paired trial command; natest accepts it.
-
-**Measured before (research, natedev, scripts at `4c18561ef`; `phases/134/research_report.md` in the unit session):**
-- Standing checkpoint: 67 `python -c` starts cost 29.4 CPU s. A trial through the existing direct adapter saved 29.1 CPU s, median of 3 pairs (37.5 -> 9.0). All 15 tests passed.
-- Merge checkpoint: 88 `progress_history.py` starts cost 14.4 CPU s. A trial that sent them to `invoke_recorder` saved 12.3 CPU s in 1 pair (24.6 -> 12.3). All 39 tests passed.
-- Not taken: progress history parser reuse (6.9 s, 1 pair), style sync Git seed (2.6 s), bulk run Git seed (-1.5 s).
-
-**Constraints from prior phases:**
-- The code changes are written, reviewed and accepted, but not committed. Keep them; do not dispatch the writers again. `run_style_command(root, case, command, ...)` in `scripts/style/style_plan_test_support.py` holds the in-process dispatch; `StylePlanFixture.run_command` delegates to it; `StandingCheckpointTests.cli` uses `partial(run_style_command, self.root, self)`. `invoke_checkpoint` takes `scripts/lib/py` as the interpreter.
-- Only the aws paired trial (Acceptance gate, line 2) remains before the checkpoint.
-
-**Spec:**
-1. Standing checkpoint. `StandingCheckpointTests.cli` (`scripts/style/test_standing_checkpoint.py`) starts a fresh interpreter through `style_cli_command` for each ledger and planner call. Route these calls through the existing in-process adapter: `StylePlanFixture.run_command` and `invoke_cli` in `scripts/style/style_plan_test_support.py`. Nested `style_footprint.py` calls run in process the same way. Real parsers, handlers, Git processes, ledger files, stdout, stderr and exit codes stay. A case that `process_boundary_for_case` marks keeps its real child process. The notification CLI test keeps its child processes.
-2. Merge checkpoint. `invoke_checkpoint` (`scripts/production/merge_checkpoint_test_support.py`) takes a command as a Python call only when the executable name starts with `python`. The production command starts the recorder with `scripts/lib/py`, so these calls start a new interpreter. Make the adapter also take the repository launcher `scripts/lib/py` as the interpreter, so `progress_history.py` calls reach `invoke_recorder`. Git fetches, pushes, hooks, branch moves and durable history stay real. Tests of locks, signals or competing processes keep real child processes.
-3. Change no production script. Remove no test, matrix row or assertion. Each module keeps its test count (15 and 39).
+- `run_style_command(root, case, command, ...)` in `scripts/style/style_plan_test_support.py` runs ledger, planner and nested `style_footprint.py` commands in process with real parsers, Git, ledger files, stdout, stderr and exit codes. `StylePlanFixture.run_command` delegates to it; `StandingCheckpointTests.cli` uses `partial(run_style_command, self.root, self)`. A case that `process_boundary_for_case` marks keeps its real child process.
+- `invoke_checkpoint` (`scripts/production/merge_checkpoint_test_support.py`) takes `scripts/lib/py` as the interpreter, so `progress_history.py` calls reach `invoke_recorder`.
+- aws paired trial, 3 rounds: `style/test_standing_checkpoint.py` 51.3 to 11.9 CPU s (15 tests); `production/test_merge_checkpoint.py` 37.8 to 16.5 CPU s (39 tests); 60.7 CPU s saved per gate.
 
 **Files:**
-- `scripts/style/test_standing_checkpoint.py` — `cli` routes through the in-process adapter.
-- `scripts/style/style_plan_test_support.py` — only if the adapter needs a hook for this module.
-- `scripts/production/merge_checkpoint_test_support.py` — `invoke_checkpoint` takes `scripts/lib/py` as the interpreter.
+- `scripts/style/style_plan_test_support.py` — `run_style_command`.
+- `scripts/style/test_standing_checkpoint.py` — `cli` through `run_style_command`.
+- `scripts/production/merge_checkpoint_test_support.py` — `invoke_checkpoint` interpreter rule.
 
-**Workers:** 2 writers, split by module; no shared file.
-- impl: standing checkpoint; hub: `scripts/style/style_plan_test_support.py`.
-- impl2: merge checkpoint.
-
-**State:** none.
-
-**Acceptance gate:**
-- Both modules pass through `python3 scripts/test_times/module_run.py` with 15 and 39 tests.
-- The aws paired trial command, 3 rounds, both modules: the summed paired median saving is at least 30 CPU s, with the same test counts. Below that, the director brings the numbers to builds before the checkpoint.
-- No local paired trial runs on natedev.
-- basedpyright reports 0 errors, 0 warnings, 0 notes on every changed file.
+**Ruled out:** progress history parser reuse (6.9 CPU s, 1 pair); style sync Git seed (2.6 CPU s); bulk run Git seed (-1.5 CPU s).
 
 ### Phase 135 — One cached command shows the daily trend of gate CPU, wall time and cost  · status: done
 **Depends on:** none
