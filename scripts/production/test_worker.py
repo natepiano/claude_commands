@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 import subprocess
 import sys
 import time
-from threading import Timer
-from collections.abc import Callable, Iterator
+from threading import Event, Timer, current_thread
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import replace
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import patch
@@ -1826,7 +1827,9 @@ class WorkerCommandTests(unittest.TestCase):
                             session_dir=case.run_dir, slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"])
                     case.assertEqual(code, worker.ExitCode.REFUSED)
                     case.assertEqual(staff.find(kind="worker", parent=case.fixture.parent.id), [])
-                    case.assertEqual(len(case.fixture.world.closed), 4)
+                    case.assertEqual(len(case.fixture.world.closed), 3)
+                    case.assertNotIn("unit-impl", [destination.label for destination in case.fixture.world.launches
+                                                  if isinstance(destination, herdr.SplitPane)])
                     case.assertEqual(case.agent.submitted, [])
                     case.assertNotIn("cleanup failed", errors.getvalue())
                 finally:
@@ -2019,12 +2022,66 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(added.row.name, "impl2")
 
     def test_first_standard_assignment_creates_the_default_team(self) -> None:
-        code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
-            slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"], reply=self.reply)
-        self.assertEqual(code, worker.ExitCode.OK)
-        self.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)},
-                         {"impl", "fix", "review", "test"})
-        self.assertEqual(len(self.agent.submitted), 1)
+        for role, ready_hooks in (("impl", False), ("test", True)):
+            with self.subTest(role=role, ready_hooks=ready_hooks):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    assignment_thread = current_thread()
+                    hook_acquired = Event()
+                    release_hook = Event()
+                    pending: dict[str, Future[turn_end.TurnOutcome]] = {}
+                    acquire = worker_panes.worker_lock
+                    bind = worker_panes.WorkerLockHold.bind
+                    guard = LauncherHangGuard("first assignment ready hooks")
+                    with ThreadPoolExecutor(max_workers=4) as hooks:
+                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow) -> None:
+                            bind(hold, row)
+                            if current_thread() is assignment_thread and ready_hooks and row.name not in pending:
+                                pending[row.name] = hooks.submit(turn_end.handle,
+                                    turn_end.WorkerEvent(str(row.current_session), reply="ready"))
+
+                        @contextmanager
+                        def queued_ready_hooks(parent: staff.StaffId, name: staff.WorkerName, *,
+                                               blocking: bool = False) -> Generator[worker_panes.WorkerLockHold | worker_panes.Kept]:
+                            with acquire(parent, name, blocking=blocking) as hold:
+                                if current_thread() is not assignment_thread and name.value == role:
+                                    hook_acquired.set()
+                                    case.assertTrue(release_hook.wait(guard.remaining()))
+                                yield hold
+                            if (current_thread() is assignment_thread and ready_hooks
+                                    and isinstance(hold, worker_panes.WorkerLockHold) and name.value in pending):
+                                if name.value == role:
+                                    case.assertTrue(hook_acquired.wait(guard.remaining()))
+                                else:
+                                    case.assertIs(pending[name.value].result(timeout=guard.remaining()), turn_end.TurnOutcome.IGNORED)
+
+                        def prompt_during_ready_hook() -> None:
+                            case.assertEqual(set(pending), {"impl", "fix", "review", "test"})
+                            case.assertFalse(pending[role].done())
+                            case.assertFalse(hook_acquired.is_set())
+
+                        if ready_hooks:
+                            case.agent.during_prompt = prompt_during_ready_hook
+                        try:
+                            with (patch.object(worker_panes.WorkerLockHold, "bind", queue_ready_hook),
+                                  patch.object(worker_panes, "worker_lock", queued_ready_hooks)):
+                                code = worker.assign(case.fixture.parent.id, cast(staff.WorkerRole, role), case.prompt,
+                                    session_dir=case.run_dir, slot=role, phase="8", kind=role,
+                                    launcher_command=["assign.sh"], reply=case.reply)
+                        finally:
+                            release_hook.set()
+                        for future in pending.values():
+                            case.assertIs(future.result(timeout=guard.remaining()), turn_end.TurnOutcome.IGNORED)
+                    case.assertEqual(code, worker.ExitCode.OK)
+                    case.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=case.fixture.parent.id)},
+                                     {"impl", "fix", "review", "test"})
+                    case.assertEqual(len(case.agent.submitted), 1)
+                    case.assertEqual(case.agent.row(case.agent.submitted[0][0]).name, role)
+                    if ready_hooks:
+                        case.assertEqual(set(pending), {"impl", "fix", "review", "test"})
+                finally:
+                    case.doCleanups()
 
     def test_assignment_continues_after_a_default_split_interruption(self) -> None:
         row = self.fixture.worker("impl", family="codex")

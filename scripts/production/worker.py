@@ -629,7 +629,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if needs_team:
             names = {row.name for row in rows}
             for default_role in ("impl", "fix", "review", "test"):
-                if default_role in names:
+                if default_role in names or default_role == role:
                     continue
                 before = rows_before_launch()
                 with redirect_stderr(io.StringIO()) as diagnostics:
