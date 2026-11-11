@@ -62,44 +62,22 @@
 
 ### Phase 3 — Scheduled prompts are built at delivery  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** no `prompt.txt` and no `PROMPT_FILE`. A tick builds the showrunner prompt from the timer owner's staff row when it sends.
-
-**Spec:**
-
-1. `scripts/production/update_registration.py`: add a `prompt --owner <staff id>` command. It prints `scheduled_prompt(minutes, production)` for the owner's current row. Minutes come from the production doc schedule, as in `adopt_moved_state`.
-2. `register` writes `PROMPT=scheduled` in the timer conf, not `PROMPT_FILE`, and writes no `prompt.txt`. `adopt_moved_state` no longer rewrites a prompt file.
-3. `scripts/message/notifier.sh`: `write_conf` and `cmd_new` carry `PROMPT=scheduled`. `instance_tick` runs the `prompt --owner "${conf[TARGET]}"` command and sends its output. A failed build skips the tick with one stderr line. Tell hierarchies before this edit.
-4. `commands/showrunner/report_interval.md`: remove the prompt-file edit step. `docs/as-built/session-notifier.md`: describe the delivery-time prompt and the owner-id target.
-5. `scripts/production/fake_showrunner.py` `write_timer` matches the new conf.
-6. Deploy program: in each `~/.local/state/notifier/showrunner-*/conf`, replace `PROMPT_FILE=...` with `PROMPT=scheduled`; delete every `~/.local/state/showrunner/*/prompt.txt`, the 3 with no staff row included. natedev holds 5 confs and 8 prompt files.
-7. Add no other guard, refusal or scan.
+- No `prompt.txt` and no `PROMPT_FILE`. `register` and `notifier.sh new` write `PROMPT=scheduled` in the showrunner timer conf. `adopt_moved_state` rewrites no prompt file.
+- `update_registration.py prompt --owner <staff id>` prints `scheduled_prompt(minutes, production)` for the owner's current staff row. Minutes come from the production doc schedule. The prompt is the template text only, with no document-path line.
+- `notifier.sh` `instance_tick`: for `PROMPT=scheduled`, it runs the `prompt --owner` command and sends its output. A failed build prints one stderr line and skips that tick.
+- `codex_winddown.start_count` passes its TICK text with `--command` and writes no prompt file.
+- `produce.md`, `report_interval.md` and `docs/as-built/session-notifier.md` describe the delivery-time prompt and the owner-id target.
+- A one-off deploy program outside the repository converts each `showrunner-*/conf` to `PROMPT=scheduled` and deletes every `~/.local/state/showrunner/*/prompt.txt`.
 
 **Files:**
 - `scripts/production/update_registration.py` — `prompt` command and registration.
-- `scripts/production/fake_showrunner.py` — test timer fixture.
 - `scripts/message/notifier.sh` — conf key and tick delivery.
-- `commands/showrunner/report_interval.md` — no prompt-file edit.
-- `docs/as-built/session-notifier.md` — delivery-time prompt.
-- `scripts/message/test_notifier.py` — tick rows.
-- `scripts/production/test_update_registration.py` — registration rows.
-- `scripts/production/test_update_registration_log.py` — state move rows.
-- `scripts/production/test_update_registration_commands.py` — prompt command rows.
-
-**Workers:** 1 writer + 1 tester.
-- `impl` — the source and doc files above.
-- `test` — the test files above. Rows: a tick after a showrunner rename sends the new name; a tick after a doc move sends the new path; no `prompt.txt` exists after registration.
-
-**State:** notifier conf key; deploy program above.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-1. The unittest line passes for the four test modules above.
-2. basedpyright over the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+- `scripts/production/codex_winddown.py` — count timer text by `--command`.
+- `scripts/production/fake_showrunner.py` — test timer fixture.
+- `commands/showrunner/produce.md`, `commands/showrunner/report_interval.md`, `docs/as-built/session-notifier.md` — delivery-time prompt.
+- `scripts/message/test_notifier.py`, `scripts/production/test_codex_winddown.py`, `test_update_registration.py`, `test_update_registration_log.py`, `test_update_registration_commands.py` — tick, registration and prompt rows.
 
 ### Phase 4 — Astra design records keep staff ids  · status: todo
 
