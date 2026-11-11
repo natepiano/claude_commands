@@ -3032,7 +3032,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on both files: 0 errors, 0 warnings, 0 notes.
 - aws pairs show a CPU gain; with no gain, the phase lands nothing.
 
-### Phase 158 — The standing checkpoint tests build their sample repository once for each class  · status: todo
+### Phase 158 — The standing checkpoint tests build their sample repository once for each class  · status: done
 **Depends on:** none
 
 #### Work Order
