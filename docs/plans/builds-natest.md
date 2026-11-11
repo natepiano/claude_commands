@@ -2974,7 +2974,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `phases/148/removed_tests.md` lists every removed test with its reason, and the counts.
 - Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
 
-### Phase 149 — Four buildlog test modules keep only the tests that pay their way  · status: todo
+### Phase 149 — Four buildlog test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
 #### Work Order
