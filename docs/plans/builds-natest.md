@@ -2811,7 +2811,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Ruled out:** direct fixture calls (-2.6 CPU s alone); retained immutable Git reads (-4.9 CPU s alone); both together remove only 16 of 8,618 processes.
 
-### Phase 140 — Find where the style sync test module spends its CPU  · status: todo
+### Phase 140 — Find where the style sync test module spends its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -2842,3 +2842,38 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Acceptance gate:**
 - The report at `phases/140/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
+
+**Result:** Profile 46.3 CPU s, 4,218 process starts. Three test-only candidates in `scripts/style/test_style_sync.py`, each one pair: private sender CLIs in process (11.6 s), the scratch cargo-save CLI in process (7.6 s), and a seeded initial Git repository (7.5 s). All three together saved 19.5 CPU s in one pair, with 70 tests passing. Signal, lock, verifier and workspace processes stay real. The saving is below 30 CPU s alone, so a speed phase joins it with Phase 141 candidates.
+
+### Phase 141 — Find where the crate run test module spends its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A measured report names where `style/test_crate_run.py` (median 47.6 CPU s) spends its CPU, and which changes save CPU with the same tests.
+
+**Decision:** Director, 2026-11-11: the next unstudied module in the descending sort, beside the Phase 140 research. Research first, as in Phases 137, 139 and 140.
+
+**Spec:**
+1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
+2. Name each fixed cost: interpreter starts, imports, real sleeps or wait intervals, subprocess trees, repeated setup.
+3. Measure one local pair for each candidate change in a scratch copy, and one pair for the candidates together. A test that proves a process boundary keeps its process.
+4. For each candidate in shared code, count the other test modules it reaches.
+5. Name the owning unit of each file a change would touch.
+6. Edit no repository file.
+
+**Files:**
+- `scripts/style/test_crate_run.py` — read only.
+
+**Workers:** 1 writer; research only.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 137: Phase 138 defers recorder and staff imports. Do not count that saving again here.
+- Phase 134: `run_style_command` in `scripts/style/style_plan_test_support.py` runs style plan commands in process; reuse it where it fits.
+- Phase 140: it studies `style/test_style_sync.py`. Name each candidate that both modules share, and do not count its saving twice.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report at `phases/141/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
