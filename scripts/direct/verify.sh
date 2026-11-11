@@ -21,6 +21,7 @@
 #   --saved              final: read a saved workspace pass
 #   --tree <tree>        final --saved: select a tree
 #   --filter <name>      test: select names; repeat to select more names
+#   --run-ignored only   test: run only ignored tests, with optional filters
 #   --features <list>    check, test, doc, build: enable Cargo features
 #   --no-cache           test, lint: ignore saved results
 #   --target <name>      pin movable steps to one configured target
@@ -55,6 +56,7 @@
 #
 # --test <name> runs one integration test target.
 # Repeat --filter <name> to select tests that contain any named text.
+# --run-ignored only selects ignored tests; with no package, all packages.
 # Do not combine an integration test target with --filter.
 # --features <list> enables features for the package.
 # Also add workspace.metadata.dev.features.
@@ -359,6 +361,7 @@ parse_routing_arguments() {
 
 # Parse the package separately from flags and their values.
 parse_command_arguments() {
+    local ignored_only=0 integration_target=0
     VERIFY_PACKAGE=""
     COMMAND_ARGS=()
     SAVED_FINAL=0
@@ -377,7 +380,14 @@ parse_command_arguments() {
                 if [[ ( "$1" == --test && "$CMD" != test ) || ( "$1" == --name && "$CMD" != example ) || -z "${2:-}" || "$2" == --* ]]; then
                     command_help "$CMD" >&2; exit 2
                 fi
-                if [[ "$1" == --name ]]; then EXAMPLE_NAME=$2; fi
+                if [[ "$1" == --name ]]; then EXAMPLE_NAME=$2; else integration_target=1; fi
+                COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
+            --run-ignored)
+                if [[ "$CMD" != test || "${2:-}" != only ]]; then
+                    echo 'verify.sh: use test [<package>] --run-ignored only, without --test.' >&2
+                    exit 2
+                fi
+                ignored_only=1
                 COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
             --features|--filter|--bin|--example|--target|--env|--fetch|--mac|--local)
                 [[ $# -ge 2 ]] || { command_help "$CMD" >&2; exit 2; }
@@ -388,6 +398,10 @@ parse_command_arguments() {
                 VERIFY_PACKAGE=$1; shift ;;
         esac
     done
+    if [[ "$ignored_only" == 1 && "$integration_target" == 1 ]]; then
+        echo 'verify.sh: use test [<package>] --run-ignored only, without --test.' >&2
+        exit 2
+    fi
     [[ -z "$SAVED_TREE" || "$SAVED_FINAL" == 1 ]] || { command_help final >&2; exit 2; }
     [[ "$SAVED_FINAL" == 0 || ${#COMMAND_ARGS[@]} == 0 ]] || { command_help final >&2; exit 2; }
     ARGS=("$VERIFY_PACKAGE" ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"})
@@ -536,6 +550,72 @@ else
     PY="$VERIFY_START_DIR/../lib/py"
 fi
 
+# One parent-owned helper serves command substitutions and cleanup traps.
+verify_helper() {
+    if [[ "${1:-}" == --start ]]; then
+        [[ "${VERIFY_HELPER_STARTED:-0}" == 0 ]] || return 0
+        VERIFY_HELPER_STARTED=1
+        local script="$VERIFY_START_DIR/verify_helper.py" input output
+        [[ -f "$script" ]] || return 0
+        VERIFY_HELPER_LOCK="$(mktemp 2>/dev/null)" || return 0
+        coproc VERIFY_CALLS { exec "$VERIFY_START_DIR/../lib/py" "$script" "$VERIFY_HELPER_LOCK"; } 2>/dev/null
+        input=${VERIFY_CALLS[1]:-}
+        output=${VERIFY_CALLS[0]:-}
+        [[ -n "$input" && -n "$output" ]] || return 0
+        # Bash places coprocess and process-substitution descriptors at 63 and below, so the helper uses 70-73.
+        if { exec 70>&"$input" 71<&"$output"; } 2>/dev/null; then
+            VERIFY_HELPER_INPUT=70
+            VERIFY_HELPER_OUTPUT=71
+            eval "exec $input>&- $output<&-"
+        fi
+        return 0
+    fi
+    (
+    local input="" has_input=0 status output errors entry
+    local forwarded=()
+    if [[ "${1:-}" == --stdin ]]; then
+        shift
+        has_input=1
+        input="$(cat; printf '\001')"
+        input="${input%$'\001'}"
+    fi
+    if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
+        if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" ]]; then
+            while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do forwarded+=("$entry"); done
+        fi
+        exec 72>"$VERIFY_HELPER_LOCK"
+        if flock -x 72 2>/dev/null && (
+            printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
+            env -0
+            printf '\0%s\0' "$input"
+            if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
+            printf '\0'
+        ) >&"$VERIFY_HELPER_INPUT" 2>/dev/null \
+            && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
+            && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
+            && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then
+            exec 72>&-
+            if [[ "$status" =~ ^[0-9]+$ ]]; then
+                printf '%s' "$output"
+                printf '%s' "$errors" >&2
+                return "$status"
+            fi
+        else
+            exec 72>&-
+        fi
+    fi
+    if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" && ${#forwarded[@]} -gt 0 ]]; then
+        exec 73< <(printf '%s\0' "${forwarded[@]}")
+        export VERIFY_RESULT_ENVIRONMENT_FD=73
+    fi
+    if [[ "$has_input" == 1 ]]; then
+        printf '%s' "$input" | "$PY" "$@"
+    else
+        "$PY" "$@"
+    fi
+    )
+}
+
 hash_stream() {
     local hash
     if command -v sha256sum >/dev/null 2>&1; then
@@ -546,6 +626,9 @@ hash_stream() {
     printf '%s\n' "${hash%% *}"
 }
 
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf_record.sh"
+
 lint_code_key() {
     local file hash
     hash="$(
@@ -555,6 +638,7 @@ lint_code_key() {
                 "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"; do
                 if [[ -f "$file" ]]; then
                     printf 'present\0'
+                    case "$file" in *.conf) stem="${file##*/}"; conf_record "${stem%.conf}" ;; esac
                     cat -- "$file" || exit 1
                 else
                     printf 'absent\0'
@@ -939,7 +1023,7 @@ read_metadata() {
 set_gate_metadata() {
     export BUILDLOG_OUTPUT_ROOTS=""
     GATE_METADATA="$(cargo metadata --no-deps --format-version 1)" || { GATE_METADATA=""; return 1; }
-    BUILDLOG_OUTPUT_ROOTS="$("$PY" "$VERIFY_START_DIR/../buildlog/step_context.py" output-roots \
+    BUILDLOG_OUTPUT_ROOTS="$(verify_helper --stdin "$VERIFY_START_DIR/../buildlog/step_context.py" output-roots \
         <<< "$GATE_METADATA" 2>/dev/null)" || BUILDLOG_OUTPUT_ROOTS=""
 }
 
@@ -999,7 +1083,7 @@ load_metadata() {
             ;;
     esac
     if [[ -z "${GATE_METADATA:-}" ]]; then set_gate_metadata || exit 2; fi
-    values="$("$PY" "$VERIFY_METADATA_SCRIPT" "${requests[@]}" <<< "$GATE_METADATA")" || exit 2
+    values="$(verify_helper --stdin "$VERIFY_METADATA_SCRIPT" "${requests[@]}" <<< "$GATE_METADATA")" || exit 2
     eval "$values"
     METADATA_READY=1
 }
@@ -1202,6 +1286,7 @@ print_built_binaries() {
 
 NEXTEST_ARGS=()
 compose_nextest_args() {
+    local ignored_only=0
     set -- "${ARGS[@]}"
     PKG="${1:-}"
     shift
@@ -1211,12 +1296,15 @@ compose_nextest_args() {
     # takes no filter.
     REST=()
     while [[ $# -gt 0 ]]; do
-        if [[ "$1" == --test && -z "$TARGET" && ${#FILTERS[@]} -eq 0 && -n "${2:-}" ]]; then
+        if [[ "$1" == --test && -z "$TARGET" && ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 && -n "${2:-}" ]]; then
             TARGET=$2
             shift 2
         elif [[ "$1" == "--filter" && -z "$TARGET" \
               && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
             FILTERS+=("$2")
+            shift 2
+        elif [[ "$1" == --run-ignored && "${2:-}" == only && -z "$TARGET" ]]; then
+            ignored_only=1
             shift 2
         else
             REST+=("$1")
@@ -1264,8 +1352,11 @@ compose_nextest_args() {
     NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}")
     if [[ -n "$TEST_FILTER" ]]; then NEXTEST_ARGS+=(-E "$TEST_FILTER"); fi
     NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
-    # Allow an empty package run; named filters must still match tests.
-    if [[ ${#FILTERS[@]} -eq 0 ]]; then
+    if [[ "$ignored_only" == 1 ]]; then
+        NEXTEST_ARGS+=(--run-ignored only)
+    fi
+    # Filters and ignored-test selections must match tests.
+    if [[ ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 ]]; then
         NEXTEST_ARGS+=(--no-tests=warn)
     fi
 }
@@ -1277,8 +1368,10 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
     # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
-    SESSION_TMPDIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" run-temp-path "$UNIT_SESSION_DIR")"
-    if [[ -d "$SESSION_TMPDIR" ]] || "$PY" "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$UNIT_SESSION_DIR" >/dev/null 2>&1; then
+    verify_helper --start
+    SESSION_TMPDIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" run-temp-path "$UNIT_SESSION_DIR")"
+    # Other worker commands use the session TMPDIR after this verify process exits.
+    if [[ -d "$SESSION_TMPDIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$UNIT_SESSION_DIR" >/dev/null 2>&1; then
         export TMPDIR="$SESSION_TMPDIR"
     fi
 fi
@@ -1311,8 +1404,9 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
 fi
 
 # Set the run identity after detachment so the run owns its queue place.
+verify_helper --start
 if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
-    BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
+    BUILDLOG_RUN_START="$(verify_helper "$STEP_RECORD_SCRIPT" start "$$")"
     if [[ -n "$BUILDLOG_RUN_START" ]]; then
         export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
     fi
@@ -1643,12 +1737,13 @@ finish_hold_wait() {
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$MAC_IDLE_MARKER" && -f "${MAC_IDLE_SCRIPT:-/nonexistent}" ]]; then
-        "$PY" "$MAC_IDLE_SCRIPT" remove "$BUILDLOG_CALL_ID" || true
+        verify_helper "$MAC_IDLE_SCRIPT" remove "$BUILDLOG_CALL_ID" || true
     fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
         rm -rf "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
+    [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
 
 # Pass records (see the header): on for `test` and `lint` in a
@@ -1692,7 +1787,7 @@ BUILDLOG_MAC_COPY_S=""
 BUILDLOG_MAC_COPY_COUNT=""
 BUILDLOG_MAC_COPY_NATEDEV_S=""
 export BUILDLOG_TARGET=""
-if [[ "$CMD" == test && " ${ARGS[*]} " == *" --filter "* ]]; then
+if [[ "$CMD" == test && ( " ${ARGS[*]} " == *" --filter "* || " ${ARGS[*]} " == *" --run-ignored "* ) ]]; then
     FILTER_RUN=1
 fi
 if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
@@ -1726,7 +1821,7 @@ tree_key() {
             fi
         done
         while IFS= read -r name; do
-            words+=(--filter "$name")
+            if [[ -n "$name" ]]; then words+=(--filter "$name"); fi
         done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
     fi
     if [[ "$CMD" == test ]]; then
@@ -1741,7 +1836,7 @@ tree_key() {
     fi
     VERIFY_RESULT_ENVIRONMENT_FD=3 \
     VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
-    "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
+    verify_helper --stdin "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
         3< <(printf '%s\0' ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"}) \
         <<< "${GATE_METADATA}" 2>/dev/null || true
 }
@@ -1821,7 +1916,7 @@ cancel_tree_run() {
 
 start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
-    TREE_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
+    TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { rm -rf "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
@@ -1940,7 +2035,7 @@ note_event() {
     BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="$token_wait_s" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
         BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" BUILDLOG_PACKAGE="${VERIFY_PACKAGE:-}" \
-        "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+        verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${VERIFY_PACKAGE:+"$VERIFY_PACKAGE"} ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -2056,7 +2151,10 @@ try_mac_test() {
         if [[ "$reserved_target" != "$selected_target" || "$reserved_settings" != "$1" ]]; then
             return 0
         fi
-        runner_args+=(--claim-owner-pid $$)
+        local claim_id episode attempt claim_session
+        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
+        runner_args+=(--claim-owner-pid $$ --claim-id "$claim_id" --episode "$episode" --attempt "$attempt"
+            --claim-session "$claim_session")
     fi
     if declare -F release_token >/dev/null; then release_token || return $?; fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
@@ -2344,7 +2442,7 @@ initialize_step_record() {
     if [[ -n "$PINNED_TARGET" ]]; then record_args+=(--pinned-target "$PINNED_TARGET"); fi
     record_args+=(--package "$PKG")
     local report
-    report=$(env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${record_args[@]}" --report) || exit 2
+    report=$(unset BUILDLOG_CALL_ID; verify_helper "$STEP_RECORD_SCRIPT" "${record_args[@]}" --report) || exit 2
     {
         IFS= read -r VERIFY_MONOTONIC_OFFSET_US
         IFS= read -r STEP_RECORD_PATH
@@ -2460,9 +2558,9 @@ route_compiling_step() {
 
 step_stopped_by_hold() {
     (( status > 128 )) || return 1
-    local admission=0
-    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" stopped --call-id "$BUILDLOG_CALL_ID" \
-        --consumed "$HOLD_WAIT_DIR/stops" || admission=$?
+    local admission=0 call_id="$BUILDLOG_CALL_ID"
+    (unset BUILDLOG_CALL_ID; verify_helper "$STEP_RECORD_SCRIPT" stopped --call-id "$call_id" \
+        --consumed "$HOLD_WAIT_DIR/stops") || admission=$?
     case "$admission" in 0) return 0 ;; 1) ;; *) exit "$admission" ;; esac
     admission=0
     check_routing_hold || admission=$?
@@ -2474,7 +2572,7 @@ register_mac_wait() {
     [[ "${OSTYPE:-}" == linux* && -f "$MAC_IDLE_SCRIPT" ]] || return 0
     [[ "$(target_platform "$(target_for_settings "$1")")" == macos ]] || return 0
     local board="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
-    MAC_IDLE_MARKER="$("$PY" "$MAC_IDLE_SCRIPT" register "$BUILDLOG_CALL_ID" "$$" \
+    MAC_IDLE_MARKER="$(verify_helper "$MAC_IDLE_SCRIPT" register "$BUILDLOG_CALL_ID" "$$" \
         "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" "$PKG" "$1" "$2" \
         "${BUILDLOG_HOLD_WAITER_FILE:-}" "${board:+$board/token_waiters}" \
         "${CLAUDE_CODE_SESSION_ID:-}" "${TMPDIR:-}" 1)" || MAC_IDLE_MARKER=""
@@ -2492,7 +2590,7 @@ remember_mac_retry() {
                 MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON="" MAC_RETRY_AFTER=0
                 BUILDLOG_MAC_IDLE_HOOK=""
                 if [[ -n "$MAC_IDLE_MARKER" ]]; then
-                    "$PY" "$MAC_IDLE_SCRIPT" exclude "$BUILDLOG_CALL_ID" "$BUILDLOG_MAC_REASON" || true
+                    verify_helper "$MAC_IDLE_SCRIPT" exclude "$BUILDLOG_CALL_ID" "$BUILDLOG_MAC_REASON" || true
                     MAC_IDLE_MARKER=""
                 fi
             fi
@@ -2539,8 +2637,13 @@ target_for_settings() {
 
 release_wait_claim() {
     [[ -n "${HOLD_WAIT_DIR:-}" ]] || return 0
-    "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ >/dev/null 2>&1 || true
-    rm -f "$HOLD_WAIT_DIR/ssh-reservation"
+    local claim_id="" episode="" attempt="" claim_session=""
+    if [[ -s "$HOLD_WAIT_DIR/ssh-reservation.identity" ]]; then
+        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
+        "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ --claim-id "$claim_id" \
+            --episode "$episode" --attempt "$attempt" --session "$claim_session" >/dev/null 2>&1 || true
+    fi
+    rm -f "$HOLD_WAIT_DIR/ssh-reservation" "$HOLD_WAIT_DIR/ssh-reservation.identity"
 }
 
 ssh_reserve_hook() {
@@ -2564,7 +2667,8 @@ ssh_reserve_hook() {
     local remote_kind
     remote_kind=$(remote_step_kind)
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
-        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
+        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" \
+        --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity" --target "$name"
     if [[ "${3:-}" == 0 ]]; then printf '%s ' --new-step; fi
     if [[ "$(target_platform "$name")" == macos ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
 }
@@ -2848,7 +2952,7 @@ start_copy_watch() {
     local parent_pid="${BASHPID:-$(exec sh -c 'printf "%s\n" "$PPID"')}"
     local copy_parent=()
     [[ -z "${HOLD_WAIT_DIR:-}" ]] || copy_parent=(--parent "$HOLD_WAIT_DIR")
-    COPY_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-copy --owner "$$" "${copy_parent[@]}")"
+    COPY_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-copy --owner "$$" "${copy_parent[@]}")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -3141,7 +3245,7 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     set_gate_metadata 2>/dev/null || true
 fi
 
-HOLD_WAIT_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
+HOLD_WAIT_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
 if [[ "$CMD" == lint ]]; then
     # The call owns these files. Cleanup removes them with the wait directory.
     export VERIFY_LINT_VERSIONS_FILE="$HOLD_WAIT_DIR/lint-versions"

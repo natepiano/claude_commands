@@ -23,24 +23,35 @@ A later assignment resumes the same conversation when the worker remains availab
 Codex code review uses read-only review workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
+A failed compaction prints one error line, and the dispatch continues without compaction.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.
 
 ## Pane submission and completion
 
 `assign.sh` returns after successful prompt delivery. Exit 0 means submitted.
-The transcript can record the prompt later.
+Codex dispatch also requires the prompt in its transcript before it reports submission.
+Codex dispatch waits up to `WORKER_SETTLE_SECONDS` for the receipt.
+An unproved Codex prompt returns uncertain when this bound passes or the process exits.
+A recorded prompt remains submitted after a process exit.
+Claude can record the prompt later.
 A failed delivery command returns an error.
-The transcript prevents replay and proves completion.
-The native hook starts one separate handler process and returns.
+The transcript prevents replay.
+A matching final transcript reply proves completion.
+A matching dispatch prompt also permits completion from the hook's own DONE reply before the final transcript record appears.
+The native hook sends its payload to a separate handler through stdin and returns.
+The child reads stdin before it applies the completion rule.
+The payload stays outside the child argument list.
 The handler runs once outside the terminal session.
 The pass retains its id, launcher arguments, reply path, and completion actions.
 The director ends its turn after the assigned synchronous review.
-The turn hook sends the director the worker, phase, outcome, and reply path.
+The turn hook sends the director the worker, phase, outcome, and pass id.
+The notice includes the reply path when the reply has text.
 The director reads that reply when the message resumes it.
 
 `scripts/herdr/turn_end.py` serves both families.
-Codex receives `-c notify=[...]` on its launch line.
+Codex uses the global `Stop` handler installed through `scripts/hooks/codex_hooks.py`.
+Codex worker launch lines contain no `-c notify` argument.
 Claude receives an asynchronous `Stop` command through launch-line `--settings` JSON.
 The launcher changes no account settings file.
 The hook finds the worker through its native conversation id.
@@ -50,6 +61,11 @@ This lookup includes dispatches outside the run root.
 Older workers without a link use the held-run lookup.
 A session without a worker pass changes nothing.
 A later event retries unfinished completion steps for a completed pass.
+The hook reads the worker's run inside the worker lock.
+A new assign finishes the unfinished completion before it replaces the link.
+That notice names its own pass and says it is a late result. The pane stays for the new assign.
+The late step does not retire the worker, and it keeps a hold that the new assign also owns.
+If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
 
 An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
 It saves the reply without typing another prompt.
@@ -57,24 +73,50 @@ This rule also applies to a completed managed Astra review.
 The saved completion includes the reason and pane for a close anomaly.
 A successful completed rerun sets its status file to `done` after it sends the notice.
 Native duplicate hook events still send no second message.
+Each completion notice ends its first line with `; pass <dispatch instance id>`.
+An explicit rerun repeats the saved completion text with the same pass id.
+Each notice uses the worker's native identity and name, including a notice from the director's rerun.
+The saved completion supplies the sender identity for a retired managed Astra reviewer.
+The sender identity remains the same after a session change and retirement.
+Turn and run events send no notice when the outcome, reply, and run ids match the last notice.
+A changed outcome, reply, or run id sends one notice.
+Waiting notices add `; runs <run ids>` to the first line.
+The run ids include received results that still await a worker reply.
+An empty turn reply writes no reply file and adds no `; reply <path>` text.
 
 A new Codex worker has no resume argument.
 Its pane session report supplies the first native identity.
 The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
 Every other foreground process prevents the pane report from proving a sole Codex process.
 
-`worker.dispatch_receipt` owns the completion rule.
+`worker.dispatch_receipt` reads the transcript and detached run evidence.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
 A pending run reply or friend reply keeps the pass active without another prompt.
+Run events preserve the last worker reply while a result awaits a reply.
+A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A worker puts its question in its reply and ends the turn.
 The turn hook sends that reply to the director.
 An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 A turn without DONE reports `no DONE` when no pending work explains it.
+The notice includes the worker's last reply and leaves the pass active.
 The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
+The completion rule accepts the saved DONE hook completion for the same dispatch.
+Live detached work prevents completion before pane closure.
+The hook ends `scratch.worker_task(row.id)` before it closes the pane.
+This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
+A failed cleanup adds one line to the director notice and permits pane closure.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
+A refused launcher retry retains the existing pass and its run, including a run with one worker.
+A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+The review trial uses the latest completion duration for each pass.
+Named adversary and contract reviews use the same completion hook.
+Their DONE reply records `done` and sends one notice.
+The hook also saves an assigned style review result.
 A close anomaly retains the completed outcome and reaches the director in the hook message.
 A held reviewer role remains held after submission. Completion ends that reviewer and releases the role.
+The close matches the pane's terminal identity and closes it without a foreground-process wait.
+Uncertain ownership or failed closure produces a retained-pane diagnostic.
 
 Event producers call `handle(WorkerEvent(thread_id, EventKind.RUN_FINISHED))` after a run record reaches `finished`.
 The final diff event uses `EventKind.STAGE_READY` for a review with two stages.
@@ -83,12 +125,32 @@ The director sends the final-diff event with `turn_end.py stage-ready <worker>`.
 
 ### Hook input sources
 
-The [Codex notification reference](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications) defines one JSON argument.
-Its fields include `type`, `thread-id`, `turn-id`, `cwd`, `input-messages`, and `last-assistant-message`.
-The event type is `agent-turn-complete`.
+The [Codex Stop reference](https://learn.chatgpt.com/docs/hooks#stop) defines JSON on stdin.
+Its fields include `session_id`, `turn_id`, `cwd`, `hook_event_name`, `stop_hook_active`, `transcript_path`, `model`, and `last_assistant_message`.
+A null `last_assistant_message` becomes an empty reply.
+Saved launch records can retain legacy `notify` arguments.
+The handler ignores their `agent-turn-complete` payloads.
+The global Stop hook supplies completion for those workers.
 The [Claude Stop reference](https://code.claude.com/docs/en/hooks#stop) defines JSON on stdin.
 Its fields include `session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`, `stop_hook_active`, and `last_assistant_message`.
-The hook uses the native id to select the worker. The shared transcript receipt decides completion.
+The hook uses the native id to select the worker.
+The hook applies the completion rule described above.
+
+### Stop hook deployment
+
+The director installs the hook after deployment.
+Each registered Codex home must trust the shared `hooks.json` handlers.
+
+1. Set `CODEX_HOME` to the account home and run `scripts/lib/py scripts/hooks/codex_hooks.py install`.
+2. Run `scripts/lib/py scripts/hooks/codex_hooks.py check` with the same `CODEX_HOME`.
+
+The installer reports the `turn-end` handler as trusted.
+A worker needs no new launch-line setting to use the installed Stop hook.
+Every Codex session runs the handler at each turn end. A non-worker turn exits as ignored and adds one line to `~/.local/state/herdr/turn-end-ignored.jsonl`.
+A Codex process that started before the Stop hook was installed (2026-11-09 08:27 EST) runs no Stop hook. Measured: such a process finished turns after that time and added no line.
+Close that worker's pane. Its next assign starts a new process that has the hook.
+A pane launched with `-c notify` sends a payload that the handler saves as an ignored line with an empty thread.
+Why: legacy notify passed the payload as one argument, and Linux refuses one argument over 128 KiB. Long-lived threads lost turn ends that way (2026-11-09).
 
 ## Unit code reviewers
 
@@ -103,6 +165,12 @@ Titles use the current staff placement and assignment role.
 ### Staff identity and admission
 
 A worker has one fixed staff id, name, parent and worktree.
+Its `role` records its last dispatch. Its `home` records the absolute account folder.
+`KnownWorkerRole | WorkerRoleUnknown` and `SessionHome | HomeUnknown` represent these values.
+Missing keys mean unknown. Serialization omits missing values.
+An invalid value remains unknown and retains its raw JSON value.
+`progress_history.begin_dispatch` uses `staff.set_worker_role`.
+Pane publication uses `staff.set_home`.
 `current_session` selects its Claude session or Codex thread.
 A family change preserves the fixed staff id.
 The [staff design](staff-accessors.md#staff-identity-and-backends) defines the row fields and backend evidence.
@@ -115,7 +183,24 @@ Only successful publication permits successful dispatch.
 A publication failure runs the caller's cleanup callback and reports the native id.
 The Claude coordinator tries to stop an unpublished session.
 A failed stop reports `cleanup unproved`.
-Native pane startup retains an unpublished pane for recovery.
+A failed pane admission closes only the new pane that this call created.
+A reviewer hold failure or a failure before dispatch submission ends only the worker pane that this call created.
+The same cleanup applies when worker restore fails before it submits its resume prompt.
+Cleanup closes only the saved pane and terminal.
+The close target is the worker's current session for both Claude and Codex.
+It retires a staff row only if this launch created the row.
+A resumed worker keeps its existing row after cleanup.
+An existing pane keeps its pane and staff row.
+A failed close prints `anomaly: <pane>: cleanup failed: <reason>` and preserves the original failure code.
+An incomplete start also closes its new pane.
+The start result identifies a new pane and its saved terminal.
+Dispatch reads staff rows before start and adds no pane scan for cleanup.
+A target refusal before prompt delivery runs cleanup.
+Cleanup stops only after target checks pass and the prompt can reach the agent.
+Restore cancels cleanup through the callback in `Herdr.prompt`.
+For an existing pane, the launcher quits its own agent and keeps the shell.
+Both paths compare the current terminal and process with the identities saved after launch.
+A replacement process remains open. Cleanup prints one anomaly with the pane id.
 
 A new slot takes the parent/name lock before the row lock.
 An existing slot takes the row lock.
@@ -169,7 +254,7 @@ An accepted retry prints `unchanged`.
 The launcher retains its original prompt identity and its dispatch record.
 `review.sh` has no pending dispatch check and does not restore a saved extract.
 
-### Legacy mesh coordinator and friends
+### Claude coordinator and friends
 
 `assign.py.execute_herdr` sends normal assignments through `worker.py` and native worker panes.
 The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.
@@ -382,13 +467,9 @@ An ended identity cannot reopen.
 
 A design role uses `worker.py` operations.
 `worker.py list --json` gives each worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
-It computes three fields at read time and stores none of them:
-
-1. `work`: `idle`, `busy` or `unknown`, from `worker_panes.worker_state` for the current manager.
-2. `account`: the account label from `member_account.resume_account` for the current manager.
-3. `home`: the account's absolute home path.
-
-With unavailable backend evidence, `account` contains `{"state": "AccountUnavailable", "reason": ...}` and `home` is absent.
+The staff row supplies `role` and `home`. The `home` folder name supplies the account label.
+`work` is `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
+An unknown role uses `WorkerRoleUnavailable`. An unknown home uses `AccountUnavailable` and omits `home`.
 `worker.py list --json --all` reads workers for every manager and adds each parent's name as `manager`.
 It needs no caller row and makes no process, pane, or thread read.
 Its `state` uses the saved dispatch status or staff hold.
@@ -397,7 +478,7 @@ History lookup resolves fixed manager ids through the staff record, even after a
 History lookup reads the last 64 KiB of each file, plus one byte to skip a leading partial line.
 History-only dispatches outside this window use the same unknown fields as missing dispatches.
 It skips invalid lines and decodes only wanted worker events.
-Stored account history resolves only the unit group and reads its history once.
+Listing reads no role map or account history. Missing dispatch history does not change the staff role or home.
 Per-manager listing keeps its live observations.
 
 History lookup resolves fixed manager ids through staff, even after a session change.
@@ -480,6 +561,11 @@ The [session roster](session-roster.md) shows open roles through their current s
 `worker_lock` holds the parent's named creation lock until the new worker has a fixed staff id.
 `WorkerLockHold.bind` locks that fixed id before creation serialization ends.
 A competing dispatch returns `Kept` when the lock is held.
+`worker.py dispatch` holds this lock from pass creation through prompt submission.
+It releases the lock before the completion hook ends the pass.
+`worker_dispatch_state` keeps an active pass with a saved submission held during this gap.
+A transcript that ends with the dispatch DONE line proves completion before the hook records the pass end.
+An active pass without a saved submission, a held worker lock, or a live detached run is stale.
 `scripts/production/staff.py` owns `slot_operation` and `row_operation`.
 These locks protect native identity publication and family changes.
 Inherited child processes share the staff lock through its file descriptor.
@@ -523,7 +609,8 @@ Daemon sessions retain their `codex:<thread>` route.
 ## Retirement and resume
 
 Unit retirement stops workers through the pane worker path.
-Run cleanup preserves worker threads.
+DONE closure preserves worker rows and conversations.
+Run cleanup selects workers from its dispatch records and calls `worker.py end` for each selected member.
 `remove_workers.py` resolves the selected staff member before it calls the worker command.
 Shutdown keeps saved Claude child launcher commands in `ClaudeChildResume`.
 Pane worker resume messages keep the fixed staff id and dispatch id.
@@ -545,11 +632,13 @@ Detached command records retain their own process and working directory checks.
 
 ## Pane closure and restore
 
-The director closes a worker pane after it accepts a pass.
+The completion hook closes a worker pane after DONE.
 An immediate repair or phase dispatch can retain the pane.
-A busy worker or live detached run prevents closure.
+A live detached run keeps the pass active, so the hook closes no pane until that run ends.
+The close reads no process. It closes the pane at once.
 Closure keeps the staff row and thread.
 The next assign resumes that thread in a new pane.
+An account move resumes an open or stopped worker in its same pane and closes no pane.
 Restore reopens only workers with active dispatches.
 Idle workers stay closed until their next assign.
 Account moves preserve closed idle workers.
@@ -563,6 +652,24 @@ It stores none of these three fields.
 `member_account.resume_account` supplies the account label and absolute home path.
 Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
 That row has no `home` field.
+
+`worker.py list` text rows read `<n> <name> <role> <account>[ <machine>] <pane> <state>[ <reason>]`.
+`_worker_pane_state` is the one mapping from an observed worker to its pane and state words.
+
+| Observed worker | Pane | State |
+| --- | --- | --- |
+| `OpenWorker` | `open` | `paused` or `exited` from the staff row, else `busy`, `idle` or `unknown` |
+| `StoppedWorker` | `open` | `exited` |
+| `ClosedWorker` | `closed` | `-` |
+| Any other class | `unknown` | `-`, and the row keeps its reason |
+
+A row whose pane is not open prints `-` for the account.
+`list --all` prints `-` for the pane and the account, and a state from the dispatch status.
+`display_cells.machine_column` decides the machine field.
+The field shows only when a row uses a machine other than the home machine in `config/build_targets.conf`.
+A worker uses the machine of its parent's worktree.
+`list_workers(as_json=False)` replaces the `state` key with the column word, so the key holds the observed class name only in JSON output.
+`list --json` and `list --json --all` have no pane column and no machine field.
 
 ## Assignment settings and command files
 

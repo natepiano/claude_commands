@@ -1195,5 +1195,29 @@
       "sha256": "b7574f53336dcae46fdd6f2e84fd35e2f2ec72529ca9769d8e96f68985b486b8",
       "time": "2026-11-08T12:35:09.855573-05:00"
     }
+  },
+  "sweep.disk_floor_recovered": {
+    "Mac": {
+      "objections": [
+        {
+          "quote": "Mac has 156.0 GiB free, above the 155.0 GiB line.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: user 2026-11-09 via the builds showrunner: approve - the words of the new 'disk space is back' push are approved as proposed; user then said 'yes go' to this record step; reviewer: opus",
+      "sha256": "ef2a639e7167724c282f7f7c4ba882cec56ff3f5ac663a60a2f98c66cc367ed8",
+      "time": "2026-11-09T12:05:16.092500-05:00"
+    },
+    "natedev": {
+      "objections": [
+        {
+          "quote": "natedev has 156.0 GiB free, above the 155.0 GiB line.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: user 2026-11-09 via the builds showrunner: approve - the words of the new 'disk space is back' push are approved as proposed; user then said 'yes go' to this record step; reviewer: opus",
+      "sha256": "ef2a639e7167724c282f7f7c4ba882cec56ff3f5ac663a60a2f98c66cc367ed8",
+      "time": "2026-11-09T12:05:09.578495-05:00"
+    }
   }
 }

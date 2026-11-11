@@ -17,12 +17,14 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, NoReturn, cast, final, overload
 
 from scripts.astra import astra_roles
+from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily
@@ -195,9 +197,9 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
     director = staff.runtime_id()
     session = args.session_dir
     if not session:
-        marker = unit_runs.marker(director, os.environ.get("UNIT_ACTIVE_DIR"))
-        if marker.is_file():
-            session = marker.read_text().strip()
+        opened = unit_runs.open_run(director)
+        if opened is not None:
+            session = str(opened)
         elif unit_runs.environ("RUN_DIR"):
             session = unit_runs.environ("RUN_DIR")
         else:
@@ -434,11 +436,17 @@ def image_note(images: list[str]) -> str:
 
 
 
+def launcher_command() -> list[str]:
+    """Name this launch the way the recorder saves it for a repeated launcher."""
+    return ["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]]
+
+
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
     """Send the assignment through the shared worker command."""
     directory = phase_reservation.phase_directory(run, phase)
     directory.mkdir(parents=True, exist_ok=True)
+    launcher = launcher_command()
     slot = args.to or args.new_worker or role
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
     summary = directory / f"{slot}_summary{suffix}.txt"
@@ -478,21 +486,22 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     actions = progress_history.CompletionActions(str(summary), str(status), args.summary,
         str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
-    command += ["--launcher-command", json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]]),
-                "--completion-actions", json.dumps(asdict(actions))]
+    command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions))]
     matched = progress_history.dispatch_worker(run, slot=slot, phase=phase, role=cast(staff.WorkerRole, role),
-        prompt=message, launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
+        prompt=message, launcher_command=launcher)
+    recorded = progress_history.launch_slot(run, slot, launcher)
     if not (isinstance(matched, progress_history.MatchedDispatch)
-            and progress_history.dispatch_completed(run, slot, matched.instance_id)):
+            and progress_history.dispatch_completed(run, recorded, matched.instance_id)):
         write_text_atomic(status, "running\n")
     _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
               f"role={role}; status in {status}"], env)
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
               "header", slot, role], env, check=False)
+    previous_pass = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(recorded))
     with log.open("a") as output:
         result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
-    passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(slot))
-    selected = text(passed.get("worker_name")) or slot
+    selected = progress_history.launch_slot(run, slot, launcher)
+    passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
     if selected != slot:
         status = progress_history.worker_artifact(status, slot, selected)
         target_log = progress_history.worker_artifact(log, slot, selected)
@@ -501,14 +510,14 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                           json.dumps({"worker": selected, "round": number, "paths": paths}))
     if result.returncode:
         write_text_atomic(status, "error\n")
-        if result.returncode in (1, 2):
-            passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(slot))
-            progress_history.complete_dispatch(run, slot, text(passed.get("instance_id")), status="error")
+        if result.returncode in (1, 2) and passed.get("instance_id") != previous_pass.get("instance_id"):
+            passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
+            progress_history.complete_dispatch(run, selected, text(passed.get("instance_id")), status="error")
             if role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1":
                 env["UNIT_PASS_OWNER"] = "launcher"
-                failed = AssignmentResult(args, run, phase, role, slot, env, style_assignment=style)
+                failed = AssignmentResult(args, run, phase, role, selected, env, style_assignment=style)
                 _ = finish_repair(failed, result.returncode)
-        _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "blocked",
+        _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), selected, "blocked",
                   f"role={role}; exit {result.returncode}; log {log}"], env)
     return staff_worker.DispatchSubmission.SUBMITTED if result.returncode == 0 else result.returncode
 
@@ -609,7 +618,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
             try:
                 thread = client.native_session(current.pane, "codex", max(0, deadline - time.monotonic()))
                 break
-            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                 if time.monotonic() >= deadline:
                     raise
                 _ = threading.Event().wait(max(0, min(0.1, deadline - time.monotonic())))
@@ -622,7 +631,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
     except side_pane.SidePaneRefused as error:
         print(str(error), file=sys.stderr)
         result = worker_panes.ExitCode.REFUSED
-    except (herdr.HerdrFailure, conf.Unusable, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (herdr_types.HerdrFailure, conf.Unusable, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"assign.sh: consultation unavailable: {error}", file=sys.stderr)
         result = worker_panes.ExitCode.UNCERTAIN
     finally:
@@ -633,7 +642,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
                     print(f"assign.sh: consultation close unproved: {closed.reason}; "
                           + f"pane {opened.pane} ({args.new_worker}) stays open", file=sys.stderr)
                     result = 1
-            except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"assign.sh: consultation close failed: {error}", file=sys.stderr)
                 result = 1
     return result
@@ -658,14 +667,14 @@ def execute_durable(args: Arguments) -> int:
         slot=name.value, phase=args.phase, kind="astra",
         reply=Path(args.summary) if args.summary else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
         completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
-        launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
+        launcher_command=launcher_command())
     return result
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
                               env: dict[str, str]) -> int:
     """Submit one held reviewer and retain its role until completion."""
-    command = ["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]]
+    command = launcher_command()
     matched = progress_history.dispatch_worker(run, slot=args.new_worker, phase="astra-review", role="astra-reviewer",
                                                prompt=prompt, launcher_command=command)
     if (isinstance(matched, progress_history.MatchedDispatch)
@@ -686,24 +695,30 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
     parent = worker_admission.parent(staff.snapshot(), run=run)
     target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
-    current = launch(target, policy)
-    if not isinstance(current, worker_panes.OpenWorker):
-        return staff_worker.startup_result(target.name, current)
-    try:
-        client = herdr.Herdr(herdr.shared_session())
-        process = client.pane_agent_process(current.pane, current.terminal)
-        role = astra_roles.hold("reviewer", astra_roles.ExecProcess(process.pid), str(current.row.id))
-        if isinstance(role, astra_roles.HoldWorkerUnavailable):
+    before = staff_worker.rows_before_launch()
+    with ExitStack() as cleanup:
+        current = launch(target, policy)
+        staff_worker.arm_launch_cleanup(cleanup, before, current)
+        if not isinstance(current, worker_panes.OpenWorker):
+            return staff_worker.startup_result(target.name, current)
+        try:
+            client = herdr.Herdr(herdr.shared_session())
+            process = client.pane_agent_process(current.pane, current.terminal)
+            role = astra_roles.hold("reviewer", astra_roles.ExecProcess(process.pid), str(current.row.id))
+            if isinstance(role, astra_roles.HoldWorkerUnavailable):
+                return 1
+            result = staff_worker.dispatch(target.parent, target.name, target.role, prompt,
+                session_dir=run, slot=args.new_worker, phase="astra-review", kind="astra",
+                reply=Path(args.summary), policy=policy, started=current,
+                completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
+                    finish_phase="astra-review", finish_run=True),
+                launcher_command=launcher_command(), on_submission=cleanup.pop_all)
+            if result is staff_worker.DispatchSubmission.SUBMITTED:
+                _ = cleanup.pop_all()
+            return result
+        except (OSError, ValueError) as error:
+            print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
             return 1
-        return staff_worker.dispatch(target.parent, target.name, target.role, prompt,
-            session_dir=run, slot=args.new_worker, phase="astra-review", kind="astra",
-            reply=Path(args.summary), policy=policy, started=current,
-            completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
-                finish_phase="astra-review", finish_run=True),
-            launcher_command=["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])
-    except (OSError, ValueError) as error:
-        print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
-        return 1
 
 
 def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> int:
@@ -734,7 +749,7 @@ def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
     """End a sole failed dispatch without changing its exit code."""
     try:
         passes = recorded_passes(run)
-        if any(entry.get("status") == "completed" for entry in passes):
+        if any(entry.get("status") in ("active", "refused", "completed") for entry in passes):
             return
         if any(entry.get("team_slot") != slot for entry in passes):
             return
@@ -749,7 +764,7 @@ def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
         own_names = {slot, *(text(entry.get("worker_name")) for entry in passes if entry.get("worker_name"))}
         if names - own_names:
             return
-        held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), env.get("UNIT_ACTIVE_DIR"), record=record)
+        held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), record=record)
         if {Path(folder).resolve() for folder in held} != {run}:
             return
         commands = ([PYTHON, PROGRESS, "finish-run", "--session-dir", str(run), "--status", "error"],
@@ -802,10 +817,12 @@ def main() -> int:
     if checked.returncode:
         return 3 if checked.returncode == 3 else 2
     slot = args.to or args.new_worker or role
-    before = object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(slot)
+    before = object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(
+        progress_history.launch_slot(run, slot, launcher_command()))
     code = execute_herdr(args, run, phase, prompt, role, paths, env)
-    if code == 2 or (code == 1 and env.get("UNIT_RESOLVES_ROUND") != "1" and object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(slot) != before):
-        end_failed_launch(run, slot, env)
+    selected = progress_history.launch_slot(run, slot, launcher_command())
+    if code == 2 or (code == 1 and env.get("UNIT_RESOLVES_ROUND") != "1" and object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected) != before):
+        end_failed_launch(run, selected, env)
     return submission_result(code)
 
 

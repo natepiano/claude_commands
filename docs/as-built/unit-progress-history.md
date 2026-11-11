@@ -34,6 +34,8 @@ Saved event names remain historical text.
 Active readers obtain the current folder through `plan_history.staff_directory`.
 They do not route through saved folder copies or an absolute plan path.
 `start-run` with a plan calls `unit_config.set_plan` on the unit's existing `.unit.toml`.
+`start-run` with a different plan on an existing run records that plan and its project clock.
+The same plan changes nothing.
 Staff stores neither the plan nor the port.
 
 `progress_history.last_dispatch(worker_id)` returns `RecordedDispatch` or `NoDispatchRecorded`.
@@ -191,10 +193,8 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/direct/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
-`FIX_PASS < 10` counter, which could not converge: the re-review after each fix
-was a fresh blind review of a now-larger diff, with no memory of what had already
-been accepted, so it always returned something.
+`scripts/direct/findings.py` records findings and controls repair batches for `/unit:direct`.
+Stable finding identities preserve accepted verdicts across reviews.
 
 State lives in `findings_state.json` beside the progress state and holds the
 ledger of the newest open phase. When the current phase changes, the ledger it
@@ -207,7 +207,10 @@ or more open and none named, `<N> phases are open (<ids>); name one with
 --phase`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
-Each finding is `open`, `fixed_pending_review`, or `accepted`.
+Repair states are `open`, `repair_in_flight`, `fixed_pending_review`, `accepted`, and `routed`.
+Decision states are `held_for_decision` and `decided`.
+A routed finding remains unresolved outside the gating batch.
+Its receiving checkpoint records closure through `close-route`.
 
 `gate` returns one of two verdicts and the unit director follows it — it never
 decides on its own whether to run another round:
@@ -218,14 +221,14 @@ decides on its own whether to run another round:
 There is no third verdict. The gate does not stop the run, and it holds no
 override, because there is nothing to override.
 
-Three rules are enforced by refusal, not by prose:
+The ledger enforces these batch rules:
 
-- **Severity narrows.** Round 1 gates blockers and minors; every later round
+1. **Severity narrows.** Round 1 gates blockers and minors; every later round
   gates blockers only. Nits never gate, and are returned as `non_gating_open` so
   they can still be reported.
-- **One batch per round.** `dispatch --covers` refuses a partial batch, so a
+2. **One batch per round.** `dispatch --covers` refuses a partial batch, so a
   round cannot repair one finding, re-review, and rediscover the rest.
-- **No gate with verdicts outstanding.** `gate` refuses while any finding is
+3. **No gate with verdicts outstanding.** `gate` refuses while any finding is
   `fixed_pending_review`; reopening an `accepted` finding requires `--evidence`
   naming the hunk that invalidated it.
 
@@ -237,22 +240,21 @@ consecutive rounds with no decrease in the gating-open count;
 `MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
 `RUNAWAY_ROUNDS` backstop.
 
-Each of these used to stop the phase and hand it to the user. They stopped too
-much: the stall test in particular fires on a converging phase whose every
-round repairs exactly what it was handed and whose next gate finds something
-genuinely new, which reads as one open blocker round after round. The count cannot tell
-that apart from a repair that will not take. So the tests were kept for what they
-are good at — naming the shape of a phase that is not converging — and the
-enforcement was dropped. The unit director reports the sentence and dispatches the
-round; the user watches the run and stops it themselves when it warrants.
+These advisories describe repair cost and progress.
+They do not stop the phase.
+The director reports the advisory and continues through the repair rules.
+An unchanged open count can describe new findings or repeated failed repairs, so the count alone cannot decide when to stop.
 
 The repair budget is the first round's gating count times
 `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
-limits are set in `~/.claude/config/direct.conf`, read at startup by
-`findings.py` and required there — an absent or unusable value exits 2 rather
-than falling back. They now decide when an advisory is worth printing rather than
-when a phase stops, so the shipped values set where a phase starts being reported
-as slow, not where it is cut off.
+limits are set in `~/.claude/config/direct.conf` and read by `findings.py` at startup.
+An absent or unusable required value exits 2.
+The budget and convergence limits control advisories.
+`ROUTING_FROM_ROUND=4` and `ASTRA_AFTER_FAILED_FIXES=2` enforce repair evidence.
+From round four, each kept finding needs its category and evidence.
+A due Astra record applies to the finding's current fix-attempt count.
+Every dispatch records affected accepted checks or an explicit reason for none.
+The [repair overview](repair-rounds.md#repair-control-and-routed-work) defines these controls and the distinct round measures.
 
 A ledger batch with a started fix pass counts as one repair round. Relaunches of that batch add no round.
 A dispatch alone adds no round. Passes without a ledger batch add no round to `repair_round`.
@@ -278,7 +280,7 @@ It accepts an empty phase instance id and preserves the `finding_route_closed` e
 findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>]
 findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
 findings.py gate --session-dir <dir> [--phase <id>]
-findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,...
+findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<category>:<evidence>]
 findings.py status --session-dir <dir> [--phase <id>]
 ```
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from pathlib import Path
 
@@ -39,8 +39,8 @@ from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.hooks import conversation_pause
 from scripts.production import unit_lookup
 from scripts.message import sessions
-from scripts.shutdown import inventory
-from scripts.shutdown import restart
+from scripts.agents import inventory
+from scripts.agents import restart
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production.production_doc import Refusal, read_production
 from scripts.accounts import accounts
@@ -49,7 +49,7 @@ from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import confirm_tab_close, process as write_process, private_process_registry
 from scripts.whoami.account_test_support import stored_room
-from scripts.shutdown.test_support import registry_confirmation, ShutdownTestCase
+from scripts.agents.test_support import registry_confirmation, ShutdownTestCase
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -64,7 +64,7 @@ SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.
 LINUX_LAUNCHER_CLI = """import runpy, sys
 from unittest.mock import patch
 from scripts.production.fake_unit_host import private_process_registry
-from scripts.shutdown import remote
+from scripts.agents import remote
 script = sys.argv.pop(1)
 with private_process_registry(), patch.object(remote, 'local_machine', return_value='natedev'):
     runpy.run_path(script, run_name='__main__')
@@ -270,8 +270,8 @@ class AddUnitTestCase(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        self.staff.setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         _ = self.enterContext(patch.object(sessions, "process_start", side_effect=fixture_process_start))
         _ = self.enterContext(patch.object(runtime_sessions, "process_start", side_effect=fixture_process_start))
@@ -497,7 +497,7 @@ def submit_command(argv):
         self.persist_herdr_unit(session, self.root)
         environment = self.root / "proc/202/environ"
         _ = environment.write_text(environment.read_text() + f"\0CLAUDE_CONFIG_DIR={directory}")
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         with patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"])):
             pane_record.write(session, pane_record.launch("w1:p1", "62ccbd64-f22e-5647-b20e-7899aa39d766", str(self.root),
                 {"CLAUDE_CONFIG_DIR": str(directory)},
@@ -860,7 +860,7 @@ def submit_command(argv):
             return launch_session(request, director, prompt, selected, target=target, model=model,
                                   autocompact_window=autocompact_window)
 
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
         def stop(identity: str) -> stop_resume.Stopped | stop_resume.StopFailed:
             nonlocal stopped
             self.assertEqual(identity, "62ccbd64-f22e-5647-b20e-7899aa39d766")

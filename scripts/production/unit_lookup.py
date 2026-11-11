@@ -19,16 +19,19 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
-from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.herdr.herdr import HerdrPlace  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
+from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.message.sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, session_staff, unit_config  # noqa: E402
 from scripts.production.session_labels import StaffLabels
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib import unit_runs  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.herdr import herdr
 
 USAGE = "usage: unit_lookup.py list <production name> | pane <production name> <unit>"
 
@@ -223,11 +226,12 @@ class RunRecord(NamedTuple):
 
 
 class HeldRun(NamedTuple):
-    """A directed run and its recorded worktree and state."""
+    """A directed run with its history, worktree, state, and held folder."""
 
     path: Path
     worktree: Path
     state: UnitState
+    folder: Path
 
 
 @dataclass(frozen=True)
@@ -272,7 +276,7 @@ class HeldRunLookup:
                     last = _last_event(path)
                     state = (UnitState.RUN_FINISHED if last is not None
                              and last.get("event_type") == "run_finished" else UnitState.RUNNING)
-                    self._histories[path] = HeldRun(path, row.worktree.path, state)
+                    self._histories[path] = HeldRun(path, row.worktree.path, state, Path(folder))
                 except (OSError, UnicodeError, ValueError) as error:
                     self._histories[path] = HeldRunUnknown(path, str(error))
             run = self._histories[path]
@@ -377,6 +381,8 @@ class RecordsPartlyUnread(NamedTuple):
 
 
 def _place_of(pid: int, places: dict[int, HerdrPlace]) -> HerdrPlace | None:
+    from scripts.herdr import herdr
+
     place = places.get(pid)
     if place is not None:
         return place
@@ -441,6 +447,8 @@ def _claudes(processes: list[herdr.HerdrProcess], *,
 def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
                   processes: list[herdr.HerdrProcess]) -> Iterable[LabeledSession]:
     """Join live Claude by PID, retaining stopped panes and unknown evidence."""
+    from scripts.herdr import herdr
+
     running = {session["name"] for session in herdr.live_sessions()}
     holders = {process.pid: (process.place, claudes[process.pid].session_id if process.pid in claudes else
                             process.marks.get("CODEX_THREAD_ID", "") or process.marks.get("CLAUDE_CODE_SESSION_ID", ""))
@@ -510,12 +518,14 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
 
 def observed_session_labels(*, record: staff.StaffSnapshot | None = None, running: Sequence[SessionRecord] | None = None) -> tuple[LabeledSession, ...]:
     """Read native process identities for stop and cleanup checks."""
+    from scripts.herdr import herdr
+
     try:
         record = record if record is not None else staff.snapshot()
         processes = herdr.herdr_processes(membership=StaffLabels(record))
         claudes, unread = _claudes(processes, running=running)
         return tuple(_herdr_labeled(claudes, unread, processes))
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         raise OSError(str(error)) from error
 
 

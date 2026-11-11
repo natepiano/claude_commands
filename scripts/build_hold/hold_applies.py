@@ -51,8 +51,9 @@ def hold_applies() -> str:
         state = target_state(build_targets.local_target())
         if isinstance(state, StateUnreadable):
             raise HoldStateReadError(state.reason)
-        holds = build_hold.natedev_holds(build_hold.holder_directory())
-        if not holds.in_force or build_targets.caller_holds_only_own():
+        directory = build_hold.holder_directory()
+        holds = build_hold.natedev_holds(directory)
+        if not build_targets.caller_waits_on_hold(holds, directory):
             return ""
         if not isinstance(state, Held):
             raise HoldStateReadError("holder file exists; target state disagrees")

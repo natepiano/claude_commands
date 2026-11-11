@@ -427,6 +427,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS claude_message ON turns (machine, turn_key)
     WHERE family = 'claude';
 CREATE INDEX IF NOT EXISTS turns_at ON turns (at);
 CREATE INDEX IF NOT EXISTS turns_agent_at ON turns (machine, family, parent_id, agent_id, at);
+CREATE INDEX IF NOT EXISTS turns_director_cost ON turns (at, machine, agent_id, model, input, cache_read, cache_write_5m, cache_write_1h, output)
+    WHERE role = 'director';
 CREATE TABLE IF NOT EXISTS compactions (
     machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
     agent_id TEXT NOT NULL, at TEXT NOT NULL,
@@ -1566,8 +1568,7 @@ def collect_mac(db: sqlite3.Connection) -> None:
         payload = reader_payload(offsets)
         with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
             process: subprocess.Popen[str] = subprocess.Popen(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", MAC_HOST, command],
+                ["ssh", "-o", "BatchMode=yes", MAC_HOST, command],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
                 text=True, encoding="utf-8", errors="strict")
             try:

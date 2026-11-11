@@ -2,7 +2,7 @@
 """SessionStart hook: record the Claude launch of the herdr pane this session runs in.
 
 The entry is what a restore needs to resume the pane on its own account: see
-`scripts/shutdown/pane_record.py`. A session outside herdr gets nothing.
+`scripts/agents/pane_record.py`. A session outside herdr gets nothing.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import sys
 from typing import TypedDict, cast
 from collections.abc import Mapping
 
-from scripts.shutdown import pane_record  # noqa: E402
+from scripts.agents import pane_record  # noqa: E402
 from scripts.production import session_staff, staff  # noqa: E402
 from scripts.hooks import staff_session_identity  # noqa: E402
 

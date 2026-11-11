@@ -17,7 +17,8 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.style import coverage_report
+from scripts.style import coverage_report, style_config
+from scripts.style.ledger_test_support import write_style_units
 from scripts.style import rules
 from scripts.style import style_ledger
 from scripts.style import style_rules
@@ -163,23 +164,37 @@ class CoverageReportTests(unittest.TestCase):
     def staff_units(self, *units: str) -> None:
         doc = self.repo / ".git/tool-based-ui-production.md"
         doc.parent.mkdir(parents=True, exist_ok=True)
-        _ = doc.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
+        _ = doc.write_text(f"# Style production\n- **Kind:** style\n- **Branch point:** main\n"
+                           + f"- **Merge branch:** style/main\n- **Showrunner checkout:** {self.repo}\n")
+        assignments = tuple(style_config.StyleUnitAssignment(
+            next((unit for unit in units if unit == family or unit.endswith("-" + family)), f"sample-style-{family}"),
+            (family,)) for family in cast(tuple[rules.Family, ...], ("names", "types", "values", "modules")))
+        write_style_units(doc, assignments)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = recorded_showrunner("sample-style", doc)
         for unit in units:
             _ = unit_membership("sample-style", unit)
 
 
-    def test_staff_units_use_full_ids_without_a_document_and_mixed_ids_with_one(self) -> None:
+    def test_report_reads_configured_units_without_a_family_suffix(self) -> None:
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
-            self.assertEqual(set(coverage_report.production(ledger, self.tip).units), {
-                "sample-style-names", "sample-style-types",
-                "sample-style-values", "sample-style-modules",
-            })
-            self.staff_units("names", "sample-style-types", "feature")
-            self.assertEqual(coverage_report.production(ledger, self.tip).units,
-                             ("names", "sample-style-types"))
+            self.assertEqual(coverage_report.production(ledger, self.tip).units, ())
+            self.staff_units("cargo-liner-style")
+            doc = self.repo / ".git/tool-based-ui-production.md"
+            write_style_units(doc, (style_config.StyleUnitAssignment(
+                "cargo-liner-style", ("names", "types", "values", "modules")),))
+            for kind in ("style", "product"):
+                with self.subTest(kind=kind):
+                    text = doc.read_text().replace("**Kind:** style", f"**Kind:** {kind}")
+                    if kind == "product":
+                        text = text.replace("**Merge branch:** style/main", "**Merge branch:** main")
+                        text = text.replace("## Style units", "### Style units ###")
+                    _ = doc.write_text(text)
+                    production = coverage_report.production(ledger, self.tip)
+                    self.assertEqual(production.units, ("cargo-liner-style",))
+                    self.assertEqual(production.name, "sample-style")
+                    self.assertEqual(production.branch_point, "main")
 
     def test_report_finds_a_moved_ticket_by_the_declared_full_unit_id(self) -> None:
         rule = self.rule("read")

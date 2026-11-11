@@ -6,12 +6,10 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from scripts.build_hold.override_guard import require_checkout
+
 if TYPE_CHECKING:
-    from scripts.build_hold.override_guard import require_checkout
-    from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig, read_memory_config as read_fixture_config
-else:
-    from scripts.build_hold.override_guard import require_checkout
-    from scripts.build_queue.admission_records import read_memory_config as read_fixture_config
+    from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
 
 require_checkout(Path(__file__))
 
@@ -24,8 +22,10 @@ def admission_configuration_fixture() -> MemoryConfig:
     """Read the fixed test settings with the original configuration reader."""
     from unittest.mock import patch
 
+    from scripts.build_queue.admission_records import read_memory_config
+
     with patch.dict(os.environ, {"CONF_DIR": str(ADMISSION_CONFIG_FIXTURE.parent)}):
-        return read_fixture_config(report=False)
+        return read_memory_config(report=False)
 
 
 def admission_policy_fixture() -> AdmissionPolicy:
@@ -119,7 +119,7 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
         **private_ci_environment(root),
         "BUILD_HOLD_DIR": str(root / "holders"),
         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-        "UNIT_ACTIVE_DIR": str(root / "active"),
+        "STAFF_FILE": str(root / "staff.json"),
         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
     }

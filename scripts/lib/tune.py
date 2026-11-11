@@ -8,12 +8,12 @@ except FileNotFoundError:
 
 import argparse
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import shlex
 import sys
 
-from scripts.lib import conf, main_publish
+from scripts.lib import conf, conf_reads, main_publish
 from scripts.lib.conf import Unusable, check
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_hold.override_guard import refuse_overrides
@@ -77,7 +77,8 @@ def _publish(args: RequestedValueChange, checkout: Path, *, already: bool) -> in
         if not already:
             print("mac: pulled")
     else:
-        main_publish.queue_pull_only(f"{args.file}.{args.key}", outcome.reason)
+        main_publish.queue_pull_only(f"{args.file}.{args.key}", outcome.reason,
+                                     pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
         print(f"mac: queued ({outcome.reason}); the 15-minute sync sends it when the Mac wakes")
     return 0
 
@@ -99,6 +100,7 @@ def change(args: RequestedValueChange) -> int:
     if old == args.value:
         print(f"already {args.key}={args.value}")
         return _publish(args, checkout, already=True)
+    conf_reads.record(source.stem)
     before = source.read_bytes().decode("utf-8")
     write_text_atomic(source, _replace_line(before, index, args.value))
     message = (f"tune({args.file}): {args.key} {old} -> {args.value}\n\n"

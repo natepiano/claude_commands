@@ -164,6 +164,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -202,6 +203,7 @@ if TYPE_CHECKING:
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import record, store
+    from scripts.buildlog.repository import GIT_DIR, repo_name as repo_name
     from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                                               TargetFolderOverride, recorded_output_roots)
     from scripts.notify.push_texts import RenderedPush
@@ -211,6 +213,7 @@ else:
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import store
+    from scripts.buildlog.repository import GIT_DIR, repo_name as repo_name
     from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                                               TargetFolderOverride, recorded_output_roots)
 
@@ -225,10 +228,6 @@ MIB = 1 << 20
 DAY_SECONDS = 86_400
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
-GIT_DIR = ".git"
-GITDIR_PREFIX = "gitdir:"
-COMMONDIR_FILE = "commondir"
-ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
 DOC_LOCK_NAME = ".lock"
@@ -674,13 +673,40 @@ class AbovePhoneFloor:
 
 
 @dataclass(frozen=True)
+class BelowRearmLine:
+    """No interval above the rearm line has started."""
+
+
+@dataclass(frozen=True)
+class AboveRearmLine:
+    since: float
+
+
+@dataclass(frozen=True)
 class OpenPhoneCrossing:
     identity: str
     natedev: CrossingReceipt = CrossingReceipt.PENDING
     phone: CrossingReceipt = CrossingReceipt.PENDING
+    rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
 
 
-PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing
+class ReturnPushPolicy(Enum):
+    ALLOWED = "allowed"
+    SUPPRESSED = "suppressed"
+
+
+@dataclass(frozen=True)
+class RecoveringPhoneCrossing:
+    """Retire the fall key before the permitted return delivery."""
+
+    identity: str
+    receipt: CrossingReceipt = CrossingReceipt.PENDING
+    retired: bool = False
+    rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
+    return_policy: ReturnPushPolicy = ReturnPushPolicy.ALLOWED
+
+
+PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing | RecoveringPhoneCrossing
 
 
 @dataclass(frozen=True)
@@ -801,6 +827,7 @@ class FolderChoiceKind(Enum):
     SCRATCH = "scratch"
     TRASH = "trash"
     PROTECTED = "protected"
+    HELD_OUTPUT = "held_output"
     OTHER = "other"
 
 
@@ -809,6 +836,13 @@ class FolderChoice:
     label: str
     bytes: int
     kind: FolderChoiceKind
+
+
+@dataclass(frozen=True)
+class CurrentMacFolders:
+    """Folder choices measured on the Mac during this crossing delivery."""
+
+    folders: tuple[FolderChoice, ...]
 
 
 @dataclass(frozen=True)
@@ -822,6 +856,13 @@ class InsufficientFolderChoices:
 
 
 @dataclass(frozen=True)
+class HeldOnlyFolderChoices:
+    """Every measured folder holds output a build is using."""
+
+    choices: tuple[FolderChoice, ...]
+
+
+@dataclass(frozen=True)
 class UnavailableFolderChoices:
     """No current folder choice is available."""
 
@@ -829,7 +870,7 @@ class UnavailableFolderChoices:
 UNAVAILABLE_FOLDER_CHOICES = UnavailableFolderChoices()
 
 
-FolderChoices = AvailableFolderChoices | InsufficientFolderChoices | UnavailableFolderChoices
+FolderChoices = AvailableFolderChoices | InsufficientFolderChoices | HeldOnlyFolderChoices | UnavailableFolderChoices
 
 
 class FloorAlertChannels(Enum):
@@ -2723,6 +2764,11 @@ def shrink_floor(
                             break
                         if not group_unchanged(group):
                             continue
+                        if isinstance(policy, MacFloor) and not dry_run:
+                            current_claims = policy.claims_before_removal(paired_roots)
+                            if current_claims:
+                                busy.update(current_claims)
+                                break
                         attempted.append(group)
                         account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
                         if isinstance(account, ConfirmedDeletion) and account.removed:
@@ -2917,9 +2963,16 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
         saved_channels = cast(dict[str, object], saved_crossing)
         identity = saved_channels.get("identity")
         if isinstance(identity, str) and identity:
+            since = saved_channels.get("rearm_since")
+            rearm = AboveRearmLine(float(since)) if _finite_number(since) else BelowRearmLine()
             try:
-                crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
-                                            CrossingReceipt(saved_channels.get("phone")))
+                if "recovery" in saved_channels:
+                    crossing = RecoveringPhoneCrossing(identity, CrossingReceipt(saved_channels.get("recovery")),
+                                                       saved_channels.get("retired") is True, rearm,
+                                                       ReturnPushPolicy(saved_channels.get("return_policy", "allowed")))
+                else:
+                    crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
+                                                CrossingReceipt(saved_channels.get("phone")), rearm)
             except ValueError:
                 crossing = OpenPhoneCrossing(identity)
     failure: NoFailure | FailurePending | FailureReported = NoFailure()
@@ -2957,11 +3010,20 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         "build_cache_bytes": record.build_cache_bytes,
         "last_alert_at": alert_at,
         "last_push_at": push_at,
-        "phone_crossing": ({"identity": record.phone_crossing.identity,
-                            "natedev": record.phone_crossing.natedev.value,
-                            "phone": record.phone_crossing.phone.value}
-                           if isinstance(record.phone_crossing, OpenPhoneCrossing) else "above"),
     }
+    crossing = record.phone_crossing
+    if isinstance(crossing, AbovePhoneFloor):
+        data["phone_crossing"] = "above"
+    else:
+        saved_crossing: dict[str, object] = {"identity": crossing.identity}
+        if isinstance(crossing.rearm, AboveRearmLine):
+            saved_crossing["rearm_since"] = crossing.rearm.since
+        if isinstance(crossing, OpenPhoneCrossing):
+            saved_crossing.update(natedev=crossing.natedev.value, phone=crossing.phone.value)
+        else:
+            saved_crossing.update(recovery=crossing.receipt.value, retired=crossing.retired,
+                                  return_policy=crossing.return_policy.value)
+        data["phone_crossing"] = saved_crossing
     if isinstance(record.failure, FailurePending):
         data["failure"] = {"status": record.failure.event.status, "detail": record.failure.event.detail}
     elif isinstance(record.failure, FailureReported):
@@ -3242,21 +3304,38 @@ def folder_choice(path: str, size: int) -> FolderChoice:
     return FolderChoice(label, size, FolderChoiceKind.OTHER)
 
 
-def folder_choices(measurement: DiskMeasurement, protected: Sequence[tuple[str, int]], shortfall: int, *,
-                   now: float, lint_settings: conf.ConfigRead) -> FolderChoices:
-    """Use current measurements and keep protected folders distinct from holders."""
+def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: Sequence[tuple[str, int]], shortfall: int, *,
+                   now: float, lint_settings: conf.ConfigRead, held_targets: Sequence[str] = ()) -> FolderChoices:
+    """Offer build output outside source checkouts and exclude held output from recommendations."""
     choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
                for path, size in protected if size > 0]
-    if isinstance(measurement, AvailableDiskMeasurement):
+    if isinstance(measurement, CurrentMacFolders):
+        protected_labels = {item.label for item in choices}
+        choices.extend(item for item in measurement.folders if item.bytes > 0 and item.label not in protected_labels)
+    elif isinstance(measurement, AvailableDiskMeasurement):
         age = now - measurement.measured_at.timestamp()
         if 0 <= age <= lint_settings.number("sweep_snapshot_max_age_seconds"):
             protected_paths = {item[0] for item in protected}
             choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
                            if item.bytes > 0 and item.path not in protected_paths)
-    choices.sort(key=lambda item: (-item.bytes, item.label))
+    held_paths = tuple(Path(path).expanduser().resolve() for path in held_targets)
+    output_roots = OUTPUT_ROOTS.get().output_owners
+    candidates: list[FolderChoice] = []
+    for item in choices:
+        path = Path(item.label).expanduser().resolve()
+        if ((path / "Cargo.toml").exists() or (path / GIT_DIR).exists()
+                or (path not in output_roots and not is_cargo_target(str(path), lint_settings=lint_settings))):
+            continue
+        if any(path.is_relative_to(held) or held.is_relative_to(path) for held in held_paths):
+            item = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
+        candidates.append(item)
+    choices = sorted(candidates, key=lambda item: (-item.bytes, item.label))
     if not choices:
         return UNAVAILABLE_FOLDER_CHOICES
-    return (AvailableFolderChoices(tuple(choices)) if choices[0].bytes >= shortfall
+    eligible = [item for item in choices if item.kind is not FolderChoiceKind.HELD_OUTPUT]
+    if not eligible:
+        return HeldOnlyFolderChoices(tuple(choices))
+    return (AvailableFolderChoices(tuple(choices)) if eligible[0].bytes >= shortfall
             else InsufficientFolderChoices(tuple(choices)))
 
 
@@ -3266,10 +3345,13 @@ def prepare_push_texts() -> None:
 
 
 def folder_recommendation(choices: FolderChoices, shortfall: int) -> str:
-    """Describe the largest measured folder for both alert channels."""
+    """Describe the largest measured folder without held output for both alert channels."""
     if isinstance(choices, UnavailableFolderChoices):
         return "Folder sizes are unknown."
-    largest = choices.choices[0]
+    if isinstance(choices, HeldOnlyFolderChoices):
+        return ("Every measured folder holds output a build is using. "
+                "The sweep frees it when the build ends.")
+    largest = next(item for item in choices.choices if item.kind is not FolderChoiceKind.HELD_OUTPUT)
     if isinstance(choices, InsufficientFolderChoices):
         return (f"The largest folder is {largest.label} at {gib(largest.bytes)}. "
                 f"Deleting it frees only part of the {gib(shortfall)} shortfall.")
@@ -3282,23 +3364,36 @@ def folder_recommendation(choices: FolderChoices, shortfall: int) -> str:
     return f"{action} (recommended): {effect} {gib(largest.bytes)}, which covers the {gib(shortfall)} shortfall."
 
 
-def folder_choice_lines(choices: FolderChoices, shortfall: int, *, path_limit: int) -> list[str]:
-    """Render the session choices with shortened folder labels and their effects."""
+def folder_choice_lines(choices: FolderChoices, shortfall: int, *, folder_count: int) -> list[str]:
+    """List enough measured folders with full paths, within the folder count."""
     if isinstance(choices, UnavailableFolderChoices):
         lines = [folder_recommendation(choices, shortfall), "",
                  "Measure first (recommended): natedev lists folder sizes, then you choose what to delete.", "",
                  "Delete nothing: the disk stays low and builds can fail."]
     else:
-        choices = replace(choices, choices=tuple(replace(item, label=alert_path(item.label, path_limit))
-                                                 for item in choices.choices))
+        shown: list[FolderChoice] = []
+        covered = 0
+        for item in choices.choices:
+            if len(shown) >= folder_count or covered >= shortfall:
+                break
+            if item.bytes <= 0:
+                continue
+            shown.append(item)
+            if item.kind is not FolderChoiceKind.HELD_OUTPUT:
+                covered += item.bytes
+        if shown and not isinstance(choices, HeldOnlyFolderChoices):
+            largest = next(item for item in choices.choices if item.kind is not FolderChoiceKind.HELD_OUTPUT)
+            if largest not in shown:
+                shown[-1] = largest
         effects = {
             FolderChoiceKind.TRASH: "Deleting it removes discarded files.",
             FolderChoiceKind.SCRATCH: "Deleting it removes temporary work; check for work you still need.",
             FolderChoiceKind.OTHER: "Deleting it removes its contents; their use is unknown.",
             FolderChoiceKind.PROTECTED: ("It is protected: no build record shows what made it. "
                                          "Cleanup never deletes it. Deleting it removes its files."),
+            FolderChoiceKind.HELD_OUTPUT: "A build is using output inside it; deleting it can break that build.",
         }
-        lines = [f"{item.label}: holds {gib(item.bytes)}. {effects[item.kind]}" for item in choices.choices]
+        lines = [f"{item.label}: holds {gib(item.bytes)}. {effects[item.kind]}" for item in shown]
         lines.append(folder_recommendation(choices, shortfall))
         lines.append("Delete nothing: builds can fail when the disk is full.")
     lines.append("natedev checks your choice before it deletes anything.")
@@ -3315,6 +3410,8 @@ def disk_floor_push(free: int, floor: int, choices: FolderChoices, *,
         from scripts.notify.push_texts import render
     folder_action = ("In the natedev Claude session, reply measure or delete nothing."
                      if isinstance(choices, UnavailableFolderChoices)
+                     else "In the natedev Claude session, reply delete nothing."
+                     if isinstance(choices, HeldOnlyFolderChoices)
                      else f"In the natedev Claude session, say which {machine.value} folders to delete.")
     recommendation = folder_recommendation(choices, max(0, floor - free))
     if isinstance(choices, UnavailableFolderChoices):
@@ -3423,6 +3520,37 @@ def send_floor_alert(message: str, *,
     if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
         message = f"Filesystem {filesystem.key} at {filesystem.probe_path}:\n{message}"
     return send_holder_message("natedev", message, repeat=repeat, lint_settings=lint_settings)
+
+
+class FallPushRetirement(Enum):
+    NO_KEPT_PUSH = "no_kept_push"
+    DROPPED_KEPT_PUSH = "dropped_kept_push"
+    FAILED = "failed"
+
+
+def retire_floor_fall(identity: str, *, machine: FloorMachine,
+                      lint_settings: conf.ConfigRead) -> FallPushRetirement:
+    """Retire the fall key on natedev, where silence keeps both machines' pushes."""
+    from scripts.notify import silence
+
+    command = session_send.send_argv("retire", "--to", "user", "--from", "disk_floor", "--key", f"phone:{identity}")
+    if machine is FloorMachine.MAC:
+        remote = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" '
+                  + shlex.join(command[2:]))
+        command = [*silence.SSH, remote]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True,
+                                timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"lint sweep: cannot retire the fall push: {error}", file=sys.stderr)
+        return FallPushRetirement.FAILED
+    dropped = re.search(r"(?m)^dropped ([0-9]+) kept push(?:es)?$", result.stdout)
+    if result.returncode or dropped is None:
+        print(f"lint sweep: cannot retire the fall push: {result.stderr or result.stdout}", file=sys.stderr)
+    if dropped is None:
+        return FallPushRetirement.FAILED
+    return (FallPushRetirement.DROPPED_KEPT_PUSH if int(dropped.group(1))
+            else FallPushRetirement.NO_KEPT_PUSH)
 
 
 from scripts.message import sessions
@@ -3546,8 +3674,9 @@ class MacFloor:
     """Only marked output inside the three approved Mac roots can be removed."""
 
     roots: tuple[str, ...]
-    claims: floor_claims.LockedClaims
+    claims: floor_claims.ClaimSnapshot
     mirror: Path
+    busy_mirrors: frozenset[Path] = frozenset()
     leased_mirrors: frozenset[Path] = frozenset()
 
     def allows(self, target: str) -> bool:
@@ -3573,7 +3702,7 @@ class MacFloor:
         paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
         for root in targets:
             if (not self.allows(root) or self.claims.holds(root, self.mirror)
-                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)
+                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.busy_mirrors)
                     or isinstance(paths, tmp_sweep.ProcessUsesUnavailable)):
                 result[root] = LockHeld("Mac claim or process use is busy or unreadable")
             else:
@@ -3583,11 +3712,63 @@ class MacFloor:
                         break
         return result
 
+    def claims_before_removal(self, targets: Sequence[str]) -> dict[str, LockHeld]:
+        """Read claims again for output outside the acquired mirror leases."""
+        uncovered = [target for target in targets if not any(
+            Path(target).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)]
+        if not uncovered:
+            return {}
+        claims = floor_claims.read_claims(conf.read("mac_test").number("probe_timeout_s"))
+        return {target: LockHeld("Mac claim is busy or unreadable") for target in uncovered
+                if claims.holds(target, self.mirror)}
+
 
 class NatedevFloor(Enum):
     """Use the existing Linux process and build hold checks."""
 
     CURRENT = "natedev"
+
+
+def mac_folder_reclaimable_bytes(directory: str) -> int:
+    """Count file blocks once only when every hard link is inside this folder."""
+    total = 0
+    links: dict[InodeKey, int] = {}
+    shared: dict[InodeKey, os.stat_result] = {}
+    frontier = [directory]
+    while frontier:
+        try:
+            with os.scandir(frontier.pop()) as entries:
+                listed = list(entries)
+        except OSError:
+            continue
+        for entry in listed:
+            try:
+                observed = entry.stat(follow_symlinks=False)
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_directory:
+                frontier.append(entry.path)
+                continue
+            if observed.st_nlink == 1:
+                total += observed.st_blocks * 512
+                continue
+            key = (observed.st_dev, observed.st_ino)
+            links[key] = links.get(key, 0) + 1
+            shared[key] = observed
+    return total + sum(observed.st_blocks * 512 for key, observed in shared.items() if links[key] == observed.st_nlink)
+
+
+def mac_folder_measurement(policy: MacFloor) -> CurrentMacFolders:
+    """Measure each root's direct folder children without following directory symlinks."""
+    folders: set[str] = set()
+    for root in policy.roots:
+        try:
+            with os.scandir(Path(root).expanduser().resolve()) as entries:
+                folders.update(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
+        except OSError as error:
+            print(f"lint sweep: cannot measure folders under {root}: {error}", file=sys.stderr)
+    return CurrentMacFolders(tuple(folder_choice(path, mac_folder_reclaimable_bytes(path)) for path in sorted(folders)))
 
 
 class FloorFailureScope(Enum):
@@ -3641,6 +3822,7 @@ class FloorOutcome:
     after: int = 0
     busy: int = 0
     protected: tuple[tuple[str, int], ...] = ()
+    held_targets: tuple[str, ...] = ()
 
     @property
     def status(self) -> int:
@@ -3783,15 +3965,17 @@ def _hold_floor(floor: int, dry_run: bool, *,
 
 def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, lint_settings: conf.ConfigRead, detail: str = "",
                          scope: SweepFailureScope = FloorFailureScope.FILESYSTEM,
-                         machine: FloorMachine = FloorMachine.NATEDEV) -> None:
+                         policy: MacFloor | NatedevFloor = NatedevFloor.CURRENT) -> None:
     """Finalize delivery and state before an acquired floor lock closes."""
     from scripts.lint import tmp_sweep
 
+    machine = FloorMachine.MAC if isinstance(policy, MacFloor) else FloorMachine.NATEDEV
     assessment = outcome.assessment if isinstance(outcome, FloorOutcome) else outcome
     if isinstance(assessment, tmp_sweep.SkippedSweepAssessment):
         return
     after = outcome.after if isinstance(outcome, FloorOutcome) else 0
     protected = outcome.protected if isinstance(outcome, FloorOutcome) else ()
+    held_targets = outcome.held_targets if isinstance(outcome, FloorOutcome) else ()
     removed = outcome.removed if isinstance(outcome, FloorOutcome) else 0
     filesystem = FLOOR_FILESYSTEM.get()
     root_scope = scope is FloorFailureScope.FILESYSTEM and (
@@ -3800,6 +3984,61 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
     if not root_scope and not assessment.status and not path.exists():
         return
     phone_floor = int(lint_settings.number("sweep_phone_floor_gib") * GIB)
+    phone_rearm = phone_floor + int(lint_settings.number("sweep_phone_rearm_gib") * GIB)
+    rearm_seconds = lint_settings.number("sweep_phone_rearm_minutes") * 60
+
+    def recover(current: FloorRecord, free: int, save: Callable[[FloorRecord], bool]) -> FloorRecord:
+        crossing = current.phone_crossing
+        if isinstance(crossing, AbovePhoneFloor) or (
+                isinstance(crossing, RecoveringPhoneCrossing) and crossing.receipt is CrossingReceipt.ACCEPTED):
+            return current
+        if free <= phone_rearm:
+            return replace(current, phone_crossing=replace(crossing, rearm=BelowRearmLine()))
+        now = time.time()
+        interval = crossing.rearm if isinstance(crossing.rearm, AboveRearmLine) else AboveRearmLine(now)
+        crossing = replace(crossing, rearm=interval)
+        current = replace(current, phone_crossing=crossing)
+        if now - interval.since < rearm_seconds:
+            return current
+        if isinstance(crossing, OpenPhoneCrossing):
+            policy = (ReturnPushPolicy.ALLOWED if crossing.phone is CrossingReceipt.ACCEPTED
+                      else ReturnPushPolicy.SUPPRESSED)
+            crossing = RecoveringPhoneCrossing(crossing.identity, rearm=interval, return_policy=policy)
+            current = replace(current, phone_crossing=crossing)
+        if not save(current):
+            return current
+        if not crossing.retired:
+            return_policy = crossing.return_policy
+            # Save uncertainty before retirement can remove a kept fall push.
+            crossing = replace(crossing, return_policy=ReturnPushPolicy.SUPPRESSED)
+            current = replace(current, phone_crossing=crossing)
+            if not save(current):
+                return current
+            retired = retire_floor_fall(crossing.identity, machine=machine, lint_settings=lint_settings)
+            if retired is FallPushRetirement.FAILED:
+                return current
+            if (retired is FallPushRetirement.DROPPED_KEPT_PUSH
+                    or return_policy is ReturnPushPolicy.SUPPRESSED):
+                return replace(current, phone_crossing=AbovePhoneFloor())
+            crossing = replace(crossing, retired=True, return_policy=return_policy)
+            current = replace(current, phone_crossing=crossing)
+            if not save(current):
+                return current
+        if crossing.receipt is CrossingReceipt.PENDING and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE:
+            if TYPE_CHECKING:
+                from scripts.notify.push_texts import render
+            else:
+                prepare_push_texts()
+                from scripts.notify.push_texts import render
+            phone = render("sweep.disk_floor_recovered", machine=machine.value,
+                           free=gib(free), rearm=gib(phone_rearm), floor=gib(phone_floor))
+            delivery = send_phone_push(phone,
+                repeat=CrossingSendKey(f"phone-recovered:{crossing.identity}",
+                                       lint_settings.number("sweep_crossing_repeat_minutes")), lint_settings=lint_settings)
+            if delivery.accepted:
+                current = replace(current, phone_crossing=replace(crossing, receipt=CrossingReceipt.ACCEPTED))
+            _ = save(current)
+        return current
 
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         current = floor_record_or_new(previous, after)
@@ -3809,9 +4048,9 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
                 # Measure inside the record lock. Older callers cannot reset a newer crossing.
                 free = free_bytes(filesystem.probe_path if isinstance(filesystem, FilesystemFloor)
                                   else os.path.expanduser("~"))
-                if free > phone_floor:
-                    current = replace(current, phone_crossing=AbovePhoneFloor())
-                elif free < phone_floor and isinstance(current.phone_crossing, AbovePhoneFloor):
+                current = recover(current, free, save)
+                crossing = current.phone_crossing
+                if free < phone_floor and isinstance(crossing, (AbovePhoneFloor, RecoveringPhoneCrossing)):
                     current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
             except OSError as error:
                 print(f"lint sweep: cannot measure the phone floor: {error}", file=sys.stderr)
@@ -3823,9 +4062,10 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             failure = NoFailure()
         current = replace(current, failure=failure)
         crossing = current.phone_crossing if root_scope else AbovePhoneFloor()
-        natedev_pending = isinstance(crossing, OpenPhoneCrossing) and crossing.natedev is CrossingReceipt.PENDING
-        phone_due = (isinstance(crossing, OpenPhoneCrossing) and crossing.phone is CrossingReceipt.PENDING
-                     and not assessment.status)
+        natedev_pending = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+                           and crossing.natedev is CrossingReceipt.PENDING)
+        phone_due = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+                     and crossing.phone is CrossingReceipt.PENDING and not assessment.status)
         phone_pending = phone_due and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE
         crossing_pending = natedev_pending or phone_pending
         pending_failure = isinstance(failure, FailurePending)
@@ -3834,29 +4074,38 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         shortfall = max(0, phone_floor - free)
         choices: FolderChoices = UNAVAILABLE_FOLDER_CHOICES
         if crossing_pending:
-            choices = folder_choices(read_disk_measurement(), protected, shortfall,
-                                     now=time.time(), lint_settings=lint_settings)
+            measurement = mac_folder_measurement(policy) if isinstance(policy, MacFloor) else read_disk_measurement()
+            choices = folder_choices(measurement, protected, shortfall,
+                                     now=time.time(), lint_settings=lint_settings, held_targets=held_targets)
 
-        def render(path_limit: int) -> str:
+        def render(folder_count: int) -> str:
             lines: list[str] = []
             if crossing_pending:
                 lines.extend([
                     f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains."
                     + (" This is the Mac disk." if machine is FloorMachine.MAC else ""),
                     f"Cleanup removed {gib(removed)}." if removed else "The cleanup run freed nothing.",
-                    *folder_choice_lines(choices, shortfall, path_limit=path_limit),
+                    *folder_choice_lines(choices, shortfall, folder_count=folder_count),
                 ])
             if isinstance(failure, FailurePending):
                 lines.append(f"The {scope.label} failed with status {failure.event.status}. {failure.event.detail}")
             return "\n".join(lines)
-        message = fit_alert_text(render, lint_settings=lint_settings)
+        folder_count = int(lint_settings.number("sweep_alert_folder_count"))
+        message = render(folder_count)
+        while folder_count > 0 and len(message) > lint_settings.whole("sweep_message_limit"):
+            folder_count -= 1
+            message = render(folder_count)
+        if len(message) > lint_settings.whole("sweep_message_limit"):
+            choices = UNAVAILABLE_FOLDER_CHOICES
+            message = render(0)
 
         def save_delivery(delivery: FloorAlertDelivery) -> None:
             nonlocal current
             receipt = current.phone_crossing
             if isinstance(receipt, OpenPhoneCrossing):
                 receipt = replace(receipt,
-                                  natedev=CrossingReceipt.ACCEPTED if delivery.natedev.accepted else receipt.natedev,
+                                  natedev=(CrossingReceipt.ACCEPTED if natedev_pending and delivery.natedev.accepted
+                                           else receipt.natedev),
                                   phone=CrossingReceipt.ACCEPTED if delivery.phone.accepted else receipt.phone)
                 current = replace(current, phone_crossing=receipt)
             if delivery.natedev.accepted and isinstance(current.failure, FailurePending):
@@ -3934,6 +4183,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     guard: int | None = None
     outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
     protected: tuple[tuple[str, int], ...] = ()
+    held_targets: set[str] = set()
+    busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
     detail = ""
     mirror_leases = ExitStack()
     try:
@@ -3978,7 +4229,6 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             print(f"lint sweep: cannot clear the lock observation: {error}", file=sys.stderr)
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
-        busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
         paired_roots = OUTPUT_ROOTS.get().roots_for
         known_trees = {} if isinstance(policy, MacFloor) else dict(OUTPUT_ROOTS.get().known_trees)
         targets = (sorted({paired for root in filesystem.targets for paired in paired_roots(root)})
@@ -4012,18 +4262,27 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
+            with scratch.judgment_lock(Path(root)) as idle_copy:
+                if root in no_evidence and not idle_copy:
+                    held_targets.add(root)
             if root in no_evidence:
+                if root in uses or root in hold_targets:
+                    held_targets.add(root)
+                elif locked_files and root not in held_targets:
+                    root_trees = (known_trees[root] if root in known_trees else
+                                  _build_trees(root, tree_depth, lint_settings=lint_settings))
+                    if any(file_key(path) in locked_files for path in target_lock_paths(root_trees)):
+                        held_targets.add(root)
                 busy[root] = NoRecordedEvidence(root)
                 print(f"lint sweep: protected {root}: no recorded evidence")
                 continue
             if root not in known_trees and (root in hold_targets or root in uses):
                 known_trees[root] = []
-            with scratch.judgment_lock(Path(root)) as idle_copy:
-                if not idle_copy:
-                    busy[root] = LockHeld(os.path.join(root, ".claude-busy"))
-                    _ = known_trees.setdefault(root, [])
-                    print(f"lint sweep: busy .claude-busy lock; {root} left alone")
-                    continue
+            if not idle_copy:
+                busy[root] = LockHeld(os.path.join(root, ".claude-busy"))
+                _ = known_trees.setdefault(root, [])
+                print(f"lint sweep: busy .claude-busy lock; {root} left alone")
+                continue
             if root in hold_targets:
                 reason = hold_targets[root]
                 print(f"lint sweep: {reason.holder} holds natedev builds; {root} left alone")
@@ -4206,8 +4465,12 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     finally:
         try:
             if not dry_run:
-                notify_floor_problem(replace(outcome, protected=protected), lint_settings=lint_settings, detail=detail,
-                                     machine=FloorMachine.MAC if isinstance(policy, MacFloor) else FloorMachine.NATEDEV)
+                held_targets.update(root for root, use in busy.items() if not isinstance(use, NoRecordedEvidence))
+                for root in tuple(held_targets):
+                    held_targets.update(OUTPUT_ROOTS.get().roots_for(root))
+                notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets))),
+                                     lint_settings=lint_settings, detail=detail,
+                                     policy=policy)
         finally:
             try:
                 if guard is not None:
@@ -4223,93 +4486,6 @@ def size_bytes(raw: str, unit: int) -> int | None:
     except ValueError:
         return None
     return int(value * unit) if math.isfinite(value) and value >= 0 else None
-
-
-def repo_name(directory: str) -> str | None:
-    """Name of the directory holding the git common dir of the repo directory is
-    in: every worktree of a repo shares it, and a scratch clone takes the name of
-    the repo it was cloned from (source_git_dir). Read from the .git files rather
-    than from git, which a bare PATH may not reach."""
-    common = git_common_dir(directory)
-    if common is None:
-        return None
-    return os.path.basename(os.path.dirname(source_git_dir(common))) or None
-
-
-def git_common_dir(directory: str) -> str | None:
-    """The git dir every worktree of directory's repo shares."""
-    current = os.path.abspath(directory)
-    while not os.path.lexists(os.path.join(current, GIT_DIR)):
-        parent = os.path.dirname(current)
-        if parent == current:
-            return None
-        current = parent
-    common = os.path.join(current, GIT_DIR)
-    if os.path.isfile(common):
-        # A linked worktree: .git names its private git dir, whose commondir
-        # file leads back to the shared one.
-        try:
-            with open(common, encoding="utf-8") as handle:
-                pointer = handle.readline().strip()
-        except OSError:
-            return None
-        if not pointer.startswith(GITDIR_PREFIX):
-            return None
-        common = os.path.join(current, pointer[len(GITDIR_PREFIX) :].strip())
-        try:
-            with open(os.path.join(common, COMMONDIR_FILE), encoding="utf-8") as handle:
-                common = os.path.join(common, handle.readline().strip())
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return None
-    return os.path.normpath(common)
-
-
-def source_git_dir(common: str) -> str:
-    """The git dir a scratch clone came from, followed to its end: a
-    `git clone --shared` copy borrows its objects (alternates), and a plain local
-    clone names its source as a local origin. A merge check's clone of hana is
-    hana for the Mac mirror and the sweep budget. A git dir with neither is its
-    own answer."""
-    seen = {common}
-    while True:
-        source = borrowed_git_dir(common) or local_origin_git_dir(common)
-        if source is None or source in seen:
-            return common
-        seen.add(source)
-        common = source
-
-
-def borrowed_git_dir(common: str) -> str | None:
-    try:
-        with open(os.path.join(common, ALTERNATES_FILE), encoding="utf-8") as handle:
-            objects = handle.readline().strip()
-    except OSError:
-        return None
-    if not objects:
-        return None
-    return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
-
-
-def local_origin_git_dir(common: str) -> str | None:
-    """The shared git dir of origin when origin is a directory on this machine."""
-    try:
-        with open(os.path.join(common, "config"), encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
-    except OSError:
-        return None
-    in_origin = False
-    for line in lines:
-        text = line.strip()
-        if text.startswith("["):
-            in_origin = text == '[remote "origin"]'
-        elif in_origin and text.partition("=")[0].strip() == "url":
-            url = text.partition("=")[2].strip().removeprefix("file://")
-            if not os.path.isabs(url) or not os.path.isdir(url):
-                return None
-            return git_common_dir(url)
-    return None
 
 
 def budget_bytes(environ: dict[str, str], config: str | conf.ConfigRead, repo: str | None) -> tuple[int | None, str]:
@@ -4657,10 +4833,10 @@ def main(argv: list[str]) -> int:
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
-            with copies.mirror_sweep_leases(mirror_root.local_path()) as protected:
-                with floor_claims.locked_claims(timeout) as claims:
-                    return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                      policy=MacFloor(mac_roots, claims, mirror_root.local_path(), protected))
+            with copies.mirror_sweep_leases(mirror_root.local_path()) as leases:
+                claims = floor_claims.read_claims(timeout)
+                return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
+                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path(), leases.busy, leases.held))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2

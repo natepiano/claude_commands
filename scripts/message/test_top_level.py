@@ -18,6 +18,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.message import process_table
+from scripts.herdr import herdr_types
 from scripts.message import codex_daemon
 from scripts.message import roster
 from scripts.herdr import herdr
@@ -344,7 +345,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]))
         # The roster lists herdr panes; a live herdr on the test machine would reach the real server.
-        _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")))
+        _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")))
 
     def write_record(self, pid: int, *, socket_path: str, updated: int, proc_start: str = "") -> None:
         started = sessions.process_start(pid)

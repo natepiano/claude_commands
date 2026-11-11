@@ -19,20 +19,14 @@ BASE = 1_792_454_400
 
 
 class RoutedHistoryTests(unittest.TestCase):
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     runs: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.runs = self.root / "unit-history" / "runs"
         self.runs.mkdir(parents=True)
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def write_run(self, name: str, records: list[dict[str, object]]) -> Path:
         path = self.runs / f"{name}.jsonl"

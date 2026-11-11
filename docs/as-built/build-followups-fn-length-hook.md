@@ -33,7 +33,7 @@ Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-lengt
 
 ### Codex registration and trust
 
-`scripts/hooks/codex_hooks.py install|check` manages eleven handlers.
+`scripts/hooks/codex_hooks.py install|check` manages twelve handlers.
 The `queue-start` and `queue-tools` handlers run `codex-queue-drain.py` at `SessionStart` and `PostToolUse`.
 Both use matcher `*` and 10-second timeouts.
 `docs/as-built/session-roster.md` describes these handlers.
@@ -52,8 +52,16 @@ The shell command starts no Python process when the marker folder has no `*.json
 The `compaction-clear-end` handler runs `compaction-marker-clear.py` at `PostCompact`.
 Both handlers delete only the input session's marker through the shared clear function.
 Codex 0.167.0 lists these events as `userPromptSubmit` and `postCompact`.
-It reports no matcher for `UserPromptSubmit`, so listing checks use `null` for that field.
+It reports no matcher for `UserPromptSubmit` or `Stop`, so listing checks use `null` for those events.
 See [compaction markers](hook-dispatch.md#compaction-start-markers) for the marker format and retention setting.
+
+The `turn-end` handler runs `../herdr/turn_end.py` through the shared Python launcher at `Stop`, with a 10-second timeout.
+Codex supplies the event as JSON on stdin.
+The handler sends the payload to a separate child through stdin and returns without stdout text.
+The child applies the worker completion rule.
+The handler never exits 2, which would request another Codex turn.
+The installer lists this event as `stop`, with a null matcher.
+See [worker completion](long-lived-workers.md#pane-submission-and-completion) for the completion rule and deployment steps.
 
 The `ste` and `ste-subagent` handlers run `session-start-ste.py` through the shared Python launcher, with 10-second timeouts. They use `SessionStart` and `SubagentStart`, respectively. Both use `matcher: "*"`. For `SessionStart`, the matcher filters the session source, including startup, resume, clear and compact. For `SubagentStart`, it filters the subagent type. The wildcard covers every source and type. See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks).
 
@@ -68,7 +76,7 @@ Claude registration in `settings.json` and Codex installation are separate deplo
 Claude's `SessionStart` registration runs `session-start-ste.py` with matcher `startup|resume|clear|compact`.
 Its `SubagentStart` registration runs the same script.
 On natedev and the Mac, `~/.codex`, `~/.codex1`, and `~/.codex2` share one `hooks.json`.
-Each home must trust its eleven handlers separately.
+Each home must trust its twelve handlers separately.
 
 Codex 0.167.0 requires integer `timeout` values in `hooks.json`. A floating value such as `10.0` rejects the whole file, including fn-length, STE, and queue handlers. The installer rounds configured timeouts up to whole seconds. It also rounds existing floating timeouts up to integers in every handler, including user handlers. It keeps every other field of a user handler unchanged. This preserves their groups and indexes. The listed `timeoutSec` is then an integer. No older-version matching rule is used.
 
@@ -191,7 +199,10 @@ Run files keep staff references instead of copied native identities.
   It retains newlines, tabs, and the last 4000 characters.
   With no readable text, the summary is `The background agent <name> produced no summary.`
   It preserves the log and any summary that the worker writes.
-- `scripts/direct/unit_notifier.sh <claude_session_id> [on|off]` reads the marker `<session id>` from `UNIT_ACTIVE_DIR`, else from `/tmp/claude/unit/active` or `/tmp/claude/delegate/active` (it names the session directory; its basename is the run id). No mode creates the `unit-<run id>` instance (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains) (`--every` from `UNIT_PROGRESS_INTERVAL_SECONDS` rounded up to minutes, `--hold`, check `direct_run.py check`); `off` runs `notifier.sh stop unit-<run id>` and prints `progress updates off: unit-<run id>`; `on` runs `notifier.sh start` and prints `progress updates on: unit-<run id> <next_due line>` (`worker-<run id>` for a run started before the folder rename; old name read until no live marker remains). A missing or empty marker exits 1 and changes nothing; a `notifier.sh` failure passes its message and status through; a bad mode word or more than two arguments prints the usage and exits 2.
+- The director's staff row records its open run folder in `run`.
+  `unit_runs.open_run(session_id)` reads that pointer.
+  `direct_run.py check` uses the pointer to identify the current run.
+  The notifier instance uses `unit-<run id>` or the former `delegate-<run id>` prefix.
 - `/unit:report [tables|on|off]` (`commands/unit/report.md`): `on` or `off` runs `zsh ~/.claude/scripts/direct/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`, relays its line and composes no report; a failure is relayed as printed. A Codex unit has no notifier, so the command says the switch is unavailable there.
 
 ## Invariants
@@ -238,7 +249,7 @@ Run files keep staff references instead of copied native identities.
 
 - **Effort.** A Claude worker launched without `--effort` inherits `~/.claude/settings.json` (`modelSettings` → model → `effortLevel`, `xhigh` for Sonnet 5.5), so a pane line reading `thinking with xhigh effort` on a `sonnet:low` worker means the launch dropped the effort, not that the pane misleads.
 
-- **`/unit:report off`.** `unit_notifier.sh` exit 1 covers both no active run and a missing notifier instance; only the message says which, so the command relays it as printed. `off` persists in the notifier instance until `on` or `end_session.sh`. `<ProgressContract/>` in `commands/unit/direct.md` names `/unit:report off` and `/unit:report on` for a Claude unit.
+- **`/unit:report`.** Reports run on request and create no notifier instance. The command accepts only the optional `tables` argument.
 
 - **Live checks need a person.** The permission classifier refuses an automated bare `claude --bg` probe. A person must check the worker effort. Register a Claude worker as `sonnet:low`. Start it through `assign.sh --role implement`. Check that its pane shows `low effort`, not `xhigh`.
 

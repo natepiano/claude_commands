@@ -10,16 +10,56 @@ The table excludes Python test modules.
 On natedev, each Python accessor reads `staff.json` in its own process.
 On the Mac, `staff.py` asks natedev over SSH.
 
-## Staff identity and backends
+## Staff identity and kinds
 
-`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `paused`, `exited`, and `unknown_fields`.
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `role`, `home`, `run`, `paused`, `exited`, and `unknown_fields`.
 The fixed `id` identifies a member across session changes.
 `parent` is `ReportsTo(id)` or `StaffRoot`.
 `current_session` holds the native Claude session ID or Codex thread ID.
+`run` holds `OpenRun(path)` or `NoRun`.
+`set_run` stores the open run path.
+`clear_run` clears pointers that match the supplied run path.
+
+`Kind` is `Literal["showrunner", "unit", "worker", "producer"]`.
+A producer has `StaffRoot` as its parent.
+It can hold both a worktree and a document.
+It can start a staff path, such as `morty`.
+`staff_sources` includes producers when it reads active root members.
+Restart, shutdown selection, and message routing recognize the same kind.
+
+`StaffRow.home` is `SessionHome(path)` or `HomeUnknown()`.
+It records the account configuration folder.
+A move can write the target home before start confirmation.
+The home alone does not prove a successful start.
+`member_account.repair_home` repairs it from a proved live process.
+
+## Producer rows and commands
+
+Each producer runs its own named job.
+The producer kind supplies shared management.
+Each producer keeps its own role contract.
+
+| Staff name | Kind | Command | Job contract |
+|---|---|---|---|
+| `morty` | `producer` | `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
+| `brain` | `producer` | `/producer:brain` | Its command defines management only. |
+| `dwight` | `producer` | `/producer:dwight` | Strategist; its command defines management only. |
+
+The commands live in `commands/producer/`.
+Morty's operations document is `docs/producer/morty-operations.md`.
+The Codex command sync names Morty's skill `producer-morty`.
+`PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
+Each producer uses `<root>/<name>/README.md`.
+The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
+
+## Backend and hold evidence
 
 `StaffSnapshot` derives backend evidence from session records, transcripts, and live processes.
 `ClaudeBackend.family` is `claude`.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
+The worker's recorded `SessionHome` supplies `codex_home` when that home contains its transcript.
+A Codex transcript without a matching recorded home gives `BACKEND_UNAVAILABLE`, including when the row has no recorded home.
+Shared session folders do not select an account, and these rows never become `ClaudeBackend`.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
 A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
@@ -79,13 +119,20 @@ Each checkout therefore uses the same question store.
 
 The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
 They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold`, `pause`, `exit`, and `resume`.
+`set_worker_role` writes the last dispatch role.
+`set_home` writes the selected or proved account home.
+`progress_history.begin_dispatch` writes every dispatch role, including Astra policies.
+The shared pane launch builder uses `set_home`.
+`add_unit.ensure_staff_unit`, worker pane admission, and `staff_sources.ensure_staff_showrunner` complete earlier pane publications.
 
 | File | Access | `staff` calls |
 |---|---|---|
+| `commands/plan/shrink.md` | read | runtime_id; unit_runs.open_run reads the run pointer |
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
 | `commands/showrunner/units.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
-| `docs/associate-producer/operations.md` | read | staff.json (shell) |
+| `docs/producer/morty-operations.md` | read | staff.json (shell) |
 | `docs/as-built/showrunner-automation.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
+| `docs/as-built/session-notifier.md` | write | staff.py clear-run (documented shell command) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
@@ -103,6 +150,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
+| `scripts/build_hold/build_hold.py` | read | local_snapshot, OpenRun; finds the run owner's current_session |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
@@ -111,13 +159,15 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
-| `scripts/direct/board_json.py` | read | active, snapshot |
+| `scripts/direct/worker_runs.py` | read | find; pane worker rows |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/clear_phase_review.sh` | read | local_snapshot |
+| `scripts/direct/end_session.sh` | write | clear-run (shell); reads the current pointer through unit_runs.open_run |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
-| `scripts/direct/progress_history.py` | read | active, initial_snapshot, snapshot |
+| `scripts/direct/prepare_session.sh` | write | set-run (shell), line 24; stores the prepared run path |
+| `scripts/direct/progress_history.py` | write | active, initial_snapshot, snapshot, set_worker_role, set_run, clear_run |
 | `scripts/direct/recorder_fixture.py` | read | PresentWorktree |
 | `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
@@ -129,32 +179,35 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
-| `scripts/herdr/pane_launch.py` | read | initial_snapshot |
+| `scripts/herdr/pane_launch.py` | write | initial_snapshot, local_snapshot, by_id, set_home |
 | `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/turn_end.py` | write | snapshot, backend, native_id, runtime_id, retire; worker_admission.parent, find_worker, transcript_source, transcript_entries |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
-| `scripts/hooks/conversation_pause.py` | read | snapshot; LiveDoc, WrappedDoc |
+| `scripts/hooks/conversation_pause.py` | read | local_by_current_session; StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
-| `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |
+| `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/message/escalate.py` | read | active, snapshot |
+| `scripts/message/failed_lookup.py` | read | snapshot |
 | `scripts/message/morty_identity.py` | read | native_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
 | `scripts/message/roster.py` | read | initial_snapshot, runtime_id |
 | `scripts/message/send.py` | read | snapshot |
 | `scripts/message/sessions.py` | read | current_session_target |
-| `scripts/message/unit_labels.py` | read | active, snapshot |
+| `scripts/message/unit_labels.py` | read | active, snapshot, local_snapshot, OpenRun |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
+| `scripts/nix_env/heal.py` | read | initial_snapshot |
 | `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session |
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
@@ -166,11 +219,13 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/production/dailies_input.py` | read | snapshot |
 | `scripts/production/dailies_input_test_support.py` | write | rename, snapshot |
 | `scripts/production/delivery_state.py` | read | staff.json path |
+| `scripts/production/demote_showrunner.py` | write | by_id, change_director, cli_result, move, operation, snapshot |
 | `scripts/production/fake_showrunner.py` | write | native_id, update_current_session |
 | `scripts/production/fake_unit_host.py` | read | by_path |
 | `scripts/production/footer_counts.py` | read | snapshot |
 | `scripts/production/live_units.py` | read | snapshot |
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
+| `scripts/production/checkpoint_gate.py` | read | snapshot |
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
 | `scripts/production/bump_gate.py` | read | read_production.owner.id |
@@ -191,7 +246,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
-| `scripts/shutdown/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
+| `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
@@ -200,7 +255,7 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/production/staff.py` | owner | staff.json (owner) |
 | `scripts/production/staff_move.py` | write | cli_result, main, move, operation, snapshot |
 | `scripts/production/staff_sources.py` | write | active, apply_seed, cli_result, ensure, initial_snapshot, native_id, operation, set_doc, snapshot |
-| `scripts/production/staff_test_support.py` | write | ensure, ensure_worker, initial_snapshot, move, native_id, operation, set_doc, set_worktree, snapshot, update_current_session |
+| `scripts/production/staff_test_support.py` | write | ensure, ensure_worker, initial_snapshot, local_snapshot, move, native_id, operation, set_doc, set_run, set_worktree, snapshot, update_current_session |
 | `scripts/production/stall_watch.py` | read | snapshot |
 | `scripts/production/store_owner.py` | read | snapshot |
 | `scripts/production/style_units.py` | read | snapshot |
@@ -223,39 +278,40 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
 | `scripts/review_links/change_page.py` | read | snapshot |
-| `scripts/shutdown/inventory.py` | read | local_snapshot |
-| `scripts/shutdown/launch_names.py` | read | initial_snapshot |
-| `scripts/shutdown/member_account.py` | read | StaffRow (type check only) |
-| `scripts/shutdown/pane_record.py` | read | initial_snapshot |
-| `scripts/shutdown/pane_restore.py` | read | row_operation |
-| `scripts/shutdown/remote_control.py` | read | initial_snapshot |
-| `scripts/shutdown/restart.py` | read | initial_snapshot, row_operation |
-| `scripts/shutdown/session_types.py` | read | snapshot |
-| `scripts/shutdown/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
-| `scripts/shutdown/shutdown_record.py` | read | snapshot |
-| `scripts/shutdown/stop_results.py` | read | StaffRow and backend types (type check only) |
-| `scripts/shutdown/stop_resume.py` | write | initial_snapshot, row_operation, resume, set_hold, child_environment |
-| `scripts/shutdown/unit_staff_test_support.py` | read | staff.json path |
+| `scripts/agents/inventory.py` | read | local_snapshot |
+| `scripts/agents/launch_names.py` | read | initial_snapshot |
+| `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
+| `scripts/agents/pane_record.py` | read | initial_snapshot |
+| `scripts/agents/pane_restore.py` | read | row_operation |
+| `scripts/agents/remote_control.py` | read | initial_snapshot |
+| `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
+| `scripts/agents/session_types.py` | read | snapshot |
+| `scripts/agents/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
+| `scripts/agents/shutdown_record.py` | read | snapshot |
+| `scripts/agents/stop_results.py` | read | StaffRow and backend types (type check only) |
+| `scripts/agents/stop_resume.py` | write | initial_snapshot, row_operation, slot_operation, ensure, native_id, set_home, resume, set_hold, child_environment |
+| `scripts/agents/unit_staff_test_support.py` | read | staff.json path |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
 | `scripts/statusline/counts_row.py` | read | none (StaffRefused exception) |
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
 | `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
 | `scripts/style/ledger_test_support.py` | write | apply_seed, initial_snapshot, set_doc |
+| `scripts/style/style_config.py` | read | StaffRow, StaffSnapshot.find, StaffSnapshot.parent_of, LiveDoc, WrappedDoc |
 | `scripts/style/style_ledger.py` | read | snapshot |
 | `scripts/style/style_plan.py` | read | snapshot |
 | `scripts/style/style_plan_test_support.py` | read | staff.json path |
 | `scripts/style/style_proposals.py` | read | snapshot |
 | `scripts/style/style_sync.py` | read | local_snapshot, caller_identity, doc_owner |
 | `scripts/style/unit_files.py` | read | snapshot |
-| `scripts/usage/agents_log.py` | read | local_snapshot, record_path |
+| `scripts/usage/agents_log.py` | read | local_snapshot, OpenRun |
 | `scripts/usage/outcomes.py` | read | snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-172 accessors: 30 write, 141 read, 1 owner.
+183 accessor rows: 40 write, 142 read, 1 owner.
 
 ## Approved copies
 

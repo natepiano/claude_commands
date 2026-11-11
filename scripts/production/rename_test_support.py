@@ -22,14 +22,14 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 from scripts.production import merge_checkpoint
 from scripts.production.production_doc import Production, production_field, read_production
-from scripts.shutdown import shutdown
+from scripts.agents import shutdown
 from scripts.production import showrunners
 from scripts.production import tidy_wrapped
 from scripts.production import unit_move
@@ -38,7 +38,7 @@ from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-SCRIPT = Path(__file__).resolve().parents[1] / "shutdown/shutdown.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
 
 
@@ -248,6 +248,7 @@ class FolderMoveFixture(StaffTestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
+        _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
@@ -523,8 +524,8 @@ class ProductionRenameFixture(StaffTestCase):
         super().setUp()
         # Linked worktree metadata and the committed documents name absolute
         # paths. Restore private files, refs and origin at the seed's same path.
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
         self.staff_file: Path = self.root / "state/staff/staff.json"
@@ -559,7 +560,7 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
             "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),

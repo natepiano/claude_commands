@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -45,7 +45,7 @@ class MacIdlePaths:
     session_root: Path
     admission: Path
     proc: Path = Path("/proc")
-    sessions: Path = Path.home() / ".claude/sessions"
+    sessions: Path = field(default_factory=lambda: Path.home() / ".claude/sessions")
 
 
 def watch_paths() -> MacIdlePaths:

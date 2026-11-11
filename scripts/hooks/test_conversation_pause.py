@@ -71,20 +71,50 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 class ConversationPauseTests(ConversationPauseFixture):
     def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
-        instance = self.create_instance("unit-native")
         other = self.create_instance("showrunner-other", session_id="another-owner")
-        _ = (self.root / "staff.json").write_text("invalid staff JSON\n")
-        result = self.run_prompt("hello")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            f"conversation-pause: timer lookup: cannot read staff record {self.root / 'staff.json'}: invalid staff JSON:",
-            result.stderr,
-        )
-        reply = cast(dict[str, object], json.loads(result.stdout))
-        self.assertEqual(reply["systemMessage"],
-                         f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}")
-        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue((other / "state").read_text().startswith("ENABLED=1\n"))
+        for failure in ("invalid JSON", "directory"):
+            with self.subTest(failure=failure):
+                session_id = fixture_runtime_id(f"unreadable-{failure}")
+                instance = self.create_instance(f"unit-{session_id}", session_id=session_id)
+                path = self.root / "staff.json" if failure == "invalid JSON" else self.root
+                if failure == "invalid JSON":
+                    _ = path.write_text("invalid staff JSON\n")
+                self.environment["STAFF_FILE"] = str(path)
+                with patch.dict(os.environ, self.environment), self.assertRaises(staff.StaffUnreadable):
+                    _ = conversation_pause.director_turn(session_id)
+                result = self.run_prompt("hello", extra={"session_id": session_id})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                detail = "invalid staff JSON:" if failure == "invalid JSON" else "[Errno 21] Is a directory:"
+                self.assertIn(
+                    f"conversation-pause: timer lookup: cannot read staff record {path}: {detail}",
+                    result.stderr,
+                )
+                reply = cast(dict[str, object], json.loads(result.stdout))
+                self.assertEqual(reply["systemMessage"],
+                                 f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}")
+                self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+                self.assertTrue((other / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_prompt_reuses_one_staff_read_for_activity_hold_and_timer_pause(self) -> None:
+        for state in ("active", "paused"):
+            with self.subTest(state=state):
+                owner = fixture_member("showrunner", name=f"one-read-{state}")
+                _ = staff.set_run(owner.id, staff.OpenRun(self.root / f"run-{state}"))
+                if state == "paused":
+                    _ = staff.set_hold(owner.id, staff.Paused("now", "reviewer", "review"))
+                timer = self.create_instance(f"showrunner-{owner.id}", session_id=owner.id)
+                with patch.object(staff, "_local_fields", wraps=staff._local_fields) as reads:  # pyright: ignore[reportPrivateUsage]
+                    result = self.run_prompt("hello", extra={"session_id": owner.current_session})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(reads.call_count, 1)
+                reply = cast(dict[str, object], json.loads(result.stdout))
+                if state == "paused":
+                    self.assertIn("This unit is paused", str(reply))
+                    self.assertTrue((timer / "state").read_text().startswith("ENABLED=1\n"))
+                else:
+                    self.assertIn("Automatic updates paused", str(reply))
+                    self.assertTrue((timer / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_staff_timer_is_found_after_the_showrunner_session_changes(self) -> None:
         owner = fixture_member("showrunner", name="timer-owner")
@@ -244,8 +274,10 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(self.activity_calls(1), expected)
         self.activity_log.unlink()
         _ = (self.notifier_root / self.showrunner_timer("demo") / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
-        _ = (self.unit_active_root / SESSION).write_text("/tmp/claude/unit/run-1\n")
-        self.assertEqual(self.run_prompt("hello").returncode, 0)
+        owner = fixture_member("showrunner", name="unit-director")
+        _ = staff.set_run(owner.id, staff.OpenRun(self.root / "run-1"))
+        self.assertEqual(self.run_prompt("hello", extra={"session_id": owner.current_session}).returncode, 0)
+        expected[0][4] = owner.current_session
         self.assertEqual(self.activity_calls(1), expected)
 
     def test_other_sessions_and_prompts_record_no_activity(self) -> None:

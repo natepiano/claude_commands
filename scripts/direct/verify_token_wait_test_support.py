@@ -78,8 +78,8 @@ class VerifyTokenWaitFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.started_groups = set()
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.environment = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
 
@@ -226,7 +226,7 @@ esac
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "hold-release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "ROSTER_RUN_ROOT": str(self.root / "unit"),
             "UNIT_RUN_ROOT": str(self.root / "unit"),
             "SCRATCH_ROOT": str(self.root / "scratch"),

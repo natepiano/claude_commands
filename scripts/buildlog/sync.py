@@ -16,7 +16,8 @@ import subprocess
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import NotRequired, TypedDict, cast
 from urllib.parse import quote
@@ -35,12 +36,66 @@ REMOTE_ROOT = ".local/state/buildlog/"
 LOCK_NAME = "sync.lock"
 
 
+class TransferBytes(TypedDict):
+    operation: str
+    sent_bytes: int
+    received_bytes: int
+    complete: bool
+
+
+@dataclass
+class TransferLedger:
+    """Application bytes for each SSH or rsync exchange."""
+
+    transfers: list[TransferBytes] = field(default_factory=list)
+
+    def observe(self, operation: str, arguments: list[str], stdout: str, stderr: str) -> None:
+        if arguments[0] == "rsync":
+            sent = re.search(r"Total bytes sent:\s*([\d,]+)", stdout)
+            received = re.search(r"Total bytes received:\s*([\d,]+)", stdout)
+            summary = re.search(r"sent ([\d,]+) bytes\s+received ([\d,]+) bytes", stdout)
+            complete = bool((sent and received) or summary)
+            sent_bytes = int(sent[1].replace(",", "")) if sent else int(summary[1].replace(",", "")) if summary else 0
+            received_bytes = int(received[1].replace(",", "")) if received else int(summary[2].replace(",", "")) if summary else 0
+        elif arguments[0] == "ssh":
+            sent_bytes = len(arguments[-1].encode("utf-8"))
+            received_bytes = len(stdout.encode("utf-8")) + len(stderr.encode("utf-8"))
+            complete = True
+        else:
+            return
+        self.transfers.append({"operation": operation, "sent_bytes": sent_bytes,
+                               "received_bytes": received_bytes, "complete": complete})
+
+    def observe_bytes(self, operation: str, arguments: list[str], stdout: bytes, stderr: bytes) -> None:
+        self.observe(operation, arguments, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace"))
+        if arguments[0] == "ssh":
+            self.transfers[-1]["received_bytes"] = len(stdout) + len(stderr)
+
+
+@dataclass(frozen=True)
+class NoRunTransfers:
+    """No run receives the exchange measurements."""
+
+
+active_transfers: ContextVar[TransferLedger | NoRunTransfers] = ContextVar("active_transfers", default=NoRunTransfers())
+
+
+@contextmanager
+def measure_transfers(ledger: TransferLedger) -> Generator[None]:
+    token = active_transfers.set(ledger)
+    try:
+        yield
+    finally:
+        active_transfers.reset(token)
+
+
 class SyncRecord(TypedDict):
     at: str
     peer: str
     ok: bool
     last_ok: str | None
     last_failure: NotRequired[str]
+    transfers: NotRequired[list[TransferBytes]]
 
 
 @dataclass(frozen=True)
@@ -174,6 +229,9 @@ def write_status(peer: str, ok: bool, target: str = "mac") -> None:
         "ok": ok,
         "last_ok": now if ok else (previous.last_good.at if isinstance(previous, SyncStatus) and isinstance(previous.last_good, LastSynced) else None),
     }
+    ledger = active_transfers.get()
+    if isinstance(ledger, TransferLedger):
+        status["transfers"] = ledger.transfers
     if not ok:
         status['last_failure'] = now
     elif isinstance(previous, SyncStatus) and isinstance(previous.last_failure, SyncFailure):
@@ -245,8 +303,15 @@ def resume() -> int:
 
 
 def run(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+    if args[0] == "rsync":
+        args = [*args[:2], "--stats", *args[2:]]
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        ledger = active_transfers.get()
+        if isinstance(ledger, TransferLedger):
+            operation = "buildlog_control" if args[0] == "ssh" else "buildlog_push" if ":" in args[-1] else "buildlog_pull"
+            ledger.observe(operation, args, result.stdout, result.stderr)
+        return result
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -275,9 +340,14 @@ def sync_target(target: str) -> None:
                 return
             _ = health.write_snapshot()
             settings = record.sync_config()
-            _ = sync_peer(peer, store.root(), store.host_name(), ssh_options(),
-                          configured_timeout(settings, "sync.reach_timeout_s"),
-                          configured_timeout(settings, "sync.rsync_timeout_s"))
+            ledger = TransferLedger()
+            parent = active_transfers.get()
+            with measure_transfers(ledger):
+                _ = sync_peer(peer, store.root(), store.host_name(), ssh_options(peer.host),
+                              configured_timeout(settings, "sync.reach_timeout_s"),
+                              configured_timeout(settings, "sync.rsync_timeout_s"))
+            if isinstance(parent, TransferLedger):
+                parent.transfers.extend(ledger.transfers)
     except BlockingIOError:
         print(f"buildlog sync: {target}: another sync holds the lock; hourly sync can retry")
     except Exception as error:  # The recorder must preserve the step result.
@@ -299,10 +369,10 @@ def _sync_locked() -> int:
     settings = record.sync_config()
     reach_timeout = configured_timeout(settings, "sync.reach_timeout_s")
     rsync_timeout = configured_timeout(settings, "sync.rsync_timeout_s")
-    options = ssh_options()
     status = 0
     for peer in peers:
-        status = max(status, sync_peer(peer, root, host, options, reach_timeout, rsync_timeout))
+        with measure_transfers(TransferLedger()):
+            status = max(status, sync_peer(peer, root, host, ssh_options(peer.host), reach_timeout, rsync_timeout))
     return status
 
 
@@ -313,7 +383,9 @@ def configured_timeout(settings: dict[str, str], key: str) -> float:
     return value
 
 
-def ssh_options() -> list[str]:
+def ssh_options(host: str) -> list[str]:
+    if any(host in record.target_hosts(target) for target in ("mac", "natedev")):
+        return ["-o", "BatchMode=yes"]
     timeout = configured_timeout(record.sync_config(), "sync.connect_timeout_s")
     return ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout:g}"]
 
@@ -335,19 +407,20 @@ def sync_peer(peer: SyncPeer, root: Path, host: str, options: list[str],
         write_status(peer.host, False, peer.target)
         return 1
     shell = shlex.join(["ssh", *options])
-    exclusions = ["--exclude=admission/", "--exclude=pending-steps/", "--exclude=pending-launches/"]
+    exclusions = ["--exclude=admission/", "--exclude=pending-steps/", "--exclude=pending-launches/",
+                  "--exclude=*.lock", "--exclude=*.tmp", "--exclude=*.sqlite*", "--exclude=*.bak*"]
     push_folders = (host, store.CI_DIR) if host == "natedev" else (host,)
     sources = [str(root / name) for name in push_folders if (root / name).is_dir()]
     if sources and failed(
         f"push to {peer.host}",
-        run(["rsync", "-rt", "-e", shell, *exclusions, *sources, f"{peer.host}:{REMOTE_ROOT}"], rsync_timeout),
+        run(["rsync", "-rt", "--compress", "-e", shell, *exclusions, *sources, f"{peer.host}:{REMOTE_ROOT}"], rsync_timeout),
     ):
         write_status(peer.host, False, peer.target)
         return 1
     # Host-owned append files keep their paths across peers. Never replace local files.
     owned_hosts = record.synchronized_hosts() if peer.legacy_override else record.target_hosts(peer.target)
     pull = [
-        "rsync", "-rt", "-e", shell, *exclusions,
+        "rsync", "-rt", "--compress", "-e", shell, *exclusions,
         *(f"--include=/{name}/***" for name in owned_hosts if name != host),
         "--exclude=*", f"{peer.host}:{REMOTE_ROOT}", f"{root}/",
     ]

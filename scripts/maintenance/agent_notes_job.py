@@ -142,11 +142,14 @@ def _perform(part: Part) -> int:
                 agent_accounts.observe_workers_home(), agent_notes.claude_note_logins(note_file.read_notes()))
             for line in refreshed.messages:
                 print(line)
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
 
         with stop_resume.detached_moves():
             for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
                 print(line)
+        from scripts.herdr import turn_end
+        for line in turn_end.report_quota_refusals():
+            print(line)
     elif part is Part.WATCHDOG:
         from scripts.accounts import unit_watchdog
         for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):

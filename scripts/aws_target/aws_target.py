@@ -9,7 +9,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 import fcntl
@@ -88,10 +88,11 @@ class AwsCli:
         self.timeout_s = timeout_s
         self.execute = execute
 
-    def call(self, operation: str, *arguments: str, service: str = 'ec2') -> dict[str, object]:
+    def call(self, operation: str, *arguments: str, service: str = 'ec2',
+             timeout_s: float | None = None) -> dict[str, object]:
         result = self.execute(['aws', '--profile', self.profile, '--region', self.region,
                                service, operation, *arguments, '--output', 'json'], capture_output=True, text=True,
-                              timeout=self.timeout_s, check=False)
+                              timeout=self.timeout_s if timeout_s is None else timeout_s, check=False)
         if result.returncode:
             raise AwsUnavailable(result.stderr.strip() or f'{operation}: failed')
         if not result.stdout.strip() or service == 'cloudformation' and operation == 'deploy':
@@ -117,6 +118,57 @@ class AwsCli:
             return InstanceEvidence(instance_id, f'{instance_id}:{generation}', cast(ledger.InstanceState, state), now)
         except (KeyError, TypeError, AttributeError, IndexError) as error:
             raise AwsUnavailable('instance lifecycle reply is malformed') from error
+
+
+USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}})
+
+
+def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
+                          read_usd: Decimal) -> tuple[ledger.ChargeRead, ...]:
+    """Read daily account costs by usage type and count every API page."""
+    period = f'Start={datetime.fromtimestamp(start, UTC):%Y-%m-%d},End={datetime.fromtimestamp(end, UTC):%Y-%m-%d}'
+    days: dict[str, ledger.ChargeRead] = {}
+    token = ''
+    pages = 0
+    while True:
+        arguments = ['--time-period', period, '--granularity', 'DAILY', '--metrics', 'UnblendedCost', 'UsageQuantity',
+                     '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--filter', USAGE_ONLY, '--no-paginate']
+        if token:
+            arguments.extend(('--next-page-token', token))
+        reply = api.call('get-cost-and-usage', *arguments, service='ce')
+        items = ledger.rows(reply, 'ResultsByTime')
+        if not items:
+            raise ValueError('Cost Explorer daily reply is unavailable')
+        pages += 1
+        for item in items:
+            bounds = ledger.mapping(item['TimePeriod'])
+            day = ledger.text(bounds, 'Start')
+            usage: list[ledger.UsageTypeCost] = []
+            for group in ledger.rows(item, 'Groups'):
+                keys = cast(list[str], group['Keys'])
+                metrics = ledger.mapping(group['Metrics'])
+                cost = ledger.mapping(metrics['UnblendedCost'])
+                quantity = ledger.mapping(metrics['UsageQuantity'])
+                if cost.get('Unit') != 'USD':
+                    raise ValueError('Cost Explorer requires USD')
+                usage.append(ledger.UsageTypeCost(keys[0], conf.decimal(ledger.text(cost, 'Amount')),
+                                                  conf.decimal(ledger.text(quantity, 'Amount')), ledger.text(quantity, 'Unit')))
+            previous = days.get(day)
+            combined: dict[str, ledger.UsageTypeCost] = {}
+            for row in (*previous.usage_types, *usage) if previous else usage:
+                old = combined.get(row.usage_type, ledger.UsageTypeCost(row.usage_type, Decimal(0)))
+                combined[row.usage_type] = replace(row, usd=old.usd + row.usd, quantity=old.quantity + row.quantity)
+            types = tuple(row for _, row in sorted(combined.items()))
+            days[day] = ledger.ChargeRead(day, now,
+                int(datetime.fromisoformat(day).replace(tzinfo=UTC).timestamp()),
+                int(datetime.fromisoformat(ledger.text(bounds, 'End')).replace(tzinfo=UTC).timestamp()),
+                sum((row.usd for row in types), Decimal(0)), Decimal(0), Decimal(0), types,
+                item['Estimated'] is True or bool(previous and previous.provisional))
+        token = str(reply.get('NextPageToken', ''))
+        if not token:
+            break
+    readings = tuple(days[day] for day in sorted(days))
+    return (*readings[:-1], replace(readings[-1], query_usd=read_usd * pages))
 
 
 @contextmanager
@@ -214,31 +266,11 @@ class Controller:
                                             money(str(row['SpotPrice'])), 'DescribeSpotPriceHistory') for row in rows)
         _ = ledger.CostLedger(self.directory).refresh_prices(self.settings_path, now, fetch)
 
-    def _release(self, evidence: InstanceEvidence) -> None:
-        paths = mac_test.state_paths(self.target)
-        captured = mac_test.capture_release_evidence(paths, evidence.generation, evidence.state, evidence.observed_at)
-        if captured.claims:
-            _ = mac_test.release_stopped_claims(paths, captured)
-
     def refresh_charges(self, api: AwsCli, now: int) -> measurement.ChargeRead | measurement.MeasurementUnavailable:
 
-        def fetch(start: int, end: int) -> Decimal:
+        def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
             settings = read_settings(self.settings_path)
-            start_day = datetime.fromtimestamp(start, UTC).date().isoformat()
-            end_day = datetime.fromtimestamp(end, UTC).date().isoformat()
-            reply = api.call('get-cost-and-usage', '--time-period', f'Start={start_day},End={end_day}',
-                             '--granularity', 'DAILY', '--metrics', 'UnblendedCost', '--filter',
-                             json.dumps({'Tags': {'Key': settings.cost_explorer_tag_key, 'Values': [settings.cost_explorer_tag_value]}}), service='ce')
-            rows = reply.get('ResultsByTime')
-            items = cast(list[object], rows) if isinstance(rows, list) else []
-            if len(items) != 1 or not isinstance(items[0], dict):
-                raise ValueError('Cost Explorer daily reply is unavailable')
-            row = cast(dict[str, object], items[0])
-            total = cast(dict[str, object], row['Total'])
-            cost = cast(dict[str, object], total['UnblendedCost'])
-            if cost.get('Unit') != 'USD':
-                raise ValueError('Cost Explorer requires USD')
-            return money(str(cost['Amount']))
+            return fetch_account_charges(api, start, end, now, settings.cost_explorer_read_usd)
 
         return measurement.read_charges(self.settings_path, self.directory, now, fetch)
 
@@ -253,8 +285,6 @@ class Controller:
         _ = self._save(state, ControlResult('stopping', reason, now, evidence.generation))
         _ = api.call('stop-instances', '--instance-ids', evidence.instance_id)
         confirmed = api.observe(evidence.instance_id, int(self.clock()))
-        if confirmed.state in mac_test.RELEASE_STATES:
-            self._release(confirmed)
         if confirmed.state in ('stopped', 'terminated'):
             self._clear_drain(state)
         return self._save(state, ControlResult(confirmed.state, reason, now, confirmed.generation))
@@ -290,7 +320,6 @@ class Controller:
                 state = self._read()
                 api = AwsCli(settings.credentials_profile, settings.region, settings.aws_timeout_s, self.execute)
                 evidence = api.observe(settings.instance_id, now)
-                self._release(evidence)
                 previous_generation = state.get('permitted_generation')
                 state['instance_evidence'] = asdict(evidence)
                 unpublished = UnpublishedPermissionSince.read(state, evidence.generation, now)
@@ -303,7 +332,7 @@ class Controller:
                 if state.get('stop_generation') == evidence.generation and evidence.state in ('running', 'pending'):
                     return self._stop(api, state, evidence, 'recorded_stop_intent')
                 if action == 'stop':
-                    if evidence.state in mac_test.RELEASE_STATES:
+                    if evidence.state in ('stopping', 'stopped', 'terminated'):
                         return self._save(state, ControlResult(evidence.state, 'manual_stop', now, evidence.generation))
                     return self._stop(api, state, evidence, 'manual_stop')
                 ledger.CostLedger(self.directory).observe(ledger.InstanceObservation(now, evidence.state, 'DescribeInstances'))
@@ -312,11 +341,9 @@ class Controller:
                 except (AwsUnavailable, OSError, ValueError, KeyError, TypeError) as error:
                     state['price_error'] = str(error)
                 try:
-                    period_day = measurement.charge_period_day(read_settings(self.settings_path), now).isoformat()
-                    if state.get('charge_period_day') != period_day:
-                        reading = self.refresh_charges(api, now)
-                        if isinstance(reading, measurement.ChargeRead):
-                            state['charge_period_day'] = reading.day
+                    reading = self.refresh_charges(api, now)
+                    if isinstance(reading, measurement.ChargeRead):
+                        state['charge_period_day'] = reading.day
                 except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                     print(f'aws_target: charge read unavailable: {error}', file=sys.stderr)
                 decision = ledger.spending_guard(self.settings_path, self.directory, 'admission',

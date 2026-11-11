@@ -205,6 +205,10 @@ Method (side A and side B 1 already ran this way; keep it):
 3. Side A builds into `dylib_ab/target-a`, side B into `dylib_ab/target-b`, through `CARGO_TARGET_DIR`. Cold means an empty target folder; compiler and download caches stay.
 4. Run each verify.sh call with `--local`, `--no-cache` and the measurement reason, on natedev only.
 5. Record wall, build, test, wait and load per run. Exclude an interrupted run.
+6. Each incremental run alternates adding and removing one comment in `crates/hana/src/environment/constants.rs`, a leaf module of the hana binary. Both sides use the same edit sequence; side B starts from the original file.
+7. The completed runs are in `report-unit-dylib-ab.md` at the worktree root. Read it first and run only the missing runs.
+8. The missing runs are side B incremental tests 2 and 3. The B2 run `20261103T221339-813897-4c39` ended with exit 143 while it waited for memory, so it is not a sample. Its record and log are in `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/mesh_runs/`. Check that record again before you select the runs.
+9. The clone at `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/dylib_ab/hana` no longer exists (checked 2026-11-09). `target-a` and `target-b` remain beside it. Make a new clone at the same commit in that folder. If the target folders are gone, the side B runs need a new cold build first.
 
 Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
@@ -527,43 +531,24 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 **Ruled out:** a per-kill `cached_property` (under 1 ms per report).
 
-### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
-**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`); queue-unit's Phase 34 (`/build:page`: `commands/build/page.md` runs `scripts/build_queue/memory_feed.py link`, which prints the page URL from `output_folder` in `config/memory_feed.conf`). From the builds showrunner (not the user), 2026-11-08: "queue owns the page link command and builds it after its Phase 33. The name still waits on the user." From the user (via the builds showrunner), 2026-11-08: "use /build:page that is fine". The builds showrunner added: start Phase 26 now with that name, and merge queue's Phase 34 when it lands on builds.
+### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: done
 
-From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
+#### As-built
 
-#### Work Order
-
-**Goal:** One build page. `buildlog costs` no longer exists. `buildlog charts` publishes no page of its own: it prints the tailnet link of queue's shared build page, or prints the reason and exits non-zero when no link is available.
-
-**Spec:**
-- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 271) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
-- Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
-- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It runs `scripts/build_queue/memory_feed.py link` from the same checkout (the `/build:page` command) and prints the one URL line from its stdout, or opens it when a local display exists and `--no-open` is absent. A non-zero exit, a missing command, or stdout that is not one `http`/`https` URL is no link: it prints `buildlog charts: <reason>` to stderr (the command's stderr when it gave one) and exits 1. Tests use a stand-in link command; after queue Phase 34 is merged from builds, run the real `buildlog charts --no-open` once and quote its line.
-- Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
-- A test that calls `chart_data` and also proves a calculation keeps that proof. Change it to read the typed `ChartSet`, for example `test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket` in `test_charts.py`. Delete only assertions about removed output.
-- Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`. Measurement records that name `costs` as a reader in `docs/as-built/buildlog-memory-stalls.md` stay as written.
+- `buildlog charts` publishes no page of its own. `charts.main` runs `scripts/build_queue/memory_feed.py link` (the `/build:page` command) from the same checkout and prints its one URL line. It opens the URL when a local display exists and `--no-open` is absent. `--days 7|30` stays.
+- No link prints `buildlog charts: <reason>` to stderr and exits 1. No link means: a non-zero exit, a missing command, or stdout that is not one printable `http`/`https` URL with a valid port. The reason is the command's stderr when it gave one.
+- `buildlog costs` is gone: the CLI prints its unknown-command usage and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
+- `render_html`, `publish`, `PAGE`, `chart_data` and the cost text output are gone. Calculation tests read the typed `ChartSet`.
+- The cost Definitions are sentences in `docs/as-built/buildlog-memory-stalls.md`. `build-report-session.md`, `build-targets.md` and `mac-test-offload.md` name `buildlog charts`.
+- Live check, 2026-11-09, from this branch: `buildlog charts --no-open` printed `http://100.103.14.30:8765/h7uj5c/memory_live.html`, the same line as `/build:page`.
 
 **Files:**
-- `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — `buildlog charts` in place of `buildlog costs`.
-- `scripts/buildlog/cli.py` — no `costs` command.
-- `scripts/buildlog/costs.py` — no text output.
-- `scripts/buildlog/charts.py` — `main` prints the shared page link; page code removed.
-- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — assertions about removed output go; calculation assertions stay on the typed data; new link tests.
-- `docs/as-built/buildlog-memory-stalls.md` — Definitions.
+- `scripts/buildlog/cli.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/charts.py`
+- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py`
+- `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md`, `docs/as-built/buildlog-memory-stalls.md`
 
-**Workers:** 1 writer — `rowcpu` owns all files; nothing splits.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form (`mock.patch("scripts.buildlog.charts.x")`), and a library module adds no `sys.path` line. Phase 37: the index uses WAL mode. `page_data` reads it through `charts.read_index` and gets the last committed snapshot during a rebuild. A read-only file comparison may permit only the index `-wal` and `-shm` sidecar changes (`read_only_evidence` in `scripts/aws_target/measurement_test_support.py`). A test that needs a blocked reader uses `PRAGMA locking_mode = EXCLUSIVE`; `BEGIN EXCLUSIVE` alone does not block WAL readers.
-
-**Acceptance gate:**
-- A test proves `buildlog charts` prints the shared page's tailnet link and writes no page file.
-- A test proves a missing link prints the reason and exits non-zero.
-- `buildlog costs` prints the CLI's unknown-command usage and exits 2.
-- `scripts.buildlog.test_charts`, `test_costs`, `test_report`, `test_cli` (if present) green with and without `PYTHONPATH`.
-- `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
+**Gotchas:**
+- `~/.claude/scripts/buildlog/buildlog` runs the installed copy, not the worktree. Check a branch with `scripts/lib/py scripts/buildlog/cli.py charts --no-open` from the worktree.
 
 ### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: done
 
@@ -849,91 +834,44 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - The static import walk does not see Python source in string literals. Search the scripts that tests write at run time for the old path.
 - A new caller that reads a moved name through `memory_admit` fails basedpyright with an unknown attribute.
 
-### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: todo
-**Depends on:** queue-unit's Phase 36 (swap by owner) on builds, because both change `memory_feed.py` and `memory_live.html`. Merge builds before the start. This phase was queue-unit's Phase 35.
+### Phase 39 — Cloud gates show as normal rows on /build:queue and the build page · status: done
 
-From the user (via aws-unit, 2026-11-08): "each row is work and it needs to reflect that work", "design approved - we need to make sure it's reflected in the build page also". From the builds showrunner (not the user), 2026-11-08: start after queue's Phase 36 lands on builds.
+#### As-built
 
-Approved layout:
-
-```
-  # showrunner   unit       step           min machine vCPU pid         GiB: kept/use; need
-run hana         merge-gate hana nextest     2 natedev   32 pid 361734  ░░ 13.3 / 0.1
-run sdlc         agents     merge-gate       4 aws       32 pid 1084018 running · 312 of 737 modules · 1 failed
-run builds       queue      targeted test    1 aws       16 pid 1631041 setup · 0 of 130 modules
-  1 sdlc         devtools   merge-gate       2                pid 1676409 ██ 4.6
-cloud            natest     targeted test    0                pid 1868327 waits for a cloud slot: 9 of 9 in use
-Head: free 25.5 GiB; reserve 3.0 GiB; need 4.6 GiB · cloud 2 of 9 slots
-```
-
-#### Work Order
-
-**Goal:** A cloud gate is a normal row of the queue table, in the text view and on the build page, and the separate Cloud section and card go.
-
-**Spec:**
-- Each cloud gate is a row of the main table, sorted with the other running and waiting rows.
-- The machine column shows `aws` for a cloud gate. natedev and the Mac rows do not change.
-- A new vCPU column after machine, on every running row, shows the CPU count of the machine that runs the work. Cloud: `CloudProgress.size_vcpus`. Local counts come from the system or config, not a literal.
-- The last column: a local row keeps its memory bar. A cloud row shows its state (requesting, setup, running, uploading), modules done of total, and failed modules when any. After 3 missed progress pushes it adds "no update for <age>" in red. A cloud row has no memory reservation.
-- A cloud gate that waits for a slot has `cloud` in the # column, and its last column is the slot wait text.
-- The head line adds "cloud N of 9 slots"; the slot count comes from config.
-- `memory_live.html` shows the same rows and columns; the Cloud card goes. The text view loses its Cloud section (`queue_view.cloud_lines`).
-- Data: `admission_protocol` `CloudRow` / `CloudPlace`, `cloud_progress.CloudProgress(state, size_vcpus, failed_modules, updated_at)`, and the modules counter on the same sidecar. No aws-side change.
+- Cloud gates are rows in the one queue table (`append_cloud_row` in `queue_view.py`), with no separate Cloud group. The Head line gives the cloud slot count, for example `cloud 1 of 1 slots`.
+- A running cloud row shows machine `aws`, its vCPU count and its progress text in the memory column. A waiting row, local or cloud, leaves the machine and vCPU cells blank. A running local row shows `os.cpu_count()` in the vCPU column.
+- A late running cloud row shows a red ` · no update for <age>`. `CloudUpdateLate.seconds` holds the age, and `cloud_update_age` formats it for the text view, the step card and the feed field `late_age`.
+- The build page shows the same rows in the feed order, with `#` and `vCPU` columns. `CloudWorkRow` in `memory_feed.py` has `machine: Literal["aws", ""]`, `late_age` and `stale`. CI rows stay last on the page, as before.
+- The step card keeps its Cloud lines.
 
 **Files:**
-- `scripts/build_queue/queue_view.py` — cloud rows in the table; no `cloud_lines` section.
-- `scripts/build_queue/memory_feed.py` — cloud rows and the vCPU column in the feed.
-- `scripts/build_queue/memory_live.html` — the rows and columns; no `renderCloud` card.
-- `scripts/build_queue/memory_page_proof.mjs` — the browser proof.
-- `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_memory_feed.py` — row tests.
+- `scripts/build_queue/queue_view.py` — cloud rows, the vCPU column, `CloudUpdateLate`, `cloud_update_age`.
+- `scripts/build_queue/memory_feed.py` — the `CloudWorkRow` fields for the page.
+- `scripts/build_queue/memory_live.html` — cloud rows and the vCPU column on the page.
+- `scripts/build_queue/test_queue_view.py`, `test_queue_card.py`, `test_memory_feed.py`, `test_build_queue.py`, `memory_page_proof.mjs`, `golden/*.txt` — tests and goldens.
+- `docs/as-built/build-memory-admission.md` — the queue table section.
 
-**Workers:** `1 writer + 1 tester`
-- writer — `queue_view.py`, `memory_feed.py`, `memory_live.html`.
-- tester — the Python tests and `memory_page_proof.mjs`.
+**Gotchas:**
+- A test that renders a vCPU column patches `os.cpu_count` to 17 (`QueueViewFixtureTests`, `QueueTests.setUp`). The real count differs per machine.
+- Format an age once, from seconds. Text that is formatted and then parsed back fails at `updated_at=0`.
 
-**State:** none.
+### Phase 40 — /build:queue retires when the build page covers it · status: done
 
-**Constraints from prior phases:** Read `admission_protocol` `CloudRow`/`CloudPlace` and `cloud_progress.CloudProgress` as they are; aws-unit owns them. Tunables live in config and are read at use.
+#### As-built
 
-**Acceptance gate:**
-- Tests show a running cloud row, a waiting cloud row with `cloud` in the # column, a stale cloud row with "no update for <age>", the vCPU column, and the head line slot count, in the text view and in the feed.
-- The browser proof shows the same rows on the page and no Cloud card.
-- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
-- The checkpoint notice goes to aws-unit too; aws checks it with a live cloud gate.
-
-### Phase 40 — /build:queue retires when the build page covers it · status: todo
-**Depends on:** Phase 39; queue-unit's Phase 10m. This phase was queue-unit's Phase 10n.
-
-From the user (C959, 2026-11-04, through builds): "we are moving to the new build html page - we will use /build:queue for reference until we can retire it". From the builds showrunner (not the user), 2026-11-08: do this one last, after Phase 39.
-
-#### Work Order
-
-**Goal:** The `/build:queue` view goes once the build page shows each thing it shows; its controls stay.
-
-**Spec:**
-- List what `/build:queue` shows and confirm the page shows each item, the queue 10m wait states included. Then remove the view routes and the view code that only they use.
-- `build_queue.py` keeps the `bump`, `clear` and `admit-head` controls: the page does not have them, and they stay until the user approves a replacement (architect review of queue 18, 2026-11-06).
-- Keep each formatter that a current caller uses: the queue card uses `queue_view` formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`; `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code. Keep `queue_lines.step_text`: the card and the build page use it.
-- The queue card and the unit-board queue pane stay unless the user says otherwise.
+- `build_queue.py` with no control word and no `--json` prints `build queue: the queue view is on the build page; run /build:page` and exits 3. It reads no admission state first.
+- The `--json` route that the unit-board queue pane runs (`mods/unit-board/hooks/register.tsx:326`) and its selector cards do not change. `bump`, `clear` and `admit-head` do not change.
+- The feed has `mac_idle_alert` (from `mac_idle_alert.alert_line`, empty when there is no alert) and `priority_text` (`head_facts.priority_text`). The build page shows the alert as a red line above the title and the priority line above Head.
+- Each `queue_view` formatter still has a caller (the `--json` route, the card or the feed), so `queue_view.py` did not change.
 
 **Files:**
-- `commands/build/queue.md` — the controls only.
-- `scripts/build_queue/build_queue.py` — no view routes.
-- `scripts/build_queue/queue_view.py` — no code that only the view routes used.
-- `scripts/build_queue/test_build_queue.py` — tests for the removed routes go.
+- `scripts/build_queue/build_queue.py` — controls, the `--json` route and the plain-view refusal.
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html` — the alert and priority on the page.
+- `commands/build/queue.md`, `commands/build/status.md`, `docs/as-built/build-memory-admission.md`, `docs/as-built/build-targets.md` — the controls, the pane and the page.
+- `scripts/build_queue/test_build_queue.py`, `test_queue_evidence.py`, `test_memory_feed.py`, `test_queue_view.py`, `memory_page_proof.mjs` — tests of the plain route moved to `--json` with the same expected content.
 
-**Workers:** `1 writer + 1 tester`
-- writer — `commands/build/queue.md`, `build_queue.py` and the view code that only it uses.
-- tester — `test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 39 put cloud rows in the main table; the page and the text view show the same rows.
-
-**Acceptance gate:**
-- The summary lists each `/build:queue` item and where the page shows it.
-- No caller of the removed code remains (LSP `findReferences` or `rg`).
-- The unit's targeted test passes; `basedpyright` 0 errors, 0 warnings, 0 notes on the changed Python files.
+**Gotchas:**
+- The `--json` route renders with colour. A test compares its text exactly with a colour render. `test_queue_card` compares the non-colour page exactly with `golden/card_1.txt`.
 
 ### Phase 41 — The vault sync keeps the Mac main ref and files its stop question · status: done
 
@@ -969,3 +907,66 @@ From the user (C959, 2026-11-04, through builds): "we are moving to the new buil
 
 **Gotchas:**
 - The kernel stamps file times from a coarse clock that can be one tick behind `time.time()`. A test that compares a file time with `time.time()` fails now and then; a cloud gate saw a 0.16 ms miss.
+
+### Phase 43 — The build page proof removes the folders it makes · status: done
+
+#### As-built
+
+- `memory_page_proof.mjs` removes its `memory-page-proof-*` output folder and its `memory-proof-chrome-*` profile when the proof ends, on pass and on failure.
+- A folder given as `argv[2]` belongs to the caller and stays. The success line names `output` only for that folder.
+- The script has no folder scan and no signal handler.
+
+**Files:**
+- `scripts/build_queue/memory_page_proof.mjs` — the build page proof.
+
+**Gotchas:**
+- Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
+
+### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
+
+#### As-built
+
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
+
+### Phase 45 — Copy watch test processes end by themselves · status: done
+
+#### As-built
+
+- Every helper process that `test_copy_watch.py` starts arms `signal.alarm` at the test hang guard as its first action: the step stub, the runner stub, the parent wrapper, its delayed child and the live-pid child.
+- The fixture passes `TEST_HANG_GUARD_SECS` from `test_hang_guard` in each process environment.
+- A suite that is killed before `tearDown` leaves no helper for longer than the guard. The real watcher did not change and ends when its parent is gone.
+- No new test. A one-second trial showed the step stub and the runner stub in hold mode end with SIGALRM.
+
+**Files:**
+- `scripts/mac_test/test_copy_watch.py` — the fixture processes and their time limit.
+
+**Gotchas:**
+- A forked child does not inherit a pending alarm, so each process arms its own. An alarm does stay across `exec`.
+
+### Phase 46 — Report and memory commands load only the code they use · status: done
+
+#### As-built
+
+- `disk.py` imports `scripts.lint.sweep` inside the four functions that use it. `disk.read_snapshot` does not load it.
+- `memory.window_report` imports `queue_snapshot` on each run. It imports `room_text` and `memory_admit` only for a queue snapshot in the window.
+- `report.py` has no direct queue or sweep import, so the report command loads neither `sweep` nor `queue_evidence`.
+- Thirty interleaved process pairs measured 0.268 CPU seconds saved per report process and 0.148 per memory process. The saving is 16.25 CPU seconds per merge gate at 7 report, 41 `test_index` and 23 memory children, and 5.3 without the `test_index` children.
+- Program output, row counts and SQL do not change.
+
+**Files:**
+- `scripts/buildlog/disk.py` — the disk snapshot and its floor.
+- `scripts/buildlog/memory.py` — the memory snapshot and the window report.
+
+**Gotchas:**
+- A module-level import of `sweep` or `queue_evidence` in these files brings the cost back.
+
+**Ruled out:**
+- A separate module for the `disk.py` writers needs caller and test edits and saves no more.

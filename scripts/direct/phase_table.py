@@ -27,9 +27,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.direct import plan_history
 from scripts.lib import unit_runs
 from scripts.lib.user_zone import user_zone
-from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production import session_staff, staff, unit_config, unit_names
 from scripts.production.production_doc import Refusal, production_field
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 # The finding_opened event schema uses these severities. Importing findings to
 # read its SEVERITIES also validates command-only convergence configuration.
@@ -43,6 +43,8 @@ class Production(NamedTuple):
 
 
 def read_production(path: Path, *, resolver: session_staff.RowResolver | None = None) -> Production:
+    from scripts.production import unit_lookup
+
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     try:
         owner = unit_lookup.doc_owner(path.expanduser(), resolver.record)
@@ -393,6 +395,14 @@ class NoPlan(Exception):
     """The requested worker session does not identify a readable plan."""
 
 
+class RemovedPlan(NoPlan):
+    """The run names a plan file that no longer exists, as after its as-built."""
+
+    def __init__(self, plan_path: Path) -> None:
+        super().__init__(f"Unable to read plan {plan_path}")
+        self.plan_path: Path = plan_path
+
+
 def _json_object(text: str) -> dict[str, object] | None:
     try:
         parsed: object = json.loads(text)  # pyright: ignore[reportAny]
@@ -642,6 +652,14 @@ def parallel_line(check: ParallelCheck) -> str:
         f"Parallel: unknown — {which} no **Depends on:** line; "
         + "add one under each phase heading and rerun"
     )
+
+
+def session_parallel_line(session_dir: Path) -> str:
+    """The session's `Parallel:` line; ad hoc work after its plan's removal has no plan to read."""
+    try:
+        return parallel_line(build(session_dir).parallel)
+    except RemovedPlan as removed:
+        return f"Parallel: none — no plan at {removed.plan_path}; the run does ad hoc work"
 
 
 def _normalized_title(title: str) -> str:
@@ -1017,6 +1035,8 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
         resolver = session_staff.RowResolver(record)
     try:
         phases = plan_history.plan_phases(plan_path, resolver=resolver)
+    except FileNotFoundError as error:
+        raise RemovedPlan(plan_path) from error
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
@@ -1888,7 +1908,11 @@ def owned_notes(production: str, unit: str) -> list[Path]:
 def refresh(session_dir: Path) -> None:
     """Rewrite a production unit's generated phase note, when it has one."""
     resolver = session_staff.RowResolver(staff.snapshot())
-    record = build(session_dir, resolver=resolver)
+    try:
+        record = build(session_dir, resolver=resolver)
+    except RemovedPlan:
+        # Ad hoc work after the as-built: the removed plan has no phase note to rewrite.
+        return
     reference = _production_reference(record.plan, resolver=resolver)
     if isinstance(reference, PlanOutsideProduction):
         return
@@ -1974,7 +1998,7 @@ def main() -> int:
             refresh(session_dir.expanduser().resolve())
             return 0
         if command == "parallel":
-            print(parallel_line(build(session_dir.expanduser().resolve()).parallel))
+            print(session_parallel_line(session_dir.expanduser().resolve()))
             return 0
         if command == "prune":
             if production_doc is None:

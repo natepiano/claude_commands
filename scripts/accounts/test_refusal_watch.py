@@ -11,6 +11,7 @@ from scripts.production import staff_sources, staff, staff_test_support
 from scripts.message import sessions as status_sessions
 import io
 import fcntl
+import itertools
 import json
 import os
 import socket
@@ -30,7 +31,7 @@ from scripts.lib import conf
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -44,16 +45,16 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
-    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    from scripts.shutdown import inventory, shutdown_record, restart_support, pane_record
+    from scripts.agents.unit_staff_test_support import isolated_parents, unit_host
+    from scripts.agents import inventory, shutdown_record, restart_support, pane_record
     from scripts.message import sessions
 else:
-    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    inventory = import_module("scripts.shutdown.inventory")
-    shutdown_record = import_module("scripts.shutdown.shutdown_record")
-    restart_support = import_module("scripts.shutdown.restart_support")
+    from scripts.agents.unit_staff_test_support import isolated_parents, unit_host
+    inventory = import_module("scripts.agents.inventory")
+    shutdown_record = import_module("scripts.agents.shutdown_record")
+    restart_support = import_module("scripts.agents.restart_support")
     sessions = import_module('scripts.message.sessions')
-    pane_record = import_module("scripts.shutdown.pane_record")
+    pane_record = import_module("scripts.agents.pane_record")
 
 
 def setUpModule() -> None:
@@ -2560,18 +2561,26 @@ class RefusalWatchTests(unittest.TestCase):
             self.assertEqual(found.refused_at.at, REFUSAL_AT)
 
     def test_codex_refusal_keeps_its_time_and_window_after_bookkeeping(self) -> None:
-        for folder, window in (("sessions", "weekly"), ("archived_sessions", "5-hour")):
-            with self.subTest(folder=folder):
+        for folder, window, task_error in (("sessions", "weekly", False), ("archived_sessions", "5-hour", False),
+                                           ("sessions", "weekly", True)):
+            with self.subTest(folder=folder, task_error=task_error):
                 home = self.home / ".codex2"
                 path = home / folder / "2026/11/05/rollout-refused-thread.jsonl"
-                path.parent.mkdir(parents=True)
+                path.parent.mkdir(parents=True, exist_ok=True)
                 text = f"You've hit your usage limit. {window} limit reached."
-                _ = path.write_text("\n".join(json.dumps(entry) for entry in [
-                    {"type": "session_meta", "payload": {"id": "refused-thread"}},
+                refusal: list[dict[str, object]] = [
+                    {"type": "event_msg", "payload": {"type": "token_count"}},
+                    {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+                     "payload": {"type": "task_complete", "last_agent_message": None,
+                                 "error": {"message": text, "codex_error_info": "usage_limit_exceeded"}}},
+                ] if task_error else [
                     {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
                      "payload": {"type": "error", "message": text}},
                     {"type": "event_msg", "payload": {"type": "token_count"}},
                     {"type": "event_msg", "payload": {"type": "task_complete"}},
+                ]
+                _ = path.write_text("\n".join(json.dumps(entry) for entry in [
+                    {"type": "session_meta", "payload": {"id": "refused-thread"}}, *refusal,
                 ]) + "\n")
                 found = refusal_watch.transcript_refusal("refused-thread", config_dir=home)
                 self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
@@ -2615,16 +2624,22 @@ class RefusalWatchTests(unittest.TestCase):
         home = self.home / ".codex"
         path = home / "sessions/rollout-continued-thread.jsonl"
         path.parent.mkdir(parents=True)
-        refusal = {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
-                   "payload": {"type": "error", "message": "You've hit your usage limit."}}
-        for exchange in (
+        for refusal, exchange in itertools.product((
+            {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+             "payload": {"type": "error", "message": "You've hit your usage limit."}},
+            {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+             "payload": {"type": "task_complete", "error": {"message": "You've hit your usage limit."}}},
+        ), (
+            {"type": "event_msg", "payload": {"type": "task_started"}},
             {"type": "event_msg", "payload": {"type": "user_message", "message": "continue"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "message": "I checked the usage limit."}},
             {"type": "response_item", "payload": {"type": "message", "role": "assistant",
                 "content": [{"type": "output_text", "text": "You've hit your usage limit is the old error."}]}},
             {"type": "event_msg", "payload": {"type": "error", "message": "Connection failed."}},
-        ):
-            with self.subTest(exchange=exchange):
+            {"type": "event_msg", "payload": {"type": "task_complete",
+                "error": {"message": "Connection failed.", "codex_error_info": "other"}}},
+        )):
+            with self.subTest(refusal=refusal, exchange=exchange):
                 _ = path.write_text(json.dumps(refusal) + "\n" + json.dumps(exchange) + "\n")
                 found = refusal_watch.transcript_refusal("continued-thread", config_dir=home,
                                                        screen_text="You've hit your weekly limit.")

@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.usage import context_economy as economy
+from scripts.usage import collect, context_economy as economy
 from scripts.usage.context_economy_read import (
     CompactionEvent, MacReadFailed, MacSessions, Request, Session, SettingsSet, SizeNotReported, Start,
 )
@@ -134,11 +134,34 @@ class ContextEconomyTests(unittest.TestCase):
             "settings_keys = autoCompactWindow precomputeCompactionEnabled model\n"
             + "files = commands/unit/direct.md\n"
             + f"# whole: 1..\nmin_requests = {min_requests}\n"
-            + f"# whole: 1..\nactive_gap_seconds = {active_gap_seconds}\n", encoding="utf-8")
+            + f"# whole: 1..\nactive_gap_seconds = {active_gap_seconds}\n"
+            + "# whole: 1..\nhourly_recent_hours = 1\n# whole: 1..\nhourly_baseline_days = 1\n", encoding="utf-8")
 
     def report(self, sessions: list[Session], timeline: list[SettingsSet], *, by: Literal["settings", "week"] = "settings",
                role: str = "") -> economy.Report:
         return economy.build_report(sessions, {"fixture": timeline}, self.store, at(-60), at(14 * 86400), by=by, role=role)
+
+    def test_hourly_rates_compare_complete_hours_with_the_baseline(self) -> None:
+        requests = [("a", "natedev", "director", -7200, 1_000_000), ("a", "natedev", "director", -3600, 3_000_000),
+                    ("b", "natedev", "director", -3599, 3_000_000), ("b", "mac", "director", -3598, 3_000_000),
+                    ("c", "natedev", "showrunner", -3597, 9_000_000), ("a", "natedev", "director", 60, 9_000_000)]
+        hour = at(0).replace(minute=0, second=0, microsecond=0)
+        with closing(sqlite3.connect(self.store)) as database:
+            _ = database.executescript(collect.SCHEMA)
+            for index, (agent, machine, role, offset, tokens) in enumerate(requests):
+                _ = database.execute(
+                    "INSERT INTO turns (machine, family, kind, parent_id, agent_id, turn_key, at, model, input, cache_write_5m, "
+                    + "cache_write_1h, cache_read, output, before_first_edit, role, attribution, lens_state) "
+                    + "VALUES (?, 'claude', 'session', '', ?, ?, ?, 'claude-opus-5-5', ?, 0, 0, 0, 0, 0, ?, 'recorded', 'not_applicable')",
+                    (machine, agent, str(index), (hour + timedelta(seconds=offset)).isoformat(), tokens, role))
+            database.commit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(economy.main(["hourly", "--store", str(self.store)]), 0)
+        rows = output.getvalue().splitlines()
+        self.assertIn(f"Ledger as of {hour + timedelta(seconds=60):%a %H:%M} UTC", rows[0])
+        self.assertEqual(rows[4:], ["| normal (median) | 1 | 1.0M | 1.00M |", "| busy (p75) | 1 | 1.0M | 1.00M |",
+                                    f"| {hour - timedelta(hours=1):%a %H:00} | 3 | 9.0M | 3.00M |"])
 
     def record_role(self, session: Session, role: str) -> None:
         with closing(sqlite3.connect(self.store)) as database:

@@ -29,13 +29,8 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertNotIn("TICKS FAILING", output)
         self.assertEqual(calls, "health unit-test-run\n")
 
-    def test_missing_active_marker_skips_health(self) -> None:
+    def test_no_staff_run_skips_health(self) -> None:
         output, calls = self.run_status(None, "failing: no instance", 1)
-        self.assertNotIn("TICKS FAILING", output)
-        self.assertIsNone(calls)
-
-    def test_empty_active_marker_skips_health(self) -> None:
-        output, calls = self.run_status("", "failing: no instance", 1)
         self.assertNotIn("TICKS FAILING", output)
         self.assertIsNone(calls)
 

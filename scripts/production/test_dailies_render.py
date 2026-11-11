@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import sys
@@ -43,16 +43,16 @@ AGENT_LINES = ["* none active"]
 
 def setUpModule() -> None:
     # The state check reads the build hold and mac_test state; no test sees the machine's own.
-    scratch = tempfile.TemporaryDirectory()
-    staff_scope = isolated_staff_file(Path(scratch.name) / "staff.json", {})
+    scratch = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    staff_scope = isolated_staff_file(scratch / "staff.json", {})
     _ = staff_scope.__enter__()
     unittest.addModuleCleanup(staff_scope.__exit__, None, None, None)
-    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, source_environment(Path(scratch.name) / "sources"))))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, source_environment(scratch / "sources"))))
     _ = unittest.enterModuleContext(isolated_source_readers())
     _ = fixture_member("showrunner", name="fixture")
     previous = {name: os.environ.get(name) for name in ("BUILD_HOLD_DIR", "MAC_TEST_STATE_DIR")}
-    os.environ["BUILD_HOLD_DIR"] = str(Path(scratch.name) / "build-hold")
-    os.environ["MAC_TEST_STATE_DIR"] = str(Path(scratch.name) / "mac-test")
+    os.environ["BUILD_HOLD_DIR"] = str(scratch / "build-hold")
+    os.environ["MAC_TEST_STATE_DIR"] = str(scratch / "mac-test")
 
     def restore() -> None:
         for name, value in previous.items():
@@ -60,7 +60,6 @@ def setUpModule() -> None:
                 _ = os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-        scratch.cleanup()
 
     unittest.addModuleCleanup(restore)
 
@@ -365,7 +364,6 @@ for name in ("first", "second"):
             "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
             "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-state"),
             "NOTIFIER_SESSIONS_DIR": str(Path(scratch) / "sessions"),
-            "UNIT_ACTIVE_DIR": str(Path(scratch) / "active"),
             "TZ": ZONE, "USER_ZONE": ZONE,
         }):
             record = holder(purpose="the writer's timings")

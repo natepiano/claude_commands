@@ -11,7 +11,6 @@ import sys
 import tempfile
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -38,15 +37,13 @@ TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
 FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
 SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
-# Eight workers overlap imports and limit the number of Python processes.
-ISOLATION_IMPORT_WORKERS = 8
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
 
 
 COORDINATION_VARIABLES = (
-    "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "UNIT_ACTIVE_DIR",
+    "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR",
     "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
 )
 
@@ -209,7 +206,9 @@ def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]
         connection.row_factory = sqlite3.Row
         records = cast(list[sqlite3.Row],
                        connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
-        return [{name: cast(object, row[name]) for name in row.keys()} for row in records]
+        return [{name: cast(object, row[name]) for name in row.keys()
+                 if not (table == "gate_modules" and name in {"config_reads", "folder_scans", "content_reads"} and row[name] is None)}
+                for row in records]
 
 
 class LogIsolationTests(unittest.TestCase):
@@ -231,30 +230,52 @@ class LogIsolationTests(unittest.TestCase):
         environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_DIR"}
         real_root = Path.home() / ".local/state/buildlog"
 
-        def import_module(module: Path) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                [
-                    str(CLI.parents[1] / "lib/py"),
-                    "-c",
-                    "import importlib, sys; from scripts.buildlog import store; "
-                    + "importlib.import_module(sys.argv[1]); print(store.root())",
-                    "scripts.buildlog." + module.stem,
-                ],
-                cwd=Path(__file__).resolve().parents[2],
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+        bootstrap = '''import importlib, json, os, sys, tempfile, traceback, unittest, unittest.mock
+from scripts.buildlog import store
 
+for module in json.loads(sys.argv[1]):
+    importlib.import_module(module)
+
+results = []
+for module in sys.argv[2:]:
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        pid = os.fork()
+        if pid == 0:
+            os.dup2(output.fileno(), 1)
+            os.dup2(errors.fileno(), 2)
+            try:
+                importlib.import_module(module)
+                print(store.root(), flush=True)
+            except BaseException:
+                traceback.print_exc()
+                raise SystemExit(1)
+            raise SystemExit(0)
+        _, status = os.waitpid(pid, 0)
+        output.seek(0)
+        errors.seek(0)
+        results.append((os.waitstatus_to_exitcode(status), output.read().decode(), errors.read().decode()))
+print(json.dumps(results))
+'''
         modules = sorted(Path(__file__).parent.glob("test_*.py"))
-        with ThreadPoolExecutor(max_workers=ISOLATION_IMPORT_WORKERS) as pool:
-            futures = [(module, pool.submit(import_module, module)) for module in modules]
-            for module, future in futures:
-                with self.subTest(module=module.name):
-                    result = future.result()
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
+        production_modules = sorted(
+            "scripts.buildlog." + module.stem
+            for module in Path(__file__).parent.glob("*.py")
+            if not module.name.startswith("test_")
+            and not module.name.endswith("_test_support.py")
+            and module.name != "__init__.py"
+        )
+        parent = subprocess.run(
+            [str(CLI.parents[1] / "lib/py"), "-c", bootstrap, json.dumps(production_modules),
+             *("scripts.buildlog." + module.stem for module in modules)],
+            cwd=Path(__file__).resolve().parents[2], env=environment,
+            capture_output=True, text=True, check=True,
+        )
+        results = cast(list[tuple[int, str, str]], json.loads(parent.stdout))
+        for module, (status, output, errors) in zip(modules, results, strict=True):
+            with self.subTest(module=module.name):
+                result = subprocess.CompletedProcess([module.name], status, output, errors)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
 
 
 def encode(record: Record) -> bytes:
@@ -279,6 +300,26 @@ class IndexTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
+
+    def test_gate_config_reads_store_sorted_empty_and_missing_records(self) -> None:
+        template = gate_run()["modules"][0]
+        run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "config-reads", "host": "mac",
+                       "modules": [{**template, "module": "test_empty.py", "config_reads": [], "folder_scans": [], "content_reads": []},
+                                   {**template, "module": "test_missing.py"},
+                                   {**template, "module": "test_read.py", "config_reads": ["z", "a", "z"],
+                                    "folder_scans": ["scripts/", "docs", "scripts/"],
+                                    "content_reads": ["scripts/z.py", "scripts/a.py", "scripts/z.py"]}]}
+        self.write(self.host_file, run)
+        _ = index.update()
+        self.assertIn("config_reads", [row[1] for row in self.rows("PRAGMA table_info(gate_modules)")])
+        self.assertEqual(self.rows("SELECT module, config_reads FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None), ("test_read.py", '["a", "z"]')])
+        self.assertEqual(self.rows("SELECT module, folder_scans FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["docs", "scripts/"]')])
+        self.assertEqual(self.rows("SELECT module, content_reads FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["scripts/a.py", "scripts/z.py"]')])
 
     def test_update_enables_the_configured_spill_threshold(self) -> None:
         spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")

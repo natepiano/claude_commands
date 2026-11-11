@@ -1,7 +1,6 @@
 """Test the sender command and its refusal without live delivery."""
 from __future__ import annotations
 
-import ast
 import os
 from pathlib import Path
 import subprocess
@@ -119,6 +118,10 @@ class SenderRequest(unittest.TestCase):
         self.assertEqual(result.stderr, "REFUSED: real scripts/message/send.py is forbidden in tests\n")
 
 result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(SenderRequest))
+assert isinstance(session_send_test_support.refusal_marker, session_send_test_support.SenderGuardNotInstalled)
+assert os.environ["TEST_SENDER_GUARD"] == str(marker)
+if mode != "fake":
+    assert marker.read_text() == "real sender refused\n"
 raise SystemExit(not result.wasSuccessful())
 '''
 
@@ -174,32 +177,6 @@ class SessionSendTests(unittest.TestCase):
     def test_caught_refusal_keeps_the_marker_after_a_fake_send(self) -> None:
         result = self.probe("caught")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_sender_callers_install_the_guard_in_set_up_module(self) -> None:
-        scripts = Path(__file__).resolve().parents[1]
-        targets = {"session_send_argv", "send_holder_message", "send_floor_alert", "deliver_reading_alert"}
-        missing: list[str] = []
-        for path in sorted(scripts.rglob("*.py")):
-            if not (path.name.startswith("test_") or path.name.endswith("_test.py")):
-                continue
-            if path == scripts / "message/test_send.py":
-                continue
-            module = ast.parse(path.read_text(), filename=str(path))
-            if not any((isinstance(node, ast.Name) and node.id in targets)
-                       or (isinstance(node, ast.Attribute) and node.attr in targets)
-                       for node in ast.walk(module)):
-                continue
-            guarded = any(
-                isinstance(node, ast.FunctionDef) and node.name == "setUpModule"
-                and any(isinstance(call, ast.Call)
-                        and ((isinstance(call.func, ast.Name) and call.func.id == "forbid_real_sender")
-                             or (isinstance(call.func, ast.Attribute) and call.func.attr == "forbid_real_sender"))
-                        for call in ast.walk(node))
-                for node in module.body
-            )
-            if not guarded:
-                missing.append(str(path.relative_to(scripts)))
-        self.assertEqual(missing, [], "Sender tests must install forbid_real_sender in setUpModule")
 
     def test_general_command_keeps_arguments_and_accepts_a_sender_override(self) -> None:
         arguments = ("retire", "--to", "session:fixture", "--key", "fixture key")

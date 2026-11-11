@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -70,6 +70,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 from scripts.production.staff_test_support import fixture_member, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment
 
 class LifecycleFixture(unittest.TestCase):
@@ -112,12 +113,12 @@ class LifecycleFixture(unittest.TestCase):
         socket_for = showrunners.socket_for
         labeled_sessions = unit_lookup.labeled_sessions
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        self.staff.setUp()
         _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", labeled_sessions))
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(self.remove_fixture)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.root = self.fixture_root
         self.bind_fixture()
         self.env = self.fixture_env.copy()
@@ -133,9 +134,8 @@ class LifecycleFixture(unittest.TestCase):
 
     def remove_fixture(self) -> None:
         """Release the next fixture path before removal can fail."""
-        finished = Path(tempfile.mkdtemp(prefix="finished-", dir=self.fixture_root.parent))
-        _ = self.fixture_root.rename(finished)
-        shutil.rmtree(finished)
+        with tempfile.TemporaryDirectory(prefix="finished-", dir=self.fixture_root.parent) as finished:
+            _ = self.fixture_root.rename(finished)
 
     def bind_fixture(self) -> None:
         self.origin = self.root / "origin.git"
@@ -162,6 +162,7 @@ class LifecycleFixture(unittest.TestCase):
                          ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
+                    "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",

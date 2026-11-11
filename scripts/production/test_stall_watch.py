@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
+from scripts.agents import detached_runs
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
@@ -34,16 +35,18 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import showrunners, staff
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit
 from scripts.herdr import fake_herdr
-from scripts.herdr import herdr
+from scripts.herdr import herdr, worker_panes
 from scripts.production import stall_watch
 from scripts.production.session_pane import HerdrFailure, read_place, agent_status
 from scripts.hooks import context_usage
 from scripts.message import rca
+from scripts.whoami import account, usage_store
+from scripts.whoami.agent_accounts import UsageReadOutcome
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.test_showrunners import stalled_session_reader
 from scripts.production import unit_lookup
@@ -509,6 +512,9 @@ always=natedev
             return real_run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
 
         with (mock.patch.object(subprocess, "run", run),
+              mock.patch.object(account, "process_config_dir",
+                                return_value=account.ConfiguredClaudeFolder(self.root / ".claude")),
+              mock.patch.object(usage_store, "store_file", return_value=self.root / "usage.json"),
               mock.patch.multiple(stall_watch, STATE_DIR=self.state,
                                   PROJECTS_DIR=self.projects, SESSIONS=self.sessions_script,
                                   SEND=self.bin / "send.py", PS="ps"),
@@ -518,8 +524,8 @@ always=natedev
 
     def stop_unit(self) -> Path:
         """Stop the fixture's unit through the real cancellation boundary; return its isolated launch file."""
-        from scripts.shutdown import stop_resume
-        from scripts.shutdown import pane_record
+        from scripts.agents import stop_resume
+        from scripts.agents import pane_record
         with (mock.patch.object(pane_record, "RECORD_DIR", self.root / "launches"),
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee"))):
@@ -1231,8 +1237,8 @@ always=natedev
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_stop_retires_a_transferred_units_current_production_key(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown import pane_record as staff_launches
+        from scripts.agents import pane_record
+        from scripts.agents import pane_record as staff_launches
 
         self.configure({"showrunner": ["unit-one"], "receiver": []})
         row = unit_membership("showrunner", "unit-one")
@@ -1269,7 +1275,7 @@ always=natedev
         self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
         transcript = self.projects / "project/204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
         _ = transcript.write_text(tool_call("Edit", {"file_path": "note.txt"}, START - 30))
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
         wall = [float(START)]
         # Observation starts before stop/resume, even when pane reading finishes afterwards.
         def resumed(session: str, **options: object) -> stop_resume.ClaudeUp:
@@ -1953,15 +1959,56 @@ always=natedev
         self.assertEqual(len(self.sent()), 2)
 
     def test_a_resumed_holding_unit_gets_a_fresh_idle_stretch_before_its_bump(self) -> None:
-        self.panes["unit-one"]["pane"] = "holding: paused until the showrunner says resume\n"
-        for at in (START, START + 3600):
-            self.assertEqual(self.tick(at).returncode, 0)
-        self.assertEqual(self.sent(), [])
-        self.panes["unit-one"]["pane"] = "holding: waiting on the unit tests\n"
-        self.assertEqual(self.tick(START + 3601).returncode, 0)
-        self.assertEqual(self.sent(), [])
-        self.assertEqual(self.tick(START + 3901).returncode, 0)
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+        cases = (
+            ("holding: paused until the showrunner says resume\n", "", "waiting"),
+            ("holding: waiting on the unit tests\nLogin reached its time limit\n",
+             "unit-one: the Claude login reached its time limit and needs /login.", "login limit"),
+            ("holding: waiting on the unit tests\nLogin reached its time limit\n", "", "fresh"),
+        )
+        for pane, notice, decision in cases:
+            with self.subTest(decision=decision):
+                self.send_log.unlink(missing_ok=True)
+                self.watches["unit-one"].stretch_path.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = pane
+                if decision == "fresh":
+                    transcript = self.projects / "project" / f"{unit_session('unit-one')}.jsonl"
+                    _ = transcript.write_text(json.dumps({"type": "system", "error": "Login reached its time limit"}) + "\n")
+                    os.utime(transcript, (START - 60, START - 60))
+                    at = datetime.fromtimestamp(START - 1, ZoneInfo("UTC")).isoformat()
+                    _ = (self.root / "usage.json").write_text(json.dumps({
+                        "_directory_logins": {usage_store.directory_key("Claude", str(self.root / ".claude")):
+                                              "fixture@example.invalid"},
+                        "fixture@example.invalid": {"read_outcome": UsageReadOutcome.OK,
+                                                     "weekly": {"left": 50, "resets": "", "at": at}},
+                    }))
+                    result = self.tick(START)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("inspected showrunner/unit-one: fresh", result.stdout)
+                    self.assertEqual(self.sent(), [])
+                    self.assertEqual(self.tick(START + 300).returncode, 0)
+                    resumed = self.sent()
+                    self.assertEqual(len(resumed), 2)
+                    self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in resumed}, {"bump", "tell"})
+                    tell = next(item for item in resumed if item["key"].endswith(":tell"))
+                    self.assertIn("nothing running; bumped", tell["text"])
+                    continue
+                notices = [notice] if notice else []
+                for at in (START, START + 3600):
+                    result = self.tick(at)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"inspected showrunner/unit-one: {decision}", result.stdout)
+                    self.assertEqual([item["text"] for item in self.sent()], notices)
+                if notice:
+                    tell, = self.sent()
+                    self.assertTrue(tell["key"].endswith(":tell"))
+                    self.assertEqual(tell["to"], f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
+                self.panes["unit-one"]["pane"] = pane + "holding: waiting on the unit tests\n"
+                self.assertEqual(self.tick(START + 3601).returncode, 0)
+                self.assertEqual([item["text"] for item in self.sent()], notices)
+                self.assertEqual(self.tick(START + 3901).returncode, 0)
+                resumed = self.sent()[len(notices):]
+                self.assertEqual(len(resumed), 2)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in resumed}, {"bump", "tell"})
 
     def test_status_vocabulary_is_reread_without_restarting_the_watcher(self) -> None:
         self.panes["unit-one"]["pane"] = "holding: budget nap\n"
@@ -2190,18 +2237,47 @@ always=natedev
         return {"type": "assistant", "message": {"content": list(blocks)}}
 
     def test_a_compacted_pane_reads_a_blocked_turn_end_from_the_transcript(self) -> None:
-        self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
-                       self.said({"type": "thinking", "thinking": ""}),
-                       self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}))
-        self.assertEqual(self.tick(START).returncode, 0)
-        self.assertEqual(self.tick(START + 3600).returncode, 0)
-        self.assertEqual(self.sent(), [])
+        peer_prompt: dict[str, object] = {
+            "type": "user", "message": {"content": "Peer update: the Ghostty check remains blocked."}}
+        peer_result: dict[str, object] = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "peer-call", "content": "Peer update sent."}]}}
+        for peer_entries in ([],
+                             [peer_prompt, self.said({"type": "text", "text": "—"})],
+                             [peer_prompt,
+                              self.said({"type": "tool_use", "name": "Bash", "id": "peer-call"}),
+                              peer_result,
+                              self.said({"type": "text", "text": " \n—\n "})]):
+            with self.subTest(peer_entries=peer_entries):
+                self.send_log.unlink(missing_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
+                               self.said({"type": "thinking", "thinking": ""}),
+                               self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}),
+                               *peer_entries)
+                if peer_entries:
+                    self.panes["unit-one"]["pane"] = "— holding: waiting on the tests\n"
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 3600).returncode, 0)
+                self.assertEqual(self.sent(), [])
 
     def test_a_compacted_pane_bumps_when_the_transcript_names_own_work_or_went_on(self) -> None:
+        peer_prompt: dict[str, object] = {"type": "user", "message": {"content": [
+            {"type": "text", "text": "Peer update: the Ghostty check remains blocked."}]}}
         for last, status in (([self.said({"type": "text", "text": "— holding: waiting on the tests"})],
                               "— holding: waiting on the tests"),
                              ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
-                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen")):
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "text", "text": "I continue the tests."}),
+                               self.said({"type": "text", "text": "—"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "text", "text": "—"}),
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "tool_use", "name": "Bash"}),
+                               peer_prompt,
+                               self.said({"type": "text", "text": "—"})], "none on screen")):
             with self.subTest(status=status):
                 self.compacted(*last)
                 self.assertEqual(self.tick(START).returncode, 0)
@@ -2537,20 +2613,82 @@ always=natedev
         self.assertEqual(len(self.sent()), 4)
 
     def test_running_shell_or_worker_launcher_prevents_a_bump(self) -> None:
-        for command in ("bash", "bash scripts/agents/agent_bg.sh"):
-            with self.subTest(command=command):
+        director = next(row for row in staff.find(kind="unit")
+                        if row.current_session == unit_session("unit-one"))
+        pane_worker = fixture_member("worker", name="test", parent=director.id)
+        live_records: dict[tuple[Path, str], list[detached_runs.RunRecord]] = {}
+
+        def read_live_runs(runs: Path, worker: str) -> list[detached_runs.RunRecord]:
+            return live_records.get((runs, worker), [])
+
+        cases = (
+            ("shell", "bash", herdr.AgentStatus.IDLE, "", False, "running"),
+            ("launcher", "bash scripts/agents/agent_bg.sh", herdr.AgentStatus.IDLE, "", False, "running"),
+            ("busy pane", "", herdr.AgentStatus.WORKING, "", False, "running"),
+            ("idle pane", "", herdr.AgentStatus.IDLE, "", False, "idle bump requested"),
+            ("live detached run", "", herdr.AgentStatus.IDLE, "running", False, "running"),
+            ("finished detached run", "", herdr.AgentStatus.IDLE, "finished", False, "idle bump requested"),
+            ("live detached run outside the run roots", "", herdr.AgentStatus.IDLE, "running", True, "running"),
+        )
+        for label, command, status, detached_status, outside_roots, decision in cases:
+            with (self.subTest(case=label),
+                  mock.patch.object(detached_runs, "live_runs", side_effect=read_live_runs)):
+                live_records.clear()
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
                 self.send_log.unlink(missing_ok=True)
-                _ = self.tick(START)
-                worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.children.append(worker)
-                claude_pid = self.children[0].pid
-                self.process_rows.append(f"{worker.pid} {claude_pid} {command} running")
-                _ = self.tick(START + 300)
-                self.assertEqual(self.sent(), [])
-                _ = self.process_rows.pop()
+                with mock.patch.object(worker_panes, "observe_parents", return_value={}):
+                    initial = self.tick(START)
+                self.assertEqual(initial.returncode, 0, initial.stderr)
+                self.assertIn("inspected showrunner/unit-one: fresh", initial.stdout)
+                held_folder = self.root / "held" / "unit-one"
+                if outside_roots:
+                    outside_folder = self.root / "outside" / "unit-one"
+                    outside_folder.parent.mkdir()
+                    _ = held_folder.rename(outside_folder)
+                    held_folder = outside_folder
+                    self.unheld_runs.add("unit-one")
+                    _ = staff.set_run(director.id, staff.OpenRun(held_folder))
+                detached_folder = held_folder / "detached_runs"
+                if detached_status:
+                    detached_folder.mkdir(parents=True, exist_ok=True)
+                    record: detached_runs.RunRecord = {
+                        "run_id": "worker-test", "status": "running" if detached_status == "running" else "finished",
+                        "session_dir": str(detached_folder.parent), "worker": pane_worker.name,
+                        "staff_id": pane_worker.id, "label": "worker tests", "command": ["test"],
+                        "log": str(detached_folder / "worker-test.log"), "started_at": START,
+                        "pid": 900001, "director_dir": str(self.root), "done_message_file": "",
+                    }
+                    _ = (detached_folder / "worker-test.json").write_text(json.dumps(record))
+                    live_records[(detached_folder, pane_worker.name)] = [record] if detached_status == "running" else []
+                if command:
+                    worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self.children.append(worker)
+                    claude_pid = self.children[0].pid
+                    self.process_rows.append(f"{worker.pid} {claude_pid} {command} running")
+                observed: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {
+                    director.id: [worker_panes.OpenWorker(pane_worker, "w2:p1", "worker-terminal", status)]}
+                with mock.patch.object(worker_panes, "observe_parents", return_value=observed):
+                    result = self.tick(START + 300)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"inspected showrunner/unit-one: {decision}", result.stdout)
+                if command:
+                    _ = self.process_rows.pop()
+                if decision == "running":
+                    self.assertEqual(self.sent(), [])
+                    saved = cast(stall_watch.Stretch, json.loads(self.watches["unit-one"].stretch_path.read_text()))
+                    self.assertEqual(saved["since"], START + 300)
+                    live_records.clear()
+                    with mock.patch.object(worker_panes, "observe_parents", return_value={}):
+                        fresh = self.tick(START + 301)
+                    self.assertEqual(fresh.returncode, 0, fresh.stderr)
+                    self.assertIn("inspected showrunner/unit-one: fresh", fresh.stdout)
+                    self.assertEqual(self.sent(), [])
+                else:
+                    sent = self.sent()
+                    self.assertEqual(len(sent), 2)
+                    self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
 
     def test_work_the_unit_started_outside_its_tree_prevents_a_bump(self) -> None:
         """A build a unit backgrounded is reparented away from its Claude but keeps the unit's marks."""

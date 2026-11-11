@@ -14,7 +14,6 @@ from scripts.production import session_staff, showrunners, staff
 from scripts.production import unit_lookup
 from scripts.accounts import session_state
 from scripts.message import sessions
-from scripts.shutdown import remote
 from scripts.herdr import herdr
 
 
@@ -22,12 +21,9 @@ class LiveUnit(NamedTuple):
     unit: str
     # None when no observed herdr session has the unit identity.
     session: unit_lookup.LabeledSession | None
-    status: str = "active"
+    status: session_state.SessionState = "exited"
     member: staff.StaffRow | session_state.UnrecordedStaff = session_state.UnrecordedStaff()
-
-    @property
-    def staff_status(self) -> session_state.StaffState:
-        return session_state.staff_state(self.member)
+    machine: str = ""
 
     @property
     def name(self) -> str:
@@ -80,11 +76,9 @@ def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...]) -> lis
                              or herdr.is_claude_process([observed.process.command])))):
                 activity = session_state.LiveActivity("idle")
         member = row if row is not None else session_state.UnrecordedStaff()
-        state: str = session_state.classify(member, activity)
-        if (row is not None and isinstance(row.worktree, staff.PresentWorktree)
-                and row.worktree.machine != remote.local_machine() and session_state.staff_state(row) == "active"):
-            state = f"on {row.worktree.machine}"
-        result.append(unit._replace(status=state, member=member))
+        state = session_state.classify(member, activity)
+        machine = staff.worktree_machine(row) if row is not None else ""
+        result.append(unit._replace(status=state, member=member, machine=machine))
     return result
 
 

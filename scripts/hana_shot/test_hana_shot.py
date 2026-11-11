@@ -26,9 +26,11 @@ import unittest
 from unittest import mock
 import zlib
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
-from scripts.lib import conf
+from scripts.lib import conf, process_group
+from scripts.lib import scratch as scratch_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
@@ -397,12 +399,16 @@ class HanaShotTest(BuildLogIsolatedTest):
         return [cast(dict[str, object], json.loads(line)) for line in self.timings.read_text().splitlines()]
 
     def script_environment(self, session_variables: dict[str, str] | None = None) -> dict[str, str]:
+        cache_home = self.scratch / "cache"
         environment = {
             **os.environ,
-            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "XDG_CACHE_HOME": str(cache_home),
             # RemoteTests puts its fake scp and ssh here.
             "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         }
+        # Keep the blocked cache in the timing-write failure test.
+        if not cache_home.exists() or cache_home.is_dir():
+            environment.update(interpreter_cache_environment(cache_home))
         for name in ("CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             _ = environment.pop(name, None)
         if session_variables is not None:
@@ -950,13 +956,13 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
             self.assertIn("so this Hana runs that code:", diagnostics.getvalue())
             return cast(subprocess.Popen[bytes], process)
 
-        def make_scratch(*, prefix: str) -> str:
-            self.assertEqual(prefix, "hana-shot-15797-")
+        def make_scratch(*, word: str) -> Path:
+            self.assertEqual(word, "hana-shot-15797")
             # Git status has already run; replace only the subsequent Hana start.
             _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=start_stub))
             scratch = self.root / "scratch"
             scratch.mkdir()
-            return str(scratch)
+            return scratch
 
         with (
             redirect_stderr(diagnostics),
@@ -964,7 +970,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "wait_ready"),
             mock.patch.object(hana_shot, "launch_state_path", return_value=self.root / "launch.json"),
-            mock.patch.object(tempfile, "mkdtemp", side_effect=make_scratch),
+            mock.patch.object(scratch_folders, "new", side_effect=make_scratch),
         ):
             state, _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose="launch warning")
         warning = next(line for line in diagnostics.getvalue().splitlines() if line.startswith("hana_shot: warning:"))
@@ -1010,7 +1016,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
         with (
             mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
-            mock.patch.object(tempfile, "mkdtemp", return_value=str(launch_scratch)),
+            mock.patch.object(scratch_folders, "new", return_value=launch_scratch),
             mock.patch.object(subprocess, "Popen", side_effect=start),
             mock.patch.object(hana_shot, "wait_ready"),
             redirect_stderr(io.StringIO()),
@@ -1042,7 +1048,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
     def test_caller_without_a_staff_row_launches_with_an_empty_owner(self) -> None:
         self.stop_fake_listener()
         self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
-        _ = fixture_member("agent", name="another-caller")
+        _ = fixture_member("producer", name="another-caller")
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": fixture_runtime_id("missing-caller")}):
             _ = self.launch_without_starting_hana()
         self.assertIn("HANA_TEST_OWNER=", self.launch_command)
@@ -1246,6 +1252,28 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertFalse(scratch.exists())
         self.assertEqual(list(self.state_path.parent.iterdir()), [])
         self.assertIn("temporary launch panic: kept diagnostic", diagnostics)
+
+    def test_parent_that_exits_on_sigterm_still_gets_sigkill_for_its_group(self) -> None:
+        pid = 424242
+        process = cast(subprocess.Popen[bytes], mock.Mock(
+            pid=pid,
+            wait=mock.Mock(side_effect=[subprocess.TimeoutExpired("fixture Hana", 20), 0]),
+        ))
+        signals: list[tuple[int, int]] = []
+
+        def signal_group(group: int, number: int) -> None:
+            signals.append((group, number))
+
+        with (
+            mock.patch.object(hana_shot.Brp, "call", return_value={}),
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(process_group, "send_process_group", side_effect=signal_group),
+            mock.patch.object(time, "sleep"),
+            redirect_stderr(io.StringIO()),
+        ):
+            hana_shot.shutdown(self.port, process)
+
+        self.assertEqual(signals, [(pid, signal.SIGTERM), (pid, signal.SIGKILL)])
 
     def test_shutdown_never_kills_recovered_pid_when_binary_identity_changed(self) -> None:
         self.stop_fake_listener()

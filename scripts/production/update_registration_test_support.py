@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 from types import ModuleType
@@ -118,8 +118,8 @@ class RegistrationFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         self.owner_id = next(row.id for row in staff.snapshot().find(kind="showrunner")
                              if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path == self.doc)

@@ -11,8 +11,9 @@ from typing import override
 from unittest import mock
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr import herdr_types
 from scripts.production import staff, unit_config, unit_command
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.herdr import herdr
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id
@@ -30,7 +31,7 @@ class CommandHerdr:
 
     def panes(self) -> list[dict[str, str]]:
         if self.pane_error:
-            raise herdr.HerdrFailure(self.pane_error)
+            raise herdr_types.HerdrFailure(self.pane_error)
         return self.pane_records
 
     def agents(self) -> list[dict[str, str]]:

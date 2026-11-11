@@ -92,7 +92,7 @@ def grant_call(path: Path) -> None:
     with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
+        "STAFF_FILE": str(release.parent / "staff.json"),
     }), mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
          mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
         holders = build_hold.read_holders(build_hold.holder_directory())
@@ -105,7 +105,7 @@ def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> 
     with local_hold_environment({
         "BUILD_HOLD_DIR": str(release.parent / "build-hold"),
         "BUILD_HOLD_RELEASE_DIR": str(release),
-        "UNIT_ACTIVE_DIR": str(release.parent / "active"),
+        "STAFF_FILE": str(release.parent / "staff.json"),
     }), build_hold.release_lock():
         cycle = build_hold.read_cycle()
         assert cycle is not None
@@ -216,8 +216,8 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     def setUp(self) -> None:
         self.cleanup_failures = ()
         self.root: Path = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(self.assert_nothing_outlives)
         self.home: Path = self.root / "home"
         self.bin_directory: Path = self.root / "bin"
@@ -264,13 +264,13 @@ class VerifyHoldWaitFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        VerifyHoldTools.setUpClass()
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
+        VerifyHoldTools.setUpClass()
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
         self.addCleanup(self.fixture_cleanups)
+        self.fixture.setUp()
         root = self.fixture.root
         pressure = root / "memory-pressure"
         write_pressure_reading(pressure)
@@ -280,7 +280,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-            "UNIT_ACTIVE_DIR": str(root / "active"),
+            "STAFF_FILE": str(root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "UNIT_TEAM_ROLE": "", "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
@@ -296,7 +296,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         script = self.fixture.root / "unblocked-step.sh"
         _ = script.write_text('set -eo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
-            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+            + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
 PY=$CLAUDE_PYTHON

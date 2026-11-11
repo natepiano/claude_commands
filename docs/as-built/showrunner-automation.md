@@ -213,12 +213,12 @@ Each local Promote checkout must exist before the command pushes.
   `start_gate` starts `bump_gate.py --record <step record>` before promotion.
   The checkpoint does not wait for its result.
   `copies.standing` supplies a checkout of the recorded pushed tip.
-  `run_checkpoint_test_steps` supplies the shared test, flake, and retry rules.
+  `checkpoint_gate.run_checkpoint_test_steps` supplies the shared test, flake, and retry rules.
   The production checkout retains flake notes, and `bump-gate.log` retains output.
   The record holds the test plan, tip, runner pid and start, result, detail, and successful recipients.
   A live runner prevents another launch; unknown liveness holds the gate.
   A dead runner without a result permits another launch.
-  Completion and delivery compare the current tip, pid, and process start under `record_lock`.
+  Completion and delivery compare the current tip, pid, and process start under `checkpoint_gate.record_lock`.
   A replaced runner cannot publish a result or deliver a notice.
   Red results reach the unit and showrunner; green results reach the showrunner.
   Delivery resolves current sessions from the recorded fixed owner and unit ids.
@@ -234,6 +234,7 @@ Each local Promote checkout must exist before the command pushes.
   A completed child handoff retry changes nothing and sends no second notice.
   Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-scriptsproductionmerge_gatepy).
 - **Review numbers.** The unit obtains `--review-trial` from `progress_history.py review-trial`.
+  The checkpoint command passes `--phase-id <phase id>` for the phase it checkpoints.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
 - **Held simplify items.** The checkpoint notice carries each held item and its ledger reference.
   The [simplify lens](simplify-lens.md#findings-and-decisions) defines which items require user questions and which items the director settles.
@@ -241,19 +242,47 @@ Each local Promote checkout must exist before the command pushes.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
-     `_unit_paths` excludes paths imported from origin merge branches. The report gives both path counts.
+     `_unit_paths` excludes unchanged paths that an origin merge base contains.
+     A path absent from that base remains in scope, including a deleted plan.
+     The report gives both path counts.
      A shrink allows only the plan doc and `<plan stem>-next.md`.
      An as-built commit allows only Markdown paths and must change or delete the plan.
   3. *conflicts*: `merge-tree --write-tree --name-only` exit 1 is held, asking the unit to merge the merge branch and send a new hash.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
-  6. *test*: each package owning a changed file (nearest `Cargo.toml`, named by its directory) through `verify.sh test`, each changed `crates/<pkg>/examples/<name>` through `verify.sh example`, then each Merge tests command, into `<scratch>/merge_<short>_test.log` with `<name>_EXIT=<rc>` lines. A command that cannot start is exit 127. `parse_merge_tests(lines, checkout)` reads the commands at input: each backticked entry before the first unbackticked `(` is split with `shlex`, each word passes `expanduser` then `expandvars` (the commands run with no shell), and an entry is refused by name when a `$VAR` is still left, or when its first word is neither on PATH nor an executable file in the checkout (a package name or a directory, as cargo-liner wrote, 2026-10-17). A shrink runs none.
+  6. *test*: `prepare_checkpoint` merges `origin/main` before test selection.
+     It selects every changed path from the tip before the checkpoint merge through the prepared tip.
+     Packages run through `verify.sh test`, and changed examples run through `verify.sh example`.
+     Then each configured Merge tests command runs without a shell.
+     `parse_merge_tests` reads backticked entries before the first unquoted parenthesis and splits them with `shlex`.
+     Each word expands home and environment variables.
+     A remaining `$VAR` or an unavailable executable refuses the command by name.
+     Output enters `<scratch>/merge_<short>_test.log` with `<name>_EXIT=<rc>` lines.
+     A command that cannot start has exit 127.
+     A shrink runs no tests.
   7. *red*: run each failed command once alone.
      If every nextest `FAIL` row names a Known flaky test, run only those tests again.
      Use `verify.sh test [<package>] --filter <name>` per test, or `-E test(=<name>)` for other nextest commands.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
-     Otherwise, confirm that `HEAD` is this merge and is not on origin, then use `reset --keep HEAD~1`.
-  8. *push and promote*. `GitPush` merges `origin/main` with `--no-ff` when it has diverged, then pushes the merge branch. A failed merge always runs `git merge --abort`, including during a repeated promotion. Conflicts produce `push: held` with the conflicting paths, separated by commas. A repeated promotion keeps HEAD and the work tree as they were before the push step. When rollback is allowed and origin did not move, the push step also resets the checkpoint merge. The message asks the unit to merge `origin/main` into the merge branch, resolve the conflict, and run the push again. A merge failure without conflicting paths stays failed. Other push failures use the same rollback rule. `ValidateAndPush`: `validate_and_push.sh --quick --to <merge branch> --fix-commit "ci(<showrunner name>): format fixes after <unit> phase <N>" [--cancel-prior]`, reset to origin on failure. Then each **Promote** checkout through `promote_local_checkout(checkout, merge_branch, tip)`: it must be on `main`; `merge --ff-only <tip>`, where tip is the pushed merge-branch tip; push `main` only when `main ^origin/main ^origin/<merge branch>` is empty. Then the Mac through `pull_mac_checkout(mac, source)`: `ssh mac "cd <mac> && git pull --ff-only natedev:<first Promote checkout> main; printf 'rc=%s\n' $?"`, judged by the printed `rc=`. Failed Mac pulls use up to `MAC_PULL_TRIES=3` total attempts with `MAC_PULL_RETRY_SECONDS=2` seconds between attempts, read from `config/merge_checkpoint.conf` for each pull (`MERGE_CHECKPOINT_CONFIG` selects another file).
+     Otherwise, restore the tip before the checkpoint merge while origin still has its old tip.
+     This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
+  8. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
+     It publishes only when the tested tip contains main.
+     Otherwise, it releases the lock, merges main, retests the new paths, and tries again.
+     Tests never run inside this lock.
+     `push_git` pushes without another merge.
+     A main conflict aborts the merge and reports `push: held` with the conflicting paths.
+     Preparation failure restores the tip before this run when origin still has its old tip.
+     An interrupted promotion and a child handoff use the same test loop.
+     Each caller retains its own rollback rule for a failed push.
+     `ValidateAndPush` uses `validate_and_push.sh --quick --to <merge branch>` with the configured fix subject and optional `--cancel-prior`.
+     Local promotion fast-forwards each main checkout to the pushed tip.
+     It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
+     Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
+     The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
+     It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
+     An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
+     An answering Mac whose pull fails still fails promotion.
   9. Record the code checkpoint's review ledger row and production log line.
      `review_regime.py add` uses the configured plan, unit, phase, merge time, review numbers, and optional exclusion.
      The ledger key includes unit, plan, and phase.
@@ -272,16 +301,27 @@ Each local Promote checkout must exist before the command pushes.
   `Change-Review-Covers: <hash>` names each covered commit.
   The merge gates retain their staff reads before publication.
 
-  All merge callers use `list_ready` after every promotion step succeeds, including the Mac pull.
-  A failed step adds no rows.
+  Merge callers use `list_ready` after promotion succeeds or the Mac pull enters the shared pending queue.
+  A failed required step adds no rows.
   Git publication receipts and style notices retain their existing behavior, including on failed promotions.
   There is no `change-review` receipt.
   `list_ready` fetches `origin main` in the source checkout before it checks ancestry.
   A failed fetch prints one error line, adds nothing, and does not fail the merge.
   It scans first-parent merges on the production's merge branch from 2026-11-06.
   Older merges add no rows.
-  It passes each merge's commits through `publication_changes` and excludes foreign units through `foreign_units`.
-  Child handoffs retain their production routing.
+  It excludes foreign history through origin merge refs and `_publication_exclusions`.
+  A local gate branch remains eligible when its name differs from the production merge branch.
+  `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
+  The count and row writer use this same selection.
+  `checkpoint_producers` reads recorded owners through `progress_history.load_events`, using the held staff snapshot.
+  Legacy records use `StaffSnapshot.unit_by_worktree`.
+  Merge writers record the known producer when they make the merge.
+  An inner merge record supplies ownership for handoff commits without a checkpoint owner.
+  Commit subjects supply no Producer identity.
+  The Production cell uses the producing unit's showrunner staff id.
+  Missing ownership leaves Producer empty.
+  Promotion-only scans use the promoted checkout.
+  The [repair overview](repair-rounds.md#mac-pulls-and-visible-change-ownership) defines these records.
   A row requires its merge to be an ancestor of `origin/main`.
   The row records that merge's short hash.
 
@@ -476,8 +516,24 @@ The caller's working directory stays unchanged.
   Scripts use package imports; shell displays call the helper through `scripts/lib/py`.
   A stored time retains its original zone when that zone identifies the recorded instant.
   Tests select a private zone when their expected output requires it.
-- **`/zone` (2026-10-21).** `commands/zone.md` runs `scripts/lib/zone.py`. Bare, it prints the zone, its label, its UTC offset and the time now. `set NAME` resolves NAME (`resolve`): an exact IANA name, else the one zone whose city matches (case, accents, `_` and spaces ignored), else the one zone that uses the label now or in six months; more than one match, or none, is refused with exit 2, the matches grouped by UTC offset. Then, on natedev only: the checkout of `user_zone.CONF` must be on main and take `origin/main` as a fast-forward; the `zone=` line is rewritten (comments kept) and committed with `--only` that file, subject `user zone: <zone> (<label>), set with /zone`; `main_publish.commit` compares the named file with HEAD when `git commit` fails. If `git diff --quiet HEAD -- <conf>` exits 0, it keeps the new text and prints `anomaly: git commit: <error>; the commit exists` to stderr. Any other result restores the old text and refuses the change. It returns the short HEAD, so `/zone` and `/tune` continue to push. `main` is pushed only when every commit origin lacks has that subject. The Mac pulls as a promotion does (`ssh mac … git pull --ff-only natedev:<checkout> main`, judged by `rc=`), and `broadcast.py --from zone --all` tells both machines. When the Mac pull fails, the change and its message go to `<XDG_STATE_HOME>/zone/mac.json`, and the broadcast runs `--here`. A bare `zone.py` pulls and sends a queued change; `merge_checkpoint.promote` runs `zone.py drain --pulled` after each Mac pull, which sends only the message. `ZONE_SSH`, `ZONE_BROADCAST` and `ZONE_STATE` replace ssh, broadcast.py and the queue folder in `scripts/lib/test_zone.py`.
-  A rerun checks the config against HEAD. It commits an uncommitted zone even when the stored zone already equals the request.
+- **`/zone`:** `commands/zone.md` runs `scripts/lib/zone.py`.
+  Bare, it prints the configured zone, label, UTC offset, and current time.
+  `set NAME` resolves an IANA name, city, or current seasonal label.
+  Ambiguous or unknown names exit 2 with the candidate offsets.
+  Publication runs on natedev through `main_publish`, shared with `/tune`.
+  It updates `zone=` while preserving comments, commits only that file, and pushes main.
+  A failed commit keeps the new text when the file already matches HEAD.
+  Otherwise, it restores the previous text and refuses publication.
+  The Mac pulls through the shared helper, and the broadcast reaches both machines.
+  A failed pull queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
+  Pending pulls retain each Mac path and source.
+  A bare call drains the queue before it returns.
+  Promotion runs `zone.py drain --pulled <path>` after a successful pull.
+  The drain skips only that path and pulls every other pending target before sending the notice.
+  Clearing one target preserves other targets and an undelivered notice.
+  A legacy queue without `pulls` represents one default `~/.claude` pull.
+  `ZONE_SSH`, `ZONE_BROADCAST`, and `ZONE_STATE` select private test dependencies.
+  A repeated request commits an uncommitted zone even when its stored value already matches.
 - **Status line assignment.** `statusline.sh` sends the native session ID and staff data to `scripts/statusline/assignment.py`.
   `StaffSnapshot.by_current_session` selects the row.
   The row supplies the current name, kind, and parent name.
@@ -540,14 +596,14 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
   All cells escape pipes.
   The command reads terminal metadata, never pane contents.
-  - **Status and anomalies:** Both tables show Status as `paused` or `active` from the staff row.
+  - **Status and anomalies:** Both tables derive Status through the shared session classifier and the staff hold fields.
     `live_units.read_units(name)` returns `UnitListing(units, anomalies)`.
     `units_of(name)` uses that reader and prints its anomalies on stderr.
     `units_in(name, every)` joins supplied observations and adds each unit's staff status.
     `session_staff.anomalies` collects diagnostics and preserves other callers' stderr output.
     The command prints read failures below the table on stdout when they make the table wrong or incomplete.
     Staff name conflicts also produce lines. Each process has at most one line.
-    The command does not scan other processes.
+    Detached run checks share one process snapshot when needed.
     A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
     A process without an identity reports an unreadable thread when its pane holds staff.
     One staff candidate retains its pane placement with unknown status.
@@ -558,7 +614,7 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
     The worker scanner uses this reader before it joins the current thread to its staff row.
     A missing pane launch record does not make a resolved staff worker unknown.
-    `send.morty_stamp` matches Morty's thread against `MORTY_NATIVE_ID` from `config/send.conf`.
+    `scripts/message/morty_identity.py` supplies the shared match against `MORTY_NATIVE_ID` from `config/send.conf`.
     A match produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     A failed send adds one anomaly line and preserves the table and exit code.
@@ -573,20 +629,41 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `| Unit | Status | Phase | Non-Phase Work | Queued |`.
+  - **Phase productions:** `| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
-    An active unit on another machine shows `on <machine>`.
+    Both tables add a **Machine** column after **Status** only when a row runs on another machine.
+    The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
+    `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
+    `worker.py list --json` keeps its existing fields.
     Phase shows `phase <n> of <m> — <task>`.
     The task uses the newest plan run's open step, then the phase title.
     Other phase states include `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Cells limit task text to 80 characters and end longer text with `…`.
-    Non-Phase Work reads only the unit's newest run.
-    A finished run gives `—`.
-    Otherwise, it shows the newest open phase absent from the plan, followed by ` +<k> more` when needed.
-    Queued shows the first queued item, followed by ` +<n> more` when needed.
-    An unreadable queue shows `queue unreadable` and prints its path and cause on stderr.
-  - **Style productions:** `production_field(lines, "Kind") == "style"` selects `style_units.table`.
+    Progress uses `█` for done, `▓` for open, and `░` for todo, followed by `<done>/<total>`.
+    Plans above 20 phases use 20 equal groups, with open before todo before done.
+    Repair rounds append `fix rounds <n>` and `+ 1 running` when applicable.
+    When the plan has no phases, an open run supplies Progress and ETA from its full event history.
+    This fallback changes neither Phase, Non-Phase Work, nor Queued.
+    A finished newest run supplies no fallback.
+    ETA uses the latest stated promise from `eta_trail`, never `schedule_end`.
+    Passed promises add `late <elapsed>`; open phases without promises show `no ETA`.
+    A predicted plan finish adds `ends <time>`.
+    Times use the production zone and a short date outside the current day.
+    Workers uses `worker_runs` to show waiting runs, queued results, missing runs, and working workers.
+    Run workers appear first; idle workers append a count, and closed workers add nothing.
+    Remote units show no worker facts.
+    The command reads panes once for the displayed units and their workers.
+    It shares one lazy process snapshot and reads no CPU totals or log tails.
+    Non-Phase Work uses the unit's newest unfinished run and shows open phases absent from the configured plan.
+    Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
+    Each item or title uses an 80-character limit; counts remain after the cut.
+    A configured plan with phases takes priority over the newest run's plan.
+    The fallback plan path resolves against the staff worktree.
+    An unreadable queue retains `queue unreadable` and reports its path and cause.
+  - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
+    Other productions use it for units named in their `Style units` table.
+    `style_config.has_style_units` detects that table; `style_config.read_config` reads its assignments.
     It prints `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`.
     Ticket shows `#<number without unit prefix> · <rule stem> · <crate> · <ticket work>`.
     An empty rule uses the first rules-list stem plus `+<extra count>`.
@@ -596,8 +673,28 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     Otherwise, it shows `idle (<HH:MM>)` with the last refill time, else `idle`.
     `NoTicket` represents a unit with no such ticket.
   - **Style step:** `format_step(step, ticket, idle)` says in words what the unit does now. It takes `open_step` on the newest run. When the step's activity text is not empty and is not a generic word, the cell shows that text, for example `building 5 frontend-boundaries moves`. Otherwise it maps the label: `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. Another label shows as it is; an empty label shows `—`. With no open step, an assigned ticket shows `starting <ticket work>`, a checkpointed ticket shows `waiting for the showrunner to merge`, and a unit with no ticket shows `idle — <last refill outcome>` or `idle`. The full refill outcome appears only in Step, including any sync wait reason. The cell never shows a bare `impl` or `checkpoint sent`. ETA (`eta_cell`) is `current.eta.time` as `HH:MM`, else `—`.
-  - **Style counts:** Findings built is the all-time built count for the unit family; Last 24 h counts findings built in the last 24 h. These two columns and Findings left align right; text columns align left. The recent count uses `built_at`, or `style_ledger.legacy_built_at_sql` on a ledger before schema 25 (`style-showrunner.md`). Findings left (`left_cell(approved, filed, split, now)`) counts filed findings with approved decisions. `FamilyCounts.filed` counts all filed findings of the family. When the two counts are equal the cell shows `<approved>`; otherwise it shows `<approved> approved of <filed> filed`. A recorded split appends `: ready <a> · changed <b> · structure <c> · other <d> (<age>)`. Age counts whole minutes below 60 (`<n> min`), whole hours below 24 (`<n> h`), else whole days (`<n> d`), since `split_at`. A split row with no refill outcome leaves an idle unit as `idle`. Each distinct proposal file is read once. `proposal_issue.decision_answer` decides approval; `rules.style_family` on its unit decides family. A built finding with no decision file uses its build ticket's family. The total line is `All families: <built> findings built · <approved> approved findings left[ of <filed> filed] · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`; `of <filed> filed` shows only when the counts differ. `<filed>` sums `LedgerSnapshot.total_filed`, which counts every filed finding in a ledger, also findings with no resolvable family. The date is now plus `approved / r` days. Zero recent builds ends it with `no ETA: nothing built in 24 h`. Numbers use thousands commas; times and the date use the production zone.
-  - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables and `board_json.py`. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
+  - **Style counts:** The production's `Style units` table assigns families to each unit.
+    `style_units.table` sums `FamilyCounts` across those families for each unit row.
+    Findings built counts all built findings; Last 24 h counts findings first built in the last 24 hours.
+    These columns and Findings left align right; text columns align left.
+    The recent count uses `built_at`, with `style_ledger.legacy_built_at_sql` for ledgers before schema 25 (`style-showrunner.md`).
+    Findings left (`left_cell(approved, filed, split, now)`) counts filed findings with approved decisions.
+    `FamilyCounts.filed` counts every filed finding in one family.
+    Equal counts show `<approved>`; unequal counts show `<approved> approved of <filed> filed`.
+    A recorded split appends `: ready <a> · changed <b> · structure <c> · other <d> (<age>)`.
+    Age counts whole minutes below 60 (`<n> min`), whole hours below 24 (`<n> h`), then whole days (`<n> d`), since `split_at`.
+    A split row with no refill outcome leaves an idle unit as `idle`.
+    The reader reads each distinct proposal file once.
+    `proposal_issue.decision_answer` determines approval; the pinned rule blob determines the finding's family.
+    A built finding with no decision file uses its build ticket's family.
+    The total line is:
+    `All families: <built> findings built · <approved> approved findings left[ of <filed> filed] · <r> built in the last 24 h · ETA at that rate <YYYY-MM-DD>`.
+    `of <filed> filed` appears only when the counts differ.
+    `<filed>` sums `LedgerSnapshot.total_filed` across distinct ledgers, including findings with no resolvable family.
+    The date is now plus `approved / r` days.
+    Zero recent builds gives `no ETA: nothing built in 24 h`.
+    Numbers use thousands commas; times and the date use the production zone.
+  - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
 
 - **A unit's newest run.** `unit_run.py --production <showrunner name> <unit>` prints the run id, machine, and UTC start.
   Staff supplies the current unit folder.
@@ -637,7 +734,12 @@ Saved progress state uses the fixed staff reference instead of a copied session 
 
 ### Waits, renames and alerts: `waiting.py`
 
-Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so a bad doc fails as one line. A unit is named by its Unit value, or by its session's name now. `units_from_doc` reads `unit_lookup.doc_units` and the lookup, so `search` and `agenda` pass over a retired unit, and `named_unit` (`scratch-test`, `eta-request`) refuses one as `unknown unit <name>`.
+Each subcommand takes `--production`.
+`main` catches `checkpoint_gate.Stop` and reports a bad doc on one line.
+A unit uses its Unit value or its current session name.
+`units_from_doc` reads `unit_lookup.doc_units` and the lookup.
+`search` and `agenda` skip retired units.
+`named_unit` (`scratch-test`, `eta-request`) refuses a retired unit as `unknown unit <name>`.
 
 - `scratch-test <unit> --tests "<command>" --state-dir <dir>`: a detached temporary worktree at the unit's branch tip, `merge --no-commit --no-ff <merge branch>`, then `sh -c <tests>` into `<state-dir>/scratch-test-<unit>-<YYYYmmdd-HHMMSS-ffffff>.log`. `ScratchGreen(log) | ScratchRed(last 4 lines, log) | ScratchConflict`; the verdict prints first; the worktree and merge state are always removed; nothing is committed or pushed. A red never says `blocked`; a conflict is a `failed` line, not a red. The log path feeds `ci_points.py notice lift`.
 - `waits`: `cargo-berth board --json` overlaps (an `unconfigured` envelope reads `berth not configured`) and the LOG's `block: <waiting> on <unit> (code|files: …), clears ~HH:MM` / `block cleared: …` pairs as `WaitOpen(since) | WaitCleared`. Each open wait prints its age and `act now` at 60 minutes open or 30 minutes past its clear time. A `block:` or `block cleared:` line whose waiting unit is in `retired_units` is dropped; a live unit's wait on a retired unit stays.
@@ -653,7 +755,9 @@ Permission prompts notify their owning showrunner after 60 seconds, retrying unt
 
 The pass shares one absolute monotonic deadline across discovery, pane text and agent-status reads, sends and RCA work. Each discovery lookup receives a share of the remaining time, reserving time for later productions and inspection; a failed lookup prints once and leaves healthy results available in the same pass. The discovery result carries each failed production and its reason alongside the rows; one formatter renders log diagnostics, while single-value callers receive reason text without the command prefix; the showrunner listing, name, address and tree commands, and stall-watch, finish their healthy work before returning non-zero when a lookup failed. Single-name and address APIs still raise on unknown liveness rather than treating it as a stopped showrunner; incomplete registrations keep their existing warning-and-skip behavior. Herdr caps each pane command at the smaller of its usual 10 seconds and the remaining pass time. Once inspection time expires, each skipped unit prints one line and retains its saved prompt and idle state for the next pass. A status read that exhausts the budget also leaves that unit unchanged. Inspection ends `delivery_reserve_seconds` before the pass deadline (10 seconds in `config/stall_watch.conf`, read at use). This leaves time to deliver alerts found in that pass. The process snapshot shares the inspection deadline and reserves the configured cleanup time within it. A failed, timed-out or unavailable `ps` produces one process-snapshot diagnostic and unknown liveness, never an empty process table. That pass retains pane prompt and idle state, sends already pending deliveries and retires, then exits non-zero. Snapshot and sender children start in separate process groups. On timeout the watcher signals the owned group through the shared checked process-group helper, bounds pipe draining and child reaping by the cleanup deadline, and closes pipes that still remain open. A timed-out retire keeps its state for retry; neither inherited output pipes nor sender cleanup can extend the pass deadline. The pass reads and validates both sender limits once from `config/stall_watch.conf`, then shares them between the snapshot and delivery batch. An invalid override prints one sender-config diagnostic and uses the packaged limits, so pending relays and retires still run within the pass deadline; the pass returns non-zero after that work. Scheduling uses one atomically written `inspection.cursor`, separate from alert state. Work is sorted by production and unit, then starts after the previous pass's first attempted unit, wrapping at the end. The first eligible pane about to be read advances the cursor once per pass, even if its text or status read exhausts the inspection budget. A pass that starts no inspection leaves the cursor unchanged. With a stable eligible set, every unit gets first access to the budget within at most one pass per unit. Exhausted and skipped units retain their alert state byte for byte. A partial discovery never clears watchdog recovery evidence for unobserved productions, permits a safety decision about unknown child liveness, or reports a successful wind-down. Inventory callers that require completeness reject the partial result with its plain reasons; observational reports keep the healthy rows with their visible failure status.
 
-- **Paused units and external waits.** `stall_watch.status_defers_bump` checks the latest assistant turn-end status in the transcript. The pane supplies a fallback when the transcript has no usable status. A pause or an explicit external-owner wait resets the stretch without a bump or report, including near compaction. The watcher reads `paused_status_pattern`, `external_wait_pattern` and `external_owner_pattern` from `config/stall_watch.conf` at use. The `owner` group identifies the dependency. Live peer names and the showrunner's staff name also match. Matching ignores case. Other `holding:` lines prevent a bump only when they name an outside party anywhere in the line. The watcher reads those party words from `holding_party_pattern` at use and also checks the same peer names. The unit's own name, pane label, Claude session name and full session address do not count as outside parties. A party occurrence inside a complete own name does not count. A separate occurrence or a longer peer name still counts. The watcher reuses the pane labels from discovery through the shared pane snapshot. It makes no extra herdr read for labels. A failed label read produces one diagnostic per session per pass. Prompt checks continue without the label. Both checks keep the status text unchanged. Hyphens join words, so `user-interface` does not name the user. A sentence period ends a name; `.v2` continues it. Such a hold gets only the per-unit log line `inspected <showrunner name>/<name>: holding`. It sends no delivery to the unit or showrunner. The hold leaves `tell_sent` false, so a later idle unit can receive its bump and tell. A hold naming only its own worker, work order, tests or build receives the normal idle bump when nothing runs. `work_running` resets the stretch while that work runs. A resumed unit gets a fresh idle stretch. An override may omit status patterns; the watcher reads those patterns from the packaged config. Prompt grace still requires a valid value in the selected file. Invalid status rules print a diagnostic and suppress the unit's bump for that pass. Other units and pending deliveries continue. Missing, unmatched or empty `owner` captures are invalid. Run records still control eligibility. Herdr's `blocked` status follows the permission-prompt path above. Shutdown adds no unit-pause flag; stopped directors fail the live-session check.
+- **Paused units and external waits.** `stall_watch.status_defers_bump` checks the latest assistant turn-end status in the transcript. The pane supplies a fallback when the transcript has no usable status. A pause or an explicit external-owner wait resets the stretch without a bump or report, including near compaction. The watcher reads `paused_status_pattern`, `external_wait_pattern` and `external_owner_pattern` from `config/stall_watch.conf` at use. The `owner` group identifies the dependency. Live peer names and the showrunner's staff name also match. Matching ignores case. Other `holding:` lines prevent a bump only when they name an outside party anywhere in the line. The watcher reads those party words from `holding_party_pattern` at use and also checks the same peer names. The unit's own name, pane label, Claude session name and full session address do not count as outside parties. A party occurrence inside a complete own name does not count. A separate occurrence or a longer peer name still counts. The watcher reuses the pane labels from discovery through the shared pane snapshot. It makes no extra herdr read for labels. A failed label read produces one diagnostic per session per pass. Prompt checks continue without the label. Both checks keep the status text unchanged. Hyphens join words, so `user-interface` does not name the user. A sentence period ends a name; `.v2` continues it. Such a hold gets only the per-unit log line `inspected <showrunner name>/<name>: holding`. It sends no delivery to the unit or showrunner. The hold leaves `tell_sent` false, so a later idle unit can receive its bump and tell. A hold naming only its own worker, work order, tests or build receives the normal idle bump when nothing runs. Running work resets the stretch, and the unit reads `running`. Running work is one of these: a process that `work_running` finds; a busy pane worker whose staff parent is the director (`worker_panes.worker_state(observed) == "busy"`); or a live detached run of such a worker (`detached_runs.live_runs(<held run folder>/detached_runs, <worker name>)`). The watcher checks pane workers only for a unit with no process work, and detached runs only when no pane worker is busy. `read_busy_pane_worker_parents` makes one `worker_panes.observe_parents` read for all directors of the pass, on first need, and makes none when no watched director has staff workers. The held run folder is `unit_lookup.HeldRun.folder`, which can be a verified marker target outside `unit_runs.run_roots()`. A worker that waits on its own detached run reads idle in its pane, so only the detached-run check finds that work. A failed pane read or detached-run read counts as no work. It prints one `stall-watch: pane workers:` or `stall-watch: detached runs: <unit>:` line, and the pass continues. A resumed unit gets a fresh idle stretch. An override may omit status patterns; the watcher reads those patterns from the packaged config. Prompt grace still requires a valid value in the selected file. Invalid status rules print a diagnostic and suppress the unit's bump for that pass. Other units and pending deliveries continue. Missing, unmatched or empty `owner` captures are invalid. Run records still control eligibility. Herdr's `blocked` status follows the permission-prompt path above. Shutdown adds no unit-pause flag; stopped directors fail the live-session check.
+
+- **Expired login.** The watcher reads `login_limit_pattern` from `config/stall_watch.conf` at use. It checks the pane text after the last turn end, before the idle stretch. While the limit shows, the unit gets no bump. The showrunner gets one tell: `<unit>: the Claude login reached its time limit and needs /login.` The saved stretch keeps a `login_since` mark and `tell_sent`, so later passes send nothing more. The idle clock stays reset, and the log line reads `login limit`. The login is back when the usage store holds a successful read for the session's Claude login, newer than the session's last transcript activity. `login_restored` makes that read only for a pane at the limit. The login belongs to the account, so other sessions keep the old limit text after one `/login`. With the login back, the unit follows the normal idle path and gets its bump after the stall time. A value that cannot be read keeps the limit. A newer turn end also ends the limit. An old stretch file without the mark still reads.
 
 - **`unit_status.sh` units.** `unit_status.sh <state-dir> <user-zone> --production <showrunner name>` takes its units from `live_units.py --production <showrunner name>`. Each block is headed by the unit id, and its text is read with `session_pane.py read unit <showrunner name> <unit>`.
 
@@ -682,7 +786,11 @@ Copied pane marks do not select rows.
 
 - Every refusal comes before any write: `add_unit.py` refuses in `launch_request`, the shutdown-state check (before `preflight`), `preflight` or the live herdr session name check before the stub, row or commit, and a shutdown refusal ends no session; `--check` writes and starts nothing. The director resolves in `preflight`, so promotion never stops a session it cannot relaunch.
 
-- `merge_checkpoint.py` leaves the merge branch as it was on red. `reset --keep HEAD~1` runs only when `HEAD` is this merge and is not on origin. Promotion targets the pushed merge-branch tip, never the earlier checkpoint merge. `main` is pushed only when it holds no commits outside `origin/main` and `origin/<merge branch>`, and never with force.
+- `merge_checkpoint.py` restores the tip before the checkpoint merge on red when origin still has its old tip.
+  Rollback includes main merges from this run and preserves earlier unpublished work.
+  Promotion targets the pushed merge-branch tip.
+  Main is pushed only when it holds no commits outside `origin/main` and `origin/<merge branch>`.
+  Publication never uses force.
 
 - The dailies builder's one pre-check write is idempotent pruning of this production's retired generated phase notes. Every other write waits until every check has passed. Every builder call passes `--render-state`, the same file the renderer gets as `--state`.
 
@@ -720,7 +828,11 @@ Copied pane marks do not select rows.
 
 - A re-run of `add_unit.py` must name its original mode; the mode comes from the commit subject, then the configured plan, then the stub.
 
-- `ssh`'s own exit status is always 0 here; the Mac pull is read from the `rc=` line it prints. The Mac pulls from `natedev:<first Promote checkout>`.
+- The remote `rc=` line identifies a Mac pull result.
+  SSH exit 255 without that line identifies an unreachable Mac after the configured retries.
+  Promotion queues that target and source, reports the pending pull, and continues.
+  Other pull failures still fail promotion.
+  The Mac pulls from `natedev:<first Promote checkout>`.
 
 - `merge_checkpoint.py` accepts a Merge tests command only with status zero.
 

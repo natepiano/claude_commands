@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
@@ -41,7 +41,7 @@ class ProfileNotesPassTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory(prefix="profile-fixture-")
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        _ = self.enterContext(patch.object(profile, "SCRATCH_ROOT", self.root))
+        _ = self.enterContext(patch.object(tempfile, "tempdir", str(self.root)))
         self.home = self.root / "home"
         self.home.mkdir()
         self.notes = self.home / "notes"
@@ -142,7 +142,8 @@ always=
             output = io.StringIO()
             stats = self.root / f"pass-{number}.prof"
             with redirect_stdout(output):
-                measured = profile.profile_pass(stats, self.root / "scratch")
+                measured = profile.profile_pass(stats)
+            self.assertEqual(list(self.root.glob("notes-pass-*")), [])
             self.assertEqual(measured.incomplete, ())
             self.assertEqual(snapshot(self.home), before)
             self.assertTrue(stats.is_file())
@@ -165,16 +166,6 @@ always=
                 self.assertIn(f"{entry.name}: ", report)
             self.assertNotIn("fixture@example.invalid", report)
 
-    def test_scratch_outside_private_root_is_refused_before_loading_the_pass(self) -> None:
-        error = io.StringIO()
-        with redirect_stderr(error):
-            result = profile.main(["--stats", str(self.root / "unused.prof"), "--scratch", "/var/tmp/notes-profile"])
-        self.assertEqual(result, 1)
-        self.assertIn("below /tmp/claude/", error.getvalue())
-        self.assertFalse((self.root / "unused.prof").exists())
-        with self.assertRaises(ValueError):
-            _ = profile.private_scratch(profile.SCRATCH_ROOT)
-
     def test_recovery_results_are_read_from_scratch_with_their_saved_job(self) -> None:
         state = profile.state_path(self.pass_.watchdog, "_state_file", True)
         result = state.parent / "unit-watchdog-results/job.json"
@@ -186,7 +177,7 @@ always=
         }}))
         before = snapshot(self.home)
         with ExitStack() as stack:
-            scratch = profile.private_scratch(self.root / "scratch")
+            scratch = self.root / "scratch"
             profile.redirect_state(self.pass_, scratch, stack)
             copied_state = profile.state_path(self.pass_.watchdog, "_state_file", True)
             copied = cast(dict[str, dict[str, dict[str, str]]], json.loads(copied_state.read_text()))
@@ -195,13 +186,6 @@ always=
             self.assertTrue(copied_result.is_relative_to(scratch))
             self.assertEqual(copied_result.read_text(), result.read_text())
         self.assertEqual(snapshot(self.home), before)
-
-    def test_scratch_symlink_cannot_escape_the_private_root(self) -> None:
-        with tempfile.TemporaryDirectory() as outside:
-            link = self.root / "escape"
-            link.symlink_to(outside, target_is_directory=True)
-            with self.assertRaises(ValueError):
-                _ = profile.private_scratch(link)
 
     def test_child_reader_is_timed_and_unaudited_action_is_not_started(self) -> None:
         measured = profile.Measurements()
@@ -253,16 +237,6 @@ always=
                     with self.assertRaises(OSError):
                         _ = profile.checked_child(policy, command, supplied)
 
-    def test_private_scratch_accepts_a_resolved_symlink_root(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / "claude"
-            target.mkdir()
-            link = self.root / "tmp-link"
-            link.symlink_to(target.parent, target_is_directory=True)
-            with patch.object(profile, "SCRATCH_ROOT", link / "claude", create=True):
-                private = profile.private_scratch(link / "claude/profile")
-            self.assertTrue(private.is_relative_to(target.resolve()))
-
     def test_recovery_result_parent_traversal_cannot_rewrite_outside_scratch(self) -> None:
         state = profile.state_path(self.pass_.watchdog, "_state_file", True)
         state.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +247,7 @@ always=
         _ = state.write_text(json.dumps({"session": {"job": {"result": traversal}}}))
         with ExitStack() as stack:
             with self.assertRaises(ValueError):
-                profile.redirect_state(self.pass_, profile.private_scratch(self.root / "scratch"), stack)
+                profile.redirect_state(self.pass_, self.root / "scratch", stack)
         self.assertEqual(outside.read_text(), "keep this file")
         self.assertEqual(outside.stat().st_mode & 0o777, 0o640)
 
@@ -298,20 +272,11 @@ always=
             _ = guarded(object(), command)
             self.assertEqual(started.call_count, 1)
 
-    def test_private_scratch_test_compares_resolved_paths(self) -> None:
-        # Model macOS: spelling a path through /tmp differs from its resolved path.
-        real = self.root / "private-tmp"
-        real.mkdir()
-        link = self.root / "tmp"
-        link.symlink_to(real, target_is_directory=True)
-        with patch.object(tempfile, "TemporaryDirectory", return_value=nullcontext(str(link))):
-            self.test_private_scratch_accepts_a_resolved_symlink_root()
-
     def test_writing_children_with_read_prefixes_never_start(self) -> None:
         commands = (
             ("git", "symbolic-ref", "HEAD", "refs/heads/other"),
             ("git", "status", "--porcelain", "--output=/tmp/marker"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "mac",
+            ("ssh", "-o", "BatchMode=yes", "mac",
              "python3 ~/.claude/scripts/accounts/accounts.py role-map-read; touch /tmp/marker"),
             ("ssh", "mac", "python3 ~/.claude/scripts/message/roster.py --here --snapshot; touch /tmp/marker"),
             ("herdr", "pane", "list", "--output", "/tmp/marker"),
@@ -336,11 +301,11 @@ always=
             ("git", "-C", "/fixture", "rev-list", "--count", "--invert-grep",
              "--grep=^agent-sessions-snapshot: ", "@{u}..HEAD"),
             ("git", "-C", "/fixture", "status", "--porcelain"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "natedev",
+            ("ssh", "-o", "BatchMode=yes", "natedev",
              "python3 ~/.claude/scripts/accounts/accounts.py role-map-read"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "natedev",
+            ("ssh", "-o", "BatchMode=yes", "natedev",
              "python3 ~/.claude/scripts/accounts/accounts.py next-read"),
-            ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac",
+            ("ssh", "-o", "BatchMode=yes", "mac",
              "~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py --here --snapshot"),
             ("herdr", "--session", "agents", "pane", "list"),
             ("herdr", "--session", "agents", "pane", "process-info", "--pane", "new-pane"),
@@ -363,11 +328,11 @@ always=
         read = "python3 ~/.claude/scripts/accounts/accounts.py role-map-read"
         for operator in (";", "|", "&", "`", "$", "<", ">", "\n"):
             with self.subTest(operator=operator):
-                self.assertFalse(profile.readonly_child(("ssh", "-o", "BatchMode=yes", "-o",
-                    "ConnectTimeout=5", "mac", read + operator + "touch /tmp/marker")))
+                self.assertFalse(profile.readonly_child(("ssh", "-o", "BatchMode=yes",
+                    "mac", read + operator + "touch /tmp/marker")))
 
     def test_roster_child_runs_the_fixed_read_form_without_shell_expansion(self) -> None:
-        words = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac",
+        words = ("ssh", "-o", "BatchMode=yes", "mac",
                  '\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/message/roster.py\" --here --snapshot')
         entry = next(entry for entry in profile.patch_list(self.pass_) if entry.mode == "child_launch")
         with patch.object(subprocess.Popen, "__init__") as started:

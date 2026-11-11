@@ -4,51 +4,96 @@ from __future__ import annotations
 import json
 import io
 import os
+import shutil
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr
+from datetime import datetime
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.accounts import refusals
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
-from scripts.lib import atomic_file, process_start
-from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib import atomic_file, process_start, scratch
+from scripts.message import send
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
-from scripts.production import staff, test_worker, worker
+from scripts.production import staff, test_worker, worker, worker_admission
+from scripts.production.staff_test_support import fixture_worker
+from scripts.whoami import agent_accounts, note_file, quota_alert
 
 
 class NativeHookEntryTests(unittest.TestCase):
     def test_native_entry_starts_a_separate_handler_without_calling_handle(self) -> None:
-        for family in ("codex", "claude"):
-            with self.subTest(family=family):
-                reply = 'The work is complete.\nDONE "dispatch"'
-                value = ({"type": "agent-turn-complete", "thread-id": "native-thread",
-                          "last-assistant-message": reply} if family == "codex" else
-                         {"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": reply})
+        real_popen = subprocess.Popen
+        for family, size in (("codex", 1), ("claude", 1), ("codex", 5_000)):
+            with self.subTest(family=family, size=size), TemporaryDirectory() as folder:
+                reply = 'The work is complete.\nDONE "dispatch"' * size
+                value: dict[str, object] = {"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": reply}
+                if family == "codex":
+                    value.update({"turn_id": "turn-1", "model": "sol", "transcript_path": None})
                 payload = json.dumps(value)
-                arguments = [payload] if family == "codex" else []
-                with patch.object(turn_end, "handle") as handler, \
-                        patch.object(subprocess, "Popen") as start, \
-                        patch.object(sys, "stdin", io.StringIO(payload)):
-                    self.assertEqual(turn_end.main(arguments), 0)
+                receiver = Path(folder) / "receive.py"
+                receipt = Path(folder) / "receipt.json"
+                atomic_file.write_text_atomic(receiver, "\n".join((
+                    "from dataclasses import asdict",
+                    "import json, sys",
+                    "from pathlib import Path",
+                    "from scripts.herdr import turn_end",
+                    "from scripts.lib.atomic_file import write_text_atomic",
+                    "turn_end.handle = lambda event: write_text_atomic(Path(sys.argv[1]), json.dumps(asdict(event)))",
+                    "raise SystemExit(turn_end.main(sys.argv[2:]))", "")))
+                children: list[subprocess.Popen[bytes]] = []
+
+                def receive(arguments: list[str], *, start_new_session: bool, stdin: int,
+                            stdout: int, stderr: int) -> subprocess.Popen[bytes]:
+                    child = real_popen([arguments[0], str(receiver), str(receipt), *arguments[2:]],
+                        start_new_session=start_new_session, stdin=stdin, stdout=stdout, stderr=stderr)
+                    self.addCleanup(child.wait, timeout=TEST_HANG_GUARD_SECS)
+                    self.addCleanup(child.kill)
+                    children.append(child)
+                    return child
+
+                output = io.StringIO()
+                with (patch.object(turn_end, "handle") as handler,
+                      patch.object(subprocess, "Popen", side_effect=receive) as start,
+                      patch.object(sys, "stdin", io.StringIO(payload)),
+                      patch.object(sys, "stdout", output)):
+                    self.assertEqual(turn_end.main([]), 0)
                 handler.assert_not_called()
                 start.assert_called_once_with(
-                    [sys.executable, str(Path(turn_end.__file__).resolve()), "--handle-hook", payload],
-                    start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    [sys.executable, str(Path(turn_end.__file__).resolve()), "--handle-hook"],
+                    start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.assertEqual(children[0].wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                self.assertEqual(json.loads(receipt.read_text()),
+                                 {"thread_id": "native-thread", "kind": "turn end", "reply": reply})
+                self.assertEqual(output.getvalue(), "")
 
     def test_separate_invocation_calls_handle_once_without_starting_another_process(self) -> None:
-        payload = json.dumps({"type": "agent-turn-complete", "thread-id": "native-thread",
-                              "last-assistant-message": "The work is complete."})
-        with patch.object(turn_end, "handle", return_value=turn_end.TurnOutcome.DONE) as handler, \
-                patch.object(subprocess, "Popen") as start:
-            self.assertEqual(turn_end.main(["--handle-hook", payload]), 0)
-        handler.assert_called_once_with(turn_end.WorkerEvent("native-thread", reply="The work is complete."))
-        start.assert_not_called()
+        cases: tuple[tuple[dict[str, object], turn_end.WorkerEvent], ...] = (
+            ({"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": "The work is complete."},
+             turn_end.WorkerEvent("native-thread", reply="The work is complete.")),
+            ({"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": None},
+             turn_end.WorkerEvent("native-thread")),
+            ({"type": "agent-turn-complete", "thread-id": "native-thread", "last-assistant-message": "The work is complete."},
+             turn_end.WorkerEvent("")),
+        )
+        for value, expected in cases:
+            with (self.subTest(value=value),
+                  patch.object(turn_end, "handle", return_value=turn_end.TurnOutcome.DONE) as handler,
+                  patch.object(subprocess, "Popen") as start,
+                  patch.object(sys, "stdin", io.StringIO(json.dumps(value))),
+                  patch.object(sys, "stdout", io.StringIO()) as output):
+                self.assertEqual(turn_end.main(["--handle-hook"]), 0)
+            handler.assert_called_once_with(expected)
+            start.assert_not_called()
+            self.assertEqual(output.getvalue(), "")
 
 
 @final
@@ -64,49 +109,119 @@ class TurnEndTests(unittest.TestCase):
         self.addCleanup(self.case.doCleanups)
 
     def test_native_hook_inputs_complete_each_family_once_and_close_its_pane(self) -> None:
-        for family, close in ((family, close) for family in ("codex", "claude")
-                              for close in ("closed", "kept", "outside")):
-            with self.subTest(family=family, close=close):
+        cases = [(family, close, "current") for family in ("codex", "claude")
+                 for close in ("closed", "setup", "outside")]
+        cases.extend((family, "closed", transcript) for family in ("codex", "claude")
+                     for transcript in ("no final reply", "older reply"))
+        cases.append(("codex", "scratch", "current"))
+        cases.append(("codex", "closed", "trailing period"))
+        for family, close, transcript in cases:
+            with self.subTest(family=family, close=close, transcript=transcript):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
-                name = "impl-" + family + "-" + close
+                name = "impl-" + family + "-" + close + "-" + transcript.replace(" ", "-")
+                self.case.agent.finish_after = int(transcript != "current")
                 self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
-                self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir), progress_history.ActiveDispatch)
-                payload: dict[str, object] = ({"type": "agent-turn-complete", "thread-id": str(row.current_session),
-                    "turn-id": "turn-1", "cwd": str(self.case.fixture.root), "input-messages": [self.case.agent.submitted[-1][1]],
-                    "last-assistant-message": self.case.agent.replies[-1]} if family == "codex" else
-                    {"hook_event_name": "Stop", "session_id": str(row.current_session), "transcript_path": "unused",
-                     "stop_hook_active": False, "last_assistant_message": self.case.agent.replies[-1]})
-                if close == "kept":
-                    self.case.fixture.world.unknown[pane] = "worker process is unreadable"
+                kept_folders: list[Path] = []
+                if close == "scratch":
+                    peer = fixture_worker("scratch-peer", self.case.fixture.parent.id)
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}):
+                        folder = scratch.new_worker()
+                        atomic_file.write_text_atomic(folder / "trial.txt", "worker output")
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": str(peer.current_session)}):
+                        kept = scratch.new_worker()
+                        atomic_file.write_text_atomic(kept / "peer.txt", "peer output")
+                        kept_folders.append(kept)
+                active = progress_history.active_dispatch(row.id, self.case.run_dir)
+                self.assertIsInstance(active, progress_history.ActiveDispatch)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                if transcript != "current":
+                    if transcript == "older reply":
+                        self.case.agent.append(pane, "assistant", "The previous result is pending.")
+                    self.case.agent.replies.append("The work is complete.\nDONE " + active.instance_id
+                                                  + ("." if transcript == "trailing period" else ""))
+                    self.case.fixture.world.locations[pane]["agent_status"] = "done"
+                payload: dict[str, object] = {
+                    "hook_event_name": "Stop", "session_id": str(row.current_session), "transcript_path": "unused",
+                    "stop_hook_active": False, "last_assistant_message": self.case.agent.replies[-1]}
+                if family == "codex":
+                    payload.update({"turn_id": "turn-1", "cwd": str(self.case.fixture.root), "model": "sol"})
+                if close == "setup":
+                    self.case.fixture.world.foreground[pane] = (998598, "direnv", ["direnv", "export", "zsh"])
                 elif close == "outside":
+                    self.case.fixture.world.remove_leaf(pane)
+                    self.case.fixture.world.layouts["w1:outside"] = {"type": "pane", "pane_id": pane}
                     self.case.fixture.world.locations[pane]["tab_id"] = "w1:outside"
                 notices = len(self.case.agent.notices)
                 self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
-                if close == "closed":
-                    self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.IGNORED)
+                self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.IGNORED)
                 self.assertEqual(len(self.case.agent.notices), notices + 1)
                 self.assertIn(f"{name}: phase 8: done; reply {self.case.reply}", self.case.agent.notices[-1])
                 self.assertEqual(self.case.reply.read_text().strip(), self.case.agent.replies[-1])
                 self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir), progress_history.NoActiveDispatch)
                 self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
-                if close == "closed":
-                    self.assertIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
-                else:
-                    self.assertIn(pane, self.case.fixture.world.locations)
-                    self.assertNotIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
-                    reason = "worker process is unreadable" if close == "kept" else "outside its parent's tabs"
-                    self.assertIn("anomaly:", self.case.agent.notices[-1])
-                    self.assertIn(reason, self.case.agent.notices[-1])
-                    self.assertIn(f"kept pane {pane}", self.case.agent.notices[-1])
-                    _ = self.case.fixture.world.unknown.pop(pane, None)
-                    self.case.fixture.world.locations[pane]["tab_id"] = "w1:t1"
-                    self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
-                    self.assertNotIn(pane, self.case.fixture.world.locations)
-                    self.assertEqual(len(self.case.agent.notices), notices + 1)
-                    self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.IGNORED)
+                self.assertIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
+                self.assertNotIn(pane, self.case.fixture.world.locations)
+                if close == "scratch":
+                    self.assertEqual(list(Path(os.environ["TMPDIR"]).iterdir()), kept_folders)
+                    self.assertEqual((kept_folders[0] / "peer.txt").read_text(), "peer output")
                 self.assertEqual(staff.by_id(row.id), row)
+                log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
+                entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
+                self.assertEqual((entry["thread_id"], entry["worker_name"], entry["reason"]),
+                    (row.current_session, name, "the hook completion is already finished"))
+
+    def test_a_codex_quota_refusal_is_reported_once_with_its_stopped_command(self) -> None:
+        for shared_sessions in (False, True):
+            with self.subTest(shared_sessions=shared_sessions):
+                _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
+                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                    self.case.fixture.root / "conf/accounts.conf")
+                self.case.agent.finish_after = 1
+                self.assertIs(self.case.dispatch("impl-shared" if shared_sessions else "impl"), worker.DispatchSubmission.SUBMITTED)
+                row = self.case.agent.row(self.case.agent.submitted[-1][0])
+                backend = staff.backend(row)
+                assert isinstance(backend, staff.CodexBackend)
+                account_home = backend.codex_home
+                if shared_sessions:
+                    shared = Path.home() / ".codex" / "sessions"
+                    shared.mkdir(parents=True, exist_ok=True)
+                    transcript = worker_admission.transcript_source(row, backend)
+                    if transcript.parent != shared:
+                        _ = shutil.copyfile(transcript, shared / transcript.name)
+                        transcript.unlink()
+                    account_home = Path.home() / ".codex1"
+                    account_home.mkdir(exist_ok=True)
+                    folder = account_home / "sessions"
+                    if folder.is_dir() and not folder.is_symlink():
+                        shutil.rmtree(folder)
+                    if not folder.is_symlink():
+                        folder.symlink_to(shared, target_is_directory=True)
+                    row = staff.set_home(row.id, staff.SessionHome(account_home))
+                    backend = staff.CodexBackend(account_home)
+                account = agent_accounts.KnownCodexAccount(account_home, "worker@example.com", "codex1")
+                refused_at = "2026-11-10T19:30:38.842000+00:00"
+                def account_at(home: Path) -> agent_accounts.KnownCodexAccount | agent_accounts.UnknownCodexAccount:
+                    return account if home == account_home else agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in")
+
+                with (patch.object(quota_alert, "blocked", return_value=["workers moved"]) as blocked,
+                      patch.object(agent_accounts, "codex_account", side_effect=account_at),
+                      patch.dict(os.environ, {"CODEX_HOME": str(Path.home() / ".codex") if shared_sessions else str(account_home)}),
+                      patch.object(note_file, "read_notes", return_value=iter(()))):
+                    self.assertEqual(turn_end.report_quota_refusals(), [])
+                    # A later refusal in the same pass sends no second notice.
+                    for timestamp, expected in ((refused_at, ["workers moved"]), ("2026-11-10T19:35:00+00:00", [])):
+                        with worker_admission.transcript_source(row, backend).open("a", encoding="utf-8") as stream:
+                            _ = stream.write(json.dumps({"type": "event_msg", "timestamp": timestamp, "payload": {
+                                "type": "task_complete", "last_agent_message": None, "error": {
+                                    "message": "You’ve hit your usage limit. Try again at Nov 15th, 2026 1:34 PM.",
+                                    "codex_error_info": "usage_limit_exceeded"}}}) + "\n")
+                        self.assertEqual(turn_end.report_quota_refusals(), expected)
+                        self.assertEqual(turn_end.report_quota_refusals(), [])
+                blocked.assert_called_once_with([], account, window=refusals.UnknownWindow(),
+                    refused_at=quota_alert.RefusedAt(datetime.fromisoformat(refused_at)),
+                    stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
         opened = self.case.opened()
@@ -126,64 +241,164 @@ class TurnEndTests(unittest.TestCase):
         self.assertNotIn(opened.pane, self.case.fixture.world.locations)
 
     def test_completed_rerun_repeats_the_saved_kept_pane_anomaly(self) -> None:
-        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
-        pane = self.case.agent.submitted[-1][0]
-        self.case.fixture.world.unknown[pane] = "worker process is unreadable"
-        self.assertEqual(self.case.finish(), turn_end.TurnOutcome.DONE)
-        notice, = self.case.agent.notices
-        self.assertIn(f"anomaly: impl: worker process is unreadable; kept pane {pane}", notice)
-        reply = self.case.reply.read_bytes(), self.case.reply.stat().st_mtime_ns
-        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
-        self.assertEqual(self.case.agent.notices, [notice, notice])
-        self.assertEqual(len(self.case.agent.submitted), 1)
-        self.assertIn(pane, self.case.fixture.world.locations)
-        self.assertEqual((self.case.reply.read_bytes(), self.case.reply.stat().st_mtime_ns), reply)
+        for family in ("codex", "claude"):
+            name = "impl-" + family
+            completions: list[str] = []
+            for pass_number in (1, 2):
+                with self.subTest(family=family, pass_number=pass_number):
+                    prompt = self.case.run_dir / f"{name}-{pass_number}.md"
+                    atomic_file.write_text_atomic(prompt, "Read the source and preserve its behavior.\n")
+                    self.case.prompt = prompt
+                    self.case.fixture.world.unknown.clear()
+                    _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
+                    submitted = len(self.case.agent.submitted)
+                    self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                    pane = self.case.agent.submitted[-1][0]
+                    row = self.case.agent.row(pane)
+                    sender = (send.CodexSender(str(row.current_session)) if family == "codex"
+                              else send.ClaudeSender(str(row.current_session)))
+                    notices = len(self.case.agent.notices)
+                    with patch.object(self.case.fixture.world, "close_terminal_pane", return_value=False):
+                        self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                    notice = self.case.agent.notices[-1]
+                    passed = worker_panes.worker_pass(row, self.case.run_dir)
+                    completions.append(notice)
+                    self.assertIn(f"; pass {passed['instance_id']}", notice)
+                    self.assertIn(f"anomaly: {name}: pane close is incomplete; kept pane {pane}", notice)
+                    reply = self.case.reply.read_bytes(), self.case.reply.stat().st_mtime_ns
+                    self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                    self.assertEqual(self.case.agent.notices[notices:], [notice, notice])
+                    self.assertEqual(self.case.agent.notice_senders[notices:], [sender, sender])
+                    self.assertEqual(len(self.case.agent.submitted), submitted + 1)
+                    self.assertIn(pane, self.case.fixture.world.locations)
+                    self.assertEqual((self.case.reply.read_bytes(), self.case.reply.stat().st_mtime_ns), reply)
+            self.assertNotEqual(*completions)
 
     def test_a_director_or_an_idle_worker_hook_changes_no_pass(self) -> None:
         row = self.case.opened().row
         before = (self.case.run_dir / "progress_history_state.json").read_bytes()
-        for identity in (self.case.fixture.parent.current_session, row.current_session, "unknown-thread"):
-            self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(identity))), turn_end.TurnOutcome.IGNORED)
+        log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
+        for identity, name, reason in (
+                (self.case.fixture.parent.current_session, self.case.fixture.parent.name, "the staff row is not a worker"),
+                (row.current_session, row.name, "no active dispatch or recoverable completion exists"),
+                ("unknown-thread", "unknown", "no staff row for the current thread"),
+                (turn_end.hook_event({"type": "agent-turn-complete", "thread-id": str(row.current_session)}).thread_id,
+                 "unknown", "no staff row for the current thread"),
+                ("", "unknown", "no staff row for the current thread")):
+            with self.subTest(identity=identity):
+                self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(identity))), turn_end.TurnOutcome.IGNORED)
+                entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
+                self.assertEqual((entry["thread_id"], entry["worker_name"], entry["reason"]), (identity, name, reason))
+        self.assertEqual(len(log.read_text().splitlines()), 5)
         self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
         self.assertEqual(self.case.agent.notices, [])
         self.assertEqual(self.case.agent.submitted, [])
 
     def test_both_completion_events_apply_the_finished_run_exception(self) -> None:
-        for index, event in enumerate((turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED)):
-            with self.subTest(event=event):
+        cases = [(event, reply_state) for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED)
+                 for reply_state in ("done", "waiting for delivery", "waiting for reply")]
+        cases.append((turn_end.EventKind.RUN_FINISHED, "empty reply"))
+        for index, (event, reply_state) in enumerate(cases):
+            with self.subTest(event=event, reply_state=reply_state):
                 name = f"impl{index + 2}"
+                self.case.reply = self.case.run_dir / f"{name}-reply.md"
+                self.case.agent.without_done = reply_state != "done"
+                self.case.agent.finish_after = int(reply_state == "empty reply")
                 self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
-                path, record = self.case.detached_record(row, "private-check")
-                record["delivery"] = f"sent: worker {row.name} at {pane}"
-                atomic_file.write_text_atomic(path, json.dumps(record))
-                self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.DONE)
-                anomaly = "run private-check finished, but its result is not in the transcript"
-                self.assertEqual(self.case.agent.notices[-1].count(anomaly), 1)
-                self.assertIn("DONE ", self.case.reply.read_text())
+                active = progress_history.active_dispatch(row.id, self.case.run_dir)
+                if reply_state == "done":
+                    path, record = self.case.detached_record(row, "private-check")
+                    record["delivery"] = f"sent: worker {row.name} at {pane}"
+                    atomic_file.write_text_atomic(path, json.dumps(record))
+                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.DONE)
+                    anomaly = "run private-check finished, but its result is not in the transcript"
+                    self.assertEqual(self.case.agent.notices[-1].count(anomaly), 1)
+                    self.assertIn("DONE ", self.case.reply.read_text())
+                else:
+                    notices: list[str] = []
+                    for number in (1, 2):
+                        run_id = f"{name}-check-{number}"
+                        path, record = self.case.detached_record(row, run_id)
+                        record["delivery"] = f"sent: worker {row.name} at {pane}"
+                        atomic_file.write_text_atomic(path, json.dumps(record))
+                        if reply_state != "waiting for delivery":
+                            self.case.agent.append(pane, "user", f"Detached run: {run_id}\nRun finished: private verification")
+                        before = len(self.case.agent.notices)
+                        for current_event in (event, event):
+                            self.assertEqual(self.case.finish(name, current_event), turn_end.TurnOutcome.WAITING_ON_REPLY)
+                            self.assertEqual(len(self.case.agent.notices), before + 1)
+                        notice = self.case.agent.notices[-1]
+                        self.assertIn("; runs ", notice)
+                        self.assertIn(run_id, notice.partition("; runs ")[2].splitlines()[0])
+                        notices.append(notice)
+                        turn_path = self.case.reply.with_name(self.case.reply.stem + "_turn" + self.case.reply.suffix)
+                        if reply_state == "empty reply":
+                            self.assertFalse(turn_path.exists())
+                            self.assertNotIn("; reply ", notice)
+                        else:
+                            self.assertIn(f"; reply {turn_path}", notice)
+                            self.assertEqual(turn_path.read_text().strip(), self.case.agent.final)
+                        self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
+                        if reply_state == "waiting for delivery":
+                            self.case.agent.append(pane, "user", f"Detached run: {run_id}\nRun finished: private verification")
+                        if reply_state != "empty reply":
+                            self.case.agent.append(pane, "assistant", self.case.agent.final)
+                    self.assertNotEqual(*notices)
+                    self.case.agent.without_done = False
+                    self.case.agent.complete(pane)
+                    self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
 
     def test_a_live_run_keeps_done_active_for_both_completion_events(self) -> None:
-        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
-        pane = self.case.agent.submitted[-1][0]
-        row = self.case.agent.row(pane)
-        active = progress_history.active_dispatch(row.id, self.case.run_dir)
-        path, record = self.case.detached_record(row, "private-check")
-        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
-                              stdin=subprocess.PIPE, text=True) as supervisor:
-            record.update(status="running", pid=supervisor.pid)
-            atomic_file.write_text_atomic(path, json.dumps(record))
-            for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED):
-                self.assertEqual(self.case.finish(kind=event), turn_end.TurnOutcome.WAITING_ON_RUNS)
-                self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
-                self.assertNotIn(pane, [closed[0] for closed in self.case.fixture.world.closed])
-            record.update(status="finished", delivery=f"sent: worker {row.name} at {pane}")
-            atomic_file.write_text_atomic(path, json.dumps(record))
-            self.assertEqual(self.case.finish(kind=turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.DONE)
-            assert supervisor.stdin is not None
-            supervisor.stdin.close()
-            _ = supervisor.wait(timeout=LauncherHangGuard("private run exit").remaining())
-        self.assertEqual(len(self.case.agent.submitted), 1)
+        for receipt in ("done", "awaiting reply", "launcher error"):
+            with self.subTest(receipt=receipt):
+                name = "impl-" + receipt.replace(" ", "-")
+                self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                pane = self.case.agent.submitted[-1][0]
+                row = self.case.agent.row(pane)
+                active = progress_history.active_dispatch(row.id, self.case.run_dir)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                path, record = self.case.detached_record(row, "private-check-" + name)
+                notices = len(self.case.agent.notices)
+                reply = self.case.agent.replies[-1]
+                if receipt == "awaiting reply":
+                    self.case.agent.append(pane, "user", "Detached run: earlier-check\nRun finished: an earlier check")
+                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                                      stdin=subprocess.PIPE, text=True) as supervisor:
+                    record.update(status="running", pid=supervisor.pid)
+                    atomic_file.write_text_atomic(path, json.dumps(record))
+                    for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED):
+                        self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.WAITING_ON_RUNS)
+                        self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
+                        self.assertNotIn(pane, [closed[0] for closed in self.case.fixture.world.closed])
+                        turn_path = self.case.reply.with_name(self.case.reply.stem + "_turn" + self.case.reply.suffix)
+                        self.assertEqual(turn_path.read_text().strip(), reply)
+                        self.assertEqual(len(self.case.agent.notices), notices + 1)
+                    if receipt == "launcher error":
+                        progress_history.complete_dispatch(self.case.run_dir, "impl", active.instance_id, status="error")
+                    if receipt == "awaiting reply":
+                        reply = "The final check is still running."
+                        self.case.agent.append(pane, "assistant", reply)
+                        for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED):
+                            self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.WAITING_ON_RUNS)
+                            self.assertEqual(len(self.case.agent.notices), notices + 2)
+                        self.case.agent.append(pane, "user", f"Detached run: {record['run_id']}\nRun finished: the final check")
+                    record.update(status="finished", delivery=f"sent: worker {row.name} at {pane}")
+                    atomic_file.write_text_atomic(path, json.dumps(record))
+                    if receipt == "awaiting reply":
+                        for event in (turn_end.EventKind.RUN_FINISHED, turn_end.EventKind.RUN_FINISHED):
+                            self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.WAITING_ON_REPLY)
+                            self.assertEqual(len(self.case.agent.notices), notices + 3)
+                            self.assertEqual(turn_path.read_text().strip(), reply)
+                        self.case.agent.complete(pane)
+                    self.assertEqual(self.case.finish(name, turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.DONE)
+                    self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
+                    self.assertNotIn(pane, self.case.fixture.world.locations)
+                    assert supervisor.stdin is not None
+                    supervisor.stdin.close()
+                    _ = supervisor.wait(timeout=LauncherHangGuard("private run exit").remaining())
+        self.assertEqual(len(self.case.agent.submitted), 3)
         self.assertEqual(self.case.agent.waited, [])
 
     def test_a_friend_reply_completes_the_same_pass_without_another_prompt(self) -> None:
@@ -220,9 +435,10 @@ class TurnEndTests(unittest.TestCase):
 
     def test_a_final_diff_event_before_the_review_reply_keeps_the_same_pass(self) -> None:
         self.case.agent.finish_after = 1
-        for ready_first in (True, False):
-            with self.subTest(ready_first=ready_first):
-                name = "review-first" if ready_first else "review-last"
+        for ready_first, hook_only, instruction in (
+                (True, False, "new"), (False, False, "new"), (True, True, "new"), (True, False, "old")):
+            with self.subTest(ready_first=ready_first, hook_only=hook_only, instruction=instruction):
+                name = ("review-hook" if hook_only else "review-first" if ready_first else "review-last") + "-" + instruction
                 ready = self.case.run_dir / f"{name}.ready"
                 code = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "review", self.case.prompt,
                     session_dir=self.case.run_dir, slot=name, phase="8", kind="review", launcher_command=[name],
@@ -231,6 +447,15 @@ class TurnEndTests(unittest.TestCase):
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                if instruction == "old":
+                    passed = worker_panes.worker_pass(row, self.case.run_dir)
+                    delivery = progress_history.dispatch_delivery(passed)
+                    old_line = (f'Read the unchanged prompt file "{self.case.prompt}". '
+                                f"End your final reply with DONE {active.instance_id}. "
+                                "A reply that waits on a detached run is not final.")
+                    progress_history.save_dispatch_delivery(self.case.run_dir, active.instance_id,
+                                                           replace(delivery, line=old_line))
                 before = len(self.case.agent.submitted)
                 notices = len(self.case.agent.notices)
                 if ready_first:
@@ -245,12 +470,20 @@ class TurnEndTests(unittest.TestCase):
                 self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
                 self.assertEqual(len(self.case.agent.submitted), before)
                 if ready_first:
-                    self.case.agent.complete(pane)
+                    if hook_only:
+                        assert isinstance(active, progress_history.ActiveDispatch)
+                        self.case.agent.last_replies[str(row.current_session)] = "The review is complete.\nDONE " + active.instance_id
+                        self.case.fixture.world.locations[pane]["agent_status"] = "done"
+                    else:
+                        self.case.agent.complete(pane)
                     self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.SUBMITTED)
                 else:
                     with patch.dict(os.environ, {"CODEX_THREAD_ID": str(self.case.fixture.parent.current_session)}):
                         self.assertEqual(turn_end.main(["stage-ready", name]), 0)
                 self.assertEqual(len(self.case.agent.submitted), before + 1)
+                stage_line = self.case.agent.submitted[-1][1]
+                ending = ". " if instruction == "old" else "\n"
+                self.assertIn(f"DONE {active.instance_id}-2{ending}", stage_line)
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": str(self.case.fixture.parent.current_session)}):
                     self.assertEqual(turn_end.main(["stage-ready", name]), 0)
                 self.assertEqual(len(self.case.agent.submitted), before + 1)
@@ -258,21 +491,38 @@ class TurnEndTests(unittest.TestCase):
                 self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
 
     def test_a_turn_ending_question_reaches_the_director_without_ending_the_pass(self) -> None:
-        self.case.agent.without_done = True
-        self.case.agent.final = "Which output format must I use? JSON or Markdown?"
-        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
-        pane = self.case.agent.submitted[-1][0]
-        row = self.case.agent.row(pane)
-        active = progress_history.active_dispatch(row.id, self.case.run_dir)
-        self.assertEqual(self.case.finish(), turn_end.TurnOutcome.NO_DONE)
-        self.assertEqual(self.case.finish(), turn_end.TurnOutcome.NO_DONE)
-        self.assertEqual(len(self.case.agent.notices), 1)
-        self.assertIn(self.case.agent.final, self.case.agent.notices[-1])
-        self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
-        self.assertIn(pane, self.case.fixture.world.locations)
-        self.case.agent.without_done = False
-        self.case.agent.complete(pane)
-        self.assertEqual(self.case.finish(), turn_end.TurnOutcome.DONE)
+        for name, reply in (("question", "Which output format must I use? JSON or Markdown?"),
+                            ("recorder", "The two file-clock changes are complete. Results are pending."),
+                            ("subagent", "The worker result is pending.")):
+            with self.subTest(name=name):
+                self.case.agent.without_done = True
+                self.case.agent.final = reply
+                notices = len(self.case.agent.notices)
+                self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                pane = self.case.agent.submitted[-1][0]
+                row = self.case.agent.row(pane)
+                active = progress_history.active_dispatch(row.id, self.case.run_dir)
+                event = turn_end.EventKind.TURN_END
+                if name == "subagent":
+                    assert isinstance(active, progress_history.ActiveDispatch)
+                    backend = staff.backend(row)
+                    assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
+                    source = worker_admission.transcript_source(row, backend)
+                    with source.open("a") as stream:
+                        _ = stream.write(json.dumps({"type": "response_item", "payload": {
+                            "type": "agent_message", "author": "/root/reviewer", "recipient": "/root",
+                            "content": [{"type": "input_text", "text": "The review is complete.\nDONE " + active.instance_id}],
+                        }}) + "\n")
+                    event = turn_end.EventKind.RUN_FINISHED
+                self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.NO_DONE)
+                self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.NO_DONE)
+                self.assertEqual(len(self.case.agent.notices), notices + 1)
+                self.assertIn(self.case.agent.final, self.case.agent.notices[-1])
+                self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
+                self.assertIn(pane, self.case.fixture.world.locations)
+                self.case.agent.without_done = False
+                self.case.agent.complete(pane)
+                self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
 
     def test_a_failed_notice_recovers_the_completed_pass_without_another_close(self) -> None:
         result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.case.prompt,
@@ -293,6 +543,67 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(self.case.fixture.world.closed, [(pane, "terminal-" + pane)])
         self.assertIsNone(staff.by_id(row.id))
         self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session))), turn_end.TurnOutcome.IGNORED)
+
+        for recovery in ("plain", "same hold", "failed notice"):
+            with (self.subTest(recovery="dispatch in another run", case=recovery),
+                  patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.case.fixture.root / "holds")}),
+                  self.case.fixture.world.process_starts()):
+                name = "late-" + recovery.replace(" ", "-")
+                role: staff.WorkerRole = "astra-reviewer" if recovery == "same hold" else "impl"
+                self.case.agent.finish_after = 0
+                opened = self.case.opened(name, role)
+                row = opened.row
+                actions = (progress_history.CompletionActions(end_worker=True, held_role=str(row.id))
+                           if recovery == "same hold" else progress_history.NO_COMPLETION_ACTIONS)
+                if recovery == "same hold":
+                    pid = self.case.fixture.world.foreground[opened.pane][0]
+                    held = astra_roles.hold("reviewer", astra_roles.ExecProcess(pid), str(row.id))
+                    self.assertNotIsInstance(held, astra_roles.HoldWorkerUnavailable)
+                first_run = self.case.run_dir
+                next_run = self.case.fixture.root / ("next-run-" + recovery.replace(" ", "-"))
+                next_state = cast(dict[str, object], json.loads((first_run / "progress_history_state.json").read_text()))
+                next_state["history_file"] = str(next_run / "history.jsonl")
+                atomic_file.write_text_atomic(next_run / "progress_history_state.json", json.dumps(next_state))
+                first_reply = first_run / (name + "-reply.md")
+                self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), role, self.case.prompt,
+                    session_dir=first_run, slot=name, phase="8", kind=role, launcher_command=["first-assign"],
+                    reply=first_reply, completion_actions=actions), worker.DispatchSubmission.SUBMITTED)
+                pane = self.case.agent.submitted[-1][0]
+                row = self.case.agent.row(pane)
+                passed = worker_panes.worker_pass(row, first_run)
+                instance = str(passed["instance_id"])
+                worker.save_reply(first_reply, self.case.agent.replies[-1])
+                progress_history.save_hook_completion(first_run, instance,
+                    progress_history.HookCompletion(turn_end.TurnOutcome.DONE, str(first_reply), role_released=False))
+                self.assertEqual(worker_panes.worker_run(row), first_run)
+                notices = len(self.case.agent.notices)
+                closed = self.case.fixture.world.closed.copy()
+                self.case.agent.finish_after = 1
+                self.case.agent.notice_failures = int(recovery == "failed notice")
+                if recovery == "same hold":
+                    pid = self.case.fixture.world.foreground[pane][0]
+                    held = astra_roles.hold("reviewer", astra_roles.ExecProcess(pid), str(row.id))
+                    self.assertNotIsInstance(held, astra_roles.HoldWorkerUnavailable)
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), role, self.case.prompt,
+                        session_dir=next_run, slot=name, phase="8", kind=role, launcher_command=["next-assign"],
+                        reply=next_run / "reply.md", completion_actions=actions), worker.DispatchSubmission.SUBMITTED)
+                if recovery == "failed notice":
+                    self.assertIn(f"late result of pass {instance} was not reported", errors.getvalue())
+                    self.assertIn(str(first_reply), errors.getvalue())
+                else:
+                    self.assertEqual(len(self.case.agent.notices), notices + 1)
+                    notice = self.case.agent.notices[-1]
+                    self.assertIn(f"; pass {instance}", notice)
+                    self.assertIn(f"late result of pass {instance}", notice)
+                if recovery == "same hold":
+                    live, = astra_roles.live_roles(staff.snapshot())
+                    self.assertEqual(live["staff_id"], row.id)
+                    self.assertIsNotNone(staff.by_id(row.id))
+                    self.assertEqual(errors.getvalue(), "")
+                self.assertIn(pane, self.case.fixture.world.locations)
+                self.assertEqual(self.case.fixture.world.closed, closed)
+                self.assertEqual(worker_panes.worker_run(row), next_run)
 
     def test_stage_two_recovers_busy_and_interrupted_submission(self) -> None:
         for reason in ("busy", "interrupt_before_submit", "interrupt_stage_two"):
@@ -355,14 +666,26 @@ class TurnEndTests(unittest.TestCase):
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=str(current.row.id)))
             self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
             active = progress_history.active_dispatch(current.row.id, self.case.run_dir)
-            event = turn_end.hook_event({"type": "agent-turn-complete", "thread-id": str(current.row.current_session),
-                                         "last-assistant-message": old_reply})
+            event = turn_end.hook_event({"hook_event_name": "Stop", "session_id": str(current.row.current_session),
+                                         "last_assistant_message": old_reply})
             stops = self.case.fixture.world.stops.copy()
-            for partial in ("", "Still reviewing."):
-                with self.subTest(partial=partial):
+            cases = (("", old_reply), ("Still reviewing.", old_reply),
+                     ("The older result is pending.", "The work is complete.\nDONE another-dispatch"))
+            for partial, hook_reply in cases:
+                with self.subTest(partial=partial, hook_reply=hook_reply):
+                    event = replace(event, reply=hook_reply)
                     if partial:
                         self.case.agent.append(current.pane, "assistant", partial)
+                    log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
+                    previous = len(log.read_text().splitlines()) if log.is_file() else 0
                     self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
+                    entries = [cast(dict[str, object], json.loads(line)) for line in log.read_text().splitlines()]
+                    self.assertEqual(len(entries), previous + 1)
+                    entry = entries[-1]
+                    self.assertEqual((entry["thread_id"], entry["worker_name"]), (current.row.current_session, name))
+                    reason = ("the transcript reply differs from the turn reply" if partial
+                              else "the submitted dispatch has no final reply")
+                    self.assertEqual(entry["reason"], reason)
                     self.assertEqual(progress_history.active_dispatch(current.row.id, self.case.run_dir), active)
                     self.assertIn(current.pane, self.case.fixture.world.locations)
                     self.assertEqual(staff.by_id(current.row.id), current.row)
@@ -408,7 +731,7 @@ class TurnEndTests(unittest.TestCase):
             before = hold.read_bytes()
             self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir), progress_history.ActiveDispatch)
             self.assertEqual(hold.read_bytes(), before)
-            self.assertEqual(staff.by_id(row.id), row)
+            self.assertEqual(staff.by_id(row.id), replace(row, role=staff.KnownWorkerRole("astra-reviewer")))
             self.case.agent.complete(self.case.agent.submitted[-1][0])
             self.assertEqual(self.case.finish(row.name), turn_end.TurnOutcome.DONE)
             self.assertFalse(hold.exists())

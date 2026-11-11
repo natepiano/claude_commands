@@ -98,7 +98,8 @@ The command adds the gate bucket, role, profile, security group, launch template
 It preserves Rust parameters and refuses a change set that changes a Rust resource.
 It records a priced shared resource entry before creation.
 It saves the image, template version, public subnets, and nixpkgs revision locally.
-This phase prepares tools at boot. A prepared image belongs to plan phase 7.
+Gates boot the official NixOS image and prepare tools at boot.
+A prepared gate image was built and then taken out of use, because it did not make gates faster.
 
 | Scaler grant | Scope |
 | --- | --- |
@@ -206,7 +207,11 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 `scripts/production/merge_gate.py` merges a checkpoint into a production's merge branch and tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 `scripts/production/targeted_test.py --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
-Targeted tests select modules by direct imports, complete path tokens, changed test modules, and folders of changed Python source files.
+Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
+File tokens can occur in a test or its imported test-support modules.
+A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or has an execute bit) also selects the tests that name any script that calls it, directly or through other scripts.
+A script calls another when it names its path by the test rule, by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the same folder (`"$SCRIPT_DIR/board.sh"`).
+Python files are not callers in this rule.
 Merge gates and nightly runs use all modules.
 Default merge and tests-only runs do not run basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
@@ -331,14 +336,31 @@ A red nightly marker bypasses reuse only in a merge gate.
 An added or removed test folder changes the ledger suite set and prevents reuse of a pass with another suite set.
 
 **Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
-The base is the newest full record on this host with the complete suite set and a commit that is an ancestor of `HEAD`.
+The certified base is the newest full record on this host with the complete suite set and an ancestor of `HEAD`.
+Other candidates are the merge bases of `HEAD` and the origin refs in `landing_branches` in `config/merge_gate.conf`.
+These branches hold commits that passed a merge gate, which runs all modules.
+The selector uses the candidate with the fewest changed paths to `HEAD`.
+A tie keeps the certified base first, then the branch order in the config.
+The selector ignores missing refs and refs without a common ancestor.
+A landing candidate can replace a missing certified base.
 The changed set includes changes from the base to `HEAD`, plus dirty paths.
 A static Python graph selects a test module under four rules:
 
 1. The test module changed.
 2. The test module directly imports a changed Python file.
-3. The test module names a changed path as a complete token.
-4. The test module shares a folder with a changed Python source file that is not a test module.
+3. The test or an imported `*_test_support.py` module names a changed file through tokens.
+4. The test module shares a folder with a changed non-test Python file and names its stem as a whole word.
+
+The third rule follows imports only through `*_test_support.py` modules.
+A whole path token matches any changed file, including a repository-root file.
+A base name token also matches when the source shares the file's folder or contains that folder's name as a token.
+Repository-root files require a whole path token.
+The rule uses cached tokens and imports for Python and non-Python changed paths.
+Configuration selection keeps its existing rule.
+
+The fourth rule counts names in imports, strings, and comments.
+Removed source files also count.
+The selector reads that text only when no earlier rule selects the module.
 
 Only test modules have graph rows. All Python paths can resolve imports.
 A removed Python file uses import facts from the base.
@@ -348,7 +370,7 @@ The cache holds imports and complete path tokens for each test-module blob.
 The current and base graphs share one cache read and one cache update.
 A warm selection reads base blobs only when the cache lacks their facts.
 Dirty sources never enter the cache or cause cache writes.
-A targeted test runs all modules only for `--full`, no certified base, or a graph error.
+A targeted test runs all modules only for `--full`, no base candidate, or a graph error.
 The nightly-red marker widens only a merge gate. It does not block targeted test reuse or selection.
 A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
@@ -563,6 +585,11 @@ A failed Mac advance names the published local commit and leaves retry to main s
 - **Main synchronization.** `scripts/lib/main_sync.py` fetches main and fast-forwards an eligible checkout.
   The `claude-sync` job runs every 15 minutes on both machines.
   It refuses another branch, an active Git operation, divergence, or tracked edits before an advance.
+  An interrupted update is not a tracked edit. When each changed tracked file, and each untracked file new at origin/main, equals origin/main, the job finishes the update.
+  It removes those untracked files, restores those tracked files to HEAD, then runs `git merge --ff-only`.
+  A tracked candidate's index entry must also equal HEAD or origin/main. Any other change blocks as `dirty`, and no file changes.
+  An untracked path that collides with a path origin/main adds also blocks as `dirty`: `dir` blocks an incoming `dir/file`, and `dir/file` blocks an incoming file `dir`.
+  The `dirty` detail names each path that blocks the update, or the last line of each git output stream when git cannot list them.
   It never resets, stashes, or creates a merge commit.
   Each run appends `MAIN_SYNC_STATE_DIR/sync.jsonl`, default `~/.local/state/main-sync/`.
   No blocked-state marker exists.
@@ -592,7 +619,34 @@ Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `finding
 
 Conversation-pause hook behavior tests live in `scripts/hooks/test_conversation_pause.py`; `test_conversation_pause_processes.py` covers alarm budgets, executable exits and concurrent lock/delivery. Both use `conversation_pause_test_support.py` restoring a private fixture seed at the same path for each case. Synchronous behavior cases execute the real hook and CLI entry points and their current Python stand-ins in-process, with isolated input, output, environment, import-time fixture paths and signal handlers. Alarm-budget, concurrent lock/delivery and executable-error cases retain real processes; detached activity calls remain detached. Fixture release and activity waits use file events and a 600-second hang guard in `scripts/lib/test_hang_guard.py`. All original assertions are retained.
 
-Style-planner tests use `style_plan_test_support.py` and split by subject into `test_style_plan.py` (rank, scope and concurrency), `test_style_plan_phases.py` (written instructions), `test_style_plan_gate.py` (gate and formatting contracts), `test_style_plan_selection.py` (held judgments), `test_style_plan_ancestry.py` (judgment tips and synchronization), `test_style_plan_structure.py` (structure priority), `test_style_plan_refill.py` (unsynced product changes), `test_style_plan_recovery.py` (waits and interrupted phases), `test_style_plan_decisions.py` (decision tickets), `test_style_plan_batches.py` (large restructure batches), `test_style_plan_type_batches.py` (type read limits), `test_style_plan_declarations.py` (declaration following), `test_style_plan_decision_completion.py` (decision completion and recovery), `test_style_plan_sites.py` (moved sites), `test_style_plan_split.py` (split accounting and command orchestration), `test_style_plan_ownership.py` (busy rename references), `test_style_plan_module_owners.py` (busy module declarations), `test_style_plan_renames.py` (item reference edits), `test_style_plan_file_renames.py` (file moves and declarations), `test_style_plan_borrowing.py` (cross-family selection and projected findings), `test_style_plan_checkpoint_refill.py` (disjoint work behind a checkpoint), and `test_style_plan_pipeline_growth.py` (atomic footprint growth and rechecks). Each class builds a complete Git/worktree fixture once and restores a private copy at the same paths for each test. Synchronous CLI and formatter fixtures run their actual code in-process; a gate case retains the executable boundary. Concurrent refill tests release on observed lock contention, with committed-ticket and disjoint-file assertions.
+Style-planner tests use `style_plan_test_support.py`. Test files cover these subjects:
+
+- `test_style_plan.py` (rank, scope and concurrency).
+- `test_style_plan_phases.py` (written instructions).
+- `test_style_plan_gate.py` (gate and formatting contracts).
+- `test_style_plan_selection.py` (held judgments).
+- `test_style_plan_ancestry.py` (judgment tips and synchronization).
+- `test_style_plan_structure.py` (structure priority).
+- `test_style_plan_refill.py` (unsynced product changes).
+- `test_style_plan_recovery.py` (waits and interrupted phases).
+- `test_style_plan_decisions.py` (decision tickets).
+- `test_style_plan_batches.py` (large restructure batches).
+- `test_style_plan_type_batches.py` (type read limits).
+- `test_style_plan_declarations.py` (declaration following).
+- `test_style_plan_decision_completion.py` (decision completion and recovery).
+- `test_style_plan_sites.py` (moved sites).
+- `test_style_plan_split.py` (split accounting and command orchestration).
+- `test_style_plan_ownership.py` (busy rename references).
+- `test_style_plan_module_owners.py` (busy module declarations).
+- `test_style_plan_renames.py` (item reference edits).
+- `test_style_plan_file_renames.py` (file moves and declarations).
+- `test_style_plan_borrowing.py` (approval and footprint checks across owned families).
+- `test_style_plan_checkpoint_refill.py` (disjoint work and two waiting checkpoints).
+- `test_style_plan_pipeline_growth.py` (atomic footprint growth and rechecks).
+
+Each class builds a complete Git/worktree fixture once and restores a private copy at the same paths for each test.
+Synchronous CLI and formatter fixtures run their actual code in-process; a gate case retains the executable boundary.
+Concurrent refill tests release on observed lock contention and check committed tickets and disjoint files.
 
 ### Small fixes on main
 
@@ -607,6 +661,13 @@ An empty helper module can pass discovery; a failed package import cannot.
 The fast check uses no full merge gate or queue admission.
 `config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
 Imports of refused repository modules also refuse the fix, including indirect imports.
+
+`GitRunner` is the only place in `fast_track.py` that starts Git.
+It keeps successful reads of objects addressed by full hash for one `reconcile` pass.
+Reads of refs and ancestry stay fresh, because another process can move them.
+Snapshot ref writes and recovery ref deletes use one `update-ref --stdin` batch.
+`copies.refresh_remotes` fetches both mappings in one fetch.
+The change took `test_fast_track` from 7,158 to 6,433 Git processes and the copies tests from 497 to 319 fetches.
 
 A successful check creates a `fast-track(<unit>): <why>` commit with `Fast-Track: <unit>`.
 `main_push_lock` protects its fast-forward push.
@@ -708,6 +769,9 @@ It preserves the caller's working directory, interpreter cache, version floor, a
 The cloud guest bootstrap supplies its own root after a fresh clone.
 The Pillow analysis and Blender entries retain their foreign interpreters and explicit `PYTHONPATH`.
 
+`update_registration.state_block` imports `merged_checkpoints` in its body.
+This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
+
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
 **Stub app-server shutdown** (`scripts/agents/codex_test_support.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
@@ -723,11 +787,14 @@ The Pillow analysis and Blender entries retain their foreign interpreters and ex
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
-| `UNIT_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/direct_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
 | `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
-`UNIT_ACTIVE_DIR` and its former name `PLAN_DELEGATE_ACTIVE_DIR` are on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when one of them, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
+The build hold reader finds the run owner through `StaffRow.run`.
+Tests use a private `STAFF_FILE` and private run folders.
+The build hold guard checks the state overrides listed in `override_guard.py` and `.sh`.
+An installed script exits 2 when a listed override is set or `HOME` differs from the account home.
+Tests use the checkout's scripts.
 
 Before the rename, each listed `UNIT_*` name had the prefix `PLAN_DELEGATE_*`.
 `UNIT_RUN_DIR` had the name `PLAN_DELEGATE_BOARD_DIR`.
@@ -741,7 +808,7 @@ The status line reads assignments from staff rows instead of these environment n
 
 ## Invariants
 
-- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/unit/active/` and `/tmp/claude/delegate/active/`, a real herdr server, the real `codex app-server`, and phone sends. Test discovery never starts a real session host or builds a missing host binary.
+- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, live run folders, a real herdr server, the real `codex app-server`, and phone sends. Test discovery never starts a real session host or builds a missing host binary.
   - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `observe_workers_home` raises on any fallback to a live Codex home.
   - Sockets use private temp dirs or ephemeral ports. No test depends on a fixed port: the refused-start test binds an ephemeral port and closes it.
   - No test writes into the repo.
@@ -780,7 +847,7 @@ The status line reads assignments from staff rows instead of these environment n
 | Memory sampling interval | 0.25 s or more; scheduler loop sleeps 0.05 s |
 | Fixture hang guards | The one 600-second hang guard in `scripts/lib/test_hang_guard.py` (`wait_until`, `communicate_launcher`, script launches, follow tests) |
 | Agents quota-handoff start timeout | 30 s, so socket round trips under load never race the five-second task deadline |
-| Mac fast-forward | ssh `ConnectTimeout=10`, 25 s limit |
+| Mac fast-forward | ssh, 25 s limit |
 
 Representative gate runs on natedev (32 cores):
 
@@ -971,3 +1038,14 @@ Only the renewer's sleep may stop; inherited jobs must survive.
 Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swap disabled.
 `step_selection.py` must remain cheap because every target command imports it.
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
+
+The merge gate owns module folders through `temporary_build_folder` contexts.
+The contexts remove folders after success or an exception.
+Style lint uses the same context and keeps its standing Cargo target.
+Style review keeps its input folder because the review worker reads it after preparation exits.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

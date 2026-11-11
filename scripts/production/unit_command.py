@@ -16,7 +16,8 @@ from typing import cast
 
 sys.dont_write_bytecode = True
 from scripts.production import staff, unit_config
-from scripts.shutdown import remote
+from scripts.herdr import herdr_types
+from scripts.agents import remote
 from scripts.herdr import herdr
 
 
@@ -73,9 +74,9 @@ def read_tab(row: staff.StaffRow) -> str:
             if kind not in ("claude", "codex"):
                 if isinstance(client.pane_activity(pane_id), herdr.PaneAtShell):
                     continue
-                raise herdr.HerdrFailure("the foreground process identity is unknown")
+                raise herdr_types.HerdrFailure("the foreground process identity is unknown")
             identity = client.native_session(pane_id, kind, herdr.PROGRAM_TIMEOUT_SECONDS)
-        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
             unknown.append(" ".join(name.split()))
             continue
         if identity == row.current_session:
@@ -121,7 +122,7 @@ def local_details(row: staff.StaffRow, holder: staff.StaffRow) -> MemberDetails:
         plan = unavailable("the plan document is not recorded")
     try:
         tab = read_tab(row)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         tab = unavailable(error)
     return MemberDetails(branch, plan, tab)
 
@@ -147,7 +148,7 @@ def read_details(row: staff.StaffRow, holder: staff.StaffRow, machine: str) -> M
         "rows=json.load(sys.stdin); "
         "print(json.dumps(asdict(local_details(*(staff.StaffRow.from_json(row) for row in rows)))))"
     )
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination,
+    command = ["ssh", "-o", "BatchMode=yes", destination,
                "~/.claude/scripts/lib/py -B -c " + shlex.quote(code)]
     try:
         result = subprocess.run(command, input=json.dumps([row.to_json(), holder.to_json()]),

@@ -366,35 +366,17 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
         return {}
 
 
-def read_run_markers(
-    active: Path, live_session_ids: set[str], by_path: dict[Path, RunDirector], problems: list[str]
-) -> None:
-    """Add the run each live director's marker names."""
-    if not active.is_dir():
-        return
-    try:
-        markers = list(active.iterdir())
-    except OSError as error:
-        problem(problems, f"unit run markers in {active}", error)
-        return
-    for marker in markers:
-        if marker.name not in live_session_ids:
-            continue
-        try:
-            lines = marker.read_text(encoding="utf-8").splitlines()
-            if lines and lines[0].strip():
-                by_path[Path(lines[0].strip()).resolve()] = DirectorSession(marker.name)
-        except (OSError, UnicodeError) as error:
-            problem(problems, f"unit run marker {marker}", error)
-
-
 def live_runs(
-    roots: tuple[Path, ...], live_session_ids: set[str], problems: list[str]
+    roots: tuple[Path, ...], live_session_ids: set[str], problems: list[str], *,
+    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
 ) -> list[LiveRun]:
-    by_path: dict[Path, RunDirector] = {}
+    record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+    by_path: dict[Path, RunDirector] = {
+        row.run.path.resolve(): DirectorSession(row.current_session)
+        for row in record.rows if row.current_session in live_session_ids and isinstance(row.run, staff.OpenRun)
+    }
     heartbeats: list[Path] = []
     for root in roots:
-        read_run_markers(root / "active", live_session_ids, by_path, problems)
         try:
             heartbeats.extend(root.glob(f"*/{unit_runs.HEARTBEAT}"))
         except OSError as error:

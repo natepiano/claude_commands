@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.lib import test_hang_guard
 from scripts.production import staff, unit_config
@@ -28,7 +28,6 @@ from typing import ClassVar, TextIO, TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
-from scripts.direct.assign_launcher_test_support import changed_files, snapshot_files
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -37,6 +36,25 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 DIRECT_DIR = Path(__file__).parent
 AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
+
+@dataclass(frozen=True)
+class FirstDispatchArtifact:
+    """A completed first dispatch publishes this file."""
+
+    relative: Path
+    content: bytes
+    mode: int
+
+def snapshot_files(root: Path) -> dict[Path, bytes]:
+    """Read regular files before a dispatch."""
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()}
+
+def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
+    """Keep files that the dispatch changed."""
+    return tuple(FirstDispatchArtifact(relative, content, (root / relative).stat().st_mode)
+                 for relative, content in snapshot_files(root).items()
+                 if before.get(relative) != content)
 
 
 CLAUDE_REGISTRY = registry_text({'assignments': {'direct': 'claude'}, 'direct.claude': {'impl': 'opus:high', 'test': 'opus:high', 'fix': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
@@ -314,7 +332,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             destination = self.root / "scripts" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(DIRECT_DIR.parent / relative, destination)
-        for name in ("conf.py", "conf.sh"):
+        for name in ("conf.py", "conf_reads.py", "conf.sh", "conf_record.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
         configure_launcher_fixture(direct_dir / "assign.sh")
@@ -386,7 +404,6 @@ class AssignClaudeLauncherFixture(LauncherFixture):
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
-        environment["UNIT_ACTIVE_DIR"] = str(self.root / "active")
         environment["UNIT_RUN_ROOT"] = str(self.root / "runs")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         return environment

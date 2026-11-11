@@ -18,7 +18,7 @@ from typing import cast
 
 from scripts.lib.process_failure import failure_detail
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 @dataclass(frozen=True)
@@ -125,6 +125,28 @@ def plan_path(path: str) -> bool:
     return path.startswith("docs/plans/")
 
 
+def only_target_merges(record: WorktreeRecord) -> bool:
+    repo = Path(record.repo)
+    target = f"refs/remotes/origin/{record.merge_branch}"
+    branch = f"refs/heads/{record.branch}"
+    commits = git(repo, "rev-list", f"{target}..{branch}").stdout.splitlines()
+    if not commits:
+        return False
+    for commit in commits:
+        parents = git(repo, "rev-list", "--parents", "-n", "1", commit).stdout.split()[1:]
+        if len(parents) < 2:
+            return False
+        for parent in parents[1:]:
+            ancestor = git(repo, "merge-base", "--is-ancestor", parent, target, check=False)
+            if ancestor.returncode == 0:
+                break
+            if ancestor.returncode != 1:
+                raise Refused(1, ancestor.stderr.strip())
+        else:
+            return False
+    return True
+
+
 def landed(record: WorktreeRecord) -> Landed | NotLanded:
     repo = Path(record.repo)
     if not has_branch(repo, record.branch):
@@ -198,6 +220,12 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         if head.returncode or head.stdout.strip() != expected:
             reason = head.stderr.strip() or f"HEAD is {head.stdout.strip() or 'detached'}; expected {expected}"
             return Kept(path, reason)
+    if has_branch(repo, record.branch) and not git(
+            repo, "rev-list", "-n", "1", f"{record.base}..refs/heads/{record.branch}").stdout.strip():
+        # A tree with no commit of its own can be in use before its first commit.
+        return Kept(path, "no commit of its own")
+    if has_branch(repo, record.branch) and only_target_merges(record):
+        return Kept(path, "only merges of the target outside it")
     result = landed(record)
     if isinstance(result, NotLanded):
         detail = "\n".join((*result.commits, *result.paths))

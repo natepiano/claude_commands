@@ -213,7 +213,20 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - Rows, `other` and free add up to less than the disk: ext4's reserved blocks are in neither used (`f_blocks - f_bfree`) nor free (`f_bavail`), about 93 GiB on natedev (`stat -f /`, 2026-10-04).
 - `read_snapshot` casts the JSON to `DiskSnapshot` without checking its shape. A change to the snapshot's keys must still render the old `disk.json`, or the report raises `KeyError` until the job's next write.
 - The heading's host is `store.host_name()` (short); the floor key's host is `socket.gethostname()` (full), as the sweep reads it.
-- To try a disk change by hand without replacing the live snapshot: `BUILDLOG_DIR=$(mktemp -d) scripts/lib/py scripts/buildlog/cli.py disk`, then `report` with the same `BUILDLOG_DIR`, and compare used and free with `df -B1 /`.
+- Run this block from the worktree root to check a disk change without replacing the live snapshot.
+  Compare used and free space in the report with the `df` output.
+
+  ```sh
+  (
+    set -e
+    BUILDLOG_DIR=$(mktemp -d)
+    trap 'rm -rf "$BUILDLOG_DIR"' EXIT
+    export BUILDLOG_DIR
+    scripts/lib/py scripts/buildlog/cli.py disk
+    scripts/lib/py scripts/buildlog/cli.py report
+    df -B1 /
+  )
+  ```
 - In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `scripts/lib/py scripts/buildlog/cli.py report <day>`.
 - `test_report.py` has no `sys.path` setup and runs only under `~/.claude/scripts/lib/py -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
 - `disk.py` imports `scripts.lint.sweep` by package name and changes no `sys.path`.
@@ -236,3 +249,9 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - **Reuse the sweep's walk and config reader.** One block counter and one lint.conf parser; the floor shown is the one the sweep enforces, against free measured the same way (`f_bavail`).
 - **These four rows.** They are where builds write: worktrees and their targets under `~/rust`, scratch clones and session folders under `/tmp`, and the two CI runners' trees. Everything else is `other`.
 - **natedev only.** The user scoped the Disk table to natedev; the Mac is not measured.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

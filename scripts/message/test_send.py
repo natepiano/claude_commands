@@ -29,12 +29,15 @@ from types import SimpleNamespace
 from typing import TextIO, cast, final, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.herdr import herdr_types
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import send
+from scripts.message import failed_lookup
 from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import relay_session_name
@@ -58,7 +61,7 @@ from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, r
 from scripts.message import roster
 from scripts.message import sessions
 from scripts.accounts import accounts
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -70,6 +73,9 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
+    notice_sender = mock.patch.object(failed_lookup, "send_notice")
+    _ = notice_sender.start()
+    unittest.addModuleCleanup(notice_sender.stop)
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -941,13 +947,18 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertFalse((self.root / "queue").exists())
 
     def test_nonstaff_live_name_delivers_to_its_roster_session(self) -> None:
-        entry = self.claude_row("free-session", "morty")
-        self.staff_rows.clear()
-        with mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])):
-            result = send.send(local_options(["--to", "morty", "--text", "hello", "--key", "nonstaff-name"]))
-        self.assertEqual(result.outcome, "sent")
-        self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'free-session.sock'}")
-        self.assertEqual(set(self.claims("nonstaff-name")), {"morty", "session:free-session"})
+        for target in ("morty", "queue-unit"):
+            with self.subTest(target=target):
+                entry = self.claude_row("free-session", target)
+                director = self.claude_row("director-session", "queue")
+                self.staff_rows.clear()
+                self.staff_member("director-session", "queue")
+                key = f"nonstaff-name:{target}"
+                with mock.patch.object(roster, "roster", return_value=roster.Roster([entry, director], [])):
+                    result = send.send(local_options(["--to", target, "--text", "hello", "--key", key]))
+                self.assertEqual(result.outcome, "sent")
+                self.assertEqual(self.relayed[-1].to, f"uds:{self.root / 'free-session.sock'}")
+                self.assertEqual(set(self.claims(key)), {target, "session:free-session"})
 
     def test_nonstaff_explicit_addresses_keep_their_transport(self) -> None:
         entry = self.daemon_row("free-thread")
@@ -995,6 +1006,51 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(send.repeat_notice_owner("resources"), "session:runner-current")
         self.assertEqual(send.send(local_options(["--to", "builds", "--text", "hello"])).outcome, "sent")
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'runner-current.sock'}")
+
+        report = staff.StaffRow(staff.StaffId("report-runner"), "showrunner", "report", staff.StaffRoot(),
+                               current_session=staff.StaffId("report-current"))
+        direct = staff.StaffRow(staff.StaffId("direct-worker"), "worker", "test2", staff.ReportsTo(report.id),
+                               current_session=staff.StaffId("direct-current"))
+        report_unit = staff.StaffRow(staff.StaffId("report-unit"), "unit", "report", staff.ReportsTo(runner.id),
+                                    current_session=staff.StaffId("report-director"))
+        nested = staff.StaffRow(staff.StaffId("nested-worker"), "worker", "test2", staff.ReportsTo(report_unit.id),
+                               current_session=staff.StaffId("nested-current"))
+        other = staff.StaffRow(staff.StaffId("other-runner"), "showrunner", "other", staff.StaffRoot(),
+                              current_session=staff.StaffId("other-current"))
+        other_unit = staff.StaffRow(staff.StaffId("other-unit"), "unit", "builds", staff.ReportsTo(other.id),
+                                   current_session=staff.StaffId("other-director"))
+        resources = staff.StaffRow(staff.StaffId("resources-worker"), "worker", "resources", staff.ReportsTo(other_unit.id),
+                                  current_session=staff.StaffId("resources-current"))
+        queue = staff.StaffRow(staff.StaffId("queue-director"), "unit", "queue", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("queue-current"))
+        queue_worker = staff.StaffRow(staff.StaffId("queue-worker"), "worker", "queue", staff.ReportsTo(other_unit.id),
+                                     current_session=staff.StaffId("queue-worker-current"))
+        alpha = staff.StaffRow(staff.StaffId("alpha-director"), "unit", "alpha", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("alpha-current"))
+        alpha_unit = staff.StaffRow(staff.StaffId("alpha-unit-director"), "unit", "alpha-unit", staff.ReportsTo(runner.id),
+                                   current_session=staff.StaffId("alpha-unit-current"))
+        record = staff.StaffSnapshot((*record.rows, report, direct, report_unit, nested, other, other_unit, resources,
+                                      queue, queue_worker, alpha, alpha_unit))
+        worker_record = staff.StaffSnapshot((other, other_unit, queue_worker))
+        for target, membership, expected in (
+            ("report/test2", record, direct),
+            ("builds/resources", record, unit),
+            ("queue-unit", record, queue),
+            ("builds/queue-unit", record, queue),
+            ("alpha-unit", record, alpha_unit),
+            ("builds/alpha-unit", record, alpha_unit),
+            ("queue-unit", worker_record, send.NoStaffRecipient()),
+            ("other/builds/queue-unit", worker_record, send.NoStaffRecipient()),
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(send.resolve_staff_recipient(target, membership), expected)
+                if target in ("queue-unit", "builds/queue-unit") and isinstance(expected, staff.StaffRow):
+                    self.assertEqual(
+                        send.resolve_recipient(target, send.LocalOnly(), roster.Roster([], []),
+                                               membership=membership, records=[]),
+                        send.QueuedStaffRecipient(f"session:{expected.current_session}", expected.name,
+                                                  str(expected.current_session)),
+                    )
 
     def test_one_staff_snapshot_supplies_resolution_and_roster(self) -> None:
         self.session("resources-current", "transport")
@@ -2967,7 +3023,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
              mock.patch.object(send, "machine", return_value="macbook"):
             code, lines = self.clear_check()
         command = cast(list[str], channel.call_args.args[0])
-        self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "natedev"])
+        self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "natedev"])
         self.assertEqual(command[-1], f"{send.REMOTE} retire --to user --from hana --key github-cold")
         self.assertEqual((code, lines), (0, ["retired: github-cold from hana: its check passed; on natedev:"
                                              + " cancelled: the emergency push for github-cold stopped"]))
@@ -3040,7 +3096,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(send.pending(send.CodexQueueOwner(thread)), "")
 
     def test_codex_pending_follows_the_stable_owner_after_a_thread_change(self) -> None:
-        member = staff.StaffRow(staff.StaffId("fixed"), "agent", "Agent", staff.StaffRoot(),
+        member = staff.StaffRow(staff.StaffId("fixed"), "producer", "Agent", staff.StaffRoot(),
                                current_session=staff.StaffId("next-thread"))
         self.staff_rows = {"fixed": member}
         for thread, owner, text in (("old-thread", "fixed", "Keep this review."),
@@ -5212,10 +5268,14 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_nonstaff_peer_names_and_addresses_keep_their_transport(self) -> None:
         for address in ("session:peer", "codex:peer-thread", "worker:peer-run/impl"):
-            for target in ("morty", address):
+            for target in ("morty", address, "queue-unit"):
                 with self.subTest(address=address, target=target):
-                    self.peer([self.row("morty", address)])
+                    name = "queue-unit" if target == "queue-unit" else "morty"
+                    self.peer([self.row(name, address)])
+                    director = self.row("queue", "session:director-session", machine="natedev")
+                    self.local = self.recipient_roster([director], [])
                     self.staff_rows.clear()
+                    self.staff_member("director-session", "queue")
                     status, output, errors = self.run_main(target)
                     self.assertEqual((status, errors), (0, ""), output)
                     forwarded = self.forwarded()[-1]
@@ -5320,17 +5380,25 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.forwarded(), [])
 
     def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
-        self.local = self.recipient_roster([], ["worker source unreadable"])
+        director = self.row("queue", "codex:director-thread", machine="natedev")
+        self.local = self.recipient_roster([director], ["worker source unreadable"])
         self.peer([self.row("absent here", "codex:peer")])
-        status, output, errors = self.run_main("absent here")
-        self.assertEqual(status, 2, output + errors)
-        self.assertNotIn("worker source unreadable", errors)
-        self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
-                      + "~/.claude/scripts/message/roster.py", errors)
-        self.assertIn("--machine", errors)
-        self.assertIn("address", errors)
+        for target, expected_status in (("absent here", 2), ("queue-unit", 0)):
+            with self.subTest(target=target):
+                status, output, errors = self.run_main(target)
+                self.assertEqual(status, expected_status, output + errors)
+                if target == "absent here":
+                    self.assertNotIn("worker source unreadable", errors)
+                    self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+                                  + "~/.claude/scripts/message/roster.py", errors)
+                    self.assertIn("--machine", errors)
+                    self.assertIn("address", errors)
+                    self.assertEqual(self.relayed + self.daemon_calls, [])
+                else:
+                    self.assertEqual(errors, "")
+                    self.assertEqual(self.daemon_calls[-1], "director-thread")
         self.assertEqual(self.ssh_calls(), [])
-        self.assertEqual(self.relayed + self.daemon_calls, [])
+        self.assertEqual(self.relayed, [])
 
     def test_missing_live_name_is_refused_after_peer_durable_warnings(self) -> None:
         warning = 'durable role /fixture/design.json: missing or invalid repository'
@@ -5375,14 +5443,36 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_unreachable_peer_reports_one_problem_and_fails_the_send(self) -> None:
         self.staff_member("remote", "only peer")
+        director = self.row("queue", "codex:director-thread", machine="natedev")
+        self.local = self.recipient_roster([director], [])
         os.environ["SSH_SNAPSHOT"], os.environ["SSH_ROSTER_STATUS"] = "ssh: connection refused", "255"
-        status, output, errors = self.run_main("only peer")
-        self.assertEqual(status, 3, output + errors)
-        self.assertEqual(len(errors.splitlines()), 1)
-        self.assertEqual(errors, "send.py: roster problems omitted: 1; "
-                         + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
-        self.assertNotIn("not reached", errors)
-        self.assertIn("FAILED: recipient lookup failed for 'only peer'", output)
+        for target, expected_status in (("only peer", 3), ("queue-unit", 0), ("missing-peer", 3), ("missing-name", 2)):
+            if expected_status == 2:
+                self.local = roster.Roster([], [])
+                self.staff_rows.clear()
+                self.peer([])
+                os.environ["SSH_ROSTER_STATUS"] = "0"
+            with (self.subTest(target=target),
+                  mock.patch.object(failed_lookup, "report", wraps=failed_lookup.report) as report):
+                status, output, errors = self.run_main(target)
+                self.assertEqual(status, expected_status, output + errors)
+                if expected_status == 3:
+                    self.assertEqual(len(errors.splitlines()), 1)
+                    self.assertEqual(errors, "send.py: roster problems omitted: 1; "
+                                     + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
+                    self.assertNotIn("not reached", errors)
+                    self.assertEqual(output, f"FAILED: recipient lookup failed for {target!r}\n")
+                    report.assert_called_once()
+                    self.assertEqual(cast(tuple[str, ...], report.call_args.args)[:2], ("fixture sender", target))
+                elif expected_status == 2:
+                    reason = f"send.py: no staff row or live session for {target!r}"
+                    self.assertEqual(output, "")
+                    self.assertEqual(errors, reason + "\n")
+                    report.assert_called_once_with("fixture sender", target, reason)
+                else:
+                    report.assert_not_called()
+                    self.assertEqual(errors, "")
+                    self.assertEqual(self.daemon_calls[-1], "director-thread")
         self.assertEqual(self.forwarded(), [])
 
     def test_refusal_advice_matches_worker_ownership_and_socketless_claude_state(self) -> None:
@@ -5478,8 +5568,8 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             _ = blocked.write_text("#!/bin/sh\necho 'unexpected external tool' >&2\nexit 91\n")
             blocked.chmod(0o755)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
-            "CLAUDE_PYTHON": sys.executable,
             "CONF_DIR": str(self.root / "config"),
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),
@@ -5680,7 +5770,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         """Add one private Codex agent and its pane route."""
         from scripts.herdr import herdr
 
-        row = fixture_member("agent", name="pane-agent")
+        row = fixture_member("producer", name="pane-agent")
         self.fixture.world.add(row, "w2:p1", family="codex", workspace="w2", tab="w2:t1")
         pane_result = self.fixture.world.result
 
@@ -5723,14 +5813,12 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual([command[2] for command in prompts], ["w2:p1", "w2:p1"])
 
     def test_codex_pane_failure_reports_the_herdr_error(self) -> None:
-        from scripts.herdr import herdr
-
         row, observed = self.codex_agent()
         pane_run = self.fixture.world.run
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             if arguments[:2] == ("agent", "prompt"):
-                raise herdr.HerdrFailure("agent_prompt_stalled: private pane did not start", code="agent_prompt_stalled")
+                raise herdr_types.HerdrFailure("agent_prompt_stalled: private pane did not start", code="agent_prompt_stalled")
             return pane_run(*arguments, deadline=deadline)
 
         output = io.StringIO()
@@ -5763,15 +5851,13 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
 
     def test_stalled_prompt_routes_the_message_and_reason_to_the_holder(self) -> None:
-        from scripts.herdr import herdr
-
         message = "Detached run: stalled-run\nResult: PASS"
         pane_run = self.fixture.world.run
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             output = pane_run(*arguments, deadline=deadline)
             if arguments[:2] == ("agent", "prompt"):
-                raise herdr.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
+                raise herdr_types.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
             return output
 
         with mock.patch.object(self.fixture.world, "run", side_effect=run):
@@ -5815,11 +5901,37 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(result.outcome, "sent", result.detail)
         prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
         self.assertEqual([command[2] for command in prompts], ["w1:p3"])
-
-
-
-
-
+        sender = self.fixture.worker("sender")
+        outside = fixture_member("showrunner", name="builds")
+        foreign: list[staff.StaffRow] = []
+        for index, unit_name in enumerate(("panes", "report"), 1):
+            holder = fixture_member("unit", name=unit_name, parent=outside.id)
+            worker = fixture_worker("test2", holder.id)
+            foreign.append(worker)
+            self.fixture.world.add(worker, f"w2:p{index + 3}", tab="w2:t3", workspace="w2")
+            observed = roster.Roster([roster.RosterEntry(
+                "fixture", "claude", "worker", worker.name, "working",
+                roster.Messageable(f"session:{worker.current_session}"), str(self.fixture.root),
+                roster.UnderShowrunner(outside.name, outside.name, f"session:{outside.current_session}"),
+                roster.UnderDirector(holder.name, holder.name, f"session:{holder.current_session}"),
+                roster.WorkerAssignment("test", str(self.fixture.root / "run")),
+                session=roster.ClaudeSession(str(worker.current_session)),
+            )], [])
+            commands = self.fixture.world.commands.copy()
+            state = self.fixture.staff_state()
+            with self.subTest(other_units=index):
+                with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": str(sender.current_session)}),
+                      mock.patch.object(roster, "roster", return_value=observed),
+                      redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()),
+                      self.assertRaises(SystemExit) as refused):
+                    _ = self.deliver("test2", "Keep this message in the sender's unit.")
+                self.assertEqual(refused.exception.code, 2)
+                self.assertIn("ambiguous staff row for 'test2'", errors.getvalue())
+                for candidate, candidate_unit in zip(foreign, ("panes", "report")):
+                    self.assertIn(f"builds/{candidate_unit}/test2", errors.getvalue())
+                    self.assertEqual(send.pending(f"staff:{candidate.id}"), "")
+                self.assertEqual(self.fixture.world.commands, commands)
+                self.assertEqual(self.fixture.staff_state(), state)
 
     def test_delivery_requires_the_callers_snapshot_and_retains_its_holder(self) -> None:
         holder = staff.update_current_session(self.fixture.parent.current_session,
@@ -5856,15 +5968,44 @@ class PaneWorkerMessageTests(unittest.TestCase):
         unit = fixture_member("unit", name="unit", parent=other.id)
         sibling = fixture_worker("impl", unit.id)
         self.fixture.world.add(sibling, "w2:p2", tab="w2:t2", workspace="w2")
+        root = staff.snapshot().parent_of(self.fixture.parent)
+        assert root is not None
+        second_unit = fixture_member("unit", name="second-unit", parent=root.id)
+        second_worker = fixture_worker("impl", second_unit.id)
+        self.fixture.world.add(second_worker, "w2:p3", tab="w2:t3", workspace="w2")
+        sender = self.fixture.worker("sender")
         location = self.fixture.world.locations["w1:p1"]
         location.update({"label": "changed", "workspace_id": "w2", "tab_id": "w2:t2"})
         location["agent_status"] = "working"
-        result = self.deliver("worker:unit/impl", "Continue the active turn.")
-        self.assertEqual(result.outcome, "sent")
-        self.assertIsInstance(result, send.PaneTextDelivered)
-        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
-        self.assertEqual([command[2] for command in prompts], ["w1:p1"])
-        self.assertIn("Continue the active turn.", prompts[0][3])
+        observed = roster.Roster([roster.RosterEntry(
+            "fixture", "claude", "worker", sibling.name, "working",
+            roster.Messageable(f"session:{sibling.current_session}"), str(self.fixture.root),
+            roster.UnderShowrunner(other.name, other.name, f"session:{other.current_session}"),
+            roster.UnderDirector(unit.name, unit.name, f"session:{unit.current_session}"),
+            roster.WorkerAssignment("impl", str(self.fixture.root / "run")),
+            session=roster.ClaudeSession(str(sibling.current_session)),
+        )], [])
+        cases = ((self.fixture.parent, "worker:unit/impl", self.row, "w1:p1"),
+                 (sender, "impl", self.row, "w1:p1"),
+                 (self.fixture.parent, "impl", self.row, "w1:p1"),
+                 (sender, "IMPL", self.row, "w1:p1"),
+                 (sender, "other/unit/impl", sibling, "w2:p2"),
+                 (sender, "worker:showrunner/second-unit/impl", second_worker, "w2:p3"),
+                 (sender, "showrunner/second-unit/impl", second_worker, "w2:p3"),
+                 (sender, "worker:second-unit/impl", second_worker, "w2:p3"))
+        for source, target, recipient, pane in cases:
+            with self.subTest(sender=source.kind, target=target):
+                with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": str(source.current_session)}),
+                      mock.patch.object(roster, "roster", return_value=observed)):
+                    before = len(self.fixture.world.commands)
+                    result = self.deliver(target, f"Continue the active turn. From {source.kind} to {target}.")
+                self.assertEqual(result.outcome, "sent")
+                self.assertIsInstance(result, send.PaneTextDelivered)
+                prompts = [command for command in self.fixture.world.commands[before:] if command[:2] == ("agent", "prompt")]
+                self.assertEqual([command[2] for command in prompts], [pane])
+                self.assertIn("Continue the active turn.", prompts[0][3])
+                self.assertEqual(self.fixture.world.processes[self.fixture.world.foreground[pane][0]].identity.id,
+                                 recipient.current_session)
         self.assertNotEqual(self.row.id, self.row.current_session)
 
     def test_full_worker_path_accepts_an_outside_sender_and_a_showrunner_holder(self) -> None:

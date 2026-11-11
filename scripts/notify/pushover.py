@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send the user one Pushover alert: the one way any session reaches their phone.
+"""Send the user one Pushover alert. Mac pushes and cancellations run on natedev.
 
   pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]
   pushover.py cancel [--source NAME] KEY     stop the emergency push sent with --key KEY
@@ -42,12 +42,13 @@ except FileNotFoundError:
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -78,6 +79,7 @@ SESSION_SOURCE = "send.py in "
 FREE_TEXT = "none (free text)"
 USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]"
 CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
+REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/pushover.py"'
 
 
 class Keys(TypedDict):
@@ -117,6 +119,7 @@ class PushLogRecord(TypedDict):
 
 
 Post = Callable[[str, bytes], tuple[int, bytes]]
+AskNatedev = Callable[[Sequence[str], str], subprocess.CompletedProcess[str]]
 
 
 def read_keys(path: Path) -> Keys | None:
@@ -485,8 +488,31 @@ def request_template_fix(record: ReviewedPushRecord) -> None:
         log("template fix", "0", record["title"], record["body"], f"notice failed: {error}")
 
 
+def ask_natedev(argv: Sequence[str], text: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(list(argv), input=text, capture_output=True, text=True, check=False)
+
+
+def via_natedev(arguments: Sequence[str], text: str, asker: AskNatedev, *,
+                source: str, priority: str, title: str, message: str) -> int:
+    """Return natedev's output and status. Log a failed connection without a local post."""
+    try:
+        reply = asker([*silence.SSH, f"{REMOTE} {shlex.join(arguments)}"], text)
+    except (OSError, TimeoutError) as error:
+        cause = str(error)
+    else:
+        if reply.returncode != 255 and (reply.stdout or reply.stderr):
+            print(reply.stdout, end="")
+            print(reply.stderr, end="", file=sys.stderr)
+            return reply.returncode
+        cause = reply.stderr.strip() or f"exit {reply.returncode}: no answer"
+    log(source, priority, title, message, f"unreachable: natedev: {cause}")
+    print(f"pushover: could not reach natedev: {cause}", file=sys.stderr)
+    return 1
+
+
 def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
-            post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "", text_id: str = "") -> int:
+            post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "", text_id: str = "",
+            asker: AskNatedev = ask_natedev) -> int:
     """Post an already reviewed version, including expiry sends; do not review again.
 
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
@@ -497,16 +523,26 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     need = "blocked" if priority == "2" else "decision" if draft.due or priority == "1" else "note"
     priority = decision_priority.priority(need, draft.due)
     message = posted_message(draft.action, draft.body, draft.session, header=header)
+    push: silence.KeptPush = {"source": source, "priority": priority, "title": title,
+                              "message": message, "detail": detail, "key": key, "text_id": text_id,
+                              "due": draft.due, "need": need, "reference": draft.reference}
+    if silence.on_mac():
+        return via_natedev(["deliver"], json.dumps(push), asker,
+                           source=source, priority=priority, title=title, message=message)
+    return deliver_here(push, keys_file, post)
+
+
+def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+    """Keep a reviewed push during silence or post it on natedev."""
+    source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
+    detail = push["detail"]
     if priority != "2":
-        kept = silence.keep({"source": source, "priority": priority, "title": title,
-                             "message": message, "detail": detail, "key": key, "text_id": text_id,
-                             "due": draft.due, "need": need, "reference": draft.reference},
-                            deliver=lambda push: post_kept(push, keys_file, post))
+        kept = silence.keep_here(push, deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
             print(f"pushover: kept: silence {kept.until}")
             return 0
-    return post_message(source, priority, title, message, keys_file, post, detail, key, text_id)
+    return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"])
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
@@ -580,7 +616,8 @@ def post_message(source: str, priority: str, title: str, message: str,
     return 1
 
 
-def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post, *,
+           asker: AskNatedev = ask_natedev) -> int:
     """Stop every emergency push sent with this key; log the outcome like a post."""
     source = parent_source()
     if len(argv) == 3 and argv[0] == "--source" and argv[1].strip():
@@ -591,6 +628,9 @@ def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post)
     key = argv[0]
     tag = push_tag(key)
     title, message = "cancel emergency push", f"key {key}, tag {tag}"
+    if silence.on_mac():
+        return via_natedev(["cancel", "--source", source, key], "", asker,
+                           source=source, priority="2", title=title, message=message)
     keys = read_keys(keys_file)
     if keys is None:
         log(source, "2", title, message, "cancel: keys missing")
@@ -619,5 +659,15 @@ def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post)
     return 1
 
 
+def main(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+    if argv == ["deliver"]:
+        push = silence.parse_push(sys.stdin.read())
+        if push is None:
+            print("pushover: deliver reads one push as JSON on stdin", file=sys.stderr)
+            return 2
+        return deliver_here(push, keys_file, post)
+    return cancel(argv[1:], keys_file, post) if argv[:1] == ["cancel"] else send(argv, keys_file, post)
+
+
 if __name__ == "__main__":
-    sys.exit(cancel(sys.argv[2:]) if sys.argv[1:2] == ["cancel"] else send(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

@@ -18,6 +18,7 @@ from typing import ClassVar, cast, override
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
@@ -165,8 +166,18 @@ from scripts.message import session_send
 from scripts.message import session_send_test_support
 
 def setUpModule():
+    previous_guard = os.environ.get("TEST_SENDER_GUARD")
+    temporary = Path(os.environ["TMPDIR"])
+    def check_cleanup():
+        assert isinstance(session_send_test_support.refusal_marker, session_send_test_support.SenderGuardNotInstalled)
+        assert os.environ.get("TEST_SENDER_GUARD") == previous_guard
+        assert not list(temporary.glob("sender-guard-*"))
+    unittest.addModuleCleanup(check_cleanup)
     session_send_test_support.forbid_real_sender()
     sys.addaudithook(last_guard)
+    if MODE == "setup_exit":
+        subprocess.run([python, str(real_sender), "--help"], check=False)
+        raise SystemExit(0)
 
 real_sender = Path(session_send.__file__).resolve().with_name("send.py")
 python = str(real_sender.parents[1] / "lib/py")
@@ -233,10 +244,23 @@ if MODE == "expected_failure":
 
 
 @dataclass(frozen=True)
+class UnwrittenFixtureTimes:
+    """The fixture exited before the runner wrote its times."""
+
+
+@dataclass(frozen=True)
 class FixtureRun:
     timed: subprocess.CompletedProcess[str]
     standard: subprocess.CompletedProcess[str]
-    times: ModuleTimes
+    recorded_times: ModuleTimes | UnwrittenFixtureTimes
+    standard_sender_folders: list[str]
+    timed_sender_folders: list[str]
+
+    @property
+    def times(self) -> ModuleTimes:
+        if isinstance(self.recorded_times, UnwrittenFixtureTimes):
+            raise AssertionError("The fixture exited without a timing report")
+        return self.recorded_times
 
 
 def read_times(path: Path) -> ModuleTimes:
@@ -258,22 +282,27 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     output = root / f"{name}.json"
     _ = output.write_text("stale output\n", encoding="utf-8")
     env = dict(os.environ)
-    for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS"):
+    for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS", "TEST_SENDER_GUARD"):
         _ = env.pop(key, None)
-    env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+    temporary = root / f"{name}_temporary"
+    temporary.mkdir()
+    env.update({**interpreter_cache_environment(root / "cache"), "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
                 "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTHONPATH": os.pathsep.join((str(root), str(folder)))})
+                "PYTHONPATH": os.pathsep.join((str(root), str(folder))), "TMPDIR": str(temporary)})
     args = [f"{name}.test_fixture"]
     standard = subprocess.run(
         [str(RUNNER.parents[1] / "lib/py"), "-m", "unittest", *args], cwd=root, env=env,
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
+    standard_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
     timed = subprocess.run(
         [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
         env={**env, "TEST_TIMES_OUT": str(output), "CHECK_REMOVED": "1"},
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
-    return FixtureRun(timed, standard, read_times(output))
+    timed_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
+    times = UnwrittenFixtureTimes() if output.read_text() == "stale output\n" else read_times(output)
+    return FixtureRun(timed, standard, times, standard_sender_folders, timed_sender_folders)
 
 
 class ModuleRunnerTests(unittest.TestCase):
@@ -304,6 +333,126 @@ class ModuleRunnerTests(unittest.TestCase):
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
+    def test_config_reads_include_python_and_shell_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
+            config = root / "config"
+            config.mkdir()
+            for stem in ("alpha", "beta", "gamma"):
+                _ = (config / (stem + ".conf")).write_text("value=one\n")
+            repository = RUNNER.parents[2]
+            source = f"""import os, subprocess, sys, unittest
+from scripts.lib import conf
+conf.read('alpha').text('value')
+class Reads(unittest.TestCase):
+    def test_reads(self):
+        conf.read('alpha').text('value')
+        subprocess.run([sys.executable, '-c', "from scripts.lib import conf; conf.read('gamma').text('value')"],
+                       env={{**os.environ, 'PYTHONPATH': {str(repository)!r}}}, check=True)
+        subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
+                       {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
+"""
+            fixture = run_fixture(root, "config_reads", source)
+            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+            self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+
+    def test_folder_scans_record_repository_listings_and_skip_imports_and_children(self) -> None:
+        cases: tuple[tuple[str, str, list[str]], ...] = (
+            ("scandir", "with os.scandir(ROOT / 'listed') as entries: list(entries)", ["listed"]),
+            ("listdir", "os.listdir(ROOT / 'listed')", ["listed"]),
+            ("bytes", "os.listdir(os.fsencode(ROOT / 'listed'))", ["listed"]),
+            ("relative", "os.listdir('listed')", ["listed"]),
+            ("root", "os.listdir(ROOT)", ["."]),
+            ("read file", """(ROOT / 'listed/item.txt').read_text()
+with open(ROOT / 'listed/item.txt', 'rb') as source: source.read()
+descriptor = os.open(ROOT / 'listed/item.txt', os.O_RDONLY)
+try:
+    os.read(descriptor, 16)
+finally:
+    os.close(descriptor)""", []),
+            ("read outside", "(OUTSIDE / 'outside.txt').read_text()", []),
+            ("read config", "(ROOT / 'config/limits.conf').read_text()", []),
+            ("read cache", "(ROOT / '__pycache__/saved.bin').read_bytes()", []),
+            ("write modes", """for mode in ('a', 'w', 'r+'):
+    with open(ROOT / 'listed/item.txt', mode) as target: target.write('fixture')""", []),
+            ("child read", "subprocess.run([sys.executable, '-c', \"from pathlib import Path; Path('listed/item.txt').read_text()\"], cwd=ROOT, check=True)", []),
+            ("patch isolation", """listed = str(ROOT / 'listed')
+outside = str(OUTSIDE)
+with mock.patch.object(os.path, 'realpath', wraps=os.path.realpath) as realpath, \\
+     mock.patch.object(os.path, 'join', wraps=os.path.join) as join, \\
+     mock.patch.object(os.path, 'dirname', wraps=os.path.dirname) as dirname:
+    os.listdir(listed)
+    os.listdir(outside)
+    self.assertEqual(realpath.call_count, 0)
+    self.assertEqual(join.call_count, 0)
+    self.assertEqual(dirname.call_count, 0)""", ["listed"]),
+            ("listdir descriptor", """descriptor = os.open(ROOT / 'listed', os.O_RDONLY)
+try:
+    os.listdir(descriptor)
+finally:
+    os.close(descriptor)""", ["listed"]),
+            ("scandir descriptor", """descriptor = os.open(ROOT / 'listed', os.O_RDONLY)
+try:
+    with os.scandir(descriptor) as entries: list(entries)
+finally:
+    os.close(descriptor)""", ["listed"]),
+            ("outside removal", "shutil.rmtree(tempfile.mkdtemp(dir=OUTSIDE))", []),
+            ("git prefixes", "subprocess.check_output(['git', 'ls-files', '-z', '--', 'scripts/', 'commands/', 'docs/'], cwd=ROOT)",
+             ["commands/", "docs/", "scripts/"]),
+            ("git C", "subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '--', 'docs/'], cwd=OUTSIDE)", ["docs/"]),
+            ("git subdirectory", "subprocess.check_output(['git', '-C', str(ROOT / 'listed'), 'ls-files', '--', '../docs/'])", ["docs/"]),
+            ("git all", "subprocess.check_output(['git', 'ls-files'], cwd=ROOT)", ["/"]),
+            ("git root magic", "subprocess.check_output(['git', 'ls-files', '--', ':/docs'], cwd=ROOT)", ["/"]),
+            ("git empty magic", "subprocess.check_output(['git', 'ls-files', '--', ':'], cwd=ROOT)", ["/"]),
+            ("git exclude magic", "subprocess.check_output(['git', 'ls-files', '--', ':!docs'], cwd=ROOT)", ["/"]),
+            ("import system", "import import_only", []),
+            ("outside", "os.listdir(OUTSIDE)", []),
+            ("child", "subprocess.run([sys.executable, '-c', \"import os; os.listdir('listed')\"], cwd=ROOT, check=True)", []),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory)
+            root = outside / "checkout"
+            library = root / "scripts/lib"
+            library.mkdir(parents=True)
+            runner = root / "scripts/test_times/module_run.py"
+            runner.parent.mkdir()
+            _ = runner.write_text(RUNNER.read_text())
+            for name in ("conf_reads.py", "package_root.py"):
+                _ = (library / name).write_text((RUNNER.parents[1] / "lib" / name).read_text())
+            for package in (root / "scripts", library, root / "tests", root / "import_only"):
+                package.mkdir(exist_ok=True)
+                _ = (package / "__init__.py").write_text("")
+            for folder in ("listed", "commands", "docs"):
+                target = root / folder
+                target.mkdir()
+                _ = (target / "item.txt").write_text("fixture\n")
+            (root / "config").mkdir()
+            _ = (root / "config/limits.conf").write_text("value=fixture\n")
+            (root / "__pycache__").mkdir()
+            _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
+            _ = (outside / "outside.txt").write_text("fixture\n")
+            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(root),
+                           "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+            for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
+                _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
+                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+            for name, action, expected in cases:
+                with self.subTest(case=name):
+                    output = outside / "times.json"
+                    source = ("import os, shutil, subprocess, sys, tempfile, unittest\nfrom pathlib import Path\nfrom unittest import mock\n"
+                              + f"ROOT = Path({str(root)!r})\nOUTSIDE = Path({str(outside)!r})\n"
+                              + "class Listing(unittest.TestCase):\n    def test_listing(self):\n"
+                              + textwrap.indent(action, "        ") + "\n")
+                    _ = (root / "tests/test_listing.py").write_text(source)
+                    entry = "import runpy, sys; runpy.run_path(sys.argv.pop(1))['main']()"
+                    result = subprocess.run([sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
+                                            cwd=root, env={**environment, "TEST_TIMES_OUT": str(output)},
+                                            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(read_times(output).get("folder_scans"), expected)
+                    self.assertEqual(read_times(output).get("content_reads"), ["listed/item.txt"] if name == "read file" else [])
+
     def sender_fixture(self, mode: str) -> FixtureRun:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -311,7 +460,12 @@ class ModuleRunnerTests(unittest.TestCase):
             config.mkdir()
             _ = (config / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
             source = SENDER_REQUEST
-            return run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+            fixture = run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+            if mode != "setup_exit" and isinstance(fixture.recorded_times, UnwrittenFixtureTimes):
+                raise AssertionError("The sender fixture exited without a timing report")
+            self.assertEqual(fixture.standard_sender_folders, [], fixture.standard.stderr)
+            self.assertEqual(fixture.timed_sender_folders, [], fixture.timed.stderr)
+            return fixture
 
     def test_real_sender_request_fails_the_module_with_one_diagnostic(self) -> None:
         fixture = self.sender_fixture("uncaught")
@@ -325,14 +479,17 @@ class ModuleRunnerTests(unittest.TestCase):
         self.assertEqual(fixture.times["failures"], 1)
 
     def test_sender_from_its_folder_or_as_a_module_fails_with_one_diagnostic(self) -> None:
-        for mode in ("cd", "module"):
+        for mode in ("cd", "module", "setup_exit"):
             with self.subTest(mode=mode):
                 fixture = self.sender_fixture(mode)
                 self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                self.assertEqual(fixture.timed.returncode, 1, fixture.timed.stderr)
                 diagnostic = "test_fixture.py: started the real scripts/message/send.py"
                 self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
                 self.assertIn("REFUSED: real scripts/message/send.py is forbidden in tests", fixture.timed.stderr)
                 self.assertNotIn("the sender probe attempted", fixture.timed.stderr)
+                if mode == "setup_exit":
+                    self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
 
     def test_caught_sender_refusal_still_fails_the_module(self) -> None:
         for mode in ("caught", "expected_failure"):

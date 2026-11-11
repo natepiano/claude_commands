@@ -20,8 +20,8 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 class TestLogIsolationTests(unittest.TestCase):
     def test_launch_recording_tests_never_write_to_an_unconfigured_home(self) -> None:
         candidates = (
-            ("discover", "-s", "scripts/shutdown", "-p", "test_pane_record.py"),
-            ("discover", "-s", "scripts/shutdown", "-p", "test_pane_restore.py"),
+            ("discover", "-s", "scripts/agents", "-p", "test_pane_record.py"),
+            ("discover", "-s", "scripts/agents", "-p", "test_pane_restore.py"),
             ("discover", "-s", "scripts/production", "-p", "test_unit_operation_panes.py"),
             ("discover", "-s", "scripts/lib", "-p", "test_nix_env_launches.py"),
             ("scripts.hana_shot.test_hana_shot.LaunchBuildWarningTests",

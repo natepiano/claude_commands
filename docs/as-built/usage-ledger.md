@@ -86,7 +86,7 @@ Every stored time is UTC ISO-8601 text ending `+00:00`.
 
 | Table | Key | Holds |
 | --- | --- | --- |
-| `turns(machine, family, kind, parent_id, agent_id, turn_key, at, model, effort, input, cache_write_5m, cache_write_1h, cache_read, output, before_first_edit, role, lens, attribution, lens_state, activity, wait_action)` | (`machine`, `family`, `parent_id`, `agent_id`, `turn_key`) | One row per model request. `activity` `work`, `wait`, `status` or `unclassified` (a row stored before version 10 whose source file is gone); `wait_action` names the first waiting action and is NULL unless `wait`. `family` `claude` or `codex`; `kind` `session`, `subagent` or `thread`; `model` `unreported` when the log names none; `attribution` `recorded`, `estimated` or `unassigned`; `lens_state` `known`, `unrecorded` or `not_applicable`. Indexes `turns_at` (`at`) and `turns_agent_at` (identity, `at`). |
+| `turns(machine, family, kind, parent_id, agent_id, turn_key, at, model, effort, input, cache_write_5m, cache_write_1h, cache_read, output, before_first_edit, role, lens, attribution, lens_state, activity, wait_action)` | (`machine`, `family`, `parent_id`, `agent_id`, `turn_key`) | One row per model request. `activity` `work`, `wait`, `status` or `unclassified` (a row stored before version 10 whose source file is gone); `wait_action` names the first waiting action and is NULL unless `wait`. `family` `claude` or `codex`; `kind` `session`, `subagent` or `thread`; `model` `unreported` when the log names none; `attribution` `recorded`, `estimated` or `unassigned`; `lens_state` `known`, `unrecorded` or `not_applicable`. Indexes `turns_at` (`at`), `turns_agent_at` (identity, `at`) and `turns_director_cost` (partial on `role = 'director'`; holds every column `context_economy hourly` reads). |
 | `compactions(machine, family, parent_id, agent_id, at)` | all five | Compaction events of both families. |
 | `openings(…identity, at)` | identity | Claude: first timestamped record, never revised. Codex: the `KnownThreadOpening` time, following the latest session metadata. |
 | `edits(…identity, edit_key, at)` | identity + `edit_key` | One row per edit; unique index `claude_edit_message` keeps a Claude edit to one row per machine. |
@@ -129,7 +129,7 @@ In `runs`, `phases` and `passes`, `state` is `open` until the finish event and `
 
 ### The Mac half
 
-The Mac is read on the Mac. `collect_mac` runs `python3 -c REMOTE_BOOTSTRAP` over `ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 natemccoy@mac` (`MAC_HOST`), with `; printf "\nrc=%s\n" "$?"` appended. `reader_payload` sends the sources of `scripts/usage/activity.py`, `agents_log.py`, `rollouts.py` and `collect.py`, in that order, and the stored Mac cursors on stdin; the bootstrap loads them under their module names and calls `read_mac(offsets)`. The Mac needs `python3` and no checkout, and nothing is written to its disk.
+The Mac is read on the Mac. `collect_mac` runs `python3 -c REMOTE_BOOTSTRAP` over `ssh -o BatchMode=yes natemccoy@mac` (`MAC_HOST`). It appends `; printf "\nrc=%s\n" "$?"`. `reader_payload` sends the sources of `scripts/usage/activity.py`, `agents_log.py`, `rollouts.py` and `collect.py`, in that order, and the stored Mac cursors on stdin; the bootstrap loads them under their module names and calls `read_mac(offsets)`. The Mac needs `python3` and no checkout, and nothing is written to its disk.
 
 `read_mac` prints one JSON record per line: `manifest`; `agents.jsonl` as base64 `chunk` records; one `director` record per run-history director; `attribution_ready`; then per changed file a `file` record, one `measurement` per turn, compaction, opening, edit or folder (`kind` names which), one `outcome` per kept run-history event, and its `cursor`, or `problem` when the file cannot be read. Transcripts and run-history files never cross the link.
 
@@ -195,7 +195,8 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 `scripts/usage/context_economy.py` reads context measurements on demand.
 `scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_mac`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
 `/context_economy` (`commands/context_economy.md`) defaults to `report`, also when its first argument starts with `--`.
-The CLI has `report`, `save`, `compare` and `trend`; `report` takes `--role` and `--by settings|week`.
+The CLI has `report`, `save`, `compare`, `trend` and `hourly`; `report` takes `--role` and `--by settings|week`.
+`hourly` reads only the ledger, so it lags by up to one collection. It shows active unit directors and weighted cost for the last `hourly_recent_hours` complete hours. Its normal and busy rows are the median and p75 of the `hourly_baseline_days` before those hours.
 The default window covers the last seven days.
 Bounds use `scripts.lib.user_zone.user_zone`.
 

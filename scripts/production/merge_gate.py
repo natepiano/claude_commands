@@ -187,6 +187,13 @@ class SelectedModules:
     paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class TreeSelection:
+    """Hold selected paths and the Git tree that the selection read."""
+    paths: tuple[str, ...]
+    tree: str
+
+
 ALL_MODULES = AllModules()
 SHARED_MACHINE = SharedMachine()
 
@@ -249,6 +256,7 @@ class RunningGateJob:
     kind: GateJobKind = GateJobKind.TEST_MODULE
     cpu_seconds: float = 0.0
     memory_stopped: bool = False
+    folder_cleanup: ExitStack = field(default_factory=ExitStack)
 
 
 @dataclass(frozen=True)
@@ -461,7 +469,7 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = bool(holds.in_force) and not build_targets.caller_holds_only_own()
+            held = build_targets.caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:
@@ -806,6 +814,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     shutil.rmtree(job.log.parent)
+    job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -971,6 +980,21 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
 
 
+def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | UnrecordableTestTree,
+                            modules: Sequence[tuple[str, Path]], *,
+                            source: Literal["tests-only", "checkpoint"] = "tests-only"
+                            ) -> tuple[AffectedSelection | FullSuite, PassedTreeLedger]:
+    """Select affected tests against the tree that the caller will test."""
+    if not modules:
+        raise GateRefused("the test list is empty")
+    ledger = PassedTreeLedger(repo, source, tested_tree, sorted({suite for suite, _ in modules}))
+    dirty = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set[str]()
+    selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
+                                state_dir=gate_state_dir())
+    report_selection(selection, len(modules))
+    return selection, ledger
+
+
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],
                     results: Sequence[GateJobResult], suite_started: dict[str, float],
                     suite_finished: dict[str, float], *, started_at: float, wall_s: float,
@@ -1093,10 +1117,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             elif mode is SuiteMode.MERGE_GATE:
                 selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
             else:
-                dirty: set[str] = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set()
-                selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
-                                            state_dir=gate_state_dir())
-            report_selection(selection, len(modules))
+                selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+            if mode is SuiteMode.MERGE_GATE or full:
+                report_selection(selection, len(modules))
             if isinstance(selection, AffectedSelection):
                 selected_paths = set(selection.modules)
                 modules = [(suite, path) for suite, path in modules if path in selected_paths]
@@ -1167,6 +1190,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
@@ -1233,8 +1257,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         slot = cpu_pool
                     request = pending.popleft()
                     suite, path = request.suite, request.path
-                    root = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary)))
+                    folder_cleanup = ExitStack()
+                    _ = module_folders.callback(folder_cleanup.close)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -1249,6 +1275,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                        job.folder_cleanup = folder_cleanup
                         job.cpu_slot = slot
                         running.append(job)
                         job_started = True
@@ -1542,7 +1569,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
               f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
-        result = subprocess.run([args.ssh, "-o", "ConnectTimeout=10", args.mac_host, remote],
+        result = subprocess.run([args.ssh, args.mac_host, remote],
                                 cwd=main_repo, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, check=False, timeout=25)
     except (GateRefused, KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:
@@ -1635,9 +1662,9 @@ def merge_checkpoint(args: GateArguments) -> int:
     if refused := change_review.missing(commits):
         raise GateRefused(f"checkpoint commits without a {change_review.TRAILER} line: "
                           + "; ".join(refused) + "; " + change_review.HELD_NEXT_STEP)
+    producer = change_review.unit_producer(args.unit)
     if review_list is not None:
         try:
-            producer = change_review.unit_producer(args.unit)
             _ = change_review.publication_changes(commits, production, known_producer=producer)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
@@ -1651,6 +1678,8 @@ def merge_checkpoint(args: GateArguments) -> int:
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
         merged = checked_git(repo, "rev-parse", "HEAD")
+        if isinstance(producer, str):
+            change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer))
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
@@ -1679,7 +1708,6 @@ def merge_checkpoint(args: GateArguments) -> int:
     if args.promote:
         promote(args)
     if review_list is not None:
-        producer = change_review.unit_producer(args.unit)
         record_changes(repo, review_list, production, str(args.merge_branch),
                        known_producer=change_review.KnownMergeProducer(merged, producer)
                        if isinstance(producer, str) else producer)
@@ -1727,7 +1755,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, merge_branch
 
 def nightly_owner(args: GateArguments) -> str:
     from scripts.production import session_staff, showrunners, staff, unit_lookup
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     try:
         doc = change_review.production_doc(args.production)
@@ -1891,7 +1919,9 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
 class CloudGateRoute(Protocol):
     """Define the cloud route boundary without coupling the local runner to AWS."""
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float) -> GateRun | str: ...
+              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES) -> GateRun | str: ...
+
+    def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -1899,8 +1929,33 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.MERGE_GATE) -> GateRun:
     """Use the scaler service and retain the permitted local fallback."""
+    absent = [name for name in type_dirs if not (repo / name).exists()]
+    if absent:
+        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
-    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s)
+    selected: AllModules | TreeSelection = ALL_MODULES
+    if mode is SuiteMode.TARGETED_TEST and not full:
+        try:
+            tree, dirty = cloud.working_tree(repo)
+        except affected_modules.GraphError as error:
+            raise GateRefused(str(error)) from error
+        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
+        modules = discover_test_modules(repo)
+        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
+        if isinstance(selection, AffectedSelection) and not selection.modules:
+            if type_dirs:
+                return run_suites(repo, type_dirs, module_time_limit_s, source=source, mode=mode)
+            reused = ledger.reuse()
+            if not reused:
+                ledger.record_pass(selection)
+            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
+                            hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
+                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
+            return GateRun((), 0.0, 0.0, selection_certified=True)
+    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
     if isinstance(outcome, str):
         print('Cloud gate uses natedev: ' + outcome, flush=True)
         return run_suites(repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode)
