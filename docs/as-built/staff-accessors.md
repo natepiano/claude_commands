@@ -10,15 +10,49 @@ The table excludes Python test modules.
 On natedev, each Python accessor reads `staff.json` in its own process.
 On the Mac, `staff.py` asks natedev over SSH.
 
-## Staff identity and backends
+## Staff identity and kinds
 
-`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `run`, `paused`, `exited`, and `unknown_fields`.
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, `doc`, `role`, `home`, `run`, `paused`, `exited`, and `unknown_fields`.
 The fixed `id` identifies a member across session changes.
 `parent` is `ReportsTo(id)` or `StaffRoot`.
 `current_session` holds the native Claude session ID or Codex thread ID.
 `run` holds `OpenRun(path)` or `NoRun`.
 `set_run` stores the open run path.
 `clear_run` clears pointers that match the supplied run path.
+
+`Kind` is `Literal["showrunner", "unit", "worker", "producer"]`.
+A producer has `StaffRoot` as its parent.
+It can hold both a worktree and a document.
+It can start a staff path, such as `morty`.
+`staff_sources` includes producers when it reads active root members.
+Restart, shutdown selection, and message routing recognize the same kind.
+
+`StaffRow.home` is `SessionHome(path)` or `HomeUnknown()`.
+It records the account configuration folder.
+A move can write the target home before start confirmation.
+The home alone does not prove a successful start.
+`member_account.repair_home` repairs it from a proved live process.
+
+## Producer rows and commands
+
+Each producer runs its own named job.
+The producer kind supplies shared management.
+Each producer keeps its own role contract.
+
+| Staff name | Kind | Command | Job contract |
+|---|---|---|---|
+| `morty` | `producer` | `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
+| `brain` | `producer` | `/producer:brain` | Its command defines management only. |
+| `dwight` | `producer` | `/producer:dwight` | Strategist; its command defines management only. |
+
+The commands live in `commands/producer/`.
+Morty's operations document is `docs/producer/morty-operations.md`.
+The Codex command sync names Morty's skill `producer-morty`.
+`PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
+Each producer uses `<root>/<name>/README.md`.
+The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
+
+## Backend and hold evidence
 
 `StaffSnapshot` derives backend evidence from session records, transcripts, and live processes.
 `ClaudeBackend.family` is `claude`.
@@ -86,7 +120,7 @@ Each checkout therefore uses the same question store.
 The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
 They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold`, `pause`, `exit`, and `resume`.
 `set_worker_role` writes the last dispatch role.
-`set_home` writes the home observed at pane start.
+`set_home` writes the selected or proved account home.
 `progress_history.begin_dispatch` writes every dispatch role, including Astra policies.
 The shared pane launch builder uses `set_home`.
 `add_unit.ensure_staff_unit`, worker pane admission, and `staff_sources.ensure_staff_showrunner` complete earlier pane publications.
@@ -246,16 +280,16 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/change_page.py` | read | snapshot |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
-| `scripts/agents/member_account.py` | read | StaffRow (type check only) |
+| `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
 | `scripts/agents/pane_restore.py` | read | row_operation |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
-| `scripts/agents/restart.py` | read | initial_snapshot, row_operation |
+| `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
 | `scripts/agents/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
 | `scripts/agents/shutdown_record.py` | read | snapshot |
 | `scripts/agents/stop_results.py` | read | StaffRow and backend types (type check only) |
-| `scripts/agents/stop_resume.py` | write | initial_snapshot, row_operation, resume, set_hold, child_environment |
+| `scripts/agents/stop_resume.py` | write | initial_snapshot, row_operation, slot_operation, ensure, native_id, set_home, resume, set_hold, child_environment |
 | `scripts/agents/unit_staff_test_support.py` | read | staff.json path |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
 | `scripts/statusline/counts_row.py` | read | none (StaffRefused exception) |
@@ -277,7 +311,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-182 accessor rows: 38 write, 143 read, 1 owner.
+183 accessor rows: 40 write, 142 read, 1 owner.
 
 ## Approved copies
 

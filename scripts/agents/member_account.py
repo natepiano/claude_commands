@@ -17,6 +17,13 @@ if TYPE_CHECKING:
     from scripts.production.staff import StaffRow
 
 
+def producer_account(kind: Literal["claude", "codex"], *, to: str = "") -> accounts.AccountSelection:
+    """Select the producer account before staff admission."""
+    if to:
+        return resume_account(kind, to=to)
+    return accounts.role_account("workers" if kind == "codex" else "showrunner")
+
+
 def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW,
                    *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection:
     """Keep an account selection or select the requested label or role account."""
