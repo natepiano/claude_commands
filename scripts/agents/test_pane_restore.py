@@ -374,6 +374,7 @@ class PaneRestoreTests(unittest.TestCase):
                     with (mock.patch.object(herdr, "read_conversation", side_effect=[first, first, last]) as read,
                           mock.patch.object(herdr, "prepare_session_environment", return_value=
                               herdr.PreparedAgentEnvironment(Path("/work/alpha"), {
+                                  **os.environ,
                                   "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR":
                                       str(cast(staff.SessionHome, self.row.home).path)})),
                           mock.patch.object(pane_launch, "finish_restore") as finish):
@@ -840,7 +841,10 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             write_text_atomic(configuration / source.name, source.read_text())
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        registry = write_registry(configuration / "models.conf")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+        })))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
 
 

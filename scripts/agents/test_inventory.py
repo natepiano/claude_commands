@@ -13,6 +13,7 @@ import unittest
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
@@ -253,8 +254,13 @@ class InventoryTests(ShutdownTestCase):
             _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": path.parent.name}}))
             os.utime(path, (timestamp, timestamp))
         self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), newer)
+        model = inventory.last_model(newer)
+        self.assertEqual(model, "newer")
+        archived = compressed_copy(newer)
+        self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), archived)
+        self.assertEqual(inventory.last_model(archived), model)
         older.unlink()
-        newer.unlink()
+        archived.unlink()
         self.assertIsNone(inventory.transcript_path(self.target_config, "lookup"))
 
     def test_inventory_models_come_from_each_sessions_config_directory(self) -> None:

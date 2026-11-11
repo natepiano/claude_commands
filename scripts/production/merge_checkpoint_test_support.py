@@ -50,6 +50,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
                       root: Path) -> subprocess.CompletedProcess[str]:
     """Run the real CLI and current fake scripts, keeping Git as real processes."""
     real_run = subprocess.run
+    python_launcher = (Path(__file__).resolve().parents[1] / "lib/py").resolve()
 
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,
@@ -59,7 +60,8 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
         child_cwd = Path.cwd() if cwd is None else Path(cwd)
         executable = Path(shutil.which(command[0], path=child_env.get("PATH")) or command[0])
         script, args = executable, command[1:]
-        if not script.is_relative_to(root) and executable.name.startswith("python") and len(command) > 1:
+        if (not script.is_relative_to(root) and len(command) > 1
+                and (executable.name.startswith("python") or executable.resolve() == python_launcher)):
             script, args = Path(command[1]), command[2:]
         if executable.name != "git" and script.is_relative_to(root) and script.is_file() and script.read_text().startswith(f"#!{sys.executable}\n"):
             fake = ModuleType("checkpoint_tool_fixture")

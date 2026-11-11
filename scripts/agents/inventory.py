@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from typing import Literal, TypedDict, cast
 
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
@@ -632,7 +633,7 @@ def last_tool_call(config_dir: Path, session_id: str) -> str:
     if path is None:
         return ""
     try:
-        with path.open("rb") as transcript:
+        with open_transcript(path) as transcript:
             size = transcript.seek(0, os.SEEK_END)
             _ = transcript.seek(max(0, size - _LAST_STEP_BYTES))
             lines = transcript.read().decode("utf-8", errors="replace").splitlines()
@@ -668,7 +669,7 @@ def transcript_path(config_dir: Path, session_id: str) -> Path | None:
     newest: Path | None = None
     modified = float("-inf")
     try:
-        for path in (config_dir / "projects").glob(f"*/{session_id}.jsonl"):
+        for path in transcript_paths(config_dir / "projects", f"*/{session_id}.jsonl"):
             try:
                 at = path.stat().st_mtime
             except OSError:
@@ -683,7 +684,7 @@ def transcript_path(config_dir: Path, session_id: str) -> Path | None:
 def last_model(path: Path) -> str | None:
     """Read complete transcript lines newest first, stopping at a real model."""
     try:
-        with path.open("rb") as transcript:
+        with open_transcript(path) as transcript:
             position = transcript.seek(0, os.SEEK_END)
             pending = b""
             while position:

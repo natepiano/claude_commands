@@ -403,6 +403,10 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
                     raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
             if kind == "claude":
                 herdr.trust_claude_launch(request.folder, pending.home)
+                from scripts.whoami.account import named_account_environment
+
+                arguments = models_registry.claude_arguments(arguments,
+                    herdr.agent_base_environment(named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
             client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + ":"], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
@@ -880,7 +884,10 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = resolve_program(kind, environment=environment)
-    command = [program, *trust_arguments(kind, entry["cwd"], resume_arguments(entry))]
+    arguments = resume_arguments(entry)
+    if kind == "claude":
+        arguments = models_registry.claude_arguments(arguments, environment)
+    command = [program, *trust_arguments(kind, entry["cwd"], arguments)]
     if message and kind == "claude":
         command.append(message)
     os.chdir(entry["cwd"])
@@ -1231,7 +1238,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         else:
             _ = entry.pop("config_dir", None)
-        if row is not None and row.kind == "producer":
+        if row is not None and row.kind == "producer" and not (
+                isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
+                and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
             space = herdr.row_workspace(row, names.tab_record, row.name)
             if isinstance(tab, SessionNotFound) or not client.producer_pane(tab.pane_id, row.name, space):
                 destination = client.producer_row_tab(str(row.id), row.name, space)
@@ -1257,20 +1266,28 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         workers = NO_WORKERS
         own = NO_OWN_PASS
+        detached = ""
         from scripts.production import worker
         try:
             if row is not None and row.kind == "worker":
-                own = worker.own_pass(row, names.tab_record)
+                from scripts.agents import detached_runs
+                from scripts.herdr import worker_panes
+
+                run = worker_panes.worker_run(row, record=names.tab_record)
+                own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
+                detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         if isinstance(own, worker.UnsubmittedAssignment):
             message = launcher_prompt(row.id, own.dispatch_id, own.command) if row is not None else ""
+            if detached:
+                message += "\n" + detached
         else:
             message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                     workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
-                                         row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
+                                     workers=workers, own_pass=own, detached=detached) if (kind != "codex" or row is not None) and (
+                                         row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":
             expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
@@ -1313,7 +1330,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         selected_home = staff.SessionHome(target_dir.absolute())
         if row is not None and row.home != selected_home:
             try:
-                _ = staff.set_home(row.id, selected_home)
+                # The launch hook can publish the new home before the start returns.
+                current = staff.by_id(row.id)
+                if current is None or current.home != selected_home:
+                    _ = staff.set_home(row.id, selected_home)
             except (staff.StaffUnreadable, staff.StaffNotFound) as error:
                 print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
         if original is not None:

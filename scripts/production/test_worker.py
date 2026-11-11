@@ -31,7 +31,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import send, sessions
 from scripts.usage import agents_log
@@ -355,6 +355,7 @@ class WorkerCommandTests(unittest.TestCase):
         result = worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse(name), role)
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
+        pane_fixtures.idle_transcript(result.row)
         return result
 
     def dispatch(self, name: str = "impl", role: staff.WorkerRole = "impl", dispatch_id: str = "") -> worker.DispatchSubmission | worker.ExitCode:
@@ -413,6 +414,49 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(active.call_count, 2)
         self.assertEqual(searches.call_count, 0)
         self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+
+    def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
+        self.assert_restore_live_run(active=False)
+
+    def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
+        self.assert_restore_live_run(active=True)
+
+    def assert_restore_live_run(self, *, active: bool) -> None:
+        from scripts.whoami import agent_accounts
+
+        opened = self.opened("active-run" if active else "idle-run")
+        dispatch_id = ""
+        if active:
+            dispatch_id = progress_history.begin_dispatch(self.run_dir, slot=opened.row.name, phase="8", role="impl",
+                worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                prompt=self.prompt, kind="impl", lens="")
+            self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch_id}.")
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        run = self.run_dir / "detached_runs" / opened.row.name
+        context = (f"Detached run {opened.row.name} remains live. "
+                   + f"Result: {run}.json; log: {run}.log. Read it with: `cat -- {run}.json {run}.log`. "
+                   + "Its result follows this worker after the move.")
+        target = self.fixture.root / ".codex2"
+        target.mkdir()
+        (target / "sessions").symlink_to(self.fixture.root / "codex/sessions", target_is_directory=True)
+        with (pane_fixtures.live_detached_run(self.run_dir, opened.row), redirect_stdout(io.StringIO()),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex2", self.fixture.root / ".codex2", "fixture")),
+              patch.object(accounts, "account_directory_readiness", return_value=accounts.AccountDirectoryReady("fixture"))):
+            code = worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({opened.row.id}))
+        self.assertEqual(code, worker.ExitCode.OK)
+        self.assertEqual(self.fixture.world.requests[-1][2]["CODEX_HOME"], str(self.fixture.root / ".codex2"))
+        prompt = self.fixture.prompts()[-1]
+        self.assertEqual(prompt[2], opened.pane)
+        self.assertEqual(prompt[3], (
+            '<system-reminder source="script">\nYou were stopped and resumed because .\n'
+            + f"Continue pass {dispatch_id} in this conversation. Keep the same pass id.\n"
+            + context + "\n</system-reminder>" if active else
+            '<system-reminder source="script"> ' + context + " </system-reminder>"))
+        self.assertEqual(self.fixture.world.closed, [])
+        current = staff.snapshot().by_id(opened.row.id)
+        assert current is not None
+        self.assertEqual(current.current_session, opened.row.current_session)
 
     def test_restore_starts_only_the_worker_with_an_active_dispatch(self) -> None:
         idle = self.opened("review", "review")
@@ -2073,6 +2117,36 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
         self.assertIn(self.agent.final, self.reply.read_text())
 
+    def test_cli_model_override_uses_the_selected_account_catalog(self) -> None:
+        _ = write_registry(self.fixture.root / "conf/models.conf", {
+            "assignments": {"direct": "claude"}, "direct.claude": {"impl": "sonnet:high"},
+        })
+        environment = claude_catalog_environment(self.fixture.root / "caller-account", {
+            "opus": "claude-opus-caller-fixture", "sonnet": "claude-sonnet-caller-fixture",
+        })
+        selected = self.fixture.root / "override-account"
+        _ = claude_catalog_environment(selected, {
+            "opus": "claude-opus-override-fixture", "sonnet": "claude-sonnet-role-fixture",
+        })
+        for index, (model, expected) in enumerate((
+            ("opus", "claude-opus-override-fixture"),
+            ("claude-opus-saved-fixture", "claude-opus-saved-fixture"),
+        )):
+            name = f"override-{index}"
+            with (self.subTest(model=model), patch.dict(os.environ, environment),
+                  patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.NamedAccount("claude2", selected)),
+                  patch.object(herdr, "launch_prepared_agent", side_effect=self.fixture.world.launch_through_herdr)):
+                code, output, errors = self.command("assign", "impl", str(self.prompt),
+                    "--session-dir", str(self.run_dir), "--slot", "impl", "--phase", "8", "--kind", "impl",
+                    "--name", name, "--reply", str(self.reply), "--model", model,
+                    "--launcher-command", json.dumps(["assign.sh", "--model", model]))
+                self.assertEqual((code, output), (0, "submitted\n"), errors)
+                pane = self.agent.submitted[-1][0]
+                self.assertEqual(self.agent.row(pane).name, name)
+                arguments = self.fixture.world.foreground[pane][2]
+                self.assertEqual(arguments[arguments.index("--model") + 1], expected)
+                self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
+
     def test_early_review_uses_one_pass_and_two_transcript_receipts(self) -> None:
         ready = self.run_dir / "final.ready"
         atomic_file.write_text_atomic(self.reply, "The previous full report.\n")
@@ -2846,6 +2920,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_end_closes_a_busy_worker_and_retires_its_row(self) -> None:
         opened = self.opened()
         self.fixture.world.locations[opened.pane]["agent_status"] = "working"
+        self.fixture.completed_dispatch(opened.row, "impl")
         with patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()), \
              patch("scripts.production.staff_sources.require_worker_stopped"):
             code, output, errors = self.command("end", "impl")

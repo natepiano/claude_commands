@@ -419,12 +419,10 @@ def resolve_model(args: Arguments, role: str, env: dict[str, str]) -> tuple[str,
     task = role if "." in role else f"direct.{role}"
     result = call(["bash", "-c", '''source "$1"; models_launch_configuration || exit 2; agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
- pair="${3:-$AGENT_MODEL}"
+ pair="${3:-$AGENT_WORD}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
  [[ -z "$4" ]] || pair="${pair%%:*}:$4"
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
- AGENT_MODEL="${pair%%:*}"
- AGENT_EFFORT="${pair##*:}"
 fi
 printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}" "$MODELS_LAUNCH_CONFIGURATION"
 ''', "assign", str(SCRIPTS / "../agents/models_config.sh"), task, args.model, args.effort], env, capture=True)

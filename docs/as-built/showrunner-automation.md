@@ -142,6 +142,7 @@ It preserves the line's comments and spacing.
 The commit uses `tune(<file>): <key> <old> -> <new>` and a `User-Approved:` trailer.
 A same-value retry finishes publication without another commit.
 `scripts/lib/main_publish.py` supplies the shared publication path for `/tune` and `/zone`.
+Its preparation and push each take a short [main push lock](repair-rounds.md#shared-main-push-lock).
 It accepts unpublished subjects beginning `tune(`, `zone(`, or `user zone: `.
 It refuses another unpublished commit before changing the setting.
 It fetches main and rebases pending publisher commits when a fast-forward fails.
@@ -223,7 +224,12 @@ Each local Promote checkout must exist before the command pushes.
   Each successful recipient is saved, and a failed send gets one retry.
   `MERGE_CHECKPOINT_SEND` selects the sender for tests.
 
-- **Publication locks.** The gate-record lock precedes `main_push_lock`.
+- **Publication locks.** `scripts/lib/main_push_lock.py` supplies the shared helper.
+  The gate-record lock precedes `main_push_lock`.
+  Nested calls in one process share the hold for the same repository.
+  Only a child with an explicit `held_environment` shares that hold through `MAIN_PUSH_LOCK_HELD`.
+  `push_validate` passes this environment to the validation shell.
+  Detached gate children receive the plain environment and take their own locks.
   The checkpoint releases the gate-record lock before local promotion.
   It retains `main-push.lock` through the last local push to main.
   Mac pulls and result delivery occur after that lock is released.
@@ -266,8 +272,8 @@ Each local Promote checkout must exist before the command pushes.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
   8. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
-     Otherwise, it releases the lock, merges main, retests the new paths, and tries again.
-     Tests never run inside this lock.
+     Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
+     The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
      Preparation failure restores the tip before this run when origin still has its old tip.

@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, Typed
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import conf, operation_deadline
+from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -1060,6 +1060,7 @@ class SavedName(TypedDict):
     seen: float
     row_id: NotRequired[str]
     terminal_id: NotRequired[str]
+    sort_after_rename: NotRequired[bool]
 
 
 class SavedSpace(TypedDict):
@@ -1123,6 +1124,8 @@ def _saved_name(value: object) -> SavedName:
         result["row_id"] = json_text(item["row_id"], "herdr layout staff row")
     if isinstance(item.get("terminal_id"), str):
         result["terminal_id"] = json_text(item["terminal_id"], "herdr layout terminal")
+    if item.get("sort_after_rename") is True:
+        result["sort_after_rename"] = True
     return result
 
 
@@ -1666,15 +1669,56 @@ class Herdr:
                 changed = True
         return changed
 
+    def mark_tab_rename(self, identity: staff.StaffId) -> None:
+        """Retain a rename request before the staff name or display labels change."""
+        with _LayoutLock(self.session):
+            saved = saved_layout(self.session)
+            record = _tab_staff()
+            changed = False
+            for space in saved["workspaces"]:
+                for entry in space["tabs"]:
+                    member = record.by_member_reference(entry["name"])
+                    if member is not None and member.id == identity and not entry.get("sort_after_rename"):
+                        entry["sort_after_rename"] = True
+                        changed = True
+            if changed:
+                _write_layout(self.session, saved)
+
     def retitle(self, pane: str, title: str, *, tab: bool = True) -> bool:
         """Set the pane title and, when requested, its tab title."""
         with _LayoutLock(self.session):
             row = next((row for row in self.listed("pane") if row.get("pane_id") == pane), None)
-            if row is None or not self._retitle(row, title, tab=tab):
+            if row is None:
+                return False
+            saved = saved_layout(self.session)
+            reorder = False
+            record = _tab_staff()
+            space_name: object = ""
+            if tab and saved["workspaces"]:
+                workspace = json_text(row.get("workspace_id"), "workspace id")
+                space_name = next((space.get("label") for space in self.listed("workspace")
+                                   if space.get("workspace_id") == workspace), "")
+                reorder = any(entry.get("sort_after_rename")
+                    and (member := record.by_member_reference(entry["name"])) is not None
+                    and member.name == title
+                    for space in saved["workspaces"] if space["name"] == space_name for entry in space["tabs"])
+            changed = self._retitle(row, title, tab=tab)
+            if not changed and not reorder:
                 return False
             if tab:
-                _ = self.order_tabs(json_text(row.get("workspace_id"), "workspace id"), saved_layout(self.session))
-            self.save_layout()
+                _ = self.order_tabs(json_text(row.get("workspace_id"), "workspace id"), saved)
+            if reorder:
+                self.record_layout()
+                saved = saved_layout(self.session)
+                for space in saved["workspaces"]:
+                    if space["name"] == space_name:
+                        for entry in space["tabs"]:
+                            member = record.by_member_reference(entry["name"])
+                            if member is not None and member.name == title:
+                                _ = entry.pop("sort_after_rename", False)
+                _write_layout(self.session, saved)
+            else:
+                self.save_layout()
             return True
 
     def scan_row_panes(self, record: staff.StaffSnapshot,
@@ -1865,7 +1909,8 @@ class Herdr:
         titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
         stored = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), list[SavedName]())
         kept = [SavedName(name=row.name, seen=item["seen"]) for item in stored
-                if (row := membership.by_member_reference(item["name"])) is not None]
+                if not item.get("sort_after_rename")
+                and (row := membership.by_member_reference(item["name"])) is not None]
         order = tab_order(name if isinstance(name, str) else "", titles, kept, unit_director_titles)
         current = list(range(len(tabs)))
         moved: dict[str, str] = {}
@@ -5143,6 +5188,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
+        agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
         try:
             trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
         except HerdrFailure as error:

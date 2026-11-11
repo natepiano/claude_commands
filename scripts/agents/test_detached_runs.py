@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Literal, cast, override
 from unittest.mock import MagicMock, patch
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import detached_run_process, detached_runs
@@ -199,6 +200,20 @@ class DetachedRunsTests(unittest.TestCase):
         record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         record.update(fields)
         _ = path.write_text(json.dumps(record), encoding="utf-8")
+
+    def test_resume_context_names_each_live_run_and_its_read_command(self) -> None:
+        paths = self.seat_runs(2)
+        text = detached_runs.resume_context(paths[0].parent, WORKER)
+        for index, path in enumerate(paths):
+            record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            log = record["log"]
+            self.assertIn(f"Detached run live-{index} remains live.", text)
+            self.assertIn(f"Result: {path}; log: {log}", text)
+            self.assertIn(f"`cat -- {path} {log}`", text)
+        self.update_record(paths[0], status="finished")
+        text = detached_runs.resume_context(paths[0].parent, WORKER)
+        self.assertNotIn("Detached run live-0", text)
+        self.assertIn("Detached run live-1", text)
 
     def start(self, command: list[str], to: str = WORKER) -> tuple[MagicMock, str]:
         """Start command for seat `to`; the Popen mock and what start printed."""
@@ -759,7 +774,7 @@ sys.exit(1)
                         ("bash", "verify.sh", "check"), str(self.root), {}, False)
                     holder = build_hold.Holder("holder", datetime.now(timezone.utc), "service deploy",
                                                build_hold.UnknownReleaseEta(), "holder")
-                    run = hold_enforcer.WaitingRun(gate, build_hold.NoOwningSession())
+                    run = hold_enforcer.WaitingRun(gate, NoOwningSession())
                     guard = LauncherHangGuard("cancelled stop blocks supervisor publication")
                     rechecking, supervisor_record_section = Event(), Event()
                     write_attempted, supervisor_blocked = Event(), Event()
