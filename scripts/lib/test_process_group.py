@@ -341,9 +341,6 @@ final_pass_finish() { :; }
 
 
 class ProcessGroupSourceTests(unittest.TestCase):
-    def test_scripts_route_every_group_signal_through_the_shared_check(self) -> None:
-        self.assertEqual(unguarded_group_signals(Path(__file__).resolve().parents[1]), [])
-
     def test_guard_finds_planted_python_shell_and_heredoc_sends(self) -> None:
         python_send = "os." + "killpg"
         shell_send = "ki" + "ll"

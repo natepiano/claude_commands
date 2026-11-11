@@ -84,5 +84,5 @@ User rule, 2026-11-04: "it should be impossible to start a worker in more than o
 - Native worker admission and pane operations implement worker start and reuse. The mesh command and its subcommands are removed.
 - `assign.sh` refuses when no live Claude or Codex process is in its parent chain (a `nohup`, `setsid` or `&` start).
 - The completion hook keeps the pass active while detached work remains. A result returns to the same native worker conversation.
-- `scripts/direct/test_one_launch_path.py` fails when a file outside the launcher starts or follows a worker.
+- `scripts/direct/test_one_launch_path_sources.py` fails when a file outside the launcher starts or follows a worker.
 - Worker panes (herdr-worker-panes decision 11) change what is behind `assign.sh`; they add no second way.
