@@ -943,13 +943,18 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertFalse((self.root / "queue").exists())
 
     def test_nonstaff_live_name_delivers_to_its_roster_session(self) -> None:
-        entry = self.claude_row("free-session", "morty")
-        self.staff_rows.clear()
-        with mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])):
-            result = send.send(local_options(["--to", "morty", "--text", "hello", "--key", "nonstaff-name"]))
-        self.assertEqual(result.outcome, "sent")
-        self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'free-session.sock'}")
-        self.assertEqual(set(self.claims("nonstaff-name")), {"morty", "session:free-session"})
+        for target in ("morty", "queue-unit"):
+            with self.subTest(target=target):
+                entry = self.claude_row("free-session", target)
+                director = self.claude_row("director-session", "queue")
+                self.staff_rows.clear()
+                self.staff_member("director-session", "queue")
+                key = f"nonstaff-name:{target}"
+                with mock.patch.object(roster, "roster", return_value=roster.Roster([entry, director], [])):
+                    result = send.send(local_options(["--to", target, "--text", "hello", "--key", key]))
+                self.assertEqual(result.outcome, "sent")
+                self.assertEqual(self.relayed[-1].to, f"uds:{self.root / 'free-session.sock'}")
+                self.assertEqual(set(self.claims(key)), {target, "session:free-session"})
 
     def test_nonstaff_explicit_addresses_keep_their_transport(self) -> None:
         entry = self.daemon_row("free-thread")
@@ -1012,10 +1017,36 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                                    current_session=staff.StaffId("other-director"))
         resources = staff.StaffRow(staff.StaffId("resources-worker"), "worker", "resources", staff.ReportsTo(other_unit.id),
                                   current_session=staff.StaffId("resources-current"))
-        record = staff.StaffSnapshot((*record.rows, report, direct, report_unit, nested, other, other_unit, resources))
-        for target, expected in (("report/test2", direct), ("builds/resources", unit)):
+        queue = staff.StaffRow(staff.StaffId("queue-director"), "unit", "queue", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("queue-current"))
+        queue_worker = staff.StaffRow(staff.StaffId("queue-worker"), "worker", "queue", staff.ReportsTo(other_unit.id),
+                                     current_session=staff.StaffId("queue-worker-current"))
+        alpha = staff.StaffRow(staff.StaffId("alpha-director"), "unit", "alpha", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("alpha-current"))
+        alpha_unit = staff.StaffRow(staff.StaffId("alpha-unit-director"), "unit", "alpha-unit", staff.ReportsTo(runner.id),
+                                   current_session=staff.StaffId("alpha-unit-current"))
+        record = staff.StaffSnapshot((*record.rows, report, direct, report_unit, nested, other, other_unit, resources,
+                                      queue, queue_worker, alpha, alpha_unit))
+        worker_record = staff.StaffSnapshot((other, other_unit, queue_worker))
+        for target, membership, expected in (
+            ("report/test2", record, direct),
+            ("builds/resources", record, unit),
+            ("queue-unit", record, queue),
+            ("builds/queue-unit", record, queue),
+            ("alpha-unit", record, alpha_unit),
+            ("builds/alpha-unit", record, alpha_unit),
+            ("queue-unit", worker_record, send.NoStaffRecipient()),
+            ("other/builds/queue-unit", worker_record, send.NoStaffRecipient()),
+        ):
             with self.subTest(target=target):
-                self.assertEqual(send.resolve_staff_recipient(target, record), expected)
+                self.assertEqual(send.resolve_staff_recipient(target, membership), expected)
+                if target in ("queue-unit", "builds/queue-unit") and isinstance(expected, staff.StaffRow):
+                    self.assertEqual(
+                        send.resolve_recipient(target, send.LocalOnly(), roster.Roster([], []),
+                                               membership=membership, records=[]),
+                        send.QueuedStaffRecipient(f"session:{expected.current_session}", expected.name,
+                                                  str(expected.current_session)),
+                    )
 
     def test_one_staff_snapshot_supplies_resolution_and_roster(self) -> None:
         self.session("resources-current", "transport")
@@ -5233,10 +5264,14 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_nonstaff_peer_names_and_addresses_keep_their_transport(self) -> None:
         for address in ("session:peer", "codex:peer-thread", "worker:peer-run/impl"):
-            for target in ("morty", address):
+            for target in ("morty", address, "queue-unit"):
                 with self.subTest(address=address, target=target):
-                    self.peer([self.row("morty", address)])
+                    name = "queue-unit" if target == "queue-unit" else "morty"
+                    self.peer([self.row(name, address)])
+                    director = self.row("queue", "session:director-session", machine="natedev")
+                    self.local = self.recipient_roster([director], [])
                     self.staff_rows.clear()
+                    self.staff_member("director-session", "queue")
                     status, output, errors = self.run_main(target)
                     self.assertEqual((status, errors), (0, ""), output)
                     forwarded = self.forwarded()[-1]
@@ -5341,17 +5376,25 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.forwarded(), [])
 
     def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
-        self.local = self.recipient_roster([], ["worker source unreadable"])
+        director = self.row("queue", "codex:director-thread", machine="natedev")
+        self.local = self.recipient_roster([director], ["worker source unreadable"])
         self.peer([self.row("absent here", "codex:peer")])
-        status, output, errors = self.run_main("absent here")
-        self.assertEqual(status, 2, output + errors)
-        self.assertNotIn("worker source unreadable", errors)
-        self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
-                      + "~/.claude/scripts/message/roster.py", errors)
-        self.assertIn("--machine", errors)
-        self.assertIn("address", errors)
+        for target, expected_status in (("absent here", 2), ("queue-unit", 0)):
+            with self.subTest(target=target):
+                status, output, errors = self.run_main(target)
+                self.assertEqual(status, expected_status, output + errors)
+                if target == "absent here":
+                    self.assertNotIn("worker source unreadable", errors)
+                    self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+                                  + "~/.claude/scripts/message/roster.py", errors)
+                    self.assertIn("--machine", errors)
+                    self.assertIn("address", errors)
+                    self.assertEqual(self.relayed + self.daemon_calls, [])
+                else:
+                    self.assertEqual(errors, "")
+                    self.assertEqual(self.daemon_calls[-1], "director-thread")
         self.assertEqual(self.ssh_calls(), [])
-        self.assertEqual(self.relayed + self.daemon_calls, [])
+        self.assertEqual(self.relayed, [])
 
     def test_missing_live_name_is_refused_after_peer_durable_warnings(self) -> None:
         warning = 'durable role /fixture/design.json: missing or invalid repository'
@@ -5396,14 +5439,22 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_unreachable_peer_reports_one_problem_and_fails_the_send(self) -> None:
         self.staff_member("remote", "only peer")
+        director = self.row("queue", "codex:director-thread", machine="natedev")
+        self.local = self.recipient_roster([director], [])
         os.environ["SSH_SNAPSHOT"], os.environ["SSH_ROSTER_STATUS"] = "ssh: connection refused", "255"
-        status, output, errors = self.run_main("only peer")
-        self.assertEqual(status, 3, output + errors)
-        self.assertEqual(len(errors.splitlines()), 1)
-        self.assertEqual(errors, "send.py: roster problems omitted: 1; "
-                         + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
-        self.assertNotIn("not reached", errors)
-        self.assertIn("FAILED: recipient lookup failed for 'only peer'", output)
+        for target, expected_status in (("only peer", 3), ("queue-unit", 0)):
+            with self.subTest(target=target):
+                status, output, errors = self.run_main(target)
+                self.assertEqual(status, expected_status, output + errors)
+                if target == "only peer":
+                    self.assertEqual(len(errors.splitlines()), 1)
+                    self.assertEqual(errors, "send.py: roster problems omitted: 1; "
+                                     + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
+                    self.assertNotIn("not reached", errors)
+                    self.assertIn("FAILED: recipient lookup failed for 'only peer'", output)
+                else:
+                    self.assertEqual(errors, "")
+                    self.assertEqual(self.daemon_calls[-1], "director-thread")
         self.assertEqual(self.forwarded(), [])
 
     def test_refusal_advice_matches_worker_ownership_and_socketless_claude_state(self) -> None:
