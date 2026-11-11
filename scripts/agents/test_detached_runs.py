@@ -200,6 +200,20 @@ class DetachedRunsTests(unittest.TestCase):
         record.update(fields)
         _ = path.write_text(json.dumps(record), encoding="utf-8")
 
+    def test_resume_context_names_each_live_run_and_its_read_command(self) -> None:
+        paths = self.seat_runs(2)
+        text = detached_runs.resume_context(paths[0].parent, WORKER)
+        for index, path in enumerate(paths):
+            record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            log = record["log"]
+            self.assertIn(f"Detached run live-{index} remains live.", text)
+            self.assertIn(f"Result: {path}; log: {log}", text)
+            self.assertIn(f"`cat -- {path} {log}`", text)
+        self.update_record(paths[0], status="finished")
+        text = detached_runs.resume_context(paths[0].parent, WORKER)
+        self.assertNotIn("Detached run live-0", text)
+        self.assertIn("Detached run live-1", text)
+
     def start(self, command: list[str], to: str = WORKER) -> tuple[MagicMock, str]:
         """Start command for seat `to`; the Popen mock and what start printed."""
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))

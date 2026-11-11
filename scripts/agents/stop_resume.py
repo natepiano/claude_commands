@@ -1257,20 +1257,28 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         workers = NO_WORKERS
         own = NO_OWN_PASS
+        detached = ""
         from scripts.production import worker
         try:
             if row is not None and row.kind == "worker":
-                own = worker.own_pass(row, names.tab_record)
+                from scripts.agents import detached_runs
+                from scripts.herdr import worker_panes
+
+                run = worker_panes.worker_run(row, record=names.tab_record)
+                own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
+                detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         if isinstance(own, worker.UnsubmittedAssignment):
             message = launcher_prompt(row.id, own.dispatch_id, own.command) if row is not None else ""
+            if detached:
+                message += "\n" + detached
         else:
             message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                     workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
-                                         row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
+                                     workers=workers, own_pass=own, detached=detached) if (kind != "codex" or row is not None) and (
+                                         row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":
             expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
