@@ -2126,7 +2126,15 @@ def resolve_staff_recipient(
     target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
     observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
 ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
-    """Select one staff identity before any transport lookup."""
+    """Select a staff recipient, including its unit form."""
+    return _staff_recipient_match(target, membership, records=records, observed=observed, allow_unit_form=True)
+
+
+def _staff_recipient_match(
+    target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
+    observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (), allow_unit_form: bool = False,
+) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
+    """Match exact staff names unless the caller permits the unit form."""
     from scripts.message import roster
 
     reference = target
@@ -2166,10 +2174,7 @@ def resolve_staff_recipient(
         except unit_names.BadName:
             return value.casefold()
 
-    normalized = "/".join(normalized_name(part) for part in reference.split("/"))
-    matches: dict[staff.StaffId, staff.StaffRow] = {}
-    paths: dict[staff.StaffId, str] = {}
-    for candidate in membership.find():
+    def name_chain(candidate: staff.StaffRow) -> list[str]:
         chain = [candidate.name]
         parent = candidate
         visited = {candidate.id}
@@ -2180,6 +2185,13 @@ def resolve_staff_recipient(
             visited.add(ancestor.id)
             chain.insert(0, ancestor.name)
             parent = ancestor
+        return chain
+
+    normalized = "/".join(normalized_name(part) for part in reference.split("/"))
+    matches: dict[staff.StaffId, staff.StaffRow] = {}
+    paths: dict[staff.StaffId, str] = {}
+    for candidate in membership.find():
+        chain = name_chain(candidate)
         path = "/".join(chain)
         canonical = "/".join(normalized_name(part) for part in chain)
         short = normalized_name(candidate.name)
@@ -2190,6 +2202,20 @@ def resolve_staff_recipient(
             if row is not None:
                 matches[row.id] = row
                 paths[row.id] = path
+    if allow_unit_form and not matches and not _sender_label_matches(target, list(observed)):
+        from scripts.copies import copies
+
+        for candidate in membership.find(kind="unit"):
+            short = normalized_name(copies.unit_owner(candidate.name))
+            if short != normalized.rsplit("/", 1)[-1]:
+                continue
+            chain = name_chain(candidate)
+            path = "/".join(chain)
+            chain[-1] = short
+            canonical = "/".join(normalized_name(part) for part in chain)
+            if normalized == canonical or ("/" not in normalized and normalized == short):
+                matches[candidate.id] = candidate
+                paths[candidate.id] = path
     foreign_workers_only = False
     if "/" not in normalized and matches and all(row.kind == "worker" for row in matches.values()):
         sender = _sender_staff_row(membership)
@@ -2253,7 +2279,7 @@ def matching_recipients(
     from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
-    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    member = _staff_recipient_match(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
     if isinstance(member, staff.StaffRow):
@@ -2269,7 +2295,7 @@ def matching_recipients(
         return LocalRosterIncomplete(observed.diagnostics)
     peer = roster.peer_roster(os.environ)
     problems = [*observed.diagnostics, *peer.diagnostics]
-    member = resolve_staff_recipient(to, membership, observed=[*observed.entries, *peer.entries])
+    member = _staff_recipient_match(to, membership, observed=[*observed.entries, *peer.entries])
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [*problems, member.reason])
     if isinstance(member, staff.StaffRow):
@@ -2297,7 +2323,7 @@ def resolve_recipient(
     def lookup() -> DeliveryRoute:
         nonlocal problems
         socket_records = (sessions.live_sessions() if records is None else records) if to.startswith("uds:") else []
-        member = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
+        member = _staff_recipient_match(to, membership, observed=observed.entries, records=socket_records)
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
         if (not isinstance(scope, NamedMachine)
@@ -2322,6 +2348,14 @@ def resolve_recipient(
                 usage_error("codex: needs a thread id")
         result = matching_recipients(to, scope, observed, membership=membership)
         problems = result.problems
+        if isinstance(result, RecipientMatches) and result.entries:
+            return _matched_recipient(to, result.entries, result.destination)
+        if isinstance(member, NoStaffRecipient):
+            fallback = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
+            if isinstance(fallback, RecipientLookupFailed):
+                usage_error(fallback.reason)
+            if isinstance(fallback, staff.StaffRow):
+                return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         if isinstance(result, LocalRosterIncomplete):
             usage_error(f"absence of {to} here is not proven; use an address or --machine")
         if isinstance(result, RecipientSearchFailed):
@@ -2330,8 +2364,6 @@ def resolve_recipient(
                       if any(problem in result.reason for problem in problems if problem not in related)
                       else result.reason)
             return RecipientLookupFailed(reason)
-        if result.entries:
-            return _matched_recipient(to, result.entries, result.destination)
         if to.startswith("worker:"):
             usage_error(f"no roster session has address {to}")
         if to.startswith("codex:"):
@@ -3335,11 +3367,11 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     else:
         route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
     destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
-    member = resolve_staff_recipient(options.to, membership, records=records, observed=observed.entries)
+    member = _staff_recipient_match(options.to, membership, records=records, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
     if isinstance(member, NoStaffRecipient) and destination != options.to:
-        member = resolve_staff_recipient(destination, membership, records=records, observed=observed.entries)
+        member = _staff_recipient_match(destination, membership, records=records, observed=observed.entries)
     registered = sessions.addressed(destination, records)
     stable = StableRecipient(options.recipient_identity.name if isinstance(options.recipient_identity, LogicalRecipientIdentity)
                              else f"staff:{member.id}" if isinstance(member, staff.StaffRow)
