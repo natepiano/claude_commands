@@ -3021,7 +3021,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on the edited files: 0 errors, 0 warnings, 0 notes.
 - The report gives Git starts and CPU before and after for each module.
 
-### Phase 154 — Find what the Mac-only verify tests spend their CPU on  · status: todo
+### Phase 154 — Find what the Mac-only verify tests spend their CPU on  · status: done
 **Depends on:** none
 
 #### Work Order
