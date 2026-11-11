@@ -152,8 +152,10 @@ def resolve_rule(name: str, progress: tuple[style_ledger.RuleCounts, ...]) -> st
 
 
 def workspace(ledger: style_ledger.Ledger, tip: str) -> tuple[rules.WorkspaceMember, ...]:
-    paths = git(ledger.repo, "ls-tree", "-rz", "--name-only", tip).split("\0")
-    manifests = {path: git(ledger.repo, "show", f"{tip}:{path}") for path in paths if PurePosixPath(path).name == "Cargo.toml"}
+    entries = style_ledger.tree_entries(ledger.repo, tip)
+    blobs = {path: entry.object for path, entry in entries.items()
+             if entry.kind == "blob" and PurePosixPath(path).name == "Cargo.toml"}
+    manifests = {path: content.decode(errors="replace") for path, content in style_ledger.blob_contents(ledger.repo, blobs)}
     return rules.workspace_members(manifests)
 
 
