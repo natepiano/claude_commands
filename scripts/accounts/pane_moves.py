@@ -136,7 +136,9 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
     return replace(failure, reason=reason)
 
 
-def _move_decision(move: WorkerMove) -> WorkerResume | accounts.IdleWorkerPaneClose | accounts.SessionMoveRefused | stop_results.ClaudeUp:
+def _move_decision(move: WorkerMove,
+                   lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+                   ) -> WorkerResume | accounts.IdleWorkerPaneClose | accounts.SessionMoveRefused | stop_results.ClaudeUp:
     """Use the same evidence for a preview and a locked move."""
     state = _observe(move)
     if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -146,9 +148,10 @@ def _move_decision(move: WorkerMove) -> WorkerResume | accounts.IdleWorkerPaneCl
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: {' '.join(active.reason.splitlines())}")
     if isinstance(active, progress_history.NoActiveDispatch) and isinstance(state, worker_panes.ClosedWorker):
         return accounts.SessionMoveRefused(move.row.id, "nothing to move", 0)
-    if (isinstance(active, progress_history.NoActiveDispatch)
-            and isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
-            and worker_panes.worker_state(state) == "idle"):
+    if (isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
+            and worker_panes.worker_state(state) == "idle"
+            and isinstance(worker_panes.worker_dispatch_state(move.row, move.run, lock),
+                           (worker_panes.ReleasedWorkerPass, worker_panes.CompletedWorkerPass))):
         return accounts.IdleWorkerPaneClose()
     role = worker_panes.dispatch_role(move.row)
     if isinstance(role, worker_panes.WorkerRoleUnavailable):
@@ -167,7 +170,7 @@ def _move_decision(move: WorkerMove) -> WorkerResume | accounts.IdleWorkerPaneCl
 
 
 def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
-    decision = _move_decision(move)
+    decision = _move_decision(move, hold)
     if isinstance(decision, accounts.IdleWorkerPaneClose):
         closed = worker_panes.close(move.parent, staff.WorkerName.parse(move.row.name), lock=hold)
         if isinstance(closed, worker_panes.Closed):

@@ -290,18 +290,26 @@ def handle(event: WorkerEvent) -> TurnOutcome:
             return _ignored(event, f"the worker lock was kept: {hold.blocker}", row.name)
         run = worker_panes.worker_run(row, record=record)
         passed = worker_panes.worker_pass(row, run)
+
+        def ignore_turn(reason: str) -> TurnOutcome:
+            if event.kind == EventKind.TURN_END:
+                dispatch = worker_panes.worker_dispatch_state(row, run, hold)
+                if not isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+                    _ = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
+            return _ignored(event, reason, row.name)
+
         completion = progress_history.hook_completion(passed)
         if isinstance(completion, progress_history.HookCompletion) and completion.finished:
-            return _ignored(event, "the hook completion is already finished", row.name)
+            return ignore_turn("the hook completion is already finished")
         active = progress_history.active_dispatch(row.id, run)
         if not isinstance(active, progress_history.ActiveDispatch) and not (
                 isinstance(completion, progress_history.HookCompletion) or
                 passed.get("status") in ("completed", "error")):
-            return _ignored(event, "no active dispatch or recoverable completion exists", row.name)
+            return ignore_turn("no active dispatch or recoverable completion exists")
         instance = active.instance_id if isinstance(active, progress_history.ActiveDispatch) else str(passed.get("instance_id", ""))
         delivery = progress_history.dispatch_delivery(passed)
         if not delivery.line:
-            return _ignored(event, "the dispatch delivery line is empty", row.name)
+            return ignore_turn("the dispatch delivery line is empty")
         client = herdr.Herdr(herdr.shared_session())
         state = worker_panes.observe_worker(parent.id, row, record)
         if isinstance(state, worker_panes.WorkerNotObserved):
@@ -312,7 +320,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         if isinstance(receipt, worker.DispatchNotSubmitted):
             if event.kind == EventKind.STAGE_READY and delivery.completion_id != instance:
                 return _submit_stage(parent, row, state, client, run, passed, instance, delivery)
-            return _ignored(event, "the transcript has no matching dispatch prompt", row.name)
+            return ignore_turn("the transcript has no matching dispatch prompt")
         if isinstance(receipt, worker.DispatchEvidenceUnknown):
             return _ignored(event, f"the transcript evidence is unknown: {receipt.reason}", row.name)
         turn_reply = receipt.reply if isinstance(receipt, worker.DispatchWaitingForRuns) else receipt
