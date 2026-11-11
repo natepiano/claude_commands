@@ -277,7 +277,14 @@ import subprocess
 tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
 common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
 with (Path(common) / "main-push.lock").open("a") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_state = "held"
+    else:
+        lock_state = "free"
+with (state / "tested-locks").open("a") as output:
+    output.write(lock_state + "\\n")
 with (state / "tested-tips").open("a") as output:
     output.write(tip + "\\n")
 if name == "checkpoint-test" and (state / "move-main").exists() and not (state / "moved-main").exists():
@@ -306,6 +313,10 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                     if outcome == "resume":
                         _ = self.git("merge", "--no-ff", "-m", "Merge interrupted checkpoint", checkpoint)
                     result = self.run_checkpoint(checkpoint, phase="3")
+                    if outcome != "conflict":
+                        tips = (self.state / "tested-tips").read_text().splitlines()
+                        lock_states = (self.state / "tested-locks").read_text().splitlines()
+                        self.assertEqual(lock_states, ["free" if tip == tips[0] else "held" for tip in tips])
                     if outcome.startswith("moving-"):
                         tips = (self.state / "tested-tips").read_text().splitlines()
                         moved = (self.state / "moved-main").read_text()

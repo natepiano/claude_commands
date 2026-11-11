@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib import main_publish
+from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -106,6 +107,34 @@ class MainPublishTests(PublicationTestCase):
         pushed, detail = main_publish.push(repo.checkout)
         self.assertTrue(pushed, detail)
         self.assertEqual(repo.remote_tip(), repo.head())
+
+        for pusher in ("python", "shell"):
+            with self.subTest(pusher=pusher, holder="another process"):
+                row = repo.checkout / "publication-row.txt"
+                _ = row.write_text(pusher + "\n")
+                _ = repo.git(repo.checkout, "add", "publication-row.txt")
+                _ = repo.git(repo.checkout, "commit", "--only", "-m", "tune(example): publication row",
+                             "--", "publication-row.txt")
+                if pusher == "python":
+                    command = [sys.executable, "-c", "from pathlib import Path; from scripts.lib import main_publish; "
+                               + "ok, detail = main_publish.push(Path.cwd()); print(detail); raise SystemExit(0 if ok else 1)"]
+                else:
+                    command = ["bash", str(Path(__file__).resolve().parents[1] / "validate_and_push/push_direct.sh"),
+                               "--publish-only", repo.head()]
+                _ = publish_after_contender(self, repo.checkout, repo.origin, command, repo.env, cwd=repo.checkout)
+                self.assertEqual(repo.remote_tip(), repo.head())
+
+        for handoff in ("explicit", "plain"):
+            with self.subTest(pusher="shell entry", holder="the parent process", handoff=handoff):
+                child = subprocess.run(
+                    [sys.executable, "-c", "from pathlib import Path; import sys; "
+                     + "from scripts.lib.main_push_lock_test_support import child_lock_handoff; "
+                     + "raise SystemExit(child_lock_handoff(Path(sys.argv[1]), sys.argv[2]))",
+                     str(repo.checkout), handoff],
+                    cwd=Path(__file__).resolve().parents[2], env=repo.env,
+                    capture_output=True, text=True, check=False, timeout=min(TEST_HANG_GUARD_SECS, 15),
+                )
+                self.assertEqual(child.returncode, 23, child.stdout + child.stderr)
 
     def test_push_refuses_to_publish_unrelated_local_commits(self) -> None:
         repo = self.repository
