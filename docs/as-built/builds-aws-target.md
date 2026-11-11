@@ -594,6 +594,8 @@ The configured allowance supplies the cost when no needed bill rows exist or the
 The spending limits do not change.
 
 The prices command prints regional Spot prices without resource identities.
+The table header follows the administrator passphrase prompt.
+Whole quota values have no decimal suffix.
 `deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
@@ -601,6 +603,14 @@ The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xl
 A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
+`deploy.py quota-request` requests `spot_quota_request_vcpus` from `cloud_gate.conf` in each configured region.
+The default request is 128 vCPUs.
+The command uses the encrypted administrator key through the admin executor.
+It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
+It prints the region, desired value, and request status without request, case, or account identifiers.
+A failed call prints only the AWS error code or Python error class and does not stop other regions.
+Any regional failure makes the command exit with status 1.
+The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.

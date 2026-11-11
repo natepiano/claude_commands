@@ -14,6 +14,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 import gzip
 from hashlib import sha256
 import json
@@ -99,6 +100,13 @@ def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
             count = 2 if size[1] == 'large' else 4 * int(size[2] or '1')
             largest = max(largest, count)
     return largest
+
+
+def spot_quota(api: AwsCli) -> Decimal:
+    """Read the regional Standard Spot vCPU quota."""
+    reply = api.call('get-service-quota', '--service-code', 'ec2',
+                     '--quota-code', 'L-34B43A08', service='service-quotas')
+    return conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
 
 
 @dataclass(frozen=True)
@@ -350,13 +358,11 @@ class Deployment:
     def _print_spot_quota(self, api: AwsCli, largest: int) -> None:
         """Show the regional gate quota without stopping deployment on a failed read."""
         try:
-            reply = api.call('get-service-quota', '--service-code', 'ec2',
-                             '--quota-code', 'L-34B43A08', service='service-quotas')
-            quota = conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
+            quota = spot_quota(api)
         except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             print(f'{api.region}: Spot vCPU quota unknown: {self.admin.redact(str(error))}')
             return
-        print(f'{api.region}: Spot quota {quota:g} vCPUs')
+        print(f'{api.region}: Spot quota {quota.normalize():f} vCPUs')
         if largest == 0:
             print(f'{api.region}: gate vCPU count is unknown')
         elif quota < largest:
@@ -1238,6 +1244,7 @@ class Deployment:
         largest = largest_gate_vcpus(configured_types)
         sizes = tuple(dict.fromkeys([*configured_types,
                                     'r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge']))
+        _ = self.admin.get()
         print('region type zone price')
         for region in gate_regions(settings.region):
             target = api.in_region(region)
@@ -1256,6 +1263,42 @@ class Deployment:
                 for zone in sorted(zones):
                     row = latest.get((size, zone), {})
                     print(region, size, zone, str(row.get('SpotPrice', 'unavailable')))
+
+    def quota_request(self) -> bool:
+        """Request the configured Spot vCPU quota without duplicating open requests."""
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        desired = conf.read_or_repository('cloud_gate').whole('spot_quota_request_vcpus')
+        api = self._api(settings)
+        success = True
+        closed = {'APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'}
+        for region in gate_regions(settings.region):
+            target = api.in_region(region)
+            try:
+                quota = spot_quota(target)
+                if quota >= desired:
+                    print(f'{region}: Spot quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
+                    continue
+                history = target.call('list-requested-service-quota-change-history-by-quota',
+                    '--service-code', 'ec2', '--quota-code', 'L-34B43A08', service='service-quotas')
+                opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in closed]
+                if opened:
+                    for row in opened:
+                        status = ledger.text(row, 'Status')
+                        value = conf.decimal(str(row['DesiredValue']))
+                        print(f'{region}: open Spot quota request {value.normalize():f} vCPUs; status {status}')
+                    continue
+                reply = target.call('request-service-quota-increase', '--service-code', 'ec2',
+                    '--quota-code', 'L-34B43A08', '--desired-value', str(desired), service='service-quotas')
+                status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
+                print(f'{region}: Spot quota request {desired} vCPUs; status {status}')
+                if status in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}:
+                    success = False
+            except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                code = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+                reason = code[1] if code else type(error).__name__
+                print(f'{region}: Spot quota request failed: {reason}')
+                success = False
+        return success
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
@@ -1547,7 +1590,7 @@ def main() -> int:
         with step('gate-trial', 'running the trial', settings_path):
             return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'remove-builder', 'remove-images', 'price', 'prices', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'remove-builder', 'remove-images', 'price', 'prices', 'quota-request', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--workload', choices=('rust', 'merge-gates'), default='rust')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
@@ -1571,6 +1614,8 @@ def main() -> int:
             return 0 if deploy.remove_images(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'prices':
             deploy.prices()
+        elif args.command == 'quota-request':
+            return 0 if deploy.quota_request() else 1
         elif args.command == 'price':
             print(json.dumps(deploy.price(), sort_keys=True))
         elif args.command == 'bootstrap':

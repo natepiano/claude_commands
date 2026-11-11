@@ -1121,6 +1121,130 @@ sys.exit(7)
                     self.assertEqual(lines, expected)
                     self.assertNotIn('fixture-admin-secret', output)
 
+    def test_prices_prints_whole_quotas_and_the_header_after_the_passphrase_prompt(self) -> None:
+        subject = self.deployment()
+        credentials = subject.admin.get()
+        prompted = False
+
+        def unlock() -> admin_secrets.AdminCredentials:
+            nonlocal prompted
+            if not prompted:
+                print('Admin passphrase: ')
+                prompted = True
+            return credentials
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if 'get-service-quota' in arguments:
+                reply: dict[str, object] = {'Quota': {'Value': 300.0}}
+            elif 'describe-availability-zones' in arguments:
+                reply = {'AvailabilityZones': []}
+            else:
+                reply = {'SpotPriceHistory': []}
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        subject.execute = execute
+        with mock.patch.object(subject.admin, 'get', side_effect=unlock), redirect_stdout(StringIO()) as captured:
+            subject.prices()
+        lines = captured.getvalue().splitlines()
+        self.assertEqual(lines, ['Admin passphrase: ', 'region type zone price', 'us-east-1: Spot quota 300 vCPUs'])
+
+    def test_quota_request_uses_admin_credentials_and_continues_after_regional_failures(self) -> None:
+        get_quota = 'get-service-quota'
+        history = 'list-requested-service-quota-change-history-by-quota'
+        request = 'request-service-quota-increase'
+        cases = (
+            (300.0, '', '', '', True),
+            (128, '', '', '', True),
+            (5, 'PENDING', '', '', True),
+            (5, 'CASE_OPENED', '', '', True),
+            (5, 'IN_PROGRESS', '', '', True),
+            (5, '', 'PENDING', '', True),
+            (5, 'APPROVED', 'CASE_OPENED', '', True),
+            (5, 'DENIED', 'PENDING', '', True),
+            (5, 'CASE_CLOSED', 'PENDING', '', True),
+            (5, 'NOT_APPROVED', 'PENDING', '', True),
+            (5, 'INVALID_REQUEST', 'PENDING', '', True),
+            (5, '', '', get_quota, False),
+            (5, '', '', history, False),
+            (5, '', '', request, False),
+            (5, '', '', 'timeout', False),
+            (5, '', '', 'uncoded', False),
+            (5, '', 'NOT_APPROVED', '', False))
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-1 us-west-2')
+        request_id = 'req-ab12cd34ef56'
+        case_id = '9876543210'
+        account_id = '123456789012'
+        for quota, history_status, request_status, failure, success in cases:
+            with self.subTest(quota=quota, history=history_status, request=request_status, failure=failure):
+                subject = self.deployment()
+                subject.admin.credentials = subject.admin.get()
+                calls: list[tuple[str, str]] = []
+
+                def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                            timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    self.assertTrue(capture_output)
+                    self.assertTrue(text)
+                    self.assertFalse(check)
+                    region = arguments[arguments.index('--region') + 1]
+                    operation = arguments[arguments.index('service-quotas') + 1]
+                    self.assertNotIn('--profile', arguments)
+                    self.assertIsNotNone(env)
+                    self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+                    self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
+                    expected = ['service-quotas', operation, '--service-code', 'ec2', '--quota-code', 'L-34B43A08']
+                    if operation == request:
+                        expected.extend(['--desired-value', '128'])
+                    self.assertEqual(list(arguments[arguments.index('service-quotas'):]), [*expected, '--output', 'json'])
+                    calls.append((region, operation))
+                    if region == 'us-west-2':
+                        self.assertEqual(operation, get_quota)
+                        reply: dict[str, object] = {'Quota': {'Value': 300.0}}
+                    elif operation == failure:
+                        code = 'TooManyRequestsException' if operation == request else 'AccessDeniedException'
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            f'An error occurred ({code}) when calling the quota operation: '
+                            + f'fixture-admin-secret arn:aws:iam::{account_id}:user/private RequestId: {request_id} CaseId: {case_id}')
+                    elif failure == 'timeout' and operation == request:
+                        raise subprocess.TimeoutExpired('fixture-admin-secret', timeout)
+                    elif failure == 'uncoded' and operation == request:
+                        return subprocess.CompletedProcess(arguments, 1, '', f'private failure {request_id} {case_id}')
+                    elif operation == get_quota:
+                        reply = {'Quota': {'Value': quota}}
+                    elif operation == history:
+                        reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 256.0,
+                            'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []}
+                    else:
+                        self.assertEqual(operation, request)
+                        reply = {'RequestedQuota': {'Status': request_status, 'DesiredValue': 128.0,
+                            'Id': request_id, 'CaseId': case_id, 'Requester': account_id}}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+                subject.execute = execute
+                with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as captured):
+                    self.assertEqual(deploy.main(), 0 if success else 1)
+                lines = captured.getvalue().splitlines()
+                self.assertEqual(lines[-1], 'us-west-2: Spot quota 300 vCPUs; no request is needed for 128 vCPUs')
+                expected_operations = [get_quota]
+                if quota < 128 and failure != get_quota:
+                    expected_operations.append(history)
+                    if failure != history and history_status not in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                        expected_operations.append(request)
+                self.assertEqual(calls, [('us-east-1', operation) for operation in expected_operations] + [('us-west-2', get_quota)])
+                if failure:
+                    reason = {'timeout': 'TimeoutExpired', 'uncoded': 'AwsUnavailable',
+                              request: 'TooManyRequestsException'}.get(failure, 'AccessDeniedException')
+                    self.assertEqual(lines[0], f'us-east-1: Spot quota request failed: {reason}')
+                elif quota >= 128:
+                    self.assertEqual(lines[0], f'us-east-1: Spot quota {int(quota)} vCPUs; no request is needed for 128 vCPUs')
+                elif history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                    self.assertEqual(lines[0], f'us-east-1: open Spot quota request 256 vCPUs; status {history_status}')
+                else:
+                    self.assertEqual(lines[0], f'us-east-1: Spot quota request 128 vCPUs; status {request_status}')
+                for private in ('fixture-admin-id', 'fixture-admin-secret', request_id, case_id, account_id):
+                    self.assertNotIn(private, captured.getvalue())
+
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()
         home_api = subject._api(aws_config.read_deployment_settings(self.settings, self.state))  # pyright: ignore[reportPrivateUsage]
