@@ -183,10 +183,26 @@ Run targeted tests with the source worktree's uncommitted changes and a merge, i
   ~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout '{tree}'
 ```
 
-`run --repo R --commit C [--apply-uncommitted W] [--merge REF]
+`run --repo R --commit C [--apply-uncommitted W] [--merge REF] [--publish PATH ...]
 -- <cmd> ...` executes the command with the checkout as its working directory.
 Every `{tree}` occurrence in an argument becomes the checkout's absolute path.
 The command's exit status is returned, and its output passes through.
+
+`--publish PATH` copies a built file out of the checkout after the command returns.
+The option can repeat. Each PATH is relative to the checkout.
+The copy occurs while `standing()` still holds the lease, so it follows the `target` symlink into the cache root.
+`publish_files(tree, paths, command_exit)` makes one `scratch.new(word="gate-binary", throwaway=True)` folder under `/tmp/claude/scratch`.
+Each file keeps its base name and mode. It is written to `.<name>.tmp` first and then renamed.
+`manifest.json` in the folder holds `repository`, the full checkout `commit`, `command_exit` and the file names.
+Stdout prints `published: <absolute path> <full commit>` for each file.
+A path that does not exist prints `copies: publish: <path> not built` on stderr.
+A copy failure ends the scratch folder and prints `copies: publish: <error>` on stderr.
+Publication never changes the exit status of `run`.
+The scratch deadline removes the folder; the hourly sweep does the removal.
+The scratch default task has a random suffix, so `scratch.end()` removes only this folder.
+The folder is outside the cache root, so a unit reads it with no permission prompt.
+`/hana_shot` launches a gate build with the `published:` path as `--binary`.
+A unit never copies from a gate checkout's `target`.
 
 `--apply-uncommitted` applies staged and unstaged tracked changes plus untracked,
 not ignored files. It commits on top of the selected commit with `--no-verify`
