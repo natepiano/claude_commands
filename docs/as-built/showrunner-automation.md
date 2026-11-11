@@ -545,6 +545,16 @@ The caller's working directory stays unchanged.
   The row supplies the current name, kind, and parent name.
   A showrunner displays `<name> showrunner`; a worker displays `worker`.
   A unit displays `<name> unit`, with `for <parent>` when the parent exists.
+  Its first line displays `<assignment> | <folder> | <branch>` when the branch is available.
+  Branch lookup starts at `workspace.current_dir`, else `cwd`, else the process folder from `--arg pwd`.
+  It resolves symbolic links in that folder before the parent search.
+  It searches parent folders for the first `.git` entry and reads `HEAD` without a `git` process.
+  A `.git` folder contains `HEAD`.
+  A `.git` file supplies an absolute `gitdir` path or a path relative to its containing folder.
+  A `ref: refs/heads/<name>` value supplies the branch name.
+  A detached `HEAD` displays `detached <first 7 characters>`.
+  A missing repository, an unreadable file, or a folder resolution failure omits the branch field.
+  Other roles keep their first line unchanged.
   Missing or damaged staff data displays `unassigned`.
   Copied `STAFF_ID`, timer targets, folders, and names do not select a row.
   Quota and notifier refresh paths keep their own behavior.
