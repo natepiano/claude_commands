@@ -351,13 +351,12 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         if deletion.returncode:
             return Kept(path, "the local branch changed after the cleanup check; the local branch stays: "
                         + failure_detail(deletion))
-        _ = git(repo, "config", "--local", "--list")
-        section = f"branch.{record.branch}"
-        config = subprocess.run(["git", "-C", str(repo), "config", "--local", "--remove-section", section],
-                                capture_output=True, text=True, check=False, env={**os.environ, "LC_ALL": "C"})
-        if config.returncode and not (config.returncode == 128
-                                      and config.stderr == f"fatal: no such section: {section}\n"):
-            raise Refused(1, failure_detail(config))
+    section = f"branch.{record.branch}"
+    config = subprocess.run(["git", "-C", str(repo), "config", "--local", "--remove-section", section],
+                            capture_output=True, text=True, check=False, env={**os.environ, "LC_ALL": "C"})
+    if config.returncode and not (config.returncode == 128
+                                  and config.stderr == f"fatal: no such section: {section}\n"):
+        raise Refused(1, failure_detail(config))
     record_file(path).unlink(missing_ok=True)
     return Ended(path, record.branch)
 
