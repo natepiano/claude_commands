@@ -93,7 +93,7 @@ class ProducerAdmissionWorld:
     def process_info(self) -> dict[str, object]:
         return {"process_info": {"shell_pid": 998042, "foreground_process_group_id": 456,
             "foreground_processes": [{"pid": 456, "name": self.kind, "cwd": str(self.folder),
-                                       "argv": [self.kind, *self.arguments[-1]]}]}}
+                                       "argv": [self.kind, *(self.arguments[-1] if self.arguments else [])]}]}}
 
 
 @contextmanager
@@ -266,18 +266,76 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(len(world.arguments), 1)
                 self.assertEqual(world.case.client.closed, [])
 
+        for location in ("registry", "codex-index", "codex-account-index", "codex-dual-source", "pane-label", "tab-label", "two-live"):
+            kind: Literal["claude", "codex"] = "codex" if location.startswith("codex") else "claude"
+            with self.subTest(location=location), producer_first_fixture(kind) as world:
+                case = world.case
+                world.active = True
+                world.environment = {"HERDR_SESSION": "agents", "HERDR_PANE_ID": world.pane,
+                                     "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME": str(world.home)}
+                case.client.rows.append({"pane_id": world.pane, "terminal_id": "manual-terminal",
+                    "tab_id": "manual-tab", "workspace_id": "w1", "label": "manual",
+                    "agent_session": {"kind": "id", "value": world.identity}})
+                case.client.native_ids[world.pane] = world.identity
+                if location in ("registry", "two-live"):
+                    directory = case.root / "sessions"
+                    directory.mkdir()
+                    _ = (directory / "456.json").write_text(json.dumps({
+                        "pid": 456, "sessionId": world.identity, "name": "dwight", "cwd": str(world.folder),
+                        "messagingSocketPath": "", "updatedAt": 1, "procStart": "generation-1"}))
+                    if location == "two-live":
+                        second = fixture_runtime_id("second-live-dwight")
+                        _ = (directory / "457.json").write_text(json.dumps({
+                            "pid": 457, "sessionId": second, "name": "dwight", "cwd": str(world.folder),
+                            "messagingSocketPath": "", "updatedAt": 1, "procStart": "generation-1"}))
+                        case.client.rows.append({"pane_id": "w1:p4", "terminal_id": "second-terminal",
+                            "tab_id": "second-tab", "workspace_id": "w1", "label": "dwight",
+                            "agent_session": {"kind": "id", "value": second}})
+                elif location in ("codex-index", "codex-account-index", "codex-dual-source"):
+                    home = case.root / (".codex" if location == "codex-index" else ".codex7")
+                    home.mkdir()
+                    _ = (home / "session_index.jsonl").write_text(json.dumps({
+                        "id": world.identity, "thread_name": "dwight"}) + "\n")
+                    cast(Mock, herdr.codex_conversations).return_value = herdr.CodexConversations({world.identity: (456,)}, ())
+                    if location == "codex-dual-source":
+                        case.client.rows[-1]["label"] = "dwight"
+                        _ = case.client.rows[-1].pop("agent_session")
+                elif location == "pane-label":
+                    case.client.rows[-1]["label"] = "dwight"
+                else:
+                    case.tab_titles["manual-tab"] = "dwight"
+                result = stop_resume.resume("dwight")
+                if location == "two-live":
+                    self.assertIsInstance(result, stop_resume.ResumeFailed, result)
+                    assert isinstance(result, stop_resume.ResumeFailed)
+                    for identity, pane in ((world.identity, world.pane), (fixture_runtime_id("second-live-dwight"), "w1:p4")):
+                        self.assertIn(identity, result.reason)
+                        self.assertIn(pane, result.reason)
+                    self.assertEqual(len(result.reason.splitlines()), 1)
+                    self.assertEqual(staff.initial_snapshot().rows, ())
+                else:
+                    self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+                    assert isinstance(result, stop_resume.ClaudeUp)
+                    self.assertEqual((result.session_id, result.pane_id, result.start_state),
+                                     (world.identity, world.pane, ClaudeStartState.ALREADY_RUNNING))
+                    self.assertEqual([(row.name, row.current_session, row.home) for row in staff.initial_snapshot().rows],
+                                     [("dwight", world.identity, staff.SessionHome(world.home))])
+                self.assertEqual(world.arguments, [])
+                self.assertEqual(case.client.opened, [])
+                self.assertEqual(list((case.root / "panes").glob(".producer-admission-*")), [])
+
     def test_interrupted_producer_admission_reuses_its_live_native_conversation(self) -> None:
         lost_stages = {"lost", "replaced", "unpublished", "foreign-recovery", "native-recovery"}
         first_ownership_stages = {"foreign-first", "native-first"}
         recovery_ownership_stages = {"foreign-recovery", "native-recovery"}
         ownership_stages = first_ownership_stages | recovery_ownership_stages
         resumed_stages = {"lost", "replaced"} | recovery_ownership_stages
-        for stage in ("admission", "publication", "lost", "replaced", "unpublished", "unrecorded",
-                      "foreign-first", "foreign-recovery", "native-first", "native-recovery", "broken-registry"):
+        for stage in ("admission", "publication", "lost", "replaced", "unpublished", "named-before-retry", "unrecorded",
+                      "foreign-first", "foreign-recovery", "native-first", "native-recovery", "broken-registry", "live-replacement"):
             with self.subTest(stage=stage), producer_first_fixture("claude") as world:
                 if stage == "publication":
                     boundary = patch.object(pane_launch, "staff_admitted", side_effect=OSError("fixture publication failure"))
-                elif stage == "unpublished":
+                elif stage in ("unpublished", "named-before-retry"):
                     boundary = patch.object(world.case.client, "start_agent", side_effect=OSError("fixture launch failure"))
                 elif stage == "unrecorded" or stage in first_ownership_stages:
                     boundary = patch.object(stop_resume, "write_text_atomic", side_effect=OSError("fixture reservation failure"))
@@ -286,6 +344,21 @@ class StopResumeTests(unittest.TestCase):
                 with boundary:
                     self.assertIsInstance(stop_resume.resume("dwight"), stop_resume.ResumeFailed)
                 self.assertEqual(len(staff.initial_snapshot().rows), 1 if stage == "publication" else 0)
+                if stage == "named-before-retry":
+                    registry = world.case.root / "sessions"
+                    registry.mkdir()
+                    _ = (registry / "123.json").write_text(json.dumps({
+                        "pid": 123, "sessionId": fixture_runtime_id("manual-dwight"), "name": "dwight",
+                        "messagingSocketPath": "", "updatedAt": 1, "procStart": "generation-1"}))
+                if stage == "live-replacement":
+                    _ = world.case.client.native_ids.pop(world.pane)
+                    world.identity = fixture_runtime_id("replacement-dwight")
+                    world.pane = "w1:p4"
+                    world.environment["HERDR_PANE_ID"] = world.pane
+                    world.case.client.native_ids[world.pane] = world.identity
+                    world.case.client.rows.append({"pane_id": world.pane, "terminal_id": "replacement-terminal",
+                        "tab_id": "replacement-tab", "workspace_id": "w1", "label": "dwight",
+                        "agent_session": {"kind": "id", "value": world.identity}})
                 if stage in lost_stages:
                     world.active = False
                     _ = world.case.client.native_ids.pop(world.pane, None)
@@ -315,6 +388,13 @@ class StopResumeTests(unittest.TestCase):
                     self.assertEqual(staff.initial_snapshot().rows, ())
                     self.assertEqual({path.name: path.read_text() for path in (world.case.root / "panes").glob(".producer-admission-*")}, receipts)
                 result = stop_resume.resume("dwight")
+                if stage == "named-before-retry":
+                    self.assertIsInstance(result, stop_resume.ResumeFailed, result)
+                    self.assertEqual(staff.initial_snapshot().rows, ())
+                    self.assertEqual(world.arguments, [])
+                    self.assertEqual(len(world.case.client.opened), 1)
+                    self.assertEqual(world.case.client.closed, [])
+                    continue
                 if stage in ownership_stages:
                     self.assertNotIn(foreign_pane, world.started_panes)
                     if stage.startswith("foreign-"):
@@ -322,6 +402,10 @@ class StopResumeTests(unittest.TestCase):
                     else:
                         self.assertEqual(world.case.client.rows[-2]["agent_session"], {"kind": "id", "value": foreign["session_id"]})
                 self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+                if stage == "live-replacement":
+                    assert isinstance(result, stop_resume.ClaudeUp)
+                    self.assertEqual((result.session_id, result.pane_id, result.start_state),
+                                     (world.identity, world.pane, ClaudeStartState.ALREADY_RUNNING))
                 self.assertEqual(staff.initial_snapshot().rows[0].current_session, world.identity)
                 self.assertEqual(len(staff.initial_snapshot().rows), 1)
                 self.assertEqual(len(world.arguments), 2 if stage in resumed_stages else 1)

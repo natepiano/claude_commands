@@ -6,13 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import sqlite3
-import json
 from pathlib import Path
 from statistics import median
 from typing import TYPE_CHECKING, cast
 
 from scripts.aws_target import ledger
-from scripts.aws_target.ledger import ChargeRead
 
 if TYPE_CHECKING:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
@@ -25,36 +23,37 @@ else:
     from scripts.mac_test import offload
 
 
-def bill_lines(reading: ChargeRead, directory: Path) -> list[str]:
-    """Show the account bill and allocate daily Spot compute across launched boxes."""
-    if not reading.account_bill:
-        return ['AWS bill: unavailable; the saved reading uses the old format.']
-    if not ledger.is_billed_day(reading):
-        return []
-    state = 'provisional' if reading.provisional else 'reported'
-    at = datetime.fromtimestamp(reading.at, UTC).isoformat()
-    lines = [f'AWS bill (account, UTC {reading.day}, {state}): ${reading.actual_usd:.2f}; '
-             + f'read at {at}; query cost ${reading.query_usd:.2f}.']
-    compute: dict[str, Decimal] = {}
-    for row in reading.usage_types:
-        if 'SpotUsage' in row.usage_type:
-            instance_type = row.usage_type.partition('SpotUsage:')[2] or 'unspecified'
-            compute[instance_type] = compute.get(instance_type, Decimal(0)) + row.usd
-    counts: dict[str, int] = {}
-    path = directory / 'cloud-gate-launches.jsonl'
-    if path.exists():
-        for line in path.read_text().splitlines():
-            row = ledger.mapping(cast(object, json.loads(line)))
-            if row.get('result') == 'launched' and reading.period_start <= float(str(row['time'])) < reading.period_end:
-                instance_type = ledger.text(row, 'instance_type')
-                counts[instance_type] = counts.get(instance_type, 0) + 1
-    for instance_type, usd in sorted(compute.items()):
-        boxes = counts.get(instance_type, 0)
-        allocation = f'${usd / boxes:.4f} per run (daily allocation)' if boxes else 'cost per run unavailable'
-        lines.append(f'AWS bill Spot compute, {instance_type}: ${usd:.4f}; {boxes} launched boxes; {allocation}.')
-    if compute:
-        lines.append('Account Spot compute can include the older Spot builder. Per-run costs use the daily allocation.')
-    return lines
+def daily_spend_source(spend: ledger.DailySpend) -> str:
+    if spend.provisional_bill:
+        return 'provisional bill'
+    return 'bill' if spend.source == 'AWS bill' else 'estimate'
+
+
+def daily_spend_lines(spends: list[ledger.DailySpend], limit: Decimal, today: str) -> list[str]:
+    if not spends:
+        return ['No spend days.', '']
+    latest = next((row for row in spends if row.day == today), spends[0])
+    label = 'Today' if latest.day == today else 'Latest day'
+    source = daily_spend_source(latest)
+    lines = [f'**{label} (UTC {latest.day}, {source}): ${latest.usd:.2f} of the ${limit:.2f} daily limit. '
+             + f'{latest.runs} gate runs.**', '']
+    lines.extend(('| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Storage | Other | Gate runs | Source |',
+                  '|---|---:|---:|---:|---:|---:|---:|---|'))
+    groups = ledger.SPEND_GROUPS[:3]
+    for spend in spends:
+        amounts = {row.group: row.usd for row in spend.groups}
+        cells = [f'${amounts.get(group, Decimal(0)):.2f}' for group in groups]
+        other = sum((usd for group, usd in amounts.items() if group not in groups), Decimal(0))
+        source = daily_spend_source(spend)
+        lines.append(f'| {spend.day} | ${spend.usd:.2f} | ' + ' | '.join(cells)
+                     + f' | ${other:.2f} | {spend.runs} | {source} |')
+    return [*lines, '']
+
+
+@dataclass(frozen=True)
+class GateCostReport:
+    tables: list[str]
+    source: str
 
 
 @dataclass(frozen=True)
@@ -80,6 +79,15 @@ def billed_cost_per_run(runs: list[FinishedGateRun], allocations: dict[tuple[str
     return sum((allocations[key] for key in groups), Decimal(0)) / len(runs)
 
 
+def trend_cost_cell(runs: list[FinishedGateRun], allocations: dict[tuple[str, str, str], Decimal]) -> str:
+    if not runs:
+        return '—'
+    billed = [run for run in runs if (run.instance_type, run.day, run.mode) in allocations]
+    if not billed:
+        return 'not billed yet'
+    return f'${billed_cost_per_run(billed, allocations):.4f}'
+
+
 def median_run_time(seconds: list[Decimal]) -> str:
     if not seconds:
         return '—'
@@ -87,7 +95,7 @@ def median_run_time(seconds: list[Decimal]) -> str:
     return f'{minutes}m {remainder}s'
 
 
-def gate_type_lines(directory: Path, day: str, days: int) -> list[str]:
+def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
     """Compare costs and times by machine type, run kind, and UTC completion day."""
     end = datetime.fromisoformat(day).replace(tzinfo=UTC) + timedelta(days=1)
     start = end - timedelta(days=days)
@@ -127,7 +135,7 @@ def gate_type_lines(directory: Path, day: str, days: int) -> list[str]:
         if at in billed_days:
             total = sum((groups.get((size, at, kind), Decimal(0)) for kind, _label in kinds), Decimal(0))
             allocations[size, at, mode] = costs[size, at] * seconds / total
-    lines = ['', '| Machine type | Merge gates | Targeted tests | All runs |', '|---|---:|---:|---:|']
+    lines = ['| Machine type | Merge gates | Targeted tests | All runs |', '|---|---:|---:|---:|']
     sizes = sorted({run.instance_type for run in runs})
     for size in sizes:
         selected = [run for run in runs if run.instance_type == size]
@@ -136,11 +144,8 @@ def gate_type_lines(directory: Path, day: str, days: int) -> list[str]:
     if len(sizes) >= 2:
         cells = [run_cost_cell([run for run in runs if run.mode == mode], allocations) for mode, _label in kinds]
         lines.append('| All types | ' + ' | '.join([*cells, run_cost_cell(runs, allocations)]) + ' |')
-    times = [f'{size} {label}: ' + median_run_time([run.test_s for run in runs if run.instance_type == size and run.mode == mode])
-             for size in sizes for mode, label in kinds]
-    lines.extend(('', 'Median test time: ' + ('; '.join(times) if times else 'no finished runs') + '.',
-        f'Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC {start.date()} through {end.date() - timedelta(days=1)} '
-        + f'({days} days); billed days only; {omitted} rows omitted with no kind or matching launch; Spot cost can include the older builder.'))
+    source = (f'Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC {start.date()} through {end.date() - timedelta(days=1)} '
+              + f'({days} days); billed days only; {omitted} rows omitted with no kind or matching launch.')
     lines.extend(('', '| Day (UTC) | Merge gates | Merge gate test time | Merge gate box time | Targeted tests | Targeted test time | Targeted box time | Cost per run |',
         '|---|---:|---:|---:|---:|---:|---:|---:|'))
     for at in sorted({run.day for run in runs}, reverse=True):
@@ -150,23 +155,15 @@ def gate_type_lines(directory: Path, day: str, days: int) -> list[str]:
             matching = [run for run in selected if run.mode == mode]
             cells.extend((str(len(matching)), median_run_time([run.test_s for run in matching]),
                           median_run_time([run.box_s for run in matching])))
-        cost = (f'${billed_cost_per_run(selected, allocations):.4f}'
-                if at in billed_days else 'not billed yet')
+        cost = trend_cost_cell(selected, allocations)
         lines.append(f'| {at} | ' + ' | '.join([*cells, cost]) + ' |')
-    return lines
-
-
-def spend_lines(spend: ledger.DailySpend, limit: Decimal, *, today: bool) -> list[str]:
-    label = "Today's spend" if today else 'Spend'
-    runs = 'run' if spend.runs == 1 else 'runs'
-    lines = [f'{label} (UTC {spend.day}): ${spend.usd:.2f}; limit ${limit:.2f}; '
-             + f'{spend.runs} {runs}; {spend.source}.', '',
-             '| Spend group | Amount | Share |', '|---|---:|---:|']
-    for row in spend.groups:
-        share = row.usd * 100 / spend.usd if spend.usd else Decimal(0)
-        lines.append(f'| {row.group} | ${row.usd:.4f} | {share:.1f}% |')
-    lines.extend(('', f'Ledger query fees: ${spend.query_usd:.2f}.', ''))
-    return lines
+    totals: list[str] = []
+    for mode, _label in kinds:
+        matching = [run for run in runs if run.mode == mode]
+        totals.extend((str(len(matching)), median_run_time([run.test_s for run in matching]),
+                       median_run_time([run.box_s for run in matching])))
+    lines.append('| All shown days | ' + ' | '.join([*totals, trend_cost_cell(runs, allocations)]) + ' |')
+    return GateCostReport([*lines, ''], source)
 
 
 @dataclass(frozen=True)

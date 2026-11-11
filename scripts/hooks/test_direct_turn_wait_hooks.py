@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 from unittest import mock
+from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -83,14 +84,15 @@ class DirectorWaitFixture:
 def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct") -> Generator[DirectorWaitFixture]:
     with short_socket_directory("turn-wait-") as temporary, ExitStack() as resources:
         root = Path(temporary)
-        run = root / "run"
-        run.mkdir()
+        _ = resources.enter_context(mock.patch.object(unit_runs, "RUN_ROOT", root / "unit"))
+        run = root / "unit" / "run"
+        run.mkdir(parents=True)
         history = root / "history" / "runs" / "run.jsonl"
         history.parent.mkdir(parents=True)
         phase: dict[str, object] = {"id": "6", "instance_id": "original-six", "title": "Wait hooks",
                                     "status": "active", "started_at": 1000}
         state: dict[str, object] = {"run_id": "run", "history_file": str(history), "working_dir": str(root),
-                                    "worktree": "fixture-unit", "status": "active", "phase": phase,
+                                    "worktree": "fixture-unit", "phase": phase,
                                     "main_agent": {"session_id": SESSION}, "pass": {}, "open_phases": [],
                                     "unit": "fixture-unit", "project_plan_doc": "plan.md"}
         _ = (root / "plan.md").write_text('> **Production: wait-production** — unit `fixture-unit`; production doc `production.md`\n')
@@ -147,6 +149,7 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root), "XDG_STATE_HOME": str(root / "state"),
             "UNIT_HISTORY_DIR": str(root / "history"), "UNIT_SYNC_WRITES": "0",
+            "SCRATCH_ROOT": str(root / "scratch"),
             "CLAUDE_PROBE_SESSION": "0", "CLAUDE_CODE_SESSION_ID": SESSION,
             "CONVERSATION_PAUSE_STATE_DIR": str(root / "pause"), "NOTIFIER_STATE_DIR": str(root / "notifier"),
             "SHOWRUNNER_STATE_DIR": str(root / "showrunner"), "ESCALATE_STATE_DIR": str(root / "escalate"),

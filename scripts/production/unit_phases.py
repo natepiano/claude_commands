@@ -295,13 +295,16 @@ def newest_unit_runs(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, Newes
 def open_unit_runs(snapshot: staff.StaffSnapshot, *,
                    read_run: RunEventsReader = read_work_events,
                    newest: dict[staff.StaffId, NewestUnitRun] | None = None) -> dict[staff.StaffId, OpenUnitRun]:
-    """Read each unit's newest run and retain its open phases."""
-    newest = newest_unit_runs(snapshot) if newest is None else newest
+    """Read each unit's staff pointer and retain its open phases."""
     result: dict[staff.StaffId, OpenUnitRun] = {}
-    for owner_id, run in newest.items():
-        events = read_run(run.path)
-        if any(event.get("event_type") == "run_finished" for event in events):
+    for owner in snapshot.find(kind="unit"):
+        if not isinstance(owner.run, staff.OpenRun) or not unit_runs.run_is_open(owner.run.path):
             continue
+        path = plan_history.history_root() / "runs" / f"{owner.run.path.name}.jsonl"
+        events = read_run(path)
+        start = next((event for event in events if event.get("event_type") == "run_started"), dict[str, object]())
+        started = next((float(value) for value in (start.get("run_started_at"), start.get("timestamp_epoch"))
+                        if isinstance(value, int | float) and not isinstance(value, bool)), 0.0)
         phases: dict[str, OpenPhaseHistory] = {}
         current = ""
         for event in events:
@@ -314,8 +317,11 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
                 _ = phases.pop(key, None)
             elif key in phases:
                 phases[key].events.append(event)
+        previous = newest.get(owner.id) if newest is not None else None
+        if previous is not None and previous.path == path:
+            started = previous.started
         if phases:
-            result[owner_id] = OpenUnitRun(run.started, run.path, tuple(
+            result[owner.id] = OpenUnitRun(started, path, tuple(
                 OpenRunPhase(phase.phase_id, display_cells.open_step(phase.events)) for phase in phases.values()))
     return result
 
@@ -408,7 +414,9 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             events[path] = display_cells.run_events(path)
         return events[path]
 
-    unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
+    unit_snapshot = staff.StaffSnapshot(tuple(
+        current for unit in units if isinstance(unit.member, staff.StaffRow)
+        if (current := snapshot.by_id(unit.member.id)) is not None))
     newest = newest_unit_runs(unit_snapshot)
     runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
     runs_reader = worker_runs.WorkerRuns(now) if runs_reader is None else runs_reader

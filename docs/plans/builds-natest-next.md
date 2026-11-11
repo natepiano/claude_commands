@@ -144,6 +144,13 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 - [x] **Phase notes stopped updating.** Text: `phase table not written: phase note target is not owned by builds/natest-unit: ~/rust/hanadocs/showrunners/builds/natest.md`. Cause: `_note_ownership` in `scripts/direct/phase_table.py` looks up the note's `unit:` field as a staff id, and the notes still hold the older `unit: natest-unit` header (queue, report and fastest also). So each write refuses. Fix: run the one-off `phase_table.py migrate-notes`, which reads `*/*.md` below `--vault-root` and rewrites the header to the staff id. Done 2026-11-05: the showrunner assigned the builds notes to natest; `phase_table.py migrate-notes` rewrote natest, queue, report, resources and verify. natedev has the fastest note.
 
+- [ ] **The copy guard source scan spends 22.5 CPU s in its checks, beyond its parse and one walk.** Owner: builds verify-unit.
+  - Target: `scripts/copies/copy_guard.py` (`scan_scripts`, `PythonPolicy`) as run by `scripts/copies/test_copy_guard_sources.py`.
+  - Why needed: the Phase 133 stage profile (3 paired rounds, 2026-11-11) puts the full module at 26.6 CPU s: parse 2.55, one walk 1.27, checks 22.49. The scan parses each Python file twice (1,012 parse calls for 506 files, about 2.5 s). The rest of the check cost is not split yet.
+  - Completion condition: a paired stage measure splits the 22.5 s by check, and the owner removes the double parse and any other repeated work that the split names.
+  - Return rule: take it as a speed phase only when a measure joins it with other savings to at least 30 CPU s per gate.
+  - Revealed by: Phase 133. Showrunner answer: backlog for verify-unit (2026-11-11).
+
 ## Floors
 
 Each floor row states its measurement conditions: revision, filesystem roots and bytecode cache (showrunner, 2026-11-09). Compare a gate reading with a floor only under the same conditions. The older rows are wall floors from before 2026-11-06, not CPU floors. A wall floor does not hold a module back when its CPU rank calls it and direct calls were not tried. The `direct/test_verify*` rows go to the batches.

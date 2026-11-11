@@ -779,6 +779,11 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows["claude4"]["roles"], ["units"])
         self.assertEqual(rows["claude4"]["selected_roles"], [])
         self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "idle": 1, "paused": 0, "exited": 0, "total": 2}])
+        self.assertEqual(rows["claude4"]["sessions"], sorted([
+            {"session": members[0].current_session, "state": "busy"},
+            {"session": members[2].current_session, "state": "idle"},
+        ], key=lambda entry: entry["session"]))
+        self.assertIn({"session": members[3].current_session, "state": "exited"}, rows["claude2"]["sessions"])
         table = accounts.render_status_table(reading)
         for text in ("units ✓ 2 (busy 1, idle 0, paused 0, exited 1)", "units 2 (busy 1, idle 1, paused 0, exited 0)",
                      "showrunners ✓ 1 (busy 0, idle 0, paused 0, exited 1)"):
@@ -5572,7 +5577,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         document = cast(dict[str, object], json.loads(output))
         self.assertEqual(set(document), {"accounts", "problems", "session_inputs", "upcoming_moves"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "sessions", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -6537,9 +6542,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
         resets = datetime.now(timezone.utc) + timedelta(days=3)
-        usage_store.save([self.reading(
-            "main@example.invalid", agent_accounts.Quota("5-hour", 50.0, resets), agent_accounts.Quota("Weekly", 50.0, resets),
-        )], datetime.now(timezone.utc))
+        report = self.reading("main@example.invalid", agent_accounts.Quota("5-hour", 50, resets),
+                              agent_accounts.Quota("Weekly", 50, resets))
+        usage_store.save([report], datetime.now(timezone.utc))
         setting = resets.astimezone(ZoneInfo("Europe/Paris")).strftime("%a %m-%d %H:%M %Z")
 
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
@@ -6547,6 +6552,53 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual(self.status_rows()[0][4], setting)
             with patch.object(showrunners, "registered_showrunners", side_effect=OSError("session records unreadable")):
                 self.assertEqual(self.status_rows()[0][4], setting)
+            def failed_discovery() -> None:
+                print("skipping fixture-showrunner: no showrunner staff row", file=sys.stderr)
+                raise OSError("session records unreadable")
+
+            saved = role_map.CachedAfterFetchFailure(datetime(2026, 10, 16, 15, 24, tzinfo=timezone.utc),
+                                                     "fixture transport failed")
+            with (patch.object(showrunners, "registered_showrunners", side_effect=failed_discovery) as discovery,
+                  patch.object(role_map, "observed_map_provenance", return_value=saved)):
+                code, output, errors = self.run_cli("status")
+            self.assertEqual((code, errors), (0, ""))
+            self.assertIn(setting, output)
+            self.assertIn(saved.at.astimezone(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d %H:%M %Z"), output)
+            self.assertNotIn("skipping fixture-showrunner", output)
+            discovery.assert_not_called()
+
+            usage_store.store_file().unlink()
+            self.live[accounts.account_dir("claude2")] = replace(report,
+                store_warnings=(agent_accounts.UsageClaimFailed("fixture claim denied"),))
+            with (patch.object(showrunners, "registered_showrunners", side_effect=failed_discovery) as discovery,
+                  patch.object(accounts, "datetime", RoleWriteTime)):
+                code, output, errors = self.run_cli("status")
+            self.assertEqual((code, errors), (0, ""))
+            read_at = RoleWriteTime.now(timezone.utc).astimezone(ZoneInfo("Europe/Paris"))
+            self.assertIn(f"fixture claim denied; read at {read_at:%Y-%m-%d %H:%M %Z}", output)
+            self.assertIn("usage store read continued without a hold", output)
+            self.assertIn(setting, output)
+            self.assertNotIn("skipping fixture-showrunner", output)
+            discovery.assert_not_called()
+
+            self.live.clear()
+            _ = self.workers_fixture()
+            usage_store.save([report, *(agent_accounts.Report("Codex", email=login,
+                five_hour=agent_accounts.Quota("5-hour", 100, resets),
+                quotas=[agent_accounts.Quota("Weekly", 100, resets)], credit_balance="0")
+                for login in ("target@example.invalid", "default@example.invalid"))], datetime.now(timezone.utc))
+            refusals.write_refusal(refusals.AccountRefusal("codex", "target@example.invalid",
+                refusals.KnownWindow("weekly"), refusals.KnownReset(resets), saved.at))
+            with (patch.object(showrunners, "registered_showrunners", side_effect=failed_discovery) as discovery,
+                  patch.object(accounts, "_check_codex_home", return_value=())):
+                code, output, errors = self.run_cli("status", "--detail")
+            self.assertEqual((code, errors), (0, ""))
+            detail_reset = resets.astimezone(ZoneInfo("Europe/Paris")).strftime("%a %Y-%m-%d %H:%M %Z")
+            self.assertIn("Codex workers: codex2; on refusal: no codex account has room; "
+                          + f"the earliest reset is {detail_reset}", output)
+            self.assertIn(setting, output)
+            self.assertNotIn("skipping fixture-showrunner", output)
+            discovery.assert_not_called()
         self.assertEqual(
             self.status_rows()[0][4],
             resets.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"),
@@ -6559,7 +6611,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             agent_accounts.Quota("5-hour", 50, resets), agent_accounts.Quota("Weekly", 50, resets),
         )], datetime.now(timezone.utc))
         zone = ZoneInfo("Asia/Tokyo")
-        with patch.object(agent_accounts, "user_zone", return_value=zone) as resolve:
+        with patch.object(accounts, "user_zone", return_value=zone) as resolve:
             self.assertEqual(self.status_rows()[0][4], resets.astimezone(zone).strftime("%a %m-%d %H:%M %Z"))
         resolve.assert_called_once_with()
 
@@ -7478,6 +7530,22 @@ class PaneWorkerMoveTests(unittest.TestCase):
             "pass": {row.name: {"worker_name": row.name, "team_slot": row.name, "kind": role,
                                  "status": status, "started_at": time.time(), "instance_id": "dispatch-" + row.name,
                                  "launcher_command": ["assign.sh", "--to", row.name]}}}))
+        if status == "active":
+            from scripts.direct import progress_history
+            from scripts.production import worker_admission
+
+            instance = "dispatch-" + row.name
+            line = (f'Read the unchanged prompt file "{self.root / "prompt.md"}". '
+                    f"End your final reply with this line alone: DONE {instance}\n"
+                    "A reply that waits on a detached run is not final.")
+            progress_history.save_dispatch_delivery(self.run_dir, instance,
+                progress_history.DispatchDelivery(line, instance, str(self.root / "reply.md")))
+            backend = staff.backend(row)
+            assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+            entry = ({"type": "event_msg", "payload": {"type": "user_message", "message": line}}
+                     if isinstance(backend, staff.CodexBackend) else
+                     {"type": "user", "message": {"role": "user", "content": line}})
+            atomic_file.write_text_atomic(worker_admission.transcript_source(row, backend), json.dumps(entry) + "\n")
         if status == "completed":
             from scripts.production import worker_admission
 
@@ -7810,9 +7878,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         from scripts.direct import progress_history
 
         row = self.worker()
-        _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
-        with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
-              patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatch("saved-pass", ("assign.sh",)))):
+        self.dispatch(row)
+        with patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()):
             result = self.move("claude2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.world.requests[-1][2]["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
@@ -9020,7 +9087,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
             "label": "fixture", "tool": "codex", "roles": ["workers"], "selected_roles": [], "role_counts": [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
-            "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {},
+            "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {}, "sessions": [],
         })
 
 

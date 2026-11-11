@@ -697,6 +697,21 @@ class WorkerPaneTests(StaffTestCase):
                         runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
                 prompt.assert_not_called()
 
+        for live in (True, False):
+            with self.subTest(cause="idle worker has no active dispatch", live=live):
+                idle = self.worker("idle-restore-" + str(live))
+                pane = "w1:p-idle-" + str(live)
+                self.world.add(idle, pane, live=live)
+                launches = list(self.world.launches)
+                with patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt:
+                    self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(), only=frozenset({idle.id}),
+                        runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
+                prompt.assert_not_called()
+                self.assertNotIn(pane, self.world.locations)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
+                self.assertEqual(self.world.launches, launches)
+                self.assertEqual(staff.by_id(idle.id), idle)
+
     def test_restore_checks_the_transcript_before_offering_an_unsubmitted_assignment(self) -> None:
         from scripts.production import worker
         _row, _source, dispatch = self.resume_fixture()
@@ -2700,9 +2715,10 @@ class WorkerPaneTests(StaffTestCase):
         run = self.run_state()
         for family in ("codex", "claude"):
             _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
-            for live, busy in ((False, False), (True, False), (True, True)):
-                with self.subTest(family=family, live=live, busy=busy):
-                    name = f"move-{family}-{live}-{busy}"
+            for live, busy, passed in ((False, False, "none"), (True, False, "none"), (True, True, "none"),
+                                       (True, False, "stale active"), (True, False, "completed")):
+                with self.subTest(family=family, live=live, busy=busy, passed=passed):
+                    name = f"move-{family}-{live}-{busy}-{passed.replace(' ', '-')}"
                     if live:
                         opened = self.start(name)
                         assert isinstance(opened, worker_panes.OpenWorker)
@@ -2716,6 +2732,14 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertEqual(row.role, staff.KnownWorkerRole("impl"))
                     if busy:
                         self.world.locations[pane]["agent_status"] = "working"
+                    if passed == "stale active":
+                        self.dispatch(row, "impl")
+                        path = run / "progress_history_state.json"
+                        state = cast(dict[str, object], json.loads(path.read_text()))
+                        cast(dict[str, dict[str, object]], state["pass"])[name]["launcher_command"] = ["assign.sh"]
+                        write_text_atomic(path, json.dumps(state))
+                    elif passed == "completed":
+                        self.completed_dispatch(row, "impl")
                     target = self.root / (family + "2")
                     move = pane_moves.WorkerMove(row, self.parent.id, family, family + "2", "", run, self.world)
                     common = moves.MoveCommon(at="2026-11-09T00:00:00+00:00", tool=family,
@@ -2736,6 +2760,9 @@ class WorkerPaneTests(StaffTestCase):
                           patch.object(worker_panes, "close", wraps=worker_panes.close) as close,
                           patch.object(self.world, "close_tab_confirmed", side_effect=AssertionError("no close check")),
                           patch.object(self.world, "pane_activity", side_effect=AssertionError("no activity check"))):
+                        if passed != "none":
+                            self.assertIsInstance(pane_moves.preview_worker(row, staff.snapshot(), family + "2", "", run),
+                                                  accounts.IdleWorkerPaneClose)
                         result = pane_moves.move_worker(row, staff.snapshot(), family + "2", "", run)
                     if busy:
                         self.assertIsInstance(result, stop_results.ClaudeUp)

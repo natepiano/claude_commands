@@ -77,12 +77,15 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 `status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the problem lines below the normal table.
 `upcoming_moves` contains the rendered upcoming move lines, including the heading.
 
-Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`.
+Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `sessions`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`.
 `tool` is `claude` or `codex`.
 Roles include observed members and selected roles with zero members.
 `selected_roles` identifies the selected account independently.
 Codex roles are `workers` or `spare`.
 Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, idle, paused, exited, total}`.
+`sessions` lists each locally observed member once as `{"session": "<native session id>", "state": "busy|idle|paused|exited"}`.
+The list uses the same classified results as the local role counts, without another pane read.
+Peer caches supply aggregate counts only; they supply no session identities.
 Claude sessions use their session-record state for busy and idle counts.
 A unit or showrunner without a live session counts as exited on its selected role account.
 Absent units use the units account; absent showrunners use the showrunners account.
