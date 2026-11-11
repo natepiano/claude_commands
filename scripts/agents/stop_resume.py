@@ -1238,7 +1238,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         else:
             _ = entry.pop("config_dir", None)
-        if row is not None and row.kind == "producer":
+        if row is not None and row.kind == "producer" and not (
+                isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
+                and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
             space = herdr.row_workspace(row, names.tab_record, row.name)
             if isinstance(tab, SessionNotFound) or not client.producer_pane(tab.pane_id, row.name, space):
                 destination = client.producer_row_tab(str(row.id), row.name, space)

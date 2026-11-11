@@ -20,6 +20,7 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from dataclasses import replace
+from enum import Enum
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import Literal, Never, cast, final, override
@@ -1691,8 +1692,13 @@ class StopResumeTests(unittest.TestCase):
         row = staff.StaffRow(fixed, "producer", "row-name", staff.StaffRoot(), current_session=current)
         retained = {**self.client.rows[0], "agent_session": {"kind": "none"}}
         self.publish_new_launch = True
-        cases: list[tuple[str, bool, tuple[str, ...], bool, bool, bool, Literal["claude", "codex"], bool]] = [
-                 (workspace, shared, commands, refuse_close, metadata, cross, "claude", False)
+
+        class ResumeCaller(Enum):
+            OTHER_PANE = "another pane"
+            TARGET_PANE = "the bound target pane"
+
+        cases: list[tuple[str, bool, tuple[str, ...], bool, bool, bool, Literal["claude", "codex"], bool, ResumeCaller]] = [
+                 (workspace, shared, commands, refuse_close, metadata, cross, "claude", False, ResumeCaller.OTHER_PANE)
                  for workspace, shared, commands, refuse_close, metadata, cross in (
                 ("producers", False, (), False, False, False),  # Control: reuse the valid producer tab.
                 ("morty", False, (), False, False, False),
@@ -1701,11 +1707,13 @@ class StopResumeTests(unittest.TestCase):
                 ("morty", False, ("background-job",), False, True, False),
                 ("morty", False, (), True, True, False),
                 ("morty", False, (), False, False, True))]
-        cases.extend(("morty", False, ("editor",), False, True, False, family, True)
+        cases.extend(("morty", False, ("editor",), False, True, False, family, True, ResumeCaller.OTHER_PANE)
                      for family in ("claude", "codex"))
-        for workspace, shared, commands, refuse_close, metadata, cross, family, stale in cases:
+        cases.append(("producers", False, ("python3",), False, False, False, "claude", False, ResumeCaller.TARGET_PANE))
+        for workspace, shared, commands, refuse_close, metadata, cross, family, stale, caller in cases:
             shell = not commands
-            with self.subTest(workspace=workspace, shared=shared, commands=commands, refuse_close=refuse_close, family=family, stale=stale):
+            with self.subTest(workspace=workspace, shared=shared, commands=commands, refuse_close=refuse_close,
+                              family=family, stale=stale, caller=caller):
                 _ = write_registry(self.root / "configuration/models.conf", {"producers": {
                     row.name: "codex:gpt-test:high" if family == "codex" else "claude:opus:max"}}, update=True)
                 variable = "CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"
@@ -1811,7 +1819,26 @@ class StopResumeTests(unittest.TestCase):
                       patch.object(self.client, "run", side_effect=run),
                       patch.object(self.client, "result", side_effect=layout),
                       patch.object(self.client, "pane_activity", side_effect=activity),
-                      patch.object(self.client, "open_tab", side_effect=open_tab) as opened):
+                      patch.object(self.client, "open_tab", side_effect=open_tab) as opened,
+                      patch.dict(os.environ, {"HERDR_SESSION": "agents", "HERDR_PANE_ID": self.entry["pane_id"]}
+                                 if caller is ResumeCaller.TARGET_PANE else {}),
+                      patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
+                    if caller is ResumeCaller.TARGET_PANE:
+                        with self.assertRaises(SystemExit):
+                            _ = stop_resume._resume_once(str(current), why="recovery",  # pyright: ignore[reportPrivateUsage]
+                                                         names=LaunchNames(staff.StaffSnapshot((row,))))
+                        execute.assert_called_once()
+                        target = cast(herdr.TabSession, execute.call_args.args[0])
+                        resumed = cast(pane_record.PaneLaunch, execute.call_args.args[1])
+                        self.assertEqual((target.pane_id, target.session_id), (self.entry["pane_id"], current))
+                        self.assertEqual(resumed["session_id"], current)
+                        opened.assert_not_called()
+                        self.start.assert_not_called()
+                        codex_start.assert_not_called()
+                        self.assertEqual(self.client.closed, [])
+                        publication = pane_record.read("agents")[self.entry["pane_id"]]
+                        self.assertEqual(publication["session_id"], fixed)
+                        continue
                     result = stop_resume._resume_once(str(current), why="recovery",  # pyright: ignore[reportPrivateUsage]
                                                      to=target_home.name.removeprefix(".") if stale else None,
                                                      names=LaunchNames(staff.StaffSnapshot((row,))))
