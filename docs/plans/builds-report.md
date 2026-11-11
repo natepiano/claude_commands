@@ -1002,34 +1002,13 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/buildlog/test_costs.py` — the unknown-command and help table.
 
 ### Phase 49 — buildlog query uses the shared table printer · status: done
-**Depends on:** natest Phase 144 on `origin/builds` (the shared `print_table` right-aligns number columns).
 
-From the builds showrunner (not the user), 2026-11-11: "Two print_table copies is duplication." `scripts/buildlog/cli.py` keeps its own `print_table` and `cell`. `scripts/lib/terminal_cells.print_table` is the shared one.
+#### As-built
 
-Director decisions, stated to the showrunner: the dashed line under the headers goes, because no other shared table has one. A NULL prints `—`, which the shared number test counts as a number, so a number column with NULLs stays right-aligned. An empty result prints `no rows`.
-
-#### Work Order
-
-**Goal:** `buildlog query` prints its table through `scripts/lib/terminal_cells.print_table`. `cli.py` has no table printer of its own.
-
-**Spec:**
-- `scripts/buildlog/cli.py` loses `print_table`. The text branch of `query` calls `terminal_cells.print_table(names, texts, empty_message="no rows")`.
-- `cell` stays in `cli.py` and makes the text of each value: `None` is `—`, a float uses `:g` below `1e15`, any other value uses `str`.
-- The output has no dashed line under the headers. Number columns are right-aligned, and text columns are left-aligned, by the shared printer.
-- The `--json` output and the stderr timing line do not change.
-- `scripts/buildlog/test_gate_index.py` gets one test of the text table: a query with an integer column, a text column and a NULL. It checks the exact lines: right-aligned numbers, `—` for the NULL, and no dashed line. A second row of that test checks that an empty result prints `no rows`. No test covers the text table now.
+- `buildlog query` prints its text table through `scripts/lib/terminal_cells.print_table`. `cli.py` has no table printer of its own.
+- `cli.cell` makes the text of each value: NULL is `—`, a float uses `:g` below `1e15`, any other value uses `str`. A number column with NULLs stays right-aligned, because the shared number test counts `—` as a number.
+- An empty result prints `no rows`. The table has no dashed line under the headers. The `--json` output and the stderr timing line do not change.
 
 **Files:**
-- `scripts/buildlog/cli.py`
-- `scripts/buildlog/test_gate_index.py`
-
-**Workers:** `1 writer`
-- writer — both files and the test.
-
-**State:** none.
-
-**Acceptance gate:**
-- The new `test_gate_index` test passes, with exact lines for the table and for `no rows`.
-- `grep -n "def print_table" scripts/buildlog/cli.py` finds nothing.
-- `scripts.buildlog.test_gate_index`, `test_costs` and `scripts.lib.test_terminal_cells` pass.
-- `basedpyright` reports 0 errors and 0 warnings on the two files.
+- `scripts/buildlog/cli.py` — `cell` and the text branch of `query`.
+- `scripts/buildlog/test_gate_index.py` — `test_query_text_aligns_numbers_and_prints_empty_results`.
