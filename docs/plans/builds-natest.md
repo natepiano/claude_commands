@@ -2525,39 +2525,63 @@ A private copy of the git index now keeps the mtime of the bytes it copies, so g
 **Gotchas:** `shutil.copy2` is not enough. It stats the path again after the read, and git replaces the index by rename, so a rewrite between the two gives old bytes with a newer mtime. Do not copy a git index with `cp` or `shutil.copyfile`; use `git_index.private_copy`. The macOS run of the `validate_ci.sh` regression is not verified.
 
 ### Phase 127 — A config edit selects only the tests that really read that config file  · status: done
-**Depends on:** none
+
+#### As-built
+
+Config reads are recorded at run time. When the environment has `CONF_READ_LOG`, each read through `conf.py` or `conf.sh` appends the config stem to that file with one append write; without the variable, the readers do no added work. `module_run.py` sets the log per module, so child processes inherit it, and writes the sorted stems to the module's times file as `config_reads`. The gate record and the build log index (schema 37, `gate_modules.config_reads`) carry them. A module with no times file has no record (NULL), which is different from an empty list.
+
+`affected_modules.select_affected` selects, for each changed `config/<name>.conf`:
+- the modules that recorded `<name>` in the newest full, non-aborted gate with at least one config record (`latest_config_reads`); a newer gate without records does not replace it;
+- the modules with no record in that gate;
+- the modules whose own text names the file (direct `SourceFacts.config_reads`).
+
+The transitive config closure is deleted. An index read error gives `FullSuite` with a reason. On 19 builds merges, the estimate is targeted CPU 17,861 to 10,042 CPU s (median 280 to 126 per merge); selection takes under 3 s.
+
+**Files:**
+- `scripts/lib/conf_reads.py` — new; the recorder (`record`, `read_text`), standard library only
+- `scripts/lib/conf.py`, `scripts/lib/conf.sh` — record each read
+- `scripts/test_times/module_run.py`, `scripts/test_times/gate_record.py`, `scripts/buildlog/index.py` — carry the records
+- `scripts/production/affected_modules.py` — `latest_config_reads`, `select_affected`
+- Nine direct config readers read through `conf_reads.read_text`
+
+**Gotchas:**
+- `conf_reads.py` binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not catch the record.
+- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`. The Mac context-economy payload ships both.
+- Nine raw readers do not record: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, the `models_registry.py` edit snapshots and `deploy.py`.
+- A new reader is missed until the next full gate records it.
+
+**Ruled out:** the transitive closure rule of Phase 96 — one `merge_gate.conf` edit selected 429 of 743 modules.
+
+### Phase 128 — Test runs start no background Git upkeep  · status: todo
+**Depends on:** Phase 127
 
 #### Work Order
 
-**Goal:** A targeted test for a changed `config/<name>.conf` selects only the test modules that read that file in the last full merge gate, plus modules with no record and modules that name the file in their own text.
+**Goal:** Git starts no automatic maintenance or garbage collection inside any test module that the gate runner starts, and the eight per-fixture copies of that setting are gone.
 
-**Decision:** User answer "B" (via the builds showrunner, 2026-11-10): each full merge gate records which config files each test module reads at run time; a targeted test selects only those modules, plus modules with no record and modules that name the file in their own text.
+**Decision:** Builds showrunner go, 2026-11-10 21:28: run after Phase 127; remove the per-fixture git upkeep copies in the same phase; get each file owner's go before the checkpoint and name the goes in the notice; proof is paired gate CPU on a review copy.
 
-**Cause:** The approved transitive rule (phase 96) selects every module whose import closure reaches a `conf.<fn>("<name>")` reader. One `merge_gate.conf` edit selects 429 of 743 modules. In the phase 112 replay, this rule was 86% of targeted CPU.
+**Cause:** Test fixtures make thousands of temporary Git repositories. After commits and fetches, Git starts `git maintenance run --auto` and `git gc --auto`, about 10% of all Git starts in a gate. Some of that work detaches and escapes the module's CPU count. Measured with `module_cost.py --commands` on 12 Git-heavy modules: Git CPU 135.4 and 125.8 CPU s with upkeep, 79.2 and 79.7 CPU s without it (about 50 CPU s saved). The measure set `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=maintenance.auto`, `GIT_CONFIG_VALUE_0=false`.
 
 **Spec:**
-1. Record reads in the two config readers. When the environment has `CONF_READ_LOG` (a file path), each read appends the config stem and a newline to that file with one append write.
-   - `scripts/lib/conf.py`: record in the one function that every reader goes through to resolve a config file. Over-recording is safe; a missed read is not.
-   - `scripts/lib/conf.sh` `conf_value`: append `$file` with a shell builtin; start no process.
-   - Without the variable, the readers do no added work.
-   - Search `scripts/` for other readers of `config/*.conf` (direct `open`, `read_text`, `jq`, `grep`, `sed`). Route each through `conf` where it is a plain value read. List the rest in the reply; a module that runs one of them must still be selected (see 4c).
-   - As built: the recorder is `scripts/lib/conf_reads.py` (standard library only). It binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not see the record. Nine raw readers stay routed through `conf_reads.read_text`. Raw readers kept: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, `models_registry.py` edit snapshots, `deploy.py`. Fixture copies of `conf.py` and the Mac context-economy payload carry `conf_reads.py`.
-2. `scripts/test_times/module_run.py`: set `CONF_READ_LOG` to a private file for the module run, so child processes inherit it. Write the sorted set of read stems into the module's times file as `config_reads`.
-3. `scripts/test_times/gate_record.py` and `scripts/production/merge_gate.py`: carry `config_reads` into each `ModuleRun` of the gate record. `scripts/buildlog/index.py`: store it on `gate_modules` (raise `SCHEMA_VERSION`). A module without a times file has no record.
-4. `scripts/production/affected_modules.py` `select_affected`, for each changed `config/<name>.conf`, selects a module when:
-   a. the newest full (`selection == "full"`), not aborted, gate run in the local build log index with at least one `config_reads` row ran the module and recorded `<name>` for it. A newer gate from a branch without records does not replace it; or
-   b. that gate run has no `config_reads` row for the module (new module, missing times file, or no full gate with records yet); or
-   c. the module's own text names the file: its own direct `SourceFacts.config_reads` (not the transitive closure) contains `<name>`.
-   Delete `transitive_config_reads` and every use of the transitive config closure. One rule only.
-5. A read error of the index gives `FullSuite` with a reason, as other graph errors do.
-6. Tests: one row each in the existing test files (`test_conf.py`, `test_conf_sh.py`, `test_module_run.py`, `test_gate_record.py`, the index test, `test_affected_modules.py`). Each new row fails on the old code. Use temporary repositories and a temporary build log; no live state; no committed test project.
+1. `scripts/test_times/module_run.py`: before it starts the module, add two command-line Git settings through the environment, `maintenance.auto=false` and `gc.auto=0`. Use `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`. Append after any inherited entries: read the inherited `GIT_CONFIG_COUNT` and number the new keys from it, as `scripts/production/ci_points.py:166` does. Child processes inherit the settings. Command-line settings also apply when a fixture sets `GIT_CONFIG_NOSYSTEM=1` or `GIT_CONFIG_GLOBAL`, which many fixtures do; a system config file would not reach those fixtures.
+2. Remove each per-fixture copy that only turns off Git upkeep in a test repository:
+   - `scripts/production/test_fast_track.py:351` (`maintenance.auto false`)
+   - `scripts/production/rename_unit_test_support.py:131` (`gc.auto 0` in the config loop) and `:321` (`gc.auto 0`)
+   - `scripts/production/add_unit_test_support.py:242` (`GIT_CONFIG_PARAMETERS` patch) and `:249` (`maintenance.auto false` loop)
+   - `scripts/production/test_staff.py:534` (change only this upkeep line; another unit may edit staff tests)
+   - `scripts/production/rename_test_support.py:595` (`gc.auto`, `maintenance.auto` loop)
+   - `scripts/production/transfer_unit_test_support.py:139` (`gc.auto 0` in the config loop)
+   - `scripts/production/test_affected_modules.py:31`
+   Search `scripts/` for others (`maintenance.auto`, `gc.auto`, `GIT_CONFIG_PARAMETERS` with those keys) and list them in the reply. Keep a copy when its test proves Git upkeep behavior itself, and say why. Do not touch `scripts/style/test_style_footprint.py:2022`: it is text in a generated Rust fixture.
+3. Confirm in the reply that every gate path runs modules through `module_run.py`: `merge_gate.py` (full and targeted) and the Mac runner. Name any path that does not.
+4. Tests: one row in `scripts/test_times/test_module_run.py`. A module run under `module_run.py` reads `git config --get maintenance.auto` as `false` and `gc.auto` as `0`, also with `GIT_CONFIG_NOSYSTEM=1`, and an inherited `GIT_CONFIG_COUNT` entry stays visible. The row fails on the old code.
 
 **Files:**
-- `scripts/lib/conf.py`, `scripts/lib/conf.sh` — record reads
-- `scripts/test_times/module_run.py`, `scripts/test_times/gate_record.py`, `scripts/production/merge_gate.py`, `scripts/buildlog/index.py` — carry the reads into the gate record
-- `scripts/production/affected_modules.py` — select by recorded reads
-- `scripts/lib/test_conf.py`, `scripts/lib/test_conf_sh.py`, `scripts/test_times/test_module_run.py`, `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_index.py`, `scripts/production/test_affected_modules.py` — one new row each
-**Workers:** 1 writer (the record format joins all files).
+- `scripts/test_times/module_run.py` — command-line Git upkeep settings
+- `scripts/test_times/test_module_run.py` — one new row
+- `scripts/production/test_fast_track.py`, `scripts/production/rename_unit_test_support.py`, `scripts/production/add_unit_test_support.py`, `scripts/production/test_staff.py`, `scripts/production/rename_test_support.py`, `scripts/production/transfer_unit_test_support.py`, `scripts/production/test_affected_modules.py` — remove the per-fixture copies
+**Workers:** 1 writer (one setting and its removed copies).
 - impl: all files.
 
-**Acceptance gate:** targeted tests for the changed files pass; basedpyright 0/0/0 and ShellCheck clean on the changed files. The director runs one full local gate on the review copy, checks that its record holds `config_reads` for each module, and replays the phase 112 selections with the new rule. Report the median modules and CPU of a config edit before and after.
+**Acceptance gate:** the changed modules pass through `module_run.py`; basedpyright 0/0/0 on the changed files. The director runs paired gate CPU on a review copy (base and change, alternating order) for the 12 Git-heavy modules and the changed modules, scales it to the gate, and reports the whole-phase gain. The phase lands only at 30 CPU s per gate or more.
