@@ -179,8 +179,14 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 Filing folds modules findings from a sibling `*_tests.rs` file under one rule.
 The repository tree supplies the declaring file and module name.
 Both readers use `external_module_source` to compare full repository paths.
+The existing item-move reach check proves the declaring file's context from a Cargo root.
+Cargo discovery supplies each root, including binary roots.
+A target path or disabled target discovery prevents resolution.
+Unsupported attributes, multiple path attributes and nonplain path literals give no source.
+An unreadable file does not stop resolution in other files.
+The anchored tree must contain exactly one readable declaration of the test file.
 A `#[path]` value resolves from the declaring file's directory.
-A plain declaration resolves from that directory in `mod.rs`, `lib.rs` or `main.rs`.
+A plain declaration resolves from that directory in a verified crate root or `mod.rs`.
 In another file `x.rs`, a plain declaration resolves from the `x/` directory.
 The ledger reads the finding’s anchor commit, or HEAD when no anchor exists.
 It reads plain module declarations and declarations with a sibling file in a `#[path]` attribute.
@@ -190,7 +196,7 @@ The whole-file move replaces the external declaration with an inline module.
 The aggregate id includes the anchor commit.
 A later anchor creates a new aggregate.
 A fold never withdraws findings into a closed aggregate.
-Files without one declaring file keep their item findings.
+Files without one verified declaring file keep their item findings.
 Other sibling files remain separate.
 The order-waste report separates `folded test file duplicate` from `bare rename duplicate`.
 It reads the retained finding's kind to select the duplicate kind.

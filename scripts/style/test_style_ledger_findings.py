@@ -1283,7 +1283,9 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 parent = f"crates/alpha/src/{mode}/mod.rs"
                 paths = tuple(f"crates/alpha/src/{mode}/{name}.rs"
                               for name in ("first_tests", "second_tests", "mixed_tests", "ordinary", "missing_tests", "ambiguous_tests"))
-                self.write(parent, "mod first_tests;\nmod mixed_tests;\nmod ambiguous_tests;\n")
+                root = "crates/alpha/src/lib.rs"
+                self.write(root, (self.repo / root).read_text() + f"\nmod {mode};\n")
+                self.write(parent, "mod first_tests;\nmod mixed_tests;\nmod ambiguous_tests;\nmod owner;\nmod other;\n")
                 owner = f"crates/alpha/src/{mode}/owner.rs"
                 self.write(owner, '#[cfg(test)]\n#[path = "second_tests.rs"]\nmod file_tests;\n')
                 self.write(f"crates/alpha/src/{mode}/other.rs",
@@ -1343,13 +1345,20 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         for directory, declaration in (
                 ("wrong", '#[path = "widget_tests.rs"] mod file_tests;'),
                 ("plain", "mod widget_tests;"),
-                ("relative", '#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;')):
+                ("relative", '#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;'),
+                ("duplicate", '#[path = "widget/widget_tests.rs"] #[path = "other.rs"] mod file_tests;'),
+                ("conditional", '#[cfg_attr(all(), path = "other_tests.rs")] mod widget_tests;')):
             parent = f"crates/alpha/src/{directory}/widget.rs"
             path = f"crates/alpha/src/{directory}/widget/widget_tests.rs"
+            self.write(f"crates/alpha/src/{directory}/mod.rs", "mod widget;\n")
             self.write(parent, declaration + "\n")
             self.write(path, "fn moved_fixture() {}\n")
             self.write(f"crates/alpha/src/{directory}/widget_tests.rs", "fn different_fixture() {}\n")
             paths.append(path)
+        root = "crates/alpha/src/lib.rs"
+        self.write(root, (self.repo / root).read_text() +
+                   "\nmod wrong;\nmod plain;\nmod relative;\nmod duplicate;\nmod conditional;\nmod unreadable;\n")
+        self.write("crates/alpha/src/unreadable.rs", "#[path = \nmod;")
         _ = self.commit("Declare test files with full module paths")
         ledger = self.ledger()
         for path in paths:
@@ -1357,16 +1366,18 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 _ = ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
                                 "Inline the whole test file.", self.blob(rule), "outside")
         folded = ledger.fold_test_files()
-        self.assertEqual({group.path for group in folded}, set(paths[1:]))
+        self.assertEqual({group.path for group in folded}, set(paths[1:3]))
         live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
-        self.assertEqual(tuple(sum(finding.path == path for finding in live) for path in paths), (2, 1, 1))
+        self.assertEqual(tuple(sum(finding.path == path for finding in live) for path in paths), (2, 1, 1, 2, 2))
         for finding in live:
-            if finding.path != paths[0]:
+            if finding.path in paths[1:3]:
                 self.assertIn(finding.path.replace("/widget/widget_tests.rs", "/widget.rs"), finding.after)
 
     def test_a_new_test_file_anchor_gets_a_new_aggregate_after_the_old_one_is_built(self) -> None:
         rule = self.rule("test-move-anchors", "tier: D\nfamily: modules\ninput_scope: file\n")
         path = "crates/alpha/src/anchor/widget_tests.rs"
+        root = "crates/alpha/src/lib.rs"
+        self.write(root, (self.repo / root).read_text() + "\nmod anchor;\n")
         self.write("crates/alpha/src/anchor/mod.rs", "mod widget_tests;\n")
         ledger = self.ledger()
         aggregates: list[str] = []

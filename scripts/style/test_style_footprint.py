@@ -2059,16 +2059,23 @@ class StyleFootprintTests(unittest.TestCase):
                     self.assertIsInstance(result, style_footprint.NoItemMoves, result)
 
     def test_test_file_inlining_resolves_the_complete_module_path(self) -> None:
-        for declaration, name, proven in (
-                ('#[path = "widget_tests.rs"] mod file_tests;', "file_tests", False),
-                ("mod widget_tests;", "widget_tests", True),
-                ('#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;', "file_tests", True)):
+        for declaration, name, proven, alias in (
+                ('#[path = "widget_tests.rs"] mod file_tests;', "file_tests", False, False),
+                ("mod widget_tests;", "widget_tests", True, False),
+                ('#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;', "file_tests", True, False),
+                ('#[cfg_attr(all(), path = "other_tests.rs")] mod widget_tests;', "widget_tests", False, False),
+                ('#[path = "widget/widget_tests.rs"] #[path = "other.rs"] mod file_tests;', "file_tests", False, False),
+                ('#[path = 17] mod file_tests;', "file_tests", False, False),
+                ("mod widget_tests;", "widget_tests", False, True)):
             with self.subTest(declaration=declaration):
                 case = StyleFootprintTests()
                 case.setUp()
                 try:
                     content = "fn moved_fixture() {}\n"
-                    case.write("src/lib.rs", "mod widget;\n")
+                    case.write("src/lib.rs", "mod widget;\n" + ("mod other;\n" if alias else ""))
+                    if alias:
+                        case.write("src/other.rs", '#[path = "widget/widget_tests.rs"] mod alias;\n')
+                    case.write("src/other_tests.rs", "fn other_fixture() {}\n")
                     case.write("src/widget.rs", declaration + "\n")
                     case.write("src/widget_tests.rs", "fn different_fixture() {}\n")
                     case.write("src/widget/widget_tests.rs", content)
@@ -2083,6 +2090,30 @@ class StyleFootprintTests(unittest.TestCase):
                         self.assertIsInstance(result, style_footprint.ItemMoves, result)
                     else:
                         self.assertIsInstance(result, style_footprint.NoItemMoves, result)
+                finally:
+                    case.doCleanups()
+
+    def test_a_binary_module_context_requires_verified_cargo_discovery(self) -> None:
+        for package_setting, proven in (("", True), ("autobins = false\n", False)):
+            with self.subTest(package_setting=package_setting):
+                case = StyleFootprintTests()
+                case.setUp()
+                try:
+                    case.write("Cargo.toml", '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n' + package_setting)
+                    case.write("src/lib.rs", "")
+                    case.write("src/bin/tool.rs", "mod widget_tests;\n")
+                    case.write("src/bin/widget_tests.rs", "fn binary_fixture() {}\n")
+                    case.write("src/orphan.rs", "mod orphan_tests;\n")
+                    base = case.commit()
+                    tree = style_footprint.RevisionTree(case.repo, base)
+                    declarations = style_footprint.external_module_declarations(tree)
+                    self.assertFalse(any(declaration.file == "src/orphan.rs" for declaration in declarations))
+                    selected = tuple(declaration for declaration in declarations if declaration.file == "src/bin/tool.rs")
+                    if proven:
+                        declaration, = selected
+                        self.assertEqual(declaration.source.path, "src/bin/widget_tests.rs")
+                    else:
+                        self.assertEqual(selected, ())
                 finally:
                     case.doCleanups()
 

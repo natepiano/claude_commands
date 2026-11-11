@@ -2656,6 +2656,10 @@ def crate_manifest(sources: RevisionTree, crate: str) -> dict[str, object]:
             targets.extend(cast(list[object], entries))
     if any(isinstance(target, dict) and "path" in target for target in targets):
         raise MoveRefused(f"{manifest} sets a target path")
+    package = data.get("package")
+    if isinstance(package, dict) and any(cast(dict[str, object], package).get(key) is False
+                                         for key in ("autolib", "autobins", "autoexamples", "autotests", "autobenches")):
+        raise MoveRefused(f"{manifest} changes target discovery")
     main = str(root / "src" / "main.rs")
     if (str(root / "src" / "lib.rs") in sources.paths and main in sources.paths
             and any(token.value == "mod" for token in tokens(sources.text(main)))):
@@ -3050,26 +3054,106 @@ class NoExternalModuleSource:
     """The item has no readable external module source."""
 
 
-def external_module_source(file: str, words: tuple[str, ...], item: SourceItem
+@dataclass(frozen=True)
+class VerifiedModuleContext:
+    """The Cargo root and source directory proved by the existing plain-module walk."""
+
+    root: str
+    directory: str
+
+
+@dataclass(frozen=True)
+class NoModuleContext:
+    """The existing plain-module walk does not prove a context for this file."""
+
+
+def verified_module_context(file: str, sources: RevisionTree) -> VerifiedModuleContext | NoModuleContext:
+    """Use the item-move reach check to prove the declaring file's context."""
+    try:
+        crate = sources.crate(file)
+        manifest = crate_manifest(sources, crate)
+        package = manifest.get("package")
+        if not isinstance(package, dict):
+            return NoModuleContext()
+        _ = crate_edition(sources, crate, manifest)
+        source_dir = PurePosixPath(crate) / "src"
+        binary_dir = source_dir / "bin"
+        roots = {str(source_dir / name) for name in ("lib.rs", "main.rs")}
+        roots.update(path for path in sources.paths if PurePosixPath(path).parent == binary_dir and path.endswith(".rs"))
+        roots.update(path for path in sources.paths if PurePosixPath(path).parent.parent == binary_dir
+                     and PurePosixPath(path).name == "main.rs")
+        contexts: list[VerifiedModuleContext] = []
+        for root in sorted(roots & sources.paths):
+            directory = PurePosixPath(root).parent
+            module = () if file == root else crate_module(file, directory)
+            if isinstance(module, OutsideCrate) or (not module and file != root):
+                continue
+            if module_chain(module, sources, crate, {}, root_file=root) is None:
+                child_dir = (PurePosixPath(file).parent if file == root or PurePosixPath(file).name == "mod.rs"
+                             else PurePosixPath(file).with_suffix(""))
+                contexts.append(VerifiedModuleContext(root, str(child_dir)))
+        return contexts[0] if len(contexts) == 1 else NoModuleContext()
+    except (MoveRefused, FootprintError, UnicodeError, IndexError, ValueError):
+        return NoModuleContext()
+
+
+def external_module_source(file: str, words: tuple[str, ...], item: SourceItem,
+                           context: VerifiedModuleContext | NoModuleContext
                            ) -> ExternalModuleSource | NoExternalModuleSource:
-    """Resolve a file-level external module declaration to its full repository path."""
-    if item.kind != "mod" or words[item.keyword + 2:item.end] != (";",):
+    """Resolve only known external module forms in a verified module context."""
+    if (isinstance(context, NoModuleContext) or item.kind != "mod"
+            or words[item.keyword + 2:item.end] != (";",)):
         return NoExternalModuleSource()
     attributes = words[item.start:item.keyword]
     parts = tuple(attributes[begin:end] for begin, end in attribute_spans(attributes))
-    path_parts = tuple(part for part in parts if part[2:3] == ("path",))
-    declaring = PurePosixPath(file)
+    if any(part[2:3] in (("cfg_attr",), ("r#cfg_attr",)) for part in parts):
+        return NoExternalModuleSource()
+    path_parts = tuple(part for part in parts if part[2:3] in (("path",), ("r#path",)))
+    if len(path_parts) > 1:
+        return NoExternalModuleSource()
     if path_parts:
-        part, = path_parts
+        part = path_parts[0]
         literal = re.fullmatch(r'"([^"\\]*)"', part[4]) if len(part) == 6 and part[3] == "=" else None
         if literal is None:
             return NoExternalModuleSource()
-        source = declaring.parent / literal[1]
+        source = PurePosixPath(file).parent / literal[1]
     else:
-        directory = declaring.parent if declaring.name in {"mod.rs", "lib.rs", "main.rs"} else declaring.with_suffix("")
-        source = directory / (item.name + ".rs")
+        source = PurePosixPath(context.directory) / (item.name + ".rs")
     return ExternalModuleSource(posixpath.normpath(str(source)),
                                 tuple(word for part in parts if part not in path_parts for word in part))
+
+
+@dataclass(frozen=True)
+class ExternalModuleDeclaration:
+    """One readable declaration in a verified file of the anchored tree."""
+
+    file: str
+    item: SourceItem
+    source: ExternalModuleSource
+
+
+def external_module_declarations(sources: RevisionTree) -> tuple[ExternalModuleDeclaration, ...]:
+    """Read all supported declarations without letting an unreadable file stop another file."""
+    declarations: list[ExternalModuleDeclaration] = []
+    for file in sorted(sources.paths):
+        if not file.endswith(".rs"):
+            continue
+        try:
+            spans = token_spans(sources.text(file))
+            if any(span.token.kind == "unknown" for span in spans):
+                continue
+            words = tuple(span.token.value for span in spans)
+            items = source_items(words)
+            if items is None:
+                continue
+            context = verified_module_context(file, sources)
+            for item in items:
+                source = external_module_source(file, words, item, context)
+                if isinstance(source, ExternalModuleSource):
+                    declarations.append(ExternalModuleDeclaration(file, item, source))
+        except (MoveRefused, FootprintError, UnicodeError, IndexError, ValueError):
+            continue
+    return tuple(declarations)
 
 
 def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:
@@ -3091,19 +3175,18 @@ def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: Revision
     moves: list[ItemMove] = []
     module_lines: list[FileSpan] = []
     parents: set[str] = set()
+    anchored_declarations = external_module_declarations(sources)
     for change in changes:
         if change.status != FileStatus.DELETED:
             continue
         path = PurePosixPath(change.path)
-        declarations: list[tuple[str, SourceItem, tuple[str, ...]]] = []
-        for file, old in befores.items():
-            for item in old.items:
-                module_source = external_module_source(file, old.words, item)
-                if not item.visibility and isinstance(module_source, ExternalModuleSource) and module_source.path == change.path:
-                    declarations.append((file, item, module_source.inline_attributes))
+        declarations = tuple(declaration for declaration in anchored_declarations if declaration.source.path == change.path)
         if not path.name.endswith("_tests.rs") or len(declarations) != 1:
             raise MoveRefused(f"{change.path}: not one complete sibling test file move")
-        parent, declared, attributes = declarations[0]
+        declared_at = declarations[0]
+        parent, declared, attributes = declared_at.file, declared_at.item, declared_at.source.inline_attributes
+        if parent not in befores:
+            raise MoveRefused(f"{change.path}: its module declaration does not change")
         if parent in parents:
             raise MoveRefused(f"{change.path}: not one complete sibling test file move")
         source = befores[change.path]
@@ -3751,7 +3834,7 @@ def configured(words: tuple[str, ...], start: int, end: int, inner: bool) -> boo
 
 
 def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
-                 texts: Mapping[str, MoveText]) -> str | None:
+                 texts: Mapping[str, MoveText], root_file: str = "") -> str | None:
     """Why the crate does not compile the module's file plainly in the tree of texts, or None.
 
     Each module on the path from the crate root needs a `mod <name>;` line in its parent's file whose attributes are
@@ -3760,6 +3843,10 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
     """
     files = crate_files(sources, crate, tuple())
     files.update({path: text.scope.module for path, text in texts.items()})
+    if root_file:
+        directory = PurePosixPath(root_file).parent
+        files = {path: () if path == root_file else crate_module(path, directory) for path in files}
+        files = {path: owner for path, owner in files.items() if owner != () or path == root_file}
     for size in range(len(module) + 1):
         declared = False
         for path, file_module in files.items():

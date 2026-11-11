@@ -4941,17 +4941,10 @@ class Ledger:
         tip = self._tip(anchor or "HEAD")
         if tip.commit not in self._test_file_destinations:
             destinations: dict[str, list[TestFileDestination]] = {}
-            for file, blob in tip.blobs.items():
-                if not file.endswith(".rs"):
-                    continue
-                code = self._rust_code(blob)
-                if not isinstance(code, RustCode):
-                    continue
-                words = tuple(token.value for token in code.tokens)
-                for item in style_footprint.source_items(words) or ():
-                    source = style_footprint.external_module_source(file, words, item)
-                    if isinstance(source, style_footprint.ExternalModuleSource):
-                        destinations.setdefault(source.path, []).append(TestFileDestination(file, item.name))
+            tree = style_footprint.RevisionTree(self.repo, tip.commit)
+            for declaration in style_footprint.external_module_declarations(tree):
+                destinations.setdefault(declaration.source.path, []).append(
+                    TestFileDestination(declaration.file, declaration.item.name))
             self._test_file_destinations[tip.commit] = {file: tuple(owners) for file, owners in destinations.items()}
         choices = self._test_file_destinations[tip.commit].get(finding.path, ())
         return choices[0] if len(choices) == 1 else SeparateItemMove()
