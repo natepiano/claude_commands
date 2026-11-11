@@ -2206,3 +2206,28 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `~/.claude/scripts/lib/py -m` imports the installed main. Run checkout-only test support with the checkout's `scripts/lib/py`.
 
 **Ruled out:** a runner `TMPDIR` for the counter files, because `nix develop` replaces it; `python3 -m` for the packaged form, because hana has a top-level `scripts/` folder and cwd comes first.
+
+### Phase 102 — The stopped-run notice goes after the run's output  · status: done
+
+**Depends on:** none. Source: builds on 2026-11-11, from a hana report. During the fps hold (11-11, 01:48-03:00 EST), the notice wrote at offset 0 of the merge gate log `/tmp/claude/scratch/gate_f83.log` and erased its TREE and FMT lines.
+
+#### Work Order
+
+**Goal:** When the hold enforcer stops a run, its notice goes after the output the run already wrote. No earlier line is lost.
+
+**Spec:**
+
+1. **The cause.** `write_refusal` (`scripts/build_hold/hold_enforcer.py:616`, called at line 684) opens `/proc/<pid>/fd/2` with `os.O_WRONLY | os.O_NONBLOCK`. That open makes a new file description at offset 0. When stderr is a file, the notice writes over the start of that file.
+2. **The fix.** Add `os.O_APPEND` to the open flags. The notice then goes at the end of a file. A pipe or a terminal is unchanged. Keep the best-effort rule: an error still writes nothing and raises nothing.
+3. **Proof.** In `scripts/build_hold/test_hold_enforcer.py`, change the existing test `test_stopped_run_writes_reason_and_log_registers_notice_then_terms_root_first_and_kills_survivor`: before the stop, the stopped root's `fd/2` holds two earlier lines (`TREE ok` and `FMT ok`). The assertion expects those two lines, then the notice. This is one new row of the same behavior, not a weaker assertion.
+
+**Files:**
+- `scripts/build_hold/hold_enforcer.py`
+- `scripts/build_hold/test_hold_enforcer.py`
+
+**Workers:** `1 writer`
+- `impl` owns both files.
+
+**State:** none.
+
+**Gate:** the targeted test; `scripts/build_hold/test_hold_enforcer.py` passes; and `basedpyright` 0/0/0 on both files and each caller module of `write_refusal`.

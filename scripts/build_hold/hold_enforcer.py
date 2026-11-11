@@ -616,7 +616,7 @@ def refusal_line(build: WouldStopBuild) -> str:
 def write_refusal(proc_root: Path, build: WouldStopBuild) -> None:
     """Best effort only; never wait on a full stderr pipe."""
     try:
-        descriptor = os.open(proc_root / str(build.process.identity.pid) / "fd/2", os.O_WRONLY | os.O_NONBLOCK)
+        descriptor = os.open(proc_root / str(build.process.identity.pid) / "fd/2", os.O_WRONLY | os.O_NONBLOCK | os.O_APPEND)
         try:
             _ = os.write(descriptor, refusal_line(build).encode())
         finally:
