@@ -79,6 +79,7 @@ NO_DIRECTOR = roster.NoDirector()
 
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
+    _ = unittest.enterModuleContext(mock.patch("scripts.message.failed_lookup.send_notice"))
 
 
 class RosterTests(unittest.TestCase):
@@ -459,11 +460,12 @@ class RosterTests(unittest.TestCase):
 
     def test_docless_staff_row_does_not_block_a_peer_name(self) -> None:
         _ = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        owner = fixture_member("producer", name="peer-only")
         membership = staff.snapshot()
         result = roster.roster(os.environ, roster.ThisMachine())
         template = next(entry for entry in result.entries if entry.name == "director")
-        peer_entry = replace(template, name="peer-only", reach=roster.Messageable("session:peer-id"),
-                             session=roster.ClaudeSession("peer-id"))
+        peer_entry = replace(template, name="peer-only", reach=roster.Messageable(f"session:{owner.current_session}"),
+                             session=roster.ClaudeSession(str(owner.current_session)))
         with mock.patch.object(roster, "peer_roster", return_value=roster.Roster([peer_entry], [])) as peer:
             found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
         self.assertIsInstance(found, send.RecipientMatches)
@@ -477,6 +479,7 @@ class RosterTests(unittest.TestCase):
 
     def test_docless_staff_warning_allows_peer_delivery_and_refuses_its_own_recipient(self) -> None:
         bad = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        owner = fixture_member("producer", name="peer-only")
         membership = staff.snapshot()
         self.assertEqual(membership.inputs, (str(self.root / "staff.json"),))
         self.assertEqual(membership.by_id(bad.id), bad)
@@ -484,8 +487,8 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(observed.problems, [])
         self.assertTrue(any(entry.name == "director" for entry in observed.entries))
         template = next(entry for entry in observed.entries if entry.name == "director")
-        peer_entry = replace(template, name="peer-only", reach=roster.Messageable("session:peer-id"),
-                             session=roster.ClaudeSession("peer-id"))
+        peer_entry = replace(template, name="peer-only", reach=roster.Messageable(f"session:{owner.current_session}"),
+                             session=roster.ClaudeSession(str(owner.current_session)))
         output, errors = io.StringIO(), io.StringIO()
         with (mock.patch.object(roster, "peer_roster", return_value=roster.Roster([peer_entry], [])) as peer,
               mock.patch.object(send, "STATE", self.root / "send-state"),
@@ -500,7 +503,7 @@ class RosterTests(unittest.TestCase):
             peer.assert_called_once()
             deliver.assert_called_once()
             message = cast(send.Message, deliver.call_args.args[0])
-            self.assertEqual((message.to, message.text), ("session:peer-id", "fixture text"))
+            self.assertEqual((message.to, message.text), (f"session:{owner.current_session}", "fixture text"))
             with self.assertRaises(SystemExit) as refused:
                 _ = send.send(send.parse(["--to", "bad", "--from", "fixture-reviewer", "--text", "fixture text"]))
             self.assertEqual(refused.exception.code, 2)
@@ -599,6 +602,7 @@ class RosterTests(unittest.TestCase):
         unit = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
         _ = fixture_worker("impl2", unit.id)
         identity = "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"
+        owner = fixture_member("producer", name="free-claude", runtime_id=identity)
         registered = sessions.addressed(f"session:{identity}", sessions.live_sessions())
         assert registered is not None
         started = send.now()
@@ -606,7 +610,8 @@ class RosterTests(unittest.TestCase):
         for target in targets:
             registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
-                _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {target: started.isoformat()}}}))
+                previous = f"staff:{owner.id}" if target == owner.name else target
+                _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {previous: started.isoformat()}}}))
                 options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
                                       "--key", "notice", "--repeat-minutes", "30"])
                 with (mock.patch.object(send, "STATE", state),
@@ -1521,7 +1526,7 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn("d2d1a6c7-68f1-5f01-b1af-3a7622ca03c6", [entry.session.session_id for entry in found.entries
                                        if isinstance(entry.session, roster.ClaudeSession)])
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())):
-            self.assertEqual(send.resolve_recipient("free-claude", send.LocalOnly(), found),
+            self.assertEqual(send.resolve_recipient("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0", send.LocalOnly(), found),
                              send.ClaudeRecipient("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0"))
         self.assertEqual([entry for entry in found.entries if entry.name == relay_name], [])
 

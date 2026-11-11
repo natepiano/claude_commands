@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.session_paths import sessions_directory
+from scripts.production import staff
 
 from scripts.message.process_identity import process_start as process_start
 from scripts.message.relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
@@ -360,23 +361,36 @@ def live_sessions() -> list[SessionRecord]:
     )
 
 
-def addressed(to: str, records: list[SessionRecord]) -> SessionRecord | None:
-    """The live session that `to` means: by `uds:` socket, by `session:` id, by its name now, or by a
-    name that it alone once had and no session has now."""
+@dataclass(frozen=True)
+class StaffNameMissing:
+    name: str
+
+
+def staff_recipient(name: str, membership: staff.StaffSnapshot) -> staff.StaffRow | StaffNameMissing:
+    """Use the shared staff lookup without reading registry names."""
+    resolve = cast(Callable[[str, staff.StaffSnapshot], staff.StaffRow | StaffNameMissing],
+                   import_module("scripts.message.send").staff_named)
+    return resolve(name, membership)
+
+
+def addressed(to: str, records: list[SessionRecord], *,
+              membership: staff.StaffSnapshot | None = None) -> SessionRecord | None:
+    """Find a native address or the current session of a named staff member."""
     if to.startswith("uds:"):
         return next((record for record in records if record["messagingSocketPath"] == to[4:]), None)
     if to.startswith("session:"):
         return next((record for record in records if record["sessionId"] == to[8:]), None)
-    now = next((record for record in records if record["name"] == to), None)
-    if now is not None:
-        return now
-    once = [record for record in records if to in record["formerNames"]]
-    return once[0] if len(once) == 1 else None
+    member = staff_recipient(to, staff.snapshot() if membership is None else membership)
+    # The CLI and send.py share StaffRow when Python loads sessions.py twice.
+    if isinstance(member, staff.StaffRow):
+        return next((record for record in records if record["sessionId"] == member.current_session), None)
+    return None
 
 
-def named(name: str, records: list[SessionRecord]) -> SessionRecord | None:
+def named(name: str, records: list[SessionRecord], *,
+          membership: staff.StaffSnapshot | None = None) -> SessionRecord | None:
     """Find the live session with this staff name."""
-    return addressed(name, records)
+    return addressed(name, records, membership=membership)
 
 
 def config_dirs() -> list[Path]:
@@ -425,23 +439,20 @@ def main(argv: list[str]) -> int:
         command = "socket"
     registry = read_registry()
     unreadable = bool(registry.unreadable)
-    records = (observation.record for observation in registry.entries)
-    if command != "id" and target.startswith("session:"):
-        matches = (record for record in records if record["sessionId"] == target[8:])
-    elif command != "id":
-        matches = (record for record in records if record["name"] == target)
-    elif target.isascii() and target.isdigit():
-        matches = (record for record in records if record["pid"] == int(target))
-    else:
-        matches = (record for record in records if record["name"] == target)
-    newest = max(
-        (record for record in matches if live_session(record)),
-        key=lambda record: record["updatedAt"], default=None,
-    )
+    records = sorted((item.record for item in registry.entries if live_session(item.record)),
+                     key=lambda record: record["updatedAt"], reverse=True)
+    try:
+        newest = (next((record for record in records if record["pid"] == int(target)), None)
+                  if command == "id" and target.isascii() and target.isdigit()
+                  else addressed(target, records))
+    except (OSError, ValueError) as error:
+        print(f"sessions: {error}", file=sys.stderr)
+        return 3
     if newest is None:
         if unreadable:
             print("sessions: one or more registry files could not be read", file=sys.stderr)
             return 3
+        print(f"sessions: no live session for {target!r}", file=sys.stderr)
         return 1
     # `SendMessage` takes the address as its `to`: the session on this machine,
     # whatever other sessions the sender's account lists under the same name.

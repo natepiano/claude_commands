@@ -526,10 +526,13 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
             "tmux": "",
         }
         _ = (directory / "renamed-session.json").write_text(json.dumps(record))
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", name, staff.StaffRoot(),
+                                current_session=staff.StaffId("renamed-session"))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))))
 
     def test_mac_release_after_session_rename_releases_own_block_and_keeps_others(self) -> None:
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "renamed-session"}):
-            for given in ([], ["--holder", "first-name"], ["--holder", "current-name"]):
+            for given in ([], ["--holder", "session:renamed-session"], ["--holder", "current-name"]):
                 with self.subTest(given=given):
                     self.session("first-name")
                     status, _, errors, calls = self.run_with_mac_stand_in(
@@ -690,6 +693,9 @@ class CommandTests(PrivateReleaseBroadcastTest):
         _ = (self.scratch / "sessions" / f"{session_id}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
             "messagingSocketPath": str(path), "updatedAt": 1}))
+        member = staff.StaffRow(staff.StaffId(session_id), "unit", name, staff.StaffRoot(),
+                                current_session=staff.StaffId(session_id))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))))
 
     def hold(self, folder: Path, given: str | None) -> str:
         identity = build_hold.holder_of(given)
@@ -718,10 +724,10 @@ class CommandTests(PrivateReleaseBroadcastTest):
         holders = build_hold.read_holders(folder)
         assert isinstance(holders, build_hold.ActiveHolders)
         self.assertEqual([(holder.name, holder.key) for holder in holders.holders], [("new-name", "id-1")])
-        # The name it had when it took the hold still finds it, and so does no name at all.
+        # The native ID still finds the hold after the registry name changes.
         with self.assertRaisesRegex(ValueError, "someone-else held nothing"):
             _ = build_hold.held_key(folder, "someone-else")
-        self.assertEqual(build_hold.held_key(folder, "old-name"), "id-1")
+        self.assertEqual(build_hold.held_key(folder, "session:id-1"), "id-1")
         self.assertEqual(build_hold.held_key(folder, "new-name"), "id-1")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
             self.assertEqual(build_hold.held_key(folder, None), "id-1")
