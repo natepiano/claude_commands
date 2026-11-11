@@ -40,6 +40,7 @@ from scripts.accounts.home_test_support import clear_notes_directory_cache, scra
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf, file_lock
+from scripts.lib.test_models_registry import write_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 from scripts.agents import stop_resume
@@ -55,6 +56,8 @@ from scripts.whoami.account_test_support import create_claude_account, stored_ro
 from scripts.whoami import quota_alert
 from scripts.whoami import run_out
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+MODELS_RESOLVER_PATH = os.environ.get("PATH", os.defpath)
 
 send_role_map_command = role_map.ssh_role_map
 start_session_counts_fetch = cast(Callable[[], bool], getattr(accounts, "_start_session_counts_fetch"))
@@ -642,34 +645,62 @@ class AccountsTests(unittest.TestCase):
 
         for label in ("claude2", "claude4"):
             self.login_directory(label, label + "@example.invalid")
-        member = unit_membership("fixture", "models")
-        _ = accounts.set_group_account("units", "claude2", why="fixture")
-        records = self.root / "member-launches"
-        records.mkdir()
-        launch = pane_launch.PaneLaunch(pane_id="models-pane", session_id=member.id,
-            config_dir=str(self.home / ".claude2"), cwd=str(self.root), name=member.name,
-            model="", remote_control=False, environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z")
-        _ = (records / "fixture.json").write_text(json.dumps({"models-pane": launch}))
-        owner = sessions.SessionRecord(pid=990901, sessionId=member.current_session, name=member.name,
-            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
-        membership = staff.local_snapshot()
-        with (patch.object(staff, "local_snapshot", return_value=membership),
-              patch.object(sessions, "running_sessions", return_value=[owner]),
-              patch.object(pane_launch, "record_directory", return_value=records),
-              patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4")),
-              patch.object(inventory, "listing", side_effect=AssertionError("timer membership was read")),
-              patch.object(accounts, "move_sessions", side_effect=AssertionError("preview moved a session"))):
-            reading = accounts.read_status(source=accounts.StoredUsageOnly())
-            result = accounts.move_group("units", "claude2", dry_run=True)
-        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
-        rows = {row["label"]: row for row in document["accounts"]}
-        self.assertEqual(rows["claude4"]["roles"], ["units"])
-        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}])
-        self.assertEqual(rows["claude2"]["role_counts"], [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
-        self.assertIsInstance(result, accounts.GroupMoveDryRun)
-        assert isinstance(result, accounts.GroupMoveDryRun)
-        self.assertEqual(result.session_ids, (member.current_session,))
-        self.assertIn(f"{member.name}: {member.current_session} · stop, then resume on claude2 (from claude4)", result.lines)
+        registry = write_registry(self.root / "producer-models.conf", {"producers": {
+            "producer-claude": "claude:opus:max", "producer-codex": "codex:gpt-test:high"}})
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
+        cases: tuple[tuple[staff.Kind, accounts.ClaudeGroup, str, str], ...] = (
+            ("unit", "units", "claude", ""), ("producer", "showrunners", "claude", ""),
+            ("producer", "showrunners", "codex", ""),
+            ("unit", "units", "claude", "live"), ("producer", "showrunners", "claude", "live"),
+            ("unit", "units", "claude", "stopped"), ("producer", "showrunners", "claude", "stopped"))
+        for kind, group, family, missing_settings in cases:
+            with self.subTest(kind=kind, family=family, missing_settings=missing_settings):
+                member = (unit_membership("fixture", "models") if kind == "unit" else
+                    fixture_member("producer", name="producer-" + family))
+                accounts.groups_file().unlink(missing_ok=True)
+                _ = accounts.set_group_account(group, "claude2", why="fixture")
+                records = self.root / "member-launches"
+                records.mkdir(exist_ok=True)
+                launch = pane_launch.PaneLaunch(pane_id="models-pane", session_id=member.id,
+                    config_dir=str(self.home / ".claude2"), cwd=str(self.root), name=member.name,
+                    model="", remote_control=False, environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z")
+                _ = (records / "fixture.json").write_text(json.dumps({"models-pane": launch}))
+                owner = sessions.SessionRecord(pid=990901, sessionId=member.current_session, name=member.name,
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
+                members = [member]
+                live = [owner]
+                if missing_settings:
+                    invalid = fixture_member("producer", name="missing-settings-producer")
+                    members.append(invalid)
+                    if missing_settings == "live":
+                        live.append(sessions.SessionRecord(pid=990902, sessionId=invalid.current_session, name=invalid.name,
+                            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy"))
+                membership = staff.StaffSnapshot(tuple(members))
+                with (patch.object(staff, "local_snapshot", return_value=membership),
+                      patch.object(sessions, "running_sessions", return_value=live),
+                      patch.object(pane_launch, "record_directory", return_value=records),
+                      patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4")),
+                      patch.object(inventory, "listing", side_effect=AssertionError("timer membership was read")),
+                      patch.object(accounts, "move_sessions", side_effect=AssertionError("preview moved a session"))):
+                    reading = accounts.read_status(source=accounts.StoredUsageOnly())
+                    with redirect_stderr(io.StringIO()) as errors:
+                        result = accounts.move_group(group, "claude2", dry_run=True)
+                if missing_settings:
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn("missing-settings-producer", errors.getvalue())
+                    self.assertIn("invalid producer settings", errors.getvalue())
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                rows = {row["label"]: row for row in document["accounts"]}
+                self.assertEqual(rows["claude4"]["roles"], [group] if family == "claude" else [])
+                self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}] if family == "claude" else [])
+                self.assertEqual(rows["claude2"]["role_counts"], [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
+                self.assertIsInstance(result, accounts.GroupMoveDryRun)
+                assert isinstance(result, accounts.GroupMoveDryRun)
+                self.assertEqual(result.session_ids, (member.current_session,) if family == "claude" else ())
+                if family == "claude":
+                    self.assertIn(f"{member.name}: {member.current_session} · stop, then resume on claude2 (from claude4)", result.lines)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
@@ -6871,39 +6902,89 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
     def test_workers_swap_selects_the_target_before_stops_and_keeps_pending_and_refused_workers(self) -> None:
-        _, target = self.workers_fixture()
-        failed = self.workers_member("project-review")
-        pending = self.workers_member("project-test")
-        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        for missing_settings in (False, True):
+            with self.subTest(missing_settings=missing_settings):
+                _, target = self.workers_fixture()
+                failed = self.workers_member("project-review")
+                pending = self.workers_member("project-test")
+                machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
+                producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(self.home / ".codex2"),
+                    doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
+                    worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
+                for name, paused, document_machine, worktree_machine in (
+                        ("paused-producer", True, machine, machine),
+                        ("remote-document-producer", False, remote.other_machine(), machine),
+                        ("remote-worktree-producer", False, machine, remote.other_machine())):
+                    excluded = fixture_member("producer", name=name,
+                        doc=staff.LiveDoc(document_machine, self.root / name / "plan.md"),
+                        worktree=staff.PresentWorktree(worktree_machine, self.root / name))
+                    if paused:
+                        _ = staff.set_hold(str(excluded.id), staff.Paused("now", "user", "hold"))
+                _ = fixture_member("producer", name="claude-producer")
+                if missing_settings:
+                    _ = fixture_member("producer", name="missing-settings-producer",
+                        doc=staff.LiveDoc(machine, self.root / "missing-settings-producer/plan.md"),
+                        worktree=staff.PresentWorktree(machine, self.root / "missing-settings-producer"))
+                registry = write_registry(self.root / "producer-models.conf", {"producers": {
+                    "codex-producer": "codex:gpt-test:high", "claude-producer": "claude:opus:max",
+                    "paused-producer": "codex:gpt-test:high", "remote-document-producer": "codex:gpt-test:high",
+                    "remote-worktree-producer": "codex:gpt-test:high"}})
+                _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
+                before = Path(os.environ["STAFF_FILE"]).read_bytes()
 
-        observed: list[Path] = []
-        def move(row: staff.StaffRow, record: staff.StaffSnapshot, target_label: str,
-                 why: str, run: Path) -> accounts.SessionMoveOutcome:
-            del why
-            self.assertEqual(record.backends[row.id].family, "codex")
-            self.assertEqual((target_label, run), ("codex1", self.root / "worker-run"))
-            observed.append(agent_accounts.workers_home())
-            return (accounts.SessionMoveRefused(row.id, "source process could not stop") if row.id == failed.id
-                    else stop_results.ResumePending(row.id, target_label, "destination is not ready"))
+                observed: list[Path] = []
+                def move(row: staff.StaffRow, record: staff.StaffSnapshot, target_label: str,
+                         why: str, run: Path) -> accounts.SessionMoveOutcome:
+                    del why
+                    self.assertEqual(record.backends[row.id].family, "codex")
+                    self.assertEqual((target_label, run), ("codex1", self.root / "worker-run"))
+                    observed.append(agent_accounts.workers_home())
+                    return (accounts.SessionMoveRefused(row.id, "source process could not stop") if row.id == failed.id
+                            else stop_results.ResumePending(row.id, target_label, "destination is not ready"))
 
-        with patch.object(pane_moves, "move_worker", side_effect=move) as stopped:
-            code, output, errors = self.run_cli("swap", "workers", "codex1")
-        self.assertEqual((code, errors), (1, ""))
-        self.assertEqual(agent_accounts.workers_home(), target)
-        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
-        self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in stopped.call_args_list}, {failed.id, pending.id})
-        self.assertEqual(stopped.call_count, 2)
-        self.assertEqual(observed, [target, target])
-        self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
-        lines = output.splitlines()
-        self.assertEqual(len(lines), 2)
-        failed_line = next(line for line in lines if failed.id in line)
-        self.assertIn("source process could not stop", failed_line)
-        self.assertNotIn("resumed", failed_line)
-        pending_line = next(line for line in lines if pending.id in line)
-        self.assertIn("pending", pending_line)
-        self.assertIn("codex1", pending_line)
-        self.assertNotIn("failed", pending_line)
+                with (patch.object(pane_moves, "move_worker", side_effect=move) as stopped,
+                      patch.object(stop_resume, "move_sessions", return_value=[stop_results.ResumePending(
+                          producer.current_session, "codex1", "destination is not ready")]) as producer_move):
+                    code, output, errors = self.run_cli("swap", "workers", "codex1")
+                if missing_settings:
+                    self.assertEqual(code, 1)
+                    self.assertEqual(len(errors.splitlines()), 1)
+                    self.assertIn("missing-settings-producer", errors)
+                    self.assertIn("invalid producer settings", errors)
+                else:
+                    self.assertEqual((code, errors), (1, ""), errors)
+                self.assertEqual(agent_accounts.workers_home(), target)
+                self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+                self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in stopped.call_args_list}, {failed.id, pending.id})
+                self.assertEqual(stopped.call_count, 2)
+                producer_move.assert_called_once_with([str(producer.current_session)], "codex1", why="by hand",
+                                                     cause="by hand", source_accounts={})
+                self.assertEqual(observed, [target, target])
+                self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
+                lines = output.splitlines()
+                self.assertEqual(len(lines), 3)
+                failed_line = next(line for line in lines if failed.id in line)
+                self.assertIn("source process could not stop", failed_line)
+                self.assertNotIn("resumed", failed_line)
+                pending_line = next(line for line in lines if pending.id in line)
+                self.assertIn("pending", pending_line)
+                self.assertIn("codex1", pending_line)
+                self.assertNotIn("failed", pending_line)
+                with (patch.object(pane_moves, "preview_worker", return_value=accounts.SessionMoveRefused(
+                          failed.id, "preview refusal")) as preview,
+                      patch.object(stop_resume, "move_sessions") as producer_move):
+                    code, output, errors = self.run_cli("swap", "workers", "codex1", "--dry-run")
+                if missing_settings:
+                    self.assertEqual(code, 0)
+                    self.assertEqual(len(errors.splitlines()), 1)
+                    self.assertIn("missing-settings-producer", errors)
+                    self.assertIn("invalid producer settings", errors)
+                else:
+                    self.assertEqual((code, errors), (0, ""))
+                self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in preview.call_args_list}, {failed.id, pending.id})
+                self.assertEqual(len(output.splitlines()), 3)
+                self.assertIn(f"{producer.name} ({producer.id}): would stop and resume", output)
+                producer_move.assert_not_called()
 
     def test_worker_release_refusals_name_the_reason_and_next_action(self) -> None:
         _ = self.workers_fixture()

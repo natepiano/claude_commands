@@ -243,7 +243,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w2C:p1")),
-              mock.patch.object(client, "pane_tab", return_value=("morty", 1, {"name": reference})),
+              mock.patch.object(client, "pane_tab", return_value=("producers", 1, {"name": reference})),
               redirect_stdout(output)):
             if kind == "codex" and rows:
                 self.assertEqual(client.codex_launch("w2C:p1")["session_id"], fixture_runtime_id("pane-record-codex"))
