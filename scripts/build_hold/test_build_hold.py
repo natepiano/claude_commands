@@ -23,6 +23,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
 from scripts.build_hold import hold_enforcer
 from scripts.production import staff
@@ -80,7 +81,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "stale-session",
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("run-owner")))
+            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
     def test_board_directory_takes_priority_over_session_directory(self) -> None:
         other_run = self.scratch / "other-run"
@@ -90,7 +91,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "UNIT_SESSION_DIR": str(other_run),
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("board-owner")))
+            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("board-owner")))
 
     def test_a_staff_run_under_either_run_folder_name_owns_the_run(self) -> None:
         for name in ("unit", "delegate"):
@@ -98,7 +99,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             run = self.scratch / name / "run"
             self.owner(identity, run)
             with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(identity))
+                self.assertEqual(build_hold.owning_session(), OwningSession(identity))
 
     def test_session_directory_is_used_when_board_directory_is_unset_or_empty(self) -> None:
         self.owner(fixture_runtime_id("run-owner"), self.unit_run)
@@ -109,7 +110,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
                         os.environ["UNIT_RUN_DIR"] = ""
                     else:
                         _ = os.environ.pop("UNIT_RUN_DIR", None)
-                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("run-owner")))
+                    self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
     def test_no_matching_staff_run_falls_back_to_shell_session(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
@@ -117,7 +118,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "shell-session",
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+            self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
 
     def test_run_resolution_names_the_owner_or_the_missing_run(self) -> None:
         identity = fixture_runtime_id("run-owner")
@@ -136,18 +137,18 @@ class OwningSessionTests(IsolatedBuildHoldTest):
         self.owner(fixture_runtime_id("another-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):
             with mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("No run needs no staff read")):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+                self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
 
     def test_no_matching_staff_run_and_no_shell_session_has_no_owner(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
+            self.assertEqual(build_hold.owning_session(), NoOwningSession())
 
     def test_no_run_and_no_shell_session_has_no_owner(self) -> None:
-        self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
+        self.assertEqual(build_hold.owning_session(), NoOwningSession())
 
     def test_owner_results_are_frozen(self) -> None:
-        for owner in (build_hold.OwningSession(fixture_runtime_id("run-owner")), build_hold.NoOwningSession()):
+        for owner in (OwningSession(fixture_runtime_id("run-owner")), NoOwningSession()):
             with self.subTest(owner=type(owner).__name__):
                 with self.assertRaises(FrozenInstanceError):
                     setattr(owner, "session_id", "changed")
@@ -2417,14 +2418,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         (directory / "environ").unlink()
         (directory / "environ").mkdir()
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("nearer"))
+        self.assertEqual(build.owner, OwningSession("nearer"))
         self.assertEqual(build.classification, "other_session")
 
     def test_claude_ancestor_without_session_id_has_process_identity(self) -> None:
         _ = self.process(10, "claude")
         _ = self.process(20, "cargo", parent=10)
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("claude:10:100"))
+        self.assertEqual(build.owner, OwningSession("claude:10:100"))
 
     def test_worker_run_maps_to_owning_session_without_changing_environment(self) -> None:
         with isolated_staff_file(self.scratch / "staff.json", {}):
@@ -2434,14 +2435,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = write_holder(self.holders, owner.current_session, "2026-10-28T12:00:00+00:00", "app test")
         _ = self.process(10, "cargo", environment={"UNIT_RUN_DIR": "/unit/run"})
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession(owner.current_session))
+        self.assertEqual(build.owner, OwningSession(owner.current_session))
         self.assertEqual(build.classification, "holder")
         self.assertEqual(os.environ["UNIT_RUN_DIR"], "")
 
     def test_session_environment_precedes_worker_mapping(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "direct", "UNIT_RUN_DIR": "/unit/run"})
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("direct"))
+        self.assertEqual(build.owner, OwningSession("direct"))
 
     def test_second_holder_means_caller_does_not_hold_only_its_own(self) -> None:
         _ = write_holder(self.holders, "second", "2026-10-28T12:00:00+00:00", "app test")
@@ -2457,7 +2458,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
             _ = self.process(20, "cargo", parent=10, start=200)
             build, = self.builds()
         self.assertEqual(build.classification, "no_session")
-        self.assertEqual(build.owner, build_hold.NoOwningSession())
+        self.assertEqual(build.owner, NoOwningSession())
 
     def test_durable_grant_is_admitted_before_the_next_service_pass(self) -> None:
         fixture = self.admission_fixture

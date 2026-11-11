@@ -6,6 +6,8 @@ try:
 except FileNotFoundError:
     pass
 
+from scripts.lib.transcripts import open_transcript, uncompressed_path
+
 import argparse
 import fcntl
 import hashlib
@@ -1305,7 +1307,7 @@ def transcript_replies(path: Path, since: datetime) -> list[TranscriptReply]:
     replies: list[TranscriptReply] = []
     previous = ""
     seen: set[str] = set()
-    with path.open(encoding="utf-8") as transcript:
+    with open_transcript(path) as transcript:
         for line in transcript:
             try:
                 record = _object(cast(object, json.loads(line)))
@@ -1332,7 +1334,7 @@ def transcript_replies(path: Path, since: datetime) -> list[TranscriptReply]:
             except ValueError:
                 continue
             if stamp >= since:
-                replies.append(TranscriptReply(text, ReplyContext(path, stamp, previous)))
+                replies.append(TranscriptReply(text, ReplyContext(uncompressed_path(path), stamp, previous)))
             previous = text
     return replies
 
