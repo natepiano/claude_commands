@@ -15,6 +15,7 @@ from typing import Literal, cast
 from unittest import mock
 
 from scripts.agents import worker_lifecycle
+from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct import claude_worker
@@ -218,6 +219,16 @@ class FamilyHandoffTests(StaffTestCase):
                     "message": {"role": "assistant" if kind == "assistant" else "user",
                                 "content": [{"type": "text", "text": "The request"}]},
                 }, set()), expected)
+        for record_type, message_type, role, expected in (
+                ("response_item", "agent_message", "", ""),
+                ("event_msg", "agent_message", "", "assistant:\nThe request"),
+                ("response_item", "message", "assistant", "assistant:\nThe request")):
+            with self.subTest(record_type=record_type, message_type=message_type):
+                self.assertEqual(worker_admission.transcript_entry({
+                    "type": record_type, "payload": {
+                        "type": message_type, "role": role, "content": [{"type": "output_text", "text": "The request"}],
+                    },
+                }, set()), expected)
 
     def source(self, family: Literal["claude", "codex"], *, turns: int = 1,
                malformed: bool = False, worker_name: str = "switch") -> tuple[worker_admission.WorkerStartAllowed, Path,
@@ -238,19 +249,31 @@ class FamilyHandoffTests(StaffTestCase):
 
 
     def test_family_switch_uses_native_release_without_run_discovery(self) -> None:
-        cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (
-            ("claude", False), ("claude", True), ("codex", False), ("codex", True))
-        for family, stopped in cases:
-            allowed, _, _ = self.source(family, worker_name=f"native-{stopped}")
+        cases: tuple[tuple[Literal["claude", "codex"], bool, bool], ...] = (
+            ("claude", False, True), ("claude", True, True),
+            ("codex", False, True), ("codex", True, True), ("claude", False, False))
+        for family, stopped, retained_launch in cases:
+            allowed, _, _ = self.source(family, worker_name=f"native-{stopped}-{retained_launch}")
             assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
             row = allowed.slot.row
             result = stop_resume.Stopped(row.current_session, 123) if stopped else stop_resume.NotRunning(row.current_session)
-            identity = fixture_runtime_id(f"native-{family}-{stopped}")
-            fixture_session(identity, staff.ClaudeBackend() if family == "codex" else staff.CodexBackend(self.root / "destination"))
+            identity = fixture_runtime_id(f"native-{family}-{stopped}-{retained_launch}")
+            backend = staff.ClaudeBackend() if family == "codex" else staff.CodexBackend(self.root / "destination")
+            fixture_session(identity, backend)
+            if not retained_launch:
+                for path in pane_launch.record_directory().glob("*.json"):
+                    path.unlink()
+
+            def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
+                self.assertEqual(staff.backend(published.row), backend)
+                self.assertEqual(staff.by_id(published.row.id), published.row)
+                return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
+
             with (mock.patch.object(stop_resume, "stop", return_value=result),
                   mock.patch.object(session_staff, "worker_run_index", side_effect=AssertionError("unnecessary run discovery"))):
                 published = worker_admission.switch_worker(allowed, "claude" if family == "codex" else "codex",
-                    start=lambda handoff: identity, dispatch=lambda published: worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, cleanup=lambda identity: worker_admission.NoDestinationToStop())
+                    start=lambda handoff: identity, dispatch=dispatch, cleanup=lambda identity: worker_admission.NoDestinationToStop(),
+                    launch_home=staff.SessionHome(backend.codex_home) if isinstance(backend, staff.CodexBackend) else staff.HomeUnknown())
             self.assertEqual(published.row.id, row.id)
             self.assertEqual(published.row.current_session, identity)
 

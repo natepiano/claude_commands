@@ -46,6 +46,7 @@ from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel,
 from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 from scripts.whoami import usage_store  # noqa: E402
@@ -1554,7 +1555,7 @@ def _update_codex(arguments: list[str], *, account_config: conf.ConfigRead | Rea
     machine = remote.other_machine()
     command = 'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'
     try:
-        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={account_config.whole("codex_update_connect_timeout_seconds")}", machine, command],
+        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=account_config.whole("codex_update_timeout_seconds"), check=False)
     except (subprocess.TimeoutExpired, OSError):
         print(f"{machine}: unreachable; run codex update there")
@@ -2123,7 +2124,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         if refusal_problem:
             reason = refusal_problem
         elif refusal is not None and not refusals.resolved(refusal, reading, now):
-            reason = "refused at " + refusal.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+            reason = "refused at " + refusal.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
         elif tool == "claude" and isinstance(reading, FreshReading) and any(
             isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five)
         ):
@@ -2338,6 +2339,89 @@ def live_group_members() -> dict[ClaudeGroup, list[LiveGroupMember]]:
     return _read_local_role_sessions(GroupAccounts(), include_workers=False).members
 
 
+@dataclass(frozen=True)
+class InvalidProducerSettings:
+    """The producer has no usable launch settings for this operation."""
+
+
+_reported_producer_settings: ContextVar[set[staff.StaffId]] = ContextVar("reported_producer_settings")
+
+
+@contextmanager
+def settings_report_scope() -> Generator[None]:
+    """Report each invalid producer once within an operation."""
+    try:
+        _ = _reported_producer_settings.get()
+    except LookupError:
+        token = _reported_producer_settings.set(set())
+        try:
+            yield
+        finally:
+            _reported_producer_settings.reset(token)
+    else:
+        yield
+
+
+def producer_settings(member: staff.StaffRow) -> models_registry.LaunchSettings | InvalidProducerSettings:
+    """Read one producer's settings and exclude it when its settings are invalid."""
+    try:
+        return models_registry.launch_settings("producers", member.name)
+    except ValueError as error:
+        reported = _reported_producer_settings.get(set())
+        if member.id not in reported:
+            reported.add(member.id)
+            account_anomaly(f"{member.name}: {error}")
+        return InvalidProducerSettings()
+
+
+def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[staff.StaffRow, ...]:
+    """Select active, unpaused, local producers of the requested family."""
+    from scripts.production import staff
+
+    machine = _session_counts_machine()
+    return tuple(row for row in staff.active(membership, "producer")
+                 if not isinstance(row.paused, staff.Paused)
+                 and (not isinstance(row.doc, staff.LiveDoc) or row.doc.machine == machine)
+                 and (not isinstance(row.worktree, staff.PresentWorktree) or row.worktree.machine == machine)
+                 and isinstance(settings := producer_settings(row), models_registry.LaunchSettings)
+                 and settings.kind == family)
+
+
+def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
+    """Select admitted local producers without a pause or an exit request."""
+    from scripts.production import staff
+
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffAbsent:
+        return ()
+    members = eligible_producers(membership, "claude") + eligible_producers(membership, "codex")
+    return tuple(row for row in members if not isinstance(row.exited, staff.Exited))
+
+
+@settings_report_scope()
+def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple[staff.StaffRow, ...]]:
+    """Keep verified accounts and retain eligible members without account proof."""
+    from scripts.production import staff
+    from scripts.message import sessions
+
+    live = live_group_members()[group]
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffUnreadable:
+        return live, ()
+    running = {session["sessionId"] for session in sessions.running_sessions()}
+    running.update(member.session_id for member in live)
+    kind = "unit" if group == "units" else "showrunner"
+    candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
+    if group == "showrunners":
+        candidates.update((row.id, row) for row in eligible_producers(membership, "claude"))
+    live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
+            or owner.kind != "producer" or owner.id in candidates]
+    verified = {member.session_id for member in live}
+    return live, tuple(row for row in candidates.values() if row.current_session not in verified)
+
+
 def session_account_label(session: ListedSession | LiveGroupMember) -> str:
     return claude_config_label(session.config_dir)
 
@@ -2502,13 +2586,13 @@ def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, 
 
 def no_room_line(tool: str, outcome: NoAccountWithRoom) -> str:
     reset = outcome.earliest_reset
-    time = reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
+    time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
     return f"no {tool} account has room; the earliest reset is {time}"
 
 
 def _pick_explanation(reason: PickReason) -> str:
     weekly = f"{reason.weekly.left:g}%" if isinstance(reason.weekly, ReadingWindow) else "unavailable"
-    reset = (reason.weekly.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
+    reset = (reason.weekly.reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
              if isinstance(reason.weekly, ReadingWindow) and isinstance(reason.weekly.reset, KnownReset) else "unknown")
     five = f"{reason.five_hour.left:g}%" if isinstance(reason.five_hour, ReadingWindow) else "no window"
     return f"{reason.label}: weekly {weekly}, resets {reset}, 5-hour {five}; {reason.status}"
@@ -2526,8 +2610,6 @@ def _iso_time(text: str, place: str) -> datetime:
         raise AccountsError(f"accounts: {place} must be an ISO timestamp") from error
     if at.tzinfo is None:
         # Command-line and historical wall times use the user's zone.
-        from scripts.lib.user_zone import user_zone
-
         at = at.replace(tzinfo=user_zone())
     return at.astimezone(timezone.utc)
 
@@ -2924,19 +3006,33 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
     return _preview_worker_moves(target, why)
 
 
+def _workers_move_rows(record: staff.StaffSnapshot, family: str) -> tuple[staff.StaffRow, ...]:
+    """Include Codex producers in the workers account selection."""
+    from scripts.production import session_staff
+
+    producers: set[staff.StaffId] = {row.id for row in eligible_producers(record, family)} if family == "codex" else set()
+    return tuple(row for row in record.rows
+                 if (row.kind == "worker" and (not row.current_session or
+                     session_staff.worker_family(record, row.id) == family)) or
+                    row.id in producers)
+
+
+@settings_report_scope()
 def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
     """Preview workers after the caller checks the destination."""
-    from scripts.production import staff, session_staff
+    from scripts.production import staff
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
     record = staff.local_snapshot()
     family = "codex" if _label_is(target, "codex") else "claude"
-    rows = tuple(row for row in record.find(kind="worker")
-                 if not row.current_session or session_staff.worker_family(record, row.id) == family)
+    rows = _workers_move_rows(record, family)
     identities = tuple(str(row.id) for row in rows)
 
     lines: list[str] = []
     nothing = 0
     for row in rows:
+        if row.kind == "producer":
+            lines.append(f"{row.name} ({row.id}): would stop and resume the same conversation on {target}")
+            continue
         try:
             run = pane_moves.run_for_worker(row, record)
             decision = pane_moves.preview_worker(row, record, target, why, run)
@@ -2961,6 +3057,14 @@ def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.S
     from scripts.production import staff
 
     try:
+        if row.kind == "producer":
+            batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
+            result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={})[0]
+            if isinstance(result, stop_results.SessionNotFound):
+                return SessionMoveRefused(row.current_session, "no saved session was found")
+            if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
+                return result
+            return SessionMoveRefused(row.current_session, result.reason)
         run = pane_moves.run_for_worker(row, record)
         return pane_moves.move_worker(row, record, target, why, run)
     except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
@@ -2976,9 +3080,10 @@ def _resolve_worker_move_target(destination: FollowWorkersRole | FixedClaudeWork
     return _current_workers_target() if isinstance(destination, FollowWorkersRole) else destination.label
 
 
+@settings_report_scope()
 def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                       why: str) -> GroupMoveStarted | GroupMoveStartFailed:
-    from scripts.production import staff, session_staff
+    from scripts.production import staff
 
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
     results: dict[staff.StaffId, SessionMoveOutcome] = {}
@@ -2991,10 +3096,8 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                     _queue_worker_moves(_resolve_worker_move_target(destination))
         while True:
             record = staff.local_snapshot()
-            for row in record.find(kind="worker"):
+            for row in _workers_move_rows(record, family):
                 target = _resolve_worker_move_target(destination)
-                if row.current_session and session_staff.worker_family(record, row.id) != family:
-                    continue
                 if attempted.get(row.id) == target:
                     continue
                 results[row.id] = _move_worker_row(pane_moves, row, record, target, why)
@@ -3002,8 +3105,7 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
             with _workers_move_lock("schedule") if isinstance(destination, FollowWorkersRole) else nullcontext():
                 target = _resolve_worker_move_target(destination)
                 latest = staff.local_snapshot()
-                if any(attempted.get(row.id) != target for row in latest.find(kind="worker")
-                       if not row.current_session or session_staff.worker_family(latest, row.id) == family):
+                if any(attempted.get(row.id) != target for row in _workers_move_rows(latest, family)):
                     continue
                 if isinstance(destination, FollowWorkersRole):
                     pending = _read_pending_worker_moves()
@@ -3059,7 +3161,7 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
         if reading.credits != "unlimited" and (not math.isfinite(credits) or credits <= 0):
             for name, window in (("weekly", reading.weekly), ("5-hour", reading.five_hour)):
                 if isinstance(window, ReadingWindow) and window.left <= 0:
-                    reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
+                    reset = (window.reset.at.astimezone(user_zone()).strftime("%a %-I:%M %p")
                              if isinstance(window.reset, KnownReset) else "unknown")
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep(), account_config=account_config)
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
@@ -3092,6 +3194,8 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
 @role_map.role_map_command
 def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Select the group after target checks, then stop and resume each owner."""
+    from scripts.production import staff
+
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
@@ -3099,11 +3203,13 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
         return checked
-    members = live_group_members()[group]
+    members, stopped = group_move_members(group)
     selected = [session for session in members if not session_on_account(session, target)]
-    ids = tuple(session.session_id for session in selected)
+    ids = (*tuple(session.session_id for session in selected), *(row.current_session for row in stopped))
     reason = why or f"{group} moved by hand"
     notices = (f"{group}: no live session moves",) if not ids else ()
+    notices += tuple(f"{row.name}: saved account is unknown; resume on {target}"
+                     for row in stopped if not isinstance(row.home, staff.SessionHome))
     if group == "showrunners":
         if TYPE_CHECKING:
             from scripts.agents import inventory
@@ -3116,7 +3222,9 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
-            *(move_preview_line(item, target) for item in selected), *notices))
+            *(move_preview_line(item, target) for item in selected),
+            *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
+              for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
     _ = set_group_account(group, target, why=reason)
     results = move_sessions(ids, target, why=reason, account_config=account_config) if ids else ()
     stdout, stderr, code = _move_output(results, (*checked.notices, *notices))
@@ -4016,7 +4124,7 @@ def _usage_store_problem(report: agent_accounts.Report, warning: agent_accounts.
     return StatusProblem(subject,
         "usage store read continued without a hold" if claim_failed else "usage store reading not saved",
         ProblemCause("usage claim" if claim_failed else "usage save",
-            f"{warning.reason}; read at {at.astimezone(agent_accounts.user_zone()):%Y-%m-%d %H:%M %Z}",
+            f"{warning.reason}; read at {at.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}",
             CauseFile(str(directory.directory if isinstance(directory, agent_accounts.ClaudeDirectorySource)
                           else directory.home if isinstance(directory, agent_accounts.CodexHomeSource)
                           else usage_store.store_file()))),
@@ -4761,7 +4869,7 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
     """
     account_config = read_account_settings(account_config)
-    zone = agent_accounts.user_zone()
+    zone = user_zone()
     statuses = account_statuses()
     for status in statuses:
         for problem in _status_problems(status, detail=detail, zone=zone):
@@ -4953,7 +5061,7 @@ def _observe_status_problem(problem: StatusProblem, raw: tuple[str, ...] = (), *
 def _map_provenance_problem(provenance: role_map.RoleMapProvenance) -> list[StatusProblem]:
     if not isinstance(provenance, role_map.CachedAfterFetchFailure):
         return []
-    stamp = provenance.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+    stamp = provenance.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
     cause = f"natedev fetch failed: {provenance.failure}"
     return [StatusProblem("role map", "using saved assignments",
         ProblemCause("role", f"map saved at {stamp}; {cause}", CauseFile(str(role_map.role_map_cache_file()))),
@@ -5110,6 +5218,7 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
     return ""
 
 
+@settings_report_scope()
 def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
     """Read local membership, processes, and activity for counts and moves."""
     from scripts.message import sessions
@@ -5169,6 +5278,10 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             role = "units"
         if owner is not None and owner.kind in ("showrunner", "worker"):
             role = "showrunners" if owner.kind == "showrunner" else "workers"
+        if owner is not None and owner.kind == "producer":
+            settings = producer_settings(owner)
+            role = ("showrunners" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
+                    else "")
         setting = _session_config_dir(session["pid"])
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         label = claude_config_label(directory) if directory is not None else "account unreadable"
@@ -5187,7 +5300,10 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                     session_state.LiveActivity(session.get("status", "")))
             counts.setdefault((directory, role), {})[identity] = state
     # A member without a live session belongs to its selected role account.
-    for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner")):
+    for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner"),
+                   *(row for row in staff.active(membership, "producer")
+                     if isinstance(settings := producer_settings(row), models_registry.LaunchSettings)
+                     and settings.kind == "claude")):
         if member.current_session in live or not local_member(member):
             continue
         role = "units" if member.kind == "unit" else "showrunners"

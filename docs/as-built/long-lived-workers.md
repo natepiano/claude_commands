@@ -23,13 +23,18 @@ A later assignment resumes the same conversation when the worker remains availab
 Codex code review uses read-only review workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
+A failed compaction prints one error line, and the dispatch continues without compaction.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.
 
 ## Pane submission and completion
 
 `assign.sh` returns after successful prompt delivery. Exit 0 means submitted.
-The transcript can record the prompt later.
+Codex dispatch also requires the prompt in its transcript before it reports submission.
+Codex dispatch waits up to `WORKER_SETTLE_SECONDS` for the receipt.
+An unproved Codex prompt returns uncertain when this bound passes or the process exits.
+A recorded prompt remains submitted after a process exit.
+Claude can record the prompt later.
 A failed delivery command returns an error.
 The transcript prevents replay.
 A matching final transcript reply proves completion.
@@ -179,6 +184,20 @@ A publication failure runs the caller's cleanup callback and reports the native 
 The Claude coordinator tries to stop an unpublished session.
 A failed stop reports `cleanup unproved`.
 A failed pane admission closes only the new pane that this call created.
+A reviewer hold failure or a failure before dispatch submission ends only the worker pane that this call created.
+The same cleanup applies when worker restore fails before it submits its resume prompt.
+Cleanup closes only the saved pane and terminal.
+The close target is the worker's current session for both Claude and Codex.
+It retires a staff row only if this launch created the row.
+A resumed worker keeps its existing row after cleanup.
+An existing pane keeps its pane and staff row.
+A failed close prints `anomaly: <pane>: cleanup failed: <reason>` and preserves the original failure code.
+An incomplete start also closes its new pane.
+The start result identifies a new pane and its saved terminal.
+Dispatch reads staff rows before start and adds no pane scan for cleanup.
+A target refusal before prompt delivery runs cleanup.
+Cleanup stops only after target checks pass and the prompt can reach the agent.
+Restore cancels cleanup through the callback in `Herdr.prompt`.
 For an existing pane, the launcher quits its own agent and keeps the shell.
 Both paths compare the current terminal and process with the identities saved after launch.
 A replacement process remains open. Cleanup prints one anomaly with the pane id.

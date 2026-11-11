@@ -96,15 +96,19 @@ The shared resume path reads the saved environment, arguments, and folder.
 The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Other Claude sessions, and sessions with no staff row, use the configured units account.
+Claude producers use the configured showrunners account.
+Other Claude sessions use the configured units account.
+A configured producer without a staff row uses the producer first-start account rule.
 When the account does not change, the resume message names no move.
 `--to ACCOUNT` overrides the account for either family.
 Restart without ACCOUNT and folder moves use the role account.
-A herdr server restore keeps the saved account for both families.
+Explicit pane restore keeps the saved account for both families.
 It passes the saved home to `restart.start_row` as an `AccountSelection`.
-It restores a closed tab when a saved launch exists.
+Explicit pane restore restores a closed tab when a saved launch exists.
+Producer upkeep uses shared resume and selects the current family account.
 An explicit CLI resume can restore an intentionally stopped session.
-Automatic recovery preserves an intentional stop.
+Unit watchdog recovery preserves an intentional stop.
+Producer upkeep excludes paused and exited rows, but it can resume an otherwise active producer after a process stop.
 A separate terminal starts the account command in the target pane.
 The action check confirms the session before signals or pane input.
 The command changes to the saved folder before the account launch.
@@ -112,9 +116,10 @@ The pane receives one opening message after identity confirmation.
 
 Resume from its own empty pane executes the saved launch in that pane.
 `stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
-The workspace comes from the row's parent showrunner, the entry name, or the shared session.
+Producers use `PRODUCER_WORKSPACE` from `config/staff.conf`, normally `producers`.
+Other rows use their parent showrunner's workspace, the entry name, or the shared session.
 A role account change does not update an existing pane shell's `resume` alias.
-An alias with an old `CLAUDE_CONFIG_DIR` remains until a herdr restart or reboot.
+Each agent launch prepares the pane aliases through `herdr.agent_alias_script(kind)` for its selected family.
 
 `resume_message.py` builds every opening message.
 The restore paths use these causes:
@@ -148,7 +153,7 @@ It normalizes the account label and preserves the result and output.
 
 `move_sessions` writes each session request before the stops, then records its confirmed or failed outcome in the accounts moves log.
 Each attempt has its own move ID and cause.
-Handed-off callers and sessions already on the target write nothing.
+Delegated callers and sessions proved live on the target write nothing.
 
 `move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
@@ -179,7 +184,6 @@ Checkout moves stop before moving files and resume afterward.
 The checkout coordinator excludes only its own pid from cwd holders.
 Other holders still refuse.
 Attach keeps its process and prompt-submission proofs.
-The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
 Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
@@ -188,6 +192,97 @@ The watchdog does not read shutdown session records.
 Unit recovery writes its completion receipt and discards the parked facts before it restores workers.
 It returns the worker restore exit code.
 A completed recovery rerun restores the workers again.
+
+## Producer launch and admission
+
+`resume morty`, `resume brain`, and `resume dwight` use `stop_resume.resume`.
+Account moves and restart share the same resume arguments, account selection, and pane launch code.
+Each producer uses its own tab in the `producers` workspace of the shared herdr session.
+`config/staff.conf` supplies the workspace through `PRODUCER_WORKSPACE`.
+`restart.producer_launch(row)` resumes `row.current_session` with the producer's configured settings.
+`restart.producer_resume(row, entry)` preserves saved launch options through `pane_record.configured_resume_arguments`.
+It takes the family, model, and effort from the current producer settings.
+`pane_launch` reads `--effort` as an option with a value.
+
+`models_registry.launch_settings("producers", name)` validates each `family:model:effort` value in `config/models.conf`.
+The configured lines are:
+
+```ini
+[producers]
+morty=codex:astra:high
+brain=codex:astra:medium
+dwight=claude:fable:high
+```
+
+These model names are aliases that the shared model registry resolves.
+`member_account.producer_account(kind, *, to="")` selects the account before admission.
+Admitted producers use `member_account.resume_account`.
+Both functions select the workers account for Codex and the showrunners account for Claude.
+An explicit `--to` overrides that selection.
+
+`accounts.eligible_producers(membership, family)` selects active, unpaused, local producers of the configured family.
+`accounts.producer_settings(member)` returns `LaunchSettings` or `InvalidProducerSettings`.
+Invalid settings exclude that producer.
+`settings_report_scope` limits its warning to one per operation.
+A workers swap includes eligible Codex producers.
+A showrunners group move includes eligible Claude producers.
+Units and showrunners retain their existing group selection.
+
+A repeated move selects a stopped producer even when its recorded home already names the target.
+Only proof that the producer runs on the target permits the move to skip it.
+`LiveAccountUnproved`, a `ResumeFailed`, identifies a live process with unreadable account evidence.
+A move returns `StopFailed` with the unreadable account reason.
+It sends no stop or start and makes no home change.
+Producers, units, and showrunners share this move check and `member_account.repair_home`.
+The move writes `home` only when it changes.
+The home records an account; it does not prove that a start finished.
+
+`pane_launch.write` owns retained producer bindings.
+`pane_launch.producer_start(directory, expected)` writes the start contract before each retained launch, including an own-pane exec.
+`ProducerStartExpectation(member, session, kind, folder, home)` defines the expected launch.
+Publication checks the native identity, process generation, family, folder, and account.
+The shared `.publication.lock` protects every pane record writer.
+Publication replaces earlier bindings through the recoverable `.producer-publication` record without closing their panes.
+`pane_launch.read_entries` returns no entries or lock file when the record folder is absent.
+Resume compares source and destination pane locations before it lists panes.
+An own-pane resume therefore needs no pane list call.
+
+### First start
+
+`ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
+It is separate from an admitted `StaffRow`.
+`PRODUCER_FOLDER_ROOT` in `config/staff.conf` defaults to `~/rust/hanadocs`.
+The first start requires `<root>/<name>/README.md`.
+Dwight uses `~/rust/hanadocs/dwight/README.md`, with role `strategist`.
+
+The first-start path uses this order:
+
+1. Lock the producer's first admission through `staff.slot_operation`.
+2. Reserve the producer's tab in the configured workspace.
+3. Save `PendingProducerAdmission(pane, terminal, kind, home)` at `_producer_admission_path(name)`.
+4. Start without a resume argument through `restart.producer_first_arguments(name)`.
+5. Prove the native identity through `Herdr.producer_admission_launch`.
+6. Admit the row through `staff.ensure("producer", ..., runtime_id=identity)`.
+7. Publish the retained binding through `pane_launch.staff_admitted` under `producer_start`.
+8. Remove the pending admission record after publication succeeds.
+
+The record path is `<pane record directory>/.producer-admission-<name>`.
+The saved record also holds the folder.
+A repeated resume completes an interrupted admission without opening another conversation.
+Later resumes use the admitted row's `current_session`.
+The pending record retains the original account.
+A conflicting `--to`, family, or folder returns failure and preserves that record.
+
+A lost or replaced reserved pane requires proof that its retained conversation stopped.
+Recovery reserves another pane and transfers the retained entry without `pid` or `proc_start`.
+It then retires the lost pane's launch.
+A shell is eligible only without a retained entry or with this pending producer's identity.
+A shell with another session's retained launch stays unchanged; recovery opens another tab.
+
+`_resume` checks pending admission before it reads the model registry.
+A registry error during pending admission returns `ResumeFailed` and preserves the record.
+Without pending admission, a registry error permits the generic resume lookup.
+The [upkeep service](herdr-restore.md#restore-services) recovers admitted producers after server loss or reboot.
 
 ## Worker resume results
 
@@ -268,7 +363,7 @@ Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.
 
 `agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
-The selection includes freestanding agents, such as brain and morty.
+The selection includes producers, such as brain, morty, and dwight.
 It saves each row ID before its stop. It starts nothing.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
@@ -310,7 +405,7 @@ The record stores no session facts, progress, claims, recovery states, or pane p
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.
-A freestanding agent without a recorded folder uses the home folder.
+A producer without a recorded folder uses the user's home folder.
 The native pane reader identifies Codex sessions from their resume arguments or pane reports.
 Callers without a report read the process's own pane through the same reader.
 No thread identity comes from an open rollout file.

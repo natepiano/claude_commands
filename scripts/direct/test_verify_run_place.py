@@ -38,6 +38,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         library.mkdir()
         (library / "py").symlink_to(sys.executable)
         (library / "package_root.py").symlink_to(VERIFY.parent.parent / "lib/package_root.py")
+        (library / "conf_record.sh").symlink_to(VERIFY.parent.parent / "lib/conf_record.sh")
         (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
         lint = scripts / "lint"
         lint.mkdir()

@@ -19,7 +19,7 @@ import time
 from threading import Event
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from functools import partial
 from importlib import import_module
@@ -91,11 +91,27 @@ class HolderRun(Enum):
 
 
 @dataclass(frozen=True)
+class CreatedWorkerPane:
+    """This start created the pane with this terminal."""
+
+    terminal: str
+
+
+@dataclass(frozen=True)
+class NoCreatedWorkerPane:
+    """This start owns no new pane."""
+
+
+NO_CREATED_WORKER_PANE = NoCreatedWorkerPane()
+
+
+@dataclass(frozen=True)
 class OpenWorker:
     row: staff.StaffRow
     pane: str
     terminal: str
     status: herdr.AgentStatus
+    created_pane: CreatedWorkerPane | NoCreatedWorkerPane = field(default=NO_CREATED_WORKER_PANE, compare=False)
 
 
 @dataclass(frozen=True)
@@ -122,6 +138,7 @@ class ProcessUnknownWorker:
     pane: str
     terminal: str
     reason: str
+    created_pane: CreatedWorkerPane | NoCreatedWorkerPane = field(default=NO_CREATED_WORKER_PANE, compare=False)
 
 
 @dataclass(frozen=True)
@@ -134,6 +151,7 @@ class IncompleteStart:
     row: staff.StaffRow
     pane: str
     reason: str
+    created_pane: CreatedWorkerPane | NoCreatedWorkerPane = field(default=NO_CREATED_WORKER_PANE, compare=False)
 
 
 class UnpublishedCleanup(Enum):
@@ -583,8 +601,8 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
         messages = [entry for entry in entries if isinstance(entry, str) and entry]
         if (not isinstance(dispatch, str) or not dispatch or not messages
                 or not messages[-1].startswith("assistant:\n")
-                or messages[-1].rstrip().splitlines()[-1] not in
-                (f"DONE {dispatch}", f"DONE {stage_two_completion_id(dispatch)}")):
+                or not any(worker_admission.reply_ends_dispatch(messages[-1], identity)
+                           for identity in (dispatch, stage_two_completion_id(dispatch)))):
             return Kept("last turn does not end with the dispatch DONE line")
     except (OSError, ValueError) as error:
         return Kept(f"completion evidence is unavailable: {error}")
@@ -1036,6 +1054,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     environment = launch_environment(policy, account, row is not None and not switching)
     if isinstance(environment, StartRefused):
         return environment
+    launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
+                   if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
     if owner.kind == "unit":
         environment["UNIT_RUN_DIR"] = str(allowed.run)
@@ -1113,6 +1133,12 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return _codex_start_session(client, launched.pane)
         return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
 
+    def created_pane() -> CreatedWorkerPane | NoCreatedWorkerPane:
+        launched = launches[-1]
+        if isinstance(launch_destinations[launched.pane], herdr.ExistingPane):
+            return NO_CREATED_WORKER_PANE
+        return CreatedWorkerPane(launch_terminals.get(launched.pane, ""))
+
     def cleanup(identity: str) -> worker_admission.CleanupOutcome:
         if not launches:
             return worker_admission.NoDestinationToStop()
@@ -1157,14 +1183,15 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if switching:
             request = hashlib.sha256(f"{row.current_session if row else ''}:{policy.settings.kind}".encode()).hexdigest()
             published = worker_admission.switch_worker(allowed, policy.settings.kind, start=start,
-                dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request)
+                dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request,
+                launch_home=launch_home)
             row = published.row
         else:
             identity = start(worker_admission.NoFamilyHandoff())
             if row is not None and identity != row.current_session:
                 return _uncertain(row, "launch proves another native session; pane retained")
             if row is None:
-                row = worker_admission.publish(allowed, identity).row
+                row = worker_admission.publish(allowed, identity, launch_home=launch_home).row
                 lock.bind(row)
     except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if not launches:
@@ -1174,7 +1201,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         launched = launches[-1]
         admitted = staff.initial_snapshot().by_current_session(identity) if identity else None
         if admitted is not None:
-            return IncompleteStart(admitted, launched.pane, str(error))
+            return IncompleteStart(admitted, launched.pane, str(error), created_pane())
         outcome = cleanup(identity)
         existing_pane = isinstance(launch_destinations.get(launched.pane), herdr.ExistingPane)
         stopped = isinstance(outcome, worker_admission.DestinationStopped)
@@ -1183,11 +1210,13 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         return UnpublishedWorker(launched.pane, str(error), status)
     launched = launches[-1]
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-        return IncompleteStart(row, launched.pane, launched.outcome.reason)
+        return IncompleteStart(row, launched.pane, launched.outcome.reason, created_pane())
     fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
     result = next((state for state in fresh.states if state.row.id == row.id), None)
     _layout(owner.id, fresh)
-    return result if isinstance(result, (OpenWorker, ProcessUnknownWorker, UncertainWorker)) else _uncertain(row, "agent launch is incomplete")
+    if isinstance(result, (OpenWorker, ProcessUnknownWorker)):
+        return replace(result, created_pane=created_pane())
+    return result if isinstance(result, UncertainWorker) else _uncertain(row, "agent launch is incomplete")
 
 
 def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.StaffSnapshot) -> None:

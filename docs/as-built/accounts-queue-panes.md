@@ -99,6 +99,8 @@ A role without reported members has zero counts; `spare` has no count.
 The totals row sums known activity counts.
 
 Units and showrunners without live sessions count as exited on their selected role account.
+Claude producers count under `showrunners` through the same hold and activity rules.
+Without a live session, they count on the selected showrunners account.
 Workers count only while live.
 Worker paused and exited counts stay zero.
 The access mark uses `read_ok`.

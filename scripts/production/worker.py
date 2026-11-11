@@ -12,6 +12,7 @@ from contextlib import ExitStack, redirect_stderr
 from dataclasses import dataclass, replace
 from enum import IntEnum
 from importlib import import_module
+from functools import partial
 import io
 import json
 import os
@@ -140,7 +141,8 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                            if part.startswith("Detached run: ")}
                 received.update(results)
                 if (text in (line.strip(), script_prompt(line).strip()) if isinstance(line, str) else
-                        any(f"End your final reply with DONE {identity}." in text for identity in
+                        any(f"End your final reply with DONE {identity}." in text
+                            or f"End your final reply with this line alone: DONE {identity}\n" in text for identity in
                             (line.dispatch_id, worker_panes.stage_two_completion_id(line.dispatch_id)))):
                     submitted = True
                     responding = True
@@ -148,7 +150,8 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                 elif isinstance(completion, FinalReply):
                     responding = False
                     reply = DispatchSubmitted()
-                elif "Read the unchanged prompt file" in text and "End your final reply with DONE " in text:
+                elif "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
+                        "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
                     responding = False
                 elif submitted and responding and results:
                     reply = DispatchAwaitingReply(
@@ -159,10 +162,10 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                 if isinstance(completion, FinalReply):
                     complete = bool(text.strip())
                 else:
-                    endings = {f"DONE {completion.dispatch_id}"}
+                    complete = worker_admission.reply_ends_dispatch(text, completion.dispatch_id)
                     if isinstance(line, DispatchPrompt):
-                        endings.add(f"DONE {worker_panes.stage_two_completion_id(completion.dispatch_id)}")
-                    complete = bool(text.rstrip().splitlines()[-1:] and text.rstrip().splitlines()[-1] in endings)
+                        complete = complete or worker_admission.reply_ends_dispatch(
+                            text, worker_panes.stage_two_completion_id(completion.dispatch_id))
                 if complete and isinstance(line, DispatchPrompt):
                     submitted = True
                 if not (isinstance(line, DispatchPrompt) and isinstance(reply, DispatchComplete)):
@@ -227,7 +230,8 @@ def _client() -> herdr.Herdr:
     return herdr.Herdr(herdr.shared_session())
 
 
-def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "") -> None:
+def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "", *,
+                   on_submission: Callable[[], object] = lambda: None) -> None:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
         raise herdr_types.HerdrFailure(f"{worker.row.name}: dispatch target is unproved", "wrong_target")
@@ -236,7 +240,9 @@ def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action:
         arguments.append(script_prompt(line))
     elif action == "compact":
         arguments.extend(("/compact", "--wait"))
-    result = subprocess.run(client.argv(*arguments), text=True, capture_output=True, check=False)
+    command = client.argv(*arguments)
+    _ = on_submission()
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
     herdr.require_success(result, f"herdr agent {action}")
 
 
@@ -309,16 +315,53 @@ class DispatchSubmission(IntEnum):
     SUBMITTED = 0
 
 
+class LaunchRow(IntEnum):
+    CREATED = 1
+    RETAINED = 2
+
+
+def rows_before_launch() -> frozenset[StaffId]:
+    return frozenset(row.id for row in staff.snapshot().rows)
+
+
+def arm_launch_cleanup(cleanup: ExitStack, before: frozenset[StaffId],
+                       result: worker_panes.WorkerStart) -> None:
+    if isinstance(result, (worker_panes.OpenWorker, worker_panes.ProcessUnknownWorker, worker_panes.IncompleteStart)):
+        if isinstance(result.created_pane, worker_panes.CreatedWorkerPane) and result.created_pane.terminal:
+            row = LaunchRow.RETAINED if result.row.id in before else LaunchRow.CREATED
+            _ = cleanup.callback(cleanup_failed_launch, result.row, result.pane, result.created_pane.terminal, row)
+
+
+def cleanup_failed_launch(row: staff.StaffRow, pane: str, terminal: str, ownership: LaunchRow) -> None:
+    """Close only the saved terminal and retire only a newly created row."""
+    try:
+        with redirect_stderr(io.StringIO()) as diagnostics:
+            client = _client()
+            closed = (client.close_tab_confirmed(pane, target=str(row.current_session), terminal=terminal)
+                      and client.close_retained_pane(pane, terminal=terminal))
+        if closed:
+            if ownership is LaunchRow.CREATED:
+                _ = staff.retire(row.id)
+            return
+        reason = " ".join(line.removeprefix("anomaly: ") for line in diagnostics.getvalue().splitlines())
+        reason = reason or "pane close is incomplete"
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+            staff.StaffRefused, staff.StaffUnreadable) as error:
+        reason = str(error)
+    print(f"anomaly: {pane}: cleanup failed: {' '.join(reason.splitlines())}", file=sys.stderr)
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
              fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
              policy: worker_panes.LaunchPolicy | worker_panes.UseRolePolicy = worker_panes.UseRolePolicy.CURRENT,
              started: worker_panes.OpenWorker | StartAtDispatch = START_AT_DISPATCH,
-             completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS) -> DispatchSubmission | ExitCode:
+             completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
+             on_submission: Callable[[], object] = lambda: None) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
-    with worker_panes.worker_lock(parent, name) as hold:
+    with worker_panes.worker_lock(parent, name) as hold, ExitStack() as cleanup:
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.BUSY
@@ -343,7 +386,9 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                                    import_module("scripts.herdr.turn_end").finish_late_completion)
                 finish_late(row, owner, hold, completion_actions.held_role)
         if isinstance(started, StartAtDispatch):
+            before = rows_before_launch()
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
+            arm_launch_cleanup(cleanup, before, current_start)
         else:
             if not started.row.reports_to(parent) or started.row.name != name.value or not hold.owns(started.row):
                 print("dispatch startup does not belong to this worker", file=sys.stderr)
@@ -352,6 +397,11 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if not isinstance(current_start, worker_panes.OpenWorker):
             return startup_result(name, current_start)
         started = current_start
+
+        def submitted() -> None:
+            _ = cleanup.pop_all()
+            _ = on_submission()
+
         instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
             worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
@@ -361,7 +411,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         saved = progress_history.dispatch_delivery(worker_panes.worker_pass(started.row, session_dir))
         if not saved.line:
             dispatch_id = dispatch_id or instance
-            line = (f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}. "
+            line = (f"Read the unchanged prompt file {json.dumps(str(prompt))}. "
+                    f"End your final reply with this line alone: DONE {dispatch_id}\n"
                     "A reply that waits on a detached run is not final.")
             handoff = worker_admission.dispatch_record(session_dir, name.value)
             if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
@@ -372,7 +423,10 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             saved = progress_history.DispatchDelivery(line, dispatch_id, str(destination),
                 str(early_ready) if isinstance(early_ready, Path) else "", completion_actions)
             progress_history.save_dispatch_delivery(session_dir, instance, saved)
-        result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id, run=session_dir)
+        result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
+                               run=session_dir, on_submission=submitted)
+        if result is DispatchSubmission.SUBMITTED:
+            submitted()
         handoff = worker_admission.dispatch_record(session_dir, name.value)
         if (result is DispatchSubmission.SUBMITTED and handoff.state in
                 (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)):
@@ -383,7 +437,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
 
 
 def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
-                   line: str, dispatch_id: str, *, run: Path) -> DispatchSubmission | ExitCode:
+                   line: str, dispatch_id: str, *, run: Path,
+                   on_submission: Callable[[], object] = lambda: None) -> DispatchSubmission | ExitCode:
     """Submit the saved prompt after the bounded idle checks."""
     current = started
     codex = isinstance(staff.backend(current.row), staff.CodexBackend)
@@ -427,10 +482,10 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
     try:
         _compact_before_dispatch(client, current)
     except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
-        print(f"{current.row.name}: compaction failed: {error}; no prompt sent", file=sys.stderr)
-        return ExitCode.UNCERTAIN
+        reason = " ".join(str(error).splitlines())
+        print(f"{current.row.name}: compaction failed: {reason}; prompt is sent without compaction", file=sys.stderr)
     try:
-        _agent_command(client, current, "prompt", line)
+        _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:
         reason = " ".join(str(error).splitlines())
         raise OSError(f"{reason}; prompt delivered to pane {current.pane}") from error
@@ -440,6 +495,25 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         reason = " ".join(str(error).splitlines())
         print(f"{reason}; prompt delivered to pane {current.pane}", file=sys.stderr)
         return ExitCode.UNCERTAIN
+    if codex:
+        deadline = time.monotonic() + conf.read("direct").number("WORKER_SETTLE_SECONDS")
+        while True:
+            receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
+            if not isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                if isinstance(client.pane_activity(current.pane), herdr.PaneAtShell):
+                    break
+            except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired):
+                pass
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        if isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+            reason = receipt.reason if isinstance(receipt, DispatchEvidenceUnknown) else "dispatch prompt is not in the transcript"
+            print(f"anomaly: {current.row.name}: {' '.join(reason.splitlines())}; submission is unproved", file=sys.stderr)
+            return ExitCode.UNCERTAIN
     return DispatchSubmission.SUBMITTED
 
 
@@ -511,53 +585,61 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
            fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
            completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS) -> DispatchSubmission | ExitCode:
-    if not name:
-        matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-            prompt=prompt.resolve(), launcher_command=launcher_command)
-        if isinstance(matched, progress_history.MatchedDispatch):
-            name = matched.worker_name
-    record = staff.snapshot()
-    rows = record.find(kind="worker", parent=parent)
-    needs_team = False
-    if not name and role in ("impl", "fix", "review", "test"):
-        owner = record.by_id(parent)
-        runs = unit_runs.held(str(owner.current_session) if owner is not None else "",
-                             os.environ.get("ROSTER_RUN_ROOT"), record=record)
-        with progress_history.dispatch_reads(record, dict.fromkeys([*(Path(run) for run in runs), session_dir])):
-            needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
-    if needs_team:
-        names = {row.name for row in rows}
-        for default_role in ("impl", "fix", "review", "test"):
-            if default_role in names:
-                continue
-            with redirect_stderr(io.StringIO()) as diagnostics:
-                result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role)
-            if isinstance(result, worker_panes.OpenWorker):
-                print(diagnostics.getvalue(), end="", file=sys.stderr)
-                continue
-            detail = (result.detail if isinstance(result, worker_panes.StartRefused) else
-                      result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
-            print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
+    with ExitStack() as cleanup:
+        if not name:
+            matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
+                prompt=prompt.resolve(), launcher_command=launcher_command)
+            if isinstance(matched, progress_history.MatchedDispatch):
+                name = matched.worker_name
         record = staff.snapshot()
-    chosen = WorkerName.parse(name) if name else select_worker(parent, role, record)
-    if not isinstance(chosen, WorkerName):
-        return startup_result(WorkerName.parse(role), chosen)
-    if chosen.value != slot:
-        if completion_actions.status_file:
-            status = Path(completion_actions.status_file)
-            target = progress_history.worker_artifact(status, slot, chosen.value)
-            completion_actions = replace(completion_actions, status_file=str(target))
-            if status.is_file():
-                _ = status.replace(target)
-        if completion_actions.summary_file:
-            target = progress_history.worker_artifact(Path(completion_actions.summary_file), slot, chosen.value)
-            completion_actions = replace(completion_actions, summary_file=str(target))
-        if isinstance(reply, Path):
-            reply = progress_history.worker_artifact(reply, slot, chosen.value)
-    return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=chosen.value,
-        phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
-        fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
-        completion_actions=completion_actions)
+        rows = record.find(kind="worker", parent=parent)
+        needs_team = False
+        if not name and role in ("impl", "fix", "review", "test"):
+            owner = record.by_id(parent)
+            runs = unit_runs.held(str(owner.current_session) if owner is not None else "",
+                                 os.environ.get("ROSTER_RUN_ROOT"), record=record)
+            with progress_history.dispatch_reads(record, dict.fromkeys([*(Path(run) for run in runs), session_dir])):
+                needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
+        if needs_team:
+            names = {row.name for row in rows}
+            for default_role in ("impl", "fix", "review", "test"):
+                if default_role in names:
+                    continue
+                before = rows_before_launch()
+                with redirect_stderr(io.StringIO()) as diagnostics:
+                    result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role)
+                if isinstance(result, worker_panes.OpenWorker):
+                    arm_launch_cleanup(cleanup, before, result)
+                    print(diagnostics.getvalue(), end="", file=sys.stderr)
+                    continue
+                with ExitStack() as failed:
+                    arm_launch_cleanup(failed, before, result)
+                detail = (result.detail if isinstance(result, worker_panes.StartRefused) else
+                          result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
+                print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
+            record = staff.snapshot()
+        chosen = WorkerName.parse(name) if name else select_worker(parent, role, record)
+        if not isinstance(chosen, WorkerName):
+            return startup_result(WorkerName.parse(role), chosen)
+        if chosen.value != slot:
+            if completion_actions.status_file:
+                status = Path(completion_actions.status_file)
+                target = progress_history.worker_artifact(status, slot, chosen.value)
+                completion_actions = replace(completion_actions, status_file=str(target))
+                if status.is_file():
+                    _ = status.replace(target)
+            if completion_actions.summary_file:
+                target = progress_history.worker_artifact(Path(completion_actions.summary_file), slot, chosen.value)
+                completion_actions = replace(completion_actions, summary_file=str(target))
+            if isinstance(reply, Path):
+                reply = progress_history.worker_artifact(reply, slot, chosen.value)
+        result = dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=chosen.value,
+            phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
+            fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
+            completion_actions=completion_actions, on_submission=cleanup.pop_all)
+        if result is DispatchSubmission.SUBMITTED:
+            _ = cleanup.pop_all()
+        return result
 
 
 def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
@@ -621,7 +703,16 @@ def resume_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
     return receipt if isinstance(receipt, DispatchEvidenceUnknown) else NO_OWN_PASS
 
 
-def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch) -> ExitCode:
+@dataclass(frozen=True)
+class NoLaunchCleanup:
+    """The restore owns no new pane to close."""
+
+
+NO_LAUNCH_CLEANUP = NoLaunchCleanup()
+
+
+def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch, *,
+                     on_submission: Callable[[], object] | NoLaunchCleanup = NO_LAUNCH_CLEANUP) -> ExitCode:
     """Read and deliver the resume step while restore holds the dispatch lock."""
     record = staff.snapshot()
     parent = record.parent_of(row)
@@ -645,7 +736,9 @@ def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispa
             return ExitCode.OK
     text = (launcher_prompt(row.id, step.dispatch_id, step.command)
             if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step))
-    client.prompt(pane.pane_id, text, target=str(recipient.current_session))
+    submit = (client.prompt if isinstance(on_submission, NoLaunchCleanup) else
+              partial(client.prompt, on_submission=on_submission))
+    submit(pane.pane_id, text, target=str(recipient.current_session))
     return ExitCode.OK
 
 
@@ -744,7 +837,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
-                with worker_panes.worker_lock(parent, WorkerName.parse(state.row.name)) as hold:
+                with worker_panes.worker_lock(parent, WorkerName.parse(state.row.name)) as hold, ExitStack() as cleanup:
                     if isinstance(hold, worker_panes.Kept):
                         outcome = ExitCode.REFUSED
                         continue
@@ -760,23 +853,31 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if only != "all":
                             print(f"{state.row.name}: closed; its next assign resumes it")
                         continue
+                    resume = _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
                         role = worker_panes.dispatch_role(state.row)
+                        before = rows_before_launch()
                         result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role,
                             account=launch_account, lock=hold, runs=runs, codex=codex)
+                        arm_launch_cleanup(cleanup, before, result)
                         code = startup_result(WorkerName.parse(state.row.name), result)
                         if code != ExitCode.OK:
                             outcome = code
                             continue
                         if isinstance(started_panes, dict):
                             started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
+                        opened = cast(worker_panes.OpenWorker, result)
+                        if isinstance(opened.created_pane, worker_panes.CreatedWorkerPane):
+                            resume = partial(_resume_launcher, on_submission=cleanup.pop_all)
                         changed = True
-                        row = cast(worker_panes.OpenWorker, result).row
+                        row = opened.row
                     else:
                         row = state.row
-                    code = _resume_launcher(row, active)
+                    code = resume(row, active)
                     if code != ExitCode.OK:
                         outcome = code
+                    else:
+                        _ = cleanup.pop_all()
             except (herdr_types.HerdrFailure, OSError, ValueError) as error:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN

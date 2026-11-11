@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-from scripts.lib import git_index
+from scripts.lib import conf_reads, git_index
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -134,11 +134,24 @@ class LaunchSettings(NamedTuple):
 def launch_settings(section: str, key: str) -> LaunchSettings:
     """Read launch settings through the existing shell resolver."""
     configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
+    resolver = 'agents_resolve "$2.$3"'
+    producer_arguments: list[str] = []
+    if section == "producers":
+        value = next((row.value for row in reversed(configuration.rows)
+                      if row.section == section and row.key == key), "")
+        match value.split(":"):
+            case ["claude" | "codex" as family, model, effort] if model and effort:
+                producer_arguments = [family, f"{model}:{effort}"]
+            case _:
+                raise ValueError(f"invalid producer settings for {key}; expected <family>:<model>:<effort>")
+        resolver = ('AGENT_FAMILY="$4"; _agents_validate_pair "$2.$3" "$4" "$5" && '
+                    '_agents_resolve_service_tier "$2.$3" "$4"')
     result = subprocess.run(
         ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
-         + 'agents_resolve "$2.$3" && '
+         + '{ ' + resolver + '; } && '
          + 'printf "%s\\n%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
-         "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key],
+         "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key,
+         *producer_arguments],
         input=configuration_shell(configuration), text=True, capture_output=True, check=False,
         env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
     values = result.stdout.splitlines()
@@ -179,7 +192,7 @@ def registry_path() -> Path:
 
 
 def registry_text(registry: Path | None = None) -> str:
-    return (registry or registry_path()).read_text(encoding="utf-8")
+    return conf_reads.read_text(registry or registry_path())
 
 
 def _records(text: str) -> list[RegistryRow]:
@@ -548,6 +561,7 @@ def main() -> int:
                 configuration = RegistryEditBase(*_snapshot({}, "", arguments.registry))
             print(configuration_shell(configuration), end="")
             return 0
+        conf_reads.record("models")
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":

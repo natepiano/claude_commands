@@ -8,7 +8,7 @@ from scripts.agents import remote
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import atomic_file, models_registry
+from scripts.lib import atomic_file, conf_reads, models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -169,9 +169,11 @@ class ProgressHistoryTests(unittest.TestCase):
         script.chmod(0o755)
         digest = cast(Callable[[], str], vars(progress_history)["_config_digest"])
         clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
+        reads = self.root / "config-reads"
         original = self.models_config_file.read_text()
         configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
         for inherited in (False, True):
+            _ = reads.write_text("")
             with self.subTest(inherited=inherited), patch.object(models_registry, "launch_configuration", wraps=models_registry.launch_configuration) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
                 "HOME": str(self.root), "CONF_DIR": str(settings), "MODELS_CONFIG_FILE": str(self.models_config_file),
                 "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
@@ -181,7 +183,9 @@ class ProgressHistoryTests(unittest.TestCase):
                 clear()
                 try:
                     text = original if inherited else self.models_config_file.read_text()
-                    self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                    with conf_reads.record_reads(reads):
+                        self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                    self.assertIn("direct", reads.read_text().splitlines())
                     self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
                     self.assertEqual(launches.call_count, int(inherited), "telemetry entered the fresh launch path")
                 finally:
@@ -1742,6 +1746,28 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--main-session-id", str(unit.current_session), at=1_700_000_001)
         self.assertEqual((self.working_dir / ".unit.toml").stat().st_mtime_ns, published)
         self.assertEqual((self.root / "staff.json").read_bytes(), published_staff)
+        # A second run of the same director, such as an Astra review folder, keeps the active run.
+        helper = self.root / "astra-review"
+        _ = self.run_command(
+            "start-run", "--session-dir", str(helper), "--working-dir", str(self.working_dir),
+            "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh",
+            "--main-session-id", str(unit.current_session), at=1_700_000_002)
+        _ = self.run_command("finish-run", "--session-dir", str(helper), "--status", "completed",
+                             at=1_700_000_003)
+        self.assertEqual(self.read_state(helper)["owner_staff_id"], unit.id)
+        self.assertEqual(unit_runs.open_run(unit.current_session), session_dir)
+        # A reused run takes the plan that its next start-run names.
+        other = self.working_dir / "docs/other.md"
+        _ = other.write_text("# Other plan\n\n## Delegation Context\n\n- **Project:** Example\n", encoding="utf-8")
+        _ = self.run_command(
+            "start-run", "--session-dir", str(session_dir),
+            "--working-dir", str(self.working_dir), "--plan-doc", str(other),
+            "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh",
+            "--main-session-id", str(unit.current_session), at=1_700_000_004)
+        self.assertEqual(self.read_state(session_dir)["project_plan_doc"], "docs/other.md")
+        changed = session_staff.RowResolver(staff.snapshot()).unit_config(unit)
+        assert isinstance(changed, unit_config.UnitConfig)
+        self.assertEqual(changed.plan, unit_config.PlanFile(Path("docs/other.md")))
 
     def test_start_run_persists_the_plan_git_time_without_an_agent_timestamp(
         self,
@@ -4177,7 +4203,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(self.pass_slots(session_dir)[""]["status"], "completed")
 
     def test_finishing_a_prepared_run_clears_pointers_for_every_staff_kind(self) -> None:
-        kinds: tuple[staff.Kind, ...] = ("agent", "worker", "unit", "showrunner")
+        kinds: tuple[staff.Kind, ...] = ("producer", "worker", "unit", "showrunner")
         for kind in kinds:
             with self.subTest(kind=kind):
                 parent = fixture_member("showrunner", name=f"prepared-parent-{kind}")

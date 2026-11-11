@@ -1126,8 +1126,15 @@ class StyleProposalsTests(unittest.TestCase):
             by_rule, by_user = sorted(result.filed, key=lambda path: frontmatter(path)["style_rule"] != [self.always])
             self.issue_command("approve", str(by_user), "--by", "user", "--showrunner", "sample-style",
                                "--unit", proposal_issue.staff_reference("sample-style/sample-style-names", "unit").id, "--plan", "docs/style-production/units/names-unit.md")
-            self.assertEqual({item.path for item in style_proposals.approved_decisions(self.proposals, proposal_issue.staff_reference("sample-style/sample-style-names", "unit").id)},
-                             {by_rule, by_user})
+            owner = proposal_issue.staff_reference("sample-style/sample-style-names", "unit")
+            retired = fixture_member("unit", name=unit_names.name("retired-names"), parent=owner.parent)
+            for approved_unit in (owner.id, retired.id):
+                with self.subTest(approved_unit=approved_unit):
+                    for issue in (by_rule, by_user):
+                        text, _ = proposal_issue.set_fields(issue.read_text(), {"unit": approved_unit}, issue)
+                        _ = issue.write_text(text)
+                    self.assertEqual({item.path for item in style_proposals.approved_decisions(self.proposals, owner.id)},
+                                     {by_rule, by_user})
 
     def filed_before_always(self, ledger: style_ledger.Ledger, *answer: str) -> Path:
         """A decision filed under the rule before it said `approval: always`, given the answer, then the field added."""

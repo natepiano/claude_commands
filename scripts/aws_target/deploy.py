@@ -35,7 +35,7 @@ from scripts.aws_target.config import (
     BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
     deployment_record, deployment_outputs, read_control_settings, read_deployment_settings, read_settings,
 )
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
@@ -1307,7 +1307,7 @@ def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
 def remote_configuration(path: Path) -> str:
     """Build separate public lifecycle settings without granting execution permission."""
     settings = read_control_settings(path)
-    source = path.read_text().splitlines()
+    source = conf_reads.read_text(path).splitlines()
     limits: dict[str, str] = {}
     for index, line in enumerate(source):
         key, separator, _ = line.partition('=')

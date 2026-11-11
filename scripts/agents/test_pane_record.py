@@ -18,6 +18,7 @@ from unittest import mock
 
 
 from scripts.agents import pane_record
+from scripts.lib.models_registry import LaunchSettings
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
@@ -129,16 +130,23 @@ class PaneRecordTests(unittest.TestCase):
     def test_plugin_directories_survive_hook_capture_and_resume(self) -> None:
         directories = ["/fixture/postmaster", "/fixture/second plugin"]
         started = self.start("w1:p2", "plugin-session", "--plugin-dir", directories[0],
-                             "--plugin-dir=" + directories[1], "-n", "postmaster")
+                             "--plugin-dir=" + directories[1], "-n", "postmaster", "--remote-control", "postmaster")
         self.assertEqual(started.returncode, 0, started.stderr)
         with mock.patch.object(pane_record, "RECORD_DIR", self.records):
             entry = pane_record.read_strict("agents")["w1:p2"]
         self.assertEqual(entry.get("plugin_directories"), directories)
-        arguments = pane_record.resume_arguments(entry)
-        parsed = pane_record.parse_claude_arguments(["claude", *arguments])
-        self.assertEqual(parsed.plugin_directories, tuple(directories))
-        self.assertFalse(parsed.has_prompt)
-        self.assertEqual(arguments.count("--plugin-dir"), 2)
+        for configured in (False, True):
+            with self.subTest(configured=configured):
+                arguments = (pane_record.configured_resume_arguments(entry, "plugin-session", "current-name",
+                    LaunchSettings("claude", "current-model", "max", "")) if configured else pane_record.resume_arguments(entry))
+                parsed = pane_record.parse_claude_arguments(["claude", *arguments])
+                self.assertEqual(parsed.plugin_directories, tuple(directories))
+                self.assertFalse(parsed.has_prompt)
+                self.assertEqual(arguments.count("--plugin-dir"), 2)
+                self.assertEqual(arguments[arguments.index("--remote-control") + 1], "current-name" if configured else "postmaster")
+                if configured:
+                    self.assertEqual(arguments[arguments.index("--model") + 1], "current-model")
+                    self.assertEqual(arguments[arguments.index("--effort") + 1], "max")
 
     def test_relative_plugin_paths_keep_their_target_after_a_folder_move(self) -> None:
         original = self.root / "work/unit"
@@ -165,16 +173,28 @@ class PaneRecordTests(unittest.TestCase):
                   "-c", 'model_reasoning_effort="high"',
                   "-c", "notice.hide_rate_limit_model_nudge=true",
                   "-c", 'service_tier="default"', "-c", 'notify=["/fixture/notify"]']
-        for model, recorded in (("fixture-model", False), ("fixture-model", True), ("", True)):
-            with self.subTest(model=model, recorded=recorded):
+        for model, recorded, configured in (("fixture-model", False, False), ("fixture-model", True, False),
+                ("", True, False), ("fixture-model", False, True), ("fixture-model", True, True)):
+            with self.subTest(model=model, recorded=recorded, configured=configured):
                 entry = pane_record.launch("w1:p2", "codex-thread", str(self.root), {}, ["codex"], kind="codex")
                 entry["model"] = model
                 if recorded:
                     entry["codex_policy"] = policy.copy()
                 else:
                     _ = entry.pop("codex_policy", None)
-                expected = ["resume", "codex-thread"] + (["--model", model] if model else [])
-                self.assertEqual(pane_record.resume_arguments(entry), expected + (policy if recorded else []))
+                if configured:
+                    arguments = pane_record.configured_resume_arguments(entry, "current-thread", "current-name",
+                        LaunchSettings("codex", "current-model", "high", "priority"))
+                    expected = ["resume", "current-thread", "--model", "current-model", "-c", 'model_reasoning_effort="high"',
+                                "-c", 'service_tier="priority"']
+                    if recorded:
+                        expected.extend(("--sandbox", "read-only", "--ask-for-approval", "never",
+                            "-c", "notice.hide_rate_limit_model_nudge=true", "-c", 'notify=["/fixture/notify"]'))
+                    self.assertEqual(arguments, expected)
+                    self.assertEqual(entry["model"], model)
+                else:
+                    expected = ["resume", "codex-thread"] + (["--model", model] if model else [])
+                    self.assertEqual(pane_record.resume_arguments(entry), expected + (policy if recorded else []))
                 if recorded:
                     self.assertEqual(entry.get("codex_policy", []), policy)
 
@@ -243,7 +263,7 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w2C:p1")),
-              mock.patch.object(client, "pane_tab", return_value=("morty", 1, {"name": reference})),
+              mock.patch.object(client, "pane_tab", return_value=("producers", 1, {"name": reference})),
               redirect_stdout(output)):
             if kind == "codex" and rows:
                 self.assertEqual(client.codex_launch("w2C:p1")["session_id"], fixture_runtime_id("pane-record-codex"))
@@ -251,7 +271,7 @@ class PaneRecordTests(unittest.TestCase):
         return output.getvalue()
 
     def test_seed_records_a_plain_codex_client_from_its_own_process(self) -> None:
-        owner = staff.StaffRow(staff.native_id("019b3a40-4250-7000-8000-000000000101"), "agent", "morty",
+        owner = staff.StaffRow(staff.native_id("019b3a40-4250-7000-8000-000000000101"), "producer", "morty",
                               staff.StaffRoot(), current_session=staff.native_id("019b3a40-4250-7000-8000-000000000102"))
         for reference in (owner.name, owner.id):
             with self.subTest(reference=reference):

@@ -31,7 +31,7 @@ from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
-from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config, write_process
 
 
 def queue_json_text(data: QueueLines) -> str:
@@ -454,41 +454,42 @@ class QueueViewTests(QueueViewFixtureTests):
                        facts=head_facts.read_head_facts(reply.reading))
 
     def test_running_waiting_and_held_rows_show_run_pids_at_every_width(self) -> None:
-        with AdmissionFixture() as fixture:
-            owner = fixture.fixture_owner(7000001, "100")
-            child = fixture.fixture_owner(7000002, "200")
-            run = wire.RunIdentity(owner.pid, owner.start_time)
-            _ = (fixture.proc.path / str(child.pid) / "environ").write_bytes(
-                f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
-            request = replace(fixture.request(owner=child, run=run), sidecar=str(fixture.scope(child)))
-            grant = only_admitted(fixture.server.handle_request(request))
-            waiter = fixture.request(owner=fixture.fixture_owner(7000003, "300"),
-                run=wire.RunIdentity(7000004, "400"), need=60 * admission_records.GIB)
-            _ = fixture.fixture_owner(7000004, "400")
-            _ = fixture.server.handle_request(waiter)
-            for held in (False, True):
-                if held:
-                    _ = fixture.server.handle_request(wire.ReleaseRequest("held", grant.reservation, 0))
-                model = self.service_model(fixture)
-                for columns in (60, 80, 100, 140):
-                    with self.subTest(held=held, columns=columns):
-                        lines = queue_view.render_view(model, columns)
-                        running, = [plain([line]) for line in lines
-                                    if plain([line]).startswith("run") and "pid 7000001" in plain([line])]
-                        queued, = waiting_rows(lines)
-                        self.assertIn("pid 7000001", running)
-                        self.assertIn("pid 7000004", queued)
-                        self.assertNotIn("pid 7000002", running)
-                        self.assertNotIn("pid 7000003", queued)
-                        self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
-                        card = queue_card.render_selection(model, "1", columns)
-                        self.assertIn("pid 7000004", plain(card))
-                        self.assertTrue(all(terminal_width(plain([line])) <= columns for line in card))
-                if held:
-                    self.assertFalse(fixture.server.reservations)
-                    room = model.reading.explanation.room
-                    assert isinstance(room, admission_records.MemoryRoom)
-                    self.assertGreater(sum(hold.memory.held for hold in room.runs), 0)
+        for folder in ("", "builds.slice/builds-detached.slice/verify.scope"):
+            with self.subTest(scope=folder), AdmissionFixture() as fixture:
+                owner = fixture.fixture_owner(7000001, "100")
+                child = fixture.fixture_owner(7000002, "200")
+                run = wire.RunIdentity(owner.pid, owner.start_time)
+                _ = (fixture.proc.path / str(child.pid) / "environ").write_bytes(
+                    f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
+                request = replace(fixture.request(owner=child, run=run), sidecar=str(fixture.scope(child, folder=folder)))
+                grant = only_admitted(fixture.server.handle_request(request))
+                waiter = fixture.request(owner=fixture.fixture_owner(7000003, "300"),
+                    run=wire.RunIdentity(7000004, "400"), need=60 * admission_records.GIB)
+                _ = fixture.fixture_owner(7000004, "400")
+                _ = fixture.server.handle_request(waiter)
+                for held in (False, True):
+                    if held:
+                        _ = fixture.server.handle_request(wire.ReleaseRequest("held", grant.reservation, 0))
+                    model = self.service_model(fixture)
+                    for columns in (60, 80, 100, 140):
+                        with self.subTest(held=held, columns=columns):
+                            lines = queue_view.render_view(model, columns)
+                            running, = [plain([line]) for line in lines
+                                        if plain([line]).startswith("run") and "pid 7000001" in plain([line])]
+                            queued, = waiting_rows(lines)
+                            self.assertIn("pid 7000001", running)
+                            self.assertIn("pid 7000004", queued)
+                            self.assertNotIn("pid 7000002", running)
+                            self.assertNotIn("pid 7000003", queued)
+                            self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+                            card = queue_card.render_selection(model, "1", columns)
+                            self.assertIn("pid 7000004", plain(card))
+                            self.assertTrue(all(terminal_width(plain([line])) <= columns for line in card))
+                    if held:
+                        self.assertFalse(fixture.server.reservations)
+                        room = model.reading.explanation.room
+                        assert isinstance(room, admission_records.MemoryRoom)
+                        self.assertGreater(sum(hold.memory.held for hold in room.runs), 0)
 
     def test_service_without_a_recorded_process_shows_pid_absence(self) -> None:
         model = self.fixture.model()
@@ -702,6 +703,27 @@ class QueueViewTests(QueueViewFixtureTests):
             assert isinstance(activity.run, LiveBuildRun)
             self.assertEqual((activity.run.pid, activity.run.start_time), (owner.pid, owner.start_time))
             self.assertNotIn("Still running after their build ended", plain(queue_view.render_view(model, 140)))
+
+    def test_a_detached_supervisor_does_not_make_a_python_scope_a_live_build(self) -> None:
+        with AdmissionFixture() as fixture:
+            supervisor = fixture.fixture_owner(700001, "100")
+            child = fixture.fixture_owner(700002, "200")
+            write_process(fixture.proc.path, child.pid, admission_records.GIB, parent=supervisor.pid, start=child.start_time)
+            parent = fixture.proc.path / str(supervisor.pid)
+            _ = (parent / "cmdline").write_bytes(b"python3\0detached_runs.py\0supervise\0private.json\0")
+            process = fixture.proc.path / str(child.pid)
+            _ = (process / "cmdline").write_bytes(b"python3\0-m\0unittest\0")
+            scope = Path(fixture.scope(child, folder="builds.slice/python.scope").read_text())
+            _ = fixture.run_pass()
+            model = self.service_model(fixture)
+            step, = [step for step in model.reading.view.running
+                if isinstance(step.measured, admission_records.UnownedSliceMemory) and step.measured.cgroup == str(scope)]
+            assert isinstance(step.measured, admission_records.UnownedSliceMemory)
+            activity = step.measured.activity
+            assert isinstance(activity, ScopeProcesses)
+            self.assertIsInstance(activity.run, NoLiveBuildRun)
+            self.assertEqual(queue_view.running_builds(model), [])
+            self.assertEqual(queue_view.leftover_processes(model.reading.view.running), [(step, step.measured, activity)])
 
     def test_ended_processes_use_session_labels_and_exclude_the_ci_slice(self) -> None:
         model = self.fixture.model()

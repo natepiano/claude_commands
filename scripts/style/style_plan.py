@@ -57,7 +57,7 @@ from scripts.style import style_proposals
 from scripts.production.issues import Issue, frontmatter
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
-from scripts.production.proposal_issue import ApprovedDecision, decision_answer, proposal_unit, require_generated_body
+from scripts.production.proposal_issue import ApprovedDecision, decision_answer, require_generated_body
 from scripts.style.unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
 from scripts.style.unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
                         parse_pilot_scope, unit_plan_path)
@@ -2117,7 +2117,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         *(["Also build the approved findings selected from: " + ", ".join(f"`{issue}`" for issue in sorted({
             finding.state.proposal for finding in held_findings if isinstance(finding.state, style_ledger.Filed)
             and str(finding.state.proposal) != ticket["proposal"]}))]
-          if any(isinstance(finding.state, style_ledger.Filed) and str(finding.state.proposal) != ticket["proposal"]
+          if approved and any(isinstance(finding.state, style_ledger.Filed) and str(finding.state.proposal) != ticket["proposal"]
                  for finding in held_findings) else []),
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
         *([f"`{ticket['crate']}` is binary-only (no library target): none of its items, `pub` or not, is public outside the crate."]
@@ -2678,6 +2678,11 @@ def fill_decision_batch(repo: Path, tip: str, candidates: tuple[BuildableDecisio
                          selected_findings, decisions)
 
 
+def catalog_definition(definitions: Mapping[str, rules.Rule], rule: str) -> rules.Rule | None:
+    """Return the catalog definition for a decision or finding rule."""
+    return definitions.get(style_ledger.base_rule(rule))
+
+
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
@@ -2706,23 +2711,24 @@ def _select_phase(
         if not folder.is_absolute():
             folder = doc.parent.parent / folder
         decisions = tuple(issue for issue in style_proposals.approved_decisions(folder, ledger.unit_name(unit))
-                          if (definition := definitions.get(issue.value("style_rule"))) is None
-                          or definition.family in families)
+                          if (definition := catalog_definition(definitions, issue.value("style_rule"))) is not None
+                          and definition.family in families)
     def decision_members(issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
-        definition = definitions.get(frontmatter(issue).get("style_rule", [""])[0])
+        definition = catalog_definition(definitions, frontmatter(issue).get("style_rule", [""])[0])
         if definition is None or definition.family not in families:
             return ()
         return tuple(finding for finding in _unbuilt_findings(ledger, issue)
-                     if (member_rule := definitions.get(finding.rule)) is not None
+                     if (member_rule := catalog_definition(definitions, finding.rule)) is not None
                      and member_rule.family == definition.family)
 
-    unbuilt = {issue.path: decision_members(issue.path) for issue in decisions if issue.value("style_rule") in definitions}
+    unbuilt = {issue.path: decision_members(issue.path) for issue in decisions
+               if catalog_definition(definitions, issue.value("style_rule")) is not None}
     if selection != FamilySelection.OWN:
         for issue in decisions:
             findings = unbuilt.get(issue.path, ())
             current = tuple(finding for finding in findings if not style_ledger.rule_changed_since_judged(finding, definitions))
             refusals["all stale"] += len(findings) - len(current)
-            definition = definitions.get(issue.value("style_rule"))
+            definition = catalog_definition(definitions, issue.value("style_rule"))
             unbuilt[issue.path] = current if definition is not None and definition.family in families else ()
             refusals["held by build ticket"] += sum(
                 isinstance(finding.state, style_ledger.Filed) and isinstance(finding.build_ticket, style_ledger.BuildTicket)
@@ -2835,7 +2841,7 @@ def _select_phase(
                                  cast(rules.Family, definition.family),
                                  style_proposals.crate_for(directories, findings[0].path), blocking_counts)
                       for issue, findings in unbuilt.items() if findings
-                      and (definition := definitions.get(frontmatter(issue).get("style_rule", [""])[0])) is not None)
+                      and (definition := catalog_definition(definitions, frontmatter(issue).get("style_rule", [""])[0])) is not None)
     deferred = tuple(ticket for ticket in queued
                      if not pending_decision_files.intersection(ticket["files"])
                      and any(priority < work_order(ticket["kind"], cast(rules.Family, ticket["family"]),
@@ -2846,7 +2852,7 @@ def _select_phase(
     # Dropping a queued ticket releases its findings for decision selection below.
     if queued:
         unbuilt = {issue.path: decision_members(issue.path) for issue in decisions
-                   if issue.value("style_rule") in definitions}
+                   if catalog_definition(definitions, issue.value("style_rule")) is not None}
         decision_findings = unbuilt
     def take_reads(candidates: tuple[TicketSelection, ...]) -> PhaseWritten | WaitingForMerge | WaitingForSync | NoAvailableWork:
         overlap_wait: WaitingForMerge | NoCheckpointBlock = NoCheckpointBlock()
@@ -2896,10 +2902,7 @@ def _select_phase(
         print(waits[path].line())
     for issue in decisions:
         rule = issue.value("style_rule")
-        definition = definitions.get(rule)
-        if definition is None:
-            print(f"waiting {issue.path}: rule {rule} not in the catalog")
-            continue
+        definition = cast(rules.Rule, catalog_definition(definitions, rule))
         if definition.family is None:
             continue
         family = definition.family
@@ -3471,14 +3474,13 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
                 decisions[path] = False
             else:
                 issue = Issue(path, frontmatter(path))
-                decisions[path] = (proposal_unit(issue) == name
-                                   and isinstance(decision_answer(issue), ApprovedDecision))
-        definition = definitions.get(finding.rule)
+                decisions[path] = isinstance(decision_answer(issue), ApprovedDecision)
+        definition = catalog_definition(definitions, finding.rule)
         if decisions[path] and definition is not None and definition.family in families:
             population.append((finding, path))
     opened = ledger.open_build_finding_ids()
     # Match the stored proposal key exactly as refill does. A merged build still holds its findings.
-    unbuilt = {finding.finding_id: issue for issue in selected if issue.value("style_rule") in definitions
+    unbuilt = {finding.finding_id: issue for issue in selected if catalog_definition(definitions, issue.value("style_rule")) is not None
                for finding in _unbuilt_findings(ledger, issue.path)}
     pending = tuple(finding for finding, _path in population
                     if finding.finding_id not in opened and finding.finding_id in unbuilt)
@@ -3502,10 +3504,10 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
             counts["ready"] += 1
             continue
         issue = unbuilt.get(finding.finding_id)
-        if issue is None or path in skipped or (definition := definitions.get(issue.value("style_rule"))) is None:
+        if issue is None or path in skipped or (definition := catalog_definition(definitions, issue.value("style_rule"))) is None:
             counts["other"] += 1
             continue
-        definition = definitions[finding.rule]
+        definition = cast(rules.Rule, catalog_definition(definitions, finding.rule))
         family = definition.family
         assert family is not None
         waits = ranked_work.waits(family)

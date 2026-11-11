@@ -102,8 +102,7 @@ for path in sorted(root.glob('runs/*.jsonl')):
 def mac_run(root: str, worktree: str, *,
             record: staff.StaffSnapshot | None = None) -> RunFound | NoMatchingRun:
     record = staff.snapshot() if record is None else record
-    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-            collect.MAC_HOST, remote_command(root)]
+    argv = ["ssh", "-o", "BatchMode=yes", collect.MAC_HOST, remote_command(root)]
     try:
         result = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
                                 errors="replace", timeout=30, check=False)

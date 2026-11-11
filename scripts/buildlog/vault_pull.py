@@ -189,7 +189,7 @@ def git_ok(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed:
 
 
 def mac_git(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed | MacUnreachable:
-    transport = ["-c", "core.sshCommand=" + shlex.join(["ssh", *sync.ssh_options()])]
+    transport = ["-c", "core.sshCommand=" + shlex.join(["ssh", *sync.ssh_options(sync.peer_name())])]
     result = git(*transport, *args)
     if isinstance(result, VaultCommandFailed):
         return MacUnreachable()
@@ -278,7 +278,7 @@ def pull() -> PullOutcome:
     settings = conf.read("build_targets")
     remote = (f"vault_lock_retries={settings.whole('vault.lock_retries')}\n"
               + f"vault_lock_retry_delay_s={settings.number('vault.lock_retry_delay_s')}\n" + REMOTE_PULL)
-    result = run(["ssh", *sync.ssh_options(), peer, remote], COMMAND_TIMEOUT_S)
+    result = run(["ssh", *sync.ssh_options(peer), peer, remote], COMMAND_TIMEOUT_S)
     if result is None:
         return MacUnreachable()
     outcome = remote_outcome(result)
