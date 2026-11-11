@@ -2838,39 +2838,13 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 142 — The wait holder and style sync test modules use less CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_wait_holder.py` and `style/test_style_sync.py` use less CPU per gate, with the same tests and assertions.
+- `verify_hold_wait_test_support.py`: the fixture environment no longer sets `CLAUDE_PYTHON` to `sys.executable`, so the real launcher uses the seeded interpreter cache. The two observer cases keep their explicit overrides.
+- `test_style_sync.py`: the private `address.py`, `send.py`, `roster.py` and scratch `cargo-save` run in process through `invoke_cli`; supported style commands go through `run_style_command`; a class seed builds the initial Git repository once and each case copies its `.git`. Signal, lock, verifier, lint driver and workspace processes stay real.
+- aws pairs, 3 rounds: style sync 42.35 → 26.40 CPU s; wait holder 65.16 → 62.60 CPU s. Same tests pass.
 
-**Decision:** User, 2026-11-11: "there is no minimum speed change required - anything is helpful - but i want you to always work on the worst case scenarios". Any measured saving ships. This phase takes the measured test-only candidates of Phases 137 and 140 for the first and third slowest modules.
-
-**Spec:**
-1. `scripts/direct/verify_hold_wait_test_support.py` (Phase 137 candidate B, 2.2 CPU s in one pair): the fixture environment at line 281 stops setting `CLAUDE_PYTHON` to `sys.executable`, so the real launcher uses the seeded interpreter cache. The two observer cases near line 543 keep their explicit overrides.
-2. `scripts/style/test_style_sync.py` (Phase 140, 19.5 CPU s together in one pair):
-   1. Run the fixture's private `address.py`, `send.py` and `roster.py` sources in process through `invoke_cli` (`scripts/production/cli_fixture.py:91`). Keep their file writes, argument reads, output and exit result. Return `CompletedProcess` results with the same check behavior. Keep the observer mocks.
-   2. Route the supported style commands through `run_style_command` (`scripts/style/style_plan_test_support.py:73`). Unknown commands and Python probes keep their subprocesses.
-   3. Run the fixture's synchronous scratch `cargo-save` command in process through `invoke_cli` with `scratch.main`. Keep `CARGO_BUILD_BUILD_DIR`. Driver-process scratch calls stay real.
-   4. Build the initial Git repository (init, two identity settings, add, first commit) once in a class fixture seed, and copy only its `.git` into each case. Every later Git call stays real.
-3. Keep every test and assertion. Signal, lock, verifier, lint driver and workspace integration processes stay real.
-
-**Files:**
-- `scripts/direct/verify_hold_wait_test_support.py`
-- `scripts/style/test_style_sync.py`
-
-**Workers:** 1 writer; the two files are small, separate changes.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 134: `run_style_command` runs style plan commands in process; reuse it without change.
-- Phase 137: the recorder and staff import change belongs to Phase 138. Do not change `progress_history.py`, `plan_history.py` or `session_staff.py` here.
-- Phase 140: the research harness used a frame check to limit the Git seed to `setUp`. Use an explicit class fixture seed instead.
-
-**State:** none.
-
-**Acceptance gate:**
-- basedpyright reports 0 errors and 0 warnings on both files.
-- Both modules pass all tests.
-- An aws paired trial (3 rounds, both modules) shows a summed CPU saving greater than zero.
+**Gotchas:** two aws trials failed for Spot capacity in us-east-2; the us-west-2 fallback (`4fde8afa6`) made the third run.
 
 ### Phase 143 — Find which Git calls the slowest test modules do not need  · status: done
 **Depends on:** none
@@ -3024,33 +2998,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 154 — Find what the Mac-only verify tests spend their CPU on  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** A measured report names the commands and fixture work that `direct/test_verify_mac_only.py` spends its CPU on, and what a test change could remove.
+- Research only; report in the unit session at `phases/154/research_report.md`. `direct/test_verify_mac_only.py`: 33.7 CPU s locally, 4,691 processes. Real `build_targets.py` (15.2 CPU s) and `verify_helper.py` (5.0 CPU s) runs lead; fixture setup costs 0.13 CPU s.
+- Candidates: two result cases can use the existing `mac_result` helper (256 fewer process starts, this module only); `assert_nothing_outlives` in `verify_mac_offload_test_support.py` can skip one `/proc` scan on its clean path (68 modules use the fixture). Shell version probes cost more; rejected.
 
-**Decision:** Architect review 152, finding 5: the module is fifth by CPU (41.7 s median). Builds cleared read-only research on 2026-11-11. Any later edit to `verify.sh` or `scripts/mac_test` needs the verify unit's go.
-
-**Spec:**
-1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <tree> direct/test_verify_mac_only.py --tests 17 --commands 15`.
-2. Attribute the CPU to each command group and test, and to the shared offload fixture (`scripts/direct/verify_mac_offload_test_support.py`, near line 1020).
-3. Name each removable cost: repeated fixture setup, process starts a test does not need, or helpers that other modules also run. Count the other modules each shared candidate reaches.
-4. Measure one local pair for each candidate in a scratch copy. A test that proves a real process boundary keeps its process.
-5. Name the owning unit of each file a change would touch. Edit no repository file.
-
-**Files:**
-- `scripts/direct/test_verify_mac_only.py` — read only.
-- `scripts/direct/verify_mac_offload_test_support.py` — read only.
-
-**Workers:** 1 writer; research only.
-- impl4: the report.
-
-**Constraints from prior phases:**
-- Phase 138 owns the recorder import change. Phase 142 owns the wait-holder interpreter change. Do not count either.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report at `phases/154/research_report.md` in the unit session gives the CPU by command and test, each candidate with its saving and reach, and the owners.
+**Gotchas:** local pairs on the shared host varied from 33.7 to 52.8 CPU s for the same tree. Only aws pairs decide a saving.
 
 ### Phase 155 — The worker, style footprint and ledger findings test modules keep only the tests that pay their way  · status: todo
 **Depends on:** none
