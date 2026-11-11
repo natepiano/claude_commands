@@ -26,7 +26,7 @@ from typing import Literal, cast
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.usage import collect, weights
-from scripts.usage.agents_log import state_dir
+from scripts.usage.agents_log import Assignment, assignments, role_at, state_dir
 from scripts.usage.context_economy_read import (
     CompactionEvent, MacReadFailed, MacSessions, Request, Session, SettingsSet, Start,
     SettingsUnknown, ReportSettingsTimeline, configured_checkout, label, read_claude, role_of,
@@ -298,7 +298,8 @@ def build_report(sessions: Sequence[Session], timelines: Mapping[str, Sequence[S
             group.quantities[measurement.quantity].append(measurement.value)
             samples = role_samples.setdefault(session_role, {quantity: [] for quantity in QUANTITIES})
             samples[measurement.quantity].append(measurement.value)
-    results = [GroupResult(machine, group_family, "; ".join(group.labels), group.values, ",".join(group.commits),
+    selection = ", ".join(f"{match.key}={json.dumps(match.value, ensure_ascii=False)}" for match in where)
+    results = [GroupResult(machine, group_family, "; ".join(filter(None, (selection, *group.labels))), group.values, ",".join(group.commits),
                            bucket if by == "week" else "", group_role, model, group.requests,
                            tuple(sorted(group.versions)),
                            {name: summarize(values) for name, values in group.quantities.items()})
@@ -376,6 +377,8 @@ def render_report(report: Report) -> str:
                       "| " + ("--- | " if weekly else "") + "--- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"))
         for group in report.groups:
             summary = group.quantities[quantity]
+            if not summary.n:
+                continue
             values = [_value(value, quantity) if summary.n else "—"
                       for value in (summary.median, summary.mean, summary.p25, summary.p75)]
             columns = [group.machine, group.family, group.settings_label, group.role, group.model, str(summary.n), *values]
@@ -514,6 +517,287 @@ def compare_reports(saved: Report, current: Report) -> str:
     return "\n".join(lines)
 
 
+CHANGE_QUANTITIES = ("cost_per_request", "context_per_request", "after_compaction", "compactions_per_active_hour")
+CHANGE_NAMES = {"cost_per_request": "cost per request", "context_per_request": "context per request",
+                "after_compaction": "context after compaction", "compactions_per_active_hour": "compactions per active hour"}
+ChangeVerdict = Literal["better", "worse", "mixed", "no clear change", "too few sessions"]
+
+
+@dataclass(frozen=True)
+class TrackedChange:
+    """One tracked value changes on one machine at a known time."""
+
+    machine: str
+    key: str
+    before: SettingsSet
+    after: SettingsSet
+
+    def description(self) -> str:
+        def value(settings: SettingsSet) -> str:
+            return json.dumps(settings.values[self.key], ensure_ascii=False, sort_keys=True) if self.key in settings.values else "<absent>"
+
+        return f"{self.key}: {value(self.before)} -> {value(self.after)}"
+
+
+@dataclass
+class ChangeSide:
+    """Session means give each session equal weight in one comparison window."""
+
+    sessions: int = 0
+    requests: int = 0
+    quantities: dict[str, list[float]] = field(default_factory=lambda: {name: [] for name in CHANGE_QUANTITIES})
+    models: set[str] = field(default_factory=set)
+    versions: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class ChangeComparison:
+    family: str
+    role: str
+    before: ChangeSide
+    after: ChangeSide
+    verdict: ChangeVerdict = "too few sessions"
+    better: tuple[str, ...] = ()
+    worse: tuple[str, ...] = ()
+    unjudged: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChangeAnalysis:
+    change: TrackedChange
+    comparisons: tuple[ChangeComparison, ...]
+    confounds: tuple[str, ...]
+    @property
+    def verdict(self) -> ChangeVerdict:
+        judged = {row.verdict for row in self.comparisons if row.verdict != "too few sessions"}
+        if not judged:
+            return "too few sessions"
+        if "mixed" in judged or {"better", "worse"} <= judged:
+            return "mixed"
+        if "better" in judged:
+            return "better"
+        return "worse" if "worse" in judged else "no clear change"
+
+
+def tracked_changes(timelines: Mapping[str, Sequence[SettingsSet]]) -> list[TrackedChange]:
+    """Skip the initial snapshot because its preceding values are unknown."""
+    changes: list[TrackedChange] = []
+    for machine, timeline in timelines.items():
+        ordered = sorted(timeline, key=lambda entry: entry.at)
+        for before, after in zip(ordered, ordered[1:]):
+            for key in sorted(before.values.keys() | after.values.keys()):
+                if (key in before.values) != (key in after.values) or not _json_equal(before.values.get(key), after.values.get(key)):
+                    changes.append(TrackedChange(machine, key, before, after))
+    return sorted(changes, key=lambda change: (change.after.at, change.machine, change.key), reverse=True)
+
+
+def _change_side(sessions: Sequence[tuple[Session, str]], timeline: Sequence[SettingsSet], change: TrackedChange,
+                 expected: SettingsSet, since: datetime, until: datetime, minimum: int,
+                 active_gap: int, window: timedelta) -> dict[tuple[str, str], ChangeSide]:
+    sides: dict[tuple[str, str], ChangeSide] = {}
+
+    def included(session: Session, at: datetime, selected: SettingsSet, beginning: datetime, end: datetime) -> bool:
+        if not beginning <= at < end:
+            return False
+        settings = _settings_at(session, at, timeline)
+        if isinstance(settings, SettingsUnknown):
+            return False
+        return ((change.key in settings.values) == (change.key in selected.values)
+                and _json_equal(settings.values.get(change.key), selected.values.get(change.key)))
+
+    for session, role in sessions:
+        before_count = sum(included(session, request.at, change.before, change.after.at - window, change.after.at)
+                           for request in session.requests)
+        after_count = sum(included(session, request.at, change.after, change.after.at, change.after.at + window)
+                          for request in session.requests)
+        if (before_count > after_count) != (expected is change.before):
+            continue
+        requests = [request for request in session.requests if included(session, request.at, expected, since, until)]
+        if len(requests) < minimum:
+            continue
+        selected = replace(session, requests=requests,
+                           compactions=[event for event in session.compactions
+                                        if included(session, event.at, expected, since, until)])
+        samples = quantity_samples(selected, active_gap)
+        side = sides.setdefault((session.family, role), ChangeSide())
+        side.sessions += 1
+        side.requests += len(requests)
+        side.models.update(request.model for request in requests)
+        side.versions.update(request.cli_version for request in requests if request.cli_version)
+        for quantity in CHANGE_QUANTITIES:
+            if samples[quantity]:
+                side.quantities[quantity].append(statistics.mean(samples[quantity]))
+    return sides
+
+
+def _judge_role(row: ChangeComparison, minimum: int, threshold: int) -> ChangeComparison:
+    unjudged = tuple(name for name in CHANGE_QUANTITIES
+                     if min(len(row.before.quantities[name]), len(row.after.quantities[name])) < minimum)
+    if len(unjudged) == len(CHANGE_QUANTITIES):
+        return replace(row, unjudged=unjudged)
+    better: list[str] = []
+    worse: list[str] = []
+    for quantity in CHANGE_QUANTITIES:
+        if quantity in unjudged:
+            continue
+        old = statistics.mean(row.before.quantities[quantity])
+        new = statistics.mean(row.after.quantities[quantity])
+        if old == 0:
+            if new > 0:
+                worse.append(quantity)
+        elif abs(100 * (new - old) / old) >= threshold:
+            (better if new < old else worse).append(quantity)
+    verdict: ChangeVerdict = ("mixed" if better and worse else "better" if better else "worse" if worse else "no clear change")
+    return replace(row, verdict=verdict, better=tuple(better), worse=tuple(worse), unjudged=unjudged)
+
+
+def _file_size(value: object) -> str:
+    if not isinstance(value, dict):
+        return "absent"
+    size = cast(dict[str, object], value).get("bytes")
+    return f"{size / 1000:.0f} KB" if isinstance(size, (int, float)) else "unknown size"
+
+
+def _change_confounds(change: TrackedChange, candidates: Sequence[TrackedChange], window: timedelta,
+                      files: Sequence[str], codex_keys: Sequence[str]) -> tuple[str, ...]:
+    nearby = [other for other in candidates if other is not change and other.machine == change.machine
+              and change.after.at - window <= other.after.at < change.after.at + window
+              and (change.key in files or other.key in files or (other.key in codex_keys) == (change.key in codex_keys))]
+    grouped: dict[str, list[TrackedChange]] = defaultdict(list)
+    for other in nearby:
+        grouped[other.key].append(other)
+    descriptions: list[str] = []
+    for key, edits in sorted(grouped.items()):
+        ordered = sorted(edits, key=lambda entry: entry.after.at)
+        if key in files:
+            noun = "edit" if len(edits) == 1 else "edits"
+            descriptions.append(f"{Path(key).name}: {len(edits)} {noun}, "
+                                + f"{_file_size(ordered[0].before.values.get(key))} -> {_file_size(ordered[-1].after.values.get(key))}")
+        else:
+            descriptions.append(TrackedChange(change.machine, key, ordered[0].before, ordered[-1].after).description())
+    return tuple(descriptions)
+
+
+def analyze_changes(sessions: Sequence[Session], timelines: Mapping[str, Sequence[SettingsSet]], store: Path,
+                    since: datetime, until: datetime, *, files: bool = False) -> list[ChangeAnalysis]:
+    """Compare the observed settings exposure in each time window, separately by family and role."""
+    configuration = conf.read("context_economy")
+    window = timedelta(hours=configuration.whole("changes_window_hours"))
+    minimum = configuration.whole("changes_min_sessions")
+    threshold = configuration.whole("changes_min_percent")
+    min_requests = configuration.whole("min_requests")
+    active_gap = configuration.whole("active_gap_seconds")
+    tracked_files = configuration.words("files")
+    codex_keys = configuration.words("codex_settings_keys")
+    candidates = tracked_changes(timelines)
+    by_machine: dict[str, list[tuple[Session, str]]] = defaultdict(list)
+    local_roles = assignments(store.parent / "agents.jsonl")
+    local_machine = socket.gethostname()
+    for session in sessions:
+        role = role_of(store, session.machine, session.family, session.session_id, session.agent_id)
+        if role == "unknown" and session.machine == local_machine and session.requests:
+            assignment = role_at(local_roles, session.agent_id, max(request.at for request in session.requests))
+            if isinstance(assignment, Assignment):
+                role = assignment.role
+        by_machine[session.machine].append((session, role))
+    results: list[ChangeAnalysis] = []
+    for change in candidates:
+        moment = change.after.at
+        if not since <= moment < until:
+            continue
+        is_file = change.key in tracked_files
+        if is_file and not files:
+            continue
+        relevant = [entry for entry in by_machine[change.machine]
+                    if is_file or entry[0].family == ("codex" if change.key in codex_keys else "claude")]
+        timeline = ReportSettingsTimeline(timelines[change.machine])
+        before = _change_side(relevant, timeline, change, change.before, moment - window,
+                              moment, min_requests, active_gap, window)
+        after = _change_side(relevant, timeline, change, change.after, moment,
+                             min(until, moment + window), min_requests, active_gap, window)
+        if not before or not after:
+            continue
+        comparisons = tuple(_judge_role(ChangeComparison(family, role, before.get((family, role), ChangeSide()),
+                                                          after.get((family, role), ChangeSide())), minimum, threshold)
+                            for family, role in sorted(before.keys() | after.keys()))
+        confounds = list(_change_confounds(change, candidates, window, tracked_files, codex_keys))
+        for row in comparisons:
+            for name, old, new in (("model", row.before.models, row.after.models),
+                                   ("CLI version", row.before.versions, row.after.versions)):
+                if old and new and old != new:
+                    confounds.append(f"{row.family}/{row.role} {name}: {', '.join(sorted(old)) or 'none'} -> "
+                                     + (", ".join(sorted(new)) or "none"))
+        results.append(ChangeAnalysis(change, comparisons, tuple(confounds)))
+    return results
+
+
+def _compact_value(value: float) -> str:
+    return f"{value / 1000:.1f}k" if abs(value) >= 1000 else _value(value, "")
+
+
+def _movement(row: ChangeComparison, quantity: str) -> str:
+    before = statistics.mean(row.before.quantities[quantity])
+    after = statistics.mean(row.after.quantities[quantity])
+    percent = f"{100 * (after - before) / before:+.0f}%" if before else "from zero"
+    return f"{CHANGE_NAMES[quantity]} {percent} ({_compact_value(before)} -> {_compact_value(after)})"
+
+
+def render_changes(analyses: Sequence[ChangeAnalysis], *, since: datetime, files: bool = False,
+                   detail: bool = False) -> str:
+    configuration = conf.read("context_economy")
+    hours = configuration.whole("changes_window_hours")
+    minimum = configuration.whole("changes_min_sessions")
+    threshold = configuration.whole("changes_min_percent")
+    counts = {verdict: sum(entry.verdict == verdict for entry in analyses)
+              for verdict in ("better", "worse", "mixed", "no clear change", "too few sessions")}
+    totals = [f"{counts[name]} {name}" for name in ("better", "worse", "mixed")]
+    if counts["no clear change"]:
+        totals.append(f"{counts['no clear change']} no clear change")
+    totals.append(f"{counts['too few sessions']} not judged")
+    kind = "changes" if files else "settings changes"
+    lines = [f"{len(analyses)} {kind} since {since.astimezone(user_zone()):%Y-%m-%d}: " + ", ".join(totals)]
+    if detail:
+        lines.extend((f"Window: {hours} hours per side; at least {minimum} sessions per side and measure; noise limit {threshold}%.",
+                      "Cost uses weighted tokens, not money. Each session contributes its mean from its larger matching side.",
+                      "Verdicts describe observed movement. Other changes and task difficulty can affect the measures."))
+    for analysis in analyses:
+        change = analysis.change
+        lines.append(f"{change.after.at.astimezone(user_zone()):%Y-%m-%d %H:%M}  {change.machine}  "
+                     + change.description().replace("<absent>", "absent"))
+        families = {row.family for row in analysis.comparisons}
+        short: list[str] = []
+        for row in analysis.comparisons:
+            role = f"{row.family}/{row.role}" if len(families) > 1 else row.role
+            count = f"{row.before.sessions} -> {row.after.sessions} sessions"
+            if row.verdict == "too few sessions":
+                short.append(f"{role} ({count})")
+            else:
+                movements = [direction + ": " + ", ".join(_movement(row, name) for name in quantities)
+                             for direction, quantities in (("worse", row.worse), ("better", row.better)) if quantities]
+                lines.append(f"  {role} ({count}): {row.verdict} — "
+                             + ("; ".join(movements) or f"all judged measures stay below the {threshold}% noise limit")
+                             + (" (" + "; ".join(f"{CHANGE_NAMES[name]}: too few samples" for name in row.unjudged) + ")"
+                                if row.unjudged else ""))
+            if detail:
+                lines.append(f"    {role}: requests {row.before.requests} -> {row.after.requests}")
+                for quantity in CHANGE_QUANTITIES:
+                    old, new = summarize(row.before.quantities[quantity]), summarize(row.after.quantities[quantity])
+                    first = _value(old.mean, quantity) if old.n else "unavailable"
+                    second = _value(new.mean, quantity) if new.n else "unavailable"
+                    if not old.n or not new.n:
+                        percent = "unavailable"
+                    elif old.mean == 0:
+                        percent = "0.0%" if new.mean == 0 else "undefined (before zero)"
+                    else:
+                        percent = f"{100 * (new.mean - old.mean) / old.mean:+.1f}%"
+                    shortage = "; too few samples" if quantity in row.unjudged else ""
+                    lines.append(f"    {quantity}: {first} -> {second} ({percent}); sessions {old.n} -> {new.n}{shortage}")
+        if short:
+            lines.append("  not judged: " + ", ".join(short))
+        lines.append("  also changed: " + ("; ".join(analysis.confounds) or "none recorded"))
+    return "\n".join(lines)
+
+
 def trend(folder: Path, role: str = "") -> str:
     reports = [(path.stem, read_result(path)) for path in folder.glob("*.json")]
     lines = ["| result | window | mac | roles | requests | " + " | ".join(QUANTITIES) + " |",
@@ -538,6 +822,8 @@ class _Arguments(argparse.Namespace):
     command: str = "report"
     name: str = ""
     last_week: bool = False
+    files: bool = False
+    detail: bool = False
     since: str = ""
     until: str = ""
     role: str = ""
@@ -575,7 +861,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     hourly = commands.add_parser("hourly")
     _ = hourly.add_argument("--store", type=Path, default=argparse.SUPPRESS)
-    for command in ("report", "save", "compare", "trend"):
+    for command in ("report", "save", "compare", "trend", "changes"):
         subcommand = commands.add_parser(command)
         for path in ("projects-root", "store", "checkout", "saved-results"):
             _ = subcommand.add_argument("--" + path, type=Path, default=argparse.SUPPRESS)
@@ -593,6 +879,9 @@ def _parser() -> argparse.ArgumentParser:
             _ = subcommand.add_argument("--role", default="")
         if command == "report":
             _ = subcommand.add_argument("--by", choices=("settings", "week"), default="settings")
+        if command == "changes":
+            _ = subcommand.add_argument("--files", action="store_true")
+            _ = subcommand.add_argument("--detail", action="store_true")
         if command in ("report", "save", "compare"):
             _ = subcommand.add_argument("--where", type=_where, action="append", default=argparse.SUPPRESS)
     return parser
@@ -693,15 +982,24 @@ def main(argv: Sequence[str] = ()) -> int:
             since = _bound(args.since, now - timedelta(days=7))
             until = _bound(args.until, now)
         machine = socket.gethostname()
-        sessions = read_claude(args.projects_root, since, until, machine)
+        read_since = (since - timedelta(hours=conf.read("context_economy").whole("changes_window_hours"))
+                      if args.command == "changes" else since)
+        sessions = read_claude(args.projects_root, read_since, until, machine)
         roots = args.codex_root or sorted(Path.home().glob(".codex*/sessions"))
-        sessions.extend(read_codex(roots, since, until, machine))
-        timelines = {machine: settings_timeline(args.checkout, timeline_start(sessions, since), until)}
-        mac = read_mac(since, until)
+        sessions.extend(read_codex(roots, read_since, until, machine))
+        timelines = {machine: settings_timeline(args.checkout, timeline_start(sessions, read_since), until)}
+        mac = read_mac(read_since, until)
         if isinstance(mac, MacSessions):
             sessions.extend(mac.sessions)
             for remote_machine in {session.machine for session in mac.sessions} or {"mac"}:
                 timelines[remote_machine] = mac.timeline
+        if args.command == "changes":
+            if isinstance(mac, MacReadFailed):
+                print(f"mac: {mac.reason}")
+            selected = [session for session in sessions if args.family == "all" or session.family == args.family]
+            analyses = analyze_changes(selected, timelines, args.store, since, until, files=args.files)
+            print(render_changes(analyses, since=since, files=args.files, detail=args.detail))
+            return 0
         report = build_report(sessions, timelines, args.store, since, until,
                               by=args.by, role=args.role, family=args.family, where=args.where)
         report = replace(report, mac=mac if isinstance(mac, MacReadFailed) else MacReadSucceeded())

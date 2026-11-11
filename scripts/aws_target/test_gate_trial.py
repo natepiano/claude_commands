@@ -299,6 +299,8 @@ class PairedTrialTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
+        _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
         shipped = Path(__file__).resolve().parents[2]
         _ = (self.root / 'cloud_gate.conf').write_text((shipped / 'config/cloud_gate.conf').read_text())
         self.repo = self.root / 'repo'
@@ -488,6 +490,16 @@ with mock.patch.object(gate_trial.subprocess, 'call', side_effect=lambda command
         self.assertEqual([row['status'] for row in runs], [0, 1, 1, 0, 0, 1])
         self.assertTrue(all(row['cpu_s'] is not None and row['tests'] == 1 for row in runs))
         self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['all_passed'])
+
+    def test_paired_cli_preserves_the_ordered_regional_deployment(self) -> None:
+        from scripts.aws_target import cloud_gate
+        regions = [{'region': region, 'template': 'fixture-' + region} for region in ('us-east-2', 'us-west-2')]
+        cloud_gate.save(self.state / 'gate-deployment.json', {'regions': regions, 'bucket': 'fixture-bucket'})
+        with mock.patch.object(trial, 'paired_service', return_value=0):
+            self.assertEqual(trial.main(['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
+                '--modules', 'fixture/test_sample.py'], self.settings, self.state), 0)
+        path = next((self.state / 'paired-trials').glob('*/*/deployment.json'))
+        self.assertEqual(cloud_gate.read(path)['regions'], regions)
 
     def test_paired_cli_uses_scaler_without_admin_or_new_settings(self) -> None:
         from scripts.aws_target import cloud_gate

@@ -15,7 +15,6 @@ from typing import cast
 
 from scripts.production import showrunners, staff, staff_move, staff_sources
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.production.rename_state import RenameRefused
 
 
 @dataclass(frozen=True)
@@ -80,7 +79,7 @@ def main(argv: list[str]) -> int:
         except subprocess.TimeoutExpired as error:
             print(f"transfer_unit: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, RenameRefused, Refusal) as error:
+        except (ValueError, OSError, Refusal) as error:
             print(f"transfer_unit: {error}", file=sys.stderr)
             return 1
     return staff.cli_result(run)

@@ -464,7 +464,13 @@ A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
 Pane workers move under their worker locks.
 An idle worker closes its pane only when the shared close check allows it.
-The check keeps the pane open for a live detached run, a held dispatch lock, or a live launcher.
+The check keeps the pane open for a held dispatch lock or a live launcher.
+An account move stops and resumes a worker with a live detached run on the target account, including an idle worker.
+The detached run continues without interruption.
+The preview and resume text name each run, its result record, its log, and the command that reads them.
+Result delivery follows the worker's stable staff ID to its current session.
+If the worker cannot receive the result, delivery uses its holder.
+A live detached run still prevents a new assignment.
 It also keeps the pane open while a submitted pass awaits completion.
 Every finished pass needs its dispatch DONE at the end of the last transcript turn before its open pane can close.
 This proof permits closure when herdr still reports a working agent.
