@@ -98,7 +98,16 @@ Without a matching row, `target_platform` returns no answer and status 1.
   Without either session, `owning_session` returns `NoOwningSession`.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
-- After the last holder file is gone, each recipient gets one release notice. No answer or allocation is awaited. The result names failed or unconfirmed deliveries: `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
+- After the last holder file is gone, each recipient gets one release notice.
+  The notice names each hold, its purpose, and its start time in the user zone.
+  For example: `fps hold for frame capture, from 07:33:20 EST`.
+  An old cycle without a purpose still names the hold and its start time.
+  The cycle keeps each purpose after the holder file is gone.
+  The release intent keeps each cycle holder's name, purpose, and start time for broadcasts and cycle recovery.
+  An old release intent without cycle holders still names its one holder.
+  Release does not wait for an answer or an allocation.
+  The result names failed or unconfirmed deliveries:
+  `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
 
 ### Where a job runs: `scripts/direct/verify.sh`
