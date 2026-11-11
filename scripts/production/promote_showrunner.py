@@ -25,6 +25,7 @@ from typing import NamedTuple, cast
 
 
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
+from scripts.herdr import herdr_types
 from scripts.agents import remote, stop_resume
 from scripts.agents import worker_lifecycle
 
@@ -41,6 +42,17 @@ from scripts.production.session_pane import HerdrFailure, read_place
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, read_new_production, read_production
 
 
+class ProductionDocumentDefault(NamedTuple):
+    """The request needs the unit's production document."""
+
+
+class CheckAllFiles(NamedTuple):
+    """The worktree check includes every file."""
+
+
+CHECK_ALL_FILES = CheckAllFiles()
+
+
 class Promotion(NamedTuple):
     # The unit name comes from its staff row.
     unit: str
@@ -53,10 +65,6 @@ class Promotion(NamedTuple):
 
 def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(where), *arguments], capture_output=True, text=True, check=False)
-
-
-def run_marker(session_id: str) -> Path:
-    return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None)
 
 
 def _session_status(pid: int) -> str:
@@ -80,11 +88,13 @@ def _quiet(unit: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.Li
         raise Refusal(f"{unit}'s pane: {verdict.reason}")
 
 
-def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path) -> None:
-    """Refuse a unit with a run open, whose workers end only with the run, or with work uncommitted."""
-    if run_marker(claude.session_id).exists():
+def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path, *,
+             skip_path: Path | CheckAllFiles = CHECK_ALL_FILES) -> None:
+    """Refuse an open run or uncommitted work outside the skipped path."""
+    if unit_runs.open_run(claude.session_id) is not None:
         raise Refusal(f"{unit} has a /unit:direct run open, and its workers with it; the run finishes first")
-    status = _git(worktree, "status", "--porcelain")
+    paths = ["--", ".", f":(top,exclude,literal){skip_path.relative_to(worktree).as_posix()}"] if isinstance(skip_path, Path) else []
+    status = _git(worktree, "status", "--porcelain", *paths)
     if status.returncode != 0:
         raise Refusal(f"cannot read {unit}'s worktree {worktree}: {status.stderr.strip()}")
     if status.stdout.strip():
@@ -98,10 +108,10 @@ def _committed(doc: Path) -> None:
 
 
 def check_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude,
-                   worktree: Path) -> None:
-    """Require an idle director and a clean worktree."""
+                   worktree: Path, *, skip_path: Path | CheckAllFiles = CHECK_ALL_FILES) -> None:
+    """Require an idle director and no uncommitted work outside the skipped path."""
     _quiet(name, marked, claude)
-    _settled(name, claude, worktree)
+    _settled(name, claude, worktree, skip_path=skip_path)
 
 
 def checked(name: str, child_name: str, doc: Path, *,
@@ -225,7 +235,7 @@ def stop_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lo
             tabs = {pane.get("tab_id", "") for pane in panes if pane["pane_id"] == place.pane}
             workers: set[str] = {worker.name for worker in record.find(kind="worker", parent=row.id)} if row is not None else set()
             shells = [pane for pane in panes if pane.get("tab_id", "") in tabs and pane.get("label") in workers]
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
             shells = []
         for pane in shells:
@@ -233,12 +243,12 @@ def stop_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lo
                 if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell) and not client.close_tab_confirmed(
                         pane["pane_id"], terminal=pane.get("terminal_id", "")):
                     print(f"anomaly: {pane.get('label')}: old worker shell close failed", file=sys.stderr)
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"anomaly: {pane.get('label')}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         try:
             if not client.close_tab_confirmed(place.pane, target=claude.session_id):
                 print(f"anomaly: {name}: old director tab close failed", file=sys.stderr)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
     return stopped
 
@@ -267,21 +277,57 @@ def restore_line(promotion: Promotion) -> str:
         "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 
 
+def default_document(parent: Production, name: str, record: staff.StaffSnapshot) -> Path:
+    """Find the unit's recorded production document before any role change."""
+    pending = promotion_record(parent, name)
+    if pending.is_file():
+        fields = cast(dict[str, str], json.loads(pending.read_text()))
+        return Path(fields["child_doc"])
+    selected = staff_sources.member(staff_sources.UnitMember(parent.name, name), record)
+    if isinstance(selected, staff_sources.MemberFound) and isinstance(selected.row.worktree, staff.PresentWorktree):
+        worktree = selected.row.worktree.path
+        saved = unit_config.read(worktree, cleanup=False)
+        if isinstance(saved, unit_config.UnitConfig) and isinstance(saved.plan, unit_config.PlanFile):
+            try:
+                return read_new_production(worktree / saved.plan.path, name).doc
+            except Refusal:
+                pass
+        found: list[Path] = []
+        for folder, directories, files in worktree.walk():
+            directories[:] = [directory for directory in directories if directory not in (".git", "target")]
+            for filename in sorted(files):
+                if Path(filename).suffix.casefold() != ".md":
+                    continue
+                try:
+                    found.append(read_new_production(folder / filename, name).doc)
+                except Refusal:
+                    continue
+        if len(found) == 1:
+            return found[0]
+        candidates = "; candidates: " + ", ".join(str(path) for path in sorted(found)) if found else ""
+        raise Refusal(f"doc default is missing or ambiguous; looked in {worktree / '.unit.toml'} and {worktree}{candidates}")
+    raise Refusal(f"doc default is missing; looked in staff row {name} under {parent.name}")
+
+
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Promote a running unit to the showrunner of its own production.")
     _ = parser.add_argument("unit")
-    _ = parser.add_argument("--production", required=True, help="the child's staff name")
-    _ = parser.add_argument("--doc", type=Path, required=True, help="the new production doc")
+    _ = parser.add_argument("--production", default="", help="the child's staff name")
+    _ = parser.add_argument("--doc", type=Path, default=ProductionDocumentDefault(), help="the new production doc")
     _ = parser.add_argument("--model", required=True, help="pass your own model id")
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
     _ = parser.add_argument("--check", action="store_true", help="run every refusal and stop nothing")
     args = parser.parse_args(argv)
     record = staff.snapshot()
+    unit_name = cast(str, args.unit)
+    child_name = cast(str, args.production) or unit_name
+    document = cast(Path | ProductionDocumentDefault, args.doc)
+    model = cast(str, args.model)
+    effort = cast(str, args.effort)
     try:
         parent_name = showrunners.own_name()
         if parent_name:
             parent = read_production(parent_name, record=record)
-            unit_name = cast(str, args.unit)
             completed = promotion_record(parent, unit_name).with_suffix(".done.json")
             receipt = completion_receipt.read_receipt(completed, record)
             if isinstance(receipt, completion_receipt.OwnedReceipt):
@@ -290,12 +336,14 @@ def _main(argv: list[str]) -> int:
                 old = staff_sources.member(staff_sources.UnitMember(parent.name, unit_name), record)
                 child_doc = receipt.fields.get("child_doc")
                 if (receipt.owner.kind == "showrunner" and isinstance(child_doc, str)
-                        and receipt.owner.name == cast(str, args.production)
+                        and receipt.owner.name == child_name
                         and (isinstance(old, staff_sources.NoSuchMember)
                              or isinstance(old.row.worktree, staff.RemovedWorktree))):
                     print(f"{unit_name} already promoted")
                     return 0
-        promotion = checked(cast(str, args.unit), cast(str, args.production), cast(Path, args.doc), record=record)
+        if isinstance(document, ProductionDocumentDefault):
+            document = default_document(read_production(parent_name, record=record), unit_name, record)
+        promotion = checked(unit_name, child_name, document, record=record)
         pending = promotion_record(promotion.parent, promotion.unit)
         target_directory = (Path(cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))["target"])
                             if pending.exists() else showrunner_account_directory())
@@ -351,12 +399,12 @@ def _main(argv: list[str]) -> int:
             if isinstance(observed, sessions.LiveSessionProcess):
                 started = finish_child(promotion, target_directory, pending, observed.pid)
             else:
-                started = add_showrunner.main(["--production", promotion.child.name, "--model", cast(str, args.model),
-                                               "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
+                started = add_showrunner.main(["--production", promotion.child.name, "--model", model,
+                                               "--effort", effort, "--resume", promotion.claude.session_id,
                                                "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refusal, OSError, herdr.HerdrFailure) as error:
+    except (Refusal, OSError, herdr_types.HerdrFailure) as error:
         print(f"promote_showrunner: {error}", file=sys.stderr)
         return 1
     if started == 2:

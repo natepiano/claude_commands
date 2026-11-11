@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.direct import plan_history
 from scripts.lib import unit_runs
 from scripts.lib.user_zone import user_zone
-from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production import session_staff, staff, unit_config, unit_names
 from scripts.production.production_doc import Refusal, production_field
 from scripts.agents import remote
 
@@ -43,6 +43,8 @@ class Production(NamedTuple):
 
 
 def read_production(path: Path, *, resolver: session_staff.RowResolver | None = None) -> Production:
+    from scripts.production import unit_lookup
+
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     try:
         owner = unit_lookup.doc_owner(path.expanduser(), resolver.record)
@@ -393,6 +395,14 @@ class NoPlan(Exception):
     """The requested worker session does not identify a readable plan."""
 
 
+class RemovedPlan(NoPlan):
+    """The run names a plan file that no longer exists, as after its as-built."""
+
+    def __init__(self, plan_path: Path) -> None:
+        super().__init__(f"Unable to read plan {plan_path}")
+        self.plan_path: Path = plan_path
+
+
 def _json_object(text: str) -> dict[str, object] | None:
     try:
         parsed: object = json.loads(text)  # pyright: ignore[reportAny]
@@ -514,8 +524,6 @@ def _newest_open_instance(
     if not runs:
         return NoOpenPhase()
     events = runs[-1]
-    if any(_text(event.get("event_type")) == "run_finished" for event in events):
-        return NoOpenPhase()
     started: list[PhaseInstance] = []
     closed: set[str] = set()
     for event in events:
@@ -583,9 +591,7 @@ def _open_instance(
 
 
 def _open_phase_ids(runs: list[list[dict[str, object]]]) -> set[str]:
-    if not runs or any(
-        _text(event.get("event_type")) == "run_finished" for event in runs[-1]
-    ):
+    if not runs:
         return set()
     opened: dict[str, str] = {}
     for event in runs[-1]:
@@ -642,6 +648,14 @@ def parallel_line(check: ParallelCheck) -> str:
         f"Parallel: unknown — {which} no **Depends on:** line; "
         + "add one under each phase heading and rerun"
     )
+
+
+def session_parallel_line(session_dir: Path) -> str:
+    """The session's `Parallel:` line; ad hoc work after its plan's removal has no plan to read."""
+    try:
+        return parallel_line(build(session_dir).parallel)
+    except RemovedPlan as removed:
+        return f"Parallel: none — no plan at {removed.plan_path}; the run does ad hoc work"
 
 
 def _normalized_title(title: str) -> str:
@@ -1005,6 +1019,17 @@ def _with_history(
     )
 
 
+def _current_run_events(runs: list[list[dict[str, object]]], record: staff.StaffSnapshot) -> list[list[dict[str, object]]]:
+    """Select the run that its owner's staff pointer names."""
+    opened = {row.run.path.name: row.run.path for row in record.rows if isinstance(row.run, staff.OpenRun)}
+    for events in runs:
+        start = next((event for event in events if event.get("event_type") == "run_started"), dict[str, object]())
+        folder = opened.get(_text(start.get("run_id")))
+        if folder is not None and unit_runs.run_is_open(folder):
+            return [events]
+    return []
+
+
 def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> PhaseRecord:
     """Build one plan's phase view entirely from its durable events."""
     plan_path = plan_path.expanduser().resolve()
@@ -1017,15 +1042,19 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
         resolver = session_staff.RowResolver(record)
     try:
         phases = plan_history.plan_phases(plan_path, resolver=resolver)
+    except FileNotFoundError as error:
+        raise RemovedPlan(plan_path) from error
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
     run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
-    open_instance = _newest_open_instance(run_events)
+    current_run = _current_run_events(run_events, resolver.record)
+    open_instance = _newest_open_instance(current_run)
     return _build_phase_record(
         plan_path, phases, run_events, _instances_by_phase(phases, instances),
         [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
+        open_ids=_open_phase_ids(current_run),
     )
 
 
@@ -1082,10 +1111,11 @@ def _build_phase_record(
     run_events: list[list[dict[str, object]]],
     assigned: list[list[PhaseInstance]],
     open_instances: list[OpenPhaseInstance],
+    *, open_ids: set[str] | None = None,
 ) -> PhaseRecord:
     """Apply the same timing and history rules to plan and run phase rows."""
     open_instance = open_instances[-1] if open_instances else NoOpenPhase()
-    open_ids = _open_phase_ids(run_events)
+    open_ids = _open_phase_ids(run_events) if open_ids is None else open_ids
     current: OpenPhase | NoOpenPhase = NoOpenPhase()
     current_position: PlanPhasePosition | OutsidePlan = OutsidePlan()
     if isinstance(open_instance, OpenPhaseInstance):
@@ -1888,7 +1918,11 @@ def owned_notes(production: str, unit: str) -> list[Path]:
 def refresh(session_dir: Path) -> None:
     """Rewrite a production unit's generated phase note, when it has one."""
     resolver = session_staff.RowResolver(staff.snapshot())
-    record = build(session_dir, resolver=resolver)
+    try:
+        record = build(session_dir, resolver=resolver)
+    except RemovedPlan:
+        # Ad hoc work after the as-built: the removed plan has no phase note to rewrite.
+        return
     reference = _production_reference(record.plan, resolver=resolver)
     if isinstance(reference, PlanOutsideProduction):
         return
@@ -1974,7 +2008,7 @@ def main() -> int:
             refresh(session_dir.expanduser().resolve())
             return 0
         if command == "parallel":
-            print(parallel_line(build(session_dir.expanduser().resolve()).parallel))
+            print(session_parallel_line(session_dir.expanduser().resolve()))
             return 0
         if command == "prune":
             if production_doc is None:

@@ -122,9 +122,10 @@ State:
   `From the showrunner:`.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
-- **A message from morty is the user's** (user, 2026-11-02). Morty is the
-  user's associate producer, a Codex session. This rule is the one source;
-  other files point here.
+- **A message from morty is the user's** (user, 2026-11-02).
+  Morty is the user's producer and uses a Codex session.
+  The user is the executive producer.
+  This rule is the one source; other files refer to it.
   - A message from morty counts as the user's own words: answers, approvals,
     rulings and priorities. Begin a relay to a unit with
     `From the user (via morty and <your name>):`.

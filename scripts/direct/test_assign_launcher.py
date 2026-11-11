@@ -58,7 +58,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         _ = shutil.copy2(ROOT / "config/scratch.conf", Path(os.environ["CONF_DIR"]) / "scratch.conf")
         for key in ("CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "PLAN_DELEGATE_RUN_DIR"):
             _ = os.environ.pop(key, None)
-        unit_runs.activate(self.session_dir, staff.runtime_id(), self.marker().parent)
+        _ = staff.set_run(self.native.fixture.parent.id, staff.OpenRun(self.session_dir))
         directory = Path(os.environ["NOTIFIER_SESSIONS_DIR"])
         directory.mkdir(parents=True, exist_ok=True)
         _ = (directory / "director.json").write_text(json.dumps({
@@ -66,8 +66,8 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             "messagingSocketPath": "", "updatedAt": 1, "procStart": sessions.process_start(os.getpid()),
         }))
 
-    def marker(self) -> Path:
-        return Path(os.environ["UNIT_ACTIVE_DIR"]) / staff.runtime_id()
+    def open_run(self) -> Path | None:
+        return unit_runs.open_run(staff.runtime_id())
 
     def failing_worker(self, code: int = 2, *, recursive_history: bool = False, after_pass_start: bool = False) -> Path:
         """Run a failing child at the worker boundary of the real launcher."""
@@ -113,7 +113,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
 
     def assert_run_ended(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertFalse(self.marker().exists(), result.stdout + result.stderr)
+        self.assertIsNone(self.open_run(), result.stdout + result.stderr)
         self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "error")
         finished = [event for event in self.events() if event.get("event_type") == "run_finished"]
         self.assertEqual([event["status"] for event in finished], ["error"])
@@ -121,8 +121,8 @@ class FailedLaunchRunTests(HookAssignmentFixture):
 
     def assert_run_active(self, result: subprocess.CompletedProcess[str], code: int = 2) -> None:
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
-        self.assertEqual(self.marker().read_text().strip(), str(self.session_dir))
-        self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "active")
+        self.assertEqual(self.open_run(), self.session_dir)
+        self.assertNotIn("status", read_object(self.session_dir / "progress_history_state.json"))
         self.assertEqual([event for event in self.events() if event.get("event_type") == "run_finished"], [])
 
     def test_a_codex_directors_only_failed_worker_ends_its_run(self) -> None:
@@ -139,20 +139,17 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             self.assert_run_ended(self.launch())
 
     def assert_prepared_marker_is_removed(self) -> None:
-        active = self.session_dir.parent / "unit" / "active"
-        with patch.dict(os.environ, {"UNIT_ACTIVE_DIR": str(active)}):
-            prepared = self.run_launcher(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
-            self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
-            run = Path(prepared.stdout.split("Session ready at ")[-1].strip())
-            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
-                unit_runs.OWNER_FIELD: self.native.fixture.parent.id,
-            }))
-            marker = active / staff.runtime_id()
-            self.assertEqual(marker.read_text().strip(), str(run), prepared.stdout + prepared.stderr)
-            ended = self.run_launcher(["bash", str(ROOT / "scripts/direct/end_session.sh")])
-            self.assertEqual(ended.returncode, 0, ended.stdout + ended.stderr)
-            self.assertFalse(marker.exists(), ended.stdout + ended.stderr)
-            self.assertIn("marker cleared", ended.stdout)
+        prepared = self.run_launcher(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        run = Path(prepared.stdout.split("Session ready at ")[-1].strip())
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+            unit_runs.OWNER_FIELD: self.native.fixture.parent.id,
+        }))
+        self.assertEqual(self.open_run(), run, prepared.stdout + prepared.stderr)
+        ended = self.run_launcher(["bash", str(ROOT / "scripts/direct/end_session.sh")])
+        self.assertEqual(ended.returncode, 0, ended.stdout + ended.stderr)
+        self.assertIsNone(self.open_run(), ended.stdout + ended.stderr)
+        self.assertIn("run pointer cleared", ended.stdout)
 
     def test_prepare_and_end_use_the_codex_id_when_the_claude_id_differs(self) -> None:
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": fixture_runtime_id("other-director")}):
@@ -161,6 +158,30 @@ class FailedLaunchRunTests(HookAssignmentFixture):
     def test_prepare_and_end_use_the_codex_id_without_a_claude_id(self) -> None:
         self.assert_prepared_marker_is_removed()
 
+
+    def test_prepare_continues_without_a_staff_row_and_refuses_unreadable_staff(self) -> None:
+        for state, expected_code in (("missing", 0), ("unreadable", 2)):
+            with self.subTest(state=state):
+                environment = {"CODEX_THREAD_ID": fixture_runtime_id(f"unregistered-{state}")}
+                staff_file = staff.record_path()
+                original = staff_file.read_bytes()
+                if state == "unreadable":
+                    _ = staff_file.write_text("invalid staff JSON\n")
+                before = staff_file.read_bytes()
+                try:
+                    with patch.dict(os.environ, environment):
+                        result = self.run_launcher(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
+                    self.assertEqual(result.returncode, expected_code, result.stdout + result.stderr)
+                    self.assertEqual(staff_file.read_bytes(), before)
+                    if state == "missing":
+                        self.assertIn("Session ready at ", result.stdout)
+                        self.assertEqual(len([line for line in result.stderr.splitlines()
+                                              if line.startswith("staff member not found:")]), 1)
+                    else:
+                        self.assertNotIn("Session ready at ", result.stdout)
+                        self.assertIn("cannot read staff record", result.stderr)
+                finally:
+                    _ = staff_file.write_bytes(original)
 
     def test_a_sole_claude_implementation_failure_ends_the_run_after_its_pass_starts(self) -> None:
         _ = write_registry(self.registry, {"assignments": {"direct": "claude"},
@@ -183,7 +204,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         self.native.agent.during_prompt = fail_after_pane_exit
         result = self.launch()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertFalse(self.marker().exists(), result.stdout + result.stderr)
+        self.assertIsNone(self.open_run(), result.stdout + result.stderr)
         self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "error")
         started = [event for event in self.events() if event.get("event_type") == "pass_started"]
         self.assertEqual([event["worker_name"] for event in started], ["impl"])
@@ -233,8 +254,8 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         result = self.launch()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
-        self.assertEqual(self.marker().read_text().strip(), str(self.session_dir))
-        self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "active")
+        self.assertEqual(self.open_run(), self.session_dir)
+        self.assertNotIn("status", read_object(self.session_dir / "progress_history_state.json"))
         diagnostics = [line for line in result.stderr.splitlines() if "unable to end failed run" in line]
         self.assertEqual(len(diagnostics), 1, result.stderr)
         self.assertIn("recursion", diagnostics[0])
@@ -325,6 +346,8 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.fixture.fixture.root))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.fixture.fixture.root)})))
         _ = self.enterContext(assignment_helpers())
         self.ready = self.fixture.run_dir / "final.ready"
         self.phase = self.fixture.run_dir / "phases/8"
@@ -423,9 +446,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         write_text_atomic(self.ready, "ready\n")
         self.assertEqual(self.fixture.finish("review", turn_end.EventKind.STAGE_READY), turn_end.TurnOutcome.SUBMITTED)
         first, second = self.fixture.agent.submitted
-        dispatch_id = first[1].split("DONE ")[-1].split(".")[0]
+        dispatch_id = first[1].split("DONE ")[-1].split()[0].removesuffix(".")
         self.assertEqual(first[0], second[0])
-        self.assertIn(f"DONE {dispatch_id}-2.", second[1])
+        self.assertIn(f"DONE {dispatch_id}-2\n", second[1])
         self.assertIn(str(self.ready.with_suffix(".diff")), second[1])
         self.assertEqual(summary.read_text(), "The previous full report.\n")
         self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
@@ -463,7 +486,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(self.fixture.agent.waited, [])
         self.fixture.agent.complete(submitted[-1][0])
         self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
-        second_id = submitted[-1][1].split("DONE ")[-1].split(".")[0]
+        second_id = submitted[-1][1].split("DONE ")[-1].split()[0].removesuffix(".")
         self.assertTrue((self.phase / "review_summary_1.txt").read_text().endswith(f"DONE {second_id}\n"))
 
     def test_review_stage_one_done_does_not_complete_stage_two_or_replace_the_report(self) -> None:
@@ -541,28 +564,28 @@ class PaneReviewLauncherTests(unittest.TestCase):
                             case.fixture.prompt, session_dir=case.fixture.run_dir, slot=name, phase="8", kind="impl",
                             launcher_command=["previous-launcher"], reply=case.fixture.reply)
                         self.assertIs(code, worker.DispatchSubmission.SUBMITTED)
+                    if sole_worker:
+                        _ = staff.set_run(case.fixture.fixture.parent.id, staff.OpenRun(case.fixture.run_dir))
                     before = case.fixture.fixture.staff_state()
                     active = progress_history.active_dispatch(opened.row.id, case.fixture.run_dir)
                     submitted = case.fixture.agent.submitted.copy()
                     if sole_worker:
                         root = case.fixture.fixture.root
-                        marker = root / "active" / staff.runtime_id()
-                        write_text_atomic(marker, str(case.fixture.run_dir) + "\n")
                         state_path = case.fixture.run_dir / unit_runs.STATE_FILE
                         state = read_object(state_path)
-                        state["status"] = "active"
+                        _ = state.pop("status", None)
                         write_text_atomic(state_path, json.dumps(state))
                         arguments = ["--role", "review", "--to", name, "--cwd", str(root), "--phase", "8",
                                      "--session-dir", str(case.fixture.run_dir), "--prompt", str(case.fixture.prompt),
                                      "--early-ready", str(case.ready)]
-                        with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(root), "UNIT_ACTIVE_DIR": str(root / "active")}):
-                            self.assertEqual(unit_runs.held(staff.runtime_id(), root, root / "active"), [str(case.fixture.run_dir)])
+                        with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(root)}):
+                            self.assertEqual(unit_runs.held(staff.runtime_id(), root), [str(case.fixture.run_dir)])
                             result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
                         self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
                         self.assertIn("role change blocked by active work: submitted pass awaits completion",
                                       (case.phase / "impl_agent_1.log").read_text())
-                        self.assertEqual(read_object(state_path)["status"], "active")
-                        self.assertEqual(marker.read_text().strip(), str(case.fixture.run_dir))
+                        self.assertNotIn("status", read_object(state_path))
+                        self.assertEqual(unit_runs.open_run(staff.runtime_id()), case.fixture.run_dir)
                         self.assertEqual((case.phase / "impl_status_1").read_text(), "error\n")
                     else:
                         with patch("scripts.agents.detached_runs.live_runs", return_value=[object()]):
@@ -654,7 +677,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertIsInstance(staff.backend(moved), staff.CodexBackend)
                 self.assertEqual(moved.parent, row.parent)
                 self.assertEqual(moved.to_json() | {"current_session": row.current_session},
-                                 replace(row, role=staff.KnownWorkerRole("impl")).to_json())
+                                 replace(row, role=staff.KnownWorkerRole("impl"),
+                                         home=staff.SessionHome(self.native.fixture.root / "codex")).to_json())
                 self.assertNotEqual(self.native.agent.submitted[-1][0], "w1:p1")
                 self.assertIsInstance(world.launches[-1], herdr.SplitPane)
                 extract = worker_admission.handoff_path(self.session_dir, row)
@@ -711,9 +735,14 @@ class AssignLauncherTests(HookAssignmentFixture):
                      "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
         result = invoke_assignment(arguments, os.environ.copy())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        submitted = self.native.agent.submitted.copy()
+        self.native.fixture.world.locations[submitted[0][0]]["agent_status"] = "working"
+        repeated = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.native.agent.submitted, submitted)
         self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
-        passed = assign.object_map(assign.object_map(state["pass"])["impl"])
+        passed = assign.object_map(assign.object_map(state["pass"])["impl2"])
         self.assertEqual((passed["worker_name"], passed["worker_id"], passed["status"]),
                          ("impl2", opened.row.id, "completed"))
         phase = self.session_dir / "phases/7"
@@ -1153,6 +1182,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.turn_starts, 1)
 
     def test_a_fresh_run_takes_its_phase_title_from_the_dispatch_prompt(self) -> None:
+        _ = staff.clear_run(self.native.fixture.parent.id, self.session_dir)
         (self.session_dir / "progress_history_state.json").unlink()
         shutil.rmtree(self.history)
         shutil.rmtree(self.session_dir / "phases", ignore_errors=True)
@@ -1180,14 +1210,12 @@ class AssignLauncherTests(HookAssignmentFixture):
 
     def test_default_session_uses_the_callers_marker_instead_of_starting_another_run(self) -> None:
         caller = os.environ["CODEX_THREAD_ID"]
-        marker = Path(os.environ["UNIT_ACTIVE_DIR"]) / caller
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        _ = marker.write_text(str(self.session_dir))
+        _ = staff.set_run(self.native.fixture.parent.id, staff.OpenRun(self.session_dir))
         with patch.dict(os.environ, {"CODEX_THREAD_ID": caller}):
             result = self.launch(session=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
-        self.assertEqual(marker.read_text(), str(self.session_dir))
+        self.assertEqual(unit_runs.open_run(caller), self.session_dir)
 
     def test_fix_requires_a_cause_and_a_wrong_phase_prompt_never_claims_the_worker(self) -> None:
         refused = self.launch("fix", execution=InProcessAssignment())

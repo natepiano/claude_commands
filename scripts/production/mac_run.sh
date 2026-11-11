@@ -67,13 +67,23 @@ on_mac() {
 ssh -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
 
 mac_test=$lib/../mac_test/mac_test.py
-claim_output=$("$lib/py" "$mac_test" claim --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
+claim_output=$("$lib/py" "$mac_test" claim --identity --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
 claim_status=$?
 if (( claim_status == 10 || claim_status == 11 || claim_status == 12 )); then
   print -r -- $claim_output
   exit 9
 fi
 (( claim_status == 0 )) || { print -r -- $claim_output; exit $claim_status }
+claim_identity=$("$lib/py" -c '
+import json
+import sys
+
+line = next(line for line in sys.argv[1].splitlines() if line.startswith("claim_identity="))
+identity = json.loads(line.removeprefix("claim_identity="))
+for field in ("claim_id", "episode", "attempt"):
+    print(identity[field])
+' "$claim_output")
+claim_fields=("${(@f)claim_identity}")
 mac_claimed=1
 release_mac_claim() {
   (( mac_claimed )) || return 0
@@ -95,7 +105,7 @@ release_mac_claim() {
       cleanup_failed=1
     fi
   fi
-  "$lib/py" "$mac_test" release --pid $$ >/dev/null 2>&1
+  "$lib/py" "$mac_test" release --pid $$ --claim-id "$claim_fields[1]" --episode "$claim_fields[2]" --attempt "$claim_fields[3]" >/dev/null 2>&1
   mac_claimed=0
   return $cleanup_failed
 }

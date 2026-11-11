@@ -1,6 +1,7 @@
 """Prove group membership, sender identity, and one concurrent delivery per address."""
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -105,7 +106,7 @@ class BroadcastTests(unittest.TestCase):
         )
         peer_driver.chmod(0o755)
         self.environment = {
-            "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "SSH_RECORD": str(self.root / "ssh.jsonl"),
             "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
             "PEER_LOG": str(self.root / "peer-log"), "SAFE_PEER_SEND": str(self.root / "send.py"),

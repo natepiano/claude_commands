@@ -26,7 +26,7 @@ from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
-from scripts.build_queue.queue_fixture import write_scope
+from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
@@ -769,6 +769,42 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(len(room.runs), int(bool(cargo_use)))
                 self.assertEqual(room.used, cargo_use)
                 self.assertEqual(room.used + room.kept, 8 * admission_records.GIB if cargo_use else 0)
+
+    def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
+        for registered, registered_use, unregistered_use, kept in (
+                ((), 0, 6, 0), ((700001,), 2, 4, 6), ((700001, 700002), 6, 0, 10)):
+            with self.subTest(registered=registered), AdmissionFixture() as fixture:
+                owners: list[wire.Owner] = []
+                for pid, worker, used in ((700001, 700011, 2), (700002, 700012, 4)):
+                    owner = fixture.fixture_owner(pid, str(pid))
+                    owners.append(owner)
+                    write_process(fixture.proc.path, worker)
+                    _ = (fixture.proc.path / str(worker) / "comm").write_text("Runner.Worker\n")
+                    write_process(fixture.proc.path, pid, used * admission_records.GIB, parent=worker)
+                    _ = (fixture.proc.path / str(pid) / "comm").write_text("cargo\n")
+                ci = Path(os.environ["BUILDLOG_CI_CGROUP"])
+                write_scope(ci, members=(700011, 700001, 700012, 700002),
+                    current=6 * admission_records.GIB, anonymous=6 * admission_records.GIB)
+                for owner in owners:
+                    if owner.pid in registered:
+                        fixture.allow_next_start()
+                        _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
+                fixture.free(20 * admission_records.GIB)
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                    page = memory_feed.reading()
+                self.assertEqual(page["used"], registered_use)
+                self.assertEqual(page["ci_ram"], unregistered_use)
+                self.assertEqual(page["cap"], 23)
+                self.assertEqual(page["reserved"], kept)
+                self.assertEqual(page["room"], 17 - kept)
+                self.assertEqual(len(page["walk"]), len(registered) + 1)
+                self.assertEqual(sum(row.get("queued", False) for row in page["walk"]), len(registered))
+                text = memory_feed.page_json(page)
+                self.assertNotIn("CI builds do not wait in the queue yet.", text)
+                self.assertNotIn("CI keep-aside", text)
 
     def test_the_leftover_list_uses_the_queue_rule_and_keeps_all_scope_members(self) -> None:
         ended = leftover_step(45)

@@ -10,6 +10,8 @@ try:
 except FileNotFoundError:
     pass
 
+from scripts.lib import unit_runs
+
 import argparse
 import configparser
 import fcntl
@@ -33,6 +35,7 @@ from uuid import UUID, uuid4
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
 from scripts.direct import progress_history, recorder_state
+from scripts.lib import conf_reads
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, worker_admission
 
@@ -380,8 +383,10 @@ def authority_request(operation: str, payload: dict[str, object]) -> dict[str, o
     """Send an ownership request after releasing all design locks."""
     config = configparser.ConfigParser()
     path = Path(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')
-    if not config.read(path):
-        raise RoleRefused('ownership authority is not configured')
+    try:
+        config.read_string(conf_reads.read_text(path))
+    except FileNotFoundError as error:
+        raise RoleRefused('ownership authority is not configured') from error
     authority = config.get('ownership', 'host')
     if authority == local_host():
         return _authority_local(operation, payload)
@@ -660,7 +665,11 @@ def refresh_census(design_id: str) -> None:
 
 def _allow_new_roles() -> None:
     config = configparser.ConfigParser()
-    _ = config.read(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')
+    try:
+        config.read_string(conf_reads.read_text(
+            Path(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')))
+    except FileNotFoundError:
+        pass
     if not config.getboolean('roles', 'new_open', fallback=True):
         raise RoleRefused('new role opens and adoptions are disabled; keep existing identities and evidence')
 
@@ -980,8 +989,7 @@ def _finish_end(design: HeldDesign, role: Role) -> None:
     directory = design_directory(design.placement.design_id)
     with _lock(directory):
         if isinstance(design.binding, DesignUnbound):
-            state = worker_lifecycle.read_worker_state(directory / 'progress_history_state.json')
-            if state.get('status') == 'active':
+            if unit_runs.run_is_open(directory):
                 _recorder_command(['finish-run', '--session-dir', str(directory), '--status', 'completed'])
         transition = directory / 'transition.json'
         pending = _read(transition) if transition.exists() else {}
@@ -1299,7 +1307,11 @@ def main(argv: list[str]) -> int:
             register_repository(argument('repository'), {argument('host'): argument('checkout')})
         elif command == 'authority':
             config = configparser.ConfigParser()
-            _ = config.read(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')
+            try:
+                config.read_string(conf_reads.read_text(
+                    Path(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')))
+            except FileNotFoundError:
+                pass
             if config.get('ownership', 'host') != local_host():
                 raise RoleRefused('this host is not the ownership authority')
             print(json.dumps(_authority_local(argument('operation'), _object(cast(object, json.load(sys.stdin))))))

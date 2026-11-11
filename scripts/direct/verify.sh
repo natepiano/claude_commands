@@ -21,6 +21,7 @@
 #   --saved              final: read a saved workspace pass
 #   --tree <tree>        final --saved: select a tree
 #   --filter <name>      test: select names; repeat to select more names
+#   --run-ignored only   test: run only ignored tests, with optional filters
 #   --features <list>    check, test, doc, build: enable Cargo features
 #   --no-cache           test, lint: ignore saved results
 #   --target <name>      pin movable steps to one configured target
@@ -55,6 +56,7 @@
 #
 # --test <name> runs one integration test target.
 # Repeat --filter <name> to select tests that contain any named text.
+# --run-ignored only selects ignored tests; with no package, all packages.
 # Do not combine an integration test target with --filter.
 # --features <list> enables features for the package.
 # Also add workspace.metadata.dev.features.
@@ -359,6 +361,7 @@ parse_routing_arguments() {
 
 # Parse the package separately from flags and their values.
 parse_command_arguments() {
+    local ignored_only=0 integration_target=0
     VERIFY_PACKAGE=""
     COMMAND_ARGS=()
     SAVED_FINAL=0
@@ -377,7 +380,14 @@ parse_command_arguments() {
                 if [[ ( "$1" == --test && "$CMD" != test ) || ( "$1" == --name && "$CMD" != example ) || -z "${2:-}" || "$2" == --* ]]; then
                     command_help "$CMD" >&2; exit 2
                 fi
-                if [[ "$1" == --name ]]; then EXAMPLE_NAME=$2; fi
+                if [[ "$1" == --name ]]; then EXAMPLE_NAME=$2; else integration_target=1; fi
+                COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
+            --run-ignored)
+                if [[ "$CMD" != test || "${2:-}" != only ]]; then
+                    echo 'verify.sh: use test [<package>] --run-ignored only, without --test.' >&2
+                    exit 2
+                fi
+                ignored_only=1
                 COMMAND_ARGS+=("$1" "$2"); shift 2 ;;
             --features|--filter|--bin|--example|--target|--env|--fetch|--mac|--local)
                 [[ $# -ge 2 ]] || { command_help "$CMD" >&2; exit 2; }
@@ -388,6 +398,10 @@ parse_command_arguments() {
                 VERIFY_PACKAGE=$1; shift ;;
         esac
     done
+    if [[ "$ignored_only" == 1 && "$integration_target" == 1 ]]; then
+        echo 'verify.sh: use test [<package>] --run-ignored only, without --test.' >&2
+        exit 2
+    fi
     [[ -z "$SAVED_TREE" || "$SAVED_FINAL" == 1 ]] || { command_help final >&2; exit 2; }
     [[ "$SAVED_FINAL" == 0 || ${#COMMAND_ARGS[@]} == 0 ]] || { command_help final >&2; exit 2; }
     ARGS=("$VERIFY_PACKAGE" ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"})
@@ -612,6 +626,9 @@ hash_stream() {
     printf '%s\n' "${hash%% *}"
 }
 
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf_record.sh"
+
 lint_code_key() {
     local file hash
     hash="$(
@@ -621,6 +638,7 @@ lint_code_key() {
                 "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"; do
                 if [[ -f "$file" ]]; then
                     printf 'present\0'
+                    case "$file" in *.conf) stem="${file##*/}"; conf_record "${stem%.conf}" ;; esac
                     cat -- "$file" || exit 1
                 else
                     printf 'absent\0'
@@ -1268,6 +1286,7 @@ print_built_binaries() {
 
 NEXTEST_ARGS=()
 compose_nextest_args() {
+    local ignored_only=0
     set -- "${ARGS[@]}"
     PKG="${1:-}"
     shift
@@ -1277,12 +1296,15 @@ compose_nextest_args() {
     # takes no filter.
     REST=()
     while [[ $# -gt 0 ]]; do
-        if [[ "$1" == --test && -z "$TARGET" && ${#FILTERS[@]} -eq 0 && -n "${2:-}" ]]; then
+        if [[ "$1" == --test && -z "$TARGET" && ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 && -n "${2:-}" ]]; then
             TARGET=$2
             shift 2
         elif [[ "$1" == "--filter" && -z "$TARGET" \
               && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
             FILTERS+=("$2")
+            shift 2
+        elif [[ "$1" == --run-ignored && "${2:-}" == only && -z "$TARGET" ]]; then
+            ignored_only=1
             shift 2
         else
             REST+=("$1")
@@ -1330,8 +1352,11 @@ compose_nextest_args() {
     NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}")
     if [[ -n "$TEST_FILTER" ]]; then NEXTEST_ARGS+=(-E "$TEST_FILTER"); fi
     NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
-    # Allow an empty package run; named filters must still match tests.
-    if [[ ${#FILTERS[@]} -eq 0 ]]; then
+    if [[ "$ignored_only" == 1 ]]; then
+        NEXTEST_ARGS+=(--run-ignored only)
+    fi
+    # Filters and ignored-test selections must match tests.
+    if [[ ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 ]]; then
         NEXTEST_ARGS+=(--no-tests=warn)
     fi
 }
@@ -1762,7 +1787,7 @@ BUILDLOG_MAC_COPY_S=""
 BUILDLOG_MAC_COPY_COUNT=""
 BUILDLOG_MAC_COPY_NATEDEV_S=""
 export BUILDLOG_TARGET=""
-if [[ "$CMD" == test && " ${ARGS[*]} " == *" --filter "* ]]; then
+if [[ "$CMD" == test && ( " ${ARGS[*]} " == *" --filter "* || " ${ARGS[*]} " == *" --run-ignored "* ) ]]; then
     FILTER_RUN=1
 fi
 if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
@@ -1796,7 +1821,7 @@ tree_key() {
             fi
         done
         while IFS= read -r name; do
-            words+=(--filter "$name")
+            if [[ -n "$name" ]]; then words+=(--filter "$name"); fi
         done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
     fi
     if [[ "$CMD" == test ]]; then
@@ -2126,7 +2151,10 @@ try_mac_test() {
         if [[ "$reserved_target" != "$selected_target" || "$reserved_settings" != "$1" ]]; then
             return 0
         fi
-        runner_args+=(--claim-owner-pid $$)
+        local claim_id episode attempt claim_session
+        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
+        runner_args+=(--claim-owner-pid $$ --claim-id "$claim_id" --episode "$episode" --attempt "$attempt"
+            --claim-session "$claim_session")
     fi
     if declare -F release_token >/dev/null; then release_token || return $?; fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
@@ -2609,8 +2637,13 @@ target_for_settings() {
 
 release_wait_claim() {
     [[ -n "${HOLD_WAIT_DIR:-}" ]] || return 0
-    "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ >/dev/null 2>&1 || true
-    rm -f "$HOLD_WAIT_DIR/ssh-reservation"
+    local claim_id="" episode="" attempt="" claim_session=""
+    if [[ -s "$HOLD_WAIT_DIR/ssh-reservation.identity" ]]; then
+        IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
+        "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ --claim-id "$claim_id" \
+            --episode "$episode" --attempt "$attempt" --session "$claim_session" >/dev/null 2>&1 || true
+    fi
+    rm -f "$HOLD_WAIT_DIR/ssh-reservation" "$HOLD_WAIT_DIR/ssh-reservation.identity"
 }
 
 ssh_reserve_hook() {
@@ -2634,7 +2667,8 @@ ssh_reserve_hook() {
     local remote_kind
     remote_kind=$(remote_step_kind)
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
-        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
+        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" \
+        --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity" --target "$name"
     if [[ "${3:-}" == 0 ]]; then printf '%s ' --new-step; fi
     if [[ "$(target_platform "$name")" == macos ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
 }

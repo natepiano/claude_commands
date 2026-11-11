@@ -1426,6 +1426,57 @@ class ReadingAlertTests(unittest.TestCase):
                 self.assertIsInstance(fixture.server.reading_alert_delivery, service.NoReadingAlertDelivery)
 
 
+class PlacementRestartTests(unittest.TestCase):
+    def test_restart_preserves_old_waiters_and_both_placement_permission_states(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment
+
+        for version in (1, 2):
+            with self.subTest(version=version), PlacementFixture() as fixture:
+                fixture.configure(cloud_gate_slots=1)
+                fixture.free(0)
+                blocker = replace(fixture.request(), place=wire.CloudPlace("aws"))
+                _ = only_admitted(fixture.server.handle_request(blocker))
+                fixture.hold_starts()
+                local = fixture.request(since=fixture.clock.now() - 100)
+                cloud = replace(fixture.request(since=fixture.clock.now() - 50), place=wire.CloudPlace("aws"))
+                legacy_messages: list[str] = []
+                for request in (local, cloud):
+                    envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+                    envelope["v"] = version
+                    message = json.dumps(envelope) + "\n"
+                    legacy_messages.append(message)
+                    reply, = fixture.connect(message).replies()
+                    self.assertIsInstance(reply, wire.Wait)
+                pending = placement_request(fixture, since=fixture.clock.now() - 25)
+                consumed = placement_request(fixture, since=fixture.clock.now() - 10)
+                _ = publish_candidate(fixture, pending)
+                pending_assignment = assignment_for(fixture, pending)
+                consumed_assignment = assignment_for(fixture, consumed)
+                claim = adopt_assignment(fixture, consumed, consumed_assignment)
+                consume = wire.ConsumePermission("first-consumption", consumed_assignment, claim)
+                self.assertEqual(fixture.server.handle_request(consume),
+                                 [wire.FirstAuthorization(consumed_assignment, claim)])
+                positions = fixture.server.places.copy()
+                waiters = {episode: fixture.server.waiters[episode].request for episode in (local.episode, cloud.episode)}
+                fixture.restart()
+                self.assertEqual(fixture.server.places, positions)
+                for message in legacy_messages:
+                    reply, = fixture.connect(message).replies()
+                    self.assertIsInstance(reply, wire.Wait)
+                self.assertEqual({episode: fixture.server.waiters[episode].request for episode in waiters}, waiters)
+                self.assertEqual(assignment_for(fixture, pending), pending_assignment)
+                self.assertEqual(assignment_for(fixture, consumed), consumed_assignment)
+                status, = fixture.server.handle_request(consume)
+                self.assertIsInstance(status, wire.DispatchStatus)
+                assert isinstance(status, wire.DispatchStatus)
+                self.assertIsInstance(status.permission, placement.PermissionConsumed)
+                pending_claim = adopt_assignment(fixture, pending, pending_assignment)
+                self.assertEqual(fixture.server.handle_request(wire.ConsumePermission(
+                    "pending-consumption", pending_assignment, pending_claim)),
+                    [wire.FirstAuthorization(pending_assignment, pending_claim)])
+
+
 class CloudAdmissionTests(unittest.TestCase):
     def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
         from scripts.build_queue import cloud_progress
@@ -3588,8 +3639,8 @@ class ServiceTests(unittest.TestCase):
 
     def test_unknown_version_gets_explicit_refusal_and_socket_is_private(self) -> None:
         with AdmissionFixture() as fixture:
-            peer = fixture.connect('{"v":3,"type":"view","data":{}}\n')
-            self.assertEqual(peer.replies(), [wire.Refused("client version 3, service supports 1..2")])
+            peer = fixture.connect('{"v":4,"type":"view","data":{}}\n')
+            self.assertEqual(peer.replies(), [wire.Refused("client version 4, service supports 1..3")])
             self.assertEqual(stat.S_IMODE(fixture.socket_path.stat().st_mode), 0o600)
 
     def test_aged_launch_alone_does_not_create_a_reservation(self) -> None:

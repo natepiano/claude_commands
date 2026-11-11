@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Fast-forward a clean main checkout to origin/main without deleting local work.
+"""Fast-forward a main checkout to origin/main without deleting local work.
+
+Changes that match origin/main can come from an interrupted update. Prove every
+candidate's content, mode, and index state before changing any file. Remove proved
+untracked files before restoring tracked paths to HEAD. Then finish the update
+with git merge --ff-only. A blocked report names every path that fails the proof
+or collides with an incoming path.
 
 Each run appends a JSON line to SYNC_LOG. Each blocked run with --notify calls
 send.py with a key for the host and state. send.py limits delivery to one message
@@ -20,6 +26,7 @@ import argparse
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -44,6 +51,15 @@ ADVANCED = "advanced"
 
 
 @dataclass(frozen=True)
+class GitFileState:
+    mode: str
+    object_id: str
+
+
+ABSENT_FILE = GitFileState("000000", "")
+
+
+@dataclass(frozen=True)
 class Outcome:
     state: str
     detail: str
@@ -55,7 +71,8 @@ class Outcome:
 
 def _git(checkout: Path, *arguments: str, timeout: float = 30) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True, text=True, check=False,
+        return subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True, text=True,
+                              errors="surrogateescape", check=False,
                               timeout=timeout, env={**os.environ, **GIT_ENVIRONMENT})
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(["git"], 124, "", f"git {arguments[0]} took over {timeout:.0f} s")
@@ -63,6 +80,126 @@ def _git(checkout: Path, *arguments: str, timeout: float = 30) -> subprocess.Com
 
 def _first_line(result: subprocess.CompletedProcess[str]) -> str:
     return failure_detail(result, lines=1).replace("\n", "; ")
+
+
+def _matches_file(checkout: Path, name: str, entry: GitFileState) -> bool:
+    path = checkout / name
+    if any((checkout / parent).is_symlink() for parent in Path(name).parents):
+        return False
+    try:
+        mode = path.lstat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return entry == ABSENT_FILE
+    if stat.S_ISLNK(mode):
+        git_mode = "120000"
+        content = os.fsencode(os.readlink(path))
+    elif stat.S_ISREG(mode):
+        git_mode = "100755" if mode & stat.S_IXUSR else "100644"
+        if entry.mode != git_mode:
+            return False
+        content = path.read_bytes()
+    else:
+        return False
+    if entry.mode != git_mode:
+        return False
+    hashed = subprocess.run(["git", "-C", str(checkout), "hash-object", "--no-filters", "--stdin"],
+                            input=content, capture_output=True, check=False, timeout=30,
+                            env={**os.environ, **GIT_ENVIRONMENT})
+    return hashed.returncode == 0 and hashed.stdout.decode("ascii").strip() == entry.object_id
+
+
+def _has_untracked_update(checkout: Path, blocking_details: list[str]) -> bool:
+    untracked = _git(checkout, "ls-files", "--others", "-z")
+    if untracked.returncode:
+        blocking_details.append(_first_line(untracked))
+        return False
+    if not untracked.stdout:
+        return False
+    added = _git(checkout, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z",
+                 "HEAD", "origin/main", "--")
+    if added.returncode:
+        blocking_details.append(_first_line(added))
+        return False
+    added_paths = set(added.stdout.split("\0")) - {""}
+    untracked_paths = set(untracked.stdout.split("\0")) - {""}
+    collisions = sorted(name for name in untracked_paths
+                        if any(name.startswith(added_path + "/") or added_path.startswith(name + "/")
+                               for added_path in added_paths))
+    blocking_details.extend(collisions)
+    return bool(untracked_paths & added_paths) or bool(collisions)
+
+
+def _finish_interrupted_update(checkout: Path, blocking_details: list[str]) -> bool:
+    """Restore candidates only after every changed working file matches origin/main."""
+    queries = [
+        _git(checkout, "ls-tree", "-r", "-z", "HEAD"),
+        _git(checkout, "ls-tree", "-r", "-z", "origin/main"),
+        _git(checkout, "-c", "core.filemode=true", "diff", "--name-only", "--no-renames", "-z", "HEAD", "--"),
+        _git(checkout, "diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD", "--"),
+        _git(checkout, "ls-files", "--others", "-z"),
+        _git(checkout, "ls-files", "--stage", "-z"),
+    ]
+    for result in queries:
+        if result.returncode:
+            blocking_details.append(_first_line(result))
+            return False
+    trees: list[dict[str, GitFileState]] = []
+    for result in queries[:2]:
+        files: dict[str, GitFileState] = {}
+        for record in result.stdout.split("\0"):
+            if record:
+                metadata, name = record.split("\t", 1)
+                mode, kind, object_id = metadata.split()
+                if kind not in ("blob", "commit"):
+                    blocking_details.append(f"git reported an unsupported object type for {name}: {kind}")
+                    return False
+                files[name] = GitFileState(mode, object_id)
+        trees.append(files)
+    head_files, target_files = trees
+    index_files: dict[str, GitFileState] = {}
+    unmerged: set[str] = set()
+    for record in queries[5].stdout.split("\0"):
+        if record:
+            metadata, name = record.split("\t", 1)
+            mode, object_id, stage = metadata.split()
+            if stage != "0":
+                unmerged.add(name)
+            else:
+                index_files[name] = GitFileState(mode, object_id)
+    tracked = (set(queries[2].stdout.split("\0") + queries[3].stdout.split("\0")) - {""}) | unmerged
+    untracked = {name for name in queries[4].stdout.split("\0")
+                 if name in target_files and name not in head_files}
+    restore: list[str] = []
+    remove: list[str] = []
+    for name in sorted(tracked | untracked):
+        try:
+            if name in unmerged or (name in tracked and index_files.get(name, ABSENT_FILE) not in (
+                    head_files.get(name, ABSENT_FILE), target_files.get(name, ABSENT_FILE))):
+                blocking_details.append(name)
+                continue
+            if _matches_file(checkout, name, head_files.get(name, ABSENT_FILE)):
+                continue
+            if not _matches_file(checkout, name, target_files.get(name, ABSENT_FILE)):
+                blocking_details.append(name)
+                continue
+            (restore if name in tracked else remove).append(name)
+        except (OSError, UnicodeError, subprocess.TimeoutExpired):
+            blocking_details.append(name)
+    if blocking_details:
+        return False
+    try:
+        for name in remove:
+            (checkout / name).unlink()
+        if restore:
+            restored = _git(checkout, "--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree",
+                            "--", *restore)
+            if restored.returncode:
+                blocking_details.append(_first_line(restored))
+                return False
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        blocking_details.append(str(error) or type(error).__name__)
+        return False
+    return True
 
 
 def sync(checkout: Path) -> Outcome:
@@ -93,13 +230,21 @@ def sync(checkout: Path) -> Outcome:
     if _git(checkout, "merge-base", "--is-ancestor", "HEAD", "origin/main").returncode:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
     status = _git(checkout, "status", "--porcelain", "--untracked-files=no")
-    if status.returncode or status.stdout.strip():
-        changed = ", ".join(line[3:] for line in status.stdout.splitlines()[:5])
-        return Outcome("dirty", f"{checkout} has changed tracked files ({changed or _first_line(status)})")
+    interrupted = False
+    blocking_details: list[str] = []
+    if status.returncode:
+        blocking_details.append(_first_line(status))
+    elif _has_untracked_update(checkout, blocking_details) or status.stdout.strip():
+        interrupted = _finish_interrupted_update(checkout, blocking_details)
+    if blocking_details:
+        return Outcome("dirty", f"{checkout} has local changes that block the update ({', '.join(blocking_details)})")
     merged = _git(checkout, "merge", "--ff-only", "-q", "origin/main")
     if merged.returncode:
         return Outcome("ff-failed", f"git merge --ff-only origin/main failed in {checkout}: {_first_line(merged)}")
-    return Outcome(ADVANCED, f"{head[:8]}..{target[:8]}")
+    detail = f"{head[:8]}..{target[:8]}"
+    if interrupted:
+        detail += "; finished an interrupted update"
+    return Outcome(ADVANCED, detail)
 
 
 def state_dir() -> Path:

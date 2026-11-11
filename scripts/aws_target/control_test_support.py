@@ -111,6 +111,8 @@ class ControlFixture(CostFixture):
         path = mac_test.claim_path(paths, scope)
         path.parent.mkdir(parents=True, exist_ok=True)
         record: mac_test.RemoteJobClaim = {
+            "claim_id": f"claim-{slot}-{pid}-{at}", "episode": f"episode-{slot}",
+            "attempt": f"attempt-{pid}-{at}", "submitting_session": "",
             "pid": pid, "proc_start": "old-process", "what": "test hana", "worktree": str(self.root),
             "since": datetime.fromtimestamp(at or self.clock.now - 10, UTC).isoformat(),
             "repo_name": "hana", "repo_key": scope.key, "slot": slot,

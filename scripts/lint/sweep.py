@@ -3306,7 +3306,7 @@ def folder_choice(path: str, size: int) -> FolderChoice:
 
 def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: Sequence[tuple[str, int]], shortfall: int, *,
                    now: float, lint_settings: conf.ConfigRead, held_targets: Sequence[str] = ()) -> FolderChoices:
-    """Classify measured folders and exclude held output from recommendations."""
+    """Offer build output outside source checkouts and exclude held output from recommendations."""
     choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
                for path, size in protected if size > 0]
     if isinstance(measurement, CurrentMacFolders):
@@ -3319,11 +3319,17 @@ def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: 
             choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
                            if item.bytes > 0 and item.path not in protected_paths)
     held_paths = tuple(Path(path).expanduser().resolve() for path in held_targets)
-    for index, item in enumerate(choices):
+    output_roots = OUTPUT_ROOTS.get().output_owners
+    candidates: list[FolderChoice] = []
+    for item in choices:
         path = Path(item.label).expanduser().resolve()
+        if ((path / "Cargo.toml").exists() or (path / GIT_DIR).exists()
+                or (path not in output_roots and not is_cargo_target(str(path), lint_settings=lint_settings))):
+            continue
         if any(path.is_relative_to(held) or held.is_relative_to(path) for held in held_paths):
-            choices[index] = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
-    choices.sort(key=lambda item: (-item.bytes, item.label))
+            item = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
+        candidates.append(item)
+    choices = sorted(candidates, key=lambda item: (-item.bytes, item.label))
     if not choices:
         return UNAVAILABLE_FOLDER_CHOICES
     eligible = [item for item in choices if item.kind is not FolderChoiceKind.HELD_OUTPUT]
@@ -3366,15 +3372,20 @@ def folder_choice_lines(choices: FolderChoices, shortfall: int, *, folder_count:
                  "Delete nothing: the disk stays low and builds can fail."]
     else:
         shown: list[FolderChoice] = []
+        covered_paths: list[Path] = []
         covered = 0
         for item in choices.choices:
             if len(shown) >= folder_count or covered >= shortfall:
                 break
             if item.bytes <= 0:
                 continue
+            path = Path(item.label).expanduser().resolve()
+            if any(path.is_relative_to(previous) or previous.is_relative_to(path) for previous in covered_paths):
+                continue
             shown.append(item)
             if item.kind is not FolderChoiceKind.HELD_OUTPUT:
                 covered += item.bytes
+                covered_paths.append(path)
         if shown and not isinstance(choices, HeldOnlyFolderChoices):
             largest = next(item for item in choices.choices if item.kind is not FolderChoiceKind.HELD_OUTPUT)
             if largest not in shown:
@@ -3753,9 +3764,9 @@ def mac_folder_reclaimable_bytes(directory: str) -> int:
     return total + sum(observed.st_blocks * 512 for key, observed in shared.items() if links[key] == observed.st_nlink)
 
 
-def mac_folder_measurement(policy: MacFloor) -> CurrentMacFolders:
-    """Measure each root's direct folder children without following directory symlinks."""
-    folders: set[str] = set()
+def mac_folder_measurement(policy: MacFloor, targets: Sequence[str]) -> CurrentMacFolders:
+    """Measure root children and discovered targets without following directory symlinks."""
+    folders = {target for target in targets if not os.path.islink(target) and os.path.isdir(target)}
     for root in policy.roots:
         try:
             with os.scandir(Path(root).expanduser().resolve()) as entries:
@@ -3809,6 +3820,15 @@ SweepFailureScope = FloorFailureScope | WorkspaceFailureScope | TemporarySweepFa
 
 
 @dataclass(frozen=True)
+class FloorTargetsNotSearched:
+    """This pass has no target search result."""
+
+
+class SearchedFloorTargets(tuple[str, ...]):
+    """The filtered target search result, including a completed search with no targets."""
+
+
+@dataclass(frozen=True)
 class FloorOutcome:
     assessment: tmp_sweep.SweepAssessment
     removed: int = 0
@@ -3817,6 +3837,7 @@ class FloorOutcome:
     busy: int = 0
     protected: tuple[tuple[str, int], ...] = ()
     held_targets: tuple[str, ...] = ()
+    targets: SearchedFloorTargets | FloorTargetsNotSearched = FloorTargetsNotSearched()
 
     @property
     def status(self) -> int:
@@ -3970,6 +3991,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
     after = outcome.after if isinstance(outcome, FloorOutcome) else 0
     protected = outcome.protected if isinstance(outcome, FloorOutcome) else ()
     held_targets = outcome.held_targets if isinstance(outcome, FloorOutcome) else ()
+    targets = outcome.targets if isinstance(outcome, FloorOutcome) else FloorTargetsNotSearched()
     removed = outcome.removed if isinstance(outcome, FloorOutcome) else 0
     filesystem = FLOOR_FILESYSTEM.get()
     root_scope = scope is FloorFailureScope.FILESYSTEM and (
@@ -4056,9 +4078,10 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             failure = NoFailure()
         current = replace(current, failure=failure)
         crossing = current.phone_crossing if root_scope else AbovePhoneFloor()
-        natedev_pending = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+        crossing_ready = isinstance(policy, NatedevFloor) or isinstance(targets, SearchedFloorTargets)
+        natedev_pending = (crossing_ready and free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
                            and crossing.natedev is CrossingReceipt.PENDING)
-        phone_due = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+        phone_due = (crossing_ready and free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
                      and crossing.phone is CrossingReceipt.PENDING and not assessment.status)
         phone_pending = phone_due and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE
         crossing_pending = natedev_pending or phone_pending
@@ -4068,7 +4091,11 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         shortfall = max(0, phone_floor - free)
         choices: FolderChoices = UNAVAILABLE_FOLDER_CHOICES
         if crossing_pending:
-            measurement = mac_folder_measurement(policy) if isinstance(policy, MacFloor) else read_disk_measurement()
+            if isinstance(policy, MacFloor):
+                assert isinstance(targets, SearchedFloorTargets)
+                measurement = mac_folder_measurement(policy, targets)
+            else:
+                measurement = read_disk_measurement()
             choices = folder_choices(measurement, protected, shortfall,
                                      now=time.time(), lint_settings=lint_settings, held_targets=held_targets)
 
@@ -4176,6 +4203,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
 
     guard: int | None = None
     outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
+    target_search: SearchedFloorTargets | FloorTargetsNotSearched = FloorTargetsNotSearched()
     protected: tuple[tuple[str, int], ...] = ()
     held_targets: set[str] = set()
     busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
@@ -4235,6 +4263,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             print(f"lint sweep: filesystem {filesystem.key} at {filesystem.probe_path}")
         if isinstance(policy, MacFloor):
             targets = [target for target in targets if policy.allows(target)]
+        target_search = SearchedFloorTargets(targets)
         owners = TargetOwnerIndex(targets)
         hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
                         if isinstance(policy, NatedevFloor) else {})
@@ -4447,7 +4476,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             except OSError as error:
                 print(f"lint sweep: cannot save floor accounting: {error}", file=sys.stderr)
         outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0 if isinstance(policy, MacFloor) else (1 if failures else 0)),
-                               0 if dry_run else max(0, total - left), free, after_free, len(busy), protected=protected)
+                               0 if dry_run else max(0, total - left), free, after_free, len(busy),
+                               protected=protected, targets=target_search)
         return outcome
     except (conf.Unusable, OSError) as error:
         if isinstance(policy, MacFloor):
@@ -4462,7 +4492,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                 held_targets.update(root for root, use in busy.items() if not isinstance(use, NoRecordedEvidence))
                 for root in tuple(held_targets):
                     held_targets.update(OUTPUT_ROOTS.get().roots_for(root))
-                notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets))),
+                notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets)),
+                                             targets=target_search),
                                      lint_settings=lint_settings, detail=detail,
                                      policy=policy)
         finally:

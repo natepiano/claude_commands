@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from types import CodeType, SimpleNamespace
 from typing import ClassVar, cast, override
@@ -32,7 +33,7 @@ from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet, write_aws_claim
 from scripts.buildlog import sync
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -343,24 +344,21 @@ class FixtureExecutor:
 
 
 class GateImageAws:
-    """Keep the image lifecycle and temporary instance in local test state."""
+    """Keep the gate stack, the saved gate image and its snapshot in local test state."""
     def __init__(self, failure: str = '') -> None:
         self.failure: str = failure
         self.commands: list[list[str]] = []
-        self.launches: list[dict[str, object]] = []
-        self.terminated: bool = False
-        self.image_count: int = 0
-        self.image_reads: int = 0
         self.version: int = 1
         self.gate_changes: list[dict[str, object]] = []
-        self.image_parameter: str = 'ami-fixture'
+        self.image_parameter: str = 'ami-old'
         self.manifest: Path = Path()
         self.live_template: dict[str, object] = {'Resources': {
             'GateExpiryFunction': {'live': 'keep'}, 'GateScalerPolicy': {'Properties': {
                 'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': ['ec2:RunInstances'],
                     'Resource': {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/${GateImage}'}}]}}}}}
         self.images: dict[str, dict[str, object]] = {
-            'ami-old': self.image('ami-old', 'snap-old'),
+            'ami-old': {'ImageId': 'ami-old', 'State': 'available', 'Tags': self.tags(),
+                'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'SnapshotId': 'snap-old', 'VolumeSize': 32}}]},
             'ami-builder': {'ImageId': 'ami-builder', 'Tags': [{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}]}}
         self.snapshots: dict[str, dict[str, object]] = {
             'snap-old': {'SnapshotId': 'snap-old', 'Tags': self.tags()},
@@ -370,11 +368,6 @@ class GateImageAws:
     def tags() -> list[dict[str, str]]:
         return [{'Key': gate_box.GATE_IMAGE_OWNER_TAG, 'Value': 'true'}]
 
-    @classmethod
-    def image(cls, name: str, snapshot: str) -> dict[str, object]:
-        return {'ImageId': name, 'State': 'available', 'Tags': cls.tags(),
-                'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'SnapshotId': snapshot, 'VolumeSize': 32}}]}
-
     def __call__(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
         self.commands.append(args)
@@ -383,8 +376,6 @@ class GateImageAws:
         error = ''
         if operation == 'get-cost-and-usage':
             reply = account_reply(arguments)
-        elif operation == 'export-credentials':
-            reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret'}
         elif operation == 'describe-stacks':
             reply = {'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'StackId': 'fixture-stack',
                 'Parameters': [{'ParameterKey': 'GateImage', 'ParameterValue': self.image_parameter},
@@ -418,54 +409,14 @@ class GateImageAws:
             reply = {'StackEvents': []}
         elif operation == 'delete-change-set':
             pass
-        elif operation == 'run-instances':
-            self.launches.append(ledger.mapping(cast(object, json.loads(args[args.index('--cli-input-json') + 1]))))
-            self.terminated = False
-            if self.failure == 'lost launch':
-                raise subprocess.TimeoutExpired('fixture launch', 1)
-            reply = {'Instances': [{'InstanceId': 'i-image'}]}
-        elif operation == 'get-object':
-            if self.failure == 'interrupt':
-                raise KeyboardInterrupt
-            if self.failure == 'timeout':
-                error = 'NoSuchKey'
+        elif operation in ('describe-images', 'describe-snapshots'):
+            owner = ledger.text(ledger.rows({'rows': cast(object, json.loads(args[args.index('--filters') + 1]))},
+                                            'rows')[0], 'Name').removeprefix('tag:')
+            tags = [{'Key': owner, 'Value': 'true'}]
+            if operation == 'describe-images':
+                reply = {'Images': [row for row in self.images.values() if row.get('Tags') == tags]}
             else:
-                _ = Path(args[args.index('--key') + 2]).write_text(json.dumps({'status': 7 if self.failure == 'prepare' else 0}))
-        elif operation == 'describe-instances':
-            reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-image',
-                'LaunchTime': '2026-11-09T00:00:00Z', 'State': {'Name': 'terminated' if self.terminated else 'running'}}]}]}
-        elif operation == 'terminate-instances':
-            self.terminated = True
-        elif operation == 'create-image':
-            if self.failure == 'create':
-                error = 'fixture image failure'
-            else:
-                self.image_count += 1
-                self.image_reads = 0
-                name, snapshot = f'ami-gate-{self.image_count}', f'snap-gate-{self.image_count}'
-                self.images[name] = self.image(name, snapshot)
-                self.images[name]['State'] = 'pending'
-                self.snapshots[snapshot] = {'SnapshotId': snapshot, 'Tags': self.tags()}
-                reply = {'ImageId': name}
-        elif operation == 'describe-images':
-            if '--image-ids' in args:
-                name = args[args.index('--image-ids') + 1]
-                if name not in self.images:
-                    error = 'InvalidAMIID.NotFound'
-                else:
-                    self.image_reads += 1
-                    if self.failure == 'image interrupt':
-                        self.failure = ''
-                        raise KeyboardInterrupt
-                    if self.failure == 'image':
-                        self.images[name]['State'] = 'failed'
-                    elif self.image_reads > 1 and self.failure != 'image timeout':
-                        self.images[name]['State'] = 'available'
-                    reply = {'Images': [self.images[name]]}
-            else:
-                reply = {'Images': [row for row in self.images.values() if row.get('Tags') == self.tags()]}
-        elif operation == 'describe-snapshots':
-            reply = {'Snapshots': [row for row in self.snapshots.values() if row['Tags'] == self.tags()]}
+                reply = {'Snapshots': [row for row in self.snapshots.values() if row['Tags'] == tags]}
         elif operation == 'deregister-image':
             del self.images[args[args.index('--image-id') + 1]]
         elif operation == 'delete-snapshot':
@@ -680,6 +631,98 @@ sys.exit(7)
         return deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
                                  notify=lambda _event: True)
 
+    def previous_output(self, output: str, command: str) -> str:
+        pending: list[str] = []
+        previous: list[str] = []
+        for line in output.splitlines():
+            if not line.startswith(command + ': ') or line.startswith((command + ': refused:', command + ': image kept:')):
+                previous.append(line)
+                continue
+            message = line.removeprefix(command + ': ')
+            done = re.fullmatch(r'(.+) done in (\d+) s', message)
+            heartbeat = re.fullmatch(r'still (.+), (\d+) min', message)
+            if done:
+                self.assertTrue(pending, line)
+                self.assertEqual(pending.pop(), done[1])
+            elif heartbeat:
+                self.assertIn(heartbeat[1], pending)
+            else:
+                pending.append(message.removesuffix(' (can take several minutes)'))
+        self.assertEqual(pending, [])
+        return ''.join(line + '\n' for line in previous)
+
+    def test_deployment_step_prints_start_and_elapsed_time(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), mock.patch.object(time, 'monotonic', side_effect=[10.0, 12.0]):
+            with deploy.step('remove-builder', 'updating the stack', self.settings, hint='can take several minutes'):
+                pass
+        self.assertEqual(output.getvalue().splitlines(), [
+            'remove-builder: updating the stack (can take several minutes)',
+            'remove-builder: updating the stack done in 2 s'])
+
+    def test_deployment_step_prints_heartbeat_until_completion(self) -> None:
+        self.replace('deploy_progress_interval_s', '0.001')
+        heartbeat = threading.Event()
+
+        class ProgressOutput(StringIO):
+            @override
+            def write(self, text: str) -> int:
+                count = super().write(text)
+                if 'remove-builder: still updating the stack,' in text:
+                    heartbeat.set()
+                return count
+
+        output = ProgressOutput()
+        with redirect_stdout(output):
+            with deploy.step('remove-builder', 'updating the stack', self.settings, hint='can take several minutes'):
+                self.assertTrue(heartbeat.wait(TEST_HANG_GUARD_SECS))
+        self.assertRegex(output.getvalue(), r'remove-builder: still updating the stack, \d+ min\n')
+        self.assertEqual(output.getvalue().splitlines()[0],
+                         'remove-builder: updating the stack (can take several minutes)')
+        self.assertRegex(output.getvalue().splitlines()[-1], r'^remove-builder: updating the stack done in \d+ s$')
+        self.assertEqual(self.previous_output(output.getvalue(), 'remove-builder'), '')
+        self.assertFalse(any(worker.name == 'deployment-progress' for worker in threading.enumerate()))
+
+    def test_stack_wait_uses_its_own_timeout_through_the_admin_executor(self) -> None:
+        self.replace('stack_wait_timeout_s', '3600')
+        calls: list[tuple[tuple[str, ...], float]] = []
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            calls.append((tuple(arguments), timeout))
+            return aws_target.execute_command(arguments, capture_output=capture_output, text=text,
+                                              timeout=timeout, check=check, env=env)
+
+        subject = deploy.Deployment(self.settings, self.state, self.bundle, execute=execute,
+                                    clock=lambda: self.now, notify=lambda _event: True)
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        waits = [(arguments, timeout) for arguments, timeout in calls if 'cloudformation' in arguments and 'wait' in arguments]
+        self.assertTrue(waits)
+        self.assertEqual({timeout for _, timeout in waits}, {3600})
+        ordinary = [(arguments, timeout) for arguments, timeout in calls if 'wait' not in arguments]
+        self.assertTrue(ordinary)
+        self.assertEqual({timeout for _, timeout in ordinary}, {30})
+
+    def test_secrets_command_prints_progress_without_exposing_credentials(self) -> None:
+        arguments = ['deploy.py', 'secrets', '--settings', str(self.settings), '--directory', str(self.state),
+                     '--output', str(self.bundle)]
+        with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(admin_secrets, 'configure') as configure,
+              redirect_stdout(StringIO()) as output):
+            self.assertEqual(deploy.main(), 0)
+        configure.assert_called_once_with(self.settings)
+        self.assertEqual(output.getvalue().splitlines()[0], 'secrets: saving encrypted credentials')
+        self.assertEqual(self.previous_output(output.getvalue(), 'secrets'), '')
+
+    def test_gate_trial_command_prints_progress_around_the_trial(self) -> None:
+        arguments = ['deploy.py', 'gate-trial', '--base', 'base', '--changed', 'changed', '--modules', 'fixture/test_ok.py']
+        with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(gate_trial, 'main', return_value=0) as trial,
+              redirect_stdout(StringIO()) as output):
+            self.assertEqual(deploy.main(), 0)
+        trial.assert_called_once_with(arguments[2:], conf.path('aws_target'), self.state)
+        self.assertEqual(output.getvalue().splitlines()[0], 'gate-trial: running the trial')
+        self.assertEqual(self.previous_output(output.getvalue(), 'gate-trial'), '')
+
     def commands(self, operation: str = '') -> list[dict[str, object]]:
         path = self.root / 'commands.jsonl'
         rows = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
@@ -787,113 +830,79 @@ sys.exit(7)
         subject.directory.mkdir()
         book = ledger.CostLedger(subject.directory)
         book.record_inventory(ledger.ResourceInventory(self.now - 1,
-            (ledger.PricedResource('gate-shared', aws_config.money('1')),), 'fixture', builder_removed=True))
-        _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+            (ledger.PricedResource('gate-shared', aws_config.money('1')),
+             ledger.PricedResource('gate-image', aws_config.money('1.60'))), 'fixture', builder_removed=True))
         _ = (subject.directory / 'deployment.json').write_text(json.dumps({
             'stack_id': 'fixture-stack', 'stack': 'fixture-build'}))
         _ = (subject.directory / 'gate-deployment.json').write_text(json.dumps({
             'deployment_id': 'fixture', 'bucket': 'fixture-bucket', 'template': 'fixture-template',
-            'version': '1', 'security_group': 'fixture-group', 'revision': 'f' * 40, 'image': 'ami-fixture',
+            'version': '1', 'security_group': 'fixture-group', 'revision': 'f' * 40, 'image': 'ami-old',
             'subnets': [{'id': 'fixture-subnet', 'zone': 'fixture-zone'}]}))
-        def advance(seconds: float) -> None:
-            self.set_clock(self.now + max(1, int(seconds)))
-        subject.pause = advance
+        (subject.directory / 'gate-image').mkdir()
+        _ = (subject.directory / 'gate-image/image.json').write_text('{"image_id":"ami-old"}')
+        _ = (subject.directory / 'image.json').write_text('{"image_id":"ami-builder"}')
         fake = GateImageAws(failure)
         fake.manifest = subject.directory / 'gate-deployment.json'
         _ = self.enterContext(mock.patch.object(subject, '_api', return_value=aws_target.AwsCli(
             'fixture-admin', 'us-east-1', 1, execute=fake)))
         return subject, fake
 
-    def test_gate_image_dry_run_needs_no_credentials_and_writes_nothing(self) -> None:
+    def test_remove_gate_image_dry_run_needs_no_credentials_and_writes_nothing(self) -> None:
         self.credentials.unlink()
         before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
         with mock.patch.object(admin_secrets.AdminSecretSession, 'get') as credentials, redirect_stdout(StringIO()) as output:
-            self.assertTrue(self.deployment().gate_image())
+            self.assertTrue(self.deployment().remove_images())
         credentials.assert_not_called()
-        self.assertIn('gate-image --approve-resources', output.getvalue())
+        self.assertIn('remove-images --approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
-    def test_gate_image_reuses_tools_and_replaces_only_after_input_changes(self) -> None:
+    def test_remove_gate_image_switches_to_the_official_image_before_deleting_the_gate_image(self) -> None:
         subject, fake = self.gate_image_fixture()
-        with mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40) as revision:
-            with mock.patch.object(box, 'create_saved_image', wraps=box.create_saved_image) as create, redirect_stdout(StringIO()) as output:
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(create.call_count, 1)
-            self.assertIn('32 GiB; monthly snapshot estimate $1.60', output.getvalue())
-            self.assertTrue(fake.terminated)
-            self.assertNotIn('ami-old', fake.images)
-            self.assertNotIn('snap-old', fake.snapshots)
-            self.assertIn('ami-builder', fake.images)
-            self.assertIn('snap-builder', fake.snapshots)
-            operations = [args[args.index('--region') + 3] for args in fake.commands]
-            self.assertLess(operations.index('create-image'), operations.index('terminate-instances'))
-            self.assertLess(operations.index('terminate-instances'), operations.index('deregister-image'))
-            self.assertEqual(fake.images['ami-gate-1']['State'], 'available')
-            with mock.patch.object(gate_box, 'GUEST', 'changed gate code'), redirect_stdout(StringIO()):
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(len(fake.launches), 1)
-            path = self.root / 'cloud_gate.conf'
-            _ = path.write_text(path.read_text().replace('packages=git ', 'packages=hello git '))
-            with redirect_stdout(StringIO()):
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(len(fake.launches), 2)
-            self.assertNotIn('ami-gate-1', fake.images)
-            self.assertNotIn('snap-gate-1', fake.snapshots)
-            revision.return_value = 'e' * 40
-            with redirect_stdout(StringIO()):
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(len(fake.launches), 3)
-        manifest = remote.read_record(subject.directory / 'gate-deployment.json')
-        self.assertEqual(manifest['image'], 'ami-gate-3')
-        self.assertEqual(manifest['revision'], 'e' * 40)
-        self.assertEqual(manifest['version'], '4')
-        self.assertEqual(len(fake.gate_changes), 6)
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.remove_images(approve_destroy=True))
+        self.assertIn('remove-images: done; gates boot from the official image', output.getvalue())
+        manifest = remote.read_record(fake.manifest)
+        self.assertEqual((manifest['image'], manifest['version'], manifest['revision']), ('ami-fixture', '2', 'f' * 40))
+        self.assertEqual(len(fake.gate_changes), 2)
         for index, change in enumerate(fake.gate_changes):
             template = ledger.mapping(change['Template'])
             self.assertEqual(ledger.mapping(template['Resources'])['GateExpiryFunction'], {'live': 'keep'})
             image_policy = ledger.mapping(ledger.mapping(ledger.mapping(
                 ledger.mapping(template['Resources'])['GateScalerPolicy'])['Properties'])['PolicyDocument'])
             statements = ledger.rows(image_policy, 'Statement')
-            self.assertEqual(len(statements), 2 if index % 2 == 0 else 1)
-            if index % 2 == 0:
-                previous = 'ami-fixture' if index == 0 else 'ami-gate-' + str(index // 2)
-                self.assertEqual(statements[-1], {'Sid': 'GateImageTransition', 'Effect': 'Allow',
-                    'Action': ['ec2:RunInstances'], 'Resource': {
-                        'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/' + previous}})
-            else:
-                self.assertEqual(template, fake.live_template)
             rows = ledger.rows(change, 'Parameters')
             self.assertEqual(next(row for row in rows if row['ParameterKey'] == 'EnableCompute'),
                              {'ParameterKey': 'EnableCompute', 'UsePreviousValue': True})
             image_parameter = next(row for row in rows if row['ParameterKey'] == 'GateImage')
-            self.assertEqual(image_parameter, {'ParameterKey': 'GateImage', 'ParameterValue':
-                'ami-gate-' + str(index // 2 + 1)} if index % 2 == 0 else {
-                    'ParameterKey': 'GateImage', 'UsePreviousValue': True})
-        self.assertEqual(fake.launches[0]['ImageId'], 'ami-fixture')
-        data = ledger.text(fake.launches[0], 'UserData')
-        self.assertIn('cloud-gate-image-expiry', data)
-        self.assertNotIn('source.bundle', data)
-        self.assertNotIn('fixture-secret', data)
+            if index == 0:
+                self.assertEqual(statements[-1], {'Sid': 'GateImageTransition', 'Effect': 'Allow',
+                    'Action': ['ec2:RunInstances'], 'Resource': {
+                        'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/ami-old'}})
+                self.assertEqual(image_parameter, {'ParameterKey': 'GateImage', 'ParameterValue': 'ami-fixture'})
+            else:
+                self.assertEqual(len(statements), 1)
+                self.assertEqual(template, fake.live_template)
+                self.assertEqual(image_parameter, {'ParameterKey': 'GateImage', 'UsePreviousValue': True})
+        self.assertEqual(fake.launchable_images(), {'ami-fixture'})
+        operations = [args[args.index('--region') + 3] for args in fake.commands]
+        last_change = len(operations) - operations[::-1].index('execute-change-set') - 1
+        self.assertLess(last_change, operations.index('deregister-image'))
+        self.assertLess(operations.index('deregister-image'), operations.index('delete-snapshot'))
+        self.assertEqual((fake.images, fake.snapshots), ({}, {}))
+        self.assertFalse((subject.directory / 'gate-image').exists())
+        self.assertFalse((subject.directory / 'image.json').exists())
+        self.assertIn('no saved image remains', output.getvalue())
         inventories = ledger.CostLedger(subject.directory).read_snapshot().inventories
         self.assertTrue(inventories[-1].builder_removed)
-        self.assertEqual(inventories[-1].resources[-1], ledger.PricedResource('gate-image', aws_config.money('1.60')))
+        self.assertEqual(inventories[-1].resources, (ledger.PricedResource('gate-shared', aws_config.money('1')),))
+        # A second run finds nothing to change or delete.
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.remove_images(approve_destroy=True))
+        self.assertIn('remove-images: nothing to remove', output.getvalue())
+        self.assertEqual(len(fake.gate_changes), 2)
 
-    def test_gate_image_retries_activation_without_rebuilding_or_deleting_the_old_snapshot(self) -> None:
-        subject, fake = self.gate_image_fixture('activate')
-        with mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40), redirect_stdout(StringIO()):
-            with self.assertRaises(aws_target.AwsUnavailable):
-                _ = subject.gate_image(approve_resources=True)
-            self.assertTrue(fake.terminated)
-            self.assertIn('snap-old', fake.snapshots)
-            self.assertEqual(remote.read_record(subject.directory / 'gate-deployment.json')['image'], 'ami-fixture')
-            fake.failure = ''
-            self.assertTrue(subject.gate_image(approve_resources=True))
-        self.assertEqual(len(fake.launches), 1)
-        self.assertNotIn('snap-old', fake.snapshots)
-        self.assertEqual(remote.read_record(subject.directory / 'gate-deployment.json')['image'], 'ami-gate-1')
-
-    def test_gate_image_keeps_the_selected_image_launchable_when_publication_fails(self) -> None:
-        for failure in ('waiter', 'manifest', 'narrow waiter'):
+    def test_remove_gate_image_keeps_the_selected_image_launchable_when_a_step_fails(self) -> None:
+        for failure in ('activate', 'waiter', 'manifest', 'narrow waiter'):
             with self.subTest(failure=failure):
                 subject, fake = self.gate_image_fixture(failure)
                 atomic_write = write_text_atomic
@@ -901,90 +910,27 @@ sys.exit(7)
                     if path == fake.manifest and fake.failure == 'manifest':
                         raise OSError('fixture manifest write failure')
                     atomic_write(path, text)
-                with (mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40),
-                      mock.patch.object(deploy, 'write_text_atomic', side_effect=write), redirect_stdout(StringIO())):
+                with mock.patch.object(deploy, 'write_text_atomic', side_effect=write), redirect_stdout(StringIO()):
                     with self.assertRaises((aws_target.AwsUnavailable, OSError)):
-                        _ = subject.gate_image(approve_resources=True)
+                        _ = subject.remove_images(approve_destroy=True)
                     selected = ledger.text(remote.read_record(fake.manifest), 'image')
-                    self.assertEqual(selected, 'ami-gate-1' if failure == 'narrow waiter' else 'ami-fixture')
+                    self.assertEqual(selected, 'ami-fixture' if failure == 'narrow waiter' else 'ami-old')
                     self.assertIn(selected, fake.launchable_images())
-                    self.assertEqual(fake.image_parameter, 'ami-gate-1')
                     self.assertIn('snap-old', fake.snapshots)
+                    self.assertTrue((subject.directory / 'gate-image').exists())
                     fake.failure = ''
-                    self.assertTrue(subject.gate_image(approve_resources=True))
-                self.assertEqual(len(fake.launches), 1)
-                self.assertEqual(fake.launchable_images(), {'ami-gate-1'})
+                    self.assertTrue(subject.remove_images(approve_destroy=True))
+                self.assertEqual(fake.launchable_images(), {'ami-fixture'})
                 self.assertNotIn('snap-old', fake.snapshots)
-
-    def test_gate_image_keeps_the_selected_image_after_interrupted_record_promotion(self) -> None:
-        for stale_record_returns in (False, True):
-            with self.subTest(stale_record_returns=stale_record_returns):
-                subject, fake = self.gate_image_fixture('stale-' + str(stale_record_returns))
-                pending = subject.directory / 'gate-image/pending/image.json'
-                saved = subject.directory / 'gate-image/image.json'
-                original_unlink = Path.unlink
-                def interrupted_unlink(path: Path, missing_ok: bool = False) -> None:
-                    if path == pending:
-                        raise KeyboardInterrupt
-                    original_unlink(path, missing_ok=missing_ok)
-                with (mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40) as revision,
-                      redirect_stdout(StringIO())):
-                    with (mock.patch.object(Path, 'unlink', autospec=True, side_effect=interrupted_unlink),
-                          self.assertRaises(KeyboardInterrupt)):
-                        _ = subject.gate_image(approve_resources=True)
-                    self.assertEqual(remote.read_record(saved), remote.read_record(pending))
-                    self.assertTrue(fake.terminated)
-                    self.assertEqual(remote.read_record(fake.manifest)['image'], 'ami-fixture')
-                    self.assertTrue(subject.gate_image(approve_resources=True))
-                    self.assertFalse(pending.exists())
-                    self.assertEqual(len(fake.launches), 1)
-                    self.assertEqual(remote.read_record(fake.manifest)['image'], 'ami-gate-1')
-                    if stale_record_returns:
-                        write_text_atomic(pending, saved.read_text())
-                    revision.return_value = 'e' * 40
-                    fake.failure = 'prepare'
-                    with self.assertRaises(deploy.DeploymentRefused):
-                        _ = subject.gate_image(approve_resources=True)
-                self.assertEqual(len(fake.launches), 2)
-                self.assertTrue(fake.terminated)
-                self.assertEqual(remote.read_record(fake.manifest)['image'], 'ami-gate-1')
-                self.assertIn('ami-gate-1', fake.images)
-                self.assertIn('snap-gate-1', fake.snapshots)
-                self.assertEqual(remote.read_record(saved)['image_id'], 'ami-gate-1')
-                self.assertFalse(pending.exists())
-                self.assertEqual(fake.launchable_images(), {'ami-gate-1'})
-
-    def test_gate_image_terminates_the_box_on_failure_timeout_and_interruption(self) -> None:
-        self.replace('gate_image_timeout_s', '60')
-        for failure in ('prepare', 'timeout', 'create', 'image', 'image timeout', 'image interrupt', 'lost launch', 'interrupt'):
-            with self.subTest(failure=failure):
-                subject, fake = self.gate_image_fixture(failure)
-                manifest = remote.read_record(fake.manifest)
-                manifest['image'] = 'ami-old'
-                write_text_atomic(fake.manifest, json.dumps(manifest))
-                fake.image_parameter = 'ami-old'
-                with (mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40),
-                      self.assertRaises((deploy.DeploymentRefused, aws_target.AwsUnavailable,
-                                         subprocess.TimeoutExpired, KeyboardInterrupt)), redirect_stdout(StringIO())):
-                    _ = subject.gate_image(approve_resources=True)
-                self.assertEqual(len(fake.launches), 1)
-                self.assertTrue(fake.terminated)
-                self.assertFalse((subject.directory / 'gate-image/image.json').exists())
-                self.assertIn('ami-old', fake.images)
-                self.assertIn('snap-old', fake.snapshots)
-                self.assertNotIn('ami-gate-1', fake.images)
-                self.assertNotIn('snap-gate-1', fake.snapshots)
-                self.assertFalse((subject.directory / 'gate-image/pending/image.json').exists())
-                self.assertIn('ami-builder', fake.images)
-                self.assertIn('snap-builder', fake.snapshots)
-                reservations = ledger.CostLedger(subject.directory).read_snapshot().gate_reservations
-                self.assertIsInstance(reservations[-1].state, ledger.GateTerminated)
+                self.assertFalse((subject.directory / 'gate-image').exists())
 
     def gate_fixture(self, change: str = 'GateBucket') -> tuple[deploy.Deployment, list[list[str]]]:
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
-        _ = (self.root / 'cloud_gate.conf').write_bytes(
-            (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        # The fixture keeps two sizes, so the shipped type list can change without these cases.
+        shipped = (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_text()
+        _ = (self.root / 'cloud_gate.conf').write_text(
+            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
         commands: list[list[str]] = []
         outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
                    'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role'}
@@ -1016,6 +962,25 @@ sys.exit(7)
         _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
         _ = self.enterContext(mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
         return subject, commands
+
+    def test_gate_stack_updates_print_named_start_and_done_lines(self) -> None:
+        image_titles = ('switching gates to the official image', 'removing the old image permission')
+        for command, titles in (('up', ('updating the stack',)), ('remove-images', image_titles)):
+            with self.subTest(command=command):
+                if command == 'up':
+                    subject, _ = self.gate_fixture()
+                    with redirect_stdout(StringIO()) as output:
+                        self.assertTrue(subject.gate_up(approve_resources=True))
+                else:
+                    subject, _ = self.gate_image_fixture()
+                    with redirect_stdout(StringIO()) as output:
+                        self.assertTrue(subject.remove_images(approve_destroy=True))
+                lines = output.getvalue().splitlines()
+                for title in titles:
+                    progress = [line for line in lines if line.startswith(f'{command}: {title}')]
+                    self.assertEqual(len(progress), 2)
+                    self.assertEqual(progress[0], f'{command}: {title} (can take several minutes)')
+                    self.assertRegex(progress[1], '^' + re.escape(f'{command}: {title}') + r' done in \d+ s$')
 
     def test_gate_deployment_preserves_rust_parameters_and_records_scoped_resources(self) -> None:
         subject, commands = self.gate_fixture()
@@ -1154,10 +1119,11 @@ sys.exit(7)
         call = api.call
         for error in (ValueError('cleanup value error'), OSError('cleanup OS error')):
             with self.subTest(error=type(error).__name__):
-                def fail_delete(operation: str, *arguments: str, service: str = 'ec2') -> dict[str, object]:
+                def fail_delete(operation: str, *arguments: str, service: str = 'ec2',
+                                timeout_s: float | None = None) -> dict[str, object]:
                     if operation == 'delete-change-set':
                         raise error
-                    return call(operation, *arguments, service=service)
+                    return call(operation, *arguments, service=service, timeout_s=timeout_s)
                 with (mock.patch.object(subject, '_api', return_value=api),
                       mock.patch.object(api, 'call', side_effect=fail_delete),
                       mock.patch.object(subject, '_before_request', side_effect=deploy.DeploymentRefused('original spending refusal'))):
@@ -1669,7 +1635,7 @@ sys.exit(7)
         self.assertEqual(self.commands(), [])
         result = ledger.mapping(remote.read_record(self.state / 'up.json')['up'])
         self.assertEqual(result['status'], 'refused')
-        self.assertEqual(output, 'up: refused: ' + str(result['reason']) + '\n')
+        self.assertEqual(self.previous_output(output, 'up'), 'up: refused: ' + str(result['reason']) + '\n')
 
     def test_up_creates_each_stage_and_the_second_run_only_checks_live_state(self) -> None:
         _ = self.credentials.write_text('[unrelated]\naws_access_key_id=other-key\naws_secret_access_key=other-value\n')
@@ -1677,7 +1643,7 @@ sys.exit(7)
         settings = self.settings.read_bytes()
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
-        self.assertEqual(output.splitlines(), ['price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
+        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
         commands = self.commands()
         operations = [cast(list[str], row['args'])[5] for row in commands]
         self.assertLess(operations.index('describe-spot-price-history'), operations.index('deploy'))
@@ -1689,7 +1655,7 @@ sys.exit(7)
         before = len(self.commands())
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
-        self.assertEqual(output.splitlines(), ['price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
+        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
         later = self.commands()[before:]
         self.assertEqual(sum('describe-spot-price-history' in cast(list[str], row['args']) for row in later), 1)
         for row in later:
@@ -1745,7 +1711,7 @@ else: raise AssertionError(args)
                 return policy(method, endpoint, body, headers, timeout)
             raise AssertionError((method, endpoint))
         _ = cast(object, self.enterContext(mock.patch.object(box, 'tailnet_request', side_effect=tailnet)))
-        _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'state_paths', return_value=mac_test.StatePaths(self.state, 'aws'))))
+        _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         return devices
 
     def join_fixture(self, devices: dict[str, object], arguments: Sequence[str], key: str,
@@ -1787,9 +1753,9 @@ else: raise AssertionError(args)
         subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=clock, notify=lambda _event: True)
         original_setup = box.BoxSetup
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
-                  admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
+                  admin: admin_secrets.AdminSecretSession, tailnet: box.TailnetTransport) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=tailnet,
                                   session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -1911,6 +1877,25 @@ else: raise AssertionError(args)
         before_commands = len(self.commands())
         with redirect_stdout(StringIO()) as output:
             self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
+        labels = ['checking the deployment', 'disabling builder routing', 'removing the builder from Tailscale',
+                  'updating the stack', 'deleting builder storage',
+                  'deleting local builder records']
+        plain = ['remove-builder: ' + label for label in labels]
+        starts = [line + ' (can take several minutes)' if label == 'updating the stack' else line
+                  for label, line in zip(labels, plain)]
+        self.assertEqual([line for line in output.getvalue().splitlines() if line in starts], starts)
+        progress = [line for line in output.getvalue().splitlines()
+                    if line in starts or any(line.startswith(start + ' done in ') for start in plain)]
+        self.assertEqual(len(progress), len(starts) * 2)
+        self.assertEqual([line for line in output.getvalue().splitlines()
+                          if line.startswith('remove-builder: ') and not line.startswith('remove-builder: done;')], progress)
+        self.assertEqual(self.previous_output('\n'.join(progress), 'remove-builder'), '')
+        print('\n'.join(progress))
+        private = ('i-fixture', 'vol-', '123456789012', 'arn:', 'device-', 'fixture-bucket',
+                   '100.64.', 'fixture-admin-secret', 'fixture-oauth-secret')
+        for value in private:
+            self.assertNotIn(value, '\n'.join(line for line in output.getvalue().splitlines()
+                                               if line.startswith('remove-builder: ')))
         self.assertIn('gate-deployment.json kept', output.getvalue())
         self.assertEqual(self.settings.read_bytes(), settings)
         self.assertEqual(self.credentials.read_bytes(), credentials)
@@ -2006,6 +1991,7 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
+        self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()
         with self.credentials.open('a') as handle:
@@ -2042,7 +2028,7 @@ else: raise AssertionError(args)
         before_service = (self.root / 'systemctl-commands').read_text()
         success, output = self.down_output()
         self.assertTrue(success, output)
-        self.assertTrue(all(line.endswith(': present') for line in output.splitlines()), output)
+        self.assertTrue(all(line.endswith(': present') for line in self.previous_output(output, 'down').splitlines()), output)
         later = [cast(list[str], row['args'])[5] for row in self.commands()[before_commands:]]
         self.assertFalse(any(operation.startswith(('delete-', 'update-')) for operation in later))
         self.assertNotIn('disable', (self.root / 'systemctl-commands').read_text()[len(before_service):])
@@ -2140,9 +2126,9 @@ else: raise AssertionError(args)
             self.replace(key, value)
         original_setup = box.BoxSetup
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
-                  admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
+                  admin: admin_secrets.AdminSecretSession, tailnet: box.TailnetTransport) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=tailnet,
                                   session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -2295,9 +2281,9 @@ else: raise AssertionError(args)
             self.replace(key, value)
         original_setup = box.BoxSetup
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
-                  admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
+                  admin: admin_secrets.AdminSecretSession, tailnet: box.TailnetTransport) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=tailnet,
                                   monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -2821,11 +2807,11 @@ else: raise AssertionError(args)
         self.assertNotIn('AccessKey', json.dumps(template))
         self.assertNotIn('mkfs', json.dumps(template))
 
-    def test_repository_configuration_enables_approved_aws_control_and_exchange(self) -> None:
+    def test_repository_configuration_keeps_aws_settings_without_registering_the_builder(self) -> None:
         root = Path(__file__).resolve().parents[2]
         self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'on')
         self.assertEqual(conf.read(root / 'config/build_targets.conf').text('targets').split(','),
-                         ['mac', 'natedev', 'aws'])
+                         ['mac', 'natedev'])
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -3136,7 +3122,11 @@ else: raise AssertionError(args)
         source = self.settings.read_text().replace('# range: 0.001..\nidle_stop_minutes=',
                                                    '# range: 10..20\nidle_stop_minutes=')
         _ = self.settings.write_text(source)
-        self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
+        reads = self.root / 'config-reads'
+        _ = reads.write_text('')
+        with conf_reads.record_reads(reads):
+            self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
+        self.assertEqual(reads.read_text().splitlines(), [self.settings.stem] * 2)
 
     def fake_commands(self, source: str, *names: str) -> None:
         for name in names:

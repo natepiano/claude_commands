@@ -26,7 +26,8 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.herdr import herdr  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
+from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.message import codex_daemon  # noqa: E402
 from scripts.message import process_table  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -264,7 +265,7 @@ class RosterEntry:
     session: ClaudeSession | NoClaudeSession = NoClaudeSession()
     account: AccountAttribution = AccountUnread("not read")
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
-    pane: herdr.HerdrPlace | NoHerdrPane = NoHerdrPane()
+    pane: HerdrPlace | NoHerdrPane = NoHerdrPane()
 
 
 @dataclass(frozen=True)
@@ -449,7 +450,7 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
         daemon=({"home": str(entry.daemon.home), "socket": str(entry.daemon.socket)}
                 if isinstance(entry.daemon, codex_daemon.CodexDaemon) else {}),
         pane=({"session": entry.pane.session, "pane": entry.pane.pane}
-              if isinstance(entry.pane, herdr.HerdrPlace) else {}),
+              if isinstance(entry.pane, HerdrPlace) else {}),
     )
 
 
@@ -524,11 +525,11 @@ def _decode_entry(value: object) -> RosterEntry:
     attributed = (_decode_state(values["account"]) if "account" in values
                   else AccountAttributionUnavailable("peer sent no account"))
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
-    pane: herdr.HerdrPlace | NoHerdrPane = NoHerdrPane()
+    pane: HerdrPlace | NoHerdrPane = NoHerdrPane()
     if "pane" in values:
         place = _snapshot_object(values["pane"])
         if place:
-            pane = herdr.HerdrPlace(_snapshot_string(place, "session"), _snapshot_string(place, "pane"))
+            pane = HerdrPlace(_snapshot_string(place, "session"), _snapshot_string(place, "pane"))
     if "daemon" in values:
         owner = _snapshot_object(values["daemon"])
         if owner:
@@ -1229,7 +1230,7 @@ def _unit_workers(
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=_codex_home_account(backend.codex_home) if isinstance(backend, staff.CodexBackend)
                         else AccountUnread("worker account not read")))
-    except (OSError, ValueError, herdr.HerdrFailure, ProductionDocumentRefused) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused) as error:
         _problem(problems, "pane workers", error)
     for run in runs:
         try:
@@ -1279,15 +1280,17 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                        worker_threads: Iterable[str] = ()) -> Roster:
     """Use the reported session or the pane process to address Codex."""
+    from scripts.herdr import herdr
+
     entries: list[RosterEntry] = []
     problems: list[str] = []
     try:
         sessions = herdr.live_sessions()
-    except herdr.HerdrMissing as error:
+    except herdr_types.HerdrMissing as error:
         for production in productions:
             _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         _problem(problems, "herdr sessions", error)
         for production in productions:
             _problem(problems, f"unit hosts for {production} were not read", error)
@@ -1301,7 +1304,7 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
         name = session["name"]
         try:
             agents = worker_panes.agent_inventory(herdr.Herdr(name))
-        except herdr.HerdrFailure as error:
+        except herdr_types.HerdrFailure as error:
             _problem(problems, f"herdr session {name}", error)
             continue
         for agent in agents:
@@ -1316,9 +1319,9 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                 try:
                     thread = CodexThread(herdr.Herdr(name).native_pane_process(
                         pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity)
-                except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                     pass
-            process = codex_processes.get(herdr.HerdrPlace(name, pane))
+            process = codex_processes.get(HerdrPlace(name, pane))
             if process is not None and process.marks.get("CODEX_THREAD_ID", "") in worker_threads:
                 continue
             entries.append(RosterEntry(
@@ -1326,8 +1329,8 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                 name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
                 reach=(Messageable(f"codex:{thread.thread_id}") if isinstance(thread, CodexThread)
                        else CannotReceiveMessages("interactive Codex in a herdr pane")),
-                thread=thread, pane=herdr.HerdrPlace(name, pane),
-                cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
+                thread=thread, pane=HerdrPlace(name, pane),
+                cwd=cwds.get(HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
                 account=_process_account(process.pid, "codex") if process else AccountUnread("pane process not found"),
             ))
@@ -1360,7 +1363,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     )
     runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
-    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
+    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems, record=membership)
     workers = _ledger_workers(runs, records, problems, membership)
     production_places: dict[str, _ProductionPlace] = {}
     try:

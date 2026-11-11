@@ -11,6 +11,7 @@ from scripts.build_queue import snapshot_codec as codec
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
+    from scripts.build_queue import placement
 else:
     class _DeferredAdmissionRecords:
         """Load domain types when an annotation or a default needs them."""
@@ -21,7 +22,16 @@ else:
 
     records = _DeferredAdmissionRecords()
 
-VERSION = 2
+    class _DeferredPlacement:
+        """Load placement types only for version 3 messages."""
+
+        def __getattr__(self, name: str) -> object:
+            from scripts.build_queue import placement
+            return cast(object, getattr(placement, name))
+
+    placement = _DeferredPlacement()
+
+VERSION = 3
 
 
 def _no_test_width() -> records.NoTestWidth:
@@ -286,21 +296,88 @@ class BuildHistoryReply:
     generation: int
 
 
-Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
-           | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest)
+@dataclass(frozen=True)
+class PlacementRequest(CallerCode):
+    episode: str
+    owner: placement.SubmittingOwner
+    since: float
+    profile: records.StepProfile | records.ProgramProfile
+    constraints: placement.PlacementConstraints
 
-Reply = Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+
+@dataclass(frozen=True)
+class ClaimFailure(CallerCode):
+    request_id: str
+    assignment: placement.PlacementAssignment
+    reason: str
+
+
+@dataclass(frozen=True)
+class ConsumePermission(CallerCode):
+    request_id: str
+    assignment: placement.PlacementAssignment
+    claim: placement.ProviderClaimReference
+
+
+@dataclass(frozen=True)
+class ExecutionReport(CallerCode):
+    request_id: str
+    assignment: placement.PlacementAssignment
+    claim: placement.ProviderClaimReference
+    evidence: placement.ExecutionEvidence
+    outcome: str = ""
+
+
+@dataclass(frozen=True)
+class PlacementWait:
+    episode: str
+    since: float
+    position: int
+    eligibility: tuple[placement.CandidateEligibility, ...]
+
+
+@dataclass(frozen=True)
+class Assignment:
+    assignment: placement.PlacementAssignment
+
+
+@dataclass(frozen=True)
+class FirstAuthorization:
+    assignment: placement.PlacementAssignment
+    claim: placement.ProviderClaimReference
+
+
+@dataclass(frozen=True)
+class DispatchStatus:
+    assignment: placement.PlacementAssignment | placement.UnknownAssignment
+    state: placement.AssignmentState
+    permission: placement.LaunchPermission | placement.NoLaunchPermission
+    reason: str = ""
+
+
+Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+           | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
+           | PlacementRequest | ClaimFailure | ConsumePermission | ExecutionReport)
+
+Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+         | PlacementWait | Assignment | FirstAuthorization | DispatchStatus)
 
 _REQUESTS: dict[str, type] = {
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
+    "placement": PlacementRequest, "claim_failure": ClaimFailure,
+    "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
 }
 REPLY_TYPES: dict[str, type] = {
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
+    "placement_wait": PlacementWait, "assignment": Assignment,
+    "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
 }
+_PLACEMENT_TYPES = (PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport,
+                    PlacementWait, Assignment, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 
 
@@ -353,6 +430,8 @@ def encode_envelope(value: object, variants: dict[str, type], version: int = VER
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
+    if version < 3 and type(value) in _PLACEMENT_TYPES:
+        raise ValueError("placement requires version 3")
     data = _write_wire_record(codec.snapshot_value(value))
     return encode_record({"v": version, "type": name, "data": data}) + "\n"
 
@@ -370,6 +449,8 @@ def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, o
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
         data = envelope["data"]
+        if version < 3 and variants[name] in _PLACEMENT_TYPES:
+            raise ValueError("placement requires version 3")
         return version, cast(object, _parse_value(data, variants[name]))
     except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error

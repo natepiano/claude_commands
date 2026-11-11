@@ -20,9 +20,10 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test import claim_state, linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -126,7 +127,7 @@ if tool == "hostname":
 if tool == "rm":
     if os.environ.get("FAKE_RM_FAIL") == "1" and any(argument.endswith("/target") for argument in arguments):
         raise SystemExit(9)
-    os.execv("/bin/rm", ["rm", *arguments])
+    os.execv(os.environ["TEST_REAL_RM"], ["rm", *arguments])
 raise SystemExit("Unexpected fake tool: " + tool)
 '''
 
@@ -188,8 +189,13 @@ class LinuxShellTests(unittest.TestCase):
                 Path(__file__).resolve().parents[1] / folder, target_is_directory=True)
         self.permission_directory = seed_runner_permission(self.root, self.settings, self.permission_at, "fixture-boot")
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
+        real_rm = shutil.which("rm")
+        if real_rm is None:
+            self.fail("The fixture needs the rm executable")
         self.environment = {
+            **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
+            "TEST_REAL_RM": real_rm,
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
             "CONF_DIR": str(self.root),
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
@@ -279,6 +285,54 @@ class LinuxShellTests(unittest.TestCase):
         events = self.events("lint")
         self.assertTrue(events, result.stdout + result.stderr)
         return events[-1]
+
+    def test_step_removes_only_old_abandoned_sessions_before_building(self) -> None:
+        minutes = offload.read_config(self.settings).abandoned_session_minutes
+        cases: tuple[tuple[str, int, bool, tuple[str, ...]], ...] = (
+            ("debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("aarch64-unknown-linux-gnu/debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("debug/incremental/crate/s-new-working", 0, True, ()),
+            ("aarch64-unknown-linux-gnu/debug/incremental/crate/s-new-working", 0, True, ()),
+            ("debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            ("aarch64-unknown-linux-gnu/debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            *((f"debug/{name}/incremental/crate/s-old-working", minutes + 2, True, ())
+              for name in ("deps", "build", ".fingerprint", "examples")),
+            ("deep/triple/debug/incremental/crate/s-old-working", minutes + 2, True, ()),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir", "other-target")),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir=other-target",)),
+            ("", 0, False, ()),
+        )
+        target = self.mirror / "target"
+        for relative, age, keep, words in cases:
+            for status in (0, 42):
+                with self.subTest(session=relative, words=words, status=status):
+                    shutil.rmtree(target, ignore_errors=True)
+                    session = target / relative
+                    lock = session.with_name(session.name.removesuffix("-working") + ".lock")
+                    if relative:
+                        session.mkdir(parents=True)
+                        _ = (session / "compiler-output").write_text("session data")
+                        _ = lock.write_text("session lock")
+                        modified = time.time() - age * 60
+                        os.utime(session, (modified, modified))
+                        os.utime(lock, (modified, modified))
+                    self.environment["FAKE_LINT_STATUS"] = str(status)
+                    previous_steps = len(self.events("lint"))
+
+                    result = self.execute(self.request(words=words))
+
+                    self.assertEqual((result.returncode, result.stderr), (status, ""), result.stdout)
+                    self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("mac_")],
+                                     [f"mac_exit={status}", "mac_cleanup=kept"])
+                    self.assertEqual(len(self.events("lint")), previous_steps + 1)
+                    build_target = self.mirror / "other-target" if words else target
+                    self.assertEqual((build_target / "warm-proof").read_text(), "warm\n")
+                    if relative:
+                        self.assertEqual(session.exists(), keep)
+                        self.assertEqual(lock.exists(), keep)
+                        if keep:
+                            self.assertEqual((session / "compiler-output").read_text(), "session data")
+                            self.assertEqual(lock.read_text(), "session lock")
 
     def test_shell_inputs_exclude_source_build_files_and_private_files(self) -> None:
         self.write_input("target/large-build", "build fixture\n")
@@ -1864,6 +1918,7 @@ class LinuxDispatchTests(unittest.TestCase):
         with redirect_stdout(output):
             status = mac_test.command_claim(args, mac_test.state_paths(args.target))
         self.actions.append(f"claim:{status}")
+        self.controller.claim_identity = claim_state.reply_claim_identity(output.getvalue())
         attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, output.getvalue(), ""))
 
     def capture(self, arguments: Sequence[str],

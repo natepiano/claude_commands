@@ -18,6 +18,7 @@ import time
 from types import FrameType
 from typing import cast, override
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_start_test_support import process_reader
@@ -28,7 +29,7 @@ from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.mac_test import mac_test, offload
+from scripts.mac_test import claim_state, mac_test, offload
 from scripts.build_hold import build_hold
 from scripts.build_targets import targets
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -131,7 +132,7 @@ class RepositorySlotTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "utc_now", return_value=datetime(2026, 11, 1, tzinfo=timezone.utc)))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.git_reply))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected child process")))
@@ -191,15 +192,26 @@ class RepositorySlotTests(unittest.TestCase):
             args.remote = f"fake-{target}"
         return args
 
-    def claim(self, target: str, worktree: Path, pid: int, remote: bool = False) -> tuple[int, str]:
+    def claim(self, target: str, worktree: Path, pid: int, remote: bool = False,
+              *, identity: bool = False,
+              request_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
+              ) -> tuple[int, str]:
         output = io.StringIO()
+        args = self.arguments(target, worktree, pid, remote)
+        args.identity = identity
+        if isinstance(request_identity, claim_state.ClaimIdentity):
+            args.claim_id, args.episode, args.attempt = request_identity.claim_id, request_identity.episode, request_identity.attempt
         with redirect_stdout(output):
-            status = mac_test.command_claim(self.arguments(target, worktree, pid, remote), mac_test.state_paths(target))
+            status = mac_test.command_claim(args, mac_test.state_paths(target))
         return status, output.getvalue()
 
     def release(self, target: str, pid: int) -> None:
         args = mac_test.CliArguments()
         args.target, args.pid = target, pid
+        claim = self.claims(target)[pid]
+        args.claim_id = cast(str, claim["claim_id"])
+        args.episode = cast(str, claim["episode"])
+        args.attempt = cast(str, claim["attempt"])
         self.assertEqual(mac_test.command_release(args, mac_test.state_paths(target)), 0)
 
     def claims(self, target: str) -> dict[int, dict[str, object]]:
@@ -338,12 +350,21 @@ class RepositorySlotTests(unittest.TestCase):
 
     def test_repeated_claim_preserves_its_occupied_slot(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
-        self.assertEqual(self.claim("aws", root, 101)[0], 0)
+        settings = self.root / "aws.conf"
+        _ = settings.write_text(settings.read_text().replace("slots=2", "slots=1"))
+        requested = claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-a")
+        self.assertEqual(self.claim("aws", root, 101, request_identity=requested)[0], 0)
         before = self.claims("aws")
 
-        self.assertEqual(self.claim("aws", root, 101)[0], 0)
+        self.assertEqual(self.claim("aws", root, 101, request_identity=requested)[0], 0)
 
         self.assertEqual(self.claims("aws"), before)
+        for other in (claim_state.ClaimIdentity("claim-b", "episode-a", "attempt-a"),
+                      claim_state.ClaimIdentity("claim-a", "episode-b", "attempt-a"),
+                      claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-b")):
+            with self.subTest(identity=other):
+                self.assertEqual(self.claim("aws", root, 101, request_identity=other)[0], 11)
+                self.assertEqual(self.claims("aws"), before)
 
     def test_takeover_keeps_the_remote_slot_until_cleanup(self) -> None:
         settings = self.root / "aws.conf"
@@ -353,7 +374,7 @@ class RepositorySlotTests(unittest.TestCase):
         before = self.claims("aws")[101]
         self.dead.add(101)
 
-        status, output = self.claim("aws", root, 102, remote=True)
+        status, output = self.claim("aws", root, 102, remote=True, identity=True)
 
         self.assertEqual(status, 13)
         answer = offload.read_claim_answer(offload.CommandOutput(status, output, ""))
@@ -382,7 +403,7 @@ class RepositorySlotTests(unittest.TestCase):
     def test_claim_answer_preserves_the_allocated_slot(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
         for pid in (101, 102):
-            status, output = self.claim("aws", root, pid)
+            status, output = self.claim("aws", root, pid, identity=True)
             answer = offload.read_claim_answer(offload.CommandOutput(status, output, ""))
 
             self.assertIsInstance(answer, offload.FreshMacClaim)
@@ -441,6 +462,7 @@ class RepositorySlotTests(unittest.TestCase):
         for output in ("claimed\nslot: 0\n", "claimed\nslot: -1\n", "claimed\nslot: x\n",
                        "claimed\nslot: 1\nslot: 2\n"):
             with self.subTest(output=output):
+                output += 'claim_identity={"claim_id":"claim-a","episode":"episode-a","attempt":"attempt-a"}\n'
                 answer = offload.read_claim_answer(offload.CommandOutput(0, output, ""))
                 self.assertIsInstance(answer, offload.MacClaimNotConfirmed)
 
@@ -457,6 +479,7 @@ class RepositorySlotTests(unittest.TestCase):
         path = paths.claims / ".claude.json"
         path.parent.mkdir(parents=True)
         _ = path.write_text(json.dumps({
+            "claim_id": "claim-a", "episode": "episode-a", "attempt": "attempt-a", "submitting_session": "",
             "pid": 101, "proc_start": "start-101", "worktree": str(root), "what": "legacy run",
             "since": "2026-11-01T00:00:00+00:00",
         }))
@@ -470,10 +493,12 @@ class RepositorySlotTests(unittest.TestCase):
         root = self.repository("project", "https://github.com/nate/project.git")
         self.assertEqual(self.claim("aws", root, 101, remote=True)[0], 0)
         self.dead.add(101)
-        status, output = self.claim("aws", root, 102, remote=True)
+        status, output = self.claim("aws", root, 102, remote=True, identity=True)
         self.assertEqual(status, 13)
 
-        repeated_status, repeated_output = self.claim("aws", root, 102, remote=True)
+        requested = claim_state.reply_claim_identity(output)
+        repeated_status, repeated_output = self.claim(
+            "aws", root, 102, remote=True, identity=True, request_identity=requested)
 
         self.assertEqual(repeated_status, 13)
         self.assertEqual(repeated_output, output)
@@ -605,7 +630,9 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(retained.get("repo_name"), before[101].get("repo_name"))
         self.assertEqual(retained.get("worktree"), str(old))
         self.assertIs(retained.get("cleanup_pending"), True)
-        self.assertEqual(self.claim("aws", source, 103, remote=True)[0], 13)
+        requested = claim_state.ClaimIdentity(cast(str, retained["claim_id"]),
+                                               cast(str, retained["episode"]), cast(str, retained["attempt"]))
+        self.assertEqual(self.claim("aws", source, 103, remote=True, request_identity=requested)[0], 13)
         self.assertEqual(self.claim("aws", source, 104, remote=True)[0], 11)
         self.assertEqual(self.claims("aws")[102], before[102])
 

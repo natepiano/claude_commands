@@ -15,3 +15,16 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py <argume
 
 Use `--family claude` for every precompute experiment save, threshold read, and comparison.
 Use `--where KEY=JSON` on `report`, `save` or `compare`; repeat it for more settings.
+
+Both machines cache parsed transcript events under `~/.cache/context_economy/`.
+Warm reads reuse unchanged files; appended files resume at the last complete line with their saved parser state.
+Append checks hash only the first 4 KiB and the last 4 KiB before the saved offset.
+A failed anchor, size, device, or inode check causes a full parse.
+The anchors assume append-only files and do not detect edits between the blocks.
+The report applies its time window after the cache read.
+Summaries survive file deletion and share one entry with the `.jsonl.zst` form.
+Compressed files without a summary use the shared zstd reader once.
+`cache_max_megabytes` in `config/context_economy.conf` bounds reproducible entries by least recent access.
+Entries whose plain source files are compressed or deleted remain protected from eviction.
+Long reads show file progress on stderr, including the Mac read.
+`progress_seconds` in the same config sets the update interval.

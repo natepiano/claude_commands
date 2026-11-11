@@ -3,21 +3,9 @@
 #
 # Usage: prepare_session.sh
 #
-# Produces:
-#   /tmp/claude/unit/<uuid>/   — unique session directory
-#   /tmp/claude/unit/active/<director-session-id>  — run-active marker
-#
-# Runs started before the rename keep /tmp/claude/delegate/ until they end; a
-# new run in the same Claude session replaces that session's marker there.
-#
-# The marker tells the Stop hook (stop-direct-continue.py) that this Claude
-# session is mid-run, so an approaching context limit cannot end the turn and
-# strand the run. end_session.sh removes it.
-#
-# First it removes every worker a dead run left alive (remove_workers.py), so a run
-# whose unit director died before its own cleanup never outlives the next start.
-#
-# Prints the session directory path to stdout (last line) for the caller to capture.
+# Creates a unique run folder under /tmp/claude/unit/.
+# Stores the run pointer in the director's staff row.
+# end_session.sh clears the run pointer when the run ends.
 
 set -euo pipefail
 
@@ -33,7 +21,14 @@ SESSION_DIR="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/build_folders.py"
 
 DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
 if [[ -n "${DIRECTOR_SESSION_ID}" ]]; then
-  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/unit_runs.py" activate "$SESSION_DIR" "$DIRECTOR_SESSION_ID"
+  if "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../production/staff.py" set-run "$DIRECTOR_SESSION_ID" "$SESSION_DIR"; then
+    :
+  else
+    RUN_POINTER_STATUS=$?
+    if (( RUN_POINTER_STATUS != 1 )); then
+      exit "${RUN_POINTER_STATUS}"
+    fi
+  fi
   "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../usage/agents_log.py" append --id "${DIRECTOR_SESSION_ID}" --role director || true
 fi
 

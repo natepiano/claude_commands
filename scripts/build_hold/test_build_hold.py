@@ -23,9 +23,11 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
 from scripts.build_hold import hold_enforcer
-from scripts.lib import unit_runs
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.message.sessions import SessionRecord
 
 from scripts.build_hold.build_hold_test_support import (
@@ -61,61 +63,46 @@ class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):
 
 
 class OwningSessionTests(IsolatedBuildHoldTest):
-    active: Path = Path()
     unit_run: Path = Path()
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.active = self.scratch / "active"
-        self.active.mkdir()
+        self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
         self.unit_run = self.scratch / "run"
 
-    def marker(self, session_id: str, run: Path) -> Path:
-        marker = self.active / session_id
-        _ = marker.write_text(str(run) + "\n")
-        return marker
+    def owner(self, session_id: str, run: Path) -> None:
+        row = fixture_member("showrunner", name="owner-" + session_id[:8], runtime_id=session_id)
+        _ = staff.set_run(row.id, staff.OpenRun(run))
 
-    def test_board_marker_wins_over_inherited_session_id(self) -> None:
-        _ = self.marker("run-owner", self.unit_run)
+    def test_staff_run_wins_over_inherited_session_id(self) -> None:
+        self.owner(fixture_runtime_id("run-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "stale-session",
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
     def test_board_directory_takes_priority_over_session_directory(self) -> None:
         other_run = self.scratch / "other-run"
-        _ = self.marker("board-owner", self.unit_run)
-        newer = self.marker("session-owner", other_run)
-        os.utime(newer, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
+        self.owner(fixture_runtime_id("board-owner"), self.unit_run)
+        self.owner(fixture_runtime_id("session-owner"), other_run)
         with mock.patch.dict(os.environ, {
             "UNIT_RUN_DIR": str(self.unit_run),
             "UNIT_SESSION_DIR": str(other_run),
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("board-owner"))
+            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("board-owner")))
 
-    def test_a_marker_under_either_run_folder_name_owns_the_run(self) -> None:
+    def test_a_staff_run_under_either_run_folder_name_owns_the_run(self) -> None:
         for name in ("unit", "delegate"):
-            active = self.scratch / name / "active"
-            active.mkdir(parents=True)
-            _ = (active / f"{name}-owner").write_text(f"{self.scratch / name / 'run'}\n")
-        environment = {name: value for name, value in os.environ.items() if name not in ("UNIT_ACTIVE_DIR", "PLAN_DELEGATE_ACTIVE_DIR")}
-        with mock.patch.object(unit_runs, "RUN_ROOT", self.scratch / "unit"), \
-                mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.scratch / "delegate"):
-            for name in ("unit", "delegate"):
-                environment["UNIT_RUN_DIR"] = str(self.scratch / name / "run")
-                with mock.patch.dict(os.environ, environment, clear=True):
-                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(f"{name}-owner"))
-
-    def test_marker_content_ignores_surrounding_whitespace(self) -> None:
-        marker = self.marker("run-owner", self.unit_run)
-        _ = marker.write_text(f" \t{self.unit_run}\n \t")
-        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+            identity = fixture_runtime_id(name + "-owner")
+            run = self.scratch / name / "run"
+            self.owner(identity, run)
+            with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}):
+                self.assertEqual(build_hold.owning_session(), OwningSession(identity))
 
     def test_session_directory_is_used_when_board_directory_is_unset_or_empty(self) -> None:
-        _ = self.marker("run-owner", self.unit_run)
+        self.owner(fixture_runtime_id("run-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"UNIT_SESSION_DIR": str(self.unit_run)}):
             for board_is_set in (False, True):
                 with self.subTest(board_is_set=board_is_set):
@@ -123,82 +110,45 @@ class OwningSessionTests(IsolatedBuildHoldTest):
                         os.environ["UNIT_RUN_DIR"] = ""
                     else:
                         _ = os.environ.pop("UNIT_RUN_DIR", None)
-                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
+                    self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
-    def test_no_matching_marker_falls_back_to_shell_session(self) -> None:
-        _ = self.marker("another-owner", self.scratch / "another-run")
+    def test_no_matching_staff_run_falls_back_to_shell_session(self) -> None:
+        self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "shell-session",
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+            self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
 
-    def test_no_run_uses_shell_session_without_marker_lookup(self) -> None:
-        _ = self.marker("another-owner", self.unit_run)
+    def test_run_resolution_names_the_owner_or_the_missing_run(self) -> None:
+        identity = fixture_runtime_id("run-owner")
+        self.owner(identity, self.unit_run)
+        missing = self.scratch / "missing-run"
+        cases: tuple[tuple[dict[str, str], build_hold.RunOwner | build_hold.NoRunNamed | build_hold.RunNotInStaff], ...] = (
+            ({"UNIT_RUN_DIR": str(self.unit_run)}, build_hold.RunOwner(identity)),
+            ({}, build_hold.NoRunNamed()),
+            ({"UNIT_RUN_DIR": str(missing)}, build_hold.RunNotInStaff(missing)),
+        )
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                self.assertEqual(build_hold.run_resolution(environment), expected)
+
+    def test_no_run_uses_shell_session_without_staff_lookup(self) -> None:
+        self.owner(fixture_runtime_id("another-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):
-            with mock.patch.object(Path, "iterdir", side_effect=AssertionError("No run needs no marker lookup")):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+            with mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("No run needs no staff read")):
+                self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
 
-    def test_no_matching_marker_and_no_shell_session_has_no_owner(self) -> None:
-        _ = self.marker("another-owner", self.scratch / "another-run")
+    def test_no_matching_staff_run_and_no_shell_session_has_no_owner(self) -> None:
+        self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
+            self.assertEqual(build_hold.owning_session(), NoOwningSession())
 
     def test_no_run_and_no_shell_session_has_no_owner(self) -> None:
-        self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
-
-    def test_newest_matching_marker_wins(self) -> None:
-        older = self.marker("z-earlier-owner", self.unit_run)
-        newer = self.marker("a-later-owner", self.unit_run)
-        _ = self.marker("other-run-owner", self.scratch / "other-run")
-        os.utime(older, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
-        os.utime(newer, ns=(1_100_000_000_000_000_000, 1_100_000_000_000_000_000))
-        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("a-later-owner"))
-
-    def test_missing_active_directory_is_skipped(self) -> None:
-        missing = self.scratch / "missing-active"
-        with mock.patch.dict(os.environ, {
-            "UNIT_ACTIVE_DIR": str(missing),
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
-        self.assertFalse(missing.exists())
-
-    def test_unreadable_active_directory_is_skipped(self) -> None:
-        with mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            with mock.patch.object(Path, "iterdir", side_effect=PermissionError("active directory denied")):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
-
-    def test_unreadable_marker_is_skipped(self) -> None:
-        _ = self.marker("run-owner", self.unit_run)
-        with mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            with mock.patch.object(Path, "read_text", side_effect=PermissionError("marker denied")):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
-
-    def test_invalid_marker_encoding_does_not_hide_readable_marker(self) -> None:
-        _ = (self.active / "invalid-marker").write_bytes(b"\xff")
-        _ = self.marker("run-owner", self.unit_run)
-        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("run-owner"))
-
-    def test_marker_subdirectories_are_skipped(self) -> None:
-        (self.active / "not-a-marker").mkdir()
-        with mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": str(self.unit_run),
-            "CLAUDE_CODE_SESSION_ID": "shell-session",
-        }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+        self.assertEqual(build_hold.owning_session(), NoOwningSession())
 
     def test_owner_results_are_frozen(self) -> None:
-        for owner in (build_hold.OwningSession("run-owner"), build_hold.NoOwningSession()):
+        for owner in (OwningSession(fixture_runtime_id("run-owner")), NoOwningSession()):
             with self.subTest(owner=type(owner).__name__):
                 with self.assertRaises(FrozenInstanceError):
                     setattr(owner, "session_id", "changed")
@@ -633,7 +583,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     [*arguments, "--target", "missing", "--holder", "alice"])
                 self.assertEqual(status, 2)
                 self.assertEqual((output + errors).splitlines(),
-                                 ["unknown target missing; configured targets: mac, natedev, aws"])
+                                 ["unknown target missing; configured targets: mac, natedev"])
                 self.assertEqual(calls, [])
                 self.assert_no_natedev_record()
 
@@ -997,21 +947,25 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
 
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            path = folder / "slot-one"
-            fields = cast(dict[str, object], json.loads(path.read_text()))
-            self.assertEqual(fields["holder"], "slot one")
-            self.assertEqual(fields["for"], "the focused test")
-            self.assertEqual(fields["release_eta"], "unknown")
-            self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
-            status = self.run_cli(folder, "status")
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertIn("slot one", status.stdout)
-            self.assertIn("the focused test", status.stdout)
-            self.assertIn("unknown", status.stdout)
+        for options in ((), ("--drain",)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as scratch, \
+                 mock.patch.object(hold_enforcer, "claimed_processes", return_value=frozenset()):
+                folder = Path(scratch)
+                result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test", *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                path = folder / "slot-one"
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(fields["holder"], "slot one")
+                self.assertEqual(fields["for"], "the focused test")
+                self.assertEqual(fields["release_eta"], "unknown")
+                self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
+                if options:
+                    self.assertEqual(result.stdout.splitlines()[-1], "drained")
+                status = self.run_cli(folder, "status")
+                self.assertEqual(status.returncode, 0, status.stderr)
+                self.assertIn("slot one", status.stdout)
+                self.assertIn("the focused test", status.stdout)
+                self.assertIn("unknown", status.stdout)
 
     def test_hold_message_tells_recipient_verify_waits_without_registering(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -1241,10 +1195,63 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
             with self.subTest(code=code):
                 result = subprocess.CompletedProcess([], code, "", "recipient refused")
                 with mock.patch.object(subprocess, "run", return_value=result):
-                    self.assertEqual(build_hold.send_release(entry, "/test/socket"), expected)
+                    self.assertEqual(build_hold.send_release(entry, "/test/socket", build_hold.RELEASE_NOTICE), expected)
         with mock.patch.object(subprocess, "run", side_effect=OSError("send unavailable")):
-            self.assertEqual(build_hold.send_release(entry, "/test/socket"),
+            self.assertEqual(build_hold.send_release(entry, "/test/socket", build_hold.RELEASE_NOTICE),
                              build_hold.ReleaseSendFailed("send unavailable"))
+
+        for record in ("current-cycle", "old-cycle", "multiple-holders", "recovered-cycle", "broadcast", "same-minute"):
+            with self.subTest(record=record), mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "TZ": "UTC"}):
+                texts: list[str] = []
+                starts = ((33, 0, "frame capture", "07:33:00"), (56, 0, "animation capture", "07:56:00"))
+                if record == "same-minute":
+                    starts = ((33, 0, "frame capture", "07:33:00"),
+                              (33, 20, "frame capture", "07:33:20"), (33, 40, "frame capture", "07:33:40"))
+                for minute, second, purpose, shown in starts:
+                    started = datetime(2026, 11, 11, 12, minute, second, tzinfo=timezone.utc)
+                    folder = self.scratch / "holders"
+                    _ = build_hold.start_hold(folder, build_hold.HolderIdentity("fps", "fps"), purpose,
+                                              build_hold.NoReleaseEta(), started)
+                    build_hold.record_recipients([("waiting session", "session-a")])
+                    cycle = build_hold.read_cycle()
+                    assert cycle is not None
+                    if record == "old-cycle":
+                        for holder in cycle["holders"].values():
+                            _ = holder.pop("purpose", None)
+                        build_hold.save_cycle(cycle)
+                    if record in ("multiple-holders", "recovered-cycle"):
+                        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("resources", "resources"),
+                                                  "render checks", build_hold.NoReleaseEta(), started + timedelta(minutes=1))
+                        _ = build_hold.release_cycle(folder, "fps")
+                    key = "resources" if record in ("multiple-holders", "recovered-cycle") else "fps"
+                    if record == "broadcast":
+                        (build_hold.release_directory() / "current").unlink()
+                    if record == "recovered-cycle":
+                        release = build_hold.release_hold
+
+                        def interrupt(directory: Path, holder: build_hold.Holder) -> str:
+                            _ = release(directory, holder)
+                            raise OSError("stopped after unlink")
+
+                        with mock.patch.object(build_hold, "release_hold", side_effect=interrupt), \
+                             self.assertRaisesRegex(OSError, "stopped after unlink"):
+                            _ = build_hold.release_cycle(folder, key)
+                        _ = (build_hold.release_directory() / cycle["id"] / "cycle.json").write_text("broken")
+                    with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
+                         mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as send:
+                        _ = build_hold.release_cycle(folder, key)
+                    send.assert_called_once()
+                    arguments = cast(list[str], send.call_args.args[0])
+                    notice = arguments[arguments.index("--all" if record == "broadcast" else "--text") + 1]
+                    texts.append(notice)
+                    if record == "old-cycle":
+                        self.assertIn(f"fps hold, from {shown} EST", notice)
+                    else:
+                        self.assertIn(f"fps hold for {purpose}, from {shown} EST", notice)
+                    if record in ("multiple-holders", "recovered-cycle"):
+                        self.assertIn(f"resources hold for render checks, from 07:{minute + 1}:00 EST", notice)
+                self.assertNotEqual(texts[0], texts[1])
+                self.assertEqual(len(set(texts)), len(texts))
 
 
     def test_empty_or_unavailable_socket_lookup_has_named_results(self) -> None:
@@ -1889,7 +1896,9 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         build_hold.record_recipients([("second waiter", "two")])
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            holder = "first" if entry["session_id"] == "one" else "second"
+            self.assertIn(f"{holder} hold for tests,", notice)
             sent.append(entry["session_id"])
             if sent == ["two", "one"]:
                 raise OSError("stopped while sending the earlier release")
@@ -2020,7 +2029,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         build_hold.record_recipients([("first", "one"), ("second", "two"), ("third", "three")])
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             sent.append(entry["session_id"])
             if sent == ["one", "two"]:
                 raise OSError("stopped after sending second notice")
@@ -2081,7 +2091,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             events.append("started" if cycle["release_started_at"] else "released")
             save(cycle)
 
-        def send(_entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(_entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders/holder").exists())
             self.assertIn("started", events)
             events.append("notice")
@@ -2131,7 +2142,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             self.assertIn("wait for release", build_hold.register_wait(session, session))
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders/holder").exists())
             sent.append(entry["session_id"])
             # Neither session acknowledges or reports that its turn ended.
@@ -2155,7 +2167,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         _ = build_hold.register_wait("two")
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders" / "holder").exists())
             self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
             sent.append(entry["session_id"])
@@ -2212,8 +2225,11 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertIn("new-holder", self.cycle()["holders"])
 
     def test_notice_says_builds_can_start_and_needs_no_answer(self) -> None:
-        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
-            _ = build_hold.send_release(build_hold.new_entry("one", "recipient"), "/test")
+        self.begin()
+        build_hold.record_recipients([("recipient", "one")])
+        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test")), \
+             mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            _ = build_hold.release_cycle(self.scratch / "holders", "holder")
         arguments = cast(list[str], run.call_args.args[0])
         notice = arguments[arguments.index("--text") + 1]
         self.assertIn("Start your builds", notice)
@@ -2402,29 +2418,31 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         (directory / "environ").unlink()
         (directory / "environ").mkdir()
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("nearer"))
+        self.assertEqual(build.owner, OwningSession("nearer"))
         self.assertEqual(build.classification, "other_session")
 
     def test_claude_ancestor_without_session_id_has_process_identity(self) -> None:
         _ = self.process(10, "claude")
         _ = self.process(20, "cargo", parent=10)
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("claude:10:100"))
+        self.assertEqual(build.owner, OwningSession("claude:10:100"))
 
     def test_worker_run_maps_to_owning_session_without_changing_environment(self) -> None:
-        active = self.scratch / "active"
-        active.mkdir()
-        _ = (active / "holder").write_text("/unit/run\n")
-        _ = self.process(10, "cargo", environment={"UNIT_RUN_DIR": "/unit/run", "UNIT_ACTIVE_DIR": str(active)})
+        with isolated_staff_file(self.scratch / "staff.json", {}):
+            owner = fixture_member("showrunner", name="holder")
+            _ = staff.set_run(owner.id, staff.OpenRun(Path("/unit/run")))
+        (self.holders / "holder").unlink()
+        _ = write_holder(self.holders, owner.current_session, "2026-10-28T12:00:00+00:00", "app test")
+        _ = self.process(10, "cargo", environment={"UNIT_RUN_DIR": "/unit/run"})
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("holder"))
+        self.assertEqual(build.owner, OwningSession(owner.current_session))
         self.assertEqual(build.classification, "holder")
         self.assertEqual(os.environ["UNIT_RUN_DIR"], "")
 
     def test_session_environment_precedes_worker_mapping(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "direct", "UNIT_RUN_DIR": "/unit/run"})
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("direct"))
+        self.assertEqual(build.owner, OwningSession("direct"))
 
     def test_second_holder_means_caller_does_not_hold_only_its_own(self) -> None:
         _ = write_holder(self.holders, "second", "2026-10-28T12:00:00+00:00", "app test")
@@ -2440,7 +2458,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
             _ = self.process(20, "cargo", parent=10, start=200)
             build, = self.builds()
         self.assertEqual(build.classification, "no_session")
-        self.assertEqual(build.owner, build_hold.NoOwningSession())
+        self.assertEqual(build.owner, NoOwningSession())
 
     def test_durable_grant_is_admitted_before_the_next_service_pass(self) -> None:
         fixture = self.admission_fixture

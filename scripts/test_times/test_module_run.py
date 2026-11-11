@@ -18,6 +18,7 @@ from typing import ClassVar, cast, override
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
@@ -285,7 +286,7 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
         _ = env.pop(key, None)
     temporary = root / f"{name}_temporary"
     temporary.mkdir()
-    env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+    env.update({**interpreter_cache_environment(root / "cache"), "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
                 "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONPATH": os.pathsep.join((str(root), str(folder))), "TMPDIR": str(temporary)})
     args = [f"{name}.test_fixture"]
@@ -331,6 +332,126 @@ class ModuleRunnerTests(unittest.TestCase):
             [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def test_config_reads_include_python_and_shell_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
+            config = root / "config"
+            config.mkdir()
+            for stem in ("alpha", "beta", "gamma"):
+                _ = (config / (stem + ".conf")).write_text("value=one\n")
+            repository = RUNNER.parents[2]
+            source = f"""import os, subprocess, sys, unittest
+from scripts.lib import conf
+conf.read('alpha').text('value')
+class Reads(unittest.TestCase):
+    def test_reads(self):
+        conf.read('alpha').text('value')
+        subprocess.run([sys.executable, '-c', "from scripts.lib import conf; conf.read('gamma').text('value')"],
+                       env={{**os.environ, 'PYTHONPATH': {str(repository)!r}}}, check=True)
+        subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
+                       {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
+"""
+            fixture = run_fixture(root, "config_reads", source)
+            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+            self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+
+    def test_folder_scans_record_repository_listings_and_skip_imports_and_children(self) -> None:
+        cases: tuple[tuple[str, str, list[str]], ...] = (
+            ("scandir", "with os.scandir(ROOT / 'listed') as entries: list(entries)", ["listed"]),
+            ("listdir", "os.listdir(ROOT / 'listed')", ["listed"]),
+            ("bytes", "os.listdir(os.fsencode(ROOT / 'listed'))", ["listed"]),
+            ("relative", "os.listdir('listed')", ["listed"]),
+            ("root", "os.listdir(ROOT)", ["."]),
+            ("read file", """(ROOT / 'listed/item.txt').read_text()
+with open(ROOT / 'listed/item.txt', 'rb') as source: source.read()
+descriptor = os.open(ROOT / 'listed/item.txt', os.O_RDONLY)
+try:
+    os.read(descriptor, 16)
+finally:
+    os.close(descriptor)""", []),
+            ("read outside", "(OUTSIDE / 'outside.txt').read_text()", []),
+            ("read config", "(ROOT / 'config/limits.conf').read_text()", []),
+            ("read cache", "(ROOT / '__pycache__/saved.bin').read_bytes()", []),
+            ("write modes", """for mode in ('a', 'w', 'r+'):
+    with open(ROOT / 'listed/item.txt', mode) as target: target.write('fixture')""", []),
+            ("child read", "subprocess.run([sys.executable, '-c', \"from pathlib import Path; Path('listed/item.txt').read_text()\"], cwd=ROOT, check=True)", []),
+            ("patch isolation", """listed = str(ROOT / 'listed')
+outside = str(OUTSIDE)
+with mock.patch.object(os.path, 'realpath', wraps=os.path.realpath) as realpath, \\
+     mock.patch.object(os.path, 'join', wraps=os.path.join) as join, \\
+     mock.patch.object(os.path, 'dirname', wraps=os.path.dirname) as dirname:
+    os.listdir(listed)
+    os.listdir(outside)
+    self.assertEqual(realpath.call_count, 0)
+    self.assertEqual(join.call_count, 0)
+    self.assertEqual(dirname.call_count, 0)""", ["listed"]),
+            ("listdir descriptor", """descriptor = os.open(ROOT / 'listed', os.O_RDONLY)
+try:
+    os.listdir(descriptor)
+finally:
+    os.close(descriptor)""", ["listed"]),
+            ("scandir descriptor", """descriptor = os.open(ROOT / 'listed', os.O_RDONLY)
+try:
+    with os.scandir(descriptor) as entries: list(entries)
+finally:
+    os.close(descriptor)""", ["listed"]),
+            ("outside removal", "shutil.rmtree(tempfile.mkdtemp(dir=OUTSIDE))", []),
+            ("git prefixes", "subprocess.check_output(['git', 'ls-files', '-z', '--', 'scripts/', 'commands/', 'docs/'], cwd=ROOT)",
+             ["commands/", "docs/", "scripts/"]),
+            ("git C", "subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '--', 'docs/'], cwd=OUTSIDE)", ["docs/"]),
+            ("git subdirectory", "subprocess.check_output(['git', '-C', str(ROOT / 'listed'), 'ls-files', '--', '../docs/'])", ["docs/"]),
+            ("git all", "subprocess.check_output(['git', 'ls-files'], cwd=ROOT)", ["/"]),
+            ("git root magic", "subprocess.check_output(['git', 'ls-files', '--', ':/docs'], cwd=ROOT)", ["/"]),
+            ("git empty magic", "subprocess.check_output(['git', 'ls-files', '--', ':'], cwd=ROOT)", ["/"]),
+            ("git exclude magic", "subprocess.check_output(['git', 'ls-files', '--', ':!docs'], cwd=ROOT)", ["/"]),
+            ("import system", "import import_only", []),
+            ("outside", "os.listdir(OUTSIDE)", []),
+            ("child", "subprocess.run([sys.executable, '-c', \"import os; os.listdir('listed')\"], cwd=ROOT, check=True)", []),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory)
+            root = outside / "checkout"
+            library = root / "scripts/lib"
+            library.mkdir(parents=True)
+            runner = root / "scripts/test_times/module_run.py"
+            runner.parent.mkdir()
+            _ = runner.write_text(RUNNER.read_text())
+            for name in ("conf_reads.py", "package_root.py"):
+                _ = (library / name).write_text((RUNNER.parents[1] / "lib" / name).read_text())
+            for package in (root / "scripts", library, root / "tests", root / "import_only"):
+                package.mkdir(exist_ok=True)
+                _ = (package / "__init__.py").write_text("")
+            for folder in ("listed", "commands", "docs"):
+                target = root / folder
+                target.mkdir()
+                _ = (target / "item.txt").write_text("fixture\n")
+            (root / "config").mkdir()
+            _ = (root / "config/limits.conf").write_text("value=fixture\n")
+            (root / "__pycache__").mkdir()
+            _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
+            _ = (outside / "outside.txt").write_text("fixture\n")
+            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(root),
+                           "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+            for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
+                _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
+                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+            for name, action, expected in cases:
+                with self.subTest(case=name):
+                    output = outside / "times.json"
+                    source = ("import os, shutil, subprocess, sys, tempfile, unittest\nfrom pathlib import Path\nfrom unittest import mock\n"
+                              + f"ROOT = Path({str(root)!r})\nOUTSIDE = Path({str(outside)!r})\n"
+                              + "class Listing(unittest.TestCase):\n    def test_listing(self):\n"
+                              + textwrap.indent(action, "        ") + "\n")
+                    _ = (root / "tests/test_listing.py").write_text(source)
+                    entry = "import runpy, sys; runpy.run_path(sys.argv.pop(1))['main']()"
+                    result = subprocess.run([sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
+                                            cwd=root, env={**environment, "TEST_TIMES_OUT": str(output)},
+                                            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(read_times(output).get("folder_scans"), expected)
+                    self.assertEqual(read_times(output).get("content_reads"), ["listed/item.txt"] if name == "read file" else [])
 
     def sender_fixture(self, mode: str) -> FixtureRun:
         with tempfile.TemporaryDirectory() as directory:

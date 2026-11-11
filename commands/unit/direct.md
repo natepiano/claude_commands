@@ -121,13 +121,13 @@ the director neither prepares style inputs nor pastes a style assignment.
 <LongLivedWorkers>
 Dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
+Use `worker.py list all` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
 The worker command selects idle workers and resumes a stopped worker in its same pane.
-Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
+Use the short name from `worker.py list all` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
 Successful prompt delivery returns the launcher.
 The transcript prevents replay and proves completion with the matching `DONE <dispatch id>` reply.
@@ -553,9 +553,8 @@ phase's gates pass. Follow its order through the next turn boundary.
 <PrepareSession>
 Run `bash ~/.claude/scripts/direct/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
-creates the run-active marker; every exit must
-eventually run `end_session.sh`
-through <RunSummary/> or single-mode completion.
+records the open run in the director's staff row.
+Run `end_session.sh` through <RunSummary/> or single-mode completion for every exit.
 
 When the plan header carries a `> **Issues:**` line, mark each issue it names
 as being built:

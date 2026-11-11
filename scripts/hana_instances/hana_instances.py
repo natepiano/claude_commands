@@ -175,7 +175,8 @@ def elapsed_seconds(value: str) -> float:
 
 
 def darwin_environment(pid: int) -> dict[str, str]:
-    from scripts.herdr.herdr import HerdrFailure, darwin_process_environment
+    from scripts.herdr.herdr import darwin_process_environment
+    from scripts.herdr.herdr_types import HerdrFailure
     try:
         return darwin_process_environment(pid)
     except HerdrFailure as error:

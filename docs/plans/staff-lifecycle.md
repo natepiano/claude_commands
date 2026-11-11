@@ -6,24 +6,34 @@ Every unit cuts its staff and lifecycle code to this page. A phase in this work 
 
 ## 1. The one record
 
-`~/.local/state/staff/staff.json` holds one row for each showrunner, unit and worker:
+`~/.local/state/staff/staff.json` holds one row for each showrunner, unit, worker, and producer:
 
 | Field | Meaning | Changes when |
 |---|---|---|
 | `id` | the first native session id | never |
 | `name` | the shown name | rename |
-| `kind` | showrunner, unit or worker | never |
+| `kind` | showrunner, unit, worker, or producer | explicit role conversion |
 | `parent` | the `id` of the row it reports to | transfer |
 | `current_session` | the native id that runs now | `/clear`, family switch |
-| `worktree` | machine and folder (a unit) | folder move, rename |
-| `doc` | machine and production doc (a showrunner) | doc move |
+| `worktree` | Machine and folder for a unit or producer. | Folder move, rename. |
+| `doc` | Machine and document for a showrunner or producer. | Document move. |
+| `home` | Account configuration folder. | Account selection or proved process evidence. |
+| `run` | The open run folder, or no run. | Run start, reopen, or finish. |
+| `paused` | The session pause state. | Pause or resume. |
+| `exited` | The session exit state. | Exit or resume. |
+
+A producer has no parent and can start a staff path.
+Morty, brain, and dwight use kind `producer`.
+Each keeps its own command under `commands/producer/` and its own job.
+The [staff contract](../as-built/staff-accessors.md#producer-rows-and-commands) defines the current producer rows.
 
 No other file, table, journal, ledger, roster, record or cache stores any of these facts.
+One exception: a pending producer admission record holds the reserved pane until staff admission and pane publication succeed.
 
 ## 2. Found, never stored
 
 1. Claude transcript or Codex thread: found by `current_session`.
-2. Family (Claude or Codex): the kind of session that `current_session` finds.
+2. Backend family: the native session that `current_session` identifies.
 3. Branch: `git -C <worktree> branch --show-current`.
 4. Pane: the herdr pane whose process runs `current_session`.
 5. Production: the `parent` chain.
@@ -31,12 +41,22 @@ No other file, table, journal, ledger, roster, record or cache stores any of the
 
 Displays (the herdr tab label, the Claude session title) show `name`. Rename sets them. No code reads them back.
 
+Producer launches select their family from `[producers]` in `config/models.conf`.
+The native session supplies evidence of the running backend.
+
 ## 3. The operations
 
 Each operation is a short list of plain steps. A rerun with nothing to change prints `unchanged`.
 
 1. **Stop:** stop each session found by `current_session`. Write nothing.
-2. **Start:** resume `current_session` in `worktree`. Claude: `claude --resume <id>`. Codex: thread resume by id, with cwd = `worktree`.
+2. **Start:** resume `current_session` in the staff folder through the shared resume path.
+   Claude uses `--resume <id>`.
+   Codex uses `resume <id>`.
+   Producers use their configured family, model, and effort from `[producers]` in `config/models.conf`.
+   Codex producers use the workers account; Claude producers use the showrunners account.
+   Each producer uses its own tab in `PRODUCER_WORKSPACE`, normally `producers`.
+   A configured producer without a row uses the shared first-admission path.
+   [Producer launch and admission](../as-built/shutdown-and-restart.md#producer-launch-and-admission) defines its reservation and identity checks.
 3. **Stop all, restart all** (user, 2026-10-08): one loop. Stop each live row, then start each.
 4. **Folder move:** stop the unit and its workers. Run `git worktree move`. Write `worktree`. Start each.
 5. **Rename** (user, 2026-11-04): write `name`. A same-name rename only sets the displays. A new name replaces the old name at the end of the folder name and the branch name; the prefix and the parent folder stay. Move the folder (step 4). Run `git branch -m`. Set the displays. A folder or branch that does not end with the old name prints one anomaly line and keeps its name.
@@ -84,5 +104,5 @@ User rule, 2026-11-04: "it should be impossible to start a worker in more than o
 - Native worker admission and pane operations implement worker start and reuse. The mesh command and its subcommands are removed.
 - `assign.sh` refuses when no live Claude or Codex process is in its parent chain (a `nohup`, `setsid` or `&` start).
 - The completion hook keeps the pass active while detached work remains. A result returns to the same native worker conversation.
-- `scripts/direct/test_one_launch_path.py` fails when a file outside the launcher starts or follows a worker.
+- `scripts/direct/test_one_launch_path_sources.py` fails when a file outside the launcher starts or follows a worker.
 - Worker panes (herdr-worker-panes decision 11) change what is behind `assign.sh`; they add no second way.

@@ -53,7 +53,8 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   A replacement uses the saved account and the current staff identity, name, and folder.
   A saved pane without a staff row uses its saved identity, account, and folder.
   Both routes send no opening prompt.
-  They preserve the saved model, Remote Control setting, and `disableAgentView`.
+  They preserve the saved Remote Control setting and `disableAgentView`.
+  Producers use the current `[producers]` model and effort; other sessions preserve the saved model.
   The launch-name reader supplies the current display name.
 - A replacement closes its source only after resume publication proves the new conversation.
   A source pane that gains another conversation or program stays open and prints an anomaly.
@@ -63,16 +64,16 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 - Before a power-off, run `agents stop --all`. It saves each local live staff row before its stop.
 - After login, run `agents restart`. Stop starts nothing.
 - `agents restart --all` uses the same selection and stop loop, then starts the selected rows.
-- The selection includes freestanding agents. A live session without a staff row prints one line and stays unsaved.
+- The selection includes producers. A live session without a staff row prints one line and stays unsaved.
 - `agents restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
 - Restart sends no work prompt and does not restore unrelated panes.
 - A restore takes focus only when that launch created a window
   (`WindowServerCreated`). After focusing that window, it closes untouched startup
   workspaces. Restoring into an existing server leaves focus and startup workspaces alone.
-- On natedev, `herdr-agents.service` is a transient unit created by `systemd-run`.
-  `systemctl --user list-unit-files` shows no herdr restore unit. No installed boot
-  unit runs `pane_restore.py`.
+- On natedev, `herdr-agents.service` is a transient unit that `systemd-run` creates.
+  The upkeep timer restores producers through shared resume.
+  It does not run `pane_restore.py`.
 - The herdr startup path adopts an answering server. Otherwise it starts one with
   `systemd-run` on Linux. On the Mac it starts the server directly from a desktop
   session, or opens an attach window to start it from a non-desktop session.
@@ -128,8 +129,46 @@ Settings entry for the user, one more SessionEnd item:
 
 ## Restore services
 
-- Automatic boot restore is not installed on either machine.
-- Layout saving and detection-rule refresh run in `herdr-upkeep`.
+`scripts/maintenance/herdr_upkeep.py` restores admitted producers through the shared resume path.
+`config/herdr_upkeep.toml` sets a 120-second interval and a 60-second run limit.
+
+Each upkeep run uses this order:
+
+1. Restore or adopt the shared herdr server.
+2. Save the shared layout.
+3. Refresh the detection rules.
+4. Resume each selected producer through `stop_resume.resume(str(row.id))`.
+
+`accounts.producer_upkeep_members()` reads the local staff snapshot.
+It selects active, local, unpaused producers from both families, without exit requests.
+Absent staff returns `()`.
+One `accounts.settings_report_scope()` covers the operation.
+Invalid producer settings exclude that producer and produce one warning per operation.
+
+Each producer has its own tab in the configured `PRODUCER_WORKSPACE`, normally `producers`.
+Resume uses its current conversation, current `[producers]` settings, and family account.
+A live producer starts nothing.
+A paused producer stays stopped.
+An exit request also excludes the producer from upkeep.
+Upkeep does not admit a configured name that has no staff row.
+The [first-start contract](shutdown-and-restart.md#producer-launch-and-admission) defines admission.
+
+A failed start, `ResumeFailed`, unknown session, or exception prints one stderr line for that producer.
+The loop continues with the other producers.
+The next upkeep run retries the failure without a stored failure record.
+The start order rotates by `int(time.time() // interval_seconds) % len(producers)`.
+Run spacing that repeats this remainder can repeat the same first producer.
+
+`run_job` passes the run deadline as `HERDR_UPKEEP_DEADLINE`.
+Each resume uses the earlier run deadline or `now + [shutdown] START_SECONDS`.
+At the run deadline, the loop prints `producer budget ended` and ends.
+The next run selects the remaining stopped producers again.
+
+After a herdr restart, upkeep restores missing producers through this same path.
+After a reboot, the timer provides the same recovery when the user service starts.
+On natedev, the NixOS upkeep module starts with a graphical login.
+Recovery before login requires `users.users.${username}.linger = true` and `nate.jobs.herdr-upkeep.needsDesktop = false`.
+No service automatically invokes the explicit `pane_restore.py` command for all saved panes.
 
 Claude launches write folder trust in the target account before the process starts.
 The write uses the repository trust key, or the folder itself outside a repository.

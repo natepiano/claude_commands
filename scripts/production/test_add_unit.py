@@ -5,19 +5,22 @@ from __future__ import annotations
 from scripts.production.staff_test_support import unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
 from scripts.lib import names
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 
 import io
 import json
 import os
 import shlex
+import socket
 import shutil
 import subprocess
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, tzinfo
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -51,6 +54,14 @@ from scripts.production import staff, unit_config
 from scripts.production.production_doc import Production, read_production
 
 class NativeClaudeUnitTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        registry = write_registry(Path.home() / ".claude/config/models.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+        })))
+
     def test_resume_uses_the_renamed_native_owner_for_arguments_and_tab(self) -> None:
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
@@ -68,16 +79,33 @@ class NativeClaudeUnitTests(StaffTestCase):
             identity=add_unit.UnitIdentity("saved-name", "saved-name"))
         from scripts.accounts.accounts import NamedAccount
 
-        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", return_value=
-              herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(LAUNCHED_AT))) as launch):
-            _ = add_unit.launch_session(request, add_unit.DirectorAgent("fixture", add_unit.DefaultEffort()),
-                "resume", NamedAccount("claude1", self.root))
-        arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
-        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
-        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
-        self.assertEqual(launch.call_args.args[2], "row-name")
-        self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
-        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in cast(dict[str, str], launch.call_args.args[4])))
+        caller = claude_catalog_environment(self.root / "caller-account", {"fable": "claude-fable-caller-fixture"})
+        selected = self.root / "selected-account"
+        _ = claude_catalog_environment(selected, {"fable": "claude-fable-selected-fixture"})
+        for director_model, saved_model, expected in (
+            ("fixture", "", "fixture"),
+            ("fable", "", "claude-fable-selected-fixture"),
+            ("fixture", "fable", "claude-fable-selected-fixture"),
+            ("fixture", "claude-fable-saved-fixture", "claude-fable-saved-fixture"),
+        ):
+            with (self.subTest(director=director_model, saved=saved_model), patch.dict(os.environ, caller),
+                  patch.object(herdr, "start_server"), patch.object(herdr, "open_tab", return_value="w1:p1"),
+                  patch.object(herdr.Herdr, "run_in_pane"),
+                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmitted(LAUNCHED_AT)) as start,
+                  patch.object(herdr, "launch_agent", wraps=herdr.launch_agent) as launch):
+                _ = add_unit.launch_session(request, add_unit.DirectorAgent(director_model, add_unit.DefaultEffort()),
+                    "resume", NamedAccount("claude1", selected), model=saved_model)
+            arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
+            started = cast(list[str], start.call_args.args[3])
+            self.assertEqual(started[started.index("--model") + 1], expected)
+            self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+            self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+            self.assertEqual(launch.call_args.args[2], "row-name")
+            environment = cast(dict[str, str], launch.call_args.args[4])
+            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(selected))
+            self.assertNotIn("STAFF_ID", environment)
+            self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in environment))
 
     def test_fresh_unit_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")
@@ -173,6 +201,59 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(prompts, ["/unit:direct docs/plans/given.md"])
         self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(stub.read_bytes(), source)
+
+    def test_name_only_uses_the_recorded_plan_and_explicit_plan_wins(self) -> None:
+        write_text_atomic(self.doc, self.doc.read_text() +
+                          "\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| alpha | docs/plans/given.md |\n")
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "record unit plan")
+        for flags in ((), ("--plan", "docs/plans/given.md")):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--check", *flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.servers_started(), [])
+
+    def test_hana_unit_without_a_port_gets_an_unused_port(self) -> None:
+        write_text_atomic(self.checkout / "crates/hana/Cargo.toml", '[package]\nname = "hana"\n')
+        _ = self.git("add", "crates/hana/Cargo.toml")
+        _ = self.git("commit", "-m", "record the Hana application")
+        with socket.socket() as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            occupied = cast(tuple[str, int], held.getsockname())[1]
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+            saved = unit_config.read(self.root / "project-alpha")
+            assert isinstance(saved, unit_config.UnitConfig)
+            self.assertIsInstance(saved.port, unit_config.AppPort)
+            assert isinstance(saved.port, unit_config.AppPort)
+            self.assertNotEqual(saved.port.number, occupied)
+
+    def test_hana_saved_config_without_a_port_gets_a_port_from_the_range(self) -> None:
+        from scripts.lib import conf
+
+        write_text_atomic(self.checkout / "crates/hana/Cargo.toml", '[package]\nname = "hana"\n')
+        _ = self.git("add", "crates/hana/Cargo.toml")
+        _ = self.git("commit", "-m", "record the Hana application")
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
+        _ = unit_config.write(worktree, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        saved = unit_config.read(worktree)
+        assert isinstance(saved, unit_config.UnitConfig)
+        self.assertIsInstance(saved.port, unit_config.AppPort)
+        assert isinstance(saved.port, unit_config.AppPort)
+        settings = conf.read("production")
+        self.assertGreaterEqual(saved.port.number, settings.whole("unit_port_first"))
+        self.assertLessEqual(saved.port.number, settings.whole("unit_port_last"))
+
+    def test_name_only_without_a_plan_reports_one_refusal_line(self) -> None:
+        result = self.cli("alpha", "--check")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("plan", result.stderr)
+        self.assertIn(str(self.doc), result.stderr)
+        self.assertEqual(self.servers_started(), [])
 
     def test_adopting_an_existing_config_without_a_port_flag_keeps_its_recorded_port(self) -> None:
         worktree = self.root / "project-alpha"

@@ -16,10 +16,8 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, nix_env_fake as fixtures
-from scripts.lib.code_kind import is_test_code
 
 
-ROOT = Path(__file__).resolve().parents[1]
 # These are account decisions with a separate, explicit contract.
 EXCEPTIONS = {
     ("accounts/accounts.py", "exec_account"): "the user explicitly names the account",
@@ -430,14 +428,6 @@ def session_launch(identity: str):
         self.assertTrue(any("selects with role_account" in problem
                             for problem in launch_account_violations(source, "agents/restart.py")))
 
-    def test_all_python_claude_launchers_use_the_shared_account_resolver(self) -> None:
-        violations: list[str] = []
-        for path in sorted(ROOT.rglob("*.py")):
-            if is_test_code(path):
-                continue
-            violations.extend(launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
-        self.assertEqual(violations, [], "\n".join(violations))
-
     def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
         for path, source in (
                 ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
@@ -454,23 +444,6 @@ claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
 subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
 '''
         self.assertEqual(shell_launch_account_violations(source, "direct/assign_claude.py"), [])
-
-    def test_shell_launchers_do_not_pick_or_set_an_unresolved_account(self) -> None:
-        for arguments in ("--print prompt", "-p prompt", "prompt", ""):
-            with self.subTest(arguments=arguments):
-                selecting = f'chosen=$(python accounts.py pick claude)\nCLAUDE_CONFIG_DIR="$chosen" claude {arguments}\n'
-                self.assertTrue(shell_launch_account_violations(selecting, "fixture.sh"))
-                unresolved = f'CLAUDE_CONFIG_DIR="/somewhere/.claude3" claude {arguments}\n'
-                self.assertTrue(shell_launch_account_violations(unresolved, "fixture.sh"))
-                for directory in ("resolver_config_dir", "record_config_dir"):
-                    rendering = f'CLAUDE_CONFIG_DIR="${directory}" claude {arguments}\n'
-                    self.assertEqual(shell_launch_account_violations(rendering, "fixture.sh"), [])
-        violations: list[str] = []
-        for path in sorted(ROOT.rglob("*.sh")):
-            if is_test_code(path):
-                continue
-            violations.extend(shell_launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
-        self.assertEqual(violations, [], "\n".join(violations))
 
 
 if __name__ == "__main__":

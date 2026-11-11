@@ -12,10 +12,12 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
+from functools import partial
 from pathlib import Path
 from unittest import mock
 from typing import cast, final, override
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.direct import phase_reservation
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
@@ -25,9 +27,10 @@ from scripts.style import style_ledger
 from scripts.style import style_footprint
 from scripts.style.ledger_test_support import write_style_units
 from scripts.style.style_config import StyleUnitAssignment
-from scripts.style.style_plan_test_support import private_class_catalog, unit_staff_id
+from scripts.style.style_plan_test_support import private_class_catalog, run_style_command, unit_staff_id
 from scripts.style import style_rules
 from scripts.production import unit_config
+from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
@@ -67,7 +70,7 @@ class StandingCheckpointTests(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.env = {
-            **os.environ, "HOME": str(self.root / "home"),
+            **os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root / "home"),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
@@ -136,8 +139,15 @@ class StandingCheckpointTests(unittest.TestCase):
         return result.stdout.strip()
 
     def cli(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(style_cli_command(SCRIPTS / script, *args), cwd=self.unit,
-                              env=self.env, capture_output=True, text=True, check=False)
+        if process_boundary_for_case(self):
+            return subprocess.run(style_cli_command(SCRIPTS / script, *args), cwd=self.unit,
+                                  env=self.env, capture_output=True, text=True, check=False)
+        run_command = partial(run_style_command, self.root, self)
+        with (unqueued_style_children(),
+              mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent),
+              mock.patch.object(subprocess, "run", side_effect=run_command)):
+            return run_command([str(SCRIPTS.parent / "lib/py"), str(SCRIPTS / script), *args],
+                               cwd=self.unit, env=self.env, capture_output=True, text=True, check=False)
 
     def rustfmt_calls(self) -> list[str]:
         return fake_fmt.calls(self.root / "fmt", "rustfmt")
@@ -491,6 +501,7 @@ class StandingCheckpointTests(unittest.TestCase):
         self.assertEqual(self.open_ticket()["state"], "assigned")
         self.assertEqual(self.git(self.unit, "diff", "--cached", "--name-only"), "")
 
+    @process_boundary
     def test_notify_cli_is_silent_for_another_branch_point_and_an_absent_production(self) -> None:
         for present in (True, False):
             if not present:

@@ -11,7 +11,7 @@ After this end, omit `--session-dir` to start a new run on retry.
 An explicit `--session-dir` retains the existing retry behavior for that folder.
 For herdr, this end applies only to exit 2. Exits 3 through 8 retain the run.
 
-Inspect `worker.py list` and the named pane.
+Inspect `worker.py list all` and the named pane.
 Keep incomplete, unpublished, busy, and unknown workers unchanged.
 A failed fresh start prints `publication failed: ...` and retains its pane without a saved pass.
 Rerun the original launcher command; it publishes once from that pane.

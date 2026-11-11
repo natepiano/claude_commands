@@ -13,6 +13,7 @@ import unittest
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
@@ -20,13 +21,11 @@ from unittest.mock import patch
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.staff_test_support import fixture_member, unit_membership, recorded_showrunner, StaffTestCase, fixture_worker
 from scripts.production import staff, worker_admission
-from scripts.lib import unit_runs as owned_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.resume_message import ClaudeChildResume, Resumable, Idle, Unavailable
 from scripts.usage import agents_log
 from scripts.agents.test_support import ShutdownTestCase, linux_process_fixture
 from scripts.agents import inventory
-from scripts.lib import unit_runs
 from scripts.whoami import account
 from scripts.herdr import herdr
 from scripts.message import sessions
@@ -114,7 +113,6 @@ with open(root / "scripts/lib/package_root.py") as package_root:
 assert str(root / "scripts/agents") not in sys.path
 from scripts.agents import inventory
 from scripts.production import staff
-from scripts.lib import unit_runs as owned_runs
 parent = staff.StaffRow(staff.StaffId("parent"), "unit", "parent", staff.STAFF_ROOT, current_session=staff.StaffId("parent"))
 assert inventory.worker_resumes(parent, staff.StaffSnapshot(())) == []
 """, str(root)],
@@ -224,17 +222,13 @@ class InventoryTests(ShutdownTestCase):
                 _ = transcript.write_text(contents + "\nmalformed-json" + ending, encoding="utf-8")
                 self.assertEqual(inventory.last_model(transcript), "latest-model")
 
-    def test_run_markers_under_either_folder_name_map_their_directors(self) -> None:
-        for name in ("unit", "delegate"):
-            (self.root / name / "active").mkdir(parents=True, exist_ok=True)
-            _ = (self.root / name / "active" / f"{name}-director").write_text(f"/runs/{name}\n", encoding="utf-8")
-        environment = {key: value for key, value in os.environ.items() if key != "SHUTDOWN_RUN_ROOT"}
-        with patch.dict(os.environ, environment, clear=True), \
-                patch.object(unit_runs, "RUN_ROOT", self.root / "unit"), \
-                patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"):
-            found = inventory._active_run_directories()  # pyright: ignore[reportPrivateUsage]
+    def test_staff_run_pointers_map_their_directors(self) -> None:
+        owners = [fixture_member("showrunner", name=name + "-director") for name in ("unit", "delegate")]
+        for owner, name in zip(owners, ("unit", "delegate"), strict=True):
+            _ = staff.set_run(owner.id, staff.OpenRun(Path("/runs") / name))
+        found = inventory._active_run_directories()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(
-            (found.get("unit-director"), found.get("delegate-director")),
+            (found.get(owners[0].current_session), found.get(owners[1].current_session)),
             ([Path("/runs/unit")], [Path("/runs/delegate")]),
         )
 
@@ -260,8 +254,13 @@ class InventoryTests(ShutdownTestCase):
             _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": path.parent.name}}))
             os.utime(path, (timestamp, timestamp))
         self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), newer)
+        model = inventory.last_model(newer)
+        self.assertEqual(model, "newer")
+        archived = compressed_copy(newer)
+        self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), archived)
+        self.assertEqual(inventory.last_model(archived), model)
         older.unlink()
-        newer.unlink()
+        archived.unlink()
         self.assertIsNone(inventory.transcript_path(self.target_config, "lookup"))
 
     def test_inventory_models_come_from_each_sessions_config_directory(self) -> None:
@@ -310,6 +309,13 @@ class InventoryTests(ShutdownTestCase):
             listed = inventory.listing()
             owned = inventory.listing(TARGET_LOGIN)
         by_id = {session.session_id: session for session in listed}
+        membership = staff.snapshot()
+        for identity, kind in ((UNIT_ID, "unit"), (DIRECTOR_ID, "showrunner")):
+            member = membership.by_current_session(identity)
+            assert member is not None
+            self.assertEqual((by_id[identity].name, by_id[identity].kind), (member.name, kind))
+        self.assertEqual(by_id[UNIT_ID].name, "shutdown")
+        self.assertEqual(by_id[DIRECTOR_ID].name, "build-followups")
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID, OTHER_ID})
         self.assertEqual({session.session_id for session in owned}, {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         for session in full:
@@ -329,6 +335,27 @@ class InventoryTests(ShutdownTestCase):
                     self.assertNotIn("production", session["host"])
                     self.assertEqual(light.doc, str(self.root / "build-followups-production.md"))
                     self.assertNotIn("doc", session["host"])
+
+        producer = fixture_member("producer", name="fixture-producer", runtime_id=OTHER_ID)
+        for registered in (True, False):
+            if not registered:
+                for folder in self.notifier.glob("showrunner-*"):
+                    (folder / "conf").unlink()
+                    folder.rmdir()
+            listed = {entry.session_id: entry for entry in inventory.listing()}
+            reports = [inventory.inventory(login) for login in (TARGET_LOGIN, OTHER_LOGIN)]
+            detailed = {entry["session_id"]: entry for report in reports for entry in report["sessions"]}
+            membership = staff.snapshot()
+            for identity in (UNIT_ID, DIRECTOR_ID, str(producer.current_session)):
+                member = membership.by_current_session(identity)
+                assert member is not None
+                with self.subTest(registered=registered, member=member.kind):
+                    self.assertEqual((listed[identity].name, listed[identity].kind), (member.name, member.kind))
+                    self.assertEqual((detailed[identity]["name"], detailed[identity]["kind"]), (member.name, member.kind))
+            self.assertEqual((listed[UNIT_ID].production, listed[UNIT_ID].doc),
+                             (listed[DIRECTOR_ID].name, listed[DIRECTOR_ID].doc))
+            for report in reports:
+                self.assertEqual(inventory.parse_inventory(json.dumps(report)), report)
 
     def test_registration_reads_the_folder_owner_document_from_one_staff_snapshot(self) -> None:
         doc = self.root / "document-name-differs.md"
@@ -358,7 +385,7 @@ class InventoryTests(ShutdownTestCase):
               patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
               patch.object(inventory, "_conf", wraps=getattr(inventory, "_conf")) as checked):
             registrations = inventory.showrunner_registrations()
-            listed = inventory.listing(registrations=registrations)
+            listed = inventory.listing()
             missing = inventory.unregistered_showrunners(listed, registrations=registrations)
         self.assertEqual(checked.call_count, 2, "membership and missing-target check must share the timer read")
         director = next(item for item in listed if item.session_id == DIRECTOR_ID)
@@ -447,7 +474,7 @@ class InventoryTests(ShutdownTestCase):
             self.records,
             self.notifier,
             self.history / "runs",
-            self.runs / "active",
+            self.runs,
             self.bin,
             self.checkout,
             self.target_config,
@@ -818,9 +845,7 @@ elif "comm=" in joined:
         _ = fixture_worker("review-worker", parent.id, runtime_id=WORKER_ID)
         run_dir = self.runs / "phase-two"
         run_dir.mkdir()
-        _ = (self.runs / "active" / DIRECTOR_ID).write_text(
-            str(run_dir) + "\n", encoding="utf-8"
-        )
+        _ = staff.set_run(parent.id, staff.OpenRun(run_dir))
         _ = (run_dir / "workers").write_text("aaaaaaaa\treview-worker\n", encoding="utf-8")
 
 
@@ -1280,6 +1305,12 @@ elif "comm=" in joined:
         decoded = inventory.parse_inventory(json.dumps(found))
 
         self.assertEqual(decoded, found)
+        producer = fixture_member("producer", name="fixture-producer", runtime_id=DESKTOP_ID)
+        found = inventory.inventory(TARGET_LOGIN)
+        decoded = inventory.parse_inventory(json.dumps(found))
+        self.assertEqual(decoded, found)
+        observed = next(entry for entry in decoded["sessions"] if entry["session_id"] == producer.current_session)
+        self.assertEqual((observed["name"], observed["kind"]), (producer.name, producer.kind))
 
     def test_parse_inventory_normalizes_a_legacy_tmux_host_to_manual_recovery(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -1459,25 +1490,11 @@ class WorkerResumeTests(StaffTestCase):
         allowed = worker_admission.WorkerStartAllowed(
             child.name, owner.id, newer, worker_admission.ExistingWorkerSlot(child))
         worker_admission.record_dispatch(allowed, "native-assignment", worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
-        owned_runs.activate(newer, owner.current_session)
+        _ = staff.set_run(owner.id, staff.OpenRun(newer))
         os.utime(older, (1, 1))
         os.utime(newer, (2, 2))
         results = inventory.worker_resumes(owner, staff.local_snapshot())
         self.assertEqual([result.seat["run_dir"] for result in results if isinstance(result, Resumable)], [str(older)])
-        self.assertEqual(len(results), 1)
-
-    def test_unreadable_foreign_owner_marker_does_not_hide_own_children(self) -> None:
-        owner = self.owner
-        child = fixture_worker("working", owner.id)
-        foreign = fixture_member("unit", name="foreign", parent=owner.id)
-        _ = fixture_worker("foreign-worker", foreign.id)
-        self.assigned(child)
-        run = self.child_run("run", {child.name: {"staff_id": child.id, "status": "running"}})
-        active = self.runs / "active"
-        active.mkdir()
-        _ = (active / foreign.current_session).write_bytes(b"\xff")
-        results = inventory.worker_resumes(owner, staff.local_snapshot())
-        self.assertEqual([result.seat["run_dir"] for result in results if isinstance(result, Resumable)], [str(run)])
         self.assertEqual(len(results), 1)
 
     def test_missing_worker_evidence_is_unavailable_and_does_not_hide_other_children(self) -> None:
@@ -1488,7 +1505,7 @@ class WorkerResumeTests(StaffTestCase):
         self.assigned(idle)
         run = self.child_run("run", {"unassigned": {"staff_id": unassigned.id, "status": "done"},
                                   "idle": {"staff_id": idle.id, "status": "done"}})
-        owned_runs.activate(run, owner.current_session)
+        _ = staff.set_run(owner.id, staff.OpenRun(run))
         results = inventory.worker_resumes(owner, staff.local_snapshot())
         errors = {result.staff_id: result.reason for result in results if isinstance(result, Unavailable)}
         self.assertIn("Claude child record is unavailable", errors[missing.id])

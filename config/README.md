@@ -264,7 +264,7 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
-`abandoned_session_minutes` sets the minimum age for removing abandoned compiler sessions before a Mac build.
+`abandoned_session_minutes` sets the minimum age for removing abandoned compiler sessions before builds on Mac and Linux targets.
 
 The Mac floor sweep reads `sweep_floor_gib=150` from this file.
 The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
@@ -365,19 +365,19 @@ Existing boxes use their saved start and end times and the instance types in `cl
 A box without a saved instance type retains its bid rate.
 No migration is required.
 Reports use the saved AWS bill and label provisional days.
-Reports show today's spend, daily limit, successful launch count, and spend groups with amounts and percentage shares.
-Historical reports omit today's estimated spend.
+Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+Reports show daily spending, limits, run counts, and compute, storage, and other costs.
+The daily spend table shows bill days and estimate days after the newest bill day.
+Historical reports omit estimate days after the report date.
 The groups are gate compute at 32 CPU, compute at 16 CPU, storage, public IPv4, data transfer, and other.
 Compute at 16 CPU includes gates and the older builder.
-Unbilled days use the label `estimated from the newest bill` when a bill exists.
+Unbilled days use the label `estimate`.
 Spot compute includes the older Spot builder when it uses the same instance type.
-The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
+The matrix splits each day's Spot cost by box seconds and divides the cost by finished runs on billed days.
 Reports read local evidence without an AWS call or a coordination file.
-`go-live.json` records the first permitted running observation for the wait comparison.
 
-`### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
-Missing comparisons remain unavailable. Run time differences can remain negative.
-The daily wait comparison remains unmatched for load.
+`### AWS` shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+`gate_type_window_days=14` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.
@@ -435,25 +435,17 @@ The guard runs before each resource request. `deployment_timeout_s` bounds each 
 `scaler_key_check_delay_s=5` allows IAM time to publish the key between checks.
 The scaler stage keeps other credential profiles and writes the private file with mode `0600`.
 It verifies the new key before deleting old keys. It deletes a new key that fails verification.
-Run `scripts/lib/py scripts/aws_target/deploy.py gate-image --approve-resources` at the terminal to prepare a cloud gate image.
+Cloud gates boot the official NixOS image that `ami_id` names, and fetch their tools at boot.
+A saved gate image was measured and taken out of use: gates were no faster with it, and its snapshot cost 1.60 USD each month.
+To inspect the saved image removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-images`.
 Without the flag, the command prints its plan and needs no credentials.
-The command uses one temporary box and terminates it after success, failure, interruption, or the time limit.
-`gate_image_timeout_s=1200` limits preparation and image availability to 1200 seconds.
-The box also has an expiry timer and the existing gate expiry tags.
-The image key contains only the configured cloud gate packages and the host nixpkgs revision.
-Gate source changes still arrive through the source bundle and never require an image build.
-Changed packages or a changed revision create a new image on the next approved command.
-After the image becomes available, the command removes older gate images and their snapshots.
-It retains the builder image independently.
-The command updates only the live stack GateImage parameter and retains every other parameter and template definition.
-The launch template and its image permission then use the saved image.
-The next gate launch uses the saved image without other launch changes.
-A gate without matching saved tools uses the existing tool fetch.
-The boot stages remain `boot`, `tools ready`, `source ready`, and `tests start`.
-The expected saving is the measured tool fetch: median 24 seconds, range 18 to 119 seconds.
-`gate_image_snapshot_usd_per_gib_month=0.05` supplies the monthly snapshot estimate per GiB.
-The command prints the logical image size and the estimate; AWS bills stored snapshot blocks.
-The ledger includes this estimate until `down` removes the gate image and its snapshot.
+To remove the saved images, run `scripts/lib/py scripts/aws_target/deploy.py remove-images --approve-destroy`.
+The command switches the live stack GateImage parameter to `ami_id` and keeps every other parameter and template definition.
+The old image stays launchable until `gate-deployment.json` names the official image.
+A second stack update then removes the old image permission.
+Then the command deletes the saved gate image, its snapshot, and its cost row.
+Last, it deletes the former builder image, its snapshot, and `image.json`. A later builder `up` would make a new image.
+A repeat after a partial removal continues from the live state. A repeat after a full removal changes nothing.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
 `scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
 The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.
@@ -818,20 +810,44 @@ The folder uses task `gate:aws-routing-proof`.
 The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 
-`deploy.py gate-trial` reads these keys when it uses them:
+Paired trials use the installed scaler service and the existing `cloud_gate.conf` settings.
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one box for all rounds.
+All module boxes run concurrently.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The command reserves the full trial cost before it permits any launch.
+A refused launch never uses a local runner.
 
-| Key | Value | Reason |
-| --- | --- | --- |
-| `gate_trial_size_reserve_usd` | `4` | Limit the spend of the size step. |
-| `gate_trial_start_reserve_usd` | `3` | Limit the spend of the start step. |
-| `gate_trial_lifetime_minutes` | `30` | Set the guest shutdown time and the attempt deadline. |
-| `gate_trial_url_lifetime_s` | `7200` | Keep presigned URLs valid through a stop and start. |
-| `gate_trial_target_gate_s` | `420` | Select the cheapest size that meets the 7-minute goal. |
-| `gate_trial_default_sizes` | `8,16,32,64` | Set the vCPU sizes of the size step. |
-| `gate_trial_size_runs` | `3` | Set the attempts for each size. |
-| `gate_trial_start_runs` | `5` | Set the attempts of the start step. |
-| `gate_trial_poll_pause_s` | `2` | Set the pause between state and result reads. |
-| `gate_trial_group_delete_wait_s` | `120` | Limit the security group delete retries. |
+Stdout contains JSON lines: each run, each module summary, and the final cost.
+Progress goes to stderr.
+The final line has `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate uses each box's rate, minimum billed seconds, lifetime, allowance, and new bill-query fees.
+Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
+The paired trial adds no settings.
+
+The paired trial replaces the size/start trials.
+The following settings are removed:
+
+1. `gate_trial_size_reserve_usd`.
+1. `gate_trial_start_reserve_usd`.
+1. `gate_trial_lifetime_minutes`.
+1. `gate_trial_url_lifetime_s`.
+1. `gate_trial_target_gate_s`.
+1. `gate_trial_module_limit_s`.
+1. `gate_trial_default_sizes`.
+1. `gate_trial_size_runs`.
+1. `gate_trial_start_runs`.
+1. `gate_trial_poll_pause_s`.
+1. `gate_trial_log_push_s`.
+1. `gate_trial_group_delete_wait_s`.
+
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.
 `deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.

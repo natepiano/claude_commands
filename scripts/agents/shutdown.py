@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
+from enum import Enum
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, cast
 
 from scripts.accounts import accounts
+from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
@@ -43,7 +45,7 @@ from scripts.production import (
 )
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused, production_journal, read_json, write_json
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.agents import (
     restart,
     restart_support,
@@ -97,6 +99,7 @@ class CommandLine(argparse.Namespace):
     to_doc: str = ""
     to_branch: str = ""
     target: str = ""
+    producer: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -241,6 +244,7 @@ USAGE = """usage: agents COMMAND
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run]
+  agents remove-stray NAME SESSION
 """
 
 
@@ -258,6 +262,255 @@ def _result_code(result: StopResult | ResumeResult) -> int:
     else:
         print(f"{result.session_id}: unchanged")
     return 0
+
+
+@dataclass(frozen=True)
+class StrayProducerPane:
+    """A terminal that contains the selected stray conversation."""
+
+    pane: str
+    terminal: str
+
+
+class ProducerCleanupStep(Enum):
+    """The next step suggested by the last successful progress write."""
+
+    STOP = "stop"
+    ADMISSION = "admission"
+    PANES = "panes"
+    TRANSCRIPTS = "transcripts"
+    COMPLETE = "complete"
+
+
+@dataclass(frozen=True)
+class ProvedStrayProcess:
+    """A native process proved before cleanup changes its evidence."""
+
+    pid: int
+    started: str
+    kind: Literal["claude", "codex"]
+
+
+@dataclass(frozen=True)
+class ProvedStrayTerminal:
+    """The pane, tab, and terminal selected before cleanup starts."""
+
+    pane: str
+    tab: str
+    terminal: str
+
+
+@dataclass(frozen=True)
+class PendingProducerCleanup:
+    """Durable targets and progress for one proved stray conversation."""
+
+    name: str
+    session: str
+    herdr_session: str
+    processes: tuple[ProvedStrayProcess, ...]
+    panes: tuple[ProvedStrayTerminal, ...]
+    admission_matches: bool
+    admission: dict[str, object]
+    transcripts: tuple[Path, ...]
+    step: ProducerCleanupStep = ProducerCleanupStep.STOP
+
+
+def save_producer_cleanup(path: Path, cleanup: PendingProducerCleanup) -> None:
+    """Persist the targets and the progress hint together."""
+    write_text_atomic(path, json.dumps({
+        "name": cleanup.name, "session": cleanup.session,
+        "herdr_session": cleanup.herdr_session,
+        "processes": [{"pid": process.pid, "started": process.started, "kind": process.kind} for process in cleanup.processes],
+        "panes": [{"pane": pane.pane, "tab": pane.tab, "terminal": pane.terminal} for pane in cleanup.panes],
+        "admission_matches": cleanup.admission_matches, "admission": cleanup.admission,
+        "transcripts": [str(transcript) for transcript in cleanup.transcripts], "step": cleanup.step.value,
+    }) + "\n", new_file_mode=0o600)
+
+
+def read_producer_cleanup(path: Path, name: str, identity: str) -> PendingProducerCleanup:
+    """Read cleanup evidence without observing its former process or pane."""
+    saved = herdr.json_object(cast(object, json.loads(path.read_text())), "producer cleanup")
+    if saved.get("name") != name or saved.get("session") != identity:
+        raise ValueError("producer cleanup targets another name or session")
+    processes: list[ProvedStrayProcess] = []
+    for value in herdr.json_items(saved.get("processes"), "cleanup processes"):
+        process = herdr.json_object(value, "cleanup process")
+        pid = process.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValueError("producer cleanup has an invalid pid")
+        kind = herdr.json_text(process.get("kind"), "cleanup process kind")
+        if kind not in ("claude", "codex"):
+            raise ValueError("producer cleanup has an invalid agent kind")
+        processes.append(ProvedStrayProcess(pid, herdr.json_text(process.get("started"), "cleanup process start"), kind))
+    panes: list[ProvedStrayTerminal] = []
+    for value in herdr.json_items(saved.get("panes"), "cleanup panes"):
+        pane = herdr.json_object(value, "cleanup pane")
+        panes.append(ProvedStrayTerminal(herdr.json_text(pane.get("pane"), "cleanup pane id"),
+            herdr.json_text(pane.get("tab"), "cleanup tab id"),
+            herdr.json_text(pane.get("terminal"), "cleanup terminal id")))
+    matches = saved.get("admission_matches")
+    if not isinstance(matches, bool):
+        raise ValueError("producer cleanup has no admission match result")
+    transcripts = tuple(Path(herdr.json_text(value, "cleanup transcript"))
+                        for value in herdr.json_items(saved.get("transcripts"), "cleanup transcripts"))
+    if any(not transcript.is_absolute() or transcript.name != identity + ".jsonl" for transcript in transcripts):
+        raise ValueError("producer cleanup has an invalid transcript target")
+    return PendingProducerCleanup(name, identity,
+        herdr.json_text(saved.get("herdr_session"), "cleanup herdr session"), tuple(processes), tuple(panes), matches,
+        herdr.json_object(saved.get("admission"), "cleanup admission"), transcripts,
+        ProducerCleanupStep(herdr.json_text(saved.get("step"), "cleanup step")))
+
+
+def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admission: Path) -> int:
+    """Complete saved steps and retain their evidence through every failure."""
+    client = herdr.Herdr(cleanup.herdr_session)
+    for process in cleanup.processes:
+        observed = sessions.process_liveness(process.pid, process.started)
+        if isinstance(observed, sessions.SessionLivenessUnknown):
+            raise OSError(observed.reason)
+        if isinstance(observed, sessions.SessionNotLive):
+            continue
+        result = stop_resume.stop(cleanup.session, process.kind, deadline=worker_lifecycle.effective_deadline())
+        observed = sessions.process_liveness(process.pid, process.started)
+        if isinstance(observed, sessions.SessionLivenessUnknown):
+            raise OSError(observed.reason)
+        if isinstance(observed, sessions.LiveSessionProcess):
+            reason = result.reason if isinstance(result, stop_resume.StopFailed) else "stop is incomplete"
+            raise ValueError(f"saved pid {process.pid} is still running: {reason}")
+    transcripts = tuple(sorted(set(cleanup.transcripts) | set(sessions.transcript_locations(cleanup.session))))
+    cleanup = replace(cleanup, step=ProducerCleanupStep.ADMISSION, transcripts=transcripts)
+    save_producer_cleanup(path, cleanup)
+    if cleanup.admission_matches and admission.exists():
+        saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
+        if saved == cleanup.admission:
+            admission.unlink()
+            sync_folder(admission.parent)
+    cleanup = replace(cleanup, step=ProducerCleanupStep.PANES)
+    save_producer_cleanup(path, cleanup)
+    for pane in cleanup.panes:
+        current = client.pane_row(pane.pane)
+        if isinstance(current, herdr.NoPane):
+            continue
+        if current.get("tab_id") != pane.tab:
+            raise ValueError(f"{pane.pane}: stray tab identity changed")
+        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal)
+        if not isinstance(client.pane_row(pane.pane), herdr.NoPane):
+            raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
+    cleanup = replace(cleanup, step=ProducerCleanupStep.TRANSCRIPTS)
+    save_producer_cleanup(path, cleanup)
+    for transcript in cleanup.transcripts:
+        if transcript.exists():
+            transcript.unlink()
+        try:
+            sync_folder(transcript.parent)
+        except FileNotFoundError:
+            pass
+    cleanup = replace(cleanup, step=ProducerCleanupStep.COMPLETE)
+    save_producer_cleanup(path, cleanup)
+    path.unlink()
+    sync_folder(path.parent)
+    print(f"{cleanup.session}: removed stray")
+    return 0
+
+
+def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProducerPane]:
+    """Retain only panes with native evidence or an idle retained conversation."""
+    retained = pane_record.read_strict(client.session)
+    record = staff.initial_snapshot()
+    observed = herdr.read_conversation(identity)
+    if isinstance(observed, herdr.UnknownConversation):
+        raise ValueError(observed.reason)
+    selected: list[StrayProducerPane] = []
+    for pane in client.panes():
+        entry = retained.get(pane["pane_id"])
+        retained_identity = ""
+        if entry is not None:
+            owner = record.by_member_reference(entry["session_id"])
+            retained_identity = owner.current_session if owner is not None else entry["session_id"]
+        if isinstance(observed, herdr.StoppedConversation) and retained_identity != identity:
+            continue
+        info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
+                                 "stray pane process info")
+        proved = False
+        for value in herdr.json_items(info.get("foreground_processes"), "stray pane foreground processes"):
+            process = herdr.json_object(value, "stray pane process")
+            pid = process.get("pid")
+            if not isinstance(observed, herdr.LiveConversation) or pid not in observed.pids:
+                continue
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise ValueError("stray pane process has no valid pid")
+            arguments = process.get("argv")
+            if not isinstance(arguments, list):
+                raise ValueError("stray pane process has no arguments")
+            argv = [herdr.json_text(argument, "stray process argument") for argument in cast(list[object], arguments)]
+            matches = herdr.is_claude_process(argv) if observed.kind == "claude" else herdr.is_codex_process(argv)
+            if not matches:
+                raise ValueError(f"{pid}: selected process no longer runs {observed.kind}")
+            native = herdr.native_process(pid, observed.kind)
+            proved = proved or native.current_identity == identity
+        idle_retained = (retained_identity == identity
+                         and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
+        if proved or idle_retained:
+            selected.append(StrayProducerPane(pane["pane_id"], herdr.json_text(pane.get("terminal_id"), "stray terminal")))
+    return selected
+
+
+def remove_stray_producer(name: str, session: str) -> int:
+    """Stop a proved stray and remove its terminal, transcripts, and admission record."""
+    identity = str(staff.native_id(session))
+    admission = stop_resume.producer_admission_record(name)
+    with staff.slot_operation("producer-first-" + name, name), staff.row_operation(name):
+        record = staff.initial_snapshot()
+        owners = [row for row in record.rows if row.kind == "producer" and row.name == name]
+        if len(owners) > 1:
+            raise ValueError(f"{name}: several producer rows match")
+        if any(row.current_session == identity for row in record.rows):
+            raise ValueError(f"{identity}: current_session belongs to a staff row; removal refused")
+        cleanup_path = admission.with_name(f".producer-cleanup-{name}-{identity}")
+        if cleanup_path.exists():
+            return finish_producer_cleanup(cleanup_path, read_producer_cleanup(cleanup_path, name, identity), admission)
+        client = herdr.Herdr(herdr.shared_session())
+        panes = stray_producer_panes(client, identity)
+        saved: dict[str, object] = {}
+        if admission.exists():
+            saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
+        retained = pane_record.read_strict(client.session)
+        admission_matches = saved.get("session_id") == identity
+        for pane in panes:
+            if saved.get("pane") == pane.pane and saved.get("terminal") == pane.terminal:
+                admission_matches = True
+            entry = retained.get(pane.pane)
+            if entry is not None and saved.get("pane") == pane.pane:
+                owner = record.by_member_reference(entry["session_id"])
+                retained_identity = owner.current_session if owner is not None else entry["session_id"]
+                admission_matches = admission_matches or retained_identity == identity
+        observed = herdr.read_conversation(identity)
+        if isinstance(observed, herdr.UnknownConversation):
+            raise ValueError(observed.reason)
+        processes: list[ProvedStrayProcess] = []
+        if isinstance(observed, herdr.LiveConversation):
+            conflicts = stop_resume.producer_conflicts(name, client)
+            if not any(found == identity or any(place == pane.pane for pane in panes) for found, place in conflicts):
+                raise ValueError(f"{identity}: session has no producer name or pane proof for {name}")
+            for pid in observed.pids:
+                native = herdr.native_process(pid, observed.kind)
+                if native.current_identity != identity:
+                    raise ValueError(f"{pid}: stray native identity changed")
+                processes.append(ProvedStrayProcess(pid, native.started, observed.kind))
+        terminals: list[ProvedStrayTerminal] = []
+        for pane in panes:
+            current = client.pane_row(pane.pane)
+            if isinstance(current, herdr.NoPane) or current.get("terminal_id") != pane.terminal:
+                raise ValueError(f"{pane.pane}: stray terminal identity changed")
+            terminals.append(ProvedStrayTerminal(pane.pane, herdr.json_text(current.get("tab_id"), "stray tab"), pane.terminal))
+        transcripts = tuple(sessions.transcript_locations(identity))
+        if not processes and not panes and not transcripts and not admission_matches:
+            print(f"{identity}: unchanged")
+            return 0
+        cleanup = PendingProducerCleanup(name, identity, client.session, tuple(processes), tuple(terminals),
+                                         admission_matches, saved, transcripts)
+        save_producer_cleanup(cleanup_path, cleanup)
+        return finish_producer_cleanup(cleanup_path, cleanup, admission)
 
 
 def _message(row: staff.StaffRow, text: str) -> restart_support.MessageSendOutcome:
@@ -383,6 +636,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = selection.add_argument("session", nargs="?")
     _ = selection.add_argument("--all", action="store_true")
     _ = command.add_argument("--dry-run", action="store_true")
+    command = commands.add_parser("remove-stray")
+    _ = command.add_argument("producer", metavar="NAME")
+    _ = command.add_argument("session", metavar="SESSION")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -430,6 +686,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--session", dest="account", required=True)
     options = parser.parse_args(arguments, namespace=CommandLine())
     try:
+        if options.command == "remove-stray":
+            return remove_stray_producer(options.producer, options.session)
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run)
         if options.command == "move":
@@ -463,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 record = staff.initial_snapshot()
                 rows = restart.live_rows(record, herdr.Herdr(herdr.shared_session()), save_tabs=True)
-            except (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
                 print(f"restart: save anomaly: {error}", file=sys.stderr)
             shutdown_record.update(started=[], pending=[str(row.id) for row in rows])
             print(f"saved {len(rows)} rows for restart at {time.strftime('%H:%M')}", flush=True)
@@ -517,7 +775,8 @@ def main(argv: list[str] | None = None) -> int:
     except staff.StaffRefused as error:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
         return 2
-    except (OSError, ValueError, staff.StaffNotFound, UnknownAccountName, UnreadableAccount, InvalidInventory) as error:
+    except (OSError, ValueError, staff.StaffNotFound, UnknownAccountName, UnreadableAccount,
+            InvalidInventory, herdr_types.HerdrFailure) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
 
@@ -771,7 +1030,7 @@ def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: st
         raise
     except ProcessLookupError:
         return []
-    except (OSError, ValueError, RetirementRefused, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, RetirementRefused, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         return [f"{description} works inside {unit.worktree}; stop it first: {error}"]
     deadline = min(time.monotonic() + duration, operation_limit)
     def still_running() -> bool:
@@ -807,7 +1066,7 @@ def retirement_runs_of(owner: staff.StaffRow, record: staff.StaffSnapshot) -> li
     found: list[Path] = []
     for root in unit_runs.run_roots(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
         for folder in sorted(root.iterdir()) if root.is_dir() else ():
-            if folder.name != "active" and record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
+            if record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
                 found.append(folder)
     return found
 
@@ -1021,14 +1280,26 @@ def unit_local_command() -> int:
             elif fields["action"] == "retire-complete":
                 if not isinstance(location, staff.RemovedWorktree):
                     raise ValueError("retirement journal requires a retired staff row")
+                journal = retirement_journal(row)
+                saved = retirement_json(journal)
+                if saved.get("pane_id"):
+                    if saved.get("pane_terminal"):
+                        pane = RetiringPane(str(saved["pane_session"]), str(saved["pane_id"]), str(saved["pane_terminal"]))
+                    else:
+                        print(f"anomaly: {saved['pane_session']}:{saved['pane_id']}: saved terminal identity is unavailable")
+                        pane = herdr.NoPane(row.name)
+                else:
+                    pane = retirement_pane(row, record)
                 result["code"] = 0
                 try:
-                    retirement_journal(row).unlink(missing_ok=True)
+                    journal.unlink(missing_ok=True)
                 except OSError as error:
                     print(f"anomaly: {row.name}: cannot remove retirement journal: {' '.join(str(error).splitlines())}")
+                retirement_close_idle_shell(pane)
             elif fields["action"] == "retire":
                 settings = conf.read("production")
                 journal = retirement_journal(row)
+                pane = retirement_pane(row, record)
                 if location.path.exists():
                     common = retirement_run(["git", "-C", str(location.path), "rev-parse", "--path-format=absolute", "--git-common-dir"], settings=settings)
                     branch = retirement_run(["git", "-C", str(location.path), "branch", "--show-current"], settings=settings)
@@ -1039,6 +1310,9 @@ def unit_local_command() -> int:
                     if config:
                         _ = unit_config.parse(config)
                     retained = {"session": row.current_session, "worktree": str(location.path),
+                                "pane_session": pane.session if isinstance(pane, RetiringPane) else "",
+                                "pane_id": pane.pane if isinstance(pane, RetiringPane) else "",
+                                "pane_terminal": pane.terminal if isinstance(pane, RetiringPane) else "",
                                 "checkout": common.stdout.strip(), "branch": branch.stdout.strip(), "config": config,
                                 "date": datetime.now(ZoneInfo(str(fields["zone"]))).date().isoformat(),
                                 "merge_branch": str(fields["merge_branch"])}
@@ -1063,7 +1337,7 @@ def unit_local_command() -> int:
                         print(f"anomaly: {reason}")
                     if not reasons:
                         result["code"] = retirement_clear_worktree(unit, settings=settings, record=record,
-                                                                  pane_workers=panes, require_cleanup=True)
+                                                                  pane_workers=panes, pane=pane, require_cleanup=True)
                 if result["code"] == 0 and retained["config"]:
                     config = unit_config.parse(retained["config"])
                     previous = unit_config.read_parked(row.id, cleanup=False)
@@ -1073,7 +1347,7 @@ def unit_local_command() -> int:
                     _ = unit_config.write_parked(row.id, replace(config, retired=facts))
             else:
                 raise ValueError("unknown remote lifecycle action")
-        except (OSError, ValueError, herdr.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
             result["code"] = 1
             print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}")
     result["output"] = output.getvalue()
@@ -1095,29 +1369,60 @@ def retirement_stop_members(row: staff.StaffRow, record: staff.StaffSnapshot) ->
                 reasons.append(f"{member.name}: {outcome.reason}")
             elif isinstance(outcome, stop_resume.SessionNotFound):
                 reasons.append(f"{member.name}: no session on this machine")
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             reasons.append(f"{member.name}: {' '.join(str(error).splitlines())}")
     stop_reasons = stop_resume.stop_unit_workers(row.id, record)
     reasons.extend(stop_reasons)
     return pane_workers, reasons
 
-def retirement_close_idle_shell(unit: RetiringUnit, pid: int, record: staff.StaffSnapshot) -> bool:
+class RetiringPane(NamedTuple):
+    session: str
+    pane: str
+    terminal: str
+
+
+def retirement_pane(row: staff.StaffRow, record: staff.StaffSnapshot) -> RetiringPane | herdr.NoPane:
     try:
-        publication = pane_record.publication_for_session(unit.staff_member.current_session, record=record)
-        if publication is None:
-            return False
-        client = herdr.Herdr(publication.path.stem)
-        pane = next((pane for pane in client.panes() if pane["pane_id"] == publication.entry["pane_id"]), None)
-        if (pane is not None
-                and pane_record.pane_shell_pid(herdr.HerdrPlace(client.session, pane["pane_id"])) == pid
-                and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell)):
-            return client.close_retained_pane(pane["pane_id"], terminal=pane.get("terminal_id", ""))
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
-        pass
-    return False
+        publication = pane_record.publication_for_session(row.current_session, record=record)
+        if publication is not None:
+            session, identity = publication.path.stem, publication.entry["pane_id"]
+            pane = next((pane for pane in herdr.Herdr(session).panes() if pane["pane_id"] == identity), None)
+            if pane is not None:
+                terminal = pane.get("terminal_id", "")
+                if not terminal:
+                    raise ValueError(f"{session}:{identity}: terminal identity is unavailable")
+                return RetiringPane(session, identity, terminal)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        print(f"anomaly: {row.name}: cannot read its pane: {error}")
+    return herdr.NoPane(row.name)
+
+
+def retirement_idle_shell(place: RetiringPane | herdr.NoPane, pid: int) -> bool:
+    if isinstance(place, herdr.NoPane):
+        return False
+    try:
+        return (pane_record.pane_shell_pid(herdr.HerdrPlace(place.session, place.pane)) == pid
+                and isinstance(herdr.Herdr(place.session).pane_activity(place.pane), herdr.PaneAtShell))
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
+        return False
+
+
+def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane) -> None:
+    if isinstance(place, herdr.NoPane):
+        return
+    try:
+        client = herdr.Herdr(place.session)
+        pane = next((pane for pane in client.panes() if pane["pane_id"] == place.pane), None)
+        if pane is not None and not isinstance(client.pane_activity(place.pane), herdr.PaneAtShell):
+            print(f"anomaly: {place.session}:{place.pane}: foreground work keeps the pane open")
+        elif not client.close_retained_pane(place.pane, terminal=place.terminal):
+            print(f"anomaly: {place.session}:{place.pane}: pane close is not confirmed")
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        print(f"anomaly: {place.session}:{place.pane}: pane close failed: {error}")
 
 def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, record: staff.StaffSnapshot,
-                             pane_workers: list[worker_panes.WorkerPane], require_cleanup: bool = False) -> int:
+                             pane_workers: list[worker_panes.WorkerPane], pane: RetiringPane | herdr.NoPane,
+                             require_cleanup: bool = False) -> int:
     row = unit.staff_member
     owned = retirement_members(unit, record)
     for key in retirement_holds({member.current_session for member in owned}):
@@ -1133,12 +1438,13 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     for reason in retirement_terminate(list(classified), classified, settings=settings):
         print(f"anomaly: {reason}")
     for pid in inside:
-        if pid != os.getpid() and pid not in classified and not retirement_close_idle_shell(unit, pid, record):
+        if pid != os.getpid() and pid not in classified and not retirement_idle_shell(pane, pid):
             for reason in retirement_stop_orphan(unit, pid, row.current_session, settings=settings):
                 print(f"anomaly: {reason}")
-    if require_cleanup and (retirement_holds({member.current_session for member in owned})
-                            or retirement_live_claims(retirement_mac_claims(unit.worktree))
-                            or (unit.worktree.exists() and unit_move.processes_inside(unit.worktree))):
+    if ((require_cleanup and (retirement_holds({member.current_session for member in owned})
+                              or retirement_live_claims(retirement_mac_claims(unit.worktree))))
+            or (unit.worktree.exists() and any(not retirement_idle_shell(pane, pid)
+                for pid in unit_move.processes_inside(unit.worktree)))):
         print(f"refused: live holds or processes remain in {unit.worktree}")
         return 1
     # Check the work again after the sessions stop.
@@ -1181,12 +1487,14 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
         _ = unit_remote_command("retire-complete", retired, updated)
         print(f"{unit.name} retired")
         return 0
+    pane = retirement_pane(row, record)
     if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
         try:
             copies.remove_trees(str(row.id))
         except copies.CopyError as error:
             print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")
+        retirement_close_idle_shell(pane)
         return 0
     refused = retirement_refusals(unit, settings=settings)
     if refused:
@@ -1203,10 +1511,12 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     pane_workers, reasons = retirement_stop_members(unit.staff_member, record)
     for reason in reasons:
         print(f"anomaly: {reason}")
-    if retirement_clear_worktree(unit, settings=settings, record=record, pane_workers=pane_workers):
+    if retirement_clear_worktree(unit, settings=settings, record=record, pane_workers=pane_workers,
+                                 pane=pane):
         return 1
     _ = staff.set_worktree(row.id, staff.RemovedWorktree(local_machine(), unit.worktree), expected=row.worktree)
     print(f"{unit.name} retired")
+    retirement_close_idle_shell(pane)
     return 0
 
 ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
@@ -1709,7 +2019,7 @@ def rename_repair_displays(row: staff.StaffRow) -> bool:
         for kind in ("claude", "codex"):
             try:
                 native_sessions.add(client.native_session(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS))
-            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
                 continue
         if native_sessions != {row.current_session}:
             if pane.get("session_id") == row.current_session:
@@ -1761,7 +2071,7 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
                 changed = True
         try:
             changed = rename_repair_displays(row) or changed
-        except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound, herdr_types.HerdrFailure) as error:
             print(f"anomaly: set_displays: {error}", file=sys.stderr)
             changed = True
         print("done" if changed else "unchanged")
@@ -1814,7 +2124,7 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
         row = rename_owner(row, request.name)
         try:
             changed = rename_repair_displays(row) or changed
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: display: {error}", file=sys.stderr)
             changed = True
         if isinstance(movement, (unit_move.FolderMove, unit_move.PendingRename)):
@@ -1833,7 +2143,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr.HerdrFailure) as error:
+        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

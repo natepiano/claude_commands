@@ -33,11 +33,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
+    from scripts.herdr import herdr
     from scripts.production import staff
 
 
-from scripts.herdr import herdr, pane_launch  # noqa: E402
-from scripts.lib import legacy_identity
+from scripts.herdr import herdr_types, pane_launch  # noqa: E402
+from scripts.lib import legacy_identity, models_registry
 from scripts.message import sessions
 from scripts.herdr.pane_launch import PaneLaunch as PaneLaunch
 from scripts.herdr.pane_launch import (
@@ -144,6 +145,28 @@ def resume_arguments(entry: PaneLaunch) -> list[str]:
     return arguments
 
 
+def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
+                                settings: models_registry.LaunchSettings) -> list[str]:
+    """Apply current model settings and retain the saved resume options."""
+    current = entry.copy()
+    current.update(kind=settings.kind, session_id=identity, name=name, model=settings.model)
+    if settings.kind == "codex":
+        policy = ["-c", f'model_reasoning_effort="{settings.effort}"']
+        if settings.service_tier:
+            policy.extend(("-c", f'service_tier="{settings.service_tier}"'))
+        saved = iter(entry.get("codex_policy", []))
+        for option in saved:
+            value = next(saved, "")
+            if option == "-c" and value.partition("=")[0].strip() in ("model_reasoning_effort", "service_tier"):
+                continue
+            policy.extend((option, value))
+        current["codex_policy"] = policy
+    arguments = resume_arguments(current)
+    if settings.kind == "claude":
+        arguments.extend(("--effort", settings.effort))
+    return arguments
+
+
 def locked(session: str) -> AbstractContextManager[None]:
     return pane_launch.locked(record_path(session))
 
@@ -161,7 +184,7 @@ def save(session: str, entries: dict[str, PaneLaunch]) -> None:
 
 def write(session: str, launch: PaneLaunch) -> None:
     """Delegate retained launch publication to the shared writer."""
-    pane_launch.write(record_path(session), without_legacy_identity(launch))
+    pane_launch.write(record_path(session), without_legacy_identity(launch), sources=tuple(record_directory().glob("*.json")))
 
 
 def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> dict[str, str]:
@@ -170,7 +193,7 @@ def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> d
     for previous in sorted(history, key=lambda item: item["written_at"]):
         if previous["session_id"] == launch["session_id"]:
             environment.update({key: value for key, value in previous["environment"].items()
-                                if key in herdr.NATIVE_ID_MARKS or _needed(key)})
+                                if key in herdr_types.NATIVE_ID_MARKS or _needed(key)})
     environment.update(launch["environment"])
     current = launch.copy()
     current["environment"] = environment
@@ -273,6 +296,8 @@ def process_parent(pid: int) -> int:
 
 
 def pane_shell_pid(place: herdr.HerdrPlace) -> int:
+    from scripts.herdr import herdr
+
     info = herdr.json_object(herdr.Herdr(place.session).result(
         "pane", "process-info", "--pane", place.pane).get("process_info"), "pane process info")
     shell = info.get("shell_pid")
@@ -295,6 +320,8 @@ def process_arguments(pid: int) -> list[str]:
 
 def claude_arguments(pid: int) -> list[str]:
     """The argv of the nearest Claude process above `pid`; empty when none is found."""
+    from scripts.herdr import herdr
+
     for _ in range(ANCESTOR_LIMIT):
         try:
             pid = process_parent(pid)
@@ -317,6 +344,8 @@ def _process_environment(pid: int) -> dict[str, str]:
 
 def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd: str) -> PaneLaunch:
     """Capture one verified live Claude using the existing argv and environment readers."""
+    from scripts.herdr import herdr
+
     if not sessions.running_session(record):
         raise ValueError(f"{record['sessionId']}: Claude is no longer running")
     environment = _process_environment(record["pid"])
@@ -345,6 +374,8 @@ def _conversation_of(config_dir: str, pid: int) -> str:
 
 def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = None) -> int:
     """Record Claude and Codex panes; name each pane whose conversation cannot be read."""
+    from scripts.herdr import herdr
+
     client = herdr.Herdr(session)
     for pane in client.panes():
         pane_id = pane["pane_id"]
@@ -397,6 +428,8 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
 
 
 if __name__ == "__main__":
+    from scripts.herdr import herdr
+
     parser = argparse.ArgumentParser(description="Record the Claude and Codex panes running now.")
     _ = parser.add_argument("command", choices=["seed"])
     _ = parser.add_argument("--session", default="")

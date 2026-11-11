@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
+from scripts.herdr import herdr_types
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -110,7 +111,7 @@ class RosterTests(unittest.TestCase):
         self.runs = self.root / "runs"
         binaries = self.root / "bin"
         for directory in (
-            self.home, self.sessions, self.notifier, self.runs / "active", binaries,
+            self.home, self.sessions, self.notifier, self.runs, binaries,
             self.root / "history" / "runs",
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -340,9 +341,7 @@ class RosterTests(unittest.TestCase):
         self.director_run.mkdir()
         _ = (self.director_run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: unit.id}),
                                                                encoding="utf-8")
-        _ = (self.runs / "active" / "17e44ec4-3e24-5ae1-b10d-5cf30de9455b").write_text(
-            str(self.director_run) + "\n", encoding="utf-8",
-        )
+        _ = staff.set_run(unit.id, staff.OpenRun(self.director_run))
         _ = (self.director_run / "workers").write_text(
             "12345678\talpha-test\n", encoding="utf-8",
         )
@@ -376,9 +375,8 @@ class RosterTests(unittest.TestCase):
 
         solo_run = self.runs / "solo-run"
         solo_run.mkdir()
-        _ = (self.runs / "active" / "22135b22-7da2-5f04-8840-738da7f248ba").write_text(
-            str(solo_run) + "\n", encoding="utf-8",
-        )
+        solo = fixture_member("producer", name="solo-director", runtime_id="22135b22-7da2-5f04-8840-738da7f248ba")
+        _ = staff.set_run(solo.id, staff.OpenRun(solo_run))
 
         orphan_run = self.runs / "orphan-run"
         self._write_pane_workers(orphan_run, {
@@ -397,9 +395,8 @@ class RosterTests(unittest.TestCase):
                 "launcher_pid": os.getpid(),
             },
         })
-        _ = (self.runs / "active" / "dead-director").write_text(
-            str(stale_run) + "\n", encoding="utf-8",
-        )
+        dead = fixture_member("producer", name="dead-director")
+        _ = staff.set_run(dead.id, staff.OpenRun(stale_run))
 
         dead_server_run = self.runs / "dead-server-run"
         self._write_pane_workers(dead_server_run, {
@@ -665,7 +662,7 @@ class RosterTests(unittest.TestCase):
     def test_stopped_run_uses_the_display_staff_record(self) -> None:
         owner = unit_membership("alpha", "unit-one")
         write_text_atomic(self.director_run / unit_runs.STATE_FILE, json.dumps({
-            unit_runs.OWNER_FIELD: owner.id, "status": "active",
+            unit_runs.OWNER_FIELD: owner.id,
         }))
         (self.sessions / "director.json").unlink()
         (self.director_run / "heartbeat.log").touch()
@@ -1962,7 +1959,7 @@ class RosterTests(unittest.TestCase):
 
     def test_codex_pane_without_a_session_report_uses_its_process_identity(self) -> None:
         world = self.pane_world
-        row = fixture_member("agent", name="process-pane")
+        row = fixture_member("producer", name="process-pane")
         world.add(row, "w1:p5", family="codex")
         responses = self._herdr_sessions()
         responses["--session native agent list"]["stdout"] = json.dumps({"result": {"agents": [
@@ -2047,7 +2044,7 @@ class RosterTests(unittest.TestCase):
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
         worker["cwd"] = str(self.home / "projects" / "unit-one")
         _ = worker_path.write_text(json.dumps(worker), encoding="utf-8")
-        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         director = next(entry for entry in found.entries if entry.name == "director")
         worker_entry = next(entry for entry in found.entries if entry.name == "claude-worker")
@@ -2197,8 +2194,12 @@ class RosterTests(unittest.TestCase):
 
     def test_pane_workers_keep_their_backend_accounts_across_a_selection_change(self) -> None:
         old, current = self.account_note(1), self.account_note(2)
+        shared = current / "sessions"
+        shared.mkdir(parents=True, exist_ok=True)
+        (old / "sessions").symlink_to(shared, target_is_directory=True)
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
-            "old-impl": {"thread_id": "old-thread", "status": "running", "role": "impl"}}, codex_home=old)
+            "old-impl": {"thread_id": "old-thread", "status": "running", "role": "impl"},
+            "shared-worker": {"thread_id": "shared-thread", "status": "done"}}, codex_home=old)
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
             "new-test": {"thread_id": "new-thread", "status": "running", "role": "test"},
             "between-turns": {"thread_id": "waiting-thread", "status": "done"}}, codex_home=current)
@@ -2206,7 +2207,8 @@ class RosterTests(unittest.TestCase):
             before = self._entries()
         with mock.patch.object(agent_accounts, "workers_home", return_value=current):
             after = self._entries()
-        for name, label in (("old-impl", "codex1"), ("new-test", "codex2"), ("between-turns", "codex2")):
+        for name, label in (("old-impl", "codex1"), ("new-test", "codex2"),
+                            ("between-turns", "codex2"), ("shared-worker", "codex1")):
             with self.subTest(worker=name):
                 self.assertEqual(before[name].account, roster.AccountLabel(label))
                 self.assertEqual(after[name].account, roster.AccountLabel(label))
@@ -2483,7 +2485,7 @@ class RosterTests(unittest.TestCase):
         record = staff.snapshot()
         with (mock.patch.object(staff, "snapshot", return_value=record),
               mock.patch.object(sys, "platform", "darwin"),
-              mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")),
+              mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
             result = roster.roster(os.environ, roster.ThisMachine())
         director = next(row for row in result.entries if row.name == "director")
@@ -2500,7 +2502,7 @@ class PaneRosterTests(StaffTestCase):
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
-             mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), \
+             mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), \
              mock.patch.object(account, "process_config_dir", return_value=None), \
              mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
@@ -2588,7 +2590,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         self.runs = self.root / "runs"
         self.registry = self.root / "sessions"
         notifier = self.root / "notifier"
-        for directory in (self.runs / "active", self.registry, notifier, self.root / "home"):
+        for directory in (self.registry, notifier, self.root / "home"):
             directory.mkdir(parents=True)
         self.environment = {
             **os.environ, "HOME": str(self.root / "home"),
@@ -2656,7 +2658,9 @@ class CodexHolderLabelsTests(unittest.TestCase):
         ]
         self.addCleanup(pane_patches.clear)
         self.addCleanup(self.pane_world.process_directory.cleanup)
-        _ = (self.runs / "active" / self.director_id).write_text(str(run) + "\n")
+        row = staff.local_snapshot().by_current_session(self.director_id)
+        assert row is not None
+        _ = staff.set_run(row.id, staff.OpenRun(run))
 
     def process(self, pid: int, parent: int, argv: list[str], environment: str = "") -> None:
         directory = self.root / "proc" / str(pid)

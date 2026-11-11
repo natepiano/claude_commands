@@ -17,6 +17,7 @@ import unittest
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
 
 import unittest.mock
@@ -854,6 +855,15 @@ class FolderAuditTests(unittest.TestCase):
         named = folder_audit.makers([stray, other, prefix, project, self.rust / "unnamed"],
                                     [later, talker, child_maker, clone_maker, untimed, lister, maker])
         self.assertEqual(named, {stray: "aaaa", project: "gggg"})
+        _ = compressed_copy(maker)
+        _ = compressed_copy(clone_maker)
+        home = self.root / "maker-home"
+        projects = home / ".claude/projects"
+        projects.mkdir(parents=True)
+        (projects / "project").symlink_to(maker.parent, target_is_directory=True)
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(home)}):
+            files = folder_audit.transcripts()
+        self.assertEqual(folder_audit.makers([stray, other, prefix, project, self.rust / "unnamed"], files), named)
 
     def test_a_folder_without_a_creation_command_prints_unknown_and_gets_no_message(self) -> None:
         stray = folder(self.temp / "unproven")

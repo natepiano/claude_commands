@@ -29,12 +29,16 @@ from types import SimpleNamespace
 from typing import TextIO, cast, final, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.test_models_registry import write_registry
+from scripts.herdr import herdr_types
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import send
+from scripts.message import failed_lookup
 from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import relay_session_name
@@ -70,6 +74,9 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
+    notice_sender = mock.patch.object(failed_lookup, "send_notice")
+    _ = notice_sender.start()
+    unittest.addModuleCleanup(notice_sender.stop)
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -204,12 +211,13 @@ class RelayAccountTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / ".claude").mkdir()
+            _ = write_registry(home / ".claude/config/models.conf")
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
             for delivered, status in ((displayed, "verbatim"), (original, "NOT VERBATIM")):
                 with (
                     self.subTest(status=status),
-                    mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                    mock.patch.dict(os.environ, {"HOME": str(home), "PATH": os.environ["PATH"]}, clear=True),
                     scratch_accounts_config() as config,
                     mock.patch.object(send, "claude_binary", return_value="claude"),
                     mock.patch.object(send, "STATE", home / "message-state"),
@@ -233,9 +241,11 @@ class RelayAccountTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / ".claude").mkdir()
+            _ = write_registry(home / ".claude/config/models.conf")
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
             with (mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_CODE_SESSION_ID": "caller",
+                                              "PATH": os.environ["PATH"],
                                               "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited-memory"}, clear=True),
                   scratch_accounts_config() as config,
                   mock.patch.object(send, "claude_binary", return_value="claude"),
@@ -255,14 +265,26 @@ class RelayAccountTests(unittest.TestCase):
             home = Path(directory)
             notes = home / "notes"
             notes.mkdir()
-            with mock.patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes)}, clear=True):
-                (home / ".claude").mkdir()
+            _ = write_registry(home / ".claude/config/models.conf")
+            binaries = home / "bin"
+            binaries.mkdir()
+            binary = binaries / "claude"
+            _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
+            binary.chmod(0o755)
+            with mock.patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes),
+                                             "PATH": str(binaries) + os.pathsep + os.environ["PATH"]}, clear=True):
                 _ = (home / ".claude.json").write_text("{}")
                 for label in ("claude1", "claude3"):
                     _ = (notes / f"{label}.md").write_text(f"---\nlogin: {label}@example.invalid\n---\n")
                     self.assertEqual(accounts.setup(label), [])
                     _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
                         "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+                    catalog = accounts.account_dir(label) / "cache/model-catalog/fixture-cc.json"
+                    catalog.parent.mkdir(parents=True)
+                    _ = catalog.write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+                        "provider_alias_targets": {"sonnet": {"default": f"claude-sonnet-{label}"}},
+                        "models": [{"id": f"claude-sonnet-{label}", "min_claude_code_version": "2.1.319"}],
+                    }}}))
                 groups = accounts.groups_file()
                 groups.parent.mkdir(parents=True, exist_ok=True)
                 _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
@@ -281,6 +303,8 @@ class RelayAccountTests(unittest.TestCase):
                         self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(accounts.account_dir(expected)))
                         self.assertEqual(environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(home / ".claude"))
                         self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)
+                        command = cast(list[str], launch.call_args.args[0])
+                        self.assertEqual(command[command.index("--model") + 1], f"claude-sonnet-{expected}")
 
 
 def call(text: str, tool_id: str = "t1") -> dict[str, object]:
@@ -941,13 +965,18 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertFalse((self.root / "queue").exists())
 
     def test_nonstaff_live_name_delivers_to_its_roster_session(self) -> None:
-        entry = self.claude_row("free-session", "morty")
-        self.staff_rows.clear()
-        with mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])):
-            result = send.send(local_options(["--to", "morty", "--text", "hello", "--key", "nonstaff-name"]))
-        self.assertEqual(result.outcome, "sent")
-        self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'free-session.sock'}")
-        self.assertEqual(set(self.claims("nonstaff-name")), {"morty", "session:free-session"})
+        for target in ("morty", "queue-unit"):
+            with self.subTest(target=target):
+                entry = self.claude_row("free-session", target)
+                director = self.claude_row("director-session", "queue")
+                self.staff_rows.clear()
+                self.staff_member("director-session", "queue")
+                key = f"nonstaff-name:{target}"
+                with mock.patch.object(roster, "roster", return_value=roster.Roster([entry, director], [])):
+                    result = send.send(local_options(["--to", target, "--text", "hello", "--key", key]))
+                self.assertEqual(result.outcome, "sent")
+                self.assertEqual(self.relayed[-1].to, f"uds:{self.root / 'free-session.sock'}")
+                self.assertEqual(set(self.claims(key)), {target, "session:free-session"})
 
     def test_nonstaff_explicit_addresses_keep_their_transport(self) -> None:
         entry = self.daemon_row("free-thread")
@@ -1010,10 +1039,36 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                                    current_session=staff.StaffId("other-director"))
         resources = staff.StaffRow(staff.StaffId("resources-worker"), "worker", "resources", staff.ReportsTo(other_unit.id),
                                   current_session=staff.StaffId("resources-current"))
-        record = staff.StaffSnapshot((*record.rows, report, direct, report_unit, nested, other, other_unit, resources))
-        for target, expected in (("report/test2", direct), ("builds/resources", unit)):
+        queue = staff.StaffRow(staff.StaffId("queue-director"), "unit", "queue", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("queue-current"))
+        queue_worker = staff.StaffRow(staff.StaffId("queue-worker"), "worker", "queue", staff.ReportsTo(other_unit.id),
+                                     current_session=staff.StaffId("queue-worker-current"))
+        alpha = staff.StaffRow(staff.StaffId("alpha-director"), "unit", "alpha", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("alpha-current"))
+        alpha_unit = staff.StaffRow(staff.StaffId("alpha-unit-director"), "unit", "alpha-unit", staff.ReportsTo(runner.id),
+                                   current_session=staff.StaffId("alpha-unit-current"))
+        record = staff.StaffSnapshot((*record.rows, report, direct, report_unit, nested, other, other_unit, resources,
+                                      queue, queue_worker, alpha, alpha_unit))
+        worker_record = staff.StaffSnapshot((other, other_unit, queue_worker))
+        for target, membership, expected in (
+            ("report/test2", record, direct),
+            ("builds/resources", record, unit),
+            ("queue-unit", record, queue),
+            ("builds/queue-unit", record, queue),
+            ("alpha-unit", record, alpha_unit),
+            ("builds/alpha-unit", record, alpha_unit),
+            ("queue-unit", worker_record, send.NoStaffRecipient()),
+            ("other/builds/queue-unit", worker_record, send.NoStaffRecipient()),
+        ):
             with self.subTest(target=target):
-                self.assertEqual(send.resolve_staff_recipient(target, record), expected)
+                self.assertEqual(send.resolve_staff_recipient(target, membership), expected)
+                if target in ("queue-unit", "builds/queue-unit") and isinstance(expected, staff.StaffRow):
+                    self.assertEqual(
+                        send.resolve_recipient(target, send.LocalOnly(), roster.Roster([], []),
+                                               membership=membership, records=[]),
+                        send.QueuedStaffRecipient(f"session:{expected.current_session}", expected.name,
+                                                  str(expected.current_session)),
+                    )
 
     def test_one_staff_snapshot_supplies_resolution_and_roster(self) -> None:
         self.session("resources-current", "transport")
@@ -3059,7 +3114,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(send.pending(send.CodexQueueOwner(thread)), "")
 
     def test_codex_pending_follows_the_stable_owner_after_a_thread_change(self) -> None:
-        member = staff.StaffRow(staff.StaffId("fixed"), "agent", "Agent", staff.StaffRoot(),
+        member = staff.StaffRow(staff.StaffId("fixed"), "producer", "Agent", staff.StaffRoot(),
                                current_session=staff.StaffId("next-thread"))
         self.staff_rows = {"fixed": member}
         for thread, owner, text in (("old-thread", "fixed", "Keep this review."),
@@ -5231,10 +5286,14 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_nonstaff_peer_names_and_addresses_keep_their_transport(self) -> None:
         for address in ("session:peer", "codex:peer-thread", "worker:peer-run/impl"):
-            for target in ("morty", address):
+            for target in ("morty", address, "queue-unit"):
                 with self.subTest(address=address, target=target):
-                    self.peer([self.row("morty", address)])
+                    name = "queue-unit" if target == "queue-unit" else "morty"
+                    self.peer([self.row(name, address)])
+                    director = self.row("queue", "session:director-session", machine="natedev")
+                    self.local = self.recipient_roster([director], [])
                     self.staff_rows.clear()
+                    self.staff_member("director-session", "queue")
                     status, output, errors = self.run_main(target)
                     self.assertEqual((status, errors), (0, ""), output)
                     forwarded = self.forwarded()[-1]
@@ -5339,17 +5398,25 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.forwarded(), [])
 
     def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
-        self.local = self.recipient_roster([], ["worker source unreadable"])
+        director = self.row("queue", "codex:director-thread", machine="natedev")
+        self.local = self.recipient_roster([director], ["worker source unreadable"])
         self.peer([self.row("absent here", "codex:peer")])
-        status, output, errors = self.run_main("absent here")
-        self.assertEqual(status, 2, output + errors)
-        self.assertNotIn("worker source unreadable", errors)
-        self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
-                      + "~/.claude/scripts/message/roster.py", errors)
-        self.assertIn("--machine", errors)
-        self.assertIn("address", errors)
+        for target, expected_status in (("absent here", 2), ("queue-unit", 0)):
+            with self.subTest(target=target):
+                status, output, errors = self.run_main(target)
+                self.assertEqual(status, expected_status, output + errors)
+                if target == "absent here":
+                    self.assertNotIn("worker source unreadable", errors)
+                    self.assertIn("roster problems omitted: 1; run ~/.claude/scripts/lib/py "
+                                  + "~/.claude/scripts/message/roster.py", errors)
+                    self.assertIn("--machine", errors)
+                    self.assertIn("address", errors)
+                    self.assertEqual(self.relayed + self.daemon_calls, [])
+                else:
+                    self.assertEqual(errors, "")
+                    self.assertEqual(self.daemon_calls[-1], "director-thread")
         self.assertEqual(self.ssh_calls(), [])
-        self.assertEqual(self.relayed + self.daemon_calls, [])
+        self.assertEqual(self.relayed, [])
 
     def test_missing_live_name_is_refused_after_peer_durable_warnings(self) -> None:
         warning = 'durable role /fixture/design.json: missing or invalid repository'
@@ -5394,14 +5461,36 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_unreachable_peer_reports_one_problem_and_fails_the_send(self) -> None:
         self.staff_member("remote", "only peer")
+        director = self.row("queue", "codex:director-thread", machine="natedev")
+        self.local = self.recipient_roster([director], [])
         os.environ["SSH_SNAPSHOT"], os.environ["SSH_ROSTER_STATUS"] = "ssh: connection refused", "255"
-        status, output, errors = self.run_main("only peer")
-        self.assertEqual(status, 3, output + errors)
-        self.assertEqual(len(errors.splitlines()), 1)
-        self.assertEqual(errors, "send.py: roster problems omitted: 1; "
-                         + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
-        self.assertNotIn("not reached", errors)
-        self.assertIn("FAILED: recipient lookup failed for 'only peer'", output)
+        for target, expected_status in (("only peer", 3), ("queue-unit", 0), ("missing-peer", 3), ("missing-name", 2)):
+            if expected_status == 2:
+                self.local = roster.Roster([], [])
+                self.staff_rows.clear()
+                self.peer([])
+                os.environ["SSH_ROSTER_STATUS"] = "0"
+            with (self.subTest(target=target),
+                  mock.patch.object(failed_lookup, "report", wraps=failed_lookup.report) as report):
+                status, output, errors = self.run_main(target)
+                self.assertEqual(status, expected_status, output + errors)
+                if expected_status == 3:
+                    self.assertEqual(len(errors.splitlines()), 1)
+                    self.assertEqual(errors, "send.py: roster problems omitted: 1; "
+                                     + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
+                    self.assertNotIn("not reached", errors)
+                    self.assertEqual(output, f"FAILED: recipient lookup failed for {target!r}\n")
+                    report.assert_called_once()
+                    self.assertEqual(cast(tuple[str, ...], report.call_args.args)[:2], ("fixture sender", target))
+                elif expected_status == 2:
+                    reason = f"send.py: no staff row or live session for {target!r}"
+                    self.assertEqual(output, "")
+                    self.assertEqual(errors, reason + "\n")
+                    report.assert_called_once_with("fixture sender", target, reason)
+                else:
+                    report.assert_not_called()
+                    self.assertEqual(errors, "")
+                    self.assertEqual(self.daemon_calls[-1], "director-thread")
         self.assertEqual(self.forwarded(), [])
 
     def test_refusal_advice_matches_worker_ownership_and_socketless_claude_state(self) -> None:
@@ -5496,9 +5585,13 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             blocked = binaries / command
             _ = blocked.write_text("#!/bin/sh\necho 'unexpected external tool' >&2\nexit 91\n")
             blocked.chmod(0o755)
+        for command in ("bash", "dirname"):
+            program = shutil.which(command)
+            assert program is not None
+            (binaries / command).symlink_to(program)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
-            "CLAUDE_PYTHON": sys.executable,
             "CONF_DIR": str(self.root / "config"),
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),
@@ -5616,6 +5709,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
 
     def test_a_process_message_to_a_nondefault_account_receives_a_reply_at_the_senders_socket(self) -> None:
         (self.root / ".claude").mkdir()
+        _ = write_registry(self.root / ".claude/config/models.conf")
         _ = (self.root / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "sender@example.invalid"}}))
         executable = self.root / ".local/bin/claude"
@@ -5699,7 +5793,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         """Add one private Codex agent and its pane route."""
         from scripts.herdr import herdr
 
-        row = fixture_member("agent", name="pane-agent")
+        row = fixture_member("producer", name="pane-agent")
         self.fixture.world.add(row, "w2:p1", family="codex", workspace="w2", tab="w2:t1")
         pane_result = self.fixture.world.result
 
@@ -5742,14 +5836,12 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual([command[2] for command in prompts], ["w2:p1", "w2:p1"])
 
     def test_codex_pane_failure_reports_the_herdr_error(self) -> None:
-        from scripts.herdr import herdr
-
         row, observed = self.codex_agent()
         pane_run = self.fixture.world.run
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             if arguments[:2] == ("agent", "prompt"):
-                raise herdr.HerdrFailure("agent_prompt_stalled: private pane did not start", code="agent_prompt_stalled")
+                raise herdr_types.HerdrFailure("agent_prompt_stalled: private pane did not start", code="agent_prompt_stalled")
             return pane_run(*arguments, deadline=deadline)
 
         output = io.StringIO()
@@ -5782,15 +5874,13 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
 
     def test_stalled_prompt_routes_the_message_and_reason_to_the_holder(self) -> None:
-        from scripts.herdr import herdr
-
         message = "Detached run: stalled-run\nResult: PASS"
         pane_run = self.fixture.world.run
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             output = pane_run(*arguments, deadline=deadline)
             if arguments[:2] == ("agent", "prompt"):
-                raise herdr.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
+                raise herdr_types.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
             return output
 
         with mock.patch.object(self.fixture.world, "run", side_effect=run):

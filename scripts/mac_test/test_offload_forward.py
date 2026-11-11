@@ -80,6 +80,22 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + '~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
+            + 'cd "$HOME"/.local/state/mac-test/mirror/hana && trim_started=$(date +%s); '
+            + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
+            + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
+                          + 'config = conf.read("lint"); '
+                          + 'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
+                          + 'config.number(sweep.RECENT_KEY)))')
+            + ' "$HOME"/.local/state/mac-test/mirror/hana/target >/dev/null 2>&1; then '
+            + 'trim_status=0; else trim_status=$?; fi; '
+            + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
+            + 'if trim_size=$(du -sk "$HOME"/.local/state/mac-test/mirror/hana/target 2>/dev/null); then '
+            + 'trim_size=${trim_size%%[[:space:]]*}; '
+            + 'over_budget=$(awk -v size="$trim_size" -v budget=64 '
+            + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
+            + 'else over_budget=unknown; fi; '
+            + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
+            + '"$trim_status" "$trim_elapsed" "$over_budget"; '
             + 'if free_gib=$(df -g "$HOME"); then '
             + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
             + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
@@ -152,7 +168,13 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(fetch_contents="PNG bytes\n", fetch_answer="fetch_kib=12\nrc=0")
         stub = self.bin_directory / "command-stub"
         _ = stub.write_text(stub.read_text().replace('exit "${pull_status:-0}"',
-            'printf "Total bytes sent: 72\\nTotal bytes received: 128\\n"; exit "${pull_status:-0}"'))
+            'printf "Total bytes sent: 72\\nTotal bytes received: 128\\n"; exit "${pull_status:-0}"').replace(
+                'if [[ $remote == *fetch_kib=* ]]; then',
+                'if [[ $remote == *sweep.sweep_workspace* ]]; then\n'
+                + '    printf "mac_exit=0\\nmac_cleanup=kept\\n"\n'
+                + '    exit 0\n'
+                + 'fi\n'
+                + 'if [[ $remote == *fetch_kib=* ]]; then'))
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots/", "--target", "mac"), call_id="call-forward",
             subprocess_cli=True, separate_stderr=True,
@@ -164,11 +186,12 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assert_fetch_wire("fetched")
         self.assertIn(f"mac_test: fetched target/shots from the Mac to {landing} (12 KiB)", answer.stdout)
         events = self.events()
-        self.assertEqual([event["command"] for event in events], ["ssh", "rsync", "ssh", "ssh", "rsync"])
+        self.assertEqual([event["command"] for event in events], ["ssh", "rsync", "ssh", "ssh", "rsync", "ssh"])
         self.assertTrue(all(event["claimed"] for event in events))
         self.assertFalse(self.claim_file.exists())
-        self.assertIn("du -sk target/shots", events[-2]["args"][-1])
-        pull = events[-1]["args"]
+        self.assertIn("du -sk target/shots", events[-3]["args"][-1])
+        self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
+        pull = events[-2]["args"]
         self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_config(self.config_path).connection)])])
         self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
@@ -177,8 +200,9 @@ class OffloadForwardTests(OffloadCommandFixture):
                 for line in path.read_text().splitlines()]
         attempt = [row for row in rows if row.get("kind") == "ssh_attempt"][-1]
         transfers = cast(list[buildlog_sync.TransferBytes], attempt["transfers"])
-        self.assertEqual(transfers[-1], {"operation": "rsync_fetch", "sent_bytes": 72,
+        self.assertEqual(transfers[-2], {"operation": "rsync_fetch", "sent_bytes": 72,
                                         "received_bytes": 128, "complete": True})
+        self.assertEqual(transfers[-1]["operation"], "ssh_run")
 
     def test_fetch_missing_does_not_pull(self) -> None:
         self.configure_fetch(fetch_answer="fetch=missing\nrc=0")

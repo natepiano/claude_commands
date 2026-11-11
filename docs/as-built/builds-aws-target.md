@@ -1,10 +1,27 @@
-# AWS build target
+# AWS cloud gates and former build target
 
 ## What it is
 
-AWS is a Linux SSH build target named `aws` on host `aws-build`. It runs `test`, `check` and staged `doc` steps. `build`, `example`, `final` and lint stay on natedev. The machine is one persistent Spot `m7a.4xlarge` (x86_64, NixOS) with a retained, encrypted 500 GiB gp3 data volume at `/home`. A durable cost ledger and one spending guard refuse AWS work at either cap: `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`. The user approved the $400 monthly cap on 2026-11-01. `daily_limit_usd=20` is derived (the monthly cap / 20); the user approved it on 2026-11-03. No code may raise either cap or copy it.
+The user removed the permanent AWS build box.
+Its instance, Tailscale device, and data volumes are gone.
+Build jobs use `mac` and `natedev` only, in that order.
+Cloud gates still run merge gates and targeted tests on temporary AWS instances.
+Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
+Cloud gates boot the official NixOS image and fetch their tools at boot.
+A saved gate image was taken out of use. Five gates with it had a 32 s median; gates without it had 29 s.
+`deploy.py remove-images --approve-destroy` switches the gates to the official image. It deletes the saved gate image, the former builder image, and their snapshots.
 
-The user approved these spending and capacity values on 2026-11-03, all in `config/aws_target.conf`:
+The former builder used host `aws-build` and one persistent Spot `m7a.4xlarge` instance.
+It used NixOS and a retained, encrypted 500 GiB gp3 data volume at `/home`.
+The repository retains its controller and deployment code.
+
+The spending caps remain in `config/aws_target.conf`: `monthly_limit_usd=400` and `daily_limit_usd=20`.
+The user approved the monthly cap on 2026-11-01 and the daily cap on 2026-11-03.
+The daily cap derives from the monthly cap divided by 20.
+No code may raise either cap or copy it.
+
+The user approved these former builder settings on 2026-11-03.
+The settings remain in `config/aws_target.conf`:
 
 1. `limit_reserve_usd=3`: the spend reserve below each cap.
 2. `drain_max_minutes=60`: at a cap, no new steps start, and the box stops within 60 minutes.
@@ -15,9 +32,31 @@ The user approved these spending and capacity values on 2026-11-03, all in `conf
 The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws wrote that private file on natedev (mode 0600) from the address the user gave.
 The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
 
-The target is live. The user approved go-live on 2026-11-03. The stacks exist in `us-east-2`, and the box is instance `i-0216cf933a26bd1ea`. `offload=on`, and `targets=mac,natedev,aws` lists AWS after natedev. [The runbook](../plans/builds-aws-runbook.md) gives the steps. The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
+The shipped registry contains `targets=mac,natedev`.
+The old `offload=on` setting does not register the former AWS target.
+The user approved its historical activation on 2026-11-03.
+[The runbook](../plans/builds-aws-runbook.md) and [source design](../plans/builds-aws-design.md) record the earlier setup.
+The design's Phase 4, lint with write-back, was not built.
 
-## How it works
+## Current state and removal
+
+`report.py` reads the AWS state folder without target registration.
+Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
+`sync.hosts.aws=aws-build` maps historical steps to those comparisons without registering the former builder.
+The AWS section shows no sync status because the permanent box no longer exists.
+
+`deploy.py down --approve-destroy` can remove the remaining gate resources without restoring the former target registration.
+Teardown resolves the former builder's claim and lock paths directly from the AWS state folder.
+It preserves the existing lock and live claim checks.
+
+The controller no longer releases claims after a box stop or generation change.
+The code no longer writes `release-evidence/` through that path.
+
+## Retained builder implementation
+
+The following sections describe retained code and the historical builder setup.
+No permanent box runs these services.
+Legacy activation requires an explicit target registration.
 
 ### Target state, slots and records
 
@@ -60,7 +99,7 @@ An interruption marker reports the instance generation.
 
 ### Routing: `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`
 
-- `verify.sh <command> [PACKAGE] --target aws` pins movable steps to AWS.
+- The retained routing code supports `verify.sh <command> [PACKAGE] --target aws` only with an explicit AWS target registration.
   This includes test, check, staged doc, example, build, final, and lint judgments.
   Tree-writing lint repairs remain on natedev.
   A pinned final runs its check and tests on AWS and saves no local pass.
@@ -114,13 +153,21 @@ An interruption marker reports the instance generation.
   An install failure declines the attempt with its error text, and the job goes to normal routing.
   Toolchains stay in `~/.rustup` on `/home`, not in the image. A new volume downloads each version once, about 1.6 GB and 20 s.
   The probe measures the checkout filesystem and runs no cargo or rustc. It reads nextest and mend through `cargo-nextest` and `cargo-mend`. The runner compares rustc after it enters the mirror.
-- `release_stopped_claims` releases host claims after a confirmed stop or a generation change, and writes `release-evidence/`.
-  A generation change releases only claims with a nonempty older generation and a start time at or before the observation.
+- The controller keeps claim files after a confirmed stop or generation change.
 
 ### Status and report
 
 - `targets.read_aws_status` and `build_targets.format_aws_status` show state, spending decision, month dollars against the cap, slots per repository, cleanup state and recovery action. Status makes no AWS call, probe or write.
-- `report.py` renders `### AWS`: uptime, steps, estimated queue wait saved and cost. `aws_report.estimate_wait_saved` compares same-day natedev steps of the same kind and repository. AWS rows appear only when an AWS `SshTarget` is configured.
+- `report.py` renders `### AWS` from the AWS state folder without an SSH target registration.
+  The section shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+  Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+  The daily spend table shows bill days and estimate days after the newest bill day.
+  Historical reports omit estimate days after the report date.
+  `aws_report.estimate_wait_saved` compares natedev steps from the same day, kind, and repository.
+  The report shows one AWS section before the Mac copies section.
+  The worker records `mode` in each launch, refusal, and finish event in `cloud-gate-launches.jsonl`.
+  After result validation, the worker records `gate_s` in the finish event.
+  `gate_type_window_days` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
@@ -442,3 +489,40 @@ CREATE reservation failures and UPDATE failures include current failed resource 
 A stable failure reconciles the compute request at once. A timeout or uncertain stack status keeps the request pending.
 The helper redacts the notification address from the prepared parameters. It does not read the private address file during failure reporting.
 The same administrator session reads failure details without another passphrase prompt.
+
+## Paired speed trials
+
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one disposable gate box.
+All boxes launch after the full trial obtains its cloud slots and cost reservations.
+The trial refuses costs above the daily or monthly room.
+It does not change either limit.
+It uses the scaler service, the existing launch template, and presigned transfers.
+It reads no administrator secret.
+
+Each box checks both trees and runs a separate `module_run.py` process for every sample.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The installed guest supplies the environment and memory sampler.
+Each tested tree supplies `module_run.py` and the test module.
+Periodic log transfers stop before measurement.
+The guest transfers each sample between measurements.
+
+Stdout contains run JSON lines, module JSON lines, and one final cost JSON line.
+The module summary gives the median CPU saving across complete pairs.
+A failed or missing sample makes `all_passed` false.
+The final line contains `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate counts only this trial's boxes, allowances, and new bill-query fees.
+Unconfirmed termination uses the reserved lifetime and returns a nonzero status.
+The command terminates boxes after results, errors, or cancellation.
+Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
+
+The paired trial replaces the size/start trials.
+The twelve `gate_trial_*` settings are removed.
+The paired trial uses the existing `cloud_gate.conf` settings.

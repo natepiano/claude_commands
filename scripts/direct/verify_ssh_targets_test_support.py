@@ -125,7 +125,7 @@ from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import offload, mac_test, claim_state
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -150,6 +150,8 @@ def complete(arguments, attempt):
     with redirect_stdout(text):
         status = mac_test.command_claim(parsed, mac_test.state_paths(parsed.target), watch_claim=False)
     attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, text.getvalue(), ""))
+    if status in (0, 13):
+        controller.claim_identity = claim_state.reply_claim_identity(text.getvalue())
     actions.append("claim:" + str(status))
     after = mac_test.read_claims(mac_test.state_paths(parsed.target))
     same_path = any(claim.path in before and claim.record["pid"] == os.getpid() for claim in after)

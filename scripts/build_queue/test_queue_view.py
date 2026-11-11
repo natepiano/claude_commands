@@ -606,13 +606,13 @@ class QueueViewTests(QueueViewFixtureTests):
                     for hidden in ("idle", "2880", "2 days", "Runner.Listener"):
                         self.assertNotIn(hidden, row)
 
-    def test_running_ci_names_its_keep_aside_in_the_view_and_card(self) -> None:
+    def test_running_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
             model = self.ci_service_model(fixture, active=True)
             for source, lines in (("view", queue_view.render_view(model, 400)),
                                   ("card", queue_card.render_card(model, [], 400))):
                 with self.subTest(source=source):
-                    self.assertIn("CI keep-aside 7.0 GiB", plain(lines))
+                    self.assertNotIn("CI keep-aside", plain(lines))
 
     def test_idle_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1388,7 +1388,7 @@ class CapViewTests(QueueViewFixtureTests):
         bar = queue_view.cap_bar(room, 60, colour=True)
         self.assertEqual(plain([bar[:9]]), "█" * 9)
         self.assertEqual([span.tone for span in bar],
-            ["suggestion"] * 9 + ["warning"] * 12 + ["success"] * 5 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
+            ["suggestion"] * 9 + ["warning"] * 5 + ["success"] * 12 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
 
     def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)

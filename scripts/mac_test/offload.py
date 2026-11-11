@@ -26,12 +26,15 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from types import FrameType
 from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
-from scripts.mac_test import cargo_manifest
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+from scripts.mac_test import cargo_manifest, claim_state
+from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
 
@@ -302,6 +305,8 @@ class MacClaimFromWait:
     """A live local process owns the reservation for transfer."""
 
     owner_pid: int
+    identity: claim_state.ClaimIdentity
+    submitting_session: claim_state.SubmittingSession
 
 
 @dataclass(frozen=True)
@@ -749,6 +754,10 @@ class CliArguments(argparse.Namespace):
         self.verb: MacVerb = "nextest"
         self.kind: str = ""
         self.claim_owner_pid: int = 0
+        self.claim_id: str = ""
+        self.episode: str = ""
+        self.attempt: str = ""
+        self.claim_session: str = ""
         self.environment: list[str] = []
         self.fetch: str | None = None
 
@@ -760,6 +769,7 @@ class ProcessController:
         self.active: ActiveProcess = IDLE_PROCESS
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
         self.copy_failure_detail: str = ""
+        self.claim_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
 
     def stop(self) -> None:
         active = self.active
@@ -800,7 +810,10 @@ class ProcessController:
                 attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
             else:
                 stdout, stderr = process.communicate()
-                attempt.answer = read_claim_answer(CommandOutput(process.returncode, stdout, stderr))
+                answer = CommandOutput(process.returncode, stdout, stderr)
+                attempt.answer = read_claim_answer(answer)
+                if answer.status in (0, 13):
+                    self.claim_identity = claim_state.reply_claim_identity(stdout)
         finally:
             self.active = IDLE_PROCESS
 
@@ -937,6 +950,9 @@ class ProcessController:
                         held_status_line = ""
                         print(line, end="", flush=True)
                     cleanup = CleanupUnconfirmed()
+                    continue
+                if marker.startswith("mac_trim="):
+                    print(line, end="", flush=True)
                     continue
                 if marker.startswith("mac_cleanup="):
                     cleanup = parse_cleanup(marker.removeprefix("mac_cleanup="))
@@ -1315,6 +1331,11 @@ def parse_probe(output: str) -> ProbeResult:
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
+    identity = (claim_state.ClaimIdentity(uuid.uuid4().hex, request.call_id, uuid.uuid4().hex)
+                if isinstance(request.admission, UnclaimedMacRun) else request.admission.identity)
+    session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
+               else claim_state.session_id(request.admission.submitting_session))
+    identity_words = ["--claim-id", identity.claim_id, "--episode", identity.episode, "--attempt", identity.attempt]
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
                if isinstance(request.admission, MacClaimFromWait) else [])
@@ -1331,6 +1352,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--remote",
         config.host,
         *copy_words,
+        *identity_words,
+        "--identity", "--session", session,
         *selection,
         *handoff,
         *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
@@ -1338,6 +1361,9 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
 
 
 def release_claim(controller: ProcessController, target: str = "") -> None:
+    identity = controller.claim_identity
+    if isinstance(identity, claim_state.NoClaimIdentity):
+        return
     result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
@@ -1345,10 +1371,15 @@ def release_claim(controller: ProcessController, target: str = "") -> None:
             "release",
             "--pid",
             str(os.getpid()),
+            "--claim-id", identity.claim_id,
+            "--episode", identity.episode,
+            "--attempt", identity.attempt,
             *(["--target", target] if target else []),
         ]
     )
     if isinstance(result, CommandOutput):
+        if result.status == 0:
+            controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
         for line in result.stdout.splitlines():
             if line.startswith("copy_bytes="):
                 transfers = cast(list[buildlog_sync.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
@@ -1362,6 +1393,8 @@ def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
     if slots and (len(slots) != 1 or not slots[0].isascii() or not slots[0].isdecimal() or int(slots[0]) < 1):
         return MacClaimNotConfirmed("state", result.stdout, result.stderr)
     slot = int(slots[0]) if slots else 1
+    if result.status in (0, 13) and isinstance(claim_state.reply_claim_identity(result.stdout), claim_state.NoClaimIdentity):
+        return MacClaimNotConfirmed("state", result.stdout, result.stderr)
     if result.status == 0:
         return FreshMacClaim(slot)
     if result.status == 13:
@@ -1777,6 +1810,46 @@ def expected_instance_generation(target: str) -> str:
     return instance_generation(state_directory(target))
 
 
+def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
+    """Trim the mirror budget before the run releases its lease."""
+    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
+        return "echo mac_cleanup=skipped"
+    budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    program = (
+        'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
+        'config = conf.read("lint"); '
+        'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
+        'config.number(sweep.RECENT_KEY)))'
+    )
+    floor = shlex.quote(f"{config.free_floor_gib:g}")
+    return (
+        f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
+        + 'trim_started=$(date +%s); '
+        + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
+        + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
+        + 'trim_status=0; else trim_status=$?; fi; '
+        + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
+        + f'if trim_size=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + 'trim_size=${trim_size%%[[:space:]]*}; '
+        + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
+        + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
+        + 'else over_budget=unknown; fi; '
+        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
+        + '"$trim_status" "$trim_elapsed" "$over_budget"; '
+        + 'if free_gib=$(df -g "$HOME"); then '
+        + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
+        + 'else free_gib=; fi; '
+        + f'if awk -v free="$free_gib" -v floor={floor} '
+        + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
+        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+        + f'if rm -rf -- "$HOME"/{target}; then '
+        + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
+        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+    )
+
+
 def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
@@ -1811,31 +1884,11 @@ def remote_test_command(
     custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
-    elif custom_target:
-        cleanup_command = "echo mac_cleanup=skipped"
     else:
-        floor = shlex.quote(f"{config.free_floor_gib:g}")
-        cleanup_command = (
-            'if free_gib=$(df -g "$HOME"); then '
-            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-            + 'else free_gib=; fi; '
-            + f'if awk -v free="$free_gib" -v floor={floor} '
-            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
-            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + f'if rm -rf -- "$HOME"/{target}; then '
-            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
-        )
+        cleanup_command = remote_cleanup_command(config, request, repository)
     abandoned_sessions = ""
     if not custom_target:
-        remove_sessions = 'for session do rm -rf -- "$session" "${session%-working}.lock"; done'
-        abandoned_sessions = (
-            f'{{ find "$HOME"/{target} -maxdepth 5 -type d '
-            + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
-            + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
-            + f"-exec sh -c {shlex.quote(remove_sessions)} sh {{}} + >/dev/null 2>&1 || :; }} && "
-        )
+        abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
@@ -2261,6 +2314,14 @@ def claimed_run(
         if not linux:
             linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
+        if not linux and isinstance(request.fetch, FetchFolder):
+            cleanup = controller.stream_mac_run([
+                *ssh_prefix(config),
+                copies.remote_use_command(request_mirror(config, request, repository),
+                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
+            ])
+            remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
+                                                          else CleanupUnconfirmed()))
         seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
@@ -2556,6 +2617,8 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--filter-run", action="store_true")
     _ = run.add_argument("--copy", action="store_true")
     _ = run.add_argument("--claim-owner-pid", type=int, default=0)
+    for field in ("claim-id", "episode", "attempt", "claim-session"):
+        _ = run.add_argument("--" + field, default="")
     _ = run.add_argument("--result")
     _ = run.add_argument("--env", dest="environment", action="append", default=[])
     _ = run.add_argument("--fetch")
@@ -2568,7 +2631,7 @@ def holder_session() -> str:
     from scripts.build_hold import build_hold
 
     owner = build_hold.owning_session()
-    if isinstance(owner, build_hold.OwningSession):
+    if isinstance(owner, OwningSession):
         return owner.session_id
     return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"
 
@@ -2600,7 +2663,11 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         target=arguments.target,
         environment=tuple((name, os.environ[name]) for name in arguments.environment),
         fetch=FetchFolder(arguments.fetch.removesuffix("/")) if arguments.fetch is not None else NO_FETCH,
-        admission=MacClaimFromWait(arguments.claim_owner_pid) if arguments.claim_owner_pid else UnclaimedMacRun(),
+        admission=MacClaimFromWait(
+            arguments.claim_owner_pid,
+            claim_state.ClaimIdentity(arguments.claim_id, arguments.episode, arguments.attempt),
+            OwningSession(arguments.claim_session) if arguments.claim_session else NoOwningSession(),
+        ) if arguments.claim_owner_pid else UnclaimedMacRun(),
     )
 
 
@@ -2675,8 +2742,12 @@ def main() -> int:
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
     settings = arguments.settings
-    if not settings and arguments.target:
-        settings = str(configured_ssh_target(arguments.target).settings)
+    if arguments.target:
+        target_settings = configured_ssh_target(arguments.target).settings.expanduser().resolve()
+        if settings and Path(settings).expanduser().resolve() != target_settings:
+            cli.error(f"--settings {Path(settings).expanduser().resolve()} differs from "
+                      + f"--target {arguments.target} settings {target_settings}")
+        settings = str(target_settings)
     config = read_config(Path(settings)) if settings else read_config()
     controller = ProcessController()
     started = time.monotonic()

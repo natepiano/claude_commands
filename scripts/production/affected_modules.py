@@ -1,4 +1,4 @@
-"""Select tests from direct Python imports and transitive configuration reads.
+"""Select tests from imports, recorded reads, folder scans, and script calls.
 
 No source is imported or evaluated. Callers own certification and execution.
 """
@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 from collections import defaultdict
 from collections.abc import Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions
 from io import BytesIO
@@ -14,12 +15,18 @@ from pathlib import Path
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 from typing import cast
 
 from scripts.lib import conf
+from scripts.test_times.gate_record import (
+    ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
+    NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
+    RecursiveDirectory, WholeRepository, module_read_record,
+)
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
 
@@ -91,8 +98,12 @@ class SourceGraph:
     config_reads: dict[str, frozenset[str]]
 
 
+def path_tokens(text: str) -> frozenset[str]:
+    return frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
+
+
 def extract_facts(text: str, path: str) -> SourceFacts:
-    tokens = frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
+    tokens = path_tokens(text)
     config_reads = {Path(token).name.removesuffix(".conf") for token in tokens if token.endswith(".conf")}
     try:
         tree = ast.parse(text, filename=path)
@@ -297,21 +308,89 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     return SourceGraph(graph, tokens, config_reads)
 
 
-def transitive_config_reads(graph: SourceGraph) -> dict[str, set[str]]:
-    importers: dict[str, set[str]] = defaultdict(set)
-    for path, dependencies in graph.imports.items():
-        for dependency in dependencies:
-            importers[dependency].add(path)
-    reads = {path: set(names) for path, names in graph.config_reads.items()}
-    pending = [path for path, names in reads.items() if names]
-    while pending:
-        source = pending.pop()
-        for importer in importers[source]:
-            added = reads[source] - reads[importer]
-            if added:
-                reads[importer].update(added)
-                pending.append(importer)
-    return reads
+def latest_module_reads() -> dict[str, ModuleReadRecord]:
+    """Read each field from its newest full, non-aborted gate."""
+    from scripts.buildlog import index
+
+    _ = index.update()
+    with closing(index.read_only()) as connection:
+        rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
+            "WITH latest AS (SELECT "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
+            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
+            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
+            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
+            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
+        ).fetchall())
+    recorded: dict[str, ModuleReadRecord] = {}
+    for suite, module, config_json, folder_json, content_json in rows:
+        path = f"scripts/{suite}/{module}"
+        reads = module_read_record(json.loads(config_json) if config_json is not None else None,
+                                   json.loads(folder_json) if folder_json is not None else None,
+                                   json.loads(content_json) if content_json is not None else None)
+        previous = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
+        configs = previous.config_reads
+        if isinstance(reads.config_reads, RecordedConfigReads):
+            stems = reads.config_reads.stems
+            if isinstance(configs, RecordedConfigReads):
+                stems |= configs.stems
+            configs = RecordedConfigReads(stems)
+        folders = previous.folder_scans
+        if isinstance(reads.folder_scans, RecordedFolderScans):
+            scans = reads.folder_scans.folders
+            if isinstance(folders, RecordedFolderScans):
+                scans |= folders.folders
+            folders = RecordedFolderScans(scans)
+        contents = previous.content_reads
+        if isinstance(reads.content_reads, RecordedContentReads):
+            paths = reads.content_reads.paths
+            if isinstance(contents, RecordedContentReads):
+                paths |= contents.paths
+            contents = RecordedContentReads(paths)
+        recorded[path] = ModuleReadRecord(configs, folders, contents)
+    return recorded
+
+
+def changed_path_parents(repo: Path, changed: set[str], base_paths: set[str]) -> set[str]:
+    """Include parents only for added and removed paths."""
+    directories = {"."}
+    for path in base_paths:
+        directories.update(parent.as_posix() for parent in Path(path).parents)
+    parents: set[str] = set()
+    for path in changed:
+        if path in base_paths and os.path.lexists(repo / path):
+            continue
+        parent = Path(path).parent
+        while parent.as_posix() not in directories:
+            parent = parent.parent
+        parents.add(parent.as_posix())
+        parent = Path(path).parent
+        while parent != Path(".") and not (repo / parent).is_dir():
+            parent = parent.parent
+        parents.add(parent.as_posix())
+    return parents
+
+
+def scans_changed_paths(scans: RecordedFolderScans, changed: set[str], parents: set[str]) -> bool:
+    for folder in scans.folders:
+        match folder:
+            case WholeRepository():
+                return True
+            case ListedDirectory(path):
+                if path in parents:
+                    return True
+            case RecursiveDirectory(prefix):
+                if any(path == prefix or path.startswith(prefix + "/") for path in changed):
+                    return True
+    return False
 
 
 def retain_facts(cache_path: Path | None, cached: dict[str, SourceFacts],
@@ -335,6 +414,79 @@ def dependency_graph(repo: Path, *, state_dir: Path | None = None
     result = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
     retain_facts(cache_path, cached, before, source_blobs(paths | dirty, blobs))
     return result.imports, result.tokens
+
+
+def folder_names_of(paths: set[str]) -> dict[str, set[str]]:
+    folder_names: dict[str, set[str]] = defaultdict(set)
+    for path in paths:
+        parent = str(Path(path).parent)
+        if parent != ".":
+            folder_names[parent].add(Path(path).name)
+    return folder_names
+
+
+def names_path(tokens: frozenset[str], source: str, paths: set[str],
+               folder_names: dict[str, set[str]]) -> bool:
+    """Match a complete path, or a file name with its folder."""
+    if tokens & paths:
+        return True
+    parent = str(Path(source).parent)
+    return any(tokens & names and (parent == folder or Path(folder).name in tokens)
+               for folder, names in folder_names.items())
+
+
+def names_changed_file(graph: SourceGraph, path: str, changed: set[str],
+                       folder_names: dict[str, set[str]]) -> bool:
+    """Match file tokens in the test and its imported test-support modules."""
+    pending = [path]
+    seen: set[str] = set()
+    while pending:
+        source = pending.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        if names_path(graph.tokens.get(source, frozenset()), source, changed, folder_names):
+            return True
+        pending.extend(dependency for dependency in graph.imports.get(source, set())
+                       if dependency.endswith("_test_support.py"))
+    return False
+
+
+def is_script(repo: Path, path: str) -> bool:
+    """A non-Python file under scripts/ that ends in .sh or has an execute bit."""
+    return (path.startswith("scripts/") and not path.endswith(".py")
+            and (path.endswith(".sh") or os.access(repo / path, os.X_OK)))
+
+
+def calls_script(tokens: frozenset[str], caller: str, targets: set[str],
+                 folder_names: dict[str, set[str]]) -> bool:
+    """Shell calls also prefix a full path or a sibling name with a variable."""
+    if names_path(tokens, caller, targets, folder_names):
+        return True
+    siblings = folder_names.get(str(Path(caller).parent), set())
+    names = {Path(target).name for target in targets}
+    for token in tokens:
+        _, slash, name = token.rpartition("/")
+        if slash and name in names and (name in siblings
+                                        or any(token.endswith(f"/{target}") for target in targets)):
+            return True
+    return False
+
+
+def script_callers(repo: Path, candidates: set[str], changed: set[str]) -> set[str]:
+    """Return the changed scripts and every script that calls one, directly or through others."""
+    found = {path for path in changed if is_script(repo, path)}
+    if not found:
+        return found
+    scripts = {path: path_tokens((repo / path).read_text(encoding="utf-8", errors="replace"))
+               for path in candidates if is_script(repo, path) and (repo / path).is_file()}
+    pending = set(found)
+    while pending:
+        folder_names = folder_names_of(pending)
+        pending = {caller for caller, tokens in scripts.items()
+                   if caller not in found and calls_script(tokens, caller, pending, folder_names)}
+        found |= pending
+    return found
 
 
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
@@ -365,15 +517,20 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
         before = set(cached)
         graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-        config_reads = transitive_config_reads(graph)
         configs = {Path(path).name.removesuffix(".conf") for path in changed
                    if path.startswith("config/") and path.endswith(".conf")}
+        recorded = latest_module_reads() if changed else {}
+        has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
+        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
+        content_changes = {path for path in changed if not path.startswith("config/")}
+        base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
+        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
         retained = source_blobs(paths | dirty, blobs)
         python = {path for path in changed if path.endswith(".py")}
         removed = {path for path in python if not (repo / path).is_file()}
         old_graph: dict[str, set[str]] = {}
         if removed:
-            old_blobs = revision_files(repo, base.commit)
+            old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
             old_paths = {path for path in old_blobs if path.endswith(".py")}
             old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
             retained.update(source_blobs(old_paths, old_blobs))
@@ -382,12 +539,22 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         for source in python:
             if not is_test_module(source):
                 folder_stems[str(Path(source).parent)].add(Path(source).stem)
+        named = changed | script_callers(repo, set(blobs) | dirty, changed)
+        folder_names = folder_names_of(named)
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
+            reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
+            config_reads = reads.config_reads
+            config_changed = bool(configs) and (isinstance(config_reads, NoConfigReadRecord)
+                or bool(config_reads.stems & configs) or bool(graph.config_reads.get(path, frozenset()) & configs))
+            folder_changed = has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
+                or scans_changed_paths(reads.folder_scans, changed, scanned_parents))
+            content_changed = bool(content_changes) and has_content_records and (isinstance(reads.content_reads, NoContentReadRecord)
+                or bool(reads.content_reads.paths & content_changes))
             if (path in changed or graph.imports.get(path, set()) & python
-                    or old_graph.get(path, set()) & removed or graph.tokens.get(path, frozenset()) & changed
-                    or config_reads.get(path, set()) & configs):
+                    or old_graph.get(path, set()) & removed or names_changed_file(graph, path, named, folder_names)
+                    or config_changed or folder_changed or content_changed):
                 selected.append(module)
                 continue
             stems = folder_stems.get(str(Path(path).parent), set())
@@ -396,5 +563,5 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
                     selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
-    except (GraphError, OSError, ValueError, SyntaxError) as error:
+    except (GraphError, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
         return FullSuite(f"graph error: {error}")

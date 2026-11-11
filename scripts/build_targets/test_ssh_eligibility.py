@@ -17,6 +17,7 @@ import sys
 import tempfile
 from typing import cast, override
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -25,7 +26,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_targets import build_targets as build_targets, targets
-from scripts.mac_test import mac_test as mac_test, offload as offload
+from scripts.mac_test import claim_state, mac_test as mac_test, offload as offload
 from scripts.build_hold import build_hold
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import (
@@ -71,7 +72,7 @@ class SshEligibilityTests(unittest.TestCase):
                                                return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         book = ledger.CostLedger(mac_test.state_paths("aws").directory)
         book.record_inventory(ledger.ResourceInventory(self.now, (
             ledger.PricedResource("retained-storage", Decimal("0")),), "priced fixture inventory"))
@@ -131,6 +132,7 @@ class SshEligibilityTests(unittest.TestCase):
         args.kind, args.repo_root, args.package = "test", str(self.root), "linux-part"
         args.pid, args.target = 501, name
         args.reservation_file = str(self.root / "reservation.tsv")
+        args.claim_identity_file = str(self.root / "reservation.identity")
         args.recover_only = recover_only
         return build_targets.command_reserve(args)
 
@@ -368,8 +370,33 @@ class SshEligibilityTests(unittest.TestCase):
                 self.assertEqual((self.root / "reservation.tsv").read_text(), f"spare\t{self.root / 'spare.conf'}\n")
                 self.assertEqual(mac_test.read_claims(mac_test.state_paths("aws")), ())
                 self.assertTrue(all("fake-spare" in command for command in self.commands))
-                self.assertEqual(build_targets.command_release_wait(501), 0)
+                for name in ("aws", "spare"):
+                    for claim in mac_test.read_claims(mac_test.state_paths(name)):
+                        self.assertEqual(build_targets.command_release_wait(
+                            501, identity=claim_state.claim_identity(claim.record)), 0)
                 (self.root / "reservation.tsv").unlink()
+
+    def test_wait_release_matches_the_acquired_attempt(self) -> None:
+        self.assertEqual(self.reserve(), 0)
+        paths = mac_test.state_paths("aws")
+        fields = (self.root / "reservation.identity").read_text().split("\t")
+        previous = claim_state.ClaimIdentity(fields[0], fields[1], fields[2])
+        self.assertEqual(build_targets.command_release_wait(501, identity=previous), 0)
+        (self.root / "reservation.tsv").unlink()
+        self.assertEqual(self.reserve(), 0)
+        current, = mac_test.read_claims(paths)
+        fields = (self.root / "reservation.identity").read_text().split("\t")
+        acquired = claim_state.ClaimIdentity(fields[0], fields[1], fields[2])
+        for delayed in (previous,
+                        claim_state.ClaimIdentity(previous.claim_id, acquired.episode, acquired.attempt),
+                        claim_state.ClaimIdentity(acquired.claim_id, previous.episode, acquired.attempt),
+                        claim_state.ClaimIdentity(acquired.claim_id, acquired.episode, previous.attempt)):
+            with self.subTest(identity=delayed):
+                self.assertEqual(build_targets.command_release_wait(501, identity=delayed), 0)
+                retained, = mac_test.read_claims(paths)
+                self.assertEqual(retained.record, current.record)
+        self.assertEqual(build_targets.command_release_wait(501, identity=acquired), 0)
+        self.assertEqual(mac_test.read_claims(paths), ())
 
     def test_invalid_spending_limit_still_allows_retained_claim_cleanup(self) -> None:
         self.occupy(71)
@@ -434,7 +461,10 @@ class SshEligibilityTests(unittest.TestCase):
                 self.assertTrue(all("fake-spare" in command for command in self.commands))
                 self.assertTrue(self.commands)
                 self.assertEqual({path: path.read_bytes() for path in before}, before)
-                self.assertEqual(build_targets.command_release_wait(501), 0)
+                for name in ("aws", "spare"):
+                    for claim in mac_test.read_claims(mac_test.state_paths(name)):
+                        self.assertEqual(build_targets.command_release_wait(
+                            501, identity=claim_state.claim_identity(claim.record)), 0)
                 reservation.unlink()
 
     def test_refused_cleanup_keeps_claims_when_connection_settings_are_unusable(self) -> None:

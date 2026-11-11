@@ -32,7 +32,7 @@ The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines
 |---|---|---|
 | Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
 | Unit staff rows | `staff.json`, via `unit_lookup.doc_units` with a present worktree | unit id and worktree per row (fallback only) |
-| Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_RUN_ROOT` replaces both) | first line: the run's session directory |
+| Open runs | The director's staff row | `run` stores the run folder; `current_session` selects the director |
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
 | Staff worker rows | `staff.json`, through `staff.local_snapshot()`: rows of kind `worker` under the run's director whose backend reads `ClaudeBackend`. A running registry record counts as Claude evidence when no transcript exists yet | Claude workers |
 | Staff workers | Staff membership and backend evidence | Fixed staff id, current native session and pane state |
@@ -152,6 +152,24 @@ The two flags together cause a usage error.
 
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
 A typed name first matches an exact canonical staff path or short name. Unit names use the staff name.
+A `<name>-unit` target finds the unit `<name>` when no staff row or live session has that exact name.
+The `<name>-unit` form uses `copies.unit_owner` and matches only rows of kind `unit`.
+In a `/` path, only the last part uses the form, and the earlier parts must match the parent chain.
+
+A `RecipientLookupFailed` route or a missing recipient name calls `failed_lookup.report`.
+The detector records the sender and failed name in `failed_lookups.json` under the message state directory.
+The detector tells the sender's owner on the first failure and at most once per pair every 24 hours.
+Each notice includes the count since the last notice, the caller command line, known configuration paths, and the printed reason.
+The count stays until a notice is confirmed as sent, queued or kept.
+An in-flight notice blocks a second notice for one send budget.
+A worker's owner is its director.
+Other staff senders use their first showrunner ancestor.
+The notice addresses a staff owner by its staff id, so two units with one name stay distinct.
+Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `UNIT_ANOMALIES_TO` from `production.conf`.
+Staff senders without a parent also use `UNIT_ANOMALIES_TO`.
+The detector sends notices as `send.py` and ignores failures from that sender.
+Detector errors print one stderr line and preserve the failed send's result.
+
 A bare worker name selects a worker under the sender's own unit.
 A match only in another unit refuses delivery and lists the full paths.
 One selected staff row supplies its `current_session`. Several matching rows produce a named ambiguity error and no delivery.
