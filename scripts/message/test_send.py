@@ -30,6 +30,7 @@ from typing import TextIO, cast, final, override
 from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.test_models_registry import write_registry
 from scripts.herdr import herdr_types
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
@@ -210,12 +211,13 @@ class RelayAccountTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / ".claude").mkdir()
+            _ = write_registry(home / ".claude/config/models.conf")
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
             for delivered, status in ((displayed, "verbatim"), (original, "NOT VERBATIM")):
                 with (
                     self.subTest(status=status),
-                    mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                    mock.patch.dict(os.environ, {"HOME": str(home), "PATH": os.environ["PATH"]}, clear=True),
                     scratch_accounts_config() as config,
                     mock.patch.object(send, "claude_binary", return_value="claude"),
                     mock.patch.object(send, "STATE", home / "message-state"),
@@ -239,9 +241,11 @@ class RelayAccountTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / ".claude").mkdir()
+            _ = write_registry(home / ".claude/config/models.conf")
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
             with (mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_CODE_SESSION_ID": "caller",
+                                              "PATH": os.environ["PATH"],
                                               "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited-memory"}, clear=True),
                   scratch_accounts_config() as config,
                   mock.patch.object(send, "claude_binary", return_value="claude"),
@@ -261,14 +265,26 @@ class RelayAccountTests(unittest.TestCase):
             home = Path(directory)
             notes = home / "notes"
             notes.mkdir()
-            with mock.patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes)}, clear=True):
-                (home / ".claude").mkdir()
+            _ = write_registry(home / ".claude/config/models.conf")
+            binaries = home / "bin"
+            binaries.mkdir()
+            binary = binaries / "claude"
+            _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
+            binary.chmod(0o755)
+            with mock.patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes),
+                                             "PATH": str(binaries) + os.pathsep + os.environ["PATH"]}, clear=True):
                 _ = (home / ".claude.json").write_text("{}")
                 for label in ("claude1", "claude3"):
                     _ = (notes / f"{label}.md").write_text(f"---\nlogin: {label}@example.invalid\n---\n")
                     self.assertEqual(accounts.setup(label), [])
                     _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
                         "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+                    catalog = accounts.account_dir(label) / "cache/model-catalog/fixture-cc.json"
+                    catalog.parent.mkdir(parents=True)
+                    _ = catalog.write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+                        "provider_alias_targets": {"sonnet": {"default": f"claude-sonnet-{label}"}},
+                        "models": [{"id": f"claude-sonnet-{label}", "min_claude_code_version": "2.1.319"}],
+                    }}}))
                 groups = accounts.groups_file()
                 groups.parent.mkdir(parents=True, exist_ok=True)
                 _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
@@ -287,6 +303,8 @@ class RelayAccountTests(unittest.TestCase):
                         self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(accounts.account_dir(expected)))
                         self.assertEqual(environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(home / ".claude"))
                         self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)
+                        command = cast(list[str], launch.call_args.args[0])
+                        self.assertEqual(command[command.index("--model") + 1], f"claude-sonnet-{expected}")
 
 
 def call(text: str, tool_id: str = "t1") -> dict[str, object]:
@@ -5567,6 +5585,10 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             blocked = binaries / command
             _ = blocked.write_text("#!/bin/sh\necho 'unexpected external tool' >&2\nexit 91\n")
             blocked.chmod(0o755)
+        for command in ("bash", "dirname"):
+            program = shutil.which(command)
+            assert program is not None
+            (binaries / command).symlink_to(program)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
@@ -5687,6 +5709,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
 
     def test_a_process_message_to_a_nondefault_account_receives_a_reply_at_the_senders_socket(self) -> None:
         (self.root / ".claude").mkdir()
+        _ = write_registry(self.root / ".claude/config/models.conf")
         _ = (self.root / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "sender@example.invalid"}}))
         executable = self.root / ".local/bin/claude"

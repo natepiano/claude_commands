@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stderr
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, redirect_stderr
 from datetime import datetime
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -115,6 +116,7 @@ class TurnEndTests(unittest.TestCase):
                      for transcript in ("no final reply", "older reply"))
         cases.append(("codex", "scratch", "current"))
         cases.append(("codex", "closed", "trailing period"))
+        cases.append(("codex", "held-lock", "current"))
         for family, close, transcript in cases:
             with self.subTest(family=family, close=close, transcript=transcript):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
@@ -154,7 +156,17 @@ class TurnEndTests(unittest.TestCase):
                     self.case.fixture.world.layouts["w1:outside"] = {"type": "pane", "pane_id": pane}
                     self.case.fixture.world.locations[pane]["tab_id"] = "w1:outside"
                 notices = len(self.case.agent.notices)
-                self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
+                if close == "held-lock":
+                    with ThreadPoolExecutor(max_workers=1) as hooks:
+                        with worker_panes.worker_lock(self.case.fixture.parent.id, staff.WorkerName.parse(name)) as hold:
+                            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                            pending = hooks.submit(turn_end.handle, turn_end.hook_event(payload))
+                            with self.assertRaises(TimeoutError):
+                                _ = pending.result(timeout=0.05)
+                        self.assertEqual(pending.result(timeout=LauncherHangGuard("queued DONE hook").remaining()),
+                                         turn_end.TurnOutcome.DONE)
+                else:
+                    self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
                 self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.IGNORED)
                 self.assertEqual(len(self.case.agent.notices), notices + 1)
                 self.assertIn(f"{name}: phase 8: done; reply {self.case.reply}", self.case.agent.notices[-1])
@@ -293,6 +305,95 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
         self.assertEqual(self.case.agent.notices, [])
         self.assertEqual(self.case.agent.submitted, [])
+
+        for cause, event, closes in (
+                ("empty delivery", turn_end.EventKind.TURN_END, True),
+                ("missing prompt", turn_end.EventKind.TURN_END, False),
+                ("ended pass", turn_end.EventKind.TURN_END, True),
+                ("working turn end", turn_end.EventKind.TURN_END, True),
+                ("live run", turn_end.EventKind.TURN_END, False),
+                ("pending bootstrap", turn_end.EventKind.TURN_END, False),
+                ("no pending assignment", turn_end.EventKind.TURN_END, True),
+                ("live launcher", turn_end.EventKind.TURN_END, False),
+                ("pending assignment", turn_end.EventKind.TURN_END, False),
+                ("empty delivery", turn_end.EventKind.RUN_FINISHED, False),
+                ("empty delivery", turn_end.EventKind.STAGE_READY, False)):
+            with self.subTest(cause=cause, event=event), ExitStack() as cleanup:
+                name = (cause + "-" + event.value).replace(" ", "-")
+                opened = self.case.opened(name)
+                if cause == "pending assignment":
+                    self.case.agent.finish_after = 100
+                    self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                elif cause not in ("pending bootstrap", "no pending assignment"):
+                    instance = progress_history.begin_dispatch(self.case.run_dir, slot=name, phase="8", role="impl",
+                        worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.case.prompt, kind="impl", lens="")
+                    if cause == "missing prompt":
+                        progress_history.save_dispatch_delivery(self.case.run_dir, instance,
+                            progress_history.DispatchDelivery(f"Read the task. DONE {instance}", instance,
+                                                              str(self.case.reply)))
+                    elif cause == "ended pass":
+                        progress_history.complete_dispatch(self.case.run_dir, name, instance, status="error")
+                    elif cause == "live launcher":
+                        supervisor = cleanup.enter_context(subprocess.Popen(
+                            [sys.executable, "-c", "import sys; sys.stdin.read()", "/fixture/assign.py", "impl"],
+                            stdin=subprocess.PIPE, text=True))
+                        _ = cleanup.callback(supervisor.kill)
+                        assert supervisor.stdin is not None
+                        _ = cleanup.callback(supervisor.stdin.close)
+                        path = self.case.run_dir / "progress_history_state.json"
+                        fields = cast(dict[str, object], json.loads(path.read_text()))
+                        passed = cast(dict[str, dict[str, object]], fields["pass"])[name]
+                        passed.update(launcher_pid=supervisor.pid, launcher_command=["bash", "/fixture/assign.sh", "impl"])
+                        atomic_file.write_text_atomic(path, json.dumps(fields))
+                    elif cause == "live run":
+                        path, record = self.case.detached_record(opened.row, "idle-live-run")
+                        supervisor = cleanup.enter_context(subprocess.Popen(
+                            [sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                            stdin=subprocess.PIPE, text=True))
+                        _ = cleanup.callback(supervisor.kill)
+                        assert supervisor.stdin is not None
+                        _ = cleanup.callback(supervisor.stdin.close)
+                        record.update(status="running", pid=supervisor.pid)
+                        atomic_file.write_text_atomic(path, json.dumps(record))
+                self.case.fixture.world.locations[opened.pane]["agent_status"] = (
+                    "working" if cause == "working turn end" else "idle")
+                notices = list(self.case.agent.notices)
+                if cause == "pending bootstrap":
+                    with ThreadPoolExecutor(max_workers=1) as hooks:
+                        with worker_panes.worker_lock(self.case.fixture.parent.id, staff.WorkerName.parse(name)) as hold:
+                            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                            pending = hooks.submit(turn_end.handle, turn_end.WorkerEvent(str(opened.row.current_session), reply="ready"))
+                            with self.assertRaises(TimeoutError):
+                                _ = pending.result(timeout=0.05)
+                            instance = progress_history.begin_dispatch(self.case.run_dir, slot=name, phase="8", role="impl",
+                                worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                                prompt=self.case.prompt, kind="impl", lens="")
+                            progress_history.save_dispatch_delivery(self.case.run_dir, instance,
+                                progress_history.DispatchDelivery("The pending assignment.", instance, str(self.case.reply)))
+                            before = (self.case.run_dir / "progress_history_state.json").read_bytes()
+                        self.assertEqual(pending.result(timeout=LauncherHangGuard("queued bootstrap hook").remaining()),
+                                         turn_end.TurnOutcome.IGNORED)
+                else:
+                    before = (self.case.run_dir / "progress_history_state.json").read_bytes()
+                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.IGNORED)
+                self.assertEqual(opened.pane not in self.case.fixture.world.locations, closes)
+                self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
+                self.assertEqual(self.case.agent.notices, notices)
+                self.assertEqual(staff.by_id(opened.row.id), opened.row)
+
+        with self.subTest(cause="consultation awaits its reply"):
+            caller = self.case.opened("consultation-caller")
+            with patch.dict(os.environ, {"HERDR_PANE_ID": caller.pane, "CODEX_THREAD_ID": str(caller.row.current_session)}):
+                consultation = side_pane.open("private-consultation", worker_panes.launch_policy("impl"),
+                                              cwd=self.case.fixture.root)
+            self.assertIsInstance(consultation, side_pane.OpenSidePane)
+            assert isinstance(consultation, side_pane.OpenSidePane)
+            pid = self.case.fixture.world.foreground[consultation.pane][0]
+            process = self.case.fixture.world.processes[pid]
+            process = replace(process, identity=herdr.PaneSessionReport(process.identity.id))
+            self.case.fixture.world.processes[pid] = process
+            self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(process.current_identity))), turn_end.TurnOutcome.IGNORED)
+            self.assertIn(consultation.pane, self.case.fixture.world.locations)
 
     def test_both_completion_events_apply_the_finished_run_exception(self) -> None:
         cases = [(event, reply_state) for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED)
@@ -741,11 +842,31 @@ class TurnEndTests(unittest.TestCase):
         router = test_worker.PaneCommandRouter()
         router.setup(self, self.case.fixture.root)
         args = assign.Arguments(new_worker="astra-reviewer", summary=str(self.case.reply), policy="astra-reviewer")
-        with (patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.case.fixture.root / "holds")}),
+        hold_role = astra_roles.hold
+        bootstrap_hooks: list[Future[turn_end.TurnOutcome]] = []
+
+        def bootstrap_during_hold(role: astra_roles.AstraRole, lifetime: astra_roles.ExecProcess | astra_roles.HeldDesignRole,
+                                  staff_id: str = "") -> astra_roles.HeldRole | astra_roles.HoldWorkerUnavailable:
+            row = staff.by_id(staff.StaffId(staff_id))
+            assert row is not None
+            state = worker_panes.observe_worker(self.case.fixture.parent.id, row, staff.snapshot())
+            assert isinstance(state, worker_panes.OpenWorker)
+            self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir), progress_history.NoActiveDispatch)
+            with worker_panes.worker_lock(self.case.fixture.parent.id, staff.WorkerName.parse(row.name)) as competing:
+                self.assertIsInstance(competing, worker_panes.Kept)
+            bootstrap_hooks.append(hooks.submit(turn_end.handle, turn_end.WorkerEvent(str(row.current_session), reply="ready")))
+            self.assertIn(state.pane, self.case.fixture.world.locations)
+            return hold_role(role, lifetime, staff_id)
+
+        with (ThreadPoolExecutor(max_workers=1) as hooks,
+              patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.case.fixture.root / "holds")}),
+              patch.object(astra_roles, "hold", side_effect=bootstrap_during_hold),
               self.case.fixture.world.process_starts()):
             code = assign.execute_astra_review_herdr(args, self.case.run_dir, self.case.fixture.root,
                 self.case.prompt, dict(os.environ))
             self.assertIs(code, worker.DispatchSubmission.SUBMITTED)
+            self.assertEqual(bootstrap_hooks.pop().result(timeout=LauncherHangGuard("review bootstrap hook").remaining()),
+                             turn_end.TurnOutcome.IGNORED)
             pane = self.case.agent.submitted[-1][0]
             row = self.case.agent.row(pane)
             hold = self.case.fixture.root / "holds" / f"{row.id}.json"

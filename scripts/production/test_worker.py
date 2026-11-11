@@ -31,7 +31,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import send, sessions
 from scripts.usage import agents_log
@@ -1483,6 +1483,28 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertIsInstance(self.receipt(), worker.DispatchSubmitted)
 
+        with self.subTest(cause="prompt enters the transcript during the wait while the worker stays working"):
+            name = "accepted-during-settle"
+            opened = self.opened(name)
+            self.agent.defer_prompt_transcript = True
+            self.agent.interrupt = "prompt"
+            with self.assertRaisesRegex(OSError, "after prompt"):
+                _ = self.dispatch(name)
+            submitted = list(self.agent.submitted)
+            pane, line = submitted[-1]
+            self.fixture.world.locations[pane]["agent_status"] = "working"
+            self.fixture.world.first_turn_timeout = True
+            wait = self.fixture.world.wait_turn_end
+
+            def accept_during_wait(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+                self.agent.append(pane, "user", line)
+                return wait(pane, timeout_ms)
+
+            with patch.object(self.fixture.world, "wait_turn_end", side_effect=accept_during_wait):
+                self.assertIs(self.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+            self.assertEqual(self.fixture.world.locations[opened.pane]["agent_status"], "working")
+            self.assertEqual(self.agent.submitted, submitted)
+
     def test_done_worker_can_take_a_fix_while_its_recorder_pass_is_active(self) -> None:
         for effort in ("high", "low"):
             with self.subTest(fix_effort=effort):
@@ -1519,6 +1541,26 @@ class WorkerCommandTests(unittest.TestCase):
         self.fixture.world.first_turn_timeout = True
         self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
         self.assertEqual(self.agent.submitted, [])
+
+        with self.subTest(cause="busy assignment preserves the submitted pass"):
+            self.fixture.world.first_turn_timeout = False
+            self.agent.finish_after = 100
+            self.assertIs(self.dispatch("submitted-worker"), worker.DispatchSubmission.SUBMITTED)
+            pane = self.agent.submitted[-1][0]
+            row = self.agent.row(pane)
+            before = (self.run_dir / "progress_history_state.json").read_bytes()
+            submitted = list(self.agent.submitted)
+            self.prompt = self.run_dir / "next-prompt.md"
+            atomic_file.write_text_atomic(self.prompt, "Check the next change.\n")
+            self.fixture.world.first_turn_timeout = True
+            self.assertEqual(self.dispatch("submitted-worker"), worker.ExitCode.BUSY)
+            self.assertEqual(self.agent.submitted, submitted)
+            self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), before)
+            self.agent.complete(pane)
+            self.assertEqual(self.finish("submitted-worker"), turn_end.TurnOutcome.DONE)
+            self.assert_pass_completed(before)
+            self.assertNotIn(pane, self.fixture.world.locations)
+            self.assertEqual(staff.by_id(row.id), row)
 
     def test_dispatch_lock_blocks_a_competing_dispatch_and_role_change(self) -> None:
         opened = self.opened()
@@ -2031,6 +2073,36 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
         self.assertIn(self.agent.final, self.reply.read_text())
 
+    def test_cli_model_override_uses_the_selected_account_catalog(self) -> None:
+        _ = write_registry(self.fixture.root / "conf/models.conf", {
+            "assignments": {"direct": "claude"}, "direct.claude": {"impl": "sonnet:high"},
+        })
+        environment = claude_catalog_environment(self.fixture.root / "caller-account", {
+            "opus": "claude-opus-caller-fixture", "sonnet": "claude-sonnet-caller-fixture",
+        })
+        selected = self.fixture.root / "override-account"
+        _ = claude_catalog_environment(selected, {
+            "opus": "claude-opus-override-fixture", "sonnet": "claude-sonnet-role-fixture",
+        })
+        for index, (model, expected) in enumerate((
+            ("opus", "claude-opus-override-fixture"),
+            ("claude-opus-saved-fixture", "claude-opus-saved-fixture"),
+        )):
+            name = f"override-{index}"
+            with (self.subTest(model=model), patch.dict(os.environ, environment),
+                  patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.NamedAccount("claude2", selected)),
+                  patch.object(herdr, "launch_prepared_agent", side_effect=self.fixture.world.launch_through_herdr)):
+                code, output, errors = self.command("assign", "impl", str(self.prompt),
+                    "--session-dir", str(self.run_dir), "--slot", "impl", "--phase", "8", "--kind", "impl",
+                    "--name", name, "--reply", str(self.reply), "--model", model,
+                    "--launcher-command", json.dumps(["assign.sh", "--model", model]))
+                self.assertEqual((code, output), (0, "submitted\n"), errors)
+                pane = self.agent.submitted[-1][0]
+                self.assertEqual(self.agent.row(pane).name, name)
+                arguments = self.fixture.world.foreground[pane][2]
+                self.assertEqual(arguments[arguments.index("--model") + 1], expected)
+                self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
+
     def test_early_review_uses_one_pass_and_two_transcript_receipts(self) -> None:
         ready = self.run_dir / "final.ready"
         atomic_file.write_text_atomic(self.reply, "The previous full report.\n")
@@ -2158,7 +2230,7 @@ class WorkerCommandTests(unittest.TestCase):
         before = len(self.fixture.world.launches)
         with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(private_root)}):
             code, output, errors = self.command("restore")
-        self.assertEqual((code, output, errors), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
+        self.assertEqual((code, output, errors), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
         self.assertEqual(staff.snapshot().by_id(row.id), row)
         self.assertEqual(len(self.fixture.world.launches), before)
         self.assertNotIn(self.agent.submitted[-1][0], self.fixture.world.foreground)
@@ -2768,11 +2840,12 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         self.fixture.dispatch(opened.row, "impl", completed=True)
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
-        before = self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()
-        self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
+        before = self.fixture.staff_state(), len(self.fixture.world.launches)
+        self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
         code, output, errors = self.command("restore")
         self.assertEqual((code, output, errors), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
-        self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches), self.fixture.world.locations.copy()), before)
+        self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches)), before)
+        self.assertNotIn(opened.pane, self.fixture.world.locations)
         self.assertEqual(staff.snapshot().by_id(opened.row.id), opened.row)
         self.assertNotIn(opened.pane, self.fixture.world.foreground)
 
@@ -2795,7 +2868,7 @@ class WorkerCommandTests(unittest.TestCase):
         _ = self.fixture.world.stop(retained.row, self.fixture.world)
         self.fixture.dispatch(retained.row, "review", completed=True)
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
-        self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
+        self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches)), before)
         self.assertNotIn(retained.pane, self.fixture.world.foreground)
         self.assertNotIn(missing.pane, self.fixture.world.foreground)

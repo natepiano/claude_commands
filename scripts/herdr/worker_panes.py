@@ -635,12 +635,14 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
 
     if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
         path = _worker_lock_path(row.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return DispatchHoldsWorker("dispatch lock is held")
+        try:
+            with path.open("r") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return DispatchHoldsWorker("dispatch lock is held")
+        except FileNotFoundError:
+            pass
     live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
     if live_runs(run / "detached_runs", row.name):
         return DispatchHoldsWorker("a detached run is live")
@@ -828,6 +830,9 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
         if same_permissions and same_role:
             hook_arguments = _turn_end_arguments(policy.settings.kind)
             return not hook_arguments or hook_arguments in pairs
+        if policy.settings.kind == "claude" and ["--model", policy.settings.model] not in pairs:
+            launched = herdr.pane_native_process(info, "claude", {})
+            expected = models_registry.claude_arguments(expected, launched.environment)
         return all(expected[index:index + 2] in [actual[pos:pos + 2] for pos in range(len(actual) - 1)]
                    for index in range(0, len(expected), 2))
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
