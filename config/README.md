@@ -313,7 +313,16 @@ The installed account file supplies these settings:
 The checkout retains its source, module selection, build settings, and settings from `cloud_gate.conf`.
 These include `instance_types`, `clone_url`, `lifetime_minutes`, `module_time_limit_s`, `spot_max_usd_per_hour`, and `attempt_allowance_usd`.
 They also include `log_push_s`, `result_poll_s`, `launch_reply_tries`, `api_timeout_s`, `termination_timeout_s`, and `credential_file`.
+`spot_quota_request_vcpus=128` requests capacity for four gates with 32 vCPUs each through `deploy.py quota-request`.
 The gate records its own bid and allowance in each reservation.
+`attempt_allowance_usd` reserves non-compute costs before launch.
+Admission includes every open reservation's allowance when bills exist.
+Completed gates use bill rates for root storage and public IPv4 over their actual box hours.
+They use the bill day's S3 costs divided by that day's gate launch count.
+The ledger uses the gate day's bill, the newest earlier bill, or the oldest bill for earlier days.
+Missing cost rows contribute zero.
+The configured allowance supplies the cost when the bill has no needed rows.
+Bill pricing corrects saved estimates that still include the older configured allowance.
 The installed account limits decide whether that reservation fits.
 
 The spending guard requires usable live spending settings through `ConfigRead.origin`.

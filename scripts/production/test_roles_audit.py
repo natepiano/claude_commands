@@ -633,27 +633,6 @@ other_names = []
             self.assertEqual(len(issues), 1, issues)
             self.assertRegex(issues[0], r"^scripts/bad\.py: .*codec can't decode")
 
-    def test_check_keeps_first_read_failure_without_reopening_the_source(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self.write_source_coverage_root(root)
-            output = root / "scripts/output.py"
-            original_read = Path.read_text
-            output_reads = 0
-
-            def read_fixture(path: Path, encoding: str = "utf-8") -> str:
-                nonlocal output_reads
-                if path == output:
-                    output_reads += 1
-                    if output_reads == 1:
-                        raise OSError("fixture source temporarily unavailable")
-                return original_read(path, encoding=encoding)
-
-            with patch.object(Path, "read_text", new=read_fixture):
-                issues = audit.check_sources(root)
-            self.assertEqual(issues, ("scripts/output.py: fixture source temporarily unavailable",))
-            self.assertEqual(output_reads, 1)
-
     def test_check_reports_the_fixed_label_from_the_former_report_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -688,9 +688,9 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
             and progress_history.dispatch_completed(run, args.new_worker, matched.instance_id)):
         parent = worker_admission.parent(staff.snapshot(), run=run)
         passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(args.new_worker))
-        repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
+        repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
                       import_module("scripts.herdr.turn_end").repeat_completion_notice)
-        repeat(matched.worker_name, parent, run, passed)
+        repeat(matched.worker_name, parent, run, passed)()
         return staff_worker.DispatchSubmission.SUBMITTED
     for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
@@ -703,7 +703,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
     target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
     before = staff_worker.rows_before_launch()
-    with worker_panes.worker_lock(target.parent, target.name) as hold, ExitStack() as cleanup:
+    with ExitStack() as notices, worker_panes.worker_lock(target.parent, target.name) as hold, ExitStack() as cleanup:
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return staff_worker.ExitCode.BUSY
@@ -722,7 +722,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                 reply=Path(args.summary), policy=policy, started=current,
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
                     finish_phase="astra-review", finish_run=True),
-                launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold)
+                launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold, notices=notices)
             if result is staff_worker.DispatchSubmission.SUBMITTED:
                 _ = cleanup.pop_all()
             return result

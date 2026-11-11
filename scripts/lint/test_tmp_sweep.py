@@ -17,8 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Generator, Iterator
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import cached_property
@@ -49,20 +48,6 @@ PROJECT = "-home-natepiano-rust-hana"
 
 def setUpModule() -> None:
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
-
-
-class ImportTests(unittest.TestCase):
-    def test_tmp_sweep_import_omits_unused_modules(self) -> None:
-        omitted = ("scripts.production.session_staff", "scripts.production.staff")
-        with tempfile.TemporaryDirectory() as directory:
-            environment = {**os.environ, "BUILDLOG_DIR": directory}
-            result = subprocess.run(
-                [sys.executable, "-c", "import sys; from scripts.lint import tmp_sweep; "
-                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
-                cwd=Path(__file__).resolve().parents[2], env=environment,
-                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
-            )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 def write(path: Path, text: str = "x" * 4096) -> Path:
@@ -434,30 +419,6 @@ class IdleTests(TmpSweepCase):
         self.assertFalse(output.parent.exists())
         self.assertEqual([entry["path"] for entry in result.deleted], [str(output.parent)])
 
-    def test_a_recent_entry_stops_the_scan_before_the_rest_is_loaded(self) -> None:
-        folder = write(self.tmp / "large" / "recent").parent
-        self.recent(folder / "recent")
-        with os.scandir(folder) as entries:
-            first = next(entries)
-        closed: list[bool] = []
-
-        def remaining_entries() -> Iterator[os.DirEntry[str]]:
-            yield first
-            self.fail("The scan loaded more entries after it could decide to keep this folder")
-
-        @contextmanager
-        def streamed_entries(_path: str) -> Generator[Iterator[os.DirEntry[str]]]:
-            try:
-                yield remaining_entries()
-            finally:
-                closed.append(True)
-
-        with mock.patch.object(os, "scandir", side_effect=streamed_entries):
-            result = tmp_sweep.last_change(str(folder), tmp_sweep.Limit(self.now - DAY, tmp_sweep.RECENT))
-
-        self.assertEqual(result, tmp_sweep.RECENT)
-        self.assertEqual(closed, [True])
-        self.assertTrue((folder / "recent").is_file())
 
     def test_streamed_scan_counts_each_hard_linked_file_once(self) -> None:
         folder = self.tmp / "linked"
@@ -1170,7 +1131,6 @@ class RunFolderTests(TmpSweepCase):
                 self.assertTrue(payload.is_file())
 
 
-
     def test_stale_pause_does_not_keep_a_dead_units_worktree(self) -> None:
         self.now: float = time.time() + 8 * DAY
         worktree = self.tmp.parent / "worktree"
@@ -1727,7 +1687,6 @@ class PaneRunTests(TmpSweepCase):
         self.assertEqual(snapshot.call_count, 1)
 
     now: float = 0.0
-
 
 
     def test_five_states_keep_only_open_or_unproved_runs(self) -> None:

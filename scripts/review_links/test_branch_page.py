@@ -1,6 +1,7 @@
 """Prove branch selection and deletion with scratch records and a bare origin."""
 from __future__ import annotations
 
+import html
 import json
 import os
 import shutil
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from http.client import HTTPConnection
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode, urlsplit
 from uuid import NAMESPACE_URL, uuid5
@@ -63,7 +64,14 @@ class ScratchBranches:
                 for line in self.command("ls-remote", "--heads", "origin").splitlines()}
 
     def rows(self) -> tuple[branch_page.MergedUnitBranch, ...]:
+        return tuple(row for row in self.listing().rows if isinstance(row, branch_page.MergedUnitBranch))
+
+    def listing(self) -> branch_page.BranchListing:
         return branch_page.list_branches(self.repository, staff.snapshot(), (self.history,))
+
+    def page(self) -> branch_page.BranchPage:
+        listing = self.listing()
+        return branch_page.BranchPage(self.repository, listing.rows, "test-token", listing.unowned_total)
 
 
 @contextmanager
@@ -100,6 +108,7 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
             ("TEST-keep", "unit", "natedev", "fixed"),
             ("TEST-rejected", "unit", "natedev", "fixed"),
             ("TEST-live", "unit", "natedev", "fixed"),
+            ("TEST-active<&", "unit", "natedev", "fixed"),
             ("TEST-production", "unit", "natedev", "fixed"),
             ("TEST-unmerged", "unit", "natedev", "fixed"),
             ("TEST-no-unit", "unit", "natedev", "none"),
@@ -122,6 +131,7 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
                 continue
             identity = staff.StaffId(str(uuid5(NAMESPACE_URL, str(root / name))))
             tree = (staff.PresentWorktree(machine, fixture.live_worktree) if name == "TEST-live"
+                    else staff.PresentWorktree(machine, root / "active") if name == "TEST-active<&"
                     else staff.RemovedWorktree(machine, foreign if evidence == "foreign-fallback"
                                               else repository if evidence in ("foreign", "owner-fallback") else root / "removed" / name))
             row = staff.StaffRow(identity, "showrunner" if kind == "showrunner" else "unit", name,
@@ -155,6 +165,16 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
         _ = fixture.command("commit", "-m", "Retain former unit rows")
         _ = fixture.staff_file.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}), encoding="utf-8")
         _ = fixture.command("worktree", "add", str(fixture.live_worktree), "TEST-live")
+        _ = fixture.command("worktree", "add", "-b", "TEST-current<&", str(root / "active"), "main")
+        for number in reversed(range(12)):
+            name = f"unowned-{number:02}"
+            _ = fixture.command("checkout", "-b", name, initial)
+            date = f"2000-01-{number + 1:02}T12:00:00+00:00"
+            with patch.dict(os.environ, {"GIT_COMMITTER_DATE": date, "GIT_AUTHOR_DATE": date}):
+                _ = fixture.command("commit", "--allow-empty", "-m", f"Commit {name}")
+            _ = fixture.command("checkout", "main")
+            _ = fixture.command("merge", "--no-ff", name, "-m", f"Merge {name}")
+            fixture.merges[name] = fixture.command("rev-parse", "HEAD")
         _ = fixture.command("push", "origin", "--all")
         with (patch.dict(os.environ, {"STAFF_FILE": str(fixture.staff_file), "UNIT_HISTORY_DIR": str(history),
                                       "REVIEW_LINKS_ROOT": str(root / "reviews"), "REVIEW_LINKS_HOST": "127.0.0.1"}),
@@ -195,7 +215,8 @@ class BranchPageTests(unittest.TestCase):
                     fixture.merges["TEST-merged"] = fixture.command("-C", str(clone), "rev-parse", "HEAD")
                     _ = fixture.command("-C", str(clone), "push", "origin", "main", "TEST-merged")
                 rows = fixture.rows()
-                expected = {"TEST-merged", "TEST-keep", "TEST-rejected", "TEST-legacy", "TEST-owner-fallback", "TEST-history-only"}
+                expected = {"TEST-merged", "TEST-keep", "TEST-rejected", "TEST-legacy", "TEST-owner-fallback",
+                            "TEST-history-only", "TEST-active<&"}
                 self.assertEqual({row.name for row in rows}, expected)
                 page = branch_page.BranchPage(fixture.repository, rows, "test-token")
                 form = BranchForm()
@@ -211,6 +232,35 @@ class BranchPageTests(unittest.TestCase):
                     self.assertEqual(row.merge_date, fixture.command("show", "-s", "--format=%cI", row.merge))
                     self.assertIn(row.merge[:12], content)
                     self.assertIn(row.merge_date, content)
+                    if row.name == "TEST-active<&":
+                        current_branch = fixture.command("-C", str(fixture.root / "active"), "branch", "--show-current")
+                        self.assertNotEqual(row.name, current_branch)
+                        self.assertEqual(row.unit_status, branch_page.ActiveUnitBranch(current_branch))
+                        self.assertIn(f"Unit: {html.escape(row.unit)} — active, now on branch {html.escape(current_branch)}", content)
+                    else:
+                        self.assertEqual(row.unit_status, branch_page.InactiveUnit())
+                        self.assertIn(f"Unit: {html.escape(row.unit)} — not active", content)
+                listing = fixture.listing()
+                unowned = [row for row in listing.rows if isinstance(row, branch_page.MergedUnownedBranch)]
+                expected_unowned = [f"unowned-{number:02}" for number in range(10)]
+                self.assertEqual([row.name for row in unowned], expected_unowned)
+                eligible = fixture.remote_names() - expected - {"main", "TEST-production", "TEST-live",
+                                                               "TEST-current<&", "TEST-unmerged"}
+                self.assertEqual(listing.unowned_total, len(eligible))
+                all_rows = BranchForm()
+                full_content = branch_page.render(fixture.page()).decode("utf-8")
+                all_rows.feed(full_content)
+                self.assertEqual(all_rows.checked, [row.name for row in listing.rows])
+                self.assertIn(f"Merged, no owner recorded (10 of {len(eligible)})", full_content)
+                self.assertNotIn("TEST-production", all_rows.offered)
+                self.assertNotIn("TEST-live", all_rows.offered)
+                self.assertNotIn("TEST-current<&", all_rows.offered)
+                for row in unowned:
+                    self.assertEqual(row.commit_date, fixture.command("show", "-s", "--format=%cI", row.name))
+                    self.assertEqual(row.merge, fixture.merges[row.name])
+                    self.assertIn(row.commit_date, full_content)
+                    self.assertIn(row.merge[:12], full_content)
+                    self.assertIn(row.merge_date, full_content)
 
     def test_delete_reports_each_result_and_keeps_unchecked_branches(self) -> None:
         for state in ("unchanged", "advanced"):
@@ -234,6 +284,32 @@ class BranchPageTests(unittest.TestCase):
                 content = branch_page.render(page, results).decode("utf-8")
                 self.assertIn("TEST deletion refused", content)
                 self.assertIn("TEST-merged: deleted", content)
+                no_owner_page = fixture.page()
+                no_owner_rows = [row.name for row in no_owner_page.rows
+                                 if isinstance(row, branch_page.MergedUnownedBranch)]
+                expected_kept: set[str] = set()
+                for selection in (no_owner_rows[::2], []):
+                    with self.subTest(selection=selection):
+                        before_unowned = fixture.remote_names()
+                        kept = set(no_owner_rows) - set(selection)
+                        no_owner_results = branch_page.submit(no_owner_page, urlencode(
+                            {"token": no_owner_page.token, "branch": selection}, doseq=True))
+                        self.assertEqual([result.name for result in no_owner_results], selection)
+                        self.assertEqual(fixture.remote_names(), before_unowned - set(selection))
+                        expected_kept.update(kept)
+                        saved = cast(list[str], json.loads(
+                            (fixture.root / "reviews" / branch_page.KEPT).read_text(encoding="utf-8")))
+                        self.assertEqual(set(saved), expected_kept)
+                        self.assertTrue(kept <= fixture.remote_names())
+                        next_page = fixture.page()
+                        self.assertTrue(set(no_owner_rows).isdisjoint(row.name for row in next_page.rows))
+                        remaining_unowned = [row for row in next_page.rows
+                                            if isinstance(row, branch_page.MergedUnownedBranch)]
+                        self.assertEqual(next_page.unowned_total, no_owner_page.unowned_total - len(no_owner_rows))
+                        expected_next = ["unowned-10", "unowned-11"] if selection else []
+                        self.assertEqual([row.name for row in remaining_unowned[:2]], expected_next)
+                        no_owner_page = next_page
+                        no_owner_rows = [row.name for row in remaining_unowned]
 
     def test_invalid_or_stale_selections_preserve_remote_branches(self) -> None:
         for change in ("unlisted", "token"):
@@ -249,6 +325,28 @@ class BranchPageTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _ = branch_page.submit(page, body)
                 self.assertEqual(fixture.command("ls-remote", "--heads", "origin"), before)
+                url = branch_page.publish(fixture.repository)
+                root = fixture.root / "reviews"
+                path = urlsplit(url).path
+                manifest_path = root / path.split("/")[1] / branch_page.MANIFEST
+                original = manifest_path.read_text(encoding="utf-8")
+                for defect in ("old form", "unknown section", "extra row field", "invalid count"):
+                    with self.subTest(defect=defect):
+                        manifest = cast(dict[str, object], json.loads(original))
+                        manifest_rows = cast(list[dict[str, object]], manifest["rows"])
+                        if defect == "old form":
+                            del manifest["unowned_total"]
+                            for row in manifest_rows:
+                                del row["section"]
+                        elif defect == "unknown section":
+                            manifest_rows[0]["section"] = "other"
+                        elif defect == "extra row field":
+                            manifest_rows[-1]["unit"] = "invented"
+                        else:
+                            manifest["unowned_total"] = 0
+                        _ = manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                        with self.assertRaises(ValueError):
+                            _ = branch_page.page_at(root, path)
 
     def test_published_page_serves_checked_rows_and_deletes_through_the_form(self) -> None:
         with scratch_branches() as fixture:
@@ -256,8 +354,10 @@ class BranchPageTests(unittest.TestCase):
             _ = hook.write_text('#!/bin/sh\nif [ "$1" = refs/heads/TEST-rejected ]; then\n'
                                 + '  echo "TEST deletion refused" >&2\n  exit 1\nfi\n', encoding="utf-8")
             hook.chmod(0o755)
+            rows = fixture.listing().rows
             url = branch_page.publish(fixture.repository)
             root = fixture.root / "reviews"
+            self.assertEqual(branch_page.page_at(root, urlsplit(url).path).rows, rows)
             _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
             address = serve.tailscale_ip()
             with serve.ReviewLinksServer((address, 0), root) as server:
@@ -304,6 +404,37 @@ class BranchPageTests(unittest.TestCase):
                     response = connection.getresponse()
                     _ = response.read()
                     self.assertEqual(response.status, 404)
+                    next_url = branch_page.publish(fixture.repository)
+                    next_path = urlsplit(next_url).path
+                    next_page = branch_page.page_at(root, next_path)
+                    no_owner_rows = [row.name for row in next_page.rows
+                                     if isinstance(row, branch_page.MergedUnownedBranch)]
+                    kept_branch = no_owner_rows[0]
+                    next_body = urlencode({"token": next_page.token, "branch": no_owner_rows[1:]}, doseq=True)
+                    connection.request("POST", next_path, next_body,
+                                       {"Content-Type": "application/x-www-form-urlencoded"})
+                    response = connection.getresponse()
+                    _ = response.read()
+                    self.assertEqual(response.status, 200)
+                    connection.request("GET", next_path)
+                    response = connection.getresponse()
+                    content = response.read().decode("utf-8")
+                    self.assertEqual(response.status, 200)
+                    reopened = BranchForm()
+                    reopened.feed(content)
+                    self.assertNotIn(kept_branch, reopened.offered)
+                    self.assertIn(f"Merged, no owner recorded ({len(no_owner_rows) - 1} of {next_page.unowned_total - 1})",
+                                  content)
+                    stale_body = urlencode({"token": next_page.token, "branch": no_owner_rows}, doseq=True)
+                    before_stale = fixture.remote_names()
+                    connection.request("POST", next_path, stale_body,
+                                       {"Content-Type": "application/x-www-form-urlencoded"})
+                    response = connection.getresponse()
+                    content = response.read().decode("utf-8")
+                    self.assertEqual(response.status, 400)
+                    self.assertIn("outside this page", content)
+                    self.assertIn(kept_branch, fixture.remote_names())
+                    self.assertEqual(fixture.remote_names(), before_stale)
                 finally:
                     server.shutdown()
                     thread.join(TEST_HANG_GUARD_SECS)

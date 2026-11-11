@@ -119,10 +119,6 @@ class FindingsLedgerFixture(unittest.TestCase):
         _ = self.config_file.write_text("\n".join(lines) + "\n" + "\n".join(
             key + "=" + value for key, value in changes.items()), encoding="utf-8")
 
-    def write_partial_config(self, text: str) -> None:
-        """Write `text` as the whole file, standard limits omitted."""
-        _ = self.config_file.write_text(text, encoding="utf-8")
-
     @staticmethod
     def dispatch_arguments(arguments: tuple[str, ...]) -> tuple[str, ...]:
         # Older ledger cases exercise other rules with a valid accepted-check list.

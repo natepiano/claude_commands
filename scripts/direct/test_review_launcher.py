@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.accounts import accounts
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
 
@@ -26,7 +27,7 @@ import tempfile
 from typing import override
 from scripts.direct import wait_for_test_state
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
+from scripts.lib.test_models_registry import RegistryReadProbe, claude_catalog_environment, write_registry
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
@@ -43,31 +44,44 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(len(probe.reads()), 1, probe.reads())
 
     def test_review_helper_keeps_the_launch_generation_after_a_registry_edit(self) -> None:
-        session = self.start_implementation("review-helper-generation")
-        self.finish_implementation(session)
-        environment = self.environment()
-        registry = Path(environment["MODELS_CONFIG_FILE"])
-        _ = write_registry(registry, {"assignments": {"direct": "claude"},
-            "direct.claude": {"review": "opus:high"},
-            "claude.agents": {"opus": "high", "sonnet": "low"}})
-        _ = (self.root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"review@example.invalid"}}')
-        backend = self.root / "bin/claude"
-        backend.parent.mkdir(exist_ok=True)
-        _ = backend.write_text("#!" + sys.executable + '''
+        for catalog, expected_model in ((False, "opus"), (True, "claude-opus-review-fixture")):
+            with self.subTest(catalog=catalog):
+                session = self.start_implementation("review-helper-generation-" + expected_model)
+                self.finish_implementation(session)
+                environment = self.environment()
+                if catalog:
+                    environment["AGENT_NOTES_DIR"] = str(self.root / "account-notes")
+                    notes = Path(environment["AGENT_NOTES_DIR"])
+                    notes.mkdir()
+                    _ = (notes / "claude2.md").write_text("---\nlogin: review@example.invalid\n---\n")
+                    with patch.dict(os.environ, environment, clear=True):
+                        self.assertEqual(accounts.setup("claude2"), [])
+                        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
+                            "oauthAccount": {"emailAddress": "review@example.invalid"}}))
+                    environment.update(claude_catalog_environment(self.root / ".claude2", {"opus": expected_model}))
+                registry = Path(environment["MODELS_CONFIG_FILE"])
+                _ = write_registry(registry, {"assignments": {"direct": "claude"},
+                    "direct.claude": {"review": "opus:high"},
+                    "claude.agents": {"opus": "high", "sonnet": "low"}})
+                backend = self.root / "bin/claude"
+                backend.parent.mkdir(exist_ok=True)
+                _ = backend.write_text("#!" + sys.executable + '''
 import json, os, sys
 from pathlib import Path
+if sys.argv[1:] == ["--version"]:
+    print("2.1.319 (Claude Code)")
+    raise SystemExit(0)
 Path(os.environ["REVIEW_AGENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "environment": dict(os.environ)}))
 print(json.dumps({"type": "result", "result": "No findings."}))
 ''')
-        backend.chmod(0o755)
-        scripts = Path(__file__).resolve().parents[1]
-        helper = self.root / "scripts/agents/agent_exec.sh"
-        agent_exec = helper.with_name("agent_exec_real.sh")
-        _ = shutil.copy2(scripts / "agents/agent_exec.sh", agent_exec)
-        for name in ("claude_account.sh", "claude_result.py"):
-            _ = shutil.copy2(scripts / "agents" / name, helper.with_name(name))
-        _ = shutil.copy2(scripts / "lib/nix_env.py", self.root / "scripts/lib/nix_env.py")
-        _ = helper.write_text('''#!/usr/bin/env bash
+                backend.chmod(0o755)
+                scripts = Path(__file__).resolve().parents[1]
+                helper = self.root / "scripts/agents/agent_exec.sh"
+                agent_exec = helper.with_name("agent_exec_real.sh")
+                _ = shutil.copy2(scripts / "agents/agent_exec.sh", agent_exec)
+                _ = shutil.copy2(scripts / "agents/claude_result.py", helper.with_name("claude_result.py"))
+                _ = shutil.copy2(scripts / "lib/nix_env.py", self.root / "scripts/lib/nix_env.py")
+                _ = helper.write_text('''#!/usr/bin/env bash
 set -euo pipefail
 python3 - <<'EDIT'
 import os
@@ -77,24 +91,29 @@ path.write_text(os.environ["NEXT_REVIEW_REGISTRY"])
 EDIT
 exec bash "''' + str(agent_exec) + '''" "$@"
 ''')
-        recorded = self.root / "review-agent.json"
-        environment.update(PATH=str(backend.parent) + os.pathsep + environment["PATH"], REVIEW_AGENT=str(recorded),
-            CLAUDE_CONFIG_DIR="",
-            CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
-            NEXT_REVIEW_REGISTRY=registry.read_text().replace("review=opus:high", "review=sonnet:low"))
-        probe = RegistryReadProbe(self.root, registry)
-        result = subprocess.run(self.review_command(session, "contract", ""), env=probe.environment(environment),
-            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        launched = cast(dict[str, object], json.loads(recorded.read_text()))
-        arguments = cast(list[str], launched["arguments"])
-        self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
-        self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
-        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", cast(dict[str, str], launched["environment"]))
-        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", cast(dict[str, str], launched["environment"]))
-        self.assertIn("review=sonnet:low", registry.read_text())
-        self.assertEqual(len(probe.reads()), 1, probe.reads())
-        self.assertIn("agent=opus", (session / "review_agent_contract").read_text())
+                recorded = self.root / "review-agent.json"
+                environment.update(PATH=str(backend.parent) + os.pathsep + environment["PATH"], REVIEW_AGENT=str(recorded),
+                    CLAUDE_CONFIG_DIR=environment["CLAUDE_CONFIG_DIR"] if catalog else "",
+                    CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
+                    NEXT_REVIEW_REGISTRY=registry.read_text().replace("review=opus:high", "review=sonnet:low"))
+                probe = RegistryReadProbe(self.root, registry)
+                result = subprocess.run(self.review_command(session, "contract", ""), env=probe.environment(environment),
+                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                launched = cast(dict[str, object], json.loads(recorded.read_text()))
+                arguments = cast(list[str], launched["arguments"])
+                self.assertEqual(arguments[arguments.index("--model") + 1], expected_model)
+                self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
+                self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", cast(dict[str, str], launched["environment"]))
+                self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", cast(dict[str, str], launched["environment"]))
+                self.assertIn("review=sonnet:low", registry.read_text())
+                self.assertEqual(len(probe.reads()), 1, probe.reads())
+                self.assertIn("agent=" + expected_model, (session / "review_agent_contract").read_text())
+                started, = [event for event in self.pass_events(session.name)
+                            if event.get("event_type") == "pass_started" and event.get("pass_kind") == "review"]
+                self.assertEqual(cast(dict[str, object], started["called_agent"])["model"], expected_model)
+                self.assertIn("claude/" + expected_model + ":high", (session / "board.log").read_text())
+                self.assertIn("claude/" + expected_model + ":high", (session / "heartbeat.log").read_text())
 
     @override
     def environment(self) -> dict[str, str]:

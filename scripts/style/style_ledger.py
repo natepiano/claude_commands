@@ -320,9 +320,9 @@ class NotJudgedAgain:
 
 @dataclass(frozen=True)
 class DuplicateOf:
-    """The finding is a bare rename that a qualified rename finding of the same rule and file already holds.
+    """Another finding holds this finding's change.
 
-    The bare finding's before and after are the last `::` segments of the qualified finding's before and after.
+    A qualified rename can hold a bare rename. A whole test file move can hold its item moves.
     """
 
     finding_id: str
@@ -695,6 +695,80 @@ class JudgedCommit:
 @dataclass(frozen=True)
 class NoJudgedCommit:
     """The finding's judging ticket is not in the ledger, or names no commit in the repo."""
+
+
+@dataclass(frozen=True)
+class TestFileDestination:
+    """The declaring file and inline module that receive a sibling test file."""
+
+    path: str
+    module: str
+
+
+@dataclass(frozen=True)
+class SeparateItemMove:
+    """The repository has no single declaration for the sibling test file."""
+
+
+def sibling_test_file_destinations(sources: style_footprint.RevisionTree) -> dict[str, TestFileDestination]:
+    """Find test files with one supported declaration in the reached source files."""
+    destinations: dict[str, list[TestFileDestination]] = {}
+    test_attribute = ("#", "[", "cfg", "(", "test", ")", "]")
+    for file in sorted(sources.paths):
+        if not file.endswith(".rs"):
+            continue
+        try:
+            spans = style_footprint.token_spans(sources.text(file))
+            if any(span.token.kind == "unknown" for span in spans):
+                continue
+            words = tuple(span.token.value for span in spans)
+            items = style_footprint.source_items(words)
+            if items is None:
+                continue
+            modules = tuple(item for item in items if item.kind == "mod")
+            if not modules:
+                continue
+            crate = sources.crate(file)
+            module = style_footprint.file_module(file, crate, sources)
+            if (isinstance(module, style_footprint.OutsideCrate)
+                    or style_footprint.module_chain(module, sources, crate, {}) is not None):
+                continue
+            parent = PurePosixPath(file)
+            for item in modules:
+                if item.visibility or words[item.keyword + 2:item.end] != (";",):
+                    continue
+                attributes = words[item.start:item.keyword]
+                parts = tuple(attributes[begin:end] for begin, end in style_footprint.attribute_spans(attributes))
+                if (len(parts) not in (1, 2) or parts.count(test_attribute) != 1
+                        or tuple(word for part in parts for word in part) != attributes):
+                    continue
+                paths = tuple(part for part in parts if part != test_attribute)
+                if paths:
+                    part = paths[0]
+                    literal = (re.fullmatch(r'"([^"/\\]+)"', part[4])
+                               if len(part) == 6 and part[:4] == ("#", "[", "path", "=") and part[-1] == "]" else None)
+                    if literal is None:
+                        continue
+                    source = parent.parent / literal[1]
+                else:
+                    directory = parent.parent if parent.name in {"mod.rs", "lib.rs", "main.rs"} else parent.with_suffix("")
+                    source = directory / (item.name + ".rs")
+                path = str(source)
+                if source.name.endswith("_tests.rs") and path in sources.paths:
+                    destinations.setdefault(path, []).append(TestFileDestination(file, item.name))
+        except (style_footprint.MoveRefused, style_footprint.FootprintError, style_footprint.CheckCouldNotRun,
+                UnicodeError, IndexError, ValueError):
+            continue
+    return {path: choices[0] for path, choices in destinations.items() if len(choices) == 1}
+
+
+@dataclass(frozen=True)
+class FoldedTestFile:
+    rule: str
+    path: str
+    finding_id: str
+    before: int
+    declaring_file: str
 
 
 @dataclass(frozen=True)
@@ -2421,6 +2495,7 @@ class Ledger:
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
         self._site_rule_families: dict[str, str] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
+        self._test_file_destinations: dict[str, dict[str, TestFileDestination]] = {}
         self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
         self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
         self._crate_names: dict[tuple[str, str, str], bool] = {}
@@ -4907,10 +4982,94 @@ class Ledger:
             return CellStillHeld(held.judgment)
         return CellWaived(held.judgment)
 
+    def _test_file_destination(self, finding: HeldFinding) -> TestFileDestination | SeparateItemMove:
+        """Find the sibling test file's module declaration in its anchored repository tree."""
+        anchor, = cast(tuple[str], self._connection.execute(
+            "SELECT anchor_commit FROM held_findings WHERE finding_id=?", (finding.finding_id,),
+        ).fetchone())
+        tip = self._tip(anchor or "HEAD")
+        if tip.commit not in self._test_file_destinations:
+            tree = style_footprint.RevisionTree(self.repo, tip.commit)
+            self._test_file_destinations[tip.commit] = sibling_test_file_destinations(tree)
+        return self._test_file_destinations[tip.commit].get(finding.path, SeparateItemMove())
+
+    def _fold_test_file_group(self, findings: tuple[HeldFinding, ...]) -> tuple[FoldedTestFile, ...]:
+        """Fold one rule's unclaimed findings into the repository's whole sibling test file move."""
+        if not findings:
+            return ()
+        first = next((finding for finding in findings if isinstance(finding.state, Filed)), findings[0])
+        destination = self._test_file_destination(first)
+        if not isinstance(destination, TestFileDestination):
+            return ()
+        text = (f"Move the whole file {first.path} into the inline {destination.module} module "
+                + f"in {destination.path}.")
+        before = f"The whole test file {first.path} is a separate sibling module."
+        after = (text + " Replace its external module declaration. "
+                 + "Keep all items, imports, attributes and comments. Remove the sibling file.")
+        anchor, = cast(tuple[str], self._connection.execute(
+            "SELECT anchor_commit FROM held_findings WHERE finding_id=?", (first.finding_id,),
+        ).fetchone())
+        anchor = anchor or self._tip("HEAD").commit
+        identity = _finding_id((first.rule, first.path, "test-file-move", destination.path, destination.module, first.rule_blob, anchor))
+        existing = cast(list[tuple[str]], self._connection.execute(
+            "SELECT state FROM held_findings WHERE finding_id=?", (identity,),
+        ).fetchall())
+        if existing and existing[0][0] not in ("unfiled", "filed"):
+            return ()
+        if len(findings) == 1 and first.finding_id == identity:
+            return ()
+        now = _now()
+        proposal = str(first.state.proposal) if isinstance(first.state, Filed) else ""
+        _ = self._connection.execute(
+            "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,"
+            + "proposal,created_at,updated_at,anchor_commit) "
+            + "SELECT ?,rule,path,1,?,'restructure',?,?,rule_blob,ticket,?,?,?, ?,? "
+            + "FROM held_findings WHERE finding_id=? ON CONFLICT(finding_id) DO NOTHING",
+            (identity, text, before, after, held_state_name(first.state), proposal, now, now, anchor, first.finding_id),
+        )
+        _ = self._connection.executemany(
+            "UPDATE held_findings SET state='withdrawn',duplicate_of=?,built_at='',updated_at=? WHERE finding_id=?",
+            [(identity, now, finding.finding_id) for finding in findings if finding.finding_id != identity],
+        )
+        return (FoldedTestFile(first.rule, first.path, identity, len(findings), destination.path),)
+
+    def fold_test_files(self) -> tuple[FoldedTestFile, ...]:
+        """Fold pending sibling test file moves in one transaction and retain their item rows as duplicates."""
+        definitions = {rule.rule_id: rule for rule in self._load_rules()}
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            groups: dict[tuple[str, str], list[HeldFinding]] = {}
+            for identity, in cast(list[tuple[str]], self._connection.execute(
+                    "SELECT finding_id FROM held_findings WHERE state IN ('unfiled','filed') AND build_ticket='' "
+                    + "AND path LIKE '%_tests.rs' ORDER BY created_at,finding_id").fetchall()):
+                finding = self._held(identity)
+                definition = definitions.get(base_rule(finding.rule))
+                if definition is not None and definition.family == "modules":
+                    groups.setdefault((finding.rule, finding.path), []).append(finding)
+            return tuple(result for findings in groups.values() for result in self._fold_test_file_group(tuple(findings)))
+
     def file_held(self, finding_id: str, proposal: Path) -> None:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             finding = self._held(finding_id)
+            if isinstance(finding.state, Withdrawn) and isinstance(finding.state.by, DuplicateOf):
+                retained = self._held(finding.state.by.finding_id)
+                if retained.text.startswith("Move the whole file "):
+                    finding = retained
+                    finding_id = finding.finding_id
+            if finding.path.endswith("_tests.rs") and isinstance(finding.build_ticket, NoBuildTicket):
+                definitions = {rule.rule_id: rule for rule in self._load_rules()}
+                definition = definitions.get(base_rule(finding.rule))
+                if definition is not None and definition.family == "modules":
+                    identities = cast(list[tuple[str]], self._connection.execute(
+                        "SELECT finding_id FROM held_findings WHERE rule=? AND path=? "
+                        + "AND state IN ('unfiled','filed') AND build_ticket='' ORDER BY created_at,finding_id",
+                        (finding.rule, finding.path),
+                    ).fetchall())
+                    folded = self._fold_test_file_group(tuple(self._held(identity) for identity, in identities))
+                    if folded:
+                        finding_id = folded[0].finding_id
+                        finding = self._held(finding_id)
             if isinstance(finding.state, Filed) and finding.state.proposal == proposal:
                 return
             if not isinstance(finding.state, Unfiled):
@@ -7896,7 +8055,7 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged")),
+        ("held", ("add", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -7954,7 +8113,7 @@ def main() -> None:
                 if action == "built":
                     _ = command.add_argument("--commit", dest="merge", default=None)
                 _ = command.add_argument("--by", required=action == "unbuilt", default=None)
-            elif action != "recheck-merged":
+            elif action not in ("recheck-merged", "fold-test-files"):
                 _ = command.add_argument("--id", required=True)
                 if action == "file":
                     _ = command.add_argument("--proposal", required=True)
@@ -8114,6 +8273,11 @@ def main() -> None:
                     person_reading = ReadByPerson(cast(str, args.by).strip())
                     for finding_id in ledger.mark_unbuilt(tuple(args.ids), person_reading):
                         print(f"unbuilt {finding_id}, read by {person_reading.by}")
+                elif args.action == "fold-test-files":
+                    folded = ledger.fold_test_files()
+                    for group in folded:
+                        print(f"folded {group.rule} {group.path}: {group.before} -> 1 ({group.finding_id}) in {group.declaring_file}")
+                    print(f"folded {len(folded)} files: {sum(group.before for group in folded)} -> {len(folded)} findings")
                 elif args.action == "recheck-merged":
                     for item in ledger.recheck_merged_findings():
                         print(not_built_line(ledger.repo, item))

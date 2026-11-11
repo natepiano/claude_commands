@@ -278,7 +278,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         write_pressure_reading(pressure)
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
-            "CLAUDE_PYTHON": sys.executable,
+            "CLAUDE_PYTHON": "",
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -301,7 +301,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
-PY=$CLAUDE_PYTHON
+PY=${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}
 CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
 STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
