@@ -329,8 +329,11 @@ class WorkerCommandTests(unittest.TestCase):
         })))
         self.agent = DispatchAgent(self.fixture)
         self.agent.pane_commands(self)
-        self.run_dir = self.fixture.root / "run"
-        self.run_dir.mkdir(exist_ok=True)
+        self.run_dir = self.fixture.root / "unit" / "run"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.run_dir.parent))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"SCRATCH_ROOT": str(self.fixture.root / "scratch")})))
+        _ = staff.set_run(self.fixture.parent.id, staff.OpenRun(self.run_dir))
         atomic_file.write_text_atomic(Path.home() / ".codex/sessions" / f"{self.fixture.parent.current_session}.jsonl",
                                       json.dumps({"type": "turn_context", "payload": {
                                           "model": "fixture", "effort": "high"}}) + "\n")
