@@ -365,25 +365,19 @@ Existing boxes use their saved start and end times and the instance types in `cl
 A box without a saved instance type retains its bid rate.
 No migration is required.
 Reports use the saved AWS bill and label provisional days.
-Reports show today's spend, daily limit, successful launch count, and spend groups with amounts and percentage shares.
-Historical reports omit today's estimated spend.
+Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+Reports show daily spending, limits, run counts, and compute, storage, and other costs.
+The daily spend table shows bill days and estimate days after the newest bill day.
+Historical reports omit estimate days after the report date.
 The groups are gate compute at 32 CPU, compute at 16 CPU, storage, public IPv4, data transfer, and other.
 Compute at 16 CPU includes gates and the older builder.
-Unbilled days use the label `estimated from the newest bill` when a bill exists.
+Unbilled days use the label `estimate`.
 Spot compute includes the older Spot builder when it uses the same instance type.
-The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
+The matrix splits each day's Spot cost by box seconds and divides the cost by finished runs on billed days.
 Reports read local evidence without an AWS call or a coordination file.
 
-`### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
-`gate_type_window_days=14` sets the UTC window for the cost matrix by machine type and run kind.
-The matrix separates merge gates, targeted tests, and all runs.
-Costs per run use billed days only; each day's cost splits by box seconds.
-Counts include all finished runs in the window.
-The daily table shows median test time, median box time, and cost per run, newest day first.
-Both tables read the shared launch log and saved bills.
-Runs use their UTC completion day; box seconds include setup time.
-Old rows without a run kind remain outside the matrix; the source line shows their count.
-Missing comparisons remain unavailable. Run time differences can remain negative.
+`### AWS` shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+`gate_type_window_days=14` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.

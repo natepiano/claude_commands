@@ -2326,41 +2326,51 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
     saving = aws_report.estimate_wait_saved(connection, day, 'aws', bounds=day_range(day))
-    lines = ['### AWS', '']
-    dollars = uptime = 'unavailable'
-    ratio = 'cost per saved hour unavailable'
-    if isinstance(usage, measurement.DailyUsage):
-        dollars = f'{usage.usd:.2f}'
-        uptime = f'{usage.uptime_s / 3600:.2f}'
-    saved = 'queue wait saved unavailable'
-    if isinstance(saving.queue_saved_s, Decimal):
-        hours = saving.queue_saved_s / Decimal(3600)
-        saved = f'about {hours:.2f} h of queue wait saved'
-        ratio = 'unavailable per saved hour'
-        if isinstance(usage, measurement.DailyUsage) and hours > 0:
-            ratio = f'${usage.usd / hours:.2f} per saved hour'
-    lines.append(f'AWS: up {uptime} h, {saving.steps} steps, {saved} for ${dollars} ({ratio}, estimated).')
-    if isinstance(saving.run_saved_s, Decimal):
-        lines.append(f'Estimated run time saved: {saving.run_saved_s / Decimal(3600):.2f} h. Negative differences remain included.')
-    else:
-        lines.append('Estimated run time saved: unavailable; matching command comparisons are missing.')
+    today = datetime.fromtimestamp(instant, UTC).date().isoformat()
+    current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
+    last_estimate_day = today if current_report else day
+    newest_bill_day = max((spend.day for spend in spends if spend.source == 'AWS bill'), default='')
+    shown = sorted((spend for spend in spends if spend.source == 'AWS bill'
+                    or newest_bill_day < spend.day <= last_estimate_day),
+                   key=lambda spend: spend.day, reverse=True)
+    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, daily_limit, today)]
+    notes: list[str] = []
+    if saving.steps > 0:
+        dollars = uptime = 'unavailable'
+        ratio = 'cost per saved hour unavailable'
+        if isinstance(usage, measurement.DailyUsage):
+            dollars = f'{usage.usd:.2f}'
+            uptime = f'{usage.uptime_s / 3600:.2f}'
+        saved = 'queue wait saved unavailable'
+        if isinstance(saving.queue_saved_s, Decimal):
+            hours = saving.queue_saved_s / Decimal(3600)
+            saved = f'about {hours:.2f} h of queue wait saved'
+            ratio = 'unavailable per saved hour'
+            if isinstance(usage, measurement.DailyUsage) and hours > 0:
+                ratio = f'${usage.usd / hours:.2f} per saved hour'
+        notes.append(f'AWS: up {uptime} h, {saving.steps} steps, {saved} for ${dollars} ({ratio}, estimated).')
+        if isinstance(saving.run_saved_s, Decimal):
+            notes.append(f'Estimated run time saved: {saving.run_saved_s / Decimal(3600):.2f} h. Negative differences remain included.')
+        else:
+            notes.append('Estimated run time saved: unavailable; matching command comparisons are missing.')
     if isinstance(snapshot, measurement.MeasurementUnavailable):
-        lines.append(f'AWS measurement unavailable: {snapshot.reason}.')
+        notes.append(f'AWS measurement unavailable: {snapshot.reason}.')
     else:
-        for reading in snapshot.charge_reads:
-            if ledger.is_billed_day(reading) and reading.period_end <= instant:
-                lines.extend(aws_report.bill_lines(reading, directory))
-        today = datetime.fromtimestamp(instant, UTC).date().isoformat()
-        current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
-        for spend in spends:
-            if spend.source == 'AWS bill' or (current_report and spend.day == today):
-                lines.extend(aws_report.spend_lines(spend, daily_limit, today=spend.day == today))
+        fees = sum((spend.query_usd for spend in shown), Decimal(0))
+        bill_read = ''
+        if snapshot.charge_reads:
+            at = max(reading.at for reading in snapshot.charge_reads)
+            bill_read = datetime.fromtimestamp(at, user_zone()).strftime('Bill read %Y-%m-%d %H:%M %Z. ')
+        notes.append(f'{bill_read}Ledger query fees for these days: ${fees:.2f}.')
+    notes.append('Spot compute can include the older Spot builder.')
     try:
         days = conf.read(settings).whole('gate_type_window_days')
-        lines.extend(aws_report.gate_type_lines(directory, day, days))
+        comparison = aws_report.gate_type_report(directory, day, days)
+        lines.extend(comparison.tables)
+        notes.append(comparison.source)
     except (OSError, ValueError, ArithmeticError, KeyError) as error:
-        lines.append(f'Gate type comparison unavailable: {error}.')
-    return [*lines, '']
+        notes.append(f'Gate type comparison unavailable: {error}.')
+    return [*lines, *(f'- {note}' for note in notes), '']
 
 
 def lead_block(

@@ -45,11 +45,11 @@ export TZ="${zone:-America/New_York}"
 [ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
 counts=
-# zsh otherwise aborts on an empty notifier glob before jq can render the line.
-[ -z "${ZSH_VERSION:-}" ] || setopt nonomatch
 # bash has EPOCHSECONDS built in; a shell with neither leaves a deferred question to the next change.
 [ -z "${ZSH_VERSION:-}" ] || zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
-for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/conf; do
+# Staff ids contain no spaces. Select owners before reading their timer folders.
+for identity in $(jq -r '.rows[]? | select(.kind == "showrunner") | .id' "$staff" 2>/dev/null); do
+  conf="${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$identity/conf"
   [ -f "$conf" ] && [ -r "$conf" ] || continue
   instance=${conf%/conf}
   target=
