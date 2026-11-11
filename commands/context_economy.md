@@ -4,7 +4,9 @@ description: Report context costs and compare saved results.
 
 Use `report` when `$ARGUMENTS` is empty or starts with `--`.
 Otherwise use `$ARGUMENTS` unchanged.
-Run `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py <arguments>` and print its output as it arrives.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py <arguments>`.
+For `changes`, remove `--raw` from the arguments. Without `--raw`, print only the summary in <ChangesSummary/>.
+For all other commands, and for `changes --raw`, print the output as it arrives.
 
 1. `report [--since TIME] [--until TIME] [--role ROLE] [--by settings|week]` shows each quantity.
 2. `save NAME [--since TIME] [--until TIME]` saves a result and refuses an existing name.
@@ -31,3 +33,14 @@ Compressed files without a summary use the shared zstd reader once.
 Entries whose plain source files are compressed or deleted remain protected from eviction.
 Long reads show file progress on stderr, including the Mac read.
 `progress_seconds` in the same config sets the update interval.
+
+<ChangesSummary>
+Write in Simplified Technical English. Take each measured number from the output.
+
+1. For each settings change, write one heading: the date, the machine, and the setting `old -> new`. Under it, put one table with the columns `Role | Verdict | Moved (before -> after)`. Give one row per judged role. Name up to three measures that moved, with their values. For `no clear change`, write `no measure moved`.
+2. Under each table, write one line: `Also changed in this window:` and the other changes, in short words.
+3. Write one line: `Trust:` low, medium or high, and why. Name the session counts, and the other changes that can cause the same movement.
+4. Write one line: `Next step:` one test that separates the change from the confounds. Propose the setting, the days and the sessions on each side.
+
+Changes with no judged role share one line at the end. End with: `Full report: /context_economy changes <same arguments> --raw`.
+</ChangesSummary>
