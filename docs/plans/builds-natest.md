@@ -2637,3 +2637,60 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - 19 modules read over 500 repository files (the largest about 1,700), so almost every change under `scripts/` selects them.
 
 **Ruled out:** a `dir_fd` fix, because no current reader needs it.
+
+### Phase 132 — A script change runs the scan checks that read it, not the slower tests beside them  · status: done
+**Depends on:** Phase 131
+
+#### Work Order
+
+**Goal:** In nine test modules, the test that scans the repository's own scripts moves into its own small module. A script change then selects only the scan module, not the slower fixture tests beside it. The duplicate `lib/test_nix_env_integration.py` goes.
+
+**Decision:** Builds showrunner, 2026-11-11: add-on 2 current, as Phase 132. Get each test owner's go before a split. Send the before and after replay at the checkpoint.
+
+**Spec:**
+1. For each module below, move the named scan tests into a new module `test_<stem>_sources.py` in the same folder. Move each scan helper only when no test that stays uses it. When a test that stays uses it, the new module imports the helper by name from the original module. Never import a `TestCase` class or a module object: the loader must find each test once. Keep each assertion unchanged. The original module keeps every other test.
+
+   | Module | Scan tests that move | Module CPU s | Scan CPU s |
+   | --- | --- | --- | --- |
+   | `copies/test_copy_guard.py` | `test_repository_build_copy_makers_have_no_transitional_exemptions` | 30.6 | 18.2 |
+   | `astra/test_design_roles.py` | `LiveDesignRoleNamesTests` | 14.2 | 3.2 |
+   | `lib/test_process_group.py` | `ProcessGroupSourceTests` | 19.2 | 12.2 |
+   | `message/test_session_send.py` | `test_sender_callers_install_the_guard_in_set_up_module` | 11.7 | 4.8 |
+   | `accounts/test_launch_accounts.py` | `test_all_python_claude_launchers_use_the_shared_account_resolver`, `test_shell_launchers_do_not_pick_or_set_an_unresolved_account` | 10.0 | 6.0 |
+   | `lib/test_claude_launch_scan.py` | `test_repository_launches_go_through_nix_env` | 9.2 | 5.2 |
+   | `notify/test_push_texts.py` | `test_each_script_delivery_uses_the_registry`, `test_only_pushover_posts_to_pushover` | 8.9 | 5.0 |
+   | `lib/test_py_floor.py` | `test_every_script_parses_at_the_interpreter_floor` | 8.2 | 5.0 |
+   | `direct/test_one_launch_path.py` | `test_only_assign_starts_or_follows_workers` | 7.2 | 4.1 |
+
+   A named test that does not read the repository stays. A test not named that reads 50 or more repository files moves. The writer reports each such change.
+2. Delete `scripts/lib/test_nix_env_integration.py`. Its `load_tests` runs every test of `lib/test_claude_launch_scan.py` a second time (9.4 CPU s per full gate). The gate already runs `lib/test_claude_launch_scan.py` as its own module, and nothing else names the file.
+3. Leave these broad readers as they are, and name them in the phase report:
+   - `lib/test_one_hang_guard.py`, `lib/test_process_failure.py` and `agents/test_no_old_model_names.py` are almost only their scan.
+   - `production/test_staff_accessors.py` and `lib/test_user_zone.py` cost under 1 CPU s.
+   - `production/test_update_registration_commands.py`, `build_queue/test_memory_feed.py`, `aws_target/test_control.py` and `mac_test/test_floor_sweep.py` copy the scripts tree and run the copy in a child process. Their read records are a correct over-approximation of the child's imports.
+4. Measure (director): over the changed paths of the last 10 builds merges, the targeted module count and CPU before and after. The after side lays the new modules' local `module_run.py` records over the last full cloud gate's records.
+
+**Files:**
+- `scripts/copies/test_copy_guard.py`, `scripts/copies/test_copy_guard_sources.py` — new scan module; owner builds verify-unit
+- `scripts/astra/test_design_roles.py`, `scripts/astra/test_design_roles_sources.py` — new scan module; owner sdlc panes-unit
+- `scripts/lib/test_process_group.py`, `scripts/lib/test_process_group_sources.py` — new scan module; owner sdlc devtools-unit
+- `scripts/message/test_session_send.py`, `scripts/message/test_session_send_sources.py` — new scan module; owner sdlc devtools-unit
+- `scripts/direct/test_one_launch_path.py`, `scripts/direct/test_one_launch_path_sources.py` — new scan module; owner sdlc devtools-unit
+- `scripts/accounts/test_launch_accounts.py`, `scripts/accounts/test_launch_accounts_sources.py` — new scan module; owner natedev accounts-unit
+- `scripts/lib/test_claude_launch_scan.py`, `scripts/lib/test_claude_launch_scan_sources.py`, `scripts/lib/test_nix_env_integration.py` — new scan module, deleted duplicate; owner natedev efficiency-unit
+- `scripts/lib/test_py_floor.py`, `scripts/lib/test_py_floor_sources.py` — new scan module; owner natedev efficiency-unit
+- `scripts/notify/test_push_texts.py`, `scripts/notify/test_push_texts_sources.py` — new scan module; owner natedev messaging-unit
+
+**Workers:** 2 writers. The modules share no file, so they split by owner production.
+- impl: the builds and natedev modules (copy guard, launch accounts, claude launch scan, nix env integration, py floor, push texts).
+- impl2: the sdlc modules (design roles, process group, session send, one launch path).
+
+**Goes:** 2026-11-11: builds for verify-unit's file; natedev for accounts-unit, efficiency-unit and messaging-unit; sdlc for panes-unit and devtools-unit. The builds-natest-streamline-a.md row for `test_nix_env_integration.py` is a past measurement and stays.
+
+**Acceptance gate:**
+- Each original module and each new module passes through `python3 scripts/test_times/module_run.py scripts/<folder> <file>`. Per pair, the test count of the original before the phase equals the sum after.
+- With `TEST_TIMES_OUT` set, each original module records fewer than 50 `content_reads`, and each new module records the scan's reads.
+- For each moved test, a planted defect in a tempdir copy fails the new module (for example, an unguarded start in a copied script for the launch scan).
+- `lib/test_claude_launch_scan.py` runs each of its tests once in the gate; no other module loads them.
+- basedpyright reports 0 errors, 0 warnings, 0 notes on every changed file.
+- The phase is a selection fix, not a speed phase. It reports the Spec item 4 replay and the full-gate CPU change (new module starts against the deleted duplicate).
