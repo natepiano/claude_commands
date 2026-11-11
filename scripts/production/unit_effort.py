@@ -30,8 +30,8 @@ from scripts.lib import models_registry
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 ROW = "production.director"
 USAGE = "usage: unit_effort.py <level> [--check]"
-READ_ROW = ('source "$1" && models_launch_configuration && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" '
-            + '"$AGENT_MODEL" "$AGENT_EFFORT" "$(_models_registry_get "$AGENT_FAMILY.agents" "$AGENT_MODEL")"')
+READ_ROW = ('source "$1" && models_launch_configuration && agents_resolve production.director && printf "%s\\n%s\\n%s\\n%s\\n" '
+            + '"$AGENT_MODEL" "$AGENT_WORD" "$AGENT_EFFORT" "$(_models_registry_get "$AGENT_FAMILY.agents" "$AGENT_WORD")"')
 # How many lines up from the bottom a form is looked for when no input box is on screen.
 BOTTOM_LINES = 25
 SGR = re.compile(r"\x1b\[([0-9;:]*)m")
@@ -43,8 +43,9 @@ RULE = "──"
 
 class DirectorRow(NamedTuple):
     model: str
+    word: str
     effort: str
-    # The efforts the registry lets this model take.
+    # The registry permits these efforts for the family word.
     allowed: list[str]
 
 
@@ -68,16 +69,16 @@ def director_row(base: models_registry.RegistryEditBase) -> DirectorRow:
                           capture_output=True, text=True, check=False,
                           env=models_registry.LaunchModelConfiguration(*base).environment(os.environ))
     values = done.stdout.splitlines()
-    if done.returncode != 0 or len(values) != 3 or not values[0]:
+    if done.returncode != 0 or len(values) != 4 or not values[0]:
         errors = [line for line in done.stderr.splitlines() if line.startswith("ERROR:")]
         raise OSError(errors[0] if errors else f"cannot resolve {ROW}")
-    model, effort, allowed = values
-    return DirectorRow(model, effort, [item.strip() for item in allowed.split(",") if item.strip()])
+    model, word, effort, allowed = values
+    return DirectorRow(model, word, effort, [item.strip() for item in allowed.split(",") if item.strip()])
 
 
-def set_row(model: str, level: str, base: models_registry.RegistryEditBase) -> str:
-    """Publish the shared launch row at `<model>:<level>`; empty on success, else why not."""
-    done = subprocess.run(["bash", str(AGENTS / "default_models.sh"), ROW, f"{model}:{level}"],
+def set_row(word: str, level: str, base: models_registry.RegistryEditBase) -> str:
+    """Publish the family word and effort in the registry. Return an empty string on success."""
+    done = subprocess.run(["bash", str(AGENTS / "default_models.sh"), ROW, f"{word}:{level}"],
                           capture_output=True, text=True, check=False,
                           env=base.environment(os.environ))
     if done.returncode == 0:
@@ -216,7 +217,7 @@ def run(level: str, check: bool) -> int:
     except OSError as error:
         print(f"unit_effort: {error}", file=sys.stderr)
         return 1
-    problem = "" if check or row.effort == level else set_row(row.model, level, base)
+    problem = "" if check or row.effort == level else set_row(row.word, level, base)
     if problem:
         print(f"unit_effort: nothing sent; {ROW} was not changed: {problem}", file=sys.stderr)
         return 1
