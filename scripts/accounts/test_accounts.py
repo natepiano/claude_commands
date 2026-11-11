@@ -6533,9 +6533,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
         resets = datetime.now(timezone.utc) + timedelta(days=3)
-        usage_store.save([self.reading(
-            "main@example.invalid", agent_accounts.Quota("5-hour", 50.0, resets), agent_accounts.Quota("Weekly", 50.0, resets),
-        )], datetime.now(timezone.utc))
+        report = self.reading("main@example.invalid", agent_accounts.Quota("5-hour", 50, resets),
+                              agent_accounts.Quota("Weekly", 50, resets))
+        usage_store.save([report], datetime.now(timezone.utc))
         setting = resets.astimezone(ZoneInfo("Europe/Paris")).strftime("%a %m-%d %H:%M %Z")
 
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
@@ -6543,6 +6543,53 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual(self.status_rows()[0][4], setting)
             with patch.object(showrunners, "registered_showrunners", side_effect=OSError("session records unreadable")):
                 self.assertEqual(self.status_rows()[0][4], setting)
+            def failed_discovery() -> None:
+                print("skipping fixture-showrunner: no showrunner staff row", file=sys.stderr)
+                raise OSError("session records unreadable")
+
+            saved = role_map.CachedAfterFetchFailure(datetime(2026, 10, 16, 15, 24, tzinfo=timezone.utc),
+                                                     "fixture transport failed")
+            with (patch.object(showrunners, "registered_showrunners", side_effect=failed_discovery) as discovery,
+                  patch.object(role_map, "observed_map_provenance", return_value=saved)):
+                code, output, errors = self.run_cli("status")
+            self.assertEqual((code, errors), (0, ""))
+            self.assertIn(setting, output)
+            self.assertIn(saved.at.astimezone(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d %H:%M %Z"), output)
+            self.assertNotIn("skipping fixture-showrunner", output)
+            discovery.assert_not_called()
+
+            usage_store.store_file().unlink()
+            self.live[accounts.account_dir("claude2")] = replace(report,
+                store_warnings=(agent_accounts.UsageClaimFailed("fixture claim denied"),))
+            with (patch.object(showrunners, "registered_showrunners", side_effect=failed_discovery) as discovery,
+                  patch.object(accounts, "datetime", RoleWriteTime)):
+                code, output, errors = self.run_cli("status")
+            self.assertEqual((code, errors), (0, ""))
+            read_at = RoleWriteTime.now(timezone.utc).astimezone(ZoneInfo("Europe/Paris"))
+            self.assertIn(f"fixture claim denied; read at {read_at:%Y-%m-%d %H:%M %Z}", output)
+            self.assertIn("usage store read continued without a hold", output)
+            self.assertIn(setting, output)
+            self.assertNotIn("skipping fixture-showrunner", output)
+            discovery.assert_not_called()
+
+            self.live.clear()
+            _ = self.workers_fixture()
+            usage_store.save([report, *(agent_accounts.Report("Codex", email=login,
+                five_hour=agent_accounts.Quota("5-hour", 100, resets),
+                quotas=[agent_accounts.Quota("Weekly", 100, resets)], credit_balance="0")
+                for login in ("target@example.invalid", "default@example.invalid"))], datetime.now(timezone.utc))
+            refusals.write_refusal(refusals.AccountRefusal("codex", "target@example.invalid",
+                refusals.KnownWindow("weekly"), refusals.KnownReset(resets), saved.at))
+            with (patch.object(showrunners, "registered_showrunners", side_effect=failed_discovery) as discovery,
+                  patch.object(accounts, "_check_codex_home", return_value=())):
+                code, output, errors = self.run_cli("status", "--detail")
+            self.assertEqual((code, errors), (0, ""))
+            detail_reset = resets.astimezone(ZoneInfo("Europe/Paris")).strftime("%a %Y-%m-%d %H:%M %Z")
+            self.assertIn("Codex workers: codex2; on refusal: no codex account has room; "
+                          + f"the earliest reset is {detail_reset}", output)
+            self.assertIn(setting, output)
+            self.assertNotIn("skipping fixture-showrunner", output)
+            discovery.assert_not_called()
         self.assertEqual(
             self.status_rows()[0][4],
             resets.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"),
@@ -6555,7 +6602,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             agent_accounts.Quota("5-hour", 50, resets), agent_accounts.Quota("Weekly", 50, resets),
         )], datetime.now(timezone.utc))
         zone = ZoneInfo("Asia/Tokyo")
-        with patch.object(agent_accounts, "user_zone", return_value=zone) as resolve:
+        with patch.object(accounts, "user_zone", return_value=zone) as resolve:
             self.assertEqual(self.status_rows()[0][4], resets.astimezone(zone).strftime("%a %m-%d %H:%M %Z"))
         resolve.assert_called_once_with()
 
