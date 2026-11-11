@@ -2455,7 +2455,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
         path = self.root / "admission/queue_times.jsonl"
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def test_priority_replacement_stays_live_and_clear_restores_order_without_resetting_clocks(self) -> None:
+    def test_priority_list_stays_live_and_clear_restores_order_without_resetting_clocks(self) -> None:
         from scripts.build_queue import admission_protocol as wire
         self.label(300, "first")
         self.label(400, "second")
@@ -2469,7 +2469,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
                 _ = admission.server.handle_request(request)
             before = {key: wire.encode_record(admission_records.stored_waiter(value.row))
                 for key, value in admission.server.waiters.items()}
-            for unit, expected in (("first", [300, 400]), ("second", [400, 300])):
+            for unit, expected in (("first", [300, 400]), ("second", [300, 400])):
                 replies = admission.completed_queue_change(wire.PrioritySetRequest(unit, unit, "user's work", "showrunner-id"))
                 self.assertEqual(replies, [wire.Ok()])
                 reading, = admission.server.handle_request(wire.ViewRequest())
@@ -2479,11 +2479,11 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             _ = admission.server.run_pass()
             reading, = admission.server.handle_request(wire.ViewRequest())
             assert isinstance(reading, wire.ViewReply)
-            self.assertEqual([step.pid for step in reading.reading.view.waiting], [400, 300])
+            self.assertEqual([step.pid for step in reading.reading.view.waiting], [300, 400])
             saved = admission.server.priority
             assert not isinstance(saved, admission_records.NoQueuePriority)
-            self.assertNotIn("until", saved)
-            self.assertEqual(saved["unit"], "second")
+            self.assertNotIn("until", wire.encode_record(saved))
+            self.assertEqual([entry["unit"] for entry in saved.entries], ["first", "second"])
             self.assertEqual(admission.server.handle_request(wire.PriorityClearRequest("clear", "showrunner-id")), [wire.Ok()])
             reading, = admission.server.handle_request(wire.ViewRequest())
             assert isinstance(reading, wire.ViewReply)
@@ -2492,7 +2492,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
                 for key, value in admission.server.waiters.items()}, before)
             events = [row for row in buildlog_rows(admission.state_dir.parent) if row.get("kind") == "queue_priority"]
             self.assertCountEqual([(row["action"], row["unit"]) for row in events],
-                [("set", "first"), ("set", "second"), ("clear", "second")])
+                [("set", "first"), ("set", "second"), ("clear", "first, second")])
             self.assertTrue(all("until" not in row for row in events))
 
 
@@ -2591,7 +2591,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
                 "initial", "chosen", "saved reason", "director")), [wire.Ok()])
             priority = fixture.server.priority
             assert not isinstance(priority, admission_records.NoQueuePriority)
-            before = priority.copy()
+            before = priority
             logged = buildlog_rows(fixture.state_dir.parent)
             for unit in ("not-a-roster-unit", UnitLabels("").unit):
                 self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
@@ -2606,8 +2606,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
             request = fixture.request()
             self.labels[request.identity.session_id] = UnitLabels("unassigned")
             _ = fixture.server.handle_request(request)
-            fixture.server.priority = {"unit": UnitLabels("").unit, "why": "old wire value",
-                "set_at": fixture.clock.now(), "set_by": "director", "transition": admission_records.SettledPriority()}
+            fixture.server.priority = admission_records.QueuePriority(({'unit': UnitLabels("").unit, 'why': "old wire value", 'set_at': fixture.clock.now(), 'set_by': "director"},), admission_records.SettledPriority())
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             self.assertEqual(admission_records.waiter_priority(view.reading.ordered[0][1]), admission_records.NormalOrder())
@@ -2625,8 +2624,8 @@ class ServicePriorityRepairTests(unittest.TestCase):
                     _ = fixture.completed_queue_change(request)
             priority = fixture.server.priority
             assert not isinstance(priority, admission_records.NoQueuePriority)
-            self.assertIsInstance(priority["transition"], admission_records.PendingPriorityTransition)
-            transition = priority["transition"]
+            self.assertIsInstance(priority.transition, admission_records.PendingPriorityTransition)
+            transition = priority.transition
             assert isinstance(transition, admission_records.PendingPriorityTransition)
             self.assertEqual(transition.month_row_end, len(prefix))
             fixture.restart()
@@ -5475,8 +5474,8 @@ class QueueExplanationTests(MemoryQueueFixture):
                                                 "since": NOW_EPOCH - 30})]),
             "recorded priority": replace(inputs, ordered=[(head_path, {**head, "priority_rank": 0}),
                                                              inputs.ordered[1]],
-                priority={"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
-                          "set_by": "showrunner"}),
+                priority=admission_records.QueuePriority(({"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
+                          "set_by": "showrunner"},))),
             "override": replace(inputs, override=override, host=admission_records.HostMemory(60 * GIB, 60 * GIB)),
             "unavailable": replace(inputs, host=admission_records.ReadingUnavailable()),
             "expired": replace(inputs, ordered=[(head_path, {**head, "estimated_at": NOW_EPOCH - 600}),
@@ -5645,12 +5644,9 @@ class QueueExplanationTests(MemoryQueueFixture):
         _ = self.waiting(400, GIB, 0)
         priorities: tuple[admission_records.QueuePriority | admission_records.NoQueuePriority, ...] = (
             admission_records.NO_QUEUE_PRIORITY,
-            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": admission_records.SettledPriority()},
-            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": admission_records.PendingPriorityTransition("transition", "set", NOW_EPOCH)},
-            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": admission_records.PendingPriorityTransition("transition", "clear", NOW_EPOCH)})
+            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.SettledPriority()),
+            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "set", NOW_EPOCH)),
+            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "clear", NOW_EPOCH)))
         for priority in priorities:
             for owners in (frozenset[str](), frozenset(('400-warmup', '300-head'))):
                 with self.subTest(owners=owners):

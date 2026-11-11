@@ -30,6 +30,7 @@ import time
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
+from scripts.lib import main_push_lock
 from scripts.lib import process_group
 
 from scripts.copies import copies
@@ -731,8 +732,6 @@ def promote(runner: GitRunner, production: str, repo: Path, commit: str, unit: s
 
 def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: str, paths: list[str],
                selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead) -> str:
-    from scripts.production import merge_checkpoint
-
     patch = selection.patch
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
@@ -759,7 +758,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                                  paths=paths, review_pass="")
                 _ = prepare_attempt(runner, repo, row, selection, base, production, copy)
                 try:
-                    with merge_checkpoint.main_push_lock(repo):
+                    with main_push_lock.main_push_lock(repo):
                         _ = runner.git(copy, "fetch", "origin", "main")
                         if runner.git(copy, "rev-parse", "origin/main").strip() != base:
                             continue

@@ -7,9 +7,10 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from typing import Literal
 
 from scripts.lib import conf
 from scripts.lib.atomic_file import sync_folder
@@ -29,6 +31,37 @@ from scripts.usage.context_economy_cache import TranscriptCache
 class RetentionPolicy:
     compress_after: timedelta
     delete_after: timedelta
+    sample_files: int
+    sample_bytes: int
+
+
+RetainedKind = Literal["showrunner", "producer", "unit"]
+
+
+@dataclass(frozen=True)
+class StaffKeepRule:
+    kind: RetainedKind
+
+
+@dataclass(frozen=True)
+class NoStaffKeep:
+    """The transcript follows the age rule."""
+
+
+@dataclass(frozen=True)
+class TranscriptFile:
+    path: Path
+    saved: os.stat_result
+
+
+@dataclass(frozen=True)
+class DeletionCandidate(TranscriptFile):
+    pass
+
+
+@dataclass(frozen=True)
+class CompressionCandidate(TranscriptFile):
+    replaced: int
 
 
 @dataclass
@@ -38,6 +71,7 @@ class RetentionTotals:
     deleted: int = 0
     skipped: int = 0
     freed: int = 0
+    kept: Counter[RetainedKind] = field(default_factory=Counter, kw_only=True)
 
 
 def read_policy() -> RetentionPolicy:
@@ -46,7 +80,8 @@ def read_policy() -> RetentionPolicy:
     delete = settings.whole("delete_after_days")
     if not 0 < compress < delete:
         raise ValueError(f"{conf.path('transcript_retention')}: require 0 < compress_after_days < delete_after_days")
-    return RetentionPolicy(timedelta(days=compress), timedelta(days=delete))
+    return RetentionPolicy(timedelta(days=compress), timedelta(days=delete),
+                           settings.whole("sample_files"), settings.whole("sample_bytes"))
 
 
 def transcript_roots(home: Path) -> list[Path]:
@@ -54,37 +89,105 @@ def transcript_roots(home: Path) -> list[Path]:
                    for root in home.glob(pattern) if root.is_dir()})
 
 
-def retained_sessions() -> frozenset[str]:
+def retained_sessions() -> dict[str, StaffKeepRule]:
     """Read local staff membership without contacting its remote owner."""
-    return frozenset(str(row.current_session) for row in staff.local_snapshot().rows if row.current_session)
+    retained: dict[str, StaffKeepRule] = {}
+    for row in staff.local_snapshot().rows:
+        if row.kind not in ("showrunner", "producer", "unit") or not row.current_session:
+            continue
+        retained[row.current_session] = StaffKeepRule(row.kind)
+    return retained
 
 
-def retain_root(root: Path, policy: RetentionPolicy, retained: frozenset[str], now: datetime, *,
-                dry_run: bool, finalize: Callable[[Path], None]) -> RetentionTotals:
-    totals = RetentionTotals(root)
+def staff_transcript(path: Path, retained: Mapping[str, StaffKeepRule]) -> StaffKeepRule | NoStaffKeep:
+    """Keep main transcripts while their eligible staff rows remain in the record."""
+    logical = uncompressed_path(path)
+    stem = logical.stem
+    rule = retained.get(stem)
+    if rule is None and stem.startswith("rollout-"):
+        rule = next((retained[stem[index + 1:]] for index, char in enumerate(stem)
+                     if char == "-" and stem[index + 1:] in retained), None)
+    return rule if rule is not None else NoStaffKeep()
+
+
+def retention_candidates(root: Path, policy: RetentionPolicy, retained: Mapping[str, StaffKeepRule], now: datetime,
+                         totals: RetentionTotals) -> list[DeletionCandidate | CompressionCandidate]:
+    candidates: list[DeletionCandidate | CompressionCandidate] = []
     for path in sorted(root.rglob("*.jsonl*")):
         if not path.name.endswith((".jsonl", ".jsonl.zst")) or not path.is_file():
             continue
-        logical = uncompressed_path(path)
-        if any(logical.stem == identity or logical.stem.endswith("-" + identity)
-               or identity in logical.parts for identity in retained):
-            totals.skipped += 1
-            continue
         saved = path.stat()
         age = now.timestamp() - saved.st_mtime
+        kept = staff_transcript(path, retained)
+        if isinstance(kept, StaffKeepRule):
+            totals.skipped += 1
+            totals.kept[kept.kind] += 1
+            continue
         if age >= policy.delete_after.total_seconds():
-            print(f"{'would delete' if dry_run else 'delete'} {path}; frees {saved.st_size} bytes")
+            candidates.append(DeletionCandidate(path, saved))
+        elif age >= policy.compress_after.total_seconds() and path.suffix != ".zst":
+            destination = path.with_suffix(path.suffix + ".zst")
+            replaced = destination.stat().st_size if destination.exists() else 0
+            candidates.append(CompressionCandidate(path, saved, replaced))
+    replaced_archives = {item.path.with_suffix(item.path.suffix + ".zst")
+                         for item in candidates if isinstance(item, CompressionCandidate)}
+    return [item for item in candidates
+            if not isinstance(item, DeletionCandidate) or item.path not in replaced_archives]
+
+
+def compression_ratio(candidates: Sequence[CompressionCandidate], policy: RetentionPolicy) -> float:
+    """Measure bounded prefixes through the same compressor as a real run."""
+    original = compressed = 0
+    if not candidates:
+        return 1.0
+    with tempfile.NamedTemporaryFile() as sample, tempfile.TemporaryFile() as output:
+        for candidate in candidates[:policy.sample_files]:
+            with candidate.path.open("rb") as source:
+                data = source.read(policy.sample_bytes)
+            if not data:
+                continue
+            _ = sample.seek(0)
+            _ = sample.truncate()
+            _ = sample.write(data)
+            sample.flush()
+            _ = output.seek(0)
+            _ = output.truncate()
+            compressed += compress_transcript(Path(sample.name), output)
+            original += len(data)
+    return compressed / original if original else 1.0
+
+
+def retain_root(root: Path, policy: RetentionPolicy, retained: Mapping[str, StaffKeepRule], now: datetime, *,
+                dry_run: bool, finalize: Callable[[Path], None], files: bool = False) -> RetentionTotals:
+    totals = RetentionTotals(root)
+    candidates = retention_candidates(root, policy, retained, now, totals)
+    if not dry_run:
+        compressions = sum(isinstance(item, CompressionCandidate) for item in candidates)
+        deletions = len(candidates) - compressions
+        print(f"{root}: compressing {compressions} files, deleting {deletions} files", flush=True)
+    ratio = (compression_ratio([item for item in candidates if isinstance(item, CompressionCandidate)], policy)
+             if dry_run else 1.0)
+    for candidate in candidates:
+        path, saved = candidate.path, candidate.saved
+        if not dry_run:
+            try:
+                current = path.stat()
+            except FileNotFoundError:
+                continue
+            if current.st_mtime_ns != saved.st_mtime_ns or current.st_size != saved.st_size:
+                continue
+        if isinstance(candidate, DeletionCandidate):
+            if files:
+                print(f"{'would delete' if dry_run else 'delete'} {path}; frees {saved.st_size} bytes")
             if not dry_run:
                 finalize(path)
                 path.unlink()
             totals.deleted += 1
             totals.freed += saved.st_size
-        elif age >= policy.compress_after.total_seconds() and path.suffix != ".zst":
+        else:
             destination = path.with_suffix(path.suffix + ".zst")
-            replaced = destination.stat().st_size if destination.exists() else 0
             if dry_run:
-                with tempfile.TemporaryFile() as output:
-                    size = compress_transcript(path, output)
+                freed = round(saved.st_size * (1 - ratio)) + candidate.replaced
             else:
                 descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
                 temporary = Path(name)
@@ -95,14 +198,20 @@ def retain_root(root: Path, policy: RetentionPolicy, retained: frozenset[str], n
                         os.fsync(output.fileno())
                         os.fchmod(output.fileno(), stat.S_IMODE(saved.st_mode))
                     os.utime(temporary, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+                    try:
+                        replaced = destination.stat().st_size
+                    except FileNotFoundError:
+                        replaced = 0
                     os.replace(temporary, destination)
                     sync_folder(path.parent)
                 finally:
                     temporary.unlink(missing_ok=True)
                 finalize(path)
                 path.unlink()
-            freed = saved.st_size + replaced - size
-            print(f"{'would compress' if dry_run else 'compress'} {path} -> {destination}; frees {freed} bytes")
+                freed = saved.st_size + replaced - size
+            if files:
+                estimate = "about " if dry_run else ""
+                print(f"{'would compress' if dry_run else 'compress'} {path} -> {destination}; frees {estimate}{freed} bytes")
             totals.compressed += 1
             totals.freed += freed
     return totals
@@ -113,14 +222,26 @@ def unchanged_summary(path: Path) -> None:
     del path
 
 
-def run(*, dry_run: bool) -> list[RetentionTotals]:
+def summary_line(totals: RetentionTotals, *, dry_run: bool) -> str:
+    compressed = "would compress" if dry_run else "compressed"
+    deleted = "would delete" if dry_run else "deleted"
+    freed = "would free about" if dry_run else "freed"
+    return (f"{totals.root}: {compressed} {totals.compressed} files; {deleted} {totals.deleted} files; "
+            + f"{totals.skipped} staff files skipped; {freed} {totals.freed / 10**9:.2f} GB")
+
+
+def run(*, dry_run: bool, files: bool = False) -> list[RetentionTotals]:
     policy = read_policy()
     retained = retained_sessions()
     now = datetime.now(timezone.utc)
 
     def process(finalize: Callable[[Path], None]) -> list[RetentionTotals]:
-        return [retain_root(root, policy, retained, now, dry_run=dry_run, finalize=finalize)
-                for root in transcript_roots(Path.home())]
+        totals: list[RetentionTotals] = []
+        for root in transcript_roots(Path.home()):
+            total = retain_root(root, policy, retained, now, dry_run=dry_run, finalize=finalize, files=files)
+            print(summary_line(total, dry_run=dry_run), flush=True)
+            totals.append(total)
+        return totals
 
     cache = Path.home() / ".cache/context_economy/summaries.sqlite3"
     if not dry_run and cache.is_file():
@@ -128,24 +249,27 @@ def run(*, dry_run: bool) -> list[RetentionTotals]:
             totals = process(summaries.mark_final)
     else:
         totals = process(unchanged_summary)
-    for total in totals:
-        print(f"{total.root}: {total.compressed} compressed; {total.deleted} deleted; "
-              + f"{total.skipped} staff transcripts skipped; {'would free' if dry_run else 'freed'} {total.freed} bytes")
-    print(f"total: {'would free' if dry_run else 'freed'} {sum(total.freed for total in totals)} bytes; "
-          + f"{sum(total.skipped for total in totals)} staff transcripts skipped")
+    combined = RetentionTotals(Path("total"), sum(item.compressed for item in totals),
+                               sum(item.deleted for item in totals), sum(item.skipped for item in totals),
+                               sum(item.freed for item in totals))
+    print(summary_line(combined, dry_run=dry_run))
+    kept = sum((item.kept for item in totals), Counter[RetainedKind]())
+    print(f"kept plain: {kept['showrunner']} showrunner, {kept['producer']} producer, {kept['unit']} unit")
     return totals
 
 
 class RetentionArguments(argparse.Namespace):
     dry_run: bool = False
+    files: bool = False
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--dry-run", action="store_true")
+    _ = parser.add_argument("--files", action="store_true", help="also print each file action")
     options = parser.parse_args(arguments, namespace=RetentionArguments())
     try:
-        _ = run(dry_run=options.dry_run)
+        _ = run(dry_run=options.dry_run, files=options.files)
     except (OSError, ValueError, subprocess.SubprocessError, staff.StaffUnreadable) as error:
         print(f"transcript retention: {error}", file=sys.stderr)
         return 1

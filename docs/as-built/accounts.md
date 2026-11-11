@@ -248,7 +248,13 @@ This interval is not a fixed reset-to-notice deadline; stale readings, failed mo
 Pane workers move under their dispatch lock with fresh pane evidence.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
-Live detached runs, held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
+Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
+A live detached run never holds an account move.
+The move stops and resumes its worker on the target account, even when the worker is idle.
+The preview and resume text name each run, its result record, its log, and the command that reads them.
+The detached run continues and delivers its result through the worker's stable staff ID.
+The normal delivery route uses the current session or its holder.
+The new-assignment check still refuses a worker with a live run.
 The preview prints `kept open: <reason>;` before its resume text.
 A held worker lock instead prints `not moved: dispatch lock is held` and refuses the move.
 Every finished pass needs its dispatch DONE at the end of the last transcript turn before its open pane can close.
@@ -262,7 +268,9 @@ The next assign resumes it on the group account.
 A busy worker or a kept worker uses `restart.stop_row` and `worker_panes.start_or_resume` to keep its conversation and pane.
 A stopped worker with a held dispatch resumes in the same pane.
 A closed worker without an active dispatch has nothing to move.
-Only an active or refused pass receives resume text through the shared target check.
+An active or refused pass receives resume text through the shared target check.
+A worker with a live detached run also receives resume text when its pass has ended.
+Single moves, group moves, swaps, refusal moves, and shutdown recovery use the same run context formatter.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 

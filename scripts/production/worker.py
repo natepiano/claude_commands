@@ -737,15 +737,17 @@ class NoLaunchCleanup:
 NO_LAUNCH_CLEANUP = NoLaunchCleanup()
 
 
-def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch, *,
+def _resume_launcher(row: staff.StaffRow,
+                     dispatch: progress_history.ActiveDispatch | progress_history.NoActiveDispatch, *,
+                     detached: str = "",
                      on_submission: Callable[[], object] | NoLaunchCleanup = NO_LAUNCH_CLEANUP) -> ExitCode:
     """Read and deliver the resume step while restore holds the dispatch lock."""
     record = staff.snapshot()
     parent = record.parent_of(row)
-    step = resume_step(row, dispatch)
-    if isinstance(step, NoOwnPass):
+    step = resume_step(row, dispatch) if isinstance(dispatch, progress_history.ActiveDispatch) else NO_OWN_PASS
+    if isinstance(step, NoOwnPass) and not detached:
         return ExitCode.OK
-    recipient = row if isinstance(step, BusyPass) else parent
+    recipient = row if isinstance(step, (BusyPass, NoOwnPass)) else parent
     client = _client()
     pane = next((item for item in client.tab_sessions()
                  if recipient is not None and item.session_id == recipient.current_session), None)
@@ -755,26 +757,29 @@ def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispa
     if isinstance(step, DispatchEvidenceUnknown):
         print(f"anomaly: {row.name}: {step.reason}", file=sys.stderr)
         return ExitCode.UNCERTAIN
-    if isinstance(step, BusyPass):
+    if isinstance(step, (BusyPass, NoOwnPass)):
         status = next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == pane.pane_id),
                       herdr.AgentStatus.UNKNOWN)
         if status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
             return ExitCode.OK
-    text = (launcher_prompt(row.id, step.dispatch_id, step.command)
-            if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step))
+    text = (launcher_prompt(row.id, step.dispatch_id, step.command) + ("\n" + detached if detached else "")
+            if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step, detached=detached))
     submit = (client.prompt if isinstance(on_submission, NoLaunchCleanup) else
               partial(client.prompt, on_submission=on_submission))
     submit(pane.pane_id, text, target=str(recipient.current_session))
     return ExitCode.OK
 
 
-def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | UnsubmittedAssignment | NoOwnPass:
+def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot, *,
+             run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT
+             ) -> BusyPass | UnsubmittedAssignment | NoOwnPass:
     """Read the worker's active pass from its own run."""
     try:
         parent = record.parent_of(row)
         if parent is None:
             raise ValueError("worker parent is unavailable")
-        active = progress_history.active_dispatch(row.id, worker_panes.worker_run(row, record=record))
+        directory = run.directory if isinstance(run, worker_panes.DispatchRun) else worker_panes.worker_run(row, record=record)
+        active = progress_history.active_dispatch(row.id, directory)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
         elif isinstance(active, progress_history.ActiveDispatch):
@@ -875,7 +880,8 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
                         outcome = ExitCode.UNCERTAIN
                         continue
-                    if not isinstance(active, progress_history.ActiveDispatch):
+                    detached = detached_runs.resume_context(run / worker_lifecycle.DETACHED_RUNS_DIR, state.row.name)
+                    if not isinstance(active, progress_history.ActiveDispatch) and not detached:
                         if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
                             allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
                             if isinstance(allowed, worker_panes.Kept):
@@ -888,7 +894,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if only != "all":
                             print(f"{state.row.name}: closed; its next assign resumes it")
                         continue
-                    resume = _resume_launcher
+                    resume = partial(_resume_launcher, detached=detached) if detached else _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
                         role = worker_panes.dispatch_role(state.row)
                         before = rows_before_launch()
@@ -903,7 +909,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
                         opened = cast(worker_panes.OpenWorker, result)
                         if isinstance(opened.created_pane, worker_panes.CreatedWorkerPane):
-                            resume = partial(_resume_launcher, on_submission=cleanup.pop_all)
+                            resume = partial(resume, on_submission=cleanup.pop_all)
                         changed = True
                         row = opened.row
                     else:

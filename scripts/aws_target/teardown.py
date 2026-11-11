@@ -24,6 +24,7 @@ DRY_RUN = '''down would disable AWS routing and aws-target.service.
 down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
 down would delete all scaler access keys and remove only the scaler credential profile.
+down would remove regional gate stacks and copied images before the home foundation stack.
 down would remove compute resources, then the foundation stack and retained Budget.
 down would delete the data volume and the gate image with its snapshot. The /home build cache is lost.
 down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
@@ -406,6 +407,9 @@ class TargetRemoval:
         (self.directory / 'deployment.json').unlink(missing_ok=True)
         return changed
 
+    def regional_gates(self) -> bool:
+        return remove_regional_gates(self.api, self.directory, include_home=True)
+
     def gate_image(self) -> bool:
         return remove_gate_images(self.api, self.directory, self.clock)
 
@@ -416,12 +420,13 @@ class TargetRemoval:
                   + '; next up starts from it')
 
     def run(self) -> bool:
-        stages = (('routing-off', self.routing), ('tailscale-device', self.devices), ('scaler-keys', self.scaler),
+        stages = (('routing-off', self.routing), ('tailscale-device', self.devices), ('regional-gates', self.regional_gates), ('scaler-keys', self.scaler),
                   ('compute', self.compute), ('foundation', self.foundation), ('retained-resources', self.retained),
                   ('gate-image', self.gate_image), ('local-state', self.local_state))
         with control_lock(self.directory / 'up'), ExitStack() as locks:
             try:
                 if self.verify():
+                    _ = self.regional_gates()
                     for name, action in stages:
                         print(f'{name}: present')
                     self._kept_image()
@@ -446,6 +451,75 @@ class TargetRemoval:
                     return False
         self._kept_image()
         return True
+
+
+def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = False) -> bool:
+    """Remove regional stacks before deleting their copied images."""
+    from scripts.aws_target.config import gate_deployment
+    manifest_path = directory / 'gate-deployment.json'
+    manifest = gate_deployment(manifest_path, api.region) if manifest_path.exists() else {}
+    stack_path = directory / 'regional-stacks.json'
+    stacks = remote.read_record(stack_path) if stack_path.exists() else {}
+    for row in ledger.rows(manifest, 'regions') if manifest else ():
+        if row.get('stack'):
+            stacks[ledger.text(row, 'region')] = row['stack']
+    changed = bool(stacks)
+    sweep_regions = dict.fromkeys([*conf.read_or_repository('cloud_gate').words('regions'), *stacks,
+        *(ledger.text(row, 'region') for row in ledger.rows(manifest, 'regions'))]) if stacks or include_home and manifest else {}
+    for region in sweep_regions:
+        target = api.in_region(region)
+        reply = target.call('describe-instances', '--filters',
+            'Name=tag:GateDeployment,Values=' + ledger.text(manifest, 'deployment_id'),
+            'Name=tag:Workload,Values=cloud-claude-gate',
+            'Name=instance-state-name,Values=pending,running,stopping,stopped')
+        instances = [ledger.text(instance, 'InstanceId') for group in ledger.rows(reply, 'Reservations')
+                     for instance in ledger.rows(group, 'Instances')]
+        if instances:
+            _ = target.call('terminate-instances', '--instance-ids', *instances)
+            _ = target.call('wait', 'instance-terminated', '--instance-ids', *instances)
+    for region, name in list(stacks.items()):
+        target = api.in_region(region)
+        try:
+            _ = target.call('delete-stack', '--stack-name', str(name), service='cloudformation')
+            _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
+        except AwsUnavailable as error:
+            if 'does not exist' not in str(error):
+                raise
+        del stacks[region]
+        write_text_atomic(stack_path, json.dumps(stacks) + '\n')
+    if manifest and len(ledger.rows(manifest, 'regions')) > 1:
+        manifest['regions'] = ledger.rows(manifest, 'regions')[:1]
+        write_text_atomic(manifest_path, json.dumps(manifest, sort_keys=True) + '\n')
+    image_path = directory / 'regional-images.json'
+    images = remote.read_record(image_path) if image_path.exists() else {}
+    for identity, value in list(images.items()):
+        row = ledger.mapping(value)
+        target = api.in_region(ledger.text(row, 'region'))
+        image = ledger.text(row, 'image')
+        if 'snapshots' not in row:
+            reply = target.call('describe-images', '--image-ids', image)
+            row['snapshots'] = [ledger.text(ledger.mapping(mapping['Ebs']), 'SnapshotId')
+                for item in ledger.rows(reply, 'Images') for mapping in ledger.rows(item, 'BlockDeviceMappings') if mapping.get('Ebs')]
+            images[identity] = row
+            write_text_atomic(image_path, json.dumps(images) + '\n')
+        if not row.get('deregistered'):
+            try:
+                _ = target.call('deregister-image', '--image-id', image)
+            except AwsUnavailable as error:
+                if 'InvalidAMIID.NotFound' not in str(error):
+                    raise
+            row['deregistered'] = True
+            write_text_atomic(image_path, json.dumps(images) + '\n')
+        for snapshot in cast(list[str], row['snapshots']):
+            try:
+                _ = target.call('delete-snapshot', '--snapshot-id', snapshot)
+            except AwsUnavailable as error:
+                if 'InvalidSnapshot.NotFound' not in str(error):
+                    raise
+        del images[identity]
+        write_text_atomic(image_path, json.dumps(images) + '\n')
+        changed = True
+    return changed
 
 
 def remove_gate_images(api: AwsCli, directory: Path, clock: Callable[[], float]) -> bool:

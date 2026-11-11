@@ -88,6 +88,10 @@ class AwsCli:
         self.timeout_s = timeout_s
         self.execute = execute
 
+    def in_region(self, region: str) -> AwsCli:
+        """Keep the executor and credentials when selecting a region."""
+        return self if region == self.region else AwsCli(self.profile, region, self.timeout_s, self.execute)
+
     def call(self, operation: str, *arguments: str, service: str = 'ec2',
              timeout_s: float | None = None) -> dict[str, object]:
         result = self.execute(['aws', '--profile', self.profile, '--region', self.region,
