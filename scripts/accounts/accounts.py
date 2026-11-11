@@ -46,6 +46,7 @@ from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel,
 from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 from scripts.whoami import usage_store  # noqa: E402
@@ -2123,7 +2124,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         if refusal_problem:
             reason = refusal_problem
         elif refusal is not None and not refusals.resolved(refusal, reading, now):
-            reason = "refused at " + refusal.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+            reason = "refused at " + refusal.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
         elif tool == "claude" and isinstance(reading, FreshReading) and any(
             isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five)
         ):
@@ -2585,13 +2586,13 @@ def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, 
 
 def no_room_line(tool: str, outcome: NoAccountWithRoom) -> str:
     reset = outcome.earliest_reset
-    time = reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
+    time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
     return f"no {tool} account has room; the earliest reset is {time}"
 
 
 def _pick_explanation(reason: PickReason) -> str:
     weekly = f"{reason.weekly.left:g}%" if isinstance(reason.weekly, ReadingWindow) else "unavailable"
-    reset = (reason.weekly.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
+    reset = (reason.weekly.reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
              if isinstance(reason.weekly, ReadingWindow) and isinstance(reason.weekly.reset, KnownReset) else "unknown")
     five = f"{reason.five_hour.left:g}%" if isinstance(reason.five_hour, ReadingWindow) else "no window"
     return f"{reason.label}: weekly {weekly}, resets {reset}, 5-hour {five}; {reason.status}"
@@ -2609,8 +2610,6 @@ def _iso_time(text: str, place: str) -> datetime:
         raise AccountsError(f"accounts: {place} must be an ISO timestamp") from error
     if at.tzinfo is None:
         # Command-line and historical wall times use the user's zone.
-        from scripts.lib.user_zone import user_zone
-
         at = at.replace(tzinfo=user_zone())
     return at.astimezone(timezone.utc)
 
@@ -3162,7 +3161,7 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
         if reading.credits != "unlimited" and (not math.isfinite(credits) or credits <= 0):
             for name, window in (("weekly", reading.weekly), ("5-hour", reading.five_hour)):
                 if isinstance(window, ReadingWindow) and window.left <= 0:
-                    reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
+                    reset = (window.reset.at.astimezone(user_zone()).strftime("%a %-I:%M %p")
                              if isinstance(window.reset, KnownReset) else "unknown")
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep(), account_config=account_config)
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
@@ -4125,7 +4124,7 @@ def _usage_store_problem(report: agent_accounts.Report, warning: agent_accounts.
     return StatusProblem(subject,
         "usage store read continued without a hold" if claim_failed else "usage store reading not saved",
         ProblemCause("usage claim" if claim_failed else "usage save",
-            f"{warning.reason}; read at {at.astimezone(agent_accounts.user_zone()):%Y-%m-%d %H:%M %Z}",
+            f"{warning.reason}; read at {at.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}",
             CauseFile(str(directory.directory if isinstance(directory, agent_accounts.ClaudeDirectorySource)
                           else directory.home if isinstance(directory, agent_accounts.CodexHomeSource)
                           else usage_store.store_file()))),
@@ -4870,7 +4869,7 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
     """
     account_config = read_account_settings(account_config)
-    zone = agent_accounts.user_zone()
+    zone = user_zone()
     statuses = account_statuses()
     for status in statuses:
         for problem in _status_problems(status, detail=detail, zone=zone):
@@ -5062,7 +5061,7 @@ def _observe_status_problem(problem: StatusProblem, raw: tuple[str, ...] = (), *
 def _map_provenance_problem(provenance: role_map.RoleMapProvenance) -> list[StatusProblem]:
     if not isinstance(provenance, role_map.CachedAfterFetchFailure):
         return []
-    stamp = provenance.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+    stamp = provenance.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
     cause = f"natedev fetch failed: {provenance.failure}"
     return [StatusProblem("role map", "using saved assignments",
         ProblemCause("role", f"map saved at {stamp}; {cause}", CauseFile(str(role_map.role_map_cache_file()))),
