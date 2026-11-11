@@ -1388,8 +1388,12 @@ class AccountsTests(unittest.TestCase):
 
     def test_exec_probe_preserves_claude_options_that_share_accounts_option_names(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
+        registry = write_registry(self.main_dir / "config/models.conf")
         arguments = ["--model", "haiku", "--help", "--detail"]
-        with patch.object(os, "execvpe") as launch:
+        with (patch.dict(os.environ, {"PATH": str(self.home / ".local/bin") + os.pathsep + MODELS_RESOLVER_PATH,
+                                     "MODELS_CONFIG_FILE": str(registry),
+                                     "MODELS_CONFIG_PUBLISH": "0"}),
+              patch.object(os, "execvpe") as launch):
             self.assertEqual(self.run_cli("exec", "--probe", "claude2", *arguments), (0, "", ""))
         launch.assert_called_once()
         self.assertEqual(launch.call_args.args[:2], (str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), *arguments]))

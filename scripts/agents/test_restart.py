@@ -38,7 +38,7 @@ from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import shutdown_record, stop_resume, pane_record
 from scripts.lib import file_lock, unit_runs
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member
 from scripts.herdr.fake_herdr import herdr_listener
@@ -1674,16 +1674,32 @@ class RestartTests(RestartTestCase):
         self.running.clear()
         row = self.rows[0]
         source, target = self.root / ".claude3", self.root / ".claude2"
-        entry = pane_record.launch("w1:p0", str(row.id), str(self.root),
-            {"CLAUDE_CONFIG_DIR": str(source)}, ["claude", "--resume", str(row.current_session)])
-        with (patch.object(pane_record, "publication_for_session",
-                  return_value=pane_launch.LaunchPublication(self.root / "agents.json", entry)),
-              patch.object(herdr, "prepare_session_environment",
-                  return_value=herdr.PreparedAgentEnvironment(self.root, {})) as prepare,
-              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
-                  "w1:p0", herdr.PromptSubmissionNotRequired()))):
-            self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
-        self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(target))
+        environment = claude_catalog_environment(source, {"fable": "claude-fable-source-fixture"})
+        _ = claude_catalog_environment(target, {"fable": "claude-fable-selected-fixture"})
+        for saved_model, expected in (("", ""), ("fable", "claude-fable-selected-fixture"),
+                                      ("claude-fable-saved-fixture", "claude-fable-saved-fixture")):
+            arguments = ["claude", "--resume", str(row.current_session)]
+            if saved_model:
+                arguments.extend(("--model", saved_model, "--effort", "high"))
+            entry = pane_record.launch("w1:p0", str(row.id), str(self.root),
+                {"CLAUDE_CONFIG_DIR": str(source)}, arguments)
+            with (self.subTest(saved_model=saved_model), patch.dict(os.environ, environment),
+                  patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", target)),
+                  patch.object(pane_record, "publication_for_session",
+                      return_value=pane_launch.LaunchPublication(self.root / "agents.json", entry)),
+                  patch.object(herdr, "prepare_session_environment",
+                      return_value=herdr.PreparedAgentEnvironment(self.root,
+                          {**os.environ, **environment, "CLAUDE_CONFIG_DIR": str(target)})) as prepare,
+                  patch.object(herdr, "launch_prepared_agent", LAUNCH_PREPARED_AGENT),
+                  patch.object(herdr, "open_tab", return_value="w1:p0"),
+                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as launch):
+                self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
+            self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(target))
+            if saved_model:
+                resumed = cast(list[str], launch.call_args.args[3])
+                self.assertEqual(resumed[resumed.index("--model") + 1], expected)
+                self.assertEqual(entry["model"], saved_model)
 
     def test_start_row_without_a_role_uses_units_unless_the_target_is_explicit(self) -> None:
         self.running.clear()
