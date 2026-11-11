@@ -207,7 +207,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:queue bump <selector>`, `clear`, `admit-head <why>` | `build_queue.py` | Changes unit priority or permits the head to exceed the budget when free memory permits. Use `/build:page` for the queue view. The unit-board pane retains its `--json` view and selected cards. Plain view requests exit 3 and name `/build:page`. |
-| Build page | `buildlog charts [--days 7\|30] [--no-open]` | Prints the shared build page link, the same link as `/build:page`. Use the `buildlog` CLI for detailed records. |
+| `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
 Each command shows its script's output unchanged; each script answers in about a second. There are no stubs at the old names `/builds`, `/build_hold` or `/mac_test`.
