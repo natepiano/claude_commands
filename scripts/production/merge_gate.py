@@ -18,7 +18,8 @@ SharedMachine is the default. WholeMachine uses one job per CPU without shared a
 Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
-Each nightly exit sends a result push unless merge_gate.conf disables it.
+A green nightly sends a result push unless merge_gate.conf disables it.
+A red nightly records its result and notifies sdlc before an assignment push.
 A failure before the checks start sends the reason. Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -37,8 +38,8 @@ import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 import fcntl
 import hashlib
@@ -63,6 +64,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
@@ -1778,6 +1780,26 @@ def type_check_summaries(output: str) -> list[str]:
             if re.fullmatch(r"\d+ errors?, \d+ warnings?, \d+ notes?", line)]
 
 
+def nightly_check_values(result: GateRun) -> dict[str, str]:
+    types = [job for job in result.jobs if job.kind is GateJobKind.TYPE_CHECK]
+    failed_types = [job for job in types if job.returncode]
+    summaries = type_check_summaries("\n".join(job.output for job in failed_types))
+    failed = [f"{job.suite}/{job.module}" for job in result.jobs
+              if job.kind is GateJobKind.TEST_MODULE and job.returncode]
+    config = conf.read("merge_gate")
+    limit = config.whole("nightly_result_modules") if failed and config.text("nightly_result_push") != "off" else len(failed)
+    unfinished = (any(job.kind is GateJobKind.RUNNER_FAILURE for job in result.jobs)
+                  or not result.jobs and not result.passed)
+    return {
+        "types": ("did not run" if not types else "passed" if not failed_types
+                  else "failed with " + summaries[-1] if summaries else "failed"),
+        "tests": ("did not finish" if unfinished else "failed in " + ", ".join(failed[:limit])
+                  + (f" and {len(failed) - limit} more" if len(failed) > limit else "")
+                  if failed else "passed"),
+        "outcome": "passed" if result.passed else "failed",
+    }
+
+
 def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> None:
     try:
         from scripts.message import send_budget
@@ -1795,20 +1817,7 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
             values["reason"] = reason[:max(0, MESSAGE_MAX - len(empty.message))].rstrip(".")
             rendered = push_texts.render("nightly.not_run", **values)
         else:
-            types = [job for job in result.jobs if job.kind is GateJobKind.TYPE_CHECK]
-            failed_types = [job for job in types if job.returncode]
-            summaries = type_check_summaries("\n".join(job.output for job in failed_types))
-            values["types"] = ("did not run" if not types else "passed" if not failed_types
-                               else "failed with " + summaries[-1] if summaries else "failed")
-            failed = [f"{job.suite}/{job.module}" for job in result.jobs
-                      if job.kind is GateJobKind.TEST_MODULE and job.returncode]
-            limit = config.whole("nightly_result_modules")
-            unfinished = (any(job.kind is GateJobKind.RUNNER_FAILURE for job in result.jobs)
-                          or not result.jobs and not result.passed)
-            values["tests"] = ("did not finish" if unfinished else "failed in " + ", ".join(failed[:limit])
-                               + (f" and {len(failed) - limit} more" if len(failed) > limit else "")
-                               if failed else "passed")
-            values["outcome"] = "passed" if result.passed else "failed"
+            values.update(nightly_check_values(result))
             rendered = push_texts.render("nightly.result", **values)
         sent = subprocess.run(push_texts.user_send_argv(rendered, key="nightly-result"),
                               capture_output=True, text=True, check=False,
@@ -1820,9 +1829,195 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
         print("Nightly result push could not be sent: " + " ".join(str(error).split()), flush=True)
 
 
+@dataclass(frozen=True)
+class NightlyNoticeUnreceived:
+    """sdlc has no confirmed delivery of this result."""
+
+
+@dataclass(frozen=True)
+class NightlyNoticeReceived:
+    at: str
+
+
+@dataclass(frozen=True)
+class NightlyFixUnassigned:
+    """No unit owns the fix yet."""
+
+
+@dataclass(frozen=True)
+class NightlyFixAssigned:
+    unit: str
+    at: str
+
+
+@dataclass(frozen=True)
+class NightlyPushPending:
+    """Assignment or its deadline must release the result push."""
+
+
+@dataclass(frozen=True)
+class NightlyPushAccepted:
+    at: str
+
+
+@dataclass(frozen=True)
+class NightlyRedResult:
+    id: str
+    branch: str
+    tree: str
+    finished: str
+    failures: tuple[str, ...]
+    types: str
+    tests: str
+    received: NightlyNoticeUnreceived | NightlyNoticeReceived = NightlyNoticeUnreceived()
+    assignment: NightlyFixUnassigned | NightlyFixAssigned = NightlyFixUnassigned()
+    delivery: NightlyPushPending | NightlyPushAccepted = NightlyPushPending()
+
+
+@contextmanager
+def nightly_red_lock(*, wait: bool = False) -> Generator[Path]:
+    directory = gate_state_dir() / "nightly-red"
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError as error:
+            raise GateRefused("another nightly result operation is running; retry") from error
+        yield directory
+
+
+def save_nightly_red(directory: Path, result: NightlyRedResult) -> None:
+    write_text_atomic(directory / f"{result.id}.json", json.dumps(asdict(result)) + "\n")
+
+
+def read_nightly_red(path: Path) -> NightlyRedResult:
+    def fields(value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise GateRefused(f"{path}: expected a nightly result table")
+        return cast(dict[str, object], value)
+
+    def text(values: dict[str, object], key: str) -> str:
+        value = values.get(key)
+        if not isinstance(value, str) or not value:
+            raise GateRefused(f"{path}: missing nightly result {key}")
+        return value
+
+    def at(values: dict[str, object], key: str) -> str:
+        value = text(values, key)
+        if datetime.fromisoformat(value).tzinfo is None:
+            raise GateRefused(f"{path}: nightly time has no time zone")
+        return value
+
+    saved = fields(cast(object, json.loads(path.read_text())))
+    failures = saved.get("failures")
+    if not isinstance(failures, list) or not all(isinstance(line, str) for line in cast(list[object], failures)):
+        raise GateRefused(f"{path}: expected nightly failure lines")
+    identity = text(saved, "id")
+    if identity != path.stem or not re.fullmatch(r"[a-zA-Z0-9_-]+", identity):
+        raise GateRefused(f"{path}: nightly result identity differs")
+    received, assignment, delivery = (fields(saved.get(key)) for key in ("received", "assignment", "delivery"))
+    return NightlyRedResult(identity, text(saved, "branch"), text(saved, "tree"), at(saved, "finished"),
+        tuple(cast(list[str], failures)), text(saved, "types"), text(saved, "tests"),
+        NightlyNoticeReceived(at(received, "at")) if received else NightlyNoticeUnreceived(),
+        NightlyFixAssigned(text(assignment, "unit"), at(assignment, "at")) if assignment else NightlyFixUnassigned(),
+        NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending())
+
+
+def nightly_time(at: str) -> str:
+    return datetime.fromisoformat(at).astimezone(user_zone()).strftime("%H:%M %Z")
+
+
+def send_nightly_red(directory: Path, result: NightlyRedResult) -> bool:
+    from scripts.message import send_budget
+    from scripts.notify import push_texts, review
+    from scripts.production import staff
+
+    if isinstance(result.delivery, NightlyPushAccepted) or conf.read("merge_gate").text("nightly_result_push") == "off":
+        return False
+    values = {"branch": result.branch, "time": nightly_time(result.finished), "types": result.types,
+              "tests": result.tests, "outcome": "failed"}
+    if isinstance(result.assignment, NightlyFixAssigned):
+        row = staff.snapshot().by_id(staff.StaffId(result.assignment.unit))
+        values.update(unit=row.name if row is not None else result.assignment.unit,
+                      assigned=nightly_time(result.assignment.at),
+                      received=nightly_time(result.received.at) if isinstance(result.received, NightlyNoticeReceived)
+                      else nightly_time(result.assignment.at))
+        text_id = "nightly.assigned"
+    else:
+        values["notice"] = ("sdlc received it at " + nightly_time(result.received.at)
+                            if isinstance(result.received, NightlyNoticeReceived) else "sdlc has not confirmed receipt")
+        text_id = "nightly.unassigned"
+    rendered = push_texts.render(text_id, **values)
+    command = push_texts.user_send_argv(rendered, key=f"nightly-result:{result.id}")
+    # This window exceeds the complete datetime range. Accepted results never expire.
+    command.extend(["--repeat-minutes", str(timedelta.max.days * 1440)])
+    sent = subprocess.run(command, capture_output=True, text=True, check=False,
+                          timeout=send_budget.user_seconds(review.user_send_seconds()))
+    if sent.returncode:
+        raise GateRefused("Nightly result push could not be sent: " + failure_detail(sent))
+    save_nightly_red(directory, replace(result, delivery=NightlyPushAccepted(datetime.now(UTC).isoformat())))
+    print("Nightly result push: " + next(iter(sent.stdout.splitlines()), ""), flush=True)
+    return True
+
+
+def assign_nightly_red(unit: str, identity: str = "") -> int:
+    from scripts.production import staff
+
+    record = staff.snapshot()
+    row = record.by_member_reference(unit) or record.by_path(unit if "/" in unit else f"sdlc/{unit}")
+    parent = record.parent_of(row) if row is not None else None
+    if row is None or row.kind != "unit" or parent is None or parent.name != "sdlc":
+        raise GateRefused(f"{unit}: choose an sdlc unit director")
+    with nightly_red_lock() as directory:
+        results = [read_nightly_red(path) for path in sorted(directory.glob("*.json"))]
+        if identity:
+            results = [result for result in results if result.id == identity]
+        else:
+            pending = [result for result in results if isinstance(result.delivery, NightlyPushPending)]
+            results = pending or sorted(results, key=lambda result: result.finished)[-1:]
+        if len(results) != 1:
+            raise GateRefused("choose one saved red result with --result ID")
+        result = results[0]
+        changed = isinstance(result.assignment, NightlyFixUnassigned)
+        if isinstance(result.assignment, NightlyFixAssigned) and result.assignment.unit != str(row.id):
+            raise GateRefused(f"{result.id}: another unit already owns this fix")
+        if changed:
+            at = datetime.now(UTC).isoformat()
+            result = replace(result, assignment=NightlyFixAssigned(str(row.id), at),
+                             received=result.received if isinstance(result.received, NightlyNoticeReceived)
+                             else NightlyNoticeReceived(at))
+            save_nightly_red(directory, result)
+        changed = send_nightly_red(directory, result) or changed
+        print("done" if changed else "unchanged")
+    return 0
+
+
+def check_nightly_assignments() -> int:
+    if not (gate_state_dir() / "nightly-red").is_dir():
+        print("unchanged")
+        return 0
+    changed = False
+    failed = False
+    with nightly_red_lock() as directory:
+        for path in sorted(directory.glob("*.json")):
+            try:
+                result = read_nightly_red(path)
+                if isinstance(result.delivery, NightlyPushAccepted):
+                    continue
+                age = (datetime.now(UTC) - datetime.fromisoformat(result.finished)).total_seconds()
+                if isinstance(result.assignment, NightlyFixUnassigned) and age < 60 * conf.read("merge_gate").whole("nightly_assign_minutes"):
+                    continue
+                changed = send_nightly_red(directory, result) or changed
+            except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"Nightly result check: {error}", file=sys.stderr)
+                failed = True
+    print("done" if changed else "unchanged")
+    return int(failed)
+
+
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
-                     type_failures: Sequence[GateJobResult] = ()) -> None:
-    from scripts.production import showrunners
+                     type_failures: Sequence[GateJobResult] = (), result_id: str = "") -> NightlyNoticeReceived | NightlyNoticeUnreceived:
+    from scripts.production import showrunners, staff
 
     requires_full = bool(failed) or not type_failures
     try:
@@ -1837,13 +2032,21 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
             if summaries:
                 detail += "\n" + summaries[-1]
-        name = copies.owner_name(copies.copy_owner(nightly_owner(args)))
-        outcome = showrunners.tell(name, f"merge-gate-nightly:{tree}",
+        if result_id:
+            detail += f"\nAssign the fix, then run merge_gate.py nightly-assigned --result {result_id} --unit UNIT."
+        owner = nightly_owner(args)
+        row = staff.snapshot().by_id(staff.StaffId(owner))
+        if row is not None:
+            owner = row.name
+        outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
+        if outcome == f"told {owner}":
+            return NightlyNoticeReceived(datetime.now(UTC).isoformat())
     except (GateRefused, change_review.ChangeReviewError, OSError, ValueError) as error:
         marker_note = "; full-required marker kept" if requires_full else ""
         print(f"Nightly notice could not be sent: {error}{marker_note}", flush=True)
+    return NightlyNoticeUnreceived()
 
 
 def nightly_git(repo: Path, *arguments: str) -> str:
@@ -1896,12 +2099,21 @@ def nightly(args: GateArguments) -> int:
                         pending.unlink(missing_ok=True)
             else:
                 marker.unlink(missing_ok=True)
-            tell_nightly_red(args, tree, failed, type_failures=type_failures)
             result_sent = True
-            push_nightly_result(args, run)
+            at = datetime.now(UTC).isoformat()
+            identity = hashlib.sha256(f"{args.merge_branch}\n{tree}\n{at}".encode()).hexdigest()[:24]
+            values = nightly_check_values(run)
+            failures = tuple(line for job in run.jobs if job.returncode
+                             for line in (f"{job.suite}/{job.module}", *job.output.splitlines()))
+            result = NightlyRedResult(identity, args.merge_branch, tree, at, failures, values["types"], values["tests"])
+            with nightly_red_lock(wait=True) as directory:
+                save_nightly_red(directory, result)
+                received = tell_nightly_red(args, tree, failed, type_failures=type_failures, result_id=identity)
+                save_nightly_red(directory, replace(result, received=received))
+                print(f"Assign the fix: merge_gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
     except (Exception, KeyboardInterrupt) as error:
-        if not result_sent:
+        if not result_sent and not (isinstance(run, GateRun) and not run.passed):
             reason = GateRefused("interrupted by SIGINT") if isinstance(error, KeyboardInterrupt) else error
             push_nightly_result(args, run if isinstance(run, GateRun) else reason)
         raise
@@ -1980,6 +2192,21 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
+        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}")
+        if arguments[0] == "nightly-assigned":
+            _ = nightly_parser.add_argument("--unit", required=True)
+            _ = nightly_parser.add_argument("--result", default="")
+        class NightlyArguments(argparse.Namespace):
+            unit: str = ""
+            result: str = ""
+        options = nightly_parser.parse_args(arguments[1:], namespace=NightlyArguments())
+        try:
+            return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
+        except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            return 1
     parser = argparse.ArgumentParser(description=__doc__)
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):

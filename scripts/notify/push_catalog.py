@@ -15,6 +15,26 @@ def mac_idle_reservation(holder: str, detail: str) -> str:
 
 
 ENTRIES = (
+    PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
+        "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
+        + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        (PushExample("tests_failed", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
+            "types": "passed", "tests": "failed in production/test_staff.py", "received": "03:00 EST",
+            "unit": "staff", "assigned": "03:05 EST"}),
+         PushExample("types_failed", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
+            "types": "failed with 3 errors, 0 warnings, 0 notes", "tests": "passed", "received": "03:00 EST",
+            "unit": "types", "assigned": "03:05 EST"})),
+        purpose="sdlc assigned the failed nightly check to a unit director."),
+    PushText("nightly.unassigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
+        "{notice}.\nsdlc has not assigned the fix yet.\n"
+        + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        (PushExample("received", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
+            "types": "passed", "tests": "failed in production/test_staff.py",
+            "notice": "sdlc received it at 03:00 EST"}),
+         PushExample("unreceived", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
+            "types": "failed with 3 errors, 0 warnings, 0 notes", "tests": "passed",
+            "notice": "sdlc has not confirmed receipt"})),
+        purpose="The failed nightly check has no assignment at its deadline."),
     PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
         "The nightly check of {branch} finished at {time}.\nType check: {types}.\nFull tests: {tests}.",
         (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",

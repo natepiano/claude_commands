@@ -560,6 +560,7 @@ whatever arrived:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
+| a nightly red notice | Assign the fix to the owning unit, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`. |
 | an update tick (a message starting `Scheduled update`) | the schedule prompt only, plus any merge whose shots are viewed and any BLOCK past its limit |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
