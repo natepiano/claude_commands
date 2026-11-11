@@ -2249,7 +2249,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Ruled out:** a second root scan in the alert path.
 
-### Phase 106 — The hold module has no import cycle  · status: todo
+### Phase 106 — The hold module has no import cycle  · status: done
 
 **Depends on:** Phase 104 (it changes `scripts/build_hold/build_hold.py`); done.
 
@@ -2265,6 +2265,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 2. **All callers.** Every module that names these types imports them from the new module. `build_hold` keeps no re-export. `placement.py` drops the `TYPE_CHECKING` import, the `_DeferredBuildHold` class and the string alias, and writes `SubmittingSession = OwningSession | NoOwningSession`.
 3. **Proof.** No new test: the type check is the gate. Run the test modules of every changed file.
 4. **Docs.** Update each as-built line that names `build_hold.OwningSession` or the deferred placement import.
+5. **The grant reader.** After the type move, four cycles remain, each through `build_hold.admitted_processes` (:573), which imports `admission_service`. Move `admitted_processes` to `scripts/build_hold/hold_enforcer.py`, keeping its import of `admission_service` inside the function. `hold_enforcer` calls its own copy. `build_hold.audit_builds` reads it through `hold_enforcer()`; add it to the `HoldEnforcer` protocol. `build_hold` keeps no import of `admission_service`. Update `docs/as-built/build-memory-admission.md` (:341).
 
 **Files:**
 - `scripts/build_hold/owning_session.py`
@@ -2290,6 +2291,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/mac_test/test_target_slots.py`
 - `scripts/mac_test/test_target_state.py`
 - `docs/as-built/build-targets.md`
+- `docs/as-built/build-memory-admission.md`
 
 **Workers:** `1 writer`
 - `impl` owns all files.
