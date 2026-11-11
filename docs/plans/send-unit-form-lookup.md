@@ -67,7 +67,7 @@
 
 **Gotchas:** a live session label with the exact name keeps priority over the unit form.
 
-### Phase 2 — A failed lookup tells the owner  · status: todo
+### Phase 2 — A failed lookup tells the owner  · status: done
 
 **Depends on:** Phase 1 (same file, `scripts/message/send.py`).
 

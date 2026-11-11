@@ -37,6 +37,7 @@ from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import send
+from scripts.message import failed_lookup
 from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import relay_session_name
@@ -72,6 +73,9 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
+    notice_sender = mock.patch.object(failed_lookup, "send_notice")
+    _ = notice_sender.start()
+    unittest.addModuleCleanup(notice_sender.stop)
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -5442,17 +5446,31 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         director = self.row("queue", "codex:director-thread", machine="natedev")
         self.local = self.recipient_roster([director], [])
         os.environ["SSH_SNAPSHOT"], os.environ["SSH_ROSTER_STATUS"] = "ssh: connection refused", "255"
-        for target, expected_status in (("only peer", 3), ("queue-unit", 0)):
-            with self.subTest(target=target):
+        for target, expected_status in (("only peer", 3), ("queue-unit", 0), ("missing-peer", 3), ("missing-name", 2)):
+            if expected_status == 2:
+                self.local = roster.Roster([], [])
+                self.staff_rows.clear()
+                self.peer([])
+                os.environ["SSH_ROSTER_STATUS"] = "0"
+            with (self.subTest(target=target),
+                  mock.patch.object(failed_lookup, "report", wraps=failed_lookup.report) as report):
                 status, output, errors = self.run_main(target)
                 self.assertEqual(status, expected_status, output + errors)
-                if target == "only peer":
+                if expected_status == 3:
                     self.assertEqual(len(errors.splitlines()), 1)
                     self.assertEqual(errors, "send.py: roster problems omitted: 1; "
                                      + "run ~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py\n")
                     self.assertNotIn("not reached", errors)
-                    self.assertIn("FAILED: recipient lookup failed for 'only peer'", output)
+                    self.assertEqual(output, f"FAILED: recipient lookup failed for {target!r}\n")
+                    report.assert_called_once()
+                    self.assertEqual(cast(tuple[str, ...], report.call_args.args)[:2], ("fixture sender", target))
+                elif expected_status == 2:
+                    reason = f"send.py: no staff row or live session for {target!r}"
+                    self.assertEqual(output, "")
+                    self.assertEqual(errors, reason + "\n")
+                    report.assert_called_once_with("fixture sender", target, reason)
                 else:
+                    report.assert_not_called()
                     self.assertEqual(errors, "")
                     self.assertEqual(self.daemon_calls[-1], "director-thread")
         self.assertEqual(self.forwarded(), [])
