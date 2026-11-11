@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from decimal import Decimal
+from datetime import UTC, datetime
 import json
 import multiprocessing
 import sys
@@ -154,7 +155,8 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
     worker.charges(record_query)
     fallback = Decimal(str(cloud_gate.settings().number('spot_max_usd_per_hour')))
     readings = worker.book.read_bills()
-    rate, reserved_type = max((ledger.gate_rate(readings, size, fallback, int(worker.clock())).usd_per_hour, size)
+    day = datetime.fromtimestamp(worker.clock(), UTC).date().isoformat()
+    rate, reserved_type = max((ledger.gate_rate(readings, size, fallback, int(worker.clock()), day).usd_per_hour, size)
                               for size in cloud_gate.settings().words('instance_types'))
     policy = read_settings(worker.settings_path)
     state = worker.book.read_snapshot()
@@ -189,13 +191,15 @@ def trial_cost(book: ledger.CostLedger, attempts: set[str], settings_path: Path,
     policy = read_settings(settings_path)
     total = Decimal(0)
     complete = True
-    for reservation in book.read_snapshot().gate_reservations:
+    state = book.read_snapshot()
+    intervals = ledger.gate_compute_intervals(state, now, policy.box_minimum_seconds, reserve=True)
+    for reservation in state.gate_reservations:
         if reservation.attempt not in attempts or isinstance(reservation.state, ledger.GateAbsent):
             continue
         confirmed = isinstance(reservation.state, ledger.GateTerminated)
         complete = complete and confirmed
-        end = reservation.state.at if isinstance(reservation.state, ledger.GateTerminated) else max(now, reservation.expires)
-        total += ledger.box_cost(reservation.rate, end - reservation.at, policy.box_minimum_seconds) + reservation.allowance_usd
+        total += sum((row.usd for row in intervals if row.source == 'gate:' + reservation.attempt), Decimal(0))
+        total += reservation.allowance_usd
     return total, complete
 
 

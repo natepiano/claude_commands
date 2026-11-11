@@ -554,7 +554,16 @@ Recovery replays saved launch arguments in the saved region before it uses the c
 Status, termination, and expired-launch searches use that region.
 The controller searches every configured region for an expired reservation without a recorded region.
 All regions use one spend ledger and the existing caps.
-Gate costs use bill rates for the recorded region.
+Gate costs use bill rates for the recorded region and UTC day.
+A day with its own completed bill keeps that day's rate when newer bills arrive.
+An unbilled day uses the newest earlier bill until its own bill arrives.
+A day before every bill uses the oldest available bill.
+Reservations store the selected rates and bill days for each UTC day.
+Each pricing pass builds one bill index for each type and region.
+Reservations that start after the current time retain their full reserved compute cost.
+Intervals that cross UTC midnight use each day's rate for that part of the lifetime.
+The minimum charge applies once per lifetime.
+The older builder and paired trials use the same daily rate rule.
 Reservations without a region use the highest configured regional rate.
 A region without a usable bill rate uses the configured rate ceiling.
 

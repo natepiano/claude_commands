@@ -918,23 +918,22 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
     def test_paired_cohort_reserves_highest_type_rate_and_prices_actual_minimum(self) -> None:
         worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-1', 1, execute=self.fake), self.book,
             self.settings, self.folder / 'reservation', clock=lambda: self.now)
-        actual_rate = ledger.box_rate
-        def rates(readings: object, size: str, fallback: Decimal, now: int, *, region: str = '') -> ledger.BoxRate:
-            del readings, now, region
-            return ledger.BoxRate(Decimal('2') if size == 'm7a.4xlarge' else fallback, 'fixture')
-        with mock.patch.object(cloud_gate.GateWorker, 'charges'), mock.patch.object(ledger, 'box_rate', side_effect=rates):
+        reading = ledger.ChargeRead('2026-01-14', int(self.now), int(self.now) - 90000, int(self.now) - 3600,
+            Decimal('2.8'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.8'), Decimal(1), 'Hrs'),
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('2'), Decimal(1), 'Hrs')))
+        with (mock.patch.object(cloud_gate.GateWorker, 'charges'),
+              mock.patch.object(self.book, 'read_bills', return_value=(reading,))):
             gate_trial.reserve_trial(worker, [self.request])
-        reserved = self.book.read_snapshot().gate_reservations[0]
-        self.assertEqual(reserved.usd_per_hour, Decimal('0.8'))
-        self.assertEqual(reserved.rate.usd_per_hour, Decimal(2))
-        self.assertEqual(reserved.instance_type, 'm7a.4xlarge')
-        with mock.patch.object(ledger, 'box_rate', return_value=ledger.BoxRate(Decimal('0.8'), 'actual')):
+            reserved = self.book.read_snapshot().gate_reservations[0]
+            self.assertEqual(reserved.usd_per_hour, Decimal('0.8'))
+            self.assertEqual(reserved.rate.usd_per_hour, Decimal(2))
+            self.assertEqual(reserved.instance_type, 'm7a.4xlarge')
             self.book.resolve_gate('attempt', ledger.GateTerminated(int(self.now) + 1, 'i-fixture'), instance_type='m7a.8xlarge')
-        cost, cleanup = gate_trial.trial_cost(self.book, {'attempt'}, self.settings, int(self.now) + 1)
+            cost, cleanup = gate_trial.trial_cost(self.book, {'attempt'}, self.settings, int(self.now) + 1)
         self.assertTrue(cleanup)
         self.assertEqual(cost, ledger.box_cost(ledger.BoxRate(Decimal('0.8'), 'actual'), 1,
             read_settings(self.settings).box_minimum_seconds) + Decimal('0.02'))
-        self.assertIs(ledger.box_rate, actual_rate)
 
     def test_paired_coordinator_launches_modules_concurrently_and_keeps_json_order(self) -> None:
         import multiprocessing
