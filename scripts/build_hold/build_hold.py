@@ -572,6 +572,8 @@ def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequen
 
 class HoldEnforcer(Protocol):
     def start(self) -> None: ...
+    def drain(self, holder: Holder, proc_root: Path = PROC_ROOT) -> int: ...
+    def working_drain_identities(self, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
     def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
                      action: Literal["audit", "stopped"]) -> None: ...
     def report(self, proc_root: Path, directory: Path) -> list[str]: ...
@@ -802,6 +804,28 @@ def natedev_holds(directory: Path) -> NatedevHolds:
     if isinstance(holders, NoHolders):
         return NatedevHolds(())
     return NatedevHolds(holders.holders)
+
+
+def caller_processes(proc_root: Path, pid: int) -> frozenset[ProcessIdentity]:
+    """Read the caller and its live ancestors without scanning other processes."""
+    lineage: set[ProcessIdentity] = set()
+    seen: set[int] = set()
+    child_start = float("inf")
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            fields = (proc_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            start = fields[19]
+            if fields[0] == "Z" or int(start) > child_start:
+                break
+            identity = ProcessIdentity(pid, start)
+            if process_start_time(pid, proc_root) != start:
+                break
+            lineage.add(identity)
+            pid, child_start = int(fields[1]), int(start)
+        except (OSError, ValueError, IndexError):
+            break
+    return frozenset(lineage)
 
 
 def release_eta_text(release: ReleaseEta) -> str:
@@ -1657,6 +1681,8 @@ def main(arguments: list[str]) -> int:
     _ = hold.add_argument("--target", type=parse_hold_target, default="natedev")
     _ = hold.add_argument("--proc-root", type=Path, default=PROC_ROOT)
     _ = hold.add_argument("--keep", type=int, action="append", default=[])
+    _ = hold.add_argument("--drain", action="store_true",
+                          help="stop waiting gate runs and wait for working runs; INT keeps the hold")
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
@@ -1685,6 +1711,8 @@ def main(arguments: list[str]) -> int:
                 target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
                 refused: list[str] = []
                 if action == "hold":
+                    if cast(bool, options.drain):
+                        refused.append("--drain")
                     if cast(list[int], options.keep):
                         refused.append("--keep")
                     if cast(object, options.release_eta) is not None:
@@ -1714,10 +1742,14 @@ def main(arguments: list[str]) -> int:
                 if not start:
                     raise ValueError(f"--keep {pid}: no live process with a start time")
                 keep.append(ProcessIdentity(pid, start))
+            if cast(bool, options.drain):
+                keep.extend(hold_enforcer().working_drain_identities(proc_root))
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
                              datetime.now(timezone.utc), keep))
             hold_enforcer().start()
             print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True)
+            if cast(bool, options.drain):
+                return hold_enforcer().drain(read_holder(holder_path(holder_directory(), identity.key)), proc_root)
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
             if isinstance(verdict, Busy):

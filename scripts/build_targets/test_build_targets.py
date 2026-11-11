@@ -1114,6 +1114,45 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.assertEqual(self.check_launch("other-session"), (
             10, "natedev is held by hana for render checks; launch after the release.\n", "",
         ))
+        proc = self.root / "proc"
+        for pid, parent in ((10, 1), (20, 10), (30, 1)):
+            directory = proc / str(pid)
+            directory.mkdir(parents=True)
+            fields = ["S", str(parent), *(["0"] * 17), str(pid * 100)]
+            _ = (directory / "stat").write_text(f"{pid} (gate) " + " ".join(fields))
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW,
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("kept-session", "peer"),
+                                  "peer checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+        for pid, session, owns_hold, admitted in (
+            (10, "other-session", False, True),
+            (20, "other-session", False, True),
+            (30, "other-session", False, False),
+            (10, "", False, True),
+            (30, "owned-session", True, False),
+        ):
+            if owns_hold:
+                _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity(session, "caller"),
+                                          "caller checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+            with self.subTest(caller_pid=pid, session=session, owns_hold=owns_hold), \
+                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}), \
+                 mock.patch.object(build_hold, "PROC_ROOT", proc), \
+                 mock.patch.object(build_hold, "process_start_time", REAL_PROCESS_START_TIME), \
+                 mock.patch.object(os, "getpid", return_value=pid):
+                with mock.patch.object(build_hold, "caller_processes", wraps=build_hold.caller_processes) as lineage:
+                    holds = build_hold.natedev_holds(self.holders)
+                    self.assertEqual(build_targets.caller_waits_on_hold(holds, self.holders), not admitted)
+                    lineage.assert_called_once_with(proc, pid)
+                if admitted:
+                    with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Kept runs must not wait")):
+                        self.assertEqual(self.verify_calls(session), (0, 0, 0))
+                    self.assertEqual(self.check_launch(session), (0, "", ""))
+                else:
+                    self.assertEqual(self.check_launch(session), (
+                        10, "natedev is held by hana for render checks; launch after the release.\n", "",
+                    ))
 
     def test_holder_session_launch_is_refused_when_another_hold_is_in_force(self) -> None:
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),

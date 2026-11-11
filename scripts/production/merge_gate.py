@@ -469,7 +469,7 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = bool(holds.in_force) and not build_targets.caller_holds_only_own()
+            held = build_targets.caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:
