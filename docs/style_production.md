@@ -33,6 +33,10 @@ Every partial B rule also has a C read in its own family.
 
 ## Style units
 
+Launch each style unit with `production/add_unit.py --unit-type style --plan <unit plan>`.
+Staff selects `/unit:style` for launch, restart, and compaction.
+The director reads `commands/unit/style.md` and the contracts in `docs/direct/style_unit.md`.
+
 The production document names one to four units in this table:
 
 | Unit | Families | Open tickets |
@@ -278,7 +282,7 @@ only the first-launch template. Edit a launched unit's copy for changes meant
 for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
-Use `style_plan.py checkpoint` as the publication coordinator; see `commands/unit/checkpoint.md`.
+Use `style_plan.py checkpoint` under <StyleCheckpoint/> in `docs/direct/style_unit.md`.
 It gates and publishes one ticket, records its checkpoint and confirms reservation release before another publication.
 With N=1 and one assigned ticket, verification uses the editing tree.
 Otherwise, verification uses the reused candidate copy while workers continue on their assigned paths.
@@ -304,17 +308,7 @@ message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before
 checking once more for work; delivery clears only that wait, preserving a later one.
 
-An N=1 ticket with no code changes makes no commit.
-
-1. Record its cells at HEAD.
-2. Verify `git merge-base --is-ancestor HEAD refs/heads/<receiving merge branch>`.
-   If ancestry fails, leave the ticket assigned and report the error.
-3. Write the checkpoint procedure's committed-awaiting-release record for that HEAD with `--ticket <ticket>`.
-4. Run `style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD> --session-dir <run folder> --phase <phase>`.
-5. Run `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>` to confirm reservation release.
-   Apply its `not built` lines as described in **Merging back**.
-6. Mark the phase done.
-7. Report `From <unit>: ticket <id> closed with no code change; <n> held.`, then refill.
+For N=1 tickets without code changes, apply <StyleNoChangeTicket/> in `docs/direct/style_unit.md`.
 
 The gate and `ticket checkpoint` refuse any ticket with an owned cell that is neither recorded nor removed, and name each one.
 When the ticket's own commits delete a cell's file, record that cell with `style_ledger.py record --verdict removed`

@@ -291,6 +291,16 @@ class StandingCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "crash"):
                 _ = self.publish(first["id"])
         checkpoint = self.git(self.unit, "rev-parse", "HEAD")
+        for next_ticket in (first, second):
+            with self.subTest(blocked_ticket=next_ticket["id"]):
+                with mock.patch.object(phase_reservation, "release_held",
+                                       side_effect=style_ledger.LedgerError("release pending")):
+                    with self.assertRaisesRegex(style_ledger.LedgerError, "release pending"):
+                        _ = self.publish(next_ticket["id"])
+                self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), checkpoint)
+                self.assertTrue(style_ledger.publication_path(self.unit, "publication.json").exists())
+                with style_ledger.open_ledger(self.unit) as ledger:
+                    self.assertEqual(ledger.ticket_get(second["id"])["state"], "assigned")
         released: list[str] = []
         def release(phase_dir: Path, ticket: str, merged: str) -> str:
             self.assertEqual(ticket, first["id"])

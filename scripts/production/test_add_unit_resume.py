@@ -425,6 +425,11 @@ class AddUnitResumeTests(AddUnitTestCase):
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
         self.assertIn(f"Run /unit:style {promoted_plan}", command)
+        selected = staff.unit_command(unit_membership("build-followups", "alpha"))
+        self.assertEqual(selected, "/unit:style")
+        contract = SCRIPT.parents[2] / "commands/unit/style.md"
+        self.assertTrue(contract.is_file())
+        self.assertIn("<RestartTakeover/>", contract.read_text())
 
     def test_excluded_standing_plan_launches_and_keeps_the_units_copy(self) -> None:
         plan = Path("docs/style-production/units/alpha-unit.md")

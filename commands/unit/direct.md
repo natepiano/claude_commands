@@ -32,9 +32,6 @@ Read `~/.claude/docs/direct/held_astra_roles.md` in full when the run holds an A
 
 After restart, compaction, move, or rename, apply <RestartTakeover/> before new dispatches.
 
-At startup or restart, a header `**Standing:** style_plan.py` runs
-<StandingPlanRefill/> before choosing a phase; repeat after compaction.
-
 State:
 
 - `SESSION_DIR`: last path printed by `prepare_session.sh`.
@@ -105,7 +102,6 @@ it:
 | <WorkerLaunchFailure/> | `docs/direct/launch_failure.md` | — |
 | <AuthorizationContract/> | `docs/direct/authorization.md` | — |
 | <HeldAstraRoles/> | `docs/direct/held_astra_roles.md` | — |
-| <StandingPlanRefill/> | `docs/direct/standing_plan_refill.md` | — |
 | <BerthDecisions/> | `docs/direct/berth_decisions.md` | — |
 | <CodexDispatchWait/> | `docs/direct/codex_dispatch_wait.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
@@ -699,9 +695,6 @@ fails the checkpoint.
 </CheckpointCommit>
 
 <ShrinkCommit>
-Standing plans skip this tag entirely: their excluded plan and pinned files
-are never staged, and no shrink commit or notice is sent.
-
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
 <PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
 `${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
@@ -771,10 +764,8 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-At <PhaseEnd/>'s next boundary, a plan whose header carries
-`**Standing:** style_plan.py` runs <StandingPlanRefill/> first. Otherwise choose
-the next phase or close the plan. If no
-todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
+At <PhaseEnd/>'s next boundary, choose the next phase or close the plan.
+If no todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
 point and <CICleanup/>, then <RunSummary/>.
 
 For `next N`, decrement after completion and clear at zero. For `through X`,
@@ -790,10 +781,6 @@ dispatching. Announce the next phase, run
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
-
-<StandingPlanRefill>
-Read `~/.claude/docs/direct/standing_plan_refill.md` in full when the plan header has `**Standing:**`.
-</StandingPlanRefill>
 
 <FinalGateCommit>
 Read `~/.claude/docs/direct/final_gate_commit.md` in full at the final gate or when a `single` task finishes.

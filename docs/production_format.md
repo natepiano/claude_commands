@@ -16,6 +16,13 @@ These commands read or write this format:
 - `/unit:direct`, `/unit:merge`, and `/unit:style` — unit commands selected by the staff row's `unit_type`.
 
 The staff row stores each unit's type: `direct`, `merge`, or `style`.
+
+| Type | Command | Work |
+| --- | --- | --- |
+| `direct` | `/unit:direct` | Phased implementation plans |
+| `merge` | `/unit:merge` | Authorized merge, gate, build, and promotion orders |
+| `style` | `/unit:style` | Standing tickets under `docs/direct/style_unit.md` |
+
 An absent type reads as `direct`; invalid values make the row unreadable.
 Readers discard the field on other staff kinds; the next write removes it.
 Promotion removes the type; demotion selects an explicit type with `--unit-type`, default `direct`.

@@ -8,8 +8,7 @@ description: Commit and push a completed phase.
 
 Type this when a phase finished and was never committed, or when a run stopped
 between the commit and the reservation release. It runs inside the current
-session and already knows the phase, the plan doc, and the mode. If no `/unit:direct`
-run is active, say so in one line and stop.
+session and already knows the phase, the plan doc, and the mode. If no unit run is active, say so in one line and stop.
 
 This is durable state with no cheap undo. Read the whole contract before acting
 on any part of it, and read the reservation record from disk — a value
@@ -26,6 +25,8 @@ Everything below is the contract.
 ---
 
 <CheckpointCommit>
+For style tickets, apply <StyleCheckpoint/> in `docs/direct/style_unit.md`.
+
 Loop/verbose only:
 
 1. Require smoke pass, `not applicable`, or `deferred`, and a `converged`
@@ -33,13 +34,10 @@ Loop/verbose only:
 2. Confirm status contains only this phase, source-comment edits left by the
    previous phase's plan review, its plan doc, and an approved change to
    `${NEXT_ITEMS_PATH}` when present. The current phase may still have its Work
-   Order. For a header `**Standing:** style_plan.py`, expect no plan doc in
-   status: it is excluded, and earlier done ticket phases keep their Work
-   Orders until refill discards them. Otherwise refuse the checkpoint if any
-   earlier `done` phase still has a Work Order; its shrink must be repaired first.
+   Order. Refuse the checkpoint if an earlier `done` phase still has a Work Order.
+   Repair its shrink before the checkpoint.
 3. Formatting is covered by <PhaseChecks/>; do not rerun it here.
-4. Mark the phase `status: done`. For a standing plan, defer this until step 6's
-   ticket checkpoint succeeds. Never put its commit hash in the plan.
+4. Mark the phase `status: done`.
 5. First record a first touch no hook recorded. When the state is still
    `EnrolledAwaitingFirstTouch`, this checks every path of this phase changed
    since `${PHASE_DIR}/phase_baseline` and writes `Active` from the clear
@@ -95,56 +93,7 @@ Loop/verbose only:
    says drift requires a live session mapping, active coordination-run marker,
    or `CARGO_BERTH_RUN`. Exit `6` has already spent the engine's single
    ten-second deadline: invoke no retry.
-6. **Standing plans:** write the checkpoint message below to a file.
-   Run the publication coordinator:
-   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py checkpoint --repo . --ticket <ticket> --session-dir "${SESSION_DIR}" --phase <phase id> --message-file <message file>`.
-   The coordinator gates the ticket's candidate and publishes it with an expected-HEAD update.
-   It updates the published paths in the index and records the checkpoint.
-   It releases the reservation while HEAD names that checkpoint.
-   The next publication waits for release confirmation.
-   Other workers continue to edit their assigned paths.
-   With N=1 and one assigned ticket, the gate and verification use the editing tree.
-   Otherwise, they use the unit's reused candidate copy.
-   The coordinator runs `doc`, so a standing ticket does not run it by hand.
-   Keep the ledger and approval documents in the original repository.
-   Never stage the plan, `docs/style-production/`, or pinned rule files.
-   On failure, retain the reservation and repeat the same coordinator command after repair.
-   A retained publication record completes the same checkpoint without another commit.
-   Before refill, use `next-phase --session-dir "${SESSION_DIR}"` to restore every ticket's phase and worker.
-   Pending sync stops new assignments while assigned workers finish.
-
-   **N=1 no-change standing ticket:** with one assigned ticket and every cell recorded `clean`, `exception`
-   or `held` at the unit's HEAD and no tracked diff, make no commit. Capture
-   `git rev-parse HEAD` once and require
-   `git merge-base --is-ancestor <captured HEAD> refs/heads/<style merge branch>`.
-   The standing fast-forward exception in `docs/production_format.md`
-   item 5 keeps HEAD on the style merge branch's history after a phase-start sync.
-   On failure, report one line to the style showrunner and leave the ticket
-   assigned until it answers. On success, from `Active`, replace the durable
-   record with `CheckpointCommittedAwaitingReleaseConfirmation` carrying that
-   same captured full id as `checkpoint_commit`, with `phase_reservation.py
-   committed --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured HEAD> --ticket <ticket>`,
-   and read it back. `--commit` takes any name of that commit, a short hash
-   too, and the record keeps its full id. This is the one case where
-   that state carries a commit the phase did not make. A failed transition or
-   read-back retains the valid durable state and runs no ticket merge. Then run
-   `style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured HEAD> --session-dir "${SESSION_DIR}" --phase <phase id>`
-   then `style_ledger.py ticket merge --repo . --id <ticket>` through
-   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py`. The
-   merge releases the held reservation and clears the record. An exit `2`
-   that ends `rerun ticket merge` keeps the reservation held: report its line
-   and rerun the merge after the cause is fixed.
-   For each `has no applied check` line that merge prints, check the change in
-   the code and run the printed `held built` command when the change is there.
-   A finding whose change is not there waits for a person, who makes the change
-   and runs that command, or waives the finding with `style_ledger.py held waive --person <name>`.
-   Run step 7; a record the merge cleared, and an inactive state, release
-   nothing. After confirmation, mark the
-   phase done, skip staging, <PushCheckpoint/> and the merge request, send
-   `From <unit>: ticket <id> closed with no code change; <n> held.`, and refill
-   at once through <StandingPlanRefill/>.
-
-   **Other plans:** stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when
+6. Stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when
    approved and changed. Every code checkpoint uses this message:
 
    ```
@@ -241,24 +190,18 @@ Loop/verbose only:
    ```
 
    `--commit` takes any name of the commit, and the record keeps its full id;
-   a name that is no commit is refused with exit `2`. A standing ticket adds
-   `--ticket <ticket>`, as above. Then read the new record back. Never write the record by hand. That durable transition
+   a name that is no commit is refused with exit `2`. Then read the new record back. Never write the record by hand. That durable transition
    must succeed before release is invoked, and its value comes only from the
-   commit that just succeeded (or the ancestry-checked, captured HEAD of the
-   no-change standing ticket above), never from conversation or from a later
-   reading of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
+   commit that just succeeded, never from conversation or a later reading of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
    release and apply <RetainPhaseReservation/> to whichever valid
    durable state remains.
 7. Read and validate the durable record again.
 
-   For a standing ticket with a retained publication record, repeat the coordinator command before marking the phase done.
-   A no-change ticket is already `merged` and needs no repeated transition.
-
    | State | Action |
    | --- | --- |
-   | `CheckpointCommittedAwaitingReleaseConfirmation` naming `held_for_ticket` | Repeat the standing ticket coordinator command. Mark the phase done after release confirmation. |
+   | `CheckpointCommittedAwaitingReleaseConfirmation` naming `held_for_ticket` | Apply <StyleCheckpoint/> in `docs/direct/style_unit.md`. |
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Read its reservation id and `checkpoint_commit` from the read-back `CheckpointReleaseConfirmationPending`, then invoke `/sync release` exactly once. |
-   | No record, and `reservation_released` names the checkpoint | A no-change ticket's merge released it: invoke no release. |
+   | No record, and `reservation_released` names the checkpoint | Release is confirmed; invoke no release. |
    | `Active` | Step 6's durable transition did not complete: do not invoke release; apply <RetainPhaseReservation/>. |
    | Either inactive state | Invoke no release. |
 
@@ -342,9 +285,7 @@ Loop/verbose only:
 </CheckpointCommit>
 
 <ShrinkCommit>
-Standing plans (`**Standing:** style_plan.py`) skip this entire section: no
-shrink, shrink commit, shrink notice or `--shrink` merge request; never stage
-their excluded plan or pinned rule files.
+Style units apply <StyleStandingLifetime/> in `docs/direct/style_unit.md` instead of shrink.
 
 Loop/verbose only, after <RunPhaseShrink/> passes its structural check. The
 next phase's workers may be editing, but they never stage files.

@@ -11,12 +11,7 @@ Pointing files: `commands/unit/direct.md`, `commands/unit/checkpoint.md`,
 `commands/plan/phase_review.md`.
 
 <PhaseEnd>
-Standing plans (`**Standing:** style_plan.py`) run <StandingPlanRefill/> at the next boundary, even with no todo phase.
-Read `docs/direct/standing_plan_refill.md` for that rule. Skip step 7 (shrink,
-shrink commit and notice); never stage, commit or shrink the excluded plan or
-pinned rule files. A no-change ticket follows <CheckpointCommit/> step 6's
-ancestry-checked HEAD path with no code commit, push or merge request, then
-refills; other tickets checkpoint the code commit before marking the phase done.
+Style ticket completion uses <StyleTicketEnd/> in `docs/direct/style_unit.md`.
 
 Run these steps in order for each completed loop or verbose phase:
 

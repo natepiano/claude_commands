@@ -25,7 +25,13 @@ after launch, edit scope only in that unit's own plan copy (see
 `docs/style_production.md`, Pilot scope).
 
 The production document's `Style units` table names each unit, its families and its `Open tickets` count.
-Pass `--unit-type style` to `production/add_unit.py` when launching or attaching each style unit.
+Launch or attach each style unit with this command:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py --production <owning production> <unit> --unit-type style --plan <unit plan>
+```
+
+Staff selects `/unit:style` for that unit.
 Each family has exactly one owner. One unit can own all four families.
 `Open tickets` sets the number assigned at once; an empty value means 1.
 Refill refuses a table with a missing family owner.

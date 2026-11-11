@@ -60,9 +60,7 @@ Ad hoc work skips this section.
 </RunPhaseReview>
 
 <RunPhaseShrink>
-Standing plans (`**Standing:** style_plan.py`) skip shrink and its structural
-check: refill discards merged or dropped ticket phases. Never commit the plan
-or pinned rule files.
+Style units apply <StyleStandingLifetime/> in `docs/direct/style_unit.md` instead of shrink.
 
 For a phased plan, read `~/.claude/commands/plan/shrink.md` in full and apply it
 with arguments `"${PLAN_DOC}" --phases <current-id> --closeout "${SESSION_DIR}"`
