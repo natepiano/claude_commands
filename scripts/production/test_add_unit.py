@@ -8,6 +8,7 @@ from scripts.lib import names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
+from scripts.lib.transcript_test_support import compressed_copy
 
 import io
 import json
@@ -61,6 +62,22 @@ class NativeClaudeUnitTests(StaffTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
         })))
+
+    def test_saved_transcript_model_uses_the_newest_file(self) -> None:
+        native = fixture_runtime_id("saved-model")
+        projects = Path.home() / ".claude/projects"
+        old = projects / "old" / f"{native}.jsonl"
+        newest = projects / "newest" / f"{native}.jsonl"
+        for path, model, modified in ((old, "older-model", 10), (newest, "saved-model", 20)):
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": model}}) + "\n")
+            os.utime(path, (modified, modified))
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    for path in (old, newest):
+                        _ = compressed_copy(path)
+                self.assertEqual(add_unit.transcript_model(native), "saved-model")
 
     def test_resume_uses_the_renamed_native_owner_for_arguments_and_tab(self) -> None:
         document = self.production("demo")
