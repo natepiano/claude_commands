@@ -151,7 +151,8 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     for name in ("py", "process_group.py"):
         _ = shutil.copy2(source / "lib" / name, home_lib / name)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
+    _ = (root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"worker@example.invalid"}}')
+    for name in ("models_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
     for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
                  "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):
@@ -179,7 +180,8 @@ def launcher_environment(root: Path) -> dict[str, str]:
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
     seed_interpreter_cache(root / "cache")
-    for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+    for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
+                 "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_REMOTE_MEMORY_DIR"):
         _ = environment.pop(name, None)
     return environment
 
