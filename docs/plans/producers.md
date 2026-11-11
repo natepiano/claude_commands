@@ -162,40 +162,27 @@ dwight=claude:fable:high
 
 **Depends on:** Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** dwight has a doc folder, a staff row of kind producer, and a live first conversation in the `producers` workspace.
-
-**Spec:**
-
-1. Create `~/rust/hanadocs/dwight/README.md` with the role name (strategist) and the management lines only.
-2. The shared resume entry recognizes a configured producer that has no staff row. It starts a new conversation with no resume argument, with the `[producers]` family, model and effort, the account rule and the producer workspace.
-3. It proves the native identity through the existing herdr path, admits the row with `staff.ensure(..., runtime_id=<proved identity>)`, and completes the retained publication through `pane_launch.staff_admitted`. Later resumes use the row's `current_session`.
-4. Start dwight. Report the model the conversation runs. The user expects Fable 5.2.
-
-**Constraints from prior phases:**
-- `StaffRow.current_session` stays required (`scripts/production/staff.py:330`). A first-start request is its own type, separate from an admitted `StaffRow`; do not use an optional identity.
-- After an interrupted admission, reuse the existing native identity and launch evidence.
-- Keep the family and model choice apart from the shared launch code.
-- Run the tests with fixture staff and a fake herdr before the live dwight start.
-- The herdr upkeep timer calls `stop_resume.resume` for each admitted, active, local, unpaused producer about every two minutes (`scripts/maintenance/herdr_upkeep.py`). Admit dwight's row only after his first start is live; a resume of a live producer starts nothing.
+- `stop_resume.resume(<name>)` starts a configured producer that has no staff row as a `ProducerFirstStart`, separate from an admitted `StaffRow`. `_first_producer_resume` opens the producer's tab in the `producers` workspace with no resume argument, using `restart.producer_first_arguments` (the `[producers]` family, model and effort) and `member_account.producer_account`.
+- It proves the native identity through `Herdr.producer_admission_launch`, admits the row with `staff.ensure(..., runtime_id=<proved identity>)` and publishes the retained pane through `pane_launch.staff_admitted`. Later resumes use the row's `current_session`.
+- A `PendingProducerAdmission` record at `_producer_admission_path(name)` holds the reserved pane until the admission ends. A rerun finishes an interrupted admission and opens no second conversation.
+- A lost reserved pane gets a new pane; the retained entry moves to it without `pid` and `proc_start`, and the lost pane's launch is retired.
+- A shell is reused only when its pane record has no entry, or the entry is this producer's pending identity. A shell that holds another session's launch is never taken; a new tab opens.
+- `_resume` checks the admission record before the registry read. A registry error with a pending admission returns `ResumeFailed` and keeps the record; without one, the resume falls back to the generic path.
+- The producer folder is `PRODUCER_FOLDER_ROOT/<name>` (`config/staff.conf`, default `~/rust/hanadocs`). dwight has `~/rust/hanadocs/dwight/README.md` (role strategist), a staff row and a live first conversation on Fable 5.1 with high effort.
 
 **Files:**
-- `scripts/agents/stop_resume.py` — first-start selection at the shared resume entry
-- `scripts/agents/restart.py` — shared launch arguments
-- `scripts/agents/member_account.py` — the existing account choice
-- `scripts/agents/shutdown.py` — command routing
-- `scripts/herdr/herdr.py` — the existing launch and native identity proof
-- `scripts/herdr/pane_launch.py` — `staff_admitted` publication
-- `scripts/production/staff.py` — the existing admission transaction
-- `scripts/production/add_showrunner.py` — read only: the existing admission pattern
-- `scripts/agents/test_stop_resume.py` — first start and the next resume
+- `scripts/agents/stop_resume.py` — producer first start, admission record, pane reservation and recovery
+- `scripts/herdr/herdr.py` — `agent_alias_script(kind)` for every agent launch; `Herdr.producer_admission_launch`
+- `scripts/agents/restart.py` — `producer_first_arguments`
+- `scripts/agents/member_account.py` — `producer_account`
+- `config/staff.conf` — `PRODUCER_FOLDER_ROOT`
+- `scripts/agents/test_stop_resume.py` — `test_interrupted_producer_admission_reuses_its_live_native_conversation` (lost, replaced, unpublished, unrecorded, foreign and native ownership, broken registry rows); the absent-registry row in `test_resume_of_a_live_target_is_an_idempotent_success`
 - `scripts/agents/test_shutdown_cli.py` — `resume dwight` routing
-- `scripts/production/test_staff.py` — admission rows
-- `~/rust/hanadocs/dwight/README.md` — the role name and the management lines
 
-**Workers:** 1 writer.
+**Gotchas:**
+- Check the admission record before the registry read, or an unreadable registry reports success for an incomplete admission.
+- Never write a pane record entry over another session's retained launch.
 
-**State:** a new staff row for dwight.
-
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`. Fixture tests cover the first admission, a failed admission and the next resume of the same conversation. The live start reports the model identifier, and `resume dwight` reaches the same live conversation.
+**Ruled out:** Fable 5.2 for dwight — the `fable` alias moves to 5.2 when it ships.
