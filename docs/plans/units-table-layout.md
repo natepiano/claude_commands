@@ -63,47 +63,18 @@ The user's words, from the sdlc showrunner on 2026-11-11:
 
 **Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** ETA becomes ETA Next, the promise for what comes next; a new ETA Plan column shows the plan finish, never earlier than a promise inside the plan.
-
-**Spec:**
-
-1. **ETA Next** replaces ETA, in the same place. It shows the latest stated promise of the first of these that exists:
-   1. the open plan phase;
-   2. the newest open phase outside the plan (the work in Non-Phase Work);
-   3. the next not-started plan phase that has a promise (the checkpoint ETA for the next phase).
-   - A passed promise adds ` · late <elapsed>`.
-   - Open work with no promise shows `no ETA`.
-   - Nothing open and no promise gives `—`.
-   - Time forms stay: `HH:MM` the same day, `Sat 18:41` within six days, otherwise `24 Oct`.
-2. **ETA Plan** comes directly after ETA Next. It shows the plan's predicted finish (`PredictedFinish`), with the same time forms and no `ends` word.
-   - The column shows only when at least one row has a plan with phases that are not all done. Otherwise the table has no ETA Plan column.
-   - A row with no running plan shows `—`.
-3. **Plan finish never earlier than a promise.** Fix this in `phase_table._plan_finish`, where the defect lives: add the latest stated promise (`eta_trail[-1][0]`) of every open and not-started phase to the projections before taking the maximum. Seen live: the phases unit showed `ends 15:42` while its phase 5 had a promise of 11-15 18:00. Every reader of `plan_finish` (the unit report too) gets the corrected time.
-   - A not-started phase has no phase instance, so `_phase_history` gives it an empty `eta_trail` today. A checkpoint ETA (`eta_stated` with `eta_phase_id` naming that phase) is then lost. Seen live: unit-board phase 2 had a 15:30 checkpoint promise, an empty trail, and `ends 13:56`. Attach each `eta_stated` event whose `eta_phase_id` names a plan phase with no instance to that phase's `eta_trail`. Item 1.3 and item 3 both read this trail.
-4. The `ends <time>` part leaves ETA Next.
-5. Update `commands/showrunner/units.md` and the two as-built docs in the same commit.
+- `eta_cell` (ETA Next) shows the latest promise of the first of: the open plan phase (from the open run's instances when present), the newest open phase outside the plan, the current open phase, the first not-started plan phase with a promise. A passed promise adds ` · late <elapsed>`. Open work with no promise gives `no ETA`; otherwise `—`. The `ends <time>` part is gone.
+- `eta_plan_cell` (ETA Plan) shows the `PredictedFinish` only when `running_plan` (some plan phase is not done), else `—`. `table` shows the ETA Plan column only when a row has a running plan.
+- `phase_table._plan_finish` adds `eta_trail[-1][0]` of every `OpenPhase` and `TodoPhase` to the projections, so the plan finish is never earlier than a phase promise. Every `plan_finish` reader gets this time.
+- `phase_table._phase_history` attaches an `eta_stated` event whose `eta_phase_id` names a row with no instances. It skips an event that `_instance_eta_events` gives to an earlier instance with that number, or that was stated before that instance's recorded finish.
+- The header is `| Unit | Status | [Machine |] Progress | Phase | Notes | ETA Next | [ETA Plan |] Workers | Non-Phase Work | Queued |`.
 
 **Files:**
-- `scripts/production/unit_phases.py` — `eta_cell` becomes the ETA Next cell, a new plan-finish cell, the optional column in `table`.
-- `scripts/direct/phase_table.py` — `_plan_finish`.
-- `scripts/production/test_unit_phases.py`, `scripts/direct/test_phase_table.py` — rows for each rule.
-- `scripts/agents/test_shutdown_cli.py` — its expected units header (about line 233).
+- `scripts/production/unit_phases.py` — `eta_cell`, `running_plan`, `eta_plan_cell`, the `table` header and cells.
+- `scripts/direct/phase_table.py` — `_plan_finish`, `_phase_history`.
+- `scripts/production/test_unit_phases.py`, `scripts/direct/test_phase_table.py`, `scripts/agents/test_shutdown_cli.py` — rows and header.
 - `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/phase-tables.md` — column text.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `unit_phases.py`, `phase_table.py`, `units.md`, both as-built docs.
-- `test` — `test_unit_phases.py` rows for each ETA Next source, the hidden and shown ETA Plan column; a `test_phase_table.py` row where a not-started phase's promise is later than the predicted finish; the header in `test_shutdown_cli.py`.
-
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 1 sets the column order up to Notes. ETA Next and ETA Plan follow Notes.
-- Progress, Phase and Notes read `progress_record` (the open-run record when the plan record has no phases). ETA Next and ETA Plan read the same record.
-- `scripts/agents/test_shutdown_cli.py` pins the units header. Each header change updates it.
-
-**Acceptance gate:**
-1. `basedpyright scripts/production/unit_phases.py scripts/production/test_unit_phases.py scripts/direct/phase_table.py scripts/direct/test_phase_table.py`: 0 errors, 0 warnings, 0 notes.
-2. `env HERDR_BIN=/nonexistent/herdr PYTHONPATH="$PWD" scripts/lib/py -m unittest scripts.production.test_unit_phases scripts.direct.test_phase_table scripts.production.test_roles_audit scripts.agents.test_shutdown_cli` passes.
-3. Live: the phases row shows an ETA Plan no earlier than its phase 5 promise.
+**Gotchas:** `build_plan` shows an unfinished plan phase as `TodoPhase` when outside work opens after it; ETA Next reads the open run's instances for that reason. A run that closes without `phase_finished` leaves `PhaseInstanceWithoutFinish`; it does not block a later promise for the same phase number.
