@@ -182,6 +182,21 @@ class GateIndexTests(unittest.TestCase):
         kept = gzip.decompress((self.root / run["modules"][0]["log"]).read_bytes())
         self.assertTrue(kept.endswith(output.encode("utf-8")))
 
+    def test_query_text_aligns_numbers_and_prints_empty_results(self) -> None:
+        _ = self.write_run("table", fixture_run())
+        cases = (
+            ("SELECT 7 AS runs, 'alpha' AS label UNION ALL SELECT 123, 'b' UNION ALL SELECT NULL, 'gamma'",
+             "runs  label\n   7  alpha\n 123  b\n   —  gamma\n"),
+            ("SELECT tests_run AS runs, reason AS label FROM gate_runs WHERE id = 'absent'", "no rows\n"),
+        )
+        for sql, expected in cases:
+            with self.subTest(sql=sql):
+                printed = io.StringIO()
+                with redirect_stdout(printed):
+                    status = cli.main(["query", sql])
+                self.assertEqual(status, 0)
+                self.assertEqual(printed.getvalue(), expected)
+
     def test_reused_run_has_zero_counts_and_no_child_rows(self) -> None:
         run = fixture_run()
         run.update({"selection": "reused", "aborted": False, "dirty": False, "suites": [], "modules": []})
