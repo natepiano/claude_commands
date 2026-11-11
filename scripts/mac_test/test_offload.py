@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-from scripts.mac_test import offload
+from scripts.mac_test import offload, claim_state
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -641,14 +641,18 @@ class OffloadSettingsTests(unittest.TestCase):
         destination = self.root / "result"
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
 
-        def complete_claim(arguments: Sequence[str], attempt: offload.LocalClaimAttempt) -> None:
-            _ = arguments
+        def complete_claim(controller: offload.ProcessController, arguments: Sequence[str],
+                           attempt: offload.LocalClaimAttempt) -> None:
+            claim = claim_state.ClaimIdentity(
+                arguments[arguments.index("--claim-id") + 1], arguments[arguments.index("--episode") + 1],
+                arguments[arguments.index("--attempt") + 1])
+            controller.claim_identity = claim
             attempt.answer = offload.FreshMacClaim()
 
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination)]), \
              mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
-             mock.patch.object(offload.ProcessController, "complete_claim", side_effect=complete_claim), \
+             mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(offload.main(), 75)
@@ -885,7 +889,9 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(self.wire_result().get("holder"), "other tests")
         self.assertTrue(self.claim_file.exists())
         self.assertEqual(self.events(), [])
-        released = self.state_command("release", "--pid", str(os.getpid()))
+        claim = self.remote_claim()
+        released = self.state_command("release", "--pid", str(os.getpid()), "--claim-id", claim["claim_id"],
+                                      "--episode", claim["episode"], "--attempt", claim["attempt"])
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
 
         _ = (self.state_directory / "block.json").write_text(

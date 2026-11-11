@@ -35,6 +35,7 @@ from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
+from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.agents import pane_record, remote
 
@@ -130,7 +131,15 @@ def fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBac
     path = _prepare_fixture_session(identity, backend)
     path.touch(exist_ok=True)
     if isinstance(backend, staff.CodexBackend):
-        os.environ["CODEX_HOME"] = str(fixture_account_home(backend.codex_home))
+        home = fixture_account_home(backend.codex_home)
+        os.environ["CODEX_HOME"] = str(home)
+        row = staff.initial_snapshot().by_current_session(identity)
+        if row is None:
+            entry = pane_launch.launch("fixture-" + identity, identity, str(home),
+                                       {"CODEX_HOME": str(home)}, ["codex"], kind="codex")
+            pane_launch.write(pane_launch.record_directory() / ("fixture-" + identity + ".json"), entry)
+        elif row.home != staff.SessionHome(home):
+            _ = staff.set_home(row.id, staff.SessionHome(home))
 
 
 def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
@@ -238,8 +247,9 @@ def fixture_member(kind: staff.Kind, *, name: str,
     if kind == "worker":
         if parent_id is None:
             raise staff.StaffRefused("a fixture worker requires a parent")
+        row = staff.ensure_worker(staff.native_id(identity), name, parent_id)
         fixture_session(identity, backend)
-        return staff.ensure_worker(staff.native_id(identity), name, parent_id)
+        return staff.by_id(row.id) or row
     return staff.ensure(kind, name=name, parent=relationship,
                         worktree=worktree, doc=doc, runtime_id=identity)
 
@@ -247,11 +257,7 @@ def fixture_member(kind: staff.Kind, *, name: str,
 def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "",
                    backend: staff.ClaudeBackend | staff.CodexBackend = CLAUDE_BACKEND) -> staff.StaffRow:
     """Publish the fake worker backend's native identity through the real writer."""
-    existing = [row for row in staff.initial_snapshot().find(kind="worker", parent=parent)
-                if row.name == name and row.parent == staff.ReportsTo(parent)]
-    identity = runtime_id or (existing[0].current_session if len(existing) == 1 else fixture_runtime_id(f"worker:{parent}:{name}"))
-    fixture_session(identity, backend)
-    return staff.ensure_worker(staff.native_id(identity), name, parent)
+    return fixture_member("worker", name=name, parent=parent, runtime_id=runtime_id, backend=backend)
 
 
 def fixture_roster(entries: dict[str, object], parent: staff.StaffId,

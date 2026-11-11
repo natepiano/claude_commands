@@ -315,6 +315,9 @@ class PaneWorld(herdr.Herdr):
             source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
             if not source.read_text():
                 write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+            entry = pane_launch.launch(pane, identity, str(prepared.directory), prepared.env,
+                                       [kind, *agent_arguments], kind="codex")
+            pane_launch.write(pane_launch.record_directory() / f"{self.session}.json", entry)
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
@@ -2613,16 +2616,16 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.closed, [("w1:p3", "terminal-w1:p3")])
         self.assertEqual(set(self.world.locations), {"w1:p0", "w1:p1", "w1:p2", "w2:p9"})
 
-    def test_account_move_keeps_open_and_stopped_panes_without_an_active_dispatch(self) -> None:
+    def test_account_move_closes_idle_panes_and_resumes_busy_workers_without_an_active_dispatch(self) -> None:
         from scripts.accounts import pane_moves, moves
         from scripts.agents import stop_results
 
         run = self.run_state()
         for family in ("codex", "claude"):
             _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
-            for live in (False, True):
-                with self.subTest(family=family, live=live):
-                    name = f"move-{family}-{live}"
+            for live, busy in ((False, False), (True, False), (True, True)):
+                with self.subTest(family=family, live=live, busy=busy):
+                    name = f"move-{family}-{live}-{busy}"
                     if live:
                         opened = self.start(name)
                         assert isinstance(opened, worker_panes.OpenWorker)
@@ -2634,12 +2637,16 @@ class WorkerPaneTests(StaffTestCase):
                     if not live:
                         row = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
                     self.assertEqual(row.role, staff.KnownWorkerRole("impl"))
+                    if busy:
+                        self.world.locations[pane]["agent_status"] = "working"
                     target = self.root / (family + "2")
                     move = pane_moves.WorkerMove(row, self.parent.id, family, family + "2", "", run, self.world)
                     common = moves.MoveCommon(at="2026-11-09T00:00:00+00:00", tool=family,
                                                subject=row.id, move_id=name)
                     prompts = self.prompts()
-                    with (patch.object(pane_moves, "_request", return_value=common),
+                    launches = list(self.world.launches)
+                    closed = list(self.world.closed)
+                    with (patch.object(pane_moves, "_request", return_value=common) as request,
                           patch.object(pane_moves, "_confirm") as confirm,
                           patch.object(pane_moves, "_source_account", return_value=family + "1"),
                           patch.object(stop_resume, "running_on_account",
@@ -2649,17 +2656,29 @@ class WorkerPaneTests(StaffTestCase):
                           patch.object(accounts, "account_directory_readiness", return_value=accounts.AccountDirectoryReady("fixture-login")),
                           patch.object(accounts, "prepare_claude_launch",
                                        return_value=accounts.PreparedAccount({"CLAUDE_CONFIG_DIR": str(target)}, frozenset())),
-                          patch.object(worker_panes, "close", side_effect=AssertionError("no close on a move")),
+                          patch.object(worker_panes, "close", wraps=worker_panes.close) as close,
                           patch.object(self.world, "close_tab_confirmed", side_effect=AssertionError("no close check")),
                           patch.object(self.world, "pane_activity", side_effect=AssertionError("no activity check"))):
                         result = pane_moves.move_worker(row, staff.snapshot(), family + "2", "", run)
-                    self.assertIsInstance(result, stop_results.ClaudeUp)
-                    assert isinstance(result, stop_results.ClaudeUp)
-                    self.assertEqual(result.pane_id, pane)
-                    self.assertEqual(self.world.launches[-1], herdr.ExistingPane(pane, "terminal-" + pane))
-                    self.assertEqual(self.world.requests[-1][2]["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"], str(target))
-                    confirm.assert_called_once_with(move, common)
-                    self.assertEqual(self.world.closed, [])
+                    if busy:
+                        self.assertIsInstance(result, stop_results.ClaudeUp)
+                        assert isinstance(result, stop_results.ClaudeUp)
+                        self.assertEqual(result.pane_id, pane)
+                        self.assertEqual(self.world.launches, [*launches, herdr.ExistingPane(pane, "terminal-" + pane)])
+                        self.assertEqual(self.world.requests[-1][2]["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"], str(target))
+                        confirm.assert_called_once_with(move, common)
+                        close.assert_not_called()
+                        self.assertEqual(self.world.closed, closed)
+                    else:
+                        self.assertEqual(result, accounts.SessionIdlePaneClosed(row.id))
+                        self.assertEqual(self.world.launches, launches)
+                        request.assert_not_called()
+                        confirm.assert_not_called()
+                        close.assert_called_once()
+                        self.assertIsInstance(cast(object, close.call_args.kwargs["lock"]), worker_panes.WorkerLockHold)
+                        self.assertEqual(self.world.closed, [*closed, (pane, "terminal-" + pane)])
+                        self.assertNotIn(pane, self.world.locations)
+                        self.assertEqual(staff.by_id(row.id), row)
                     self.assertEqual(self.prompts(), prompts)
 
     def test_account_readiness_failure_keeps_the_stopped_terminal(self) -> None:

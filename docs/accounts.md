@@ -460,9 +460,14 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
 Pane workers move under their worker locks.
-A live worker stops at the shell on the same terminal before its conversation resumes on the target account.
-A stopped pane keeps its terminal; a closed pane resumes the same conversation in a new worker pane.
-An active or refused pass receives one resume message; an idle worker receives no text.
+An idle worker without an active dispatch closes its pane and keeps its conversation.
+The move writes no journal row for that worker.
+The next assign resumes the conversation on the group account.
+A busy worker stops at the shell before its conversation resumes on the target account in the same terminal.
+A stopped worker with an active dispatch keeps its terminal.
+A closed worker with an active dispatch resumes its conversation in a new pane.
+An active or refused pass receives one resume message.
+A closed worker without an active dispatch has nothing to move.
 The last dispatch supplies the role; a missing role prints its reason and starts no replacement.
 A held worker lock or unknown evidence leaves that worker unchanged; unrelated proved moves continue.
 
@@ -475,7 +480,7 @@ A swap prints `Workers moving <source> → <target>:` and one showrunner · unit
 A worker interrupted during its turn adds `, interrupted and resumed`.
 Each failure keeps its worker name and reason; other workers continue and the selected role stays changed.
 `swap workers --dry-run` uses `Workers would move` without stopping workers or changing roles and history.
-`move workers <target> --dry-run` lists workers that would resume and workers that the move would refuse, with each reason.
+`move workers <target> --dry-run` lists idle panes that would close, workers that would resume, and refusals with each reason.
 It adds one count line for workers with nothing to move.
 For Codex, both preview and move require the target to match the workers role.
 A different target refuses with `workers role is <role>; run accounts.py swap workers <codexN> to select it`.

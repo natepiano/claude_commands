@@ -1002,6 +1002,31 @@ class AccountsTests(unittest.TestCase):
         })
         self.assertEqual(decode_session_counts(json.dumps(published), published["machine"]), published)
 
+    def test_open_worker_counts_use_the_recorded_home_with_shared_sessions(self) -> None:
+        from scripts.herdr import worker_panes
+        from scripts.herdr.test_worker_panes import PaneWorld
+        from scripts.production.staff_test_support import unit_membership
+
+        numbered = self.home / ".codex1"
+        shared = self.home / ".codex" / "sessions"
+        shared.mkdir(parents=True)
+        numbered.mkdir()
+        (numbered / "sessions").symlink_to(shared, target_is_directory=True)
+        owner = unit_membership("show", "unit")
+        owner = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
+        row = fixture_worker("shared-worker", owner.id, backend=staff.CodexBackend(numbered))
+        _ = staff.set_home(row.id, staff.SessionHome(numbered))
+        world = PaneWorld()
+        world.add(owner, "w1:p0")
+        world.add(row, "w1:p99", family="codex")
+        read_sessions = cast(Callable[..., accounts.LocalRoleSessions], getattr(accounts, "_read_local_role_sessions"))
+        with (patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}),
+              patch.object(worker_panes, "_client", return_value=world),
+              patch.object(herdr, "native_process", side_effect=world.native_process),
+              patch.object(herdr, "_startup_processes", side_effect=world.descendants)):
+            observed = read_sessions(accounts.GroupAccounts())
+        self.assertEqual(observed.counts[(numbered, "workers")], {row.current_session: "idle"})
+
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
         row = SharedStatusDocumentTests().row()
         now = datetime.now(timezone.utc)
@@ -7387,14 +7412,16 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(command[:2] == ("agent", "prompt") for command in self.world.commands))
         self.assertEqual({pane: self.world.foreground[pane] for pane in processes}, processes)
-        self.assertEqual(self.world.closed, [])
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
-        self.assertEqual(self.world.requests[0][2]["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
-        self.assertIn("w1:p1", self.world.locations)
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(self.world.launches, [])
+        self.assertEqual(self.world.requests, [])
+        self.assertNotIn("w1:p1", self.world.locations)
+        self.assertIn("idle pane closed", result.stdout)
+        self.stop.assert_not_called()
         self.assertEqual(self.fixture.staff_state(), before)
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         self.assertNotIn("nothing to move", result.stderr)
-        self.assertEqual([item["kind"] for item in moves.read_moves()], ["requested", "confirmed"])
+        self.assertEqual(moves.read_moves(), [])
 
     def test_move_elapsed_time_includes_stopping_the_worker(self) -> None:
         row = self.worker()
@@ -7439,7 +7466,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
         self.assertEqual(self.world.closed, [])
 
-    def test_stopped_idle_worker_move_keeps_the_pane_and_conversation(self) -> None:
+    def test_stopped_idle_worker_move_closes_the_pane_and_keeps_the_conversation(self) -> None:
         row = self.worker(live=False)
         self.dispatch(row, status="completed")
         before = self.fixture.staff_state()
@@ -7447,13 +7474,33 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("nothing to move", result.stderr)
-        self.assertEqual(self.world.closed, [])
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
-        self.assertEqual(self.world.requests[0][2]["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
-        self.assertIn("w1:p1", self.world.locations)
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(self.world.launches, [])
+        self.assertEqual(self.world.requests, [])
+        self.assertNotIn("w1:p1", self.world.locations)
+        self.assertIn("idle pane closed", result.stdout)
         self.assertEqual(self.fixture.staff_state(), before)
         self.stop.assert_not_called()
-        self.assertEqual([item["kind"] for item in moves.read_moves()], ["requested", "confirmed"])
+        self.assertEqual(moves.read_moves(), [])
+
+    def test_idle_pane_close_refusals_keep_the_worker_and_record_no_move(self) -> None:
+        row = self.worker()
+        before = self.fixture.staff_state()
+        for refusal in (worker_panes.Kept("close is held"),
+                        worker_panes.UncertainWorker(row, "pane identity is unclear")):
+            with self.subTest(refusal=refusal), patch.object(worker_panes, "close", return_value=refusal):
+                result = self.move("claude2")
+                reason = refusal.blocker if isinstance(refusal, worker_panes.Kept) else refusal.reason
+                self.assertEqual(result.outcomes, (accounts.SessionMoveRefused(row.id, reason),))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(self.world.closed, [])
+                self.assertEqual(self.world.launches, [])
+                self.assertEqual(self.world.requests, [])
+                self.assertIn("w1:p1", self.world.locations)
+                self.assertEqual(self.fixture.staff_state(), before)
+                self.assertEqual(moves.read_moves(), [])
+                self.stop.assert_not_called()
 
     def test_unreadable_active_dispatch_keeps_the_worker_and_reports_one_anomaly(self) -> None:
         row = self.worker()
@@ -7521,9 +7568,9 @@ class PaneWorkerMoveTests(unittest.TestCase):
             result = accounts.move_workers("codex2", dry_run=True)
         assert isinstance(result, accounts.GroupMoveDryRun)
         self.assertEqual(sorted(result.lines), sorted((
-            f"{opened.name} ({opened.id}): would stop and resume the same conversation on codex2 in its worker pane",
-            f"{stopped.name} ({stopped.id}): would stop and resume the same conversation on codex2 in its worker pane",
-            f"{unknown.name} ({unknown.id}): not moved: dispatch role is unavailable",
+            f"{opened.name} ({opened.id}): would close its idle pane; the next assign resumes it on codex2",
+            f"{stopped.name} ({stopped.id}): would close its idle pane; the next assign resumes it on codex2",
+            f"{unknown.name} ({unknown.id}): would close its idle pane; the next assign resumes it on codex2",
             "2 workers: nothing to move",
         )))
         for row in (closed, empty, other):

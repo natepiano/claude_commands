@@ -2194,8 +2194,12 @@ class RosterTests(unittest.TestCase):
 
     def test_pane_workers_keep_their_backend_accounts_across_a_selection_change(self) -> None:
         old, current = self.account_note(1), self.account_note(2)
+        shared = current / "sessions"
+        shared.mkdir(parents=True, exist_ok=True)
+        (old / "sessions").symlink_to(shared, target_is_directory=True)
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
-            "old-impl": {"thread_id": "old-thread", "status": "running", "role": "impl"}}, codex_home=old)
+            "old-impl": {"thread_id": "old-thread", "status": "running", "role": "impl"},
+            "shared-worker": {"thread_id": "shared-thread", "status": "done"}}, codex_home=old)
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
             "new-test": {"thread_id": "new-thread", "status": "running", "role": "test"},
             "between-turns": {"thread_id": "waiting-thread", "status": "done"}}, codex_home=current)
@@ -2203,7 +2207,8 @@ class RosterTests(unittest.TestCase):
             before = self._entries()
         with mock.patch.object(agent_accounts, "workers_home", return_value=current):
             after = self._entries()
-        for name, label in (("old-impl", "codex1"), ("new-test", "codex2"), ("between-turns", "codex2")):
+        for name, label in (("old-impl", "codex1"), ("new-test", "codex2"),
+                            ("between-turns", "codex2"), ("shared-worker", "codex1")):
             with self.subTest(worker=name):
                 self.assertEqual(before[name].account, roster.AccountLabel(label))
                 self.assertEqual(after[name].account, roster.AccountLabel(label))

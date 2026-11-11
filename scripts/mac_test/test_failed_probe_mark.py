@@ -24,7 +24,8 @@ from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import mac_test, offload
+from scripts.mac_test import mac_test, offload, claim_state
+from scripts.build_hold.build_hold import NoOwningSession
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 
 VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
@@ -80,6 +81,11 @@ class FailedProbeTests(OffloadCommandFixture):
         args.reservation_file = str(self.root / "reservation")
         return build_targets.command_reserve(args)
 
+    def release_reservation(self) -> int:
+        claim, = mac_test.read_claims(mac_test.state_paths("box"))
+        return build_targets.command_release_wait(os.getpid(),
+            identity=claim_state.claim_identity(claim.record), session=NoOwningSession())
+
     def test_version_decline_stays_repository_specific_after_backoff_expires(self) -> None:
         self.healthy()
         self.fixture["probe_lines"][-3] = "nextest=wrong"
@@ -126,7 +132,7 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertEqual(claim.record["what"], "nextest hana")
         self.assertEqual((self.root / "reservation").read_text(), f"box\t{self.linux_settings}\n")
         self.assertGreater(len(self.events()), before)
-        self.assertEqual(build_targets.command_release_wait(os.getpid()), 0)
+        self.assertEqual(self.release_reservation(), 0)
 
     def run_hook(self, command: str) -> subprocess.CompletedProcess[str]:
         script = shell_functions(VERIFY, "target_platform", "step_can_retry", "remote_step_kind",
@@ -164,7 +170,7 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--new-step", result.stdout)
         self.assertEqual((self.root / "ssh-reservation").read_text(), f"box\t{self.linux_settings}\n")
-        self.assertEqual(build_targets.command_release_wait(os.getpid()), 0)
+        self.assertEqual(self.release_reservation(), 0)
 
     def test_bad_mark_preserves_busy_blocked_and_off_precedence(self) -> None:
         self.fixture["probe_status"] = 255
@@ -173,7 +179,7 @@ class FailedProbeTests(OffloadCommandFixture):
         self.healthy()
         self.assertEqual(self.reserve(new_step=True), 0)
         self.assertEqual(self.free(), "busy")
-        self.assertEqual(build_targets.command_release_wait(os.getpid()), 0)
+        self.assertEqual(self.release_reservation(), 0)
         paths = mac_test.state_paths("box")
         _ = paths.block.write_text(json.dumps({"version": 2, "holder": "fixture", "for": "test",
             "since": "2026-01-01T00:00:00+00:00", "expires": "2099-01-01T00:00:00+00:00",
@@ -369,7 +375,7 @@ class FailedProbeTests(OffloadCommandFixture):
                     _ = release.write("continue\ncontinue\ncontinue\n")
                 with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
-            self.assertEqual(build_targets.command_release_wait(os.getpid()), 0)
+            self.assertEqual(self.release_reservation(), 0)
 
     def test_pinned_eligibility_repeated_in_a_wait_starts_no_recovery(self) -> None:
         self.fixture["probe_status"] = 255
@@ -419,7 +425,7 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertIsInstance(result, targets.ExcludedTarget)
         self.assertEqual(len(self.events()), count)
         self.assertIsInstance(offload.read_failed_probe("box"), offload.FailedProbe)
-        self.assertEqual(build_targets.command_release_wait(os.getpid()), 0)
+        self.assertEqual(self.release_reservation(), 0)
 
     def install_probe_gate(self) -> Path:
         ready = self.stub_directory / "recovery-ready"
