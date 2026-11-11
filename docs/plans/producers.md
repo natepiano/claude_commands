@@ -158,7 +158,7 @@ dwight=claude:fable:high
 - The nixos module starts `herdr-upkeep` from a graphical login. A start before login needs `users.users.${username}.linger = true` and `nate.jobs.herdr-upkeep.needsDesktop = false`.
 - With four or more producers and a run spacing that is a multiple of producers × interval, the rotation can give the same producer the first place each run.
 
-### Phase 5 — dwight's first start  · status: pending
+### Phase 5 — dwight's first start  · status: done
 
 **Depends on:** Phase 4
 
