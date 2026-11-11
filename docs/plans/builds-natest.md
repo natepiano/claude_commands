@@ -2904,3 +2904,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Acceptance gate:**
 - The report at `phases/143/research_report.md` in the unit session gives the Git census, each candidate with its saving and reach, and the owners.
+
+### Phase 144 — /test_times trend says targeted tests and merge gates, and every table right-aligns its numbers  · status: done
+**Depends on:** none
+
+#### As-built
+
+- User, 2026-11-11, through builds: `/test_times trend` names its tables `<place> merge gates` (selection `full`) and `<place> targeted tests` (selection `affected`), merge gates first. The database keeps `full` and `affected`.
+- `scripts/lib/terminal_cells.py` `is_number_cell` decides number cells (sign, `$`, `%` or `s` suffix, or `—`). `print_table` right-aligns each column whose cells are all number cells, header included; only test_times tools call it.
