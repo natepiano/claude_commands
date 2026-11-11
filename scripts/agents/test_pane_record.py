@@ -251,7 +251,7 @@ class PaneRecordTests(unittest.TestCase):
         return output.getvalue()
 
     def test_seed_records_a_plain_codex_client_from_its_own_process(self) -> None:
-        owner = staff.StaffRow(staff.native_id("019b3a40-4250-7000-8000-000000000101"), "agent", "morty",
+        owner = staff.StaffRow(staff.native_id("019b3a40-4250-7000-8000-000000000101"), "producer", "morty",
                               staff.StaffRoot(), current_session=staff.native_id("019b3a40-4250-7000-8000-000000000102"))
         for reference in (owner.name, owner.id):
             with self.subTest(reference=reference):
