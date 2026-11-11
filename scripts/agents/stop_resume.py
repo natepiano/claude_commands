@@ -1239,7 +1239,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         else:
             _ = entry.pop("config_dir", None)
-        if row is not None and row.kind == "producer":
+        if row is not None and row.kind == "producer" and not (
+                isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
+                and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
             space = herdr.row_workspace(row, names.tab_record, row.name)
             if isinstance(tab, SessionNotFound) or not client.producer_pane(tab.pane_id, row.name, space):
                 destination = client.producer_row_tab(str(row.id), row.name, space)
@@ -1329,7 +1331,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         selected_home = staff.SessionHome(target_dir.absolute())
         if row is not None and row.home != selected_home:
             try:
-                _ = staff.set_home(row.id, selected_home)
+                # The launch hook can publish the new home before the start returns.
+                current = staff.by_id(row.id)
+                if current is None or current.home != selected_home:
+                    _ = staff.set_home(row.id, selected_home)
             except (staff.StaffUnreadable, staff.StaffNotFound) as error:
                 print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
         if original is not None:

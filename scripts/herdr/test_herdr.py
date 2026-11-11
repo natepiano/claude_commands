@@ -286,6 +286,38 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(entry["cwd"], str(self.root))
         self.assertEqual(entry.get("pid"), 998070)
 
+        for source, report, failure in (("fresh", True, ""), ("fresh", False, ""),
+                                        ("two-fresh", False, "Codex launch has no unique foreground process"),
+                                        ("invalid-resume", False, "Codex launch identity is unavailable"),
+                                        ("herdr-failure", True, "Codex launch process info"),
+                                        ("write-failure", True, "Is a directory")):
+            with self.subTest(source=source, report=report), tempfile.TemporaryDirectory(dir=self.root) as folder:
+                arguments = ["resume", "invalid"] if source == "invalid-resume" else []
+                with (codex_launch_evidence(Path(folder), ["codex", *arguments]) as process_info,
+                      patch.object(client, "start_command", return_value=subprocess.CompletedProcess[str]([], 0, "", "")),
+                      redirect_stderr(io.StringIO()) as errors):
+                    if not report:
+                        herdr.json_object(process_info["pane"], "fixture pane")["session_id"] = ""
+                    if source == "two-fresh":
+                        processes = herdr.json_object(process_info["process_info"], "fixture process info")
+                        foreground = herdr.json_items(processes["foreground_processes"], "fixture foreground processes")
+                        processes["foreground_processes"] = [*foreground,
+                            {"pid": 998071, "argv": ["codex"], "cwd": folder}]
+                    if source == "herdr-failure":
+                        process_info["process_info"] = "unreadable"
+                    if source == "write-failure":
+                        (pane_launch.record_directory() / f"{client.session}.json").mkdir(parents=True)
+                    outcome = client.start_agent("codex-worker", "w1:p1", "codex", arguments,
+                                                 herdr.NoOpeningPrompt(), 1_000)
+                self.assertIsInstance(outcome, herdr.PromptSubmissionNotRequired)
+                if failure:
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn("legacy launch publication is unavailable:", errors.getvalue())
+                    self.assertIn(failure, errors.getvalue())
+                    self.assertIn("; launch continues\n", errors.getvalue())
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+
     def test_codex_launch_removes_retired_identity_before_retaining_the_launch(self) -> None:
         identity = fixture_runtime_id("clean-codex-launch")
         observation = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "same-start", {"SHOWRUNNER_UNIT": "old"})
@@ -6674,6 +6706,8 @@ class SavedLayoutTests(unittest.TestCase):
 
 
     def test_the_snapshot_keeps_the_row_id_when_its_name_changes(self) -> None:
+        from scripts.agents import shutdown
+
         client = self.running()
         record = staff.initial_snapshot()
         roles = next((row for row in record.rows if row.name == "roles"), None)
@@ -6692,6 +6726,63 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(saved["sdlc"], layout_row_ids(["sdlc", "design"]))
         self.assertEqual(saved["sdlc"][-1], roles.id)
         self.assertIn("design", dict(client.layout())["sdlc"])
+
+        member = next(row for row in staff.initial_snapshot().rows if row.name == "herdr")
+        for order, name, interruption, display, expected in (
+                (("natedev", "accounts", "herdr", "unit-board"), "zulu", "", "rename",
+                 ["natedev", "accounts", "unit-board", "zulu"]),
+                (("natedev", "unit-board", "accounts", "zulu"), "aardvark", "", "rename",
+                 ["natedev", "aardvark", "unit-board", "accounts"]),
+                (("natedev", "unit-board", "aardvark", "accounts"), "yankee", "sort", "rename",
+                 ["natedev", "unit-board", "accounts", "yankee"]),
+                (("natedev", "yankee", "unit-board", "accounts"), "zebra", "", "pane already renamed",
+                 ["natedev", "unit-board", "accounts", "zebra"]),
+                (("natedev", "zebra", "unit-board", "accounts"), "zebra", "", "tab restore",
+                 ["natedev", "zebra", "unit-board", "accounts"]),
+                (("natedev", "zebra", "unit-board", "accounts"), "zulu", "layout save", "rename",
+                 ["natedev", "unit-board", "accounts", "zulu"])):
+            with self.subTest(order=order, name=name, display=display, interruption=interruption):
+                workspace = next(ident for ident, label in client.spaces if label == "natedev")
+                others = [tab for tab in client.tabs if tab["workspace_id"] != workspace]
+                siblings = [next(tab for tab in client.tabs if tab["label"] == label) for label in order]
+                client.tabs = others + siblings
+                client.save_layout()
+                pane = next(tab for tab in siblings if tab["session_id"] == member.current_session)
+                before = {tab["pane_id"]: tab["tab_id"] for tab in client.tabs}
+                if display == "tab restore":
+                    client.label_pane(pane["pane_id"], "previous")
+                else:
+                    with patch.object(herdr, "Herdr", return_value=client):
+                        member = shutdown.rename_owner(member, name)
+                if display == "pane already renamed":
+                    client.label_pane(pane["pane_id"], name)
+                if interruption == "sort":
+                    with patch.object(client, "order_tabs", side_effect=OSError("stopped after the label changes")):
+                        with self.assertRaisesRegex(OSError, "stopped after the label changes"):
+                            _ = client.retitle(pane["pane_id"], name)
+                if interruption == "layout save":
+                    replace_file = Path.replace
+
+                    def refuse_layout_save(path: Path, target: str | os.PathLike[str]) -> Path:
+                        if Path(target) == herdr.layout_path("fixture"):
+                            value = cast(herdr.SavedLayout, json.loads(path.read_text()))
+                            saved_space = next(space for space in value["workspaces"] if space["name"] == "natedev")
+                            if [tab["name"] for tab in saved_space["tabs"]] == layout_row_ids(expected):
+                                raise OSError("private layout save failure")
+                        return replace_file(path, target)
+
+                    with patch.object(Path, "replace", refuse_layout_save), redirect_stderr(io.StringIO()):
+                        try:
+                            _ = client.retitle(pane["pane_id"], name)
+                        except OSError:
+                            pass
+                    client.tabs = others + siblings
+                self.assertTrue(client.retitle(pane["pane_id"], name))
+                self.assertEqual(dict(client.layout())["natedev"], expected)
+                self.assertEqual({tab["pane_id"]: tab["tab_id"] for tab in client.tabs}, before)
+                saved_space = next(space for space in herdr.saved_layout("fixture")["workspaces"]
+                                   if space["name"] == "natedev")
+                self.assertEqual([tab["name"] for tab in saved_space["tabs"]], layout_row_ids(expected))
 
     def test_without_a_saved_layout_the_showrunner_comes_first_then_a_to_z(self) -> None:
         self.assertEqual(herdr.tab_order("boss", ["delta", "boss", "alpha"], [], set()), [1, 2, 0])

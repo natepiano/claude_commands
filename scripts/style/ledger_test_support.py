@@ -13,7 +13,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 from collections.abc import Callable, Generator
 from pathlib import Path
@@ -28,7 +27,6 @@ from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RU
 from scripts.style import style_plan
 from scripts.style import style_rules
 from scripts.style import declarations
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
@@ -914,44 +912,6 @@ class LedgerTestCase(unittest.TestCase):
     def comment_only_change(self, relative: str) -> None:
         content = (self.repo / relative).read_text()
         self.write(relative, "// A note.\n/// Returns the value.\n" + content.replace("{ 1 }", "{\n    // One.\n    1\n}"))
-
-    def record_while_stalled(self, stalled: str, write: Callable[[style_ledger.Ledger], object]) -> None:
-        """A second ledger records a verdict before write may leave style_ledger.<stalled>."""
-        original = cast(Callable[..., object], getattr(style_ledger, stalled))
-        started, release = threading.Event(), threading.Event()
-
-        def stall(*arguments: object) -> object:
-            if not started.is_set():
-                started.set()
-                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS), "stalled writer was not released")
-            return original(*arguments)
-
-        _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.5))
-        rule = self.rule("concurrent")
-        recorder = self.ledger()
-        failures: list[BaseException] = []
-
-        def run() -> None:
-            # A connection serves only the thread that opened it.
-            try:
-                with style_ledger.open_ledger(self.repo) as writer:
-                    _ = write(writer)
-            except BaseException as error:
-                failures.append(error)
-
-        with mock.patch.object(style_ledger, stalled, side_effect=stall):
-            thread = threading.Thread(target=run)
-            thread.start()
-            try:
-                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS), "writer did not reach its stalled operation")
-                recorder.record(rule, self.sources[2], self.initial_tip, self.blob(rule), "clean",
-                                ticket="27001", worker="test-worker")
-            finally:
-                release.set()
-                thread.join(timeout=TEST_HANG_GUARD_SECS)
-            self.assertFalse(thread.is_alive(), "released writer did not finish")
-        self.assertEqual(failures, [])
-        self.assertEqual(self.states(rule)[self.sources[2]], "current")
 
     def judge_while_loading_rules(self, changes: int) -> tuple[style_ledger.Ledger, str, mock.MagicMock]:
         """A 1 ticket ready to checkpoint, and a catalog load whose first changes calls record a newer verdict for it."""

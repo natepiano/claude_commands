@@ -352,6 +352,14 @@ def cleanup_failed_launch(row: staff.StaffRow, pane: str, terminal: str, ownersh
     print(f"anomaly: {pane}: cleanup failed: {' '.join(reason.splitlines())}", file=sys.stderr)
 
 
+@dataclass(frozen=True)
+class SendNoticesAfterDispatch:
+    """This dispatch owns the lock and sends notices after its return."""
+
+
+SEND_NOTICES_AFTER_DISPATCH = SendNoticesAfterDispatch()
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
@@ -361,10 +369,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
              on_submission: Callable[[], object] = lambda: None,
              lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+             notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
-    with ExitStack() as operations, ExitStack() as cleanup:
+    with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
+        notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
@@ -378,17 +388,17 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
             if isinstance(receipt, DispatchComplete):
                 save_reply(Path(delivery.reply_file), receipt.reply)
-            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
+            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
                           import_module("scripts.herdr.turn_end").repeat_completion_notice)
-            repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
-                   worker_panes.worker_pass(row, session_dir))
+            _ = notice_delivery.callback(repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
+                                           worker_panes.worker_pass(row, session_dir)))
             return DispatchSubmission.SUBMITTED
         if row is not None:
             owner = staff.snapshot().parent_of(row)
             if owner is not None:
-                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], None],
+                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], Callable[[], None]],
                                    import_module("scripts.herdr.turn_end").finish_late_completion)
-                finish_late(row, owner, hold, completion_actions.held_role)
+                _ = notice_delivery.callback(finish_late(row, owner, hold, completion_actions.held_role))
         if isinstance(started, StartAtDispatch):
             before = rows_before_launch()
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
@@ -630,7 +640,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if needs_team:
             names = {row.name for row in rows}
             for default_role in ("impl", "fix", "review", "test"):
-                if default_role in names:
+                if default_role in names or default_role == role:
                     continue
                 before = rows_before_launch()
                 with redirect_stderr(io.StringIO()) as diagnostics:

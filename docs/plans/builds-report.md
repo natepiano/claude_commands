@@ -1000,3 +1000,15 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 **Files:**
 - `scripts/buildlog/cli.py` — the unknown-command line at the end of `main`.
 - `scripts/buildlog/test_costs.py` — the unknown-command and help table.
+
+### Phase 49 — buildlog query uses the shared table printer · status: done
+
+#### As-built
+
+- `buildlog query` prints its text table through `scripts/lib/terminal_cells.print_table`. `cli.py` has no table printer of its own.
+- `cli.cell` makes the text of each value: NULL is `—`, a float uses `:g` below `1e15`, any other value uses `str`. A number column with NULLs stays right-aligned, because the shared number test counts `—` as a number.
+- An empty result prints `no rows`. The table has no dashed line under the headers. The `--json` output and the stderr timing line do not change.
+
+**Files:**
+- `scripts/buildlog/cli.py` — `cell` and the text branch of `query`.
+- `scripts/buildlog/test_gate_index.py` — `test_query_text_aligns_numbers_and_prints_empty_results`.

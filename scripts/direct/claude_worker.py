@@ -13,6 +13,7 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from enum import Enum
 from io import TextIOWrapper
 from pathlib import Path
 from typing import cast
@@ -42,6 +43,18 @@ class ClaudeTurn:
     staff_id: str
     workers: bool
     env: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class PreparedClaudeLaunch:
+    """One model and account environment for the records and the command."""
+    model: str
+    environment: dict[str, str]
+    loaded: nix_env.Loaded | nix_env.NoEnvrc
+
+
+class ClaudeLaunchPreparation(Enum):
+    AT_START = "prepare the launch at start"
 
 
 @dataclass(frozen=True)
@@ -124,7 +137,7 @@ def _banner_identity(banner: str) -> str:
                  if (match := re.search(r"\b[0-9a-f]{8}\b", line))), "")
 
 
-def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str]) -> str:
+def _prepare_launch(turn: ClaudeTurn, environment: dict[str, str]) -> PreparedClaudeLaunch:
     try:
         selected = accounts.account_for_unscoped_launch(environment, workers=turn.workers)
     except accounts.AccountsError as error:
@@ -145,6 +158,24 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str]) -> str:
     if isinstance(loaded, nix_env.Refused):
         print(loaded.reason, file=sys.stderr)
         raise _LaunchFailed(1)
+    model = models_registry.claude_model(turn.model, loaded.env) if turn.model else ""
+    return PreparedClaudeLaunch(model, environment, loaded)
+
+
+def prepare_launch(turn: ClaudeTurn) -> PreparedClaudeLaunch | NotDelivered:
+    """Prepare the account and model before assign writes the launch records."""
+    with _environment(turn) as environment:
+        try:
+            return _prepare_launch(turn, environment)
+        except _LaunchFailed as error:
+            return NotDelivered(error.code)
+
+
+def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str],
+           launch: PreparedClaudeLaunch | ClaudeLaunchPreparation) -> str:
+    prepared = _prepare_launch(turn, environment) if isinstance(launch, ClaudeLaunchPreparation) else launch
+    environment.update(prepared.environment)
+    loaded = prepared.loaded
     settings = {name: value for name, value in loaded.env.items()
                 if not name.startswith(("HERDR_", "CODEX_", "CLAUDE_CODE_MESSAGING_"))
                 and name not in {"CLAUDE_CODE_BRIDGE_SESSION_ID", "TMUX", "TMUX_PANE"}}
@@ -155,8 +186,8 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str]) -> str:
     _ = settings.pop("CLAUDE_CODE_CHILD_SESSION", None)
     arguments = [binary, "--bg", "--name", turn.name, "--dangerously-skip-permissions", "--settings",
                  json.dumps({"sandbox": {"enabled": False}, "env": models_registry.agent_environment(settings)})]
-    if turn.model:
-        arguments += ["--model", models_registry.claude_model(turn.model, loaded.env)]
+    if prepared.model:
+        arguments += ["--model", prepared.model]
     if turn.effort:
         arguments += ["--effort", turn.effort]
     start_env = models_registry.agent_environment(loaded.env)
@@ -250,7 +281,8 @@ def _deliver(turn: ClaudeTurn, native_id: str, environment: Mapping[str, str]) -
         raise _LaunchFailed(2)
 
 
-def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
+def open_worker(turn: ClaudeTurn, *,
+                launch: PreparedClaudeLaunch | ClaudeLaunchPreparation = ClaudeLaunchPreparation.AT_START) -> Delivered | Unchanged | NotDelivered:
     """Publish a worker before delivering its assignment."""
     with _environment(turn) as environment:
         binary = ""
@@ -270,7 +302,7 @@ def open_worker(turn: ClaudeTurn) -> Delivered | Unchanged | NotDelivered:
                     opening = turn.run / f"{allowed.lock_reference}.opening.md"
                     _ = opening.write_text(handoff.opening(turn.prompt.read_text()))
                     prepared = replace(turn, prompt=opening)
-                created = _start(prepared, binary, environment)
+                created = _start(prepared, binary, environment, launch)
                 return _registered(created, register_seconds)
 
             def dispatch(worker: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
