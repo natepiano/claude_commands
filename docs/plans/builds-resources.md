@@ -1919,7 +1919,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Gotchas:** a changed push text needs a new approval record before a phone push sends. While approval is stale, the natedev message still sends and the phone receipt stays pending.
 
-### Phase 88 — The hana CI margin key goes after the runner activation  · status: todo
+### Phase 88 — The hana CI margin key goes after the runner activation  · status: done
 
 **Depends on:** Phase 100, queue's 10d (landed 2026-11-10, e9fe34ff1), natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
 
@@ -2264,6 +2264,8 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: todo
 
+**Depends on:** Phase 103 (it changes `scripts/build_hold/build_hold.py`); done.
+
 **Source:** builds 2026-11-11, from natedev. fps took and released three holds from 12:33 to 12:56 UTC. Each release sent the same text, `/build:hold: the build hold has been released …`, to session dea51c3e. The send-repeat guard held the later copies, so a stopped session can miss its release.
 
 #### Work Order
@@ -2275,13 +2277,17 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 1. **The text.** `send_release` (`scripts/build_hold/build_hold.py:1469`) and `send_release_broadcast` (:1483) add the released hold to `RELEASE_NOTICE`: `<holder> hold for <purpose>, from <HH:MM zone>`. The time is in the user zone (`scripts/lib/user_zone.py`). A cycle with more than one holder names each one.
 2. **The record.** The hold cycle keeps each holder's purpose beside `since` (`HoldCycle.holders`, :69; written at :1405 and in the recovery at :1348), because the holder file is gone at release. A cycle saved before this change has no purpose: the notice then names the holder and its start time only.
 3. **Proof.** Add rows to the existing release notice tests in `scripts/build_hold/test_build_hold.py` (:1197): two releases of two holds in one session give two different texts; each text names the purpose and start time; an old cycle with no purpose still sends.
+4. **Docs.** `docs/as-built/build-targets.md`: the release notice text names the hold, its purpose and its start time.
+
+**Constraints from prior phases:** Phase 103 added `run_resolution` and the `hold_sender_timeout_seconds` key; release sends keep their own path and do not use that key.
 
 **Files:**
 - `scripts/build_hold/build_hold.py`
 - `scripts/build_hold/test_build_hold.py`
-- `docs/as-built/build-targets.md` (the release notice text)
+- `docs/as-built/build-targets.md`
 
-**Workers:** `1 writer`.
+**Workers:** `1 writer`
+- `impl` owns all three files; step 4 of the Spec names the as-built change.
 
 **Gate:** the targeted test; `scripts/build_hold/test_build_hold.py` passes; `basedpyright` 0 warnings on the changed files (the import cycles go in their own phase).
 
