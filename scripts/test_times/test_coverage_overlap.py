@@ -175,7 +175,7 @@ class CoverageOverlapTests(unittest.TestCase):
                 (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
                 (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
                 *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
-                    "lib/py", "lib/conf.py", "lib/terminal_cells.py", "buildlog/treekey.py",
+                    "lib/py", "lib/conf.py", "lib/conf_reads.py", "lib/terminal_cells.py", "buildlog/treekey.py",
                     "production/gate_modules.py", "test_times/module_run.py",
                 )),
             ):

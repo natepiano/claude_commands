@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -53,6 +53,70 @@ class ConfTests(unittest.TestCase):
         _ = self.git("init", "-q")
         _ = self.git("config", "user.name", "Configuration test")
         _ = self.git("config", "user.email", "conf@example.invalid")
+
+    def test_config_reads_record_all_resolvers_and_cache_the_log_path(self) -> None:
+        self.write("value=one\n")
+        log = self.root / "reads"
+        program = """from pathlib import Path
+import os
+from scripts.lib import conf, conf_reads
+conf.path('example')
+conf_reads.read_text(Path(os.environ['CONF_DIR']) / 'example.conf')
+conf.path(Path(os.environ['CONF_DIR']) / 'example.conf')
+conf._repository_path('example')
+conf.read('example').text('value')
+os.environ['CONF_READ_LOG'] = os.environ['CONF_READ_LOG'] + '.other'
+conf.read_or_repository('example').text('value')
+conf.effective_line('example', 'value')
+conf.editable_line('example', 'value')
+conf.check('example', 'value', 'two')
+"""
+        result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
+                                env={**os.environ, "CONF_READ_LOG": str(log)}, check=True)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(log.is_file(), "The reader must record its config reads")
+        self.assertEqual(set(log.read_text().splitlines()), {"example"})
+        self.assertGreaterEqual(len(log.read_text().splitlines()), 8)
+        self.assertFalse(log.with_suffix(".other").exists())
+
+    def test_config_read_log_context_restores_the_cached_destination(self) -> None:
+        self.write("value=one\n")
+        first = self.root / "first-reads"
+        second = self.root / "second-reads"
+        program = """import os
+import sys
+from scripts.lib import conf_reads
+first, second, source = sys.argv[1:]
+with conf_reads.record_reads(first):
+    conf_reads.record('first')
+    try:
+        with conf_reads.record_reads(second):
+            conf_reads.read_text(source)
+            assert os.environ['CONF_READ_LOG'] == second
+            raise ValueError('fixture interruption')
+    except ValueError:
+        pass
+    assert os.environ['CONF_READ_LOG'] == first
+    conf_reads.record('restored')
+assert 'CONF_READ_LOG' not in os.environ
+conf_reads.record('disabled')
+"""
+        environment = dict(os.environ)
+        _ = environment.pop("CONF_READ_LOG", None)
+        result = subprocess.run([sys.executable, "-c", program, str(first), str(second), str(self.path)],
+                                capture_output=True, text=True, env=environment, check=True)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(first.read_text().splitlines(), ["first", "restored"])
+        self.assertEqual(second.read_text().splitlines(), ["example"])
+
+    def test_config_read_record_ignores_patched_os_functions(self) -> None:
+        log = self.root / "reads"
+        with conf_reads.record_reads(log), \
+                mock.patch.object(os, "open", side_effect=OSError("fixture open refusal")), \
+                mock.patch.object(os, "write", side_effect=OSError("fixture write refusal")), \
+                mock.patch.object(os, "close", side_effect=OSError("fixture close refusal")):
+            conf_reads.record("example")
+        self.assertEqual(log.read_text().splitlines(), ["example"])
 
     def test_one_read_serves_many_settings_and_a_new_read_observes_changes(self) -> None:
         self.write("# range: 0..\nfraction=2.5\n# whole: 1..\ncount=3\n"

@@ -23,13 +23,18 @@ A later assignment resumes the same conversation when the worker remains availab
 Codex code review uses read-only review workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
+A failed compaction prints one error line, and the dispatch continues without compaction.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.
 
 ## Pane submission and completion
 
 `assign.sh` returns after successful prompt delivery. Exit 0 means submitted.
-The transcript can record the prompt later.
+Codex dispatch also requires the prompt in its transcript before it reports submission.
+Codex dispatch waits up to `WORKER_SETTLE_SECONDS` for the receipt.
+An unproved Codex prompt returns uncertain when this bound passes or the process exits.
+A recorded prompt remains submitted after a process exit.
+Claude can record the prompt later.
 A failed delivery command returns an error.
 The transcript prevents replay.
 A matching final transcript reply proves completion.

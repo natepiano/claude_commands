@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import subprocess
 import sys
 import time
+from threading import Timer
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
@@ -884,16 +885,18 @@ class WorkerCommandTests(unittest.TestCase):
                         session_dir=self.run_dir, slot="impl", phase="8", kind="impl", launcher_command=["assign.sh", str(following)],
                         reply=self.reply)
                 if failure:
-                    self.assertEqual(result, worker.ExitCode.UNCERTAIN)
-                    self.assertEqual(len(self.agent.submitted), before)
+                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                    self.assertEqual(len(self.agent.submitted), before + 1)
                     self.assertIn(failure, errors.getvalue())
+                    self.assertIn(f"{name}: compaction failed:", errors.getvalue())
+                    self.assertIn("prompt is sent without compaction", errors.getvalue())
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
                     self.assertNotIn("prompt delivered to pane", errors.getvalue())
-                    continue
                 self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                 reopened = self.agent.submitted[-1][0]
                 self.assertNotEqual(reopened, pane)
                 self.assertEqual(self.agent.row(reopened).current_session, row.current_session)
-                expected = [(reopened, before)] if tokens > 43000 else []
+                expected = [(reopened, before)] if tokens > 43000 and not failure else []
                 self.assertEqual(self.agent.compactions, expected)
                 self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
                 self.agent.compactions.clear()
@@ -1179,6 +1182,64 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.finish_after = 1
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
+
+        for exited in (False, True):
+            with self.subTest(exited=exited):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    config = case.fixture.root / "conf/direct.conf"
+                    atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
+                    opened = case.opened()
+                    def queued_without_delivery(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                        if arguments[0] == "/nonexistent/herdr" and arguments[4:6] == ["prompt", opened.pane]:
+                            if exited:
+                                pid, _, _ = case.fixture.world.foreground.pop(opened.pane)
+                                del case.fixture.world.processes[pid]
+                                case.fixture.world.locations[opened.pane]["agent_status"] = "exited"
+                            return subprocess.CompletedProcess(arguments, 0, "{}", "")
+                        return case.agent.run(arguments, **options)
+                    with (patch.object(subprocess, "run", side_effect=queued_without_delivery),
+                          redirect_stderr(io.StringIO()) as errors):
+                        code = worker.assign(case.fixture.parent.id, "impl", case.prompt, session_dir=case.run_dir,
+                            slot="impl", phase="8", kind="impl", name="impl", launcher_command=["assign.sh"], reply=case.reply)
+                    case.assertEqual(code, worker.ExitCode.UNCERTAIN)
+                    case.assertEqual(case.agent.submitted, [])
+                    case.assertIsInstance(case.receipt(), worker.DispatchNotSubmitted)
+                    case.assertEqual(errors.getvalue(),
+                        "anomaly: impl: dispatch prompt is not in the transcript; submission is unproved\n")
+                    if exited:
+                        case.assertIsInstance(worker_panes.observe_worker(case.fixture.parent.id, opened.row, staff.snapshot()),
+                                              worker_panes.StoppedWorker)
+                        case.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+                    case.assertIs(case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+                    case.assertEqual(len(case.agent.submitted), 1)
+                    case.assertEqual(case.agent.row(case.agent.submitted[-1][0]).current_session, opened.row.current_session)
+                finally:
+                    case.doCleanups()
+
+        with self.subTest(delivery="delayed transcript"):
+            case = WorkerCommandTests("runTest")
+            case.setUp()
+            opened = case.opened()
+            case.agent.defer_prompt_transcript = True
+            config = case.fixture.root / "conf/direct.conf"
+            atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
+            def record_prompt() -> None:
+                pane, line = case.agent.submitted[-1]
+                case.agent.append(pane, "user", line)
+            delivery = Timer(0.1, record_prompt)
+            case.agent.during_prompt = delivery.start
+            try:
+                with redirect_stderr(io.StringIO()) as errors:
+                    case.assertIs(case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+                case.assertEqual(errors.getvalue(), "")
+                case.assertEqual(len(case.agent.submitted), 1)
+                case.assertEqual(case.agent.submitted[0][0], opened.pane)
+                case.assertIsInstance(case.receipt(), worker.DispatchSubmitted)
+            finally:
+                delivery.join()
+                case.doCleanups()
 
     def test_blocked_dispatch_returns_blocked(self) -> None:
         opened = self.opened()
@@ -1469,6 +1530,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIsNotNone(staff.by_id(opened.row.id))
 
     def test_transcript_failure_reports_whether_the_prompt_was_delivered(self) -> None:
+        config = self.fixture.root / "conf/direct.conf"
+        atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
         for delivered in (False, True):
             with self.subTest(delivered=delivered):
                 name = "impl2" if delivered else "impl"
@@ -1488,8 +1551,9 @@ class WorkerCommandTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()) as errors:
                     result = self.dispatch(name)
                 if delivered:
-                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
-                    self.assertEqual(errors.getvalue(), "")
+                    self.assertEqual(result, worker.ExitCode.UNCERTAIN)
+                    self.assertEqual(errors.getvalue(),
+                        f"anomaly: {name}: worker transcript has incomplete records; submission is unproved\n")
                 else:
                     self.assertEqual(result, worker.ExitCode.UNCERTAIN)
                     self.assertEqual(errors.getvalue(),
@@ -1566,7 +1630,9 @@ class WorkerCommandTests(unittest.TestCase):
                                     assert isinstance(result, worker_panes.OpenWorker)
                                     return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed", result.created_pane)
                                 _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=incomplete))
-                            elif failure == "target":
+                            elif failure in ("target", "compact"):
+                                if failure == "compact":
+                                    _ = patches.enter_context(patch.object(worker, "_compact_before_dispatch", side_effect=OSError("TEST compact failed")))
                                 check = cast(Callable[..., bool], herdr.check_target)
                                 def refuse(*arguments: object, **options: object) -> bool:
                                     return False if options.get("action") == "keys" and options.get("text") else check(*arguments, **options)
@@ -1593,8 +1659,6 @@ class WorkerCommandTests(unittest.TestCase):
                                     result = start(*arguments, **options)
                                     return replace(result, status=herdr.AgentStatus.UNKNOWN) if isinstance(result, worker_panes.OpenWorker) else result
                                 _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=busy))
-                            elif failure == "compact":
-                                _ = patches.enter_context(patch.object(worker, "_compact_before_dispatch", side_effect=OSError("TEST compact failed")))
                             if failure in ("recorder", "delivery"):
                                 with case.assertRaisesRegex((OSError, ValueError), "TEST .* failed"):
                                     case.assertIsInstance(case.dispatch(), worker.ExitCode)
@@ -1603,6 +1667,9 @@ class WorkerCommandTests(unittest.TestCase):
                                 case.assertEqual(code, worker.ExitCode.REFUSED if failure == "dispatch id" else
                                                  worker.ExitCode.BUSY if failure == "busy" else worker.ExitCode.UNCERTAIN)
                         case.assertEqual(case.agent.submitted, [])
+                        if failure == "compact":
+                            case.assertIn("TEST compact failed; prompt is sent without compaction", errors.getvalue())
+                            case.assertIn("dispatch target is unproved", errors.getvalue())
                         if existing:
                             case.assertEqual(staff.snapshot().rows, before[0])
                             case.assertEqual(set(case.fixture.world.locations), before[1])

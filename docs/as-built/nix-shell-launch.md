@@ -116,7 +116,8 @@ The final command's exit status passes through.
 `user_clock` runs `user_zone.py` with `python3 -S`; that helper and `/zone` share
 the `stored_zone` configuration reader.
 
-Launch scan: `scripts/lib/test_claude_launch_scan.py` checks Python process calls
+Launch scan: `scripts/lib/test_claude_launch_scan_sources.py` runs the scanner in
+`scripts/lib/test_claude_launch_scan.py` over the scripts. The scanner checks Python process calls
 whose argv starts Claude, Codex or `herdr agent start`, typed `start_agent`
 calls for either agent kind, and shell launch lines. Queries such as `--help`
 and `agents` do not count as starts. Each Python scope must call `nix_env.ensure`,

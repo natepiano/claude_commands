@@ -2523,3 +2523,146 @@ A private copy of the git index now keeps the mtime of the bytes it copies, so g
 - `scripts/aws_target/test_cloud_gate.py`, `scripts/lib/test_git_index.py`, `scripts/validate_and_push/test_rerun.py` — one regression each; each fails with the old copy
 
 **Gotchas:** `shutil.copy2` is not enough. It stats the path again after the read, and git replaces the index by rename, so a rewrite between the two gives old bytes with a newer mtime. Do not copy a git index with `cp` or `shutil.copyfile`; use `git_index.private_copy`. The macOS run of the `validate_ci.sh` regression is not verified.
+
+### Phase 127 — A config edit selects only the tests that really read that config file  · status: done
+
+#### As-built
+
+Config reads are recorded at run time. When the environment has `CONF_READ_LOG`, each read through `conf.py` or `conf.sh` appends the config stem to that file with one append write; without the variable, the readers do no added work. `module_run.py` sets the log per module, so child processes inherit it, and writes the sorted stems to the module's times file as `config_reads`. The gate record and the build log index (schema 37, `gate_modules.config_reads`) carry them. A module with no times file has no record (NULL), which is different from an empty list.
+
+`affected_modules.select_affected` selects, for each changed `config/<name>.conf`:
+- the modules that recorded `<name>` in the newest full, non-aborted gate with at least one config record (`latest_config_reads`); a newer gate without records does not replace it;
+- the modules with no record in that gate;
+- the modules whose own text names the file (direct `SourceFacts.config_reads`).
+
+The transitive config closure is deleted. An index read error gives `FullSuite` with a reason. On 19 builds merges, the estimate is targeted CPU 17,861 to 10,042 CPU s (median 280 to 126 per merge); selection takes under 3 s.
+
+**Files:**
+- `scripts/lib/conf_reads.py` — new; the recorder (`record`, `read_text`), standard library only
+- `scripts/lib/conf.py`, `scripts/lib/conf.sh` — record each read
+- `scripts/test_times/module_run.py`, `scripts/test_times/gate_record.py`, `scripts/buildlog/index.py` — carry the records
+- `scripts/production/affected_modules.py` — `latest_config_reads`, `select_affected`
+- Nine direct config readers read through `conf_reads.read_text`
+
+**Gotchas:**
+- `conf_reads.py` binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not catch the record.
+- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`. The Mac context-economy payload ships both.
+- Nine raw readers do not record: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, the `models_registry.py` edit snapshots and `deploy.py`.
+- A new reader is missed until the next full gate records it.
+
+**Ruled out:** the transitive closure rule of Phase 96 — one `merge_gate.conf` edit selected 429 of 743 modules.
+
+### Phase 128 — Test runs start no background Git upkeep  · status: done
+**Depends on:** Phase 127
+
+#### As-built
+
+- No repository change. The trial gained 2.8 CPU s on the 21 most Git-heavy modules, far under the 30 CPU s bar, and did not land.
+- The trial: `module_run.py` appended `maintenance.auto=false` and `gc.auto=0` through `GIT_CONFIG_COUNT`, one fixture helper kept those settings, and nine per-fixture copies were removed. Review closed four findings, and the full gate passed (748 modules).
+- Measure: `module_cost.py --commands` on 21 Git-heavy modules, base and change side by side. Command CPU 451.3 to 448.5 CPU s, Git CPU 92.1 to 90.2 CPU s, Git starts 82,028 to 79,432 (3%). No measured row was a detached `gc` or `maintenance` task.
+- Floor: the per-fixture copies already turned off most upkeep. The Work Order estimate (about 50 CPU s on 12 modules) did not hold on this base.
+
+**Ruled out:** a runner-wide Git upkeep setting for speed. Keep the per-fixture copies; several of them are race guards for fixture removal.
+
+### Phase 129 — Every config reader records its read, so a config edit selects its tests  · status: done
+**Depends on:** Phase 128
+
+#### As-built
+
+- Nine config readers record each config file they read in the `config_reads` record that `module_run.py` writes per module. The targeted selector uses that record to pick the tests that read an edited config file.
+- Shell readers call `conf_record <stem>` from `scripts/lib/conf_record.sh`. It is POSIX, appends to `CONF_READ_LOG` with builtins only, and starts no process. `conf.sh` sources it, and `conf_value` calls it.
+- `statusline.sh` sources the recorder only when `CONF_READ_LOG` is set. It records `statusline` and the stem of the zone file it reads.
+- `lint_config.sh` and `verify.sh` `lint_code_key` record the stem of the lint file they read. `verify.sh` sources only `conf_record.sh` before `lint_code_key`; its `conf.sh` source stays before `TOKEN_HOLD_S`.
+- Python readers: `progress_history.py` (`direct`), `new_account.py` (`statusline`), `tune.py` (the source stem) and `models_registry.py` (`models`, once before its snapshot reads) call `conf_reads.record`. `zone.py` and `deploy.py` read through `conf_reads.read_text`.
+- Test rows prove the record in `test_conf_sh.py`, `test_statusline.py`, `test_new_account.py`, `test_progress_history.py`, `test_deploy.py`, `test_models_registry.py`, `test_invoke_scope.py` and `test_verify_lint_cache_versions.py`. The lint-cache row routes the log only around `lint_code_key` in its own harness script, so the Clippy reader cannot satisfy it.
+- Raw reads that still record nothing: `production/dailies_counts.py` `read_specs`, generic file hashing in `direct/tree_watch.py` and `direct/progress_history.py`, and fixture readers in `findings_test_support.py`, `assign_launcher_test_support.py`, `rename_unit_test_support.py`, `memory_test_support.py` and `offload_test_support.py`.
+
+**Files:**
+- `scripts/lib/conf_record.sh` — the shell recorder.
+
+**Gotchas:**
+- Seven fixtures copy shell helpers one by one, and each must also copy `conf_record.sh`: `assign_claude_test_support.py`, `review_launcher_test_support.py`, `test_board_start.py`, `test_verify_nix_shell.py`, `test_verify_run_place.py`, `test_process_group.py` and `test_settings_local_keys.py`.
+- `verify.sh` runs top-level code before the nix re-exec, and some fixtures copy `verify.sh` alone. Source only `conf_record.sh` there, never `conf.sh`.
+
+**Ruled out:** rows for `tune.py` and `zone.py`, because the parsed read in the same call records the same stem; a test-only read-log branch in `verify.sh`.
+
+### Phase 130 — A test that scans repository folders runs when a file in those folders changes  · status: done
+**Depends on:** Phase 129
+
+#### As-built
+
+- `module_run.py` installs the `RepositoryFolderScans` audit hook when a times file is requested. It records `os.scandir` and `os.listdir` listings inside the running checkout as repository-relative folders (`.` for the root), and skips listings made by the import system. A `git ls-files` child process (with or without `-C`) records each pathspec as a recursive prefix with a trailing `/`; no pathspec records `/`, the whole repository. The sorted set is `folder_scans` in the times JSON; `[]` means no scan.
+- `gate_record.py`: `ModuleReadRecord` holds `config_reads` (`RecordedConfigReads | NoConfigReadRecord`) and `folder_scans` (`RecordedFolderScans | NoFolderScanRecord`). `module_read_record` is the one reader of both stored fields.
+- `buildlog/index.py` schema 38 adds `gate_modules.folder_scans` (sorted JSON; NULL means no record).
+- `affected_modules.py`: `latest_module_reads` reads each field from its newest full, non-aborted gate that has it. A listed folder selects its lister only when an added or removed path has that folder as its parent (`changed_path_parents`; a path in a new folder uses its nearest ancestor that exists at the base). A recursive prefix or `/` selects its module for any changed path under it (`scans_changed_paths`). A module with a NULL folder record is selected; with no gate that has folder records the rule selects nothing.
+- Measured on the first cloud full gate: 327 of 748 modules scan folders (about 3,100 of 4,584 CPU s), 288 list `config/` through `scripts/lint/memory_test_support.py`, and only `agents/test_no_old_model_names.py` records `/`. Over the last 10 builds merges the selection grew from 1,321 to 1,380 modules (11,344 to 11,683 CPU s); each change under `scripts/`, `docs/` or `commands/` now selects `production/test_staff_accessors.py` and `production/test_roles_audit.py`.
+
+**Files:**
+- `scripts/test_times/module_run.py` — the folder audit hook.
+- `scripts/test_times/gate_record.py` — `ModuleReadRecord` and its reader.
+- `scripts/buildlog/index.py` — the `folder_scans` column.
+- `scripts/production/affected_modules.py` — the combined reader and the folder rule.
+
+**Binds later work:** the stored folder strings (`.` root, `/` whole repository, trailing `/` recursive) are the inputs that "A test that reads the files it finds in a folder runs when one of those files changes" decodes into named states.
+
+**Gotchas:**
+- Each targeted selection reads the module records (1.2-2.6 CPU s), and the first index update on a host after the schema change rebuilds the index (99 CPU s on natedev).
+- Listings in child processes and Git listing commands other than `ls-files` record nothing.
+- A test that patches `os.path.realpath` counted the hook's own calls until the hook bound its functions at install time.
+
+**Ruled out:** selecting a lister on a content change in its listed folder, because 288 modules list `config/` and the rule selected all of them for each config edit.
+
+### Phase 131 — A test that reads the files it finds in a folder runs when one of those files changes  · status: done
+**Depends on:** Phase 130
+
+#### As-built
+
+- `module_run.py`'s `RepositoryReadAudit` records each read-mode `open` of an existing regular file inside the checkout as a repository-relative path. It skips `config/`, `__pycache__/` and opens made by the import system. The sorted set is `content_reads` in the times JSON; `[]` means no read.
+- `gate_record.py`: `ModuleReadRecord` adds `content_reads` (`RecordedContentReads | NoContentReadRecord`). `module_read_record(configs, folders, contents)` decodes the stored folder strings into `ListedDirectory(path)`, `RecursiveDirectory(prefix)` and `WholeRepository()`; `folder_scan_strings` encodes them back to the same JSON.
+- `buildlog/index.py` schema 39 adds `gate_modules.content_reads` (sorted JSON; NULL means no record).
+- `affected_modules.py`: `latest_module_reads` reads `content_reads` from the newest full, non-aborted gate that has it. A module is selected when a changed non-config path is in its content reads, or when its content record is NULL. With no gate that has content records, the rule selects nothing. `scans_changed_paths` matches on the three folder states.
+- `module_cost.py`: `runner_command(tree, module)` builds the `module_run.py` command from the requested tree for the time, trace and `--commands` runs.
+- Measured on the first cloud full gate: all 748 modules have a content record, 487 read repository files, and the records add 907 KB of JSON per gate. Over the last 10 builds merges the targeted selection grew from 978 to 1,072 modules (8,368 to 9,214 CPU s). A warm selection costs 0.14 CPU s more.
+
+**Files:**
+- `scripts/test_times/module_run.py` — the read audit.
+- `scripts/test_times/gate_record.py` — the content record and the three folder states.
+- `scripts/buildlog/index.py` — the `content_reads` column.
+- `scripts/production/affected_modules.py` — the content rule.
+- `scripts/test_times/module_cost.py` — `runner_command`.
+
+**Gotchas:**
+- The audit `open` event carries no `dir_fd`, so a read through `os.open(name, dir_fd=fd)` records nothing. No repository test reads repository files that way.
+- Reads in child processes record nothing.
+- 19 modules read over 500 repository files (the largest about 1,700), so almost every change under `scripts/` selects them.
+
+**Ruled out:** a `dir_fd` fix, because no current reader needs it.
+
+### Phase 132 — A script change runs the scan checks that read it, not the slower tests beside them  · status: done
+**Depends on:** Phase 131
+
+#### As-built
+
+- Nine modules keep their repository scan tests in `test_<stem>_sources.py` in the same folder. Each original module now reads 0 to 9 repository files (before: 609 to 1,701), so a script change selects only the scan module.
+- A scan module imports its helpers by function name from the original module. Each helper is defined there, not re-exported. Each moved test body and assertion is unchanged.
+- `scripts/lib/test_nix_env_integration.py` is deleted. The gate runs the `lib/test_claude_launch_scan.py` tests once.
+- Measured: over the last 10 builds merges, the targeted selection went from 1,072 modules (9,210 CPU s) to 1,081 (9,008 CPU s). Seven merges are about 34 CPU s lower each. The full gate went from 4,636 to 4,618 CPU s. The scan modules keep most of the old cost (3 to 19 CPU s each).
+
+**Files:**
+- `scripts/copies/test_copy_guard_sources.py` — both repository copy-policy scans (shared cached scan).
+- `scripts/astra/test_design_roles_sources.py` — retired design role name scan.
+- `scripts/lib/test_process_group_sources.py` — group signal scan of every script.
+- `scripts/message/test_session_send_sources.py` — sender guard scan of test modules.
+- `scripts/direct/test_one_launch_path_sources.py` — worker launch command scan.
+- `scripts/accounts/test_launch_accounts_sources.py` — Python and shell launcher account scans.
+- `scripts/lib/test_claude_launch_scan_sources.py` — repository launch guard scan; the scanner stays in `test_claude_launch_scan.py`.
+- `scripts/lib/test_py_floor_sources.py` — interpreter-floor parse of every script.
+- `scripts/notify/test_push_texts_sources.py` — literal phone send and Pushover host scans.
+
+**Gotchas:**
+- A scan module must never import a `TestCase` class or the original module object. The loader then runs those tests twice.
+
+**Ruled out:**
+- Splitting `lib/test_one_hang_guard.py`, `lib/test_process_failure.py` and `agents/test_no_old_model_names.py`, because each is almost only its scan.
+- Splitting `production/test_staff_accessors.py` and `lib/test_user_zone.py`, because each costs under 1 CPU s.
+- Changing the four tree-copy modules (`production/test_update_registration_commands.py`, `build_queue/test_memory_feed.py`, `aws_target/test_control.py`, `mac_test/test_floor_sweep.py`), because their read records are a correct over-approximation of the child's imports.

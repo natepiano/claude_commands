@@ -332,7 +332,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             destination = self.root / "scripts" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(DIRECT_DIR.parent / relative, destination)
-        for name in ("conf.py", "conf.sh"):
+        for name in ("conf.py", "conf_reads.py", "conf.sh", "conf_record.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
         configure_launcher_fixture(direct_dir / "assign.sh")

@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-from scripts.lib import git_index
+from scripts.lib import conf_reads, git_index
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -192,7 +192,7 @@ def registry_path() -> Path:
 
 
 def registry_text(registry: Path | None = None) -> str:
-    return (registry or registry_path()).read_text(encoding="utf-8")
+    return conf_reads.read_text(registry or registry_path())
 
 
 def _records(text: str) -> list[RegistryRow]:
@@ -561,6 +561,7 @@ def main() -> int:
                 configuration = RegistryEditBase(*_snapshot({}, "", arguments.registry))
             print(configuration_shell(configuration), end="")
             return 0
+        conf_reads.record("models")
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":

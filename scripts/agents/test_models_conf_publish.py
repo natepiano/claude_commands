@@ -159,15 +159,17 @@ class SharedRegistryTests(RegistryFixture):
         hook.mkdir()
         _ = (hook / "sitecustomize.py").write_text('''import os
 from pathlib import Path
-read_text = Path.read_text
+from scripts.lib import conf_reads
+read_text = conf_reads.read_text
 def read_then_edit(path, *arguments, **keywords):
     text = read_text(path, *arguments, **keywords)
+    path = Path(path)
     if str(path) == os.environ["MODELS_CONFIG_FILE"] and "note=original" in text:
         peer = path.with_suffix(".peer")
         peer.write_text(text.replace("note=original", "note=intermediate"))
         peer.replace(path)
     return text
-Path.read_text = read_then_edit
+conf_reads.read_text = read_then_edit
 ''')
         self.environment["PYTHONPATH"] = str(hook) + os.pathsep + self.environment["PYTHONPATH"]
         operations = ("agents_set_row direct.impl gpt-b:max",

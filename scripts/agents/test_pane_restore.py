@@ -26,6 +26,7 @@ from scripts.agents import restart
 from scripts.production import staff, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
+from scripts.lib.test_models_registry import write_registry
 from scripts.agents import pane_record as restart_records
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.message import sessions as runtime_sessions
@@ -195,6 +196,8 @@ class PaneRestoreTests(unittest.TestCase):
         self.config = Path()
         self.opened: list[tuple[str, str, str, str, dict[str, str]]] = []
         self.live: list[str] = []
+        self.workspace = "producers"
+        self.native_processes: dict[int, herdr.NativeAgentProcess] = {}
 
     @override
     def setUp(self) -> None:
@@ -217,6 +220,16 @@ class PaneRestoreTests(unittest.TestCase):
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             write_text_atomic(configuration / source.name, source.read_text())
+        registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+        for pid in (123, 4242):
+            self.native_processes[pid] = herdr.NativeAgentProcess(herdr.EnvironmentThread(self.row.current_session),
+                "fixture-generation", {"HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2",
+                                       "CLAUDE_CONFIG_DIR": str(self.config)})
+        def native_process(pid: int, kind: str, reported: str | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
+            del kind, reported
+            return self.native_processes[pid]
+        _ = self.enterContext(mock.patch.object(herdr, "native_process", side_effect=native_process))
 
         record_home = staff.set_home
         def set_home(_identity: staff.StaffId, home: staff.SessionHome) -> staff.StaffRow:
@@ -228,7 +241,7 @@ class PaneRestoreTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(staff, "initial_snapshot", side_effect=lambda: staff.StaffSnapshot((self.row,))))
         _ = self.enterContext(mock.patch("scripts.agents.remote.local_machine", return_value="natedev"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
-        _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("demo", "alpha")))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.ExistingPane("w1:p2", "w1:p2-terminal")))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
         from scripts.production.fake_unit_host import process
         process({"HERDR_PROC": str(self.root / "proc")}, 998042, 1, ["zsh"], {})
@@ -265,6 +278,8 @@ class PaneRestoreTests(unittest.TestCase):
 
     def entry(self, **changes: object) -> None:
         kind = cast(Literal["claude", "codex"], changes.get("kind", "claude"))
+        _ = write_registry(self.root / "configuration/models.conf", {"producers": {
+            "alpha": "codex:gpt-test:high" if kind == "codex" else "claude:opus:max"}}, update=True)
         if kind == "codex":
             changes = {"config_dir": str(self.root / ".codex2"),
                        "environment": {"CODEX_HOME": str(self.root / ".codex2")}, **changes}
@@ -272,11 +287,48 @@ class PaneRestoreTests(unittest.TestCase):
             "CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT": "demo", "CLAUDE_CODE_OAUTH_TOKEN": "secret"}))
         launch = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", environment,
                                     ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "opus"], kind=kind)
+        pane_record.save("agents", {})
         pane_record.write("agents", cast(pane_record.PaneLaunch, cast(object, {**launch, **changes})))
 
     def run_restore(self, client: FakeClient) -> tuple[int, str]:
         output = io.StringIO()
-        with mock.patch.object(herdr, "Herdr", return_value=client), redirect_stdout(output), redirect_stderr(output):
+        start = client.start_agent
+        result = client.result
+        def layout(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("workspace", "list"):
+                return {"workspaces": [{"workspace_id": "w1", "label": self.workspace}]}
+            if arguments[:2] == ("tab", "list"):
+                return {"tabs": [{"tab_id": row.get("tab_id", str(row["pane_id"]) + ":tab"),
+                    "workspace_id": row["workspace_id"], "label": row["label"], "pane_count": 1} for row in client.rows]}
+            return result(*arguments, deadline=deadline)
+        def started(name: str, pane: str, kind: str, agent_arguments: list[str],
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+            publish = client.publish_claude
+            client.publish_claude = False
+            try:
+                outcome = start(name, pane, kind=kind, agent_arguments=agent_arguments, opening=opening, timeout_ms=timeout_ms)
+            finally:
+                client.publish_claude = publish
+            if kind not in ("claude", "codex"):
+                raise AssertionError(kind)
+            option = "resume" if kind == "codex" else "--resume"
+            identity = agent_arguments[agent_arguments.index(option) + 1]
+            client.native_ids[pane] = identity
+            home = self.row.home
+            assert isinstance(home, staff.SessionHome)
+            environment = {"HERDR_SESSION": client.session, "HERDR_PANE_ID": pane,
+                "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR": str(home.path)}
+            self.native_processes[123] = herdr.NativeAgentProcess(herdr.EnvironmentThread(identity), "fixture-generation", environment)
+            if publish:
+                folder = self.opened[-1][3] if pane == "w1:p3" and self.opened else "/work/alpha"
+                replacement = pane_record.launch(pane, identity, folder, environment, [kind, *agent_arguments], kind=kind)
+                replacement.update(pid=123, proc_start="fixture-generation")
+                pane_record.write(client.session, replacement)
+            return outcome
+        with (mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(client, "result", side_effect=layout),
+              mock.patch.object(client, "start_agent", side_effect=started),
+              redirect_stdout(output), redirect_stderr(output)):
             code = pane_restore.restore("agents", dry_run=False)
         return code, output.getvalue()
 
@@ -288,24 +340,27 @@ class PaneRestoreTests(unittest.TestCase):
 
     def test_restore_uses_each_reader_outcome_for_both_runtimes(self) -> None:
         identity = "019b3a40-4250-7000-8000-000000000102"
-        for kind in ("claude", "codex"):
-            for state in ("live", "stopped", "unknown"):
-                with self.subTest(kind=kind, state=state):
-                    self.entry(kind=kind)
-                    observed = (herdr.LiveConversation(kind, (123,)) if state == "live" else
-                                herdr.UnknownConversation("test-tab (conversation unknown)") if state == "unknown" else
-                                herdr.StoppedConversation())
-                    client = self.restored()
-                    with (mock.patch.object(herdr, "read_conversation", return_value=observed) as read,
-                          mock.patch.object(client, "run_in_pane"),
-                          mock.patch.object(client, "start_agent", wraps=client.start_agent) as start):
-                        code, output = self.run_restore(client)
-                    self.assertEqual(code, 0, output)
-                    self.assertEqual(len(client.started), 0 if state == "live" else 1)
-                    self.assertEqual(output.count("anomaly: test-tab"), 1 if state == "unknown" else 0)
-                    read.assert_any_call(identity)
-                    if state != "live":
-                        self.assertEqual(start.call_args.kwargs["kind"], kind)
+        roles: tuple[staff.Kind, ...] = ("producer", "unit")
+        for role in roles:
+            for kind in ("claude", "codex"):
+                for state in ("live", "stopped", "unknown"):
+                    with self.subTest(role=role, kind=kind, state=state):
+                        self.row = replace(self.row, kind=role)
+                        self.entry(kind=kind)
+                        observed = (herdr.LiveConversation(kind, (123,)) if state == "live" else
+                                    herdr.UnknownConversation("test-tab (conversation unknown)") if state == "unknown" else
+                                    herdr.StoppedConversation())
+                        client = self.restored()
+                        with (mock.patch.object(herdr, "read_conversation", return_value=observed) as read,
+                              mock.patch.object(client, "run_in_pane"),
+                              mock.patch.object(client, "start_agent", wraps=client.start_agent) as start):
+                            code, output = self.run_restore(client)
+                        self.assertEqual(code, 0, output)
+                        self.assertEqual(len(client.started), 0 if state == "live" else 1)
+                        self.assertEqual(output.count("anomaly: test-tab"), 1 if state == "unknown" else 0)
+                        read.assert_any_call(identity)
+                        if state != "live":
+                            self.assertEqual(start.call_args.kwargs["kind"], kind)
 
 
     def test_restore_reports_unknown_once_across_the_real_launch_boundary(self) -> None:
@@ -318,7 +373,9 @@ class PaneRestoreTests(unittest.TestCase):
                     last = herdr.UnknownConversation("test-tab (new read failure)") if changed_reason else first
                     with (mock.patch.object(herdr, "read_conversation", side_effect=[first, first, last]) as read,
                           mock.patch.object(herdr, "prepare_session_environment", return_value=
-                              herdr.PreparedAgentEnvironment(self.root, {})),
+                              herdr.PreparedAgentEnvironment(Path("/work/alpha"), {
+                                  "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR":
+                                      str(cast(staff.SessionHome, self.row.home).path)})),
                           mock.patch.object(pane_launch, "finish_restore") as finish):
                         code, output = self.run_restore(client)
                     self.assertEqual(code, 0, output)
@@ -333,6 +390,7 @@ class PaneRestoreTests(unittest.TestCase):
         for other_conversation in (False, True):
             with self.subTest(other_conversation=other_conversation):
                 self.opened.clear()
+                self.workspace = "demo"
                 self.entry(cwd="/old/alpha")
                 client = FakeClient([{ "pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
                 activity = herdr.PaneRunning(("other work",)) if not other_conversation else herdr.PaneAtShell()
@@ -361,7 +419,8 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(client.closed, [])
                 self.assertIn("pane close anomaly:", output)
                 self.assertEqual(output.count("pane close anomaly:"), 1)
-                self.assertIn("w1:p2", pane_record.read("agents"))
+                self.assertEqual(list(pane_record.read("agents")), ["w1:p3"])
+                self.assertIn("w1:p2", [row["pane_id"] for row in client.rows])
 
     def test_unknown_staff_home_reports_once_and_keeps_normal_account_selection(self) -> None:
         self.entry()
@@ -453,7 +512,8 @@ class PaneRestoreTests(unittest.TestCase):
         pane_record.write("agents", pane_record.launch("w1:p1", str(row.current_session), str(fixture.root),
             {"CODEX_HOME": str(fixture.root / "codex")}, ["codex", "resume", str(row.current_session)], kind="codex"))
         before = fixture.world.panes()
-        with (mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+        parent_pid = fixture.world.foreground["w1:p0"][0]
+        with (mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (parent_pid,))),
               mock.patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
@@ -475,23 +535,29 @@ class PaneRestoreTests(unittest.TestCase):
 
 
     def test_seed_writes_the_entry_of_each_running_claude(self) -> None:
-        (self.root / "proc/4242").mkdir(parents=True)
-        _ = (self.root / "proc/4242/environ").write_bytes(
-            f"CLAUDE_CONFIG_DIR={self.config}\0SHOWRUNNER_UNIT=demo\0CLAUDE_CODE_OAUTH_TOKEN=secret\0".encode())
-        (self.config / "sessions").mkdir()
-        _ = (self.config / "sessions/4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "019b3a40-4250-7000-8000-000000000102"}))
-        client = FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
-        client.process_info = {"shell_pid": 998042, "foreground_process_group_id": 4242,
-            "foreground_processes": [{"pid": 4242, "name": "claude",
-                "argv": ["claude", "-n", "alpha", "--model", "opus"], "cwd": "/work/alpha"}]}
-        with (mock.patch.object(herdr, "Herdr", return_value=client),
-              mock.patch.object(sessions, "process_start", return_value="fixture-generation"),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(pane_record.seed("agents"), 0)
-        entry = pane_record.read("agents")["w1:p2"]
-        self.assertEqual((entry["session_id"], str(cast(staff.SessionHome, pane_launch.config_home(entry)).path), entry["name"], entry["model"], entry["cwd"]),
-                         (str(self.row.id), str(self.config), "alpha", "opus", "/work/alpha"))
-        self.assertEqual(entry["environment"], {})
+        for staffed in (True, False):
+            with self.subTest(staffed=staffed):
+                (self.root / "proc/4242").mkdir(parents=True, exist_ok=True)
+                _ = (self.root / "proc/4242/environ").write_bytes(
+                    f"HERDR_SESSION=agents\0HERDR_PANE_ID=w1:p2\0CLAUDE_CONFIG_DIR={self.config}\0SHOWRUNNER_UNIT=demo\0CLAUDE_CODE_OAUTH_TOKEN=secret\0".encode())
+                (self.config / "sessions").mkdir(exist_ok=True)
+                _ = (self.config / "sessions/4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "019b3a40-4250-7000-8000-000000000102"}))
+                client = FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
+                client.process_info = {"shell_pid": 998042, "foreground_process_group_id": 4242,
+                    "foreground_processes": [{"pid": 4242, "name": "claude",
+                        "argv": ["claude", "-n", "alpha", "--model", "opus"], "cwd": "/work/alpha"}]}
+                pane_record.save("agents", {})
+                membership = staff.StaffSnapshot((self.row,)) if staffed else staff.StaffSnapshot(())
+                with (mock.patch.object(staff, "initial_snapshot", return_value=membership),
+                      mock.patch.object(staff, "local_snapshot", return_value=membership),
+                      mock.patch.object(herdr, "Herdr", return_value=client),
+                      mock.patch.object(sessions, "process_start", return_value="fixture-generation"),
+                      redirect_stdout(io.StringIO())):
+                    self.assertEqual(pane_record.seed("agents"), 0)
+                entry = pane_record.read("agents")["w1:p2"]
+                self.assertEqual((entry["session_id"], str(cast(staff.SessionHome, pane_launch.config_home(entry)).path), entry["name"], entry["model"], entry["cwd"]),
+                                 (str(self.row.id if staffed else self.row.current_session), str(self.config), "alpha", "opus", "/work/alpha"))
+                self.assertEqual(entry["environment"], {})
 
 
 @final

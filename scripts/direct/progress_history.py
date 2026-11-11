@@ -34,7 +34,7 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -295,6 +295,7 @@ def _config_digest() -> str:
         text = (models_registry.launch_configuration(os.environ).text
                 if os.environ.get(models_registry.OPERATION_ENVIRONMENT[0]) else models_registry.registry_text())
         registry = text.encode("utf-8")
+        conf_reads.record(_config_path().stem)
         contents = registry + _config_path().read_bytes()
     except (OSError, ValueError, UnicodeError):
         return ""

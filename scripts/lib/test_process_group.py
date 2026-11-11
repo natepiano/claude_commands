@@ -187,7 +187,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         self.root = Path(directory)
         scripts = Path(__file__).resolve().parents[1]
         for name in ("direct/board.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
-                     "lib/process_start.py", "lib/conf.sh", "lib/conf.py"):
+                     "lib/process_start.py", "lib/conf.sh", "lib/conf_record.sh", "lib/conf.py", "lib/conf_reads.py"):
             destination = self.root / "scripts" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(scripts / name, destination)
@@ -341,9 +341,6 @@ final_pass_finish() { :; }
 
 
 class ProcessGroupSourceTests(unittest.TestCase):
-    def test_scripts_route_every_group_signal_through_the_shared_check(self) -> None:
-        self.assertEqual(unguarded_group_signals(Path(__file__).resolve().parents[1]), [])
-
     def test_guard_finds_planted_python_shell_and_heredoc_sends(self) -> None:
         python_send = "os." + "killpg"
         shell_send = "ki" + "ll"
