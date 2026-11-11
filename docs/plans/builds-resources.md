@@ -2229,7 +2229,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Ruled out:** a start time with minutes only — three holds in one minute give equal texts.
 
-### Phase 105 — The Mac floor alert lists the build output inside each Mac test copy  · status: todo
+### Phase 105 — The Mac floor alert lists the build output inside each Mac test copy  · status: done
 
 **Depends on:** Phase 99 (the Mac floor offers only build output); done.
 
@@ -2237,14 +2237,14 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 #### Work Order
 
-**Goal:** When the Mac disk falls below the alert line, the alert lists each Mac cargo target with its size in GiB, marks held ones, and recommends one that frees the shortfall.
+**Goal:** When the Mac disk falls below the alert line, the alert measures each Mac cargo target, lists the largest ones with their sizes in GiB, marks held ones, and recommends the largest one that is not held.
 
 **Spec:**
 
-1. **The list.** The floor pass already finds the Mac cargo targets: `target_dirs(roots, …)` filtered by `policy.allows` (:4236–4243). `FloorOutcome` (:3812) carries that filtered list to `notify_floor_problem`. `mac_folder_measurement(policy, targets)` measures each listed target that still exists with `mac_folder_reclaimable_bytes`, beside the root children it measures now. Do not scan the roots a second time.
-2. **The choices.** `folder_choices` keeps its filters: a measured target is a candidate, a source tree is not. A target inside held output gets the held label as now.
-3. **Proof.** Add a row to the existing Mac floor alert test in `scripts/lint/test_sweep.py` (the `mac_folder_measurement` cases near :3930 and :4317): a root child with a `Cargo.toml` and a cargo `target` inside it. The alert names `<child>/target` with its size and recommends it; a held target gets the held label and is not recommended.
-4. **Docs.** `docs/as-built/build-memory-admission.md` (:1569): the Mac measurement reads each root's direct children and each cargo target the floor pass found.
+1. **The list.** The floor pass already finds the Mac cargo targets: `target_dirs(roots, …)` filtered by `policy.allows` (:4236–4243). `FloorOutcome` (:3818) carries that filtered list to `notify_floor_problem`. `mac_folder_measurement(policy, targets)` measures each listed target that still exists with `mac_folder_reclaimable_bytes`, beside the root children it measures now. Do not scan the roots a second time.
+2. **The choices.** `folder_choices` keeps its filters: a measured target is a candidate, a source tree is not. A target inside held output gets the held label as now. Keep the existing alert limits: `folder_choice_lines` stops at the shortfall, `sweep_alert_folder_count` and `sweep_message_limit`. Keep `HeldOnlyFolderChoices` and `InsufficientFolderChoices`: when every target is held, or the largest free one cannot cover the shortfall, the alert says so as now.
+3. **Proof.** Add a row to the existing Mac floor alert test in `scripts/lint/test_sweep.py` (`test_crossing_recommends_one_measured_choice_that_frees_the_shortfall`, :4248, which patches `mac_folder_measurement` near :4317): a root child with a `Cargo.toml` and a cargo `target` inside it. The alert names `<child>/target` with its size and recommends it; a held target gets the held label and is not recommended.
+4. **Docs.** `docs/as-built/build-memory-admission.md` (the Mac measurement paragraph, :1548): the Mac measurement reads each root's direct children and each cargo target the floor pass found.
 
 **Files:**
 - `scripts/lint/sweep.py`
@@ -2262,7 +2262,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Depends on:** Phase 104 (it changes `scripts/build_hold/build_hold.py`); done.
 
-**Source:** builds 2026-11-11. `basedpyright` reports four `reportImportCycles` errors on `scripts/build_hold/build_hold.py`. Each chain ends at `scripts/build_queue/placement.py`, which imports `OwningSession` and `NoOwningSession` from `build_hold` (a `TYPE_CHECKING` import and a deferred `__getattr__` class, :9–22). `build_hold.admitted_processes` (:584) imports `admission_service`, which reaches `placement`.
+**Source:** builds 2026-11-11. `basedpyright` reports four `reportImportCycles` errors on `scripts/build_hold/build_hold.py`. Each chain ends at `scripts/build_queue/placement.py`, which imports `OwningSession` and `NoOwningSession` from `build_hold` (a `TYPE_CHECKING` import and a deferred `__getattr__` class, :9–22). `build_hold.admitted_processes` (:582) imports `admission_service`, which reaches `placement`.
 
 #### Work Order
 
@@ -2270,16 +2270,35 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Spec:**
 
-1. **One owner.** Move `OwningSession` and `NoOwningSession` (`build_hold.py:54`, :59) to a new module `scripts/build_hold/owning_session.py` that imports no repo module.
+1. **One owner.** Move `OwningSession` and `NoOwningSession` (`build_hold.py:54`, :59) to a new module `scripts/build_hold/owning_session.py` that imports no repo module. Each file in Files names these types today (`grep -rln OwningSession scripts docs/as-built`).
 2. **All callers.** Every module that names these types imports them from the new module. `build_hold` keeps no re-export. `placement.py` drops the `TYPE_CHECKING` import, the `_DeferredBuildHold` class and the string alias, and writes `SubmittingSession = OwningSession | NoOwningSession`.
 3. **Proof.** No new test: the type check is the gate. Run the test modules of every changed file.
 4. **Docs.** Update each as-built line that names `build_hold.OwningSession` or the deferred placement import.
 
 **Files:**
-- `scripts/build_hold/owning_session.py` (new)
-- `scripts/build_hold/build_hold.py`, `scripts/build_queue/placement.py`
-- each module and test that imports `OwningSession` or `NoOwningSession` (`grep -rln OwningSession scripts`)
-- `docs/as-built/*.md` lines that name them
+- `scripts/build_hold/owning_session.py`
+- `scripts/build_hold/build_hold.py`
+- `scripts/build_queue/placement.py`
+- `scripts/build_hold/hold_enforcer.py`
+- `scripts/build_queue/admission_service.py`
+- `scripts/build_targets/build_targets.py`
+- `scripts/mac_test/claim_state.py`
+- `scripts/mac_test/mac_test.py`
+- `scripts/mac_test/offload.py`
+- `scripts/agents/test_detached_runs.py`
+- `scripts/build_hold/test_build_hold.py`
+- `scripts/build_hold/test_hold_enforcer.py`
+- `scripts/build_queue/test_placement.py`
+- `scripts/build_targets/test_build_targets.py`
+- `scripts/build_targets/test_ssh_eligibility.py`
+- `scripts/build_targets/test_targets.py`
+- `scripts/copies/test_review_remote_copies.py`
+- `scripts/direct/test_verify_ssh_targets.py`
+- `scripts/mac_test/test_failed_probe_mark.py`
+- `scripts/mac_test/test_process_start_claims.py`
+- `scripts/mac_test/test_target_slots.py`
+- `scripts/mac_test/test_target_state.py`
+- `docs/as-built/build-targets.md`
 
 **Workers:** `1 writer`
 - `impl` owns all files.
