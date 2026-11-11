@@ -173,17 +173,25 @@ done
         self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", FIRST_SESSION))
 
     def test_recorder_failures_retry_without_changing_admission(self) -> None:
-        for command in ("start-wait", "wait-holder"):
+        for command in ("start-wait", "wait-holder", "not-recorded"):
             with self.subTest(command=command):
                 (self.root / "recorder-failed").unlink(missing_ok=True)
+                if command == "not-recorded":
+                    self.environment["CODEX_THREAD_ID"] = fixture_runtime_id("unregistered-wait-worker")
+                previous_rows = len(wait_rows(self.root / "session"))
                 self.run_events([{"events": ["first", 'holder ' + json.dumps({"kind": "session",
                                 "session_id": FIRST_SESSION, "session_name": "render"}),
                                 'holder ' + json.dumps({"kind": "session", "session_id": NEXT_SESSION,
                                 "session_name": "next"}), "done"], "outcome": "Granted", "seconds": 15}], failure=command)
                 self.assertIn("wait history NotRecorded", self.event_errors)
                 rows = wait_rows(self.root / "session")
-                self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", NEXT_SESSION))
-                self.assertEqual(rows[-1]["event_type"], "wait_finished")
+                if command == "not-recorded":
+                    self.assertEqual(self.event_errors.count("NotRecorded"), 1, self.event_errors)
+                    self.assertNotIn("cannot update", self.event_errors)
+                    self.assertEqual([row["event_type"] for row in rows[previous_rows:]], ["wait_not_recorded"])
+                else:
+                    self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", NEXT_SESSION))
+                    self.assertEqual(rows[-1]["event_type"], "wait_finished")
                 self.assertEqual((self.root / "outcomes").read_text().splitlines()[-1], "Granted|15")
 
     def test_memory_rejoin_opens_new_intervals_and_keeps_queue_age(self) -> None:
