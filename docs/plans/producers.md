@@ -109,7 +109,7 @@ dwight=claude:fable:high
 
 **Ruled out:** a producer-only resume, move or restart branch — producers use the shared path, with only family and model from `[producers]`.
 
-### Phase 3a — A group move rerun finishes a producer that exited early  · status: pending
+### Phase 3a — A group move rerun finishes a producer that exited early  · status: done
 
 **Depends on:** Phase 3
 

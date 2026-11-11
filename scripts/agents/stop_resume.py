@@ -15,7 +15,7 @@ import signal
 import sys
 import subprocess
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -66,6 +66,11 @@ if TYPE_CHECKING:
     from scripts.agents.restart import StopReadArguments
     from scripts.herdr import worker_panes
     from scripts.production.staff import StaffRow, StaffSnapshot, ClaudeBackend, CodexBackend, BackendUnavailable, StaffId
+
+
+@dataclass(frozen=True)
+class LiveAccountUnproved(ResumeFailed):
+    """A live process has no readable account evidence."""
 
 
 class RowStarter(Protocol):
@@ -519,16 +524,16 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     row = staff.initial_snapshot().by_member_reference(entry["session_id"])
     if row is not None and isinstance(row.exited, staff.Exited):
         _ = staff.resume(str(row.id))
-    if row is not None and (kind == "codex" or row.kind == "producer"):
+    selected_home = staff.SessionHome(Path(environment["CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"]).absolute())
+    if row is not None and row.home != selected_home:
         try:
-            key = "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"
-            _ = staff.set_home(row.id, staff.SessionHome(Path(environment[key]).absolute()))
+            _ = staff.set_home(row.id, selected_home)
         except (staff.StaffUnreadable, staff.StaffNotFound) as error:
             print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
     try:
         os.execvpe(program, command, staff.child_environment(environment))
     except OSError:
-        if row is not None and (kind == "codex" or row.kind == "producer") and isinstance(row.home, staff.SessionHome):
+        if row is not None and row.home != selected_home and isinstance(row.home, staff.SessionHome):
             _ = staff.set_home(row.id, row.home)
         if row is not None and isinstance(row.exited, staff.Exited):
             _ = staff.set_hold(str(row.id), row.exited)
@@ -599,7 +604,7 @@ def _codex_running_on_account(identity: str, pane_id: str, pid: int) -> ClaudeUp
 
     setting = account.process_codex_home(pid)
     if isinstance(setting, account.ProcessEnvironmentUnread):
-        return ResumeFailed(identity, setting.reason)
+        return LiveAccountUnproved(identity, setting.reason)
     home = setting.home if isinstance(setting, account.ProcessCodexHome) else Path.home() / ".codex"
     return ClaudeUp(identity, pane_id, accounts.codex_home_label(home), start_state=ClaudeStartState.ALREADY_RUNNING, pid=pid)
 
@@ -918,9 +923,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 attempt_pane = tab.pane_id
                 live = _start_session(tab, entry, label, message)
             started = live
-        if row is not None and (kind == "codex" or row.kind == "producer"):
+        selected_home = staff.SessionHome(target_dir.absolute())
+        if row is not None and row.home != selected_home:
             try:
-                _ = staff.set_home(row.id, staff.SessionHome(target_dir.absolute()))
+                _ = staff.set_home(row.id, selected_home)
             except (staff.StaffUnreadable, staff.StaffNotFound) as error:
                 print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
         if original is not None:
@@ -1216,6 +1222,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
         return [MoveHandedOff(identity) for identity in selected]
     began = monotonic()
     already_up: dict[str, ClaudeUp] = {}
+    handoff_failures: dict[str, StopFailed] = {}
     sources: dict[str, str] = dict(source_accounts)
     identities: dict[str, str] = {}
     from scripts.production import staff
@@ -1234,12 +1241,16 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
                 kind = restart.producer_launch(row)[0]
             tab = _tab_of(session)
-            if isinstance(tab, SessionNotFound) and (row is None or row.kind != "producer"):
+            if isinstance(tab, SessionNotFound) and row is None and publication is None:
                 continue
             identity = (tab.session_id or identity) if isinstance(tab, herdr.TabSession) else identity
             pane = tab.pane_id if isinstance(tab, herdr.TabSession) else ""
             identities[session] = identity
             running = running_on_account(identity, pane, kind=kind)
+            if isinstance(running, LiveAccountUnproved):
+                handoff_failures[session] = StopFailed(identity, running.reason)
+            elif isinstance(running, ClaudeUp) and running.account == "unknown account":
+                handoff_failures[session] = StopFailed(identity, "live process account is unreadable")
             if isinstance(running, ClaudeUp):
                 _ = sources.setdefault(session, running.account)
             if isinstance(running, ClaudeUp) and running.account == target:
@@ -1247,9 +1258,8 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 if row is not None and isinstance(running.pid, int):
                     member_account.repair_home(row, kind, running.pid)
         except (OSError, ValueError, herdr_types.HerdrFailure):
-            pass  # The per-session stop below returns the read failure without affecting other members.
-    _record_launches([session for session in selected if session not in already_up])
-    handoff_failures: dict[str, StopFailed] = {}
+            pass  # The stop returns the read failure for this member.
+    _record_launches([session for session in selected if session not in already_up and session not in handoff_failures])
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if caller:
         try:

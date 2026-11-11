@@ -1084,7 +1084,11 @@ class RestartTests(RestartTestCase):
         raise AssertionError(arguments)
 
     def liveness(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-        return sessions.LiveSessionProcess(123) if identity in self.running else sessions.SessionNotLive()
+        if identity in self.running:
+            for index, row in enumerate(self.rows):
+                if row.current_session == identity:
+                    return sessions.LiveSessionProcess(990100 + index)
+        return sessions.SessionNotLive()
 
     def panes(self) -> list[herdr.PaneIdentity]:
         return [{"pane_id": f"w1:p{n}", "workspace_id": "w1", "session_id": row.current_session,
@@ -1406,7 +1410,7 @@ class RestartTests(RestartTestCase):
         for kind in ("claude", "codex"):
             for state in ("live", "stopped", "unknown"):
                 with self.subTest(kind=kind, state=state):
-                    observed = (herdr.LiveConversation(kind, (123,)) if state == "live" else
+                    observed = (herdr.LiveConversation(kind, (990100,)) if state == "live" else
                                 herdr.UnknownConversation("test-tab (conversation unknown)") if state == "unknown" else
                                 herdr.StoppedConversation())
                     with (patch.object(herdr, "read_conversation", return_value=observed),
@@ -1512,7 +1516,7 @@ class RestartTests(RestartTestCase):
                                 (["codex", "app-server", "--listen", "ws://127.0.0.1:1234"], True)):
             with (self.subTest(arguments=arguments),
                   patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
-                  patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({str(row.current_session): (123,)} if live else {}, ())),
+                  patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({str(row.current_session): (990100,)} if live else {}, ())),
                   patch.object(herdr, "launch_prepared_agent") as launch,
                   redirect_stdout(io.StringIO()) as output):
                 self.assertEqual(restart.live_rows(staff.StaffSnapshot((row,)), herdr.Herdr("agents")), [row] if live else [])
@@ -2076,6 +2080,11 @@ class RestartTests(RestartTestCase):
                 def close_source(pane: str) -> bool:
                     source_client.close_tab_of(pane)
                     return True
+                def close_destination(pane: str) -> bool:
+                    if scenario != "source unavailable":
+                        return False
+                    client.close_tab_of(pane)
+                    return True
                 source_scope = (patch.object(source_client, "panes", return_value=[{
                     "pane_id": "old", "workspace_id": "old-space", "terminal_id": "old-terminal", "session_id": None}])
                     if cross else nullcontext())
@@ -2086,7 +2095,7 @@ class RestartTests(RestartTestCase):
                       patch.object(herdr, "Herdr", side_effect=client_for), source_scope,
                       patch.object(client, "panes", side_effect=panes),
                       patch.object(client, "pane_activity", side_effect=activity),
-                      patch.object(client, "close_tab_confirmed", return_value=False),
+                      patch.object(client, "close_tab_confirmed", side_effect=close_destination) as destination_close,
                       (patch.object(source_client, "close_tab_confirmed", side_effect=close_source)
                        if cross else nullcontext()),
                       patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(folder, {})),
@@ -2110,6 +2119,7 @@ class RestartTests(RestartTestCase):
                         self.assertEqual(source_client.closed, ["old"])
                     if scenario == "source unavailable":
                         self.assertEqual(source_client.closed, [])
+                        destination_close.assert_not_called()
 
     def test_held_sessions_saves_live_rows_and_tabs_and_keeps_pending_rows(self) -> None:
         shutdown_record.save(["earlier"])

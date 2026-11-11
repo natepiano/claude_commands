@@ -648,15 +648,32 @@ class AccountsTests(unittest.TestCase):
         registry = write_registry(self.root / "producer-models.conf", {"producers": {
             "producer-claude": "claude:opus:max", "producer-codex": "codex:gpt-test:high"}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
-        cases: tuple[tuple[staff.Kind, accounts.ClaudeGroup, str, str], ...] = (
-            ("unit", "units", "claude", ""), ("producer", "showrunners", "claude", ""),
-            ("producer", "showrunners", "codex", ""),
-            ("unit", "units", "claude", "live"), ("producer", "showrunners", "claude", "live"),
-            ("unit", "units", "claude", "stopped"), ("producer", "showrunners", "claude", "stopped"))
-        for kind, group, family, missing_settings in cases:
-            with self.subTest(kind=kind, family=family, missing_settings=missing_settings):
+        cases: tuple[tuple[staff.Kind, accounts.ClaudeGroup, str, str, str], ...] = (
+            ("unit", "units", "claude", "", ""), ("producer", "showrunners", "claude", "", ""),
+            ("producer", "showrunners", "codex", "", ""),
+            ("unit", "units", "claude", "live", ""), ("producer", "showrunners", "claude", "live", ""),
+            ("unit", "units", "claude", "stopped", ""), ("producer", "showrunners", "claude", "stopped", ""),
+            ("unit", "units", "claude", "", "paused"),
+            ("showrunner", "showrunners", "claude", "", "paused"),
+            ("unit", "units", "claude", "", "wrapped"),
+            ("showrunner", "showrunners", "claude", "", "retired"),
+            ("unit", "units", "claude", "", "remote document"),
+            ("showrunner", "showrunners", "claude", "", "remote worktree"),
+            ("producer", "showrunners", "claude", "", "paused"))
+        for kind, group, family, missing_settings, state in cases:
+            with self.subTest(kind=kind, family=family, missing_settings=missing_settings, state=state):
                 member = (unit_membership("fixture", "models") if kind == "unit" else
-                    fixture_member("producer", name="producer-" + family))
+                    fixture_member(kind, name=kind + "-" + family))
+                if state == "paused":
+                    member = replace(member, paused=staff.Paused("now", "user", "hold"))
+                elif state == "wrapped":
+                    member = replace(member, doc=staff.WrappedDoc("natedev", self.root / "plan.md"))
+                elif state == "retired":
+                    member = replace(member, worktree=staff.RemovedWorktree("natedev", self.root))
+                elif state == "remote document":
+                    member = replace(member, doc=staff.LiveDoc("mac", self.root / "plan.md"))
+                elif state == "remote worktree":
+                    member = replace(member, worktree=staff.PresentWorktree("mac", self.root))
                 accounts.groups_file().unlink(missing_ok=True)
                 _ = accounts.set_group_account(group, "claude2", why="fixture")
                 records = self.root / "member-launches"
@@ -685,6 +702,10 @@ class AccountsTests(unittest.TestCase):
                     reading = accounts.read_status(source=accounts.StoredUsageOnly())
                     with redirect_stderr(io.StringIO()) as errors:
                         result = accounts.move_group(group, "claude2", dry_run=True)
+                    unproved = result
+                    if state:
+                        with patch.object(accounts, "_session_config_dir", return_value=account.ProcessEnvironmentUnread("fixture")):
+                            unproved = accounts.move_group(group, "claude2", dry_run=True)
                 if missing_settings:
                     self.assertEqual(len(errors.getvalue().splitlines()), 1)
                     self.assertIn("missing-settings-producer", errors.getvalue())
@@ -694,13 +715,23 @@ class AccountsTests(unittest.TestCase):
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
                 rows = {row["label"]: row for row in document["accounts"]}
                 self.assertEqual(rows["claude4"]["roles"], [group] if family == "claude" else [])
-                self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}] if family == "claude" else [])
+                if state == "paused":
+                    self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 0, "paused": 1, "exited": 0, "idle": 0, "total": 1}])
+                else:
+                    self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}] if family == "claude" else [])
                 self.assertEqual(rows["claude2"]["role_counts"], [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
                 self.assertIsInstance(result, accounts.GroupMoveDryRun)
                 assert isinstance(result, accounts.GroupMoveDryRun)
-                self.assertEqual(result.session_ids, (member.current_session,) if family == "claude" else ())
-                if family == "claude":
+                if kind == "producer" and state == "paused":
+                    self.assertEqual(result.session_ids, ())
+                else:
+                    self.assertEqual(result.session_ids, (member.current_session,) if family == "claude" else ())
+                if family == "claude" and not (kind == "producer" and state == "paused"):
                     self.assertIn(f"{member.name}: {member.current_session} · stop, then resume on claude2 (from claude4)", result.lines)
+                if state:
+                    self.assertIsInstance(unproved, accounts.GroupMoveDryRun)
+                    assert isinstance(unproved, accounts.GroupMoveDryRun)
+                    self.assertEqual(unproved.session_ids, result.session_ids)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
