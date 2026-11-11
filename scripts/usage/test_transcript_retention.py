@@ -1,5 +1,6 @@
 """Apply age bands without changing staff transcripts or summaries."""
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import io
 import os
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import compress_transcript, open_transcript
+from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.usage import transcript_retention as retention
 
@@ -48,7 +50,8 @@ class RetentionTests(StaffTestCase):
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                member = fixture_member("showrunner", name="retention-fixture")
+                owner = fixture_member("showrunner", name="retention-owner")
+                member = fixture_member("unit", name="retention-fixture", parent=owner.id)
                 content = b'{"message":"retained output"}\n' * 100
                 cases = (("recent.jsonl", 13), ("compress.jsonl", 14), ("delete.jsonl", 61),
                          (str(member.current_session) + ".jsonl", 80), ("compressed-old.jsonl", 70),
@@ -65,8 +68,8 @@ class RetentionTests(StaffTestCase):
                 with redirect_stdout(io.StringIO()) as output:
                     totals = retention.retain_root(root, policy, retention.retained_sessions(), now,
                                                    dry_run=dry_run, finalize=retention.unchanged_summary, files=True)
-                self.assertEqual((totals.compressed, totals.deleted, totals.skipped), (1, 2, 3))
-                self.assertEqual(totals.freed, 2 * len(content))
+                self.assertEqual((totals.compressed, totals.deleted, totals.skipped), (1, 3, 2))
+                self.assertEqual(totals.freed, 3 * len(content))
                 self.assertIn("bytes", output.getvalue())
                 self.assertEqual(paths["recent.jsonl"].read_bytes(), content)
                 self.assertEqual(paths[str(member.current_session) + ".jsonl"].read_bytes(), content)
@@ -76,6 +79,7 @@ class RetentionTests(StaffTestCase):
                 else:
                     self.assertFalse(paths["delete.jsonl"].exists())
                     self.assertFalse(paths["compressed-old.jsonl"].exists())
+                    self.assertFalse(paths[f"{member.current_session}/subagents/agent-test.jsonl"].exists())
                     plain = paths["compress.jsonl"]
                     compressed = plain.with_suffix(".jsonl.zst")
                     self.assertFalse(plain.exists())
@@ -83,6 +87,47 @@ class RetentionTests(StaffTestCase):
                     self.assertEqual(compressed.stat().st_mode & 0o777, 0o640)
                     with open_transcript(compressed) as stream:
                         self.assertEqual(stream.read(), content)
+
+    def test_only_main_transcripts_of_recorded_staff_stay_plain_at_any_age(self) -> None:
+        now = datetime(2026, 11, 11, tzinfo=timezone.utc)
+        owner = fixture_member("showrunner", name="fixture-owner")
+        unit = fixture_member("unit", name="live-unit", parent=owner.id)
+        retired = replace(fixture_member("unit", name="retired-unit", parent=owner.id),
+                          worktree=staff.RemovedWorktree("natedev", self.root / "removed"))
+        runner = replace(fixture_member("showrunner", name="retired-runner"),
+                         doc=staff.WrappedDoc("natedev", self.root / "wrapped.md"))
+        producer = fixture_member("producer", name="live-producer")
+        worker = fixture_member("worker", name="worker", parent=unit.id)
+        absent = fixture_member("unit", name="absent-unit", parent=owner.id)
+        record = staff.StaffSnapshot((unit, retired, runner, producer, worker))
+        cases = (
+            (unit, "main", 80, True),
+            (retired, "main", 80, True),
+            (retired, "archive", 80, True),
+            (runner, "main", 80, True),
+            (producer, "main", 80, True),
+            (absent, "main", 80, False),
+            (unit, "subagent", 35, False),
+            (worker, "rollout", 35, False),
+            (worker, "rollout", 1, False),
+        )
+        with patch.object(staff, "local_snapshot", return_value=record):
+            retained = retention.retained_sessions()
+        for index, (row, form, days, kept) in enumerate(cases):
+            with self.subTest(kind=row.kind, form=form, days=days):
+                root = self.root / f"case-{index}"
+                name = (f"{row.current_session}/subagents/agent-test.jsonl" if form == "subagent"
+                        else f"rollout-2026-11-01-{row.current_session}.jsonl" if form == "rollout"
+                        else f"{row.current_session}.jsonl")
+                path = write_transcript(root / name, b"transcript\n", days, now)
+                if form == "archive":
+                    path = compressed_copy(path)
+                totals = retention.RetentionTotals(root)
+                candidates = retention.retention_candidates(root, retention.read_policy(), retained, now, totals)
+                self.assertEqual(totals.skipped, int(kept))
+                self.assertEqual(dict(totals.kept), {row.kind: 1} if kept else {})
+                self.assertEqual([item.path for item in candidates],
+                                 [] if kept or days < 14 else [path])
 
     def test_policy_and_roots_come_from_scratch_configuration_and_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -100,6 +145,8 @@ class RetentionTests(StaffTestCase):
     def test_default_and_files_output_for_real_and_dry_runs(self) -> None:
         now = datetime.now(timezone.utc)
         member = fixture_member("showrunner", name="output-fixture")
+        unit = fixture_member("unit", name="output-unit", parent=member.id)
+        producer = fixture_member("producer", name="output-producer")
         for dry_run in (True, False):
             for files in (False, True):
                 with (self.subTest(dry_run=dry_run, files=files),
@@ -107,7 +154,8 @@ class RetentionTests(StaffTestCase):
                     root = Path(directory)
                     plain = write_transcript(root / "compress.jsonl", b"repeated message\n" * 100, 20, now)
                     deleted = write_transcript(root / "delete.jsonl", b"expired\n", 80, now)
-                    _ = write_transcript(root / f"{member.current_session}.jsonl", b"staff\n", 80, now)
+                    for row in (member, unit, producer):
+                        _ = write_transcript(root / f"{row.current_session}.jsonl", b"staff\n", 80, now)
                     with (patch.object(retention, "transcript_roots", return_value=[root]),
                           redirect_stdout(io.StringIO()) as output):
                         self.assertEqual(retention.main([
@@ -116,8 +164,9 @@ class RetentionTests(StaffTestCase):
                     deleted_word = "would delete" if dry_run else "deleted"
                     free_word = "would free about" if dry_run else "freed"
                     counts = (f"{compressed_word} 1 files; {deleted_word} 1 files; "
-                              + f"1 staff files skipped; {free_word} 0.00 GB")
+                              + f"3 staff files skipped; {free_word} 0.00 GB")
                     lines = output.getvalue().splitlines()
+                    self.assertEqual(lines.pop(), "kept plain: 1 showrunner, 1 producer, 1 unit")
                     self.assertEqual(lines[-2:], [f"{root}: {counts}", f"total: {counts}"])
                     if not dry_run:
                         self.assertEqual(lines.pop(0), f"{root}: compressing 1 files, deleting 1 files")
@@ -141,7 +190,7 @@ class RetentionTests(StaffTestCase):
                 with tempfile.TemporaryFile() as output:
                     compressed_size = compress_transcript(plain, output)
                 with redirect_stdout(io.StringIO()) as output:
-                    totals = retention.retain_root(root, retention.read_policy(), frozenset(), now,
+                    totals = retention.retain_root(root, retention.read_policy(), {}, now,
                                                    dry_run=dry_run, finalize=retention.unchanged_summary, files=True)
                 self.assertEqual((totals.compressed, totals.deleted), (1, 0))
                 self.assertEqual(totals.freed, len(content) + len(before[archive][0]) - compressed_size)
@@ -168,7 +217,7 @@ class RetentionTests(StaffTestCase):
 
         with (patch.object(retention, "compress_transcript", side_effect=compress),
               redirect_stdout(io.StringIO())):
-            totals = retention.retain_root(plain.parent, retention.read_policy(), frozenset(), now,
+            totals = retention.retain_root(plain.parent, retention.read_policy(), {}, now,
                                            dry_run=False, finalize=retention.unchanged_summary)
         self.assertEqual((totals.compressed, totals.deleted), (1, 0))
         self.assertEqual(totals.freed, len(content) + len(updated_archive) - archive.stat().st_size)
@@ -186,7 +235,7 @@ class RetentionTests(StaffTestCase):
                 return compress_transcript(path, output)
 
             with patch.object(retention, "compress_transcript", side_effect=compress):
-                _ = retention.retain_root(plain.parent, retention.read_policy(), frozenset(), now,
+                _ = retention.retain_root(plain.parent, retention.read_policy(), {}, now,
                                           dry_run=False, finalize=retention.unchanged_summary)
 
     def test_real_run_skips_candidates_changed_after_collection(self) -> None:
@@ -199,7 +248,7 @@ class RetentionTests(StaffTestCase):
                     saved = path.stat()
 
                     def changed_candidates(root: Path, policy: retention.RetentionPolicy,
-                                           retained: frozenset[str], at: datetime,
+                                           retained: dict[str, retention.StaffKeepRule], at: datetime,
                                            totals: retention.RetentionTotals
                                            ) -> list[retention.DeletionCandidate | retention.CompressionCandidate]:
                         candidates = collect(root, policy, retained, at, totals)
@@ -217,7 +266,7 @@ class RetentionTests(StaffTestCase):
                           patch.object(retention, "compress_transcript") as compressor,
                           patch.object(retention, "unchanged_summary") as finalize,
                           redirect_stdout(io.StringIO())):
-                        totals = retention.retain_root(path.parent, retention.read_policy(), frozenset(), now,
+                        totals = retention.retain_root(path.parent, retention.read_policy(), {}, now,
                                                        dry_run=False, finalize=finalize)
                     self.assertEqual((totals.compressed, totals.deleted, totals.freed), (0, 0, 0))
                     compressor.assert_not_called()
@@ -256,7 +305,7 @@ class RetentionTests(StaffTestCase):
         with (patch.object(retention, "compress_transcript", side_effect=sample) as compressor,
               patch.object(retention, "unchanged_summary") as finalize,
               redirect_stdout(io.StringIO()) as output):
-            totals = retention.retain_root(root, policy, frozenset(), now,
+            totals = retention.retain_root(root, policy, {}, now,
                                            dry_run=True, finalize=finalize, files=True)
         self.assertEqual(samples, [content[:128] for content in contents[:2]])
         self.assertEqual(compressor.call_count, 2)
@@ -273,7 +322,7 @@ class RetentionTests(StaffTestCase):
         now = datetime.now(timezone.utc)
         path = write_transcript(self.root / "transcripts/delete.jsonl", b"old" * 37, 80, now)
         with patch.object(retention, "compress_transcript") as compressor:
-            totals = retention.retain_root(path.parent, retention.read_policy(), frozenset(), now,
+            totals = retention.retain_root(path.parent, retention.read_policy(), {}, now,
                                            dry_run=True, finalize=retention.unchanged_summary)
         self.assertEqual(totals.freed, 111)
         self.assertEqual(path.read_bytes(), b"old" * 37)
@@ -298,6 +347,7 @@ class RetentionTests(StaffTestCase):
             *(f"{root}: would compress 0 files; would delete 1 files; 0 staff files skipped; would free about 0.00 GB"
               for root in roots),
             "total: would compress 0 files; would delete 2 files; 0 staff files skipped; would free about 0.00 GB",
+            "kept plain: 0 showrunner, 0 producer, 0 unit",
         ])
 
     def test_sample_limits_refuse_nonpositive_values(self) -> None:

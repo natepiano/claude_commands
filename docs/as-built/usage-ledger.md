@@ -491,13 +491,21 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
 
 `scripts/usage/transcript_retention.py` acts only on this machine.
 `config/transcript_retention.conf` sets `compress_after_days` to 14 and `delete_after_days` to 60.
-The command uses file mtime and skips every session that the local staff record names.
-It also skips subagents under those sessions.
+The command uses file mtime for the age rules.
+Only main transcripts of local staff rows of kind `showrunner`, `producer`, or `unit` have a keep rule.
+Live and retired rows keep their main transcript, regardless of its age.
+The staff record has no retirement timestamp.
+A retired row's main transcript stays plain while the row stays in the record.
+A cut for rows retired more than four weeks waits for a retirement time in the staff record.
+When the staff record no longer holds the row, its transcripts follow the age rule.
+A main transcript is `<current_session>.jsonl`, its `.zst` form, or a Codex rollout whose name ends with that session id.
+Subagent files under a session folder and worker transcripts follow the age rule.
 Compression writes a neighboring `.jsonl.zst`, preserves mtime and permissions, then removes the plain file.
 Deletion removes either form after the second age limit.
 A real run prints a flushed start line for each root with its compression and deletion counts.
 Each run prints one summary per transcript root and one total line.
 Each summary gives compression, deletion, and staff skip counts, plus freed GB with two decimals.
+Dry runs and real runs also print `kept plain` counts by staff kind.
 `--files` also prints each file action.
 `--dry-run` reports "would compress", "would delete", and "would free about" without changing transcripts or the summary cache.
 The dry run estimates compression savings from bounded samples instead of compressing every candidate.
@@ -513,7 +521,8 @@ The screenshot report sends the same reader source to the Mac.
 The hana_shot report reads timing records rather than transcripts and needs no change.
 `usage/rollouts.py` already parses supplied streams and needs no reader change.
 Model-study reports, usage outcomes, and screenshot episode reports read saved measurements and need no transcript change.
-Active hooks, `production/worker_admission.py`, and worker lifecycle readers retain plain reads because the staff skip protects their resumable sessions.
+Active hooks, `production/worker_admission.py`, and worker lifecycle readers retain plain reads.
+Recent worker transcripts stay plain through the age rule.
 `message/sessions.py` and `message/rca.py` locate active sessions and do not parse historical transcripts.
 `shot_report/transcripts.py` retains `rg` only for plain-file candidate selection; its archive selection and parsing use the shared reader.
 `nightly_review` sends selected paths to the reply review subprocess, which uses the shared reader.
