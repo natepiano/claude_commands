@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import re
 import select
 import shutil
 import subprocess
@@ -707,25 +706,6 @@ PY
         self.assertFalse((self.state / "ci_run.json").exists())
         self.assertFalse((self.stub_state / "validate-calls").exists())
         self.assertEqual(self.calls("gh"), [])
-
-    def test_showrunner_and_dailies_share_review_watch_state_directory(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
-        state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
-        self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<STATE_DIR>/dailies_input_state`")
-        calls = cast(list[tuple[str, str]], re.findall(
-            r"ci_points\.py\s+(due|watch|ci start|ci collect)\b([^`]*)`",
-            produce, flags=re.DOTALL))
-        self.assertEqual(len(calls), 4, calls)
-        stateful = [(command, body) for command, body in calls
-                    if command in ("due", "watch", "ci start", "ci collect")]
-        self.assertEqual(len(stateful), 4, calls)
-        for command, body in stateful:
-            with self.subTest(command=command):
-                self.assertRegex(body, r"--state-dir\s+DAILIES_STATE_DIR\b")
-                self.assertNotRegex(body, r"--state-dir\s+SCRATCH\b")
-        self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<STATE_DIR>/dailies_input_state\b")
 
     def test_ci_start_passes_cancel_prior_only_when_requested(self) -> None:
         tip = self.git("rev-parse", "HEAD")

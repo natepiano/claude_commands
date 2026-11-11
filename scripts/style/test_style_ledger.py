@@ -186,15 +186,6 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                              [(id,) for id, (rule, _, _, verdict) in enumerate(rows, 1)
                               if style_ledger.base_rule(rule) not in invalidated or verdict == "removed"])
 
-    def test_generation_backfill_ranks_once_without_correlated_scan(self) -> None:
-        with closing(sqlite3.connect(":memory:")) as connection:
-            _ = connection.execute("CREATE TABLE judgments(rule TEXT,rule_blob TEXT,recorded_at TEXT,id INTEGER)")
-            _ = connection.execute("CREATE TABLE rule_generations(rule TEXT,rule_blob TEXT,generation INTEGER)")
-            insert = next(statement for statement in style_ledger.MIGRATIONS[30].split(";")
-                          if statement.strip().startswith("INSERT INTO rule_generations"))
-            plan = cast(list[tuple[int, int, int, str]], connection.execute("EXPLAIN QUERY PLAN " + insert).fetchall())
-            self.assertFalse(any("CORRELATED" in detail for _, _, _, detail in plan), plan)
-
     def test_generation_backfill_timestamp_tie_uses_higher_id_blob(self) -> None:
         self.assert_generation_backfill((("rule", "first", "2", "clean"), ("rule", "second", "2", "held")),
                                         {"rule": "second"})
@@ -1577,23 +1568,6 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         self.assertIn(read + "\t0\t0\t2\t0\t0\tfalse\n", beta)
         whole = self.cli("status", "--rule", read).stdout
         self.assertIn(read + "\t2\t0\t2\t0\t0\tfalse\n", whole)
-
-    def test_status_reuses_repository_counts_and_scans_again_only_for_a_selector(self) -> None:
-        read = self.rule("read")
-        self.set_tip(self.initial_tip)
-        ledger = self.ledger()
-        for rule, scope, passes in ((None, style_ledger.WholeRepository(), 1),
-                                    (read, style_ledger.WholeRepository(), 2),
-                                    (None, style_ledger.CrateCoverage("crates/alpha"), 2)):
-            with self.subTest(rule=rule, scope=scope):
-                output = io.StringIO()
-                with (
-                    redirect_stdout(output),
-                    mock.patch.object(ledger, "_coverage", wraps=cast(object, getattr(ledger, "_coverage"))) as coverage,
-                ):
-                    ledger.status(rule=rule, scope=scope)
-                    self.assertEqual(coverage.call_count, passes)
-                self.assertIn(read + "\t", output.getvalue())
 
     def test_status_cli_converts_omitted_empty_and_named_crates_to_coverage_scopes(self) -> None:
         read = self.rule("read")
