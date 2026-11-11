@@ -2251,51 +2251,18 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 106 — The hold module has no import cycle  · status: done
 
-**Depends on:** Phase 104 (it changes `scripts/build_hold/build_hold.py`); done.
+#### As-built
 
-**Source:** builds 2026-11-11. `basedpyright` reports four `reportImportCycles` errors on `scripts/build_hold/build_hold.py`. Each chain ends at `scripts/build_queue/placement.py`, which imports `OwningSession` and `NoOwningSession` from `build_hold` (a `TYPE_CHECKING` import and a deferred `__getattr__` class, :9–22). `build_hold.admitted_processes` (:582) imports `admission_service`, which reaches `placement`.
-
-#### Work Order
-
-**Goal:** `basedpyright` reports zero errors on `scripts/build_hold/build_hold.py` and on `scripts/build_queue/placement.py`.
-
-**Spec:**
-
-1. **One owner.** Move `OwningSession` and `NoOwningSession` (`build_hold.py:54`, :59) to a new module `scripts/build_hold/owning_session.py` that imports no repo module. Each file in Files names these types today (`grep -rln OwningSession scripts docs/as-built`).
-2. **All callers.** Every module that names these types imports them from the new module. `build_hold` keeps no re-export. `placement.py` drops the `TYPE_CHECKING` import, the `_DeferredBuildHold` class and the string alias, and writes `SubmittingSession = OwningSession | NoOwningSession`.
-3. **Proof.** No new test: the type check is the gate. Run the test modules of every changed file.
-4. **Docs.** Update each as-built line that names `build_hold.OwningSession` or the deferred placement import.
-5. **The grant reader.** After the type move, four cycles remain, each through `build_hold.admitted_processes` (:573), which imports `admission_service`. Move `admitted_processes` to `scripts/build_hold/hold_enforcer.py`, keeping its import of `admission_service` inside the function. `hold_enforcer` calls its own copy. `build_hold.audit_builds` reads it through `hold_enforcer()`; add it to the `HoldEnforcer` protocol. `build_hold` keeps no import of `admission_service`. Update `docs/as-built/build-memory-admission.md` (:341).
+- `scripts/build_hold/owning_session.py` owns `OwningSession(session_id: str)` and `NoOwningSession`. It imports no repository module. Every caller imports the types from it; `build_hold` keeps no re-export.
+- `placement.SubmittingSession` and `claim_state.SubmittingSession` are `OwningSession | NoOwningSession`, imported at run time. `placement.py` has no deferred import class.
+- `hold_enforcer.admitted_processes() -> frozenset[ProcessIdentity]` reads the durable grants. It imports `admission_service` inside the function. `build_hold.audit_builds` reads it through `hold_enforcer()`, and the `HoldEnforcer` protocol names it.
+- `build_hold` does not import `admission_service`. `basedpyright` reports no import cycle over the hold, queue, target and Mac test modules.
 
 **Files:**
-- `scripts/build_hold/owning_session.py`
-- `scripts/build_hold/build_hold.py`
-- `scripts/build_queue/placement.py`
-- `scripts/build_hold/hold_enforcer.py`
-- `scripts/build_queue/admission_service.py`
-- `scripts/build_targets/build_targets.py`
-- `scripts/mac_test/claim_state.py`
-- `scripts/mac_test/mac_test.py`
-- `scripts/mac_test/offload.py`
-- `scripts/agents/test_detached_runs.py`
-- `scripts/build_hold/test_build_hold.py`
-- `scripts/build_hold/test_hold_enforcer.py`
-- `scripts/build_queue/test_placement.py`
-- `scripts/build_targets/test_build_targets.py`
-- `scripts/build_targets/test_ssh_eligibility.py`
-- `scripts/build_targets/test_targets.py`
-- `scripts/copies/test_review_remote_copies.py`
-- `scripts/direct/test_verify_ssh_targets.py`
-- `scripts/mac_test/test_failed_probe_mark.py`
-- `scripts/mac_test/test_process_start_claims.py`
-- `scripts/mac_test/test_target_slots.py`
-- `scripts/mac_test/test_target_state.py`
-- `docs/as-built/build-targets.md`
-- `docs/as-built/build-memory-admission.md`
+- `scripts/build_hold/owning_session.py` — the two session types.
+- `scripts/build_hold/build_hold.py` — imports the types as `session_owner` because its own function is named `owning_session`.
+- `scripts/build_hold/hold_enforcer.py` — `admitted_processes`.
+- `scripts/build_queue/placement.py`, `scripts/build_queue/admission_service.py`, `scripts/build_targets/build_targets.py`, `scripts/mac_test/claim_state.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — import the types from the new module.
+- `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md` — the type owner and the grant reader.
 
-**Workers:** `1 writer`
-- `impl` owns all files.
-
-**Gate:** the targeted test; `basedpyright` 0 errors and 0 warnings on every changed file.
-
-**Change-Review:** none — the type check changes; nothing visible changes.
+**Gotchas:** tests patch `hold_enforcer.admitted_processes`, not `build_hold.admitted_processes`. `basedpyright` counts an import inside a function as a cycle edge, so an import of `admission_service` anywhere in `build_hold` makes the cycles again.
