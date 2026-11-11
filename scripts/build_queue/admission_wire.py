@@ -189,6 +189,7 @@ class PrioritySetRequest(CallerCode):
 class PriorityClearRequest(CallerCode):
     request_id: str
     actor: str
+    unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -318,6 +319,9 @@ def _read_wire_record(record: dict[str, object]) -> dict[str, object]:
     # Phase 33: older clients sent ShapeP90 with a fixed ten-percent share.
     if record.get("kind") == "ShapeP90":
         return {**record, "kind": "ShapeRankedPeak", "share_percent": 10}
+    priority = record.get("priority")
+    if isinstance(priority, dict):
+        record["priority"] = records.upgrade_queue_priority(cast(dict[str, object], priority))
     return record
 
 
@@ -336,6 +340,8 @@ def _write_wire_record(value: object) -> object:
 
 def parse_record(text: str, schema: type[T]) -> T:
     value = cast(object, json.loads(text, object_hook=_read_wire_record))
+    if getattr(schema, "__name__", "") == "QueuePriority" and isinstance(value, dict):
+        value = records.upgrade_queue_priority(cast(dict[str, object], value))
     return _parse_value(value, schema)
 
 

@@ -554,8 +554,8 @@ def priority_set(unit: str, why: str, actor: str) -> wire.Ok | wire.Refused:
     return _mutation(wire.PrioritySetRequest(uuid.uuid4().hex, unit, why, actor))
 
 
-def priority_clear(actor: str) -> wire.Ok | wire.Refused:
-    return _mutation(wire.PriorityClearRequest(uuid.uuid4().hex, actor))
+def priority_clear(actor: str, unit: str = "") -> wire.Ok | wire.Refused:
+    return _mutation(wire.PriorityClearRequest(uuid.uuid4().hex, actor, unit))
 
 
 def token_wait(reservation: str, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:

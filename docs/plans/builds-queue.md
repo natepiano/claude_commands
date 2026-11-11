@@ -122,7 +122,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 
 #### As-built
 
-- There is no set budget. Room = free memory now − `safety_gib` (3) − the keep-aside of every running run − the CI keep-aside. A run starts when its need fits the room, pressure is calm and it is its turn. 10t's budget controller (`budget.py`, `budget_replay.py`) and 10y's backfill and strict windows are deleted; neither landed alone.
+- There is no set budget. Room = free memory now − `safety_gib` (3) − the keep-aside of every running run. A hana CI job takes no fixed margin (resources Phase 88, 9fb57973c): a registered job is charged through its reservation, and an unregistered job counts once in the cap. A run starts when its need fits the room, pressure is calm and it is its turn. 10t's budget controller (`budget.py`, `budget_replay.py`) and 10y's backfill and strict windows are deleted; neither landed alone.
 - An admitted step keeps its accepted need for its whole life. Its keep-aside is max(0, need − anonymous use). A nextest step in an observed test phase uses its frozen need, max(test peak, history N × `test_phase_margin`). Need is never cut to a limit.
 - Order: bumped first, then the time the run first joined, then pid. A younger run starts only when its need fits room minus the first run's need. When no run of ours is admitted, no slot is held and pressure is calm, the first run starts even if it does not fit. Idle CI rows and unowned scopes are not runs of ours.
 - Pressure (full avg10 > 5, or swap > 85% with some avg10 > 25) holds starts while it lasts. An unreadable reading also holds starts. The head line then says "pressure unreadable: <path>", and after `reading_alert_seconds` one message goes to the natedev session. The alert clears when readings return.
@@ -1963,8 +1963,7 @@ A root-owned service stops and starts only by the user or under a sudo rule that
 8. Correct accounting and Machine labels ship with each converted path.
    Phase 46 cannot defer these corrections.
 9. Phase 44b (on builds before this checkpoint) made `build_targets.hold_waited_on` skip a hold whose keep list holds the caller or an ancestor. It reads that lineage from `os.getpid()`.
-   The admission service calls it for a requester (`admission_service._read_host_evidence`), so it reads the service's lineage. Merge builds, then pass the checked requesting process's lineage, with semantic confirmed and unavailable states.
-   Include the requesting process identity in the cached hold decision. Test a kept descendant, an unrelated caller of the same session, a reused pid, and two holds.
+   The admission service calls it for a requester (`admission_service._read_host_evidence`), so it reads the service's lineage. Phase 44c repairs this on the merged tree, and the two phases deploy together.
 
 9. These files are read only in this phase: `admission_code.py`, `claim_state.py`, `copies.py`, `linux_runner.py`, `target_config.py`, `store.py` and `config/`.
    `claim_state.py` keeps its stored claim shape.
@@ -2066,6 +2065,153 @@ Contact no live service, session, Mac, or AWS account.
 32. **Caller coverage:** Exercise test, check, build, doc, example, lint, and `final` through converted paths.
     Exercise direct offload and fixed local shared lint callers.
 
+### Phase 44c — The queue service lets a run that a drain keeps pass the hold  · status: todo
+**Depends on:** 44 and 44b (44b is on builds and main at b09bc83ae). It lands with Phase 44 in one deploy: the showrunner holds the Phase 44 merge until this phase is ready. Found by the 44b architect review, 2026-11-10.
+
+#### Work Order
+
+**Goal:** A run that a hold keeps (a working run the drain keeps, or a `--keep <pid>`) and its children get a local placement from the admission service while the hold is in force. Another run of the same session still waits.
+
+**Spec:**
+
+1. **Merge first.** Merge builds (with 44b) into the Phase 44 branch at the Phase 44 checkpoint. 44b's `build_targets.hold_waited_on(holds, owner, directory)` reads the keep lineage from `build_hold.caller_processes(build_hold.PROC_ROOT, os.getpid())`.
+2. **The requester's lineage, not the service's.** `admission_service._read_host_evidence` calls `hold_waited_on` for a local destination inside the service, so it reads the service's lineage. Give `hold_waited_on` the caller lineage as an argument of a semantic type: a confirmed lineage, or an unavailable lineage with its reason. `caller_waits_on_hold` passes the current process's lineage. The service passes the lineage of the checked requesting process, `PlacementRequest.owner` (`placement.SubmittingOwner(host, pid, start_time)`), read only when the start time still matches.
+3. **Unavailable lineage.** When the requester's lineage cannot be read or its start time differs, no keep list applies: a hold of another session blocks, as for a caller that no hold keeps. Do not treat an unavailable lineage as kept.
+4. **One decision per process.** `placement.HostEvidenceKey` caches host evidence per session. Add the requesting process identity to the key of a local hold decision, so two processes of one session never share a keep decision.
+5. **Docs.** In `docs/plans/builds-queue-placement.md` (adapter table, section 8), replace `build_targets.py::caller_holds_only_own` with `caller_waits_on_hold`.
+6. **Drain wording.** With `--drain`, the hold text says that the drain stops waiting runs. Today the banner (`build_hold.py:880`, "verify.sh waits by itself") and the audit line (`hold_enforcer.py:227`, "waits at its own hold gate") say a waiting run continues, and then the drain stops it. Without `--drain`, the text stays the same. builds placed this here on 2026-11-11 (C1381 validation): it must land before the deploy that uses `--drain`.
+
+**Files:**
+
+- `scripts/build_targets/build_targets.py`
+- `scripts/build_hold/build_hold.py`
+- `scripts/build_hold/hold_enforcer.py`
+- `scripts/build_hold/test_hold_enforcer.py`
+- `scripts/build_queue/admission_service.py`
+- `scripts/build_queue/placement.py`
+- `docs/plans/builds-queue-placement.md`
+- `scripts/build_targets/test_build_targets.py`
+- `scripts/build_queue/test_admission_service.py`
+- `scripts/build_hold/test_hold_applies.py`
+
+**Workers:** 1 writer + 1 tester.
+
+- `impl` owns `build_targets.py`, `build_hold.py`, `hold_enforcer.py`, `admission_service.py`, `placement.py` and the placement doc. Hub file: `build_targets.py`.
+- `test` owns the four test files and their support files. Tests use a private proc root and private hold folders, never live processes, the live hold or the live admission service.
+
+**State:** no stored record changes. Conversion: none.
+
+**Acceptance:**
+
+1. Add rows to the existing start-check and local host-evidence tables: a kept descendant gets a local placement; an unrelated process of the same session waits; a reused pid (start time differs) waits; with two holds, a caller kept by one hold waits on the other.
+2. The 44b kept-caller rows in `test_hold_applies.py` and `test_build_targets.py` stay green with no assertion change.
+3. Add a row to the `hold --drain` test in `test_hold_enforcer.py`: the output has no "waits by itself" and no "its own hold gate" text, and it says the drain stops waiting runs. The `test_build_hold.py:1020` row without `--drain` stays the same.
+
+**Verification:** `python3 -m unittest scripts.build_targets.test_build_targets scripts.build_hold.test_hold_applies scripts.build_hold.test_hold_enforcer scripts.build_hold.test_build_hold scripts.build_queue.test_admission_service`, then `targeted_test.py` for the unit, and basedpyright on each changed file with zero findings.
+
+### Phase 44i — Queue priority holds an ordered list of units  · status: done
+**Depends on:** none. Runs on builds-queue beside Phase 44, ahead of it. Ordered urgent by builds on 2026-11-11 for the user: the user bumped demo, then cables. The second bump replaced the first, and cables' nextest stayed at place 6.
+
+Work:
+1. Queue priority holds an ordered list of units, each with its why, time and actor.
+2. `bump` adds its unit at the end. A unit already in the list keeps its place.
+3. `clear` empties the list. `clear <unit>` removes that unit only.
+4. Admission orders the steps of the first unit, then the second unit, then all other steps.
+5. A stored single-unit priority reads as a list of one. No data step.
+6. The queue page and the head explanation name every unit in order.
+7. `/build:queue` describes the new bump and clear.
+
+**Workers:** 1 writer. **Verification:** the admission service, memory_admit, build_queue, queue_view and head_facts tests, `targeted_test.py`, and basedpyright with zero findings. **Deploy:** restart `build-admission.service` after the hash reaches main.
+
+### Phase 44f — The cap stays known while a step starts or ends  · status: todo
+**Depends on:** 44c, because Phase 44 also edits `scripts/lint/memory_admit.py`. Starts first after the 44 and 44c deploy, before 44e. The user on 2026-11-11: "the cap keeps showing as unavailable - then it comes back - this should never happen".
+
+Cause, measured 08:29–08:33: 4 of 50 build page readings showed "Cap unavailable: swap-backed use unavailable for <run>: scope not measured". Each was a run in its first pass after admission. `memory_admit.py` (line 1775 on main) gives `RunUseUnavailable("scope not measured")` to every step whose reading is not `MeasuredMemory`, that is `PromisedMemory` (admitted, scope not populated yet) and `GoneMemory` (its processes ended). One such run makes `memory_room` set `CapUnavailable`.
+
+Work:
+1. A `PromisedMemory` or `GoneMemory` step has `AnonymousRunUse(0)`: no process of that step holds memory. Its keep-aside stays its full need, so room does not change. Only the cap becomes known.
+2. `RunUseUnavailable` stays only for a real read failure.
+3. Tests: one row each for a promised step and a gone step: the cap is a number, and room equals the value before the change.
+
+**Workers:** 1 writer. **Verification:** the memory_admit and admission tests, `targeted_test.py`, and basedpyright with zero findings.
+
+### Phase 44h — Admission never starts a GPU test step that the GPU cannot hold  · status: todo
+**Depends on:** 44f, because both edit `scripts/lint/memory_admit.py`. Starts after 44f, before 44g. Ordered by builds on 2026-11-11. Facts from hana: the natedev GPU has 16303 MiB. One full hana suite peaks at 15768 MiB. Per test: median 279 MiB, p90 791 MiB, largest 7971 MiB. Two hana suites at once ran out of GPU memory (OutOfMemory RenderError at 05:34 and 09:17).
+
+More facts from hana (full suite on ca801be38c, 32 threads):
+1. The board peak is 15768 MiB. The peak sum of the test processes is 8951 MiB. Other users of the GPU hold the rest.
+2. The largest tests: clock_button_pixel_cases 7971 MiB, material_card_pixel_cases 5153 MiB, size-thumbs 2629 MiB, transform_translation_and_rotation 2585 MiB.
+3. The out-of-memory errors come from large render tests that run at the same time, not from growth inside one test.
+4. Per-test table: a copy is at `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phase44h_gpu_memory.md`.
+
+Item 3 means the GPU need of a step is its process sum, and room must come from live free GPU memory, because other processes hold GPU memory too.
+
+Design (builds approved it with two changes, items 2 and 6):
+1. GPU history: the sampler that records a nextest step's RAM peak also records its GPU peak, as `gpu_peak_bytes` beside `test_phase_peak_bytes` in `anon_peaks.jsonl`.
+2. Per-process GPU use: bevy renders through Vulkan, and `nvidia-smi --query-compute-apps` can leave out graphics (G) processes. First, prove on one live hana render test that its pid shows with its used memory. If it does not, use the method hana's Phase 89 used for its per-test numbers (ask hana), or `nvidia-smi --query-accounted-apps`, or NVML per-process graphics use.
+3. A GPU step: no list. A step is a GPU step when its history profile (the RAM key: host, repo, scope, package, filters, width) has a GPU peak above zero. Need = the RAM ranked peak and width scaling, plus a new margin key set with /tune.
+4. No history: a profile with no GPU history, in a repo with GPU history on this host, needs the largest GPU peak of that repo within the history days. So two full hana suites never start together. A repo with no GPU history has no GPU steps. Its first run is sampled, and the next run is gated.
+5. GPU room = live free GPU memory − the GPU need not yet reached by each admitted GPU step (the same rule as the RAM keep-aside). A host without `nvidia-smi` has no GPU gate. Mac and AWS placements take no natedev GPU room.
+6. Speed: read free GPU memory only when the head step is a GPU step, not at every admission decision. Time the call, and name its cost in the checkpoint.
+7. Wait text: a held step says that it waits for GPU memory, with its need and the free GPU memory in GiB.
+
+The Work Order follows at phase start.
+
+### Phase 44e — Every build page tooltip shows labelled rows in one shape  · status: todo
+**Depends on:** 44c. Starts next after the 44 and 44c deploy, before 44d and 44a. The user asked on 2026-11-11, from a shot of the cap line tooltip ("Cap 24.3 GiB; anonymous use 0.0 GiB + CI use 0.1 GiB + free 27.2 GiB – safety 3.0 GiB; reserved 0.0 GiB; room 24.2 GiB"): "i would like this tooltip for the cap (and other tooltips) to be more structured showing name: value pairs in rows - i also don't know what anonymous means so you need to provide better context - i don't want huge tool tips but i do want them to be informative and communicate information consistently". The Work Order follows at phase start.
+
+Every tooltip on `scripts/build_queue/memory_live.html` uses one shape:
+1. A title line: the item name and its main value, as now ("Cap line · 24.3 GiB").
+2. At most one short sentence that says what the item is.
+3. Name and value rows. Names align left. Values align right in tabular numbers. A calculation shows its terms with `+` and `−`, a rule line, then the `=` result row.
+4. The tooltip keeps its current width limit. No paragraph text.
+
+The cap line tooltip becomes:
+
+| Name | Value |
+| --- | --- |
+| Builds use | 0.0 GiB |
+| hana CI | + 0.1 GiB |
+| Free | + 27.2 GiB |
+| Safety | − 3.0 GiB |
+| Cap | = 24.3 GiB |
+
+Reserved and room leave the cap tooltip, because the room tooltip shows them in the same shape.
+
+Rules:
+1. No page text says "anonymous". The page says "Builds use" and the builds-use tooltip sentence gives the context: memory that build processes hold now, not file cache, because the system can free file cache.
+2. The feed sends numbers with names, not sentences. `room_text` and `keep_aside_text` in `scripts/build_queue/queue_evidence.py` and the run `keep_text` in `scripts/build_queue/memory_feed.py` become row lists. The page formats every amount through one function.
+3. Run, waiting step, CI, group, swap and pressure tooltips use the same rows: for example Started, Uses, Reserves, Counted, Needs, Waiting for, Reason.
+   The hana CI row shows only while a CI job runs. The user, 2026-11-11: "i don't think we need to show the ci reservation row unless a ci is running - it is really neglibible and can just be included in the build memory taken tool tips on the summary row at the top but not necessary to be on its own row without ci running". With no job running, the idle runner memory is one row in the summary row's build memory tooltip ("hana CI, idle"), and the Running table has no hana CI row.
+   The hana CI tooltip adds a Limit row for a job with no reservation: "34 GiB (the hana-ci.slice MemoryMax)". Since resources Phase 88 removed the CI margin, no page text gives this limit.
+4. The rename approved for Phase 44a moves here, because this phase rewrites that tooltip: the memory page row "worker background runs" becomes "unowned processes" (`memory_feed.py` group name and its `memory_live.html` text).
+5. The estimate source (change C1309) says in plain words what happens, with no "same-shape", "promise", "headroom" or "floor". The user asked through builds on 2026-11-11: "stop using same-shape and just say in words what is actually happening - probably this only needs to show up in the html in any case". It shows on the build page only: `need_text` in `queue_evidence.py` becomes rows, and the waiting-for-memory notice in `admission_client.py` drops its source description. Builds approved this wording on 2026-11-11. Title "Estimate · 6.2 GiB"; sentence "Memory this step should need, from earlier runs of this build: the same project, step, profile and tests." Rows:
+   1. From: "the largest peak of the last 20 runs, after the top 10% are dropped"; "the largest peak of the last 3 runs"; or "no earlier runs: the larger of the default amount and the peak of a build with the same profile".
+   2. Runs from: "the last 14 days".
+   3. Failed run: "4.1 GiB, from a failed run at 07:40" or "none".
+   4. Extra room: "× 1.150 for a release build", "× 1.100 + 0.5 GiB for a dev build", or "none".
+   5. Limit: "cut to 24.0 GiB from 26.3 GiB" or "none".
+
+**Workers:** 1 writer + 1 tester.
+- Writer: `queue_evidence.py` and `memory_feed.py` row data, and the `memory_live.html` tooltip renderer and CSS.
+- Tester: `test_memory_hover.py`, `test_memory_feed.py` and `memory_page_proof.mjs` rows for each tooltip kind, with no "anonymous" text.
+
+### Phase 44g — Mac builds show in the queue as their own rows, with their kind and progress  · status: todo
+**Depends on:** 44 and 44c (Phase 44 records each Mac placement and gives each running step its machine through `admission_records.execution_host`). The user asked on 2026-11-11: "you should find a way to add the mac builds and indicate whether they are test mirrors or actual runs somehow - they should show in the build queue with their machine just like we show aws in their own rows with their own machine. progress should show". The Work Order follows at phase start.
+
+Goal: the queue view, the queue card and the build page show each build or test on the Mac as its own row, as AWS rows show today (`memory_feed.CloudWorkRow`, `machine: "aws"`). Each Mac row shows:
+1. **Machine:** `mac`.
+2. **Kind:** in words the user reads at once (builds, 2026-11-11: no coined term). Working values: "sent from natedev" (the user's "test mirror") and "started on the Mac" (the user's "actual run"). The row shows the same columns and look as an AWS row. The split is the one the Mac activity check already uses (`docs/as-built/mac-test-offload.md`, `mac_activity_script`):
+   - A test mirror is a natedev run that the queue placed on the Mac. It runs under `~/.local/state/mac-test/mirror/`, and a speculative copy is one too. The row names its unit, as a local row does.
+   - A Mac build is other build work on the Mac: `cargo`, `rustc`, `cargo-nextest` or a `/target/` binary outside the mirror, such as a hana macOS CI job or a build in the user's own Mac clone. The row names the folder.
+3. **Progress:** the same done / total bar as a local or AWS row. A test mirror gets its counter from the run's output, which the natedev caller already reads. A Mac build shows progress only when a counter can be read; otherwise the row says why, as a local row does.
+4. **Memory:** a Mac row takes no natedev memory, so it stays out of the cap, the room and the bar, as AWS rows do.
+
+Interpretation (director, 2026-11-11, a one-line revert): "test mirrors or actual runs" means queue-placed mirror work against all other Mac build work. If the user meant a speculative copy against a placed run, that is a third value of the same Kind field.
+
+### Phase 44d — The queue holder signal test passes under a loaded gate  · status: todo
+**Depends on:** 44c. Ordered by builds 2026-11-10 (not urgent). In a full AWS gate run (hierarchies 62efaf), `scripts/build_queue/test_queue_place.py` `test_holder_signals_release_and_restore_handlers` (SIGINT case) failed its fixed 8 s wait, "signal cleanup did not finish" (line 1019), then passed alone. The wait must not depend on load. The forked holder already arms `signal.alarm(TEST_HANG_GUARD_SECS)` (line 997), so the parent can wait on the holder's pidfd with no fixed limit of its own and keep every assertion. The Work Order follows at phase start.
+
 ### Phase 44a — The queue page shows the AWS costs that matter most  · status: todo
 **Depends on:** the aws-unit change that removes the `aws` build target and makes `aws_section` stop needing it: commit `1b1fa1842`, on builds since 2026-11-10. Starts after Phase 44. Ordered by builds 2026-11-10 from the user's request: "tell queue i want it to build an aws costs pane into its html page and surface the costs that are most important to me". The Work Order follows at phase start; ask aws-unit about any ledger field.
 
@@ -2080,11 +2226,11 @@ Rules (public repository):
 2. Show no cost-ledger `recipient` field and no notification email.
 3. Make no AWS call from the page. Read only the saved ledger and bill records (`scripts/buildlog/report.py` `aws_section` reads them now).
 
-Also in this phase, approved by the user through builds 2026-11-10: the memory page row "worker background runs" becomes "unowned processes". Change the group name in `scripts/build_queue/memory_feed.py` (line 893 on main) and its text in `scripts/build_queue/memory_live.html` (line 446 on main, "Worker background runs hold this memory outside the build queue.").
+The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rewrites that tooltip. The pane's tooltips use the 44e shape.
 
 **Workers:** 1 writer + 1 tester.
 - Writer: the saved cost projection, `memory_feed.py` and `memory_live.html`.
-- Tester: cost fixtures, public-data exclusions, missing-data behavior, and the group label.
+- Tester: cost fixtures, public-data exclusions and missing-data behavior.
 
 ### Phase 44b — One hold command drains natedev for a service deploy  · status: done
 
@@ -2117,7 +2263,7 @@ Also in this phase, approved by the user through builds 2026-11-10: the memory p
 
 **Constraints from 44b (architect review of 44b, 2026-11-10).**
 1. The hold check at `merge_gate.py:472` is `build_targets.caller_waits_on_hold(holds, directory)`; `caller_holds_only_own` is gone. Keep this check when gate routing moves to the queue.
-2. Keep Phase 44 constraint 9: a hold decision uses the checked requesting process's lineage, never the service's.
+2. Keep the Phase 44c rule: a hold decision uses the checked requesting process's lineage, never the service's.
 3. The deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert, as Phase 44 deploy step 3 does.
 
 **Workers:** 2 writers.

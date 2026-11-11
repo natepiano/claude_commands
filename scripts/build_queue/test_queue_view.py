@@ -1164,15 +1164,15 @@ class QueueViewTests(QueueViewFixtureTests):
 
     def test_live_bump_marks_every_unit_row_without_moving_columns(self) -> None:
         model = self.fixture.model()
-        for unit in ("cables", "widget"):
-            priority: admission_records.QueuePriority = {"unit": unit, "why": "test", "set_at": NOW, "set_by": "actor",
-                                            "transition": admission_records.SettledPriority()}
+        for units in (("cables",), ("widget",), ("cables", "widget")):
+            priority = admission_records.QueuePriority(tuple(
+                admission_records.PriorityEntry(unit=unit, why="test", set_at=NOW, set_by="actor") for unit in units))
             bumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=priority)))
             unbumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=admission_records.NoQueuePriority())))
             for columns in (40, 60, 80, 100, 140):
-                with self.subTest(unit=unit, columns=columns):
+                with self.subTest(units=units, columns=columns):
                     baseline = queue_view.render_view(unbumped, columns, you=ASKING_SESSION, selector="widget")
                     with mock.patch.object(head_facts, "queue_moves", side_effect=AssertionError("bump history read")), \
                          mock.patch.object(gate, "read_queue_priority", side_effect=AssertionError("live priority read")):
@@ -1184,7 +1184,7 @@ class QueueViewTests(QueueViewFixtureTests):
                     steps = [row.step for row in queue_view.running_builds(model)] + list(model.reading.view.waiting)
                     self.assertEqual(len(rows), len(steps))
                     for row, before, step in zip(rows, previous, steps):
-                        expected = model.labels[step.session_id].unit == unit
+                        expected = model.labels[step.session_id].unit in units
                         self.assertEqual(sum(span.text == "●" for span in row), int(expected))
                         # The step, minutes, bars and selection mark retain their positions.
                         unit_end = 5 if expected else 4
@@ -1194,7 +1194,7 @@ class QueueViewTests(QueueViewFixtureTests):
                     data = json_form(lines, columns, NOW)
                     self.assertEqual(sum(part["text"] == "●" and part.get("tone") == "warning"
                                          for row in data["lines"] for part in row),
-                                     sum(model.labels[step.session_id].unit == unit for step in steps))
+                                     sum(model.labels[step.session_id].unit in units for step in steps))
 
     def test_no_live_bump_keeps_the_recorded_board_bytes(self) -> None:
         model = self.fixture.cap_model()

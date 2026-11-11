@@ -48,10 +48,7 @@ def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ())
 
 def with_queue_priority(reading: admission_records.QueueRead) -> admission_records.QueueRead:
     """Add a private user priority to the reading."""
-    priority: admission_records.QueuePriority = {
-        "unit": "research", "why": "the user's bump", "set_at": reading.explanation.now,
-        "set_by": "fixture-user", "transition": admission_records.SettledPriority(),
-    }
+    priority: admission_records.QueuePriority = admission_records.QueuePriority(({'unit': "research", 'why': "the user's bump", 'set_at': reading.explanation.now, 'set_by': "fixture-user"},), admission_records.SettledPriority())
     return replace(reading, explanation=replace(reading.explanation, priority=priority))
 
 
@@ -571,7 +568,14 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_queue_priority_reaches_the_feed_and_clears_when_removed(self) -> None:
         base = captured_reading()
-        cases = ((with_queue_priority(base), "queue priority: research (the user's bump)"), (base, ""))
+        first = with_queue_priority(base)
+        priority = first.explanation.priority
+        assert isinstance(priority, admission_records.QueuePriority)
+        two = replace(first, explanation=replace(first.explanation, priority=admission_records.QueuePriority(
+            (*priority.entries, {"unit": "cables", "why": "urgent", "set_at": first.explanation.now,
+                                 "set_by": "actor"}))))
+        cases = ((first, "queue priority: research (the user's bump)"),
+                 (two, "queue priority: research (the user's bump), cables (urgent)"), (base, ""))
         for reading, expected in cases:
             with self.subTest(expected=expected):
                 with mock.patch.object(admission_client, "view", return_value=reading):

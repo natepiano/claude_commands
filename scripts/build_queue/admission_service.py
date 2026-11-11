@@ -965,14 +965,12 @@ class AdmissionServer:
     def _finish_priority(self) -> None:
         if isinstance(self.priority, records.NoQueuePriority):
             return
-        transition = self.priority["transition"]
+        transition = self.priority.transition
         if isinstance(transition, records.SettledPriority):
             return
         gate.finish_priority_transition(self.priority)
-        if transition.action == "clear":
-            self.priority = records.NO_QUEUE_PRIORITY
-        else:
-            self.priority["transition"] = records.SettledPriority()
+        self.priority = (records.QueuePriority(self.priority.entries) if self.priority.entries
+                         else records.NO_QUEUE_PRIORITY)
         self.persist()
 
 
@@ -2127,6 +2125,9 @@ class AdmissionServer:
             if isinstance(request, wire.PrioritySetRequest):
                 if not request.unit.strip():
                     return self._mutation_reply(key, wire.Refused("unit is required"))
+                entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
+                if any(entry["unit"] == request.unit for entry in entries):
+                    return self._mutation_reply(key, wire.Ok())
                 rows = [waiting.row for waiting in self.waiters.values()]
                 rows.extend(record.queue_waiter for record in self.reservations.values())
                 recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
@@ -2135,18 +2136,29 @@ class AdmissionServer:
                 if request.unit == "—" or request.unit not in units:
                     return self._mutation_reply(key, wire.Refused(
                         f"unknown unit {request.unit}; the queue priority did not change"))
-                priority: records.QueuePriority = {"unit": request.unit, "why": request.why,
-                    "set_at": self.clock.now(), "set_by": request.actor,
-                    "transition": records.SettledPriority()}
+                changed = True
+                entry: records.PriorityEntry = {"unit": request.unit, "why": request.why,
+                    "set_at": self.clock.now(), "set_by": request.actor}
+                entries = (*entries, entry)
+                unit, why, actor = request.unit, request.why, request.actor
             else:
-                priority = (self.priority.copy() if not isinstance(self.priority, records.NoQueuePriority) else
-                    {"unit": "", "why": "", "set_at": self.clock.now(), "set_by": request.actor,
-                     "transition": records.SettledPriority()})
+                entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
+                if request.unit and not any(entry["unit"] == request.unit for entry in entries):
+                    return self._mutation_reply(key, wire.Refused(
+                        f"unknown unit {request.unit}; the queue priority did not change"))
+                removed = tuple(entry for entry in entries if not request.unit or entry["unit"] == request.unit)
+                changed = bool(removed)
+                entries = tuple(entry for entry in entries if request.unit and entry["unit"] != request.unit)
+                unit = request.unit or ", ".join(entry["unit"] for entry in removed)
+                why, actor = ", ".join(entry["why"] for entry in removed), request.actor
             at = self.clock.now()
-            priority["transition"] = records.PendingPriorityTransition(key,
+            month_row_end = store.read_last_whole_row_end(store.host_file(self.host, at))
+            if not changed:
+                return self._mutation_reply(key, wire.Ok())
+            transition = records.PendingPriorityTransition(key,
                 "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
-                store.read_last_whole_row_end(store.host_file(self.host, at)))
-            self.priority = priority
+                month_row_end, unit, why, actor)
+            self.priority = records.QueuePriority(entries, transition)
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
             self.persist()
             self._finish_priority()

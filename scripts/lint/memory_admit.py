@@ -315,11 +315,7 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
         value = cast(object, json.loads(path.read_text()))
         if not isinstance(value, dict):
             raise ValueError("priority is not an object")
-        row = cast(dict[str, object], value)
-        if (any(not isinstance(row.get(key), str) for key in ("unit", "why", "set_by"))
-                or any(not isinstance(number := row.get(key), (float, int))
-                       or isinstance(number, bool) or not math.isfinite(number) for key in ("set_at",))):
-            raise ValueError("invalid priority fields")
+        row = records.upgrade_queue_priority(cast(dict[str, object], value))
         return cast(QueuePriority, codec.parse_snapshot_value(row, QueuePriority))
     except FileNotFoundError:
         return NO_QUEUE_PRIORITY
@@ -329,24 +325,22 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
 
 
 def finish_priority_transition(priority: QueuePriority) -> None:
-    transition = priority["transition"]
+    transition = priority.transition
     if isinstance(transition, SettledPriority):
         return
-    record.queue_priority(transition.action, priority["unit"], priority["why"],
-                          priority["set_by"], transition.at, transition_id=transition.id, start=transition.month_row_end)
+    record.queue_priority(transition.action, transition.unit, transition.why,
+                          transition.set_by, transition.at, transition_id=transition.id, start=transition.month_row_end)
 
 
 def read_queue_priority(directory: Path, *, finish: bool = False) -> QueuePriority | NoQueuePriority:
     priority = load_queue_priority(directory)
     if isinstance(priority, NoQueuePriority):
         return priority
-    transition = priority["transition"]
+    transition = priority.transition
     if isinstance(transition, PendingPriorityTransition):
         if finish:
             finish_priority_transition(priority)
-        if transition.action == "clear":
-            return NO_QUEUE_PRIORITY
-    return priority
+    return priority if priority.entries else NO_QUEUE_PRIORITY
 
 
 class UnitMembership(Protocol):
@@ -421,8 +415,9 @@ def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrde
     ranked: list[tuple[Path, RankedWaiter]] = []
     for path, row in rows:
         unit = queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
-        order = (PriorityUnit(context.priority["unit"]) if not isinstance(context.priority, NoQueuePriority)
-                 and unit == context.priority["unit"] else NormalOrder())
+        entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
+        position = next((index for index, entry in enumerate(entries) if unit == entry["unit"]), -1)
+        order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
         ranked.append((path, rank_waiter(row, order)))
     return sorted(ranked, key=lambda item: waiter_order(item[1])), context.priority
 
@@ -1312,7 +1307,9 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
-    return (0 if isinstance(records.waiter_priority(row), PriorityUnit) else 1), row.get("order_since", row["since"]), row["pid"]
+    order = records.waiter_priority(row)
+    rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
+    return rank, row.get("order_since", row["since"]), row["pid"]
 
 
 @dataclass(frozen=True)

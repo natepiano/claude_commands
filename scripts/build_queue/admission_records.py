@@ -505,6 +505,7 @@ class Waiter(TypedDict):
 @dataclass(frozen=True)
 class PriorityUnit:
     unit: str
+    position: int = 0
 
 
 @dataclass(frozen=True)
@@ -537,14 +538,37 @@ class PendingPriorityTransition:
     action: Literal["set", "clear"]
     at: float
     month_row_end: int = 0
+    unit: str = ""
+    why: str = ""
+    set_by: str = ""
 
 
-class QueuePriority(TypedDict):
+class PriorityEntry(TypedDict):
     unit: str
     why: str
     set_at: float
     set_by: str
-    transition: SettledPriority | PendingPriorityTransition
+
+
+@dataclass(frozen=True)
+class QueuePriority:
+    entries: tuple[PriorityEntry, ...]
+    transition: SettledPriority | PendingPriorityTransition = SettledPriority()
+
+
+def upgrade_queue_priority(value: dict[str, object]) -> dict[str, object]:
+    """Read an older priority without changing its stored record."""
+    if "entries" in value or not all(key in value for key in ("unit", "why", "set_at", "set_by")):
+        return value
+    entry = {key: value[key] for key in ("unit", "why", "set_at", "set_by")}
+    transition = value.get("transition", {"kind": "SettledPriority"})
+    clearing = False
+    if isinstance(transition, dict):
+        old = cast(dict[str, object], transition)
+        clearing = old.get("action") == "clear"
+        if old.get("kind") == "PendingPriorityTransition":
+            transition = {**old, "unit": entry["unit"], "why": entry["why"], "set_by": entry["set_by"]}
+    return {"kind": "QueuePriority", "entries": [] if clearing else [entry], "transition": transition}
 
 
 @dataclass(frozen=True)
