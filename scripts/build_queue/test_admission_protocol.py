@@ -29,6 +29,7 @@ from scripts import build_queue
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
 from scripts.build_queue import admission_code, admission_records as records
+from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
 
@@ -70,6 +71,46 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(parsed, request)
                     assert isinstance(parsed, wire.AdmitRequest)
                     self.assertEqual(parsed.place, place)
+                    for version in (1, 2):
+                        envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+                        envelope["v"] = version
+                        self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, request))
+
+    def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference("mac", destination.target, destination.scope,
+                                                     "claim-a", assignment.episode, assignment.attempt)
+            requests: tuple[wire.Request, ...] = (
+                request, wire.ClaimFailure("failed", assignment, "busy"),
+                wire.ConsumePermission("consume", assignment, claim),
+                wire.ExecutionReport("report", assignment, claim, placement.ExecutionNotStarted()),
+                wire.ExecutionReport("report-observed", assignment, claim, placement.ObservedExecution(
+                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
+                wire.ExecutionReport("report-unavailable", assignment, claim,
+                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
+            )
+            for message in requests:
+                with self.subTest(message=message):
+                    self.assertEqual(wire.parse_request(wire.encode_request(message)), message)
+            replies: tuple[wire.Reply, ...] = (
+                wire.PlacementWait(request.episode, request.since, 1,
+                    (placement.CandidateEligibility(destination, placement.TemporaryExclusion("busy")),)),
+                wire.Assignment(assignment), wire.FirstAuthorization(assignment, claim),
+                wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionAvailable()),
+                wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionConsumed(fixture.clock.now())),
+                wire.DispatchStatus(assignment, placement.ClosedAssignment("obsolete"), placement.NoLaunchPermission("closed")),
+                wire.DispatchStatus(placement.UnknownAssignment(assignment.episode, "old-attempt"),
+                    placement.ClosedAssignment("unknown"), placement.NoLaunchPermission("unknown")),
+            )
+            for reply in replies:
+                with self.subTest(reply=reply):
+                    self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
 
     def test_cloud_rows_survive_view_and_mine_reply_wires(self) -> None:
         from scripts.build_queue import cloud_progress, progress_profile
@@ -337,7 +378,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                     self.assertEqual(wire.parse_record(wire.encode_record(value), type(value)), value)
             build = fixture.request(step="build")
             assert isinstance(build.profile, records.StepProfile)
-            self.assertEqual(wire.VERSION, 2)
+            self.assertEqual(wire.VERSION, 3)
             legacy_records = ModuleType("phase33_legacy_records")
             legacy_protocol = ModuleType("phase33_legacy_protocol")
             with mock.patch.dict(sys.modules, {legacy_records.__name__: legacy_records,
@@ -428,8 +469,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
 
     def test_unknown_versions_and_malformed_envelopes_are_rejected(self) -> None:
         message = cast(dict[str, object], json.loads(wire.encode_request(wire.ViewRequest())))
-        message["v"] = 3
-        with self.assertRaisesRegex(ValueError, "client version 3, service supports 1..2"):
+        message["v"] = 4
+        with self.assertRaisesRegex(ValueError, "client version 4, service supports 1..3"):
             _ = wire.parse_request(json.dumps(message))
         for line in ("", "not json", "[]", '{}', '{"v":true}', '{"v":1,"type":"bump","data":{}}'):
             with self.subTest(line=line), self.assertRaises(ValueError):

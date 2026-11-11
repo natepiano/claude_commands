@@ -18,7 +18,7 @@ from unittest import mock
 
 from scripts.build_targets import working_set
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 class WorkingSetTests(unittest.TestCase):
@@ -217,7 +217,7 @@ class WorkingSetTests(unittest.TestCase):
             staff.StaffRow(staff.StaffId("outer-id"), "unit", "outer", staff.STAFF_ROOT,
                 current_session=staff.StaffId("outer-session"),
                 worktree=staff.PresentWorktree("natedev", Path("/work/unit"))),
-            staff.StaffRow(staff.StaffId("nested-id"), "agent", "nested", staff.STAFF_ROOT,
+            staff.StaffRow(staff.StaffId("nested-id"), "producer", "nested", staff.STAFF_ROOT,
                 current_session=staff.StaffId("nested-session"),
                 worktree=staff.PresentWorktree("natedev", Path("/work/unit/nested"))),
         ))

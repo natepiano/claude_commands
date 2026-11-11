@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.production import checkpoint_gate
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
@@ -122,8 +122,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
         _ = config.write_text((checkout / "config/staff.conf").read_text())
-        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config),
-                         "CLAUDE_PYTHON": sys.executable})
+        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         library = Path(self.env["HOME"]) / ".claude/scripts/lib"
         library.symlink_to(checkout / "scripts/lib", target_is_directory=True)
         _ = self.git("remote", "set-head", "origin", "production")

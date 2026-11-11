@@ -17,19 +17,19 @@ entry: "/showrunner:accounts table: two 5-hour columns removed" (two-accounts, 2
 
 ## Decisions
 
-- **Every production names its list.** `**Change review:**` becomes a required Production Context line;
-  `/producer:to_production` writes `~/rust/hanadocs/change-review/<slug>.md` for a new production. Hana keeps
-  `~/rust/hanadocs/change-review.md`. A missing file is created with the standard skeleton on its first row.
+- **Every production names its list.** `**Change review:**` names `~/rust/hanadocs/change-review/change-review - <showrunner>.md` for its top-level showrunner.
+  A child production names its root's list. The first row creates a missing list with the standard skeleton.
 - **Rows still come from `Change-Review:` commit lines** through merge_checkpoint.py. A change that reaches the user
   without a checkpoint line (a showrunner's own change, a fix outside a run) goes in through the skill.
-- **One skill, `/change_review`,** for units and showrunners: `add` (one row), `show` (the user asked: walk the
-  To review rows one at a time), `verdict` (move a row to Reviewed). The list is found from the production doc: the
-  showrunner's update timer, or a unit plan's Production line.
+- **One skill, `/change_review`,** supports `add`, `show`, and `verdict` for units and showrunners.
+  The shared scoped queue uses current staff ownership and includes earlier production lists.
+  Both `/next change` and `show` use this queue. Earlier lists retain qualified row ids without copying their rows.
 - **change_review.py** gains `add`, `show` and `verdict` actions and a lock shared with merge appends.
 - **Never a question.** A change for the user to check is never put in open_for_user and never counted; it goes on
   the list. The user asks for "change review" when they want it.
-- **Verdicts** (every production): `works`/`fine` lands the row; any other verdict drops it and sends the row and
-  the verdict to the unit that made it; the fix returns as a new row.
+- **Verdicts** land a row when they open with `works` or `fine`, after optional `okay` or `ok` and a row id.
+  Case and later words do not change that result. Other verdicts return the row and verdict to its unit.
+  The fix returns as a new row.
 - **Feature log.** A landed row adds a feature-log note when the production's project is one the feature log knows.
   ~/.claude becomes a feature-log project (`claude`, repo natepiano/claude_commands), so build-followups changes land
   as notes too. The vault folder `feature-log/claude/` and its Base are asked of hanadocs.

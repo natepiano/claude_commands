@@ -19,17 +19,18 @@ from types import SimpleNamespace
 
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
+from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import fake_herdr
 from scripts.herdr import herdr
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
 from scripts.message import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 from scripts.production import merge_checkpoint
 from scripts.production.production_doc import Production, production_field, read_production
-from scripts.shutdown import shutdown
+from scripts.agents import shutdown
 from scripts.production import showrunners
 from scripts.production import tidy_wrapped
 from scripts.production import unit_move
@@ -38,7 +39,7 @@ from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-SCRIPT = Path(__file__).resolve().parents[1] / "shutdown/shutdown.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
 
 
@@ -232,7 +233,7 @@ class FolderMoveFixture(StaffTestCase):
         self.checkout = self.root / "checkout"
         self.old_folder = self.root / "worktrees/source-folder"
         self.new_folder = self.root / "elsewhere/destination-folder"
-        self.run_dir = self.root / "sessions/move-run"
+        self.run_dir = self.root / "unit/move-run"
         self.history = self.root / "history/runs/move-run.jsonl"
         self.records = self.root / "pane-records"
         self.checkout.mkdir()
@@ -240,7 +241,8 @@ class FolderMoveFixture(StaffTestCase):
         self.history.parent.mkdir(parents=True)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "UNIT_HISTORY_DIR": str(self.history.parent.parent),
-            "UNIT_RUN_ROOT": str(self.root / "sessions"),
+            "UNIT_RUN_ROOT": str(self.run_dir.parent),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
             "PROGRESS_SESSION_ROOTS": str(self.run_dir.parent),
             "HERDR_PANE_RECORD_DIR": str(self.records),
             "HERDR_BIN": "/nonexistent/herdr",
@@ -250,6 +252,7 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
+        _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.run_dir.parent))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -273,10 +276,11 @@ class FolderMoveFixture(StaffTestCase):
         fields: dict[str, object] = {
             "run_id": "move-run", "main_agent": {"session_id": self.owner.current_session},
             "branch": "unit-branch", "plan_doc": "plan.md",
-            "history_file": str(self.history), "status": "active", "production": "production", "unit": "kept-name",
+            "history_file": str(self.history), "production": "production", "unit": "kept-name",
         }
         write_text_atomic(self.history, json.dumps({**fields, "event_type": "run_started", "run_started_at": 1}) + "\n")
         write_text_atomic(self.run_dir / STATE_FILENAME, json.dumps(fields) + "\n")
+        _ = staff.set_run(self.owner.id, staff.OpenRun(self.run_dir))
 
     def folder_git(self, checkout: Path, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(checkout), *arguments],
@@ -560,7 +564,7 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
             "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),

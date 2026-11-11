@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.staff_test_support import fixture_member
 
@@ -26,7 +26,7 @@ from scripts.production import fake_unit_host
 from scripts.production import production_lifecycle
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.production import showrunner_tree
 from scripts.production.fake_unit_host import HostedUnit
 

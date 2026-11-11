@@ -1,15 +1,19 @@
 """Environment proof and executable boundary, using only a stub direnv."""
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
+import tempfile
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.copies import copies
 from scripts.lib import copy_record, nix_env, scratch
 from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -348,41 +352,68 @@ class RegisteredCopyTests(GitNixFixture):
             source_commit=commit, copy_commit=commit, target_mode="shared", seed_source=str(repository),
             borrows_from=str(repository / ".git"))
 
+    @contextmanager
+    def registered_checkout(self, repository: Path, *, temporary_gate: bool) -> Generator[Path]:
+        """Yield a registered shared copy or a real temporary gate."""
+        if not temporary_gate:
+            checkout = self.clone(repository)
+            self.register(repository, checkout)
+            yield checkout
+            return
+        configuration = self.root / "copies.conf"
+        settings = (Path(self.env["CONF_DIR"]) / "copies.conf").read_text(encoding="utf-8")
+        _ = configuration.write_text(settings.replace(
+            "root=~/worktrees/gates", f"root={self.root / 'gates'}"), encoding="utf-8")
+        with (patch.dict(os.environ, {"COPIES_CONFIG": str(configuration)}),
+              patch.object(tempfile, "tempdir", str(self.root)),
+              copies.standing("nix-env-proof", repository, copies.CommittedSource("HEAD")) as checkout):
+            yield checkout
+
     def test_registered_shared_copy_with_unchanged_envrc_is_approved_and_loads(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        checkout = self.clone(repository)
-        self.register(repository, checkout)
-        search_path = list(sys.path)
-        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
-        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
-        self.assertEqual(sys.path, search_path)
-        # Approval is tied to the recorded commit, not the source's current file.
-        _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
-        outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
-        self.assertIsInstance(outcome, nix_env.Loaded)
-        if not isinstance(outcome, nix_env.Loaded):
-            self.fail(str(outcome))
-        self.assertEqual(outcome.env["IN_NIX_SHELL"], "impure")
-        self.assertEqual(self.direnv_calls(), [
-            {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
-            {"args": ["export", "json"], "cwd": str(checkout)}])
+        for temporary_gate in (False, True):
+            with (self.subTest(temporary_gate=temporary_gate),
+                  self.registered_checkout(repository, temporary_gate=temporary_gate) as checkout):
+                Path(self.env["DIRENV_LOG"]).unlink(missing_ok=True)
+                Path(self.env["DIRENV_APPROVAL"]).unlink(missing_ok=True)
+                search_path = list(sys.path)
+                record = copy_record.record_path(checkout)
+                self.assertEqual(record, checkout.parent / copy_record.TEMPORARY_GATE_RECORD
+                                 if temporary_gate else checkout / copy_record.RECORD)
+                self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+                self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+                self.assertEqual(sys.path, search_path)
+                # The recorded commit determines approval, including after source edits.
+                _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
+                outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
+                self.assertIsInstance(outcome, nix_env.Loaded)
+                if not isinstance(outcome, nix_env.Loaded):
+                    self.fail(str(outcome))
+                self.assertEqual(outcome.env["IN_NIX_SHELL"], "impure")
+                self.assertEqual(self.direnv_calls(), [
+                    {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
+                    {"args": ["export", "json"], "cwd": str(checkout)}])
 
-        # The standalone helper must find scratch even when started in the copy.
-        Path(self.env["DIRENV_APPROVAL"]).unlink()
-        result = subprocess.run(
-            [str(ROOT / "scripts/lib/py"), "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
-            env={**self.env, "DIRENV_DENY": "1"}, capture_output=True, text=True,
-            timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        environment = cast(dict[str, str], json.loads(result.stdout))
-        self.assertEqual(environment["IN_NIX_SHELL"], "impure")
+                # A separate process must find the record from the checkout.
+                Path(self.env["DIRENV_APPROVAL"]).unlink()
+                result = subprocess.run(
+                    [str(ROOT / "scripts/lib/py"), "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
+                    env={**self.env, "DIRENV_DENY": "1"}, capture_output=True, text=True,
+                    timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                environment = cast(dict[str, str], json.loads(result.stdout))
+                self.assertEqual(environment["IN_NIX_SHELL"], "impure")
+            if temporary_gate:
+                self.assertFalse(checkout.parent.exists())
 
     def test_registered_copy_with_edited_envrc_requires_explicit_approval(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        checkout = self.clone(repository)
-        self.register(repository, checkout)
-        _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
-        self.assert_explicit_approval_required(checkout)
+        for temporary_gate in (False, True):
+            with (self.subTest(temporary_gate=temporary_gate),
+                  self.registered_checkout(repository, temporary_gate=temporary_gate) as checkout):
+                _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
+                self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+                self.assert_explicit_approval_required(checkout)
 
     def test_copy_without_record_requires_explicit_approval(self) -> None:
         repository = self.repository(self.home / "rust/repo")
@@ -426,9 +457,11 @@ class RegisteredCopyTests(GitNixFixture):
 
     def test_copy_from_untrusted_source_requires_explicit_approval(self) -> None:
         repository = self.repository(self.root / "outside/repo")
-        checkout = self.clone(repository)
-        self.register(repository, checkout)
-        self.assert_explicit_approval_required(checkout)
+        for temporary_gate in (False, True):
+            with (self.subTest(temporary_gate=temporary_gate),
+                  self.registered_checkout(repository, temporary_gate=temporary_gate) as checkout):
+                self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+                self.assert_explicit_approval_required(checkout)
 
     def test_source_commit_without_envrc_requires_explicit_approval(self) -> None:
         repository = self.repository(self.home / "rust/repo")

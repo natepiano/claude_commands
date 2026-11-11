@@ -438,7 +438,7 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - **Lock order.** The notifier takes its own lock only around its state edits and releases it before running a stored command, so a notifier call made under the record lock cannot deadlock with a firing job.
 - **`line` and the job.** `line` calls `ensure_job` outside the lock. A job it re-creates for a watch closed in that instant removes itself at its next run.
 - **Module names.** Repository imports use package-qualified names.
-  Buildlog uses `scripts.buildlog.record`; shutdown uses `scripts.shutdown.shutdown_record`.
+  Buildlog uses `scripts.buildlog.record`; shutdown uses `scripts.agents.shutdown_record`.
   These modules retain separate identities.
 - **basedpyright** exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 - **Import environment.** Test modules import the migration checker through `scripts.bevy_migration_plan`.

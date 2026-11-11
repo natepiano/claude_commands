@@ -2,6 +2,7 @@
 
 The account tools separate provider identity from shared configuration and conversations.
 Claude groups and Codex workers select numbered accounts through one role map.
+Producers use the group account for their configured family.
 Both machines use that map, but each machine keeps its own sign-in state.
 Account moves preserve conversations and worker threads.
 Git filters keep machine-local settings outside promoted configuration.
@@ -33,7 +34,7 @@ Loading the same module under two names creates distinct runtime types and break
 The agent-notes job runs notes, quota alerts, pacing, refusal moves, and unit recovery as separate parts.
 `scripts/maintenance/agent_notes_job.py` owns that job.
 `config/agent_notes.toml` supplies its schedules and process limits.
-Herdr layout saves and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
+Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
 
 ## Account identity and storage
@@ -79,6 +80,9 @@ The [trust guide](../accounts.md#trusted-worktrees) describes configured project
 Natedev owns the role map for both machines.
 The map contains the Claude groups `units` and `showrunners`, the Codex `workers` account, and an optional timed Claude worker route.
 Both Claude groups may select the same account.
+Codex producers use the workers account.
+Claude producers use the showrunners account.
+`[producers]` in `config/models.conf` selects each producer's family, model, and effort.
 An absent selection stays unconfigured until an explicit move selects it.
 Status, launch, and preview reads never create a selection.
 
@@ -133,19 +137,60 @@ The [launch environment](nix-shell-launch.md) describes shared Nix setup and acc
 Account moves use the shared stop and resume API.
 Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 Each attempt has its own move ID and cause.
-A session already on the target writes nothing.
+A session proved live on the target writes nothing.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
 The notes timer delegates its moves through the same boundary before its part deadline can kill them.
+For workers, the notes job writes the role and starts the moves in their own process.
+The request stays pending until the detached process ends.
+A later notes pass starts an unfinished move again; workers already on the target stay unchanged.
+The detached process confirms registered requests for its final target, with the target home.
+It fails registered requests for other targets with `superseded by <label>`.
+Replay consumes the queued entry after either completion result.
+Each worker row records its own move result.
+Worker refusals do not keep the group request open.
+The next assign moves a refused or stopped worker to the selected account, so a lasting anomaly cannot cause endless group retries.
+One `accounts-workers-move` unit serves every target.
+The runner reads the role before each worker and repeats after a changed final role.
+A run lock serializes worker moves, including the fallback without systemd.
+Direct Codex worker moves use this runner and read the selected role before each worker.
+Both direct preview and execution refuse a Codex target that differs from the workers role.
+The refusal says `workers role is <role>; run accounts.py swap workers <codexN> to select it`.
+The swap preview shares the worker preview helper and can show a new target without changing the role.
+Claude worker moves use this runner with a fixed Claude label under the same run lock.
+Only Codex moves read or complete pending group requests and their marker.
+A short schedule lock protects startup, the pending marker, the final role check, and group completion.
+Both locks use `file_lock.exclusive`.
+The marker is `~/.local/state/accounts/workers_move.json`.
+Startup writes the role and marker while it holds the schedule lock.
+A new handoff during unit exit retains this marker for the next notes pass.
+A failed start leaves the request pending; the existing blocked-entry notice reports the cause once.
 Requests use each session's observed process account, including members outside their selected group account.
 Blocked notices check the queue head and target again before delivery.
 Quota recipients use one session address for both names and IDs.
 Workers keep their threads when their Claude owner moves.
+An assignment compares the process account home with the selected account home for Claude and Codex.
+It uses one process environment read for this check and the run check.
+An unreadable environment permits reuse only for a worker whose pass is active in the current run.
+A different account follows the existing close checks, stop, and resume in the same pane.
+Workers moves and previews omit workers of the other family.
+The preview shares the move decision and lists idle panes that would close, workers that would resume, and refusals with each reason.
+One count line covers workers with nothing to move.
+These include closed workers without an active dispatch, workers without a current session, and workers already on the target.
 
 A group move validates the destination before changing the selection or stopping members.
-It selects the account for future launches and moves live off-target members.
+It selects the account for future launches and moves live members on other accounts.
+A workers swap also selects eligible Codex producers.
+A showrunners group move also selects eligible Claude producers.
+`eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
+`producer_settings` returns `LaunchSettings` or `InvalidProducerSettings`.
+One `settings_report_scope` limits each producer's invalid-settings warning to one per operation.
+A repeated move selects a stopped producer even when its home already names the target.
+Only proof that the producer runs on the target permits a skip.
+Unreadable live account evidence prevents the stop, start, and home change.
+The [producer launch contract](shutdown-and-restart.md#producer-launch-and-admission) defines the shared move and publication checks.
 An empty group can still select its account.
 Each member has an independent result.
 A single-session move refuses a grouped session and names the group operation.
@@ -179,9 +224,35 @@ Without a queued workers move, provider refusal or unavailable included usage ca
 Credit policy determines whether an exhausted account can continue.
 Worker assignment fallback to Claude remains separate from the selected Codex account.
 Routing returns only when the selected Codex account can work and its refusal has resolved.
-Pane workers move through their dispatch lock, fresh pane evidence, `restart.stop_row`, and `worker_panes.start_or_resume`.
-They keep the same conversation and reuse a stopped pane.
-Only an open pass receives resume text through the shared target check.
+An owned workers refusal with no account capacity enables `no_worker_mode` on the workers-role host, `role_map.ROLE_MAP_HOST`.
+The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
+The saved flag triggers one broadcast to showrunners and unit directors on both machines.
+`config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
+The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
+Successful Codex recovery clears the flag and broadcasts OFF after the workers account and assignment restoration succeed.
+Recovery also clears the flag when no Claude assignment fallback was saved.
+An unfinished Claude switch or failed restoration retains the flag until recovery can finish.
+The state context saves each flag change and releases the lock before it starts a separate broadcast unit.
+The start uses `systemd-run --user --collect --quiet --no-block` with the user manager's environment.
+The unit uses the repository working directory and `scripts/lib/py` to run `scripts/production/broadcast.py`.
+The quota pass waits only for the unit start, so slow peer delivery cannot consume its 30-second budget.
+A failed unit start logs one failure line and has no retry.
+The separate unit records later delivery output in its journal.
+A refresh that clears the flag reports `notes refreshed; workers-back notice sent`.
+The flag survives state reloads and suppresses repeated ON notices during the same episode.
+`agent-notes.timer` starts `agent-notes.service` 30 seconds after the preceding service finishes, with one-second timer accuracy.
+`scripts/maintenance/agent_notes_job.py` runs its quota part after the notes part.
+`config/agent_notes.toml` sets the quota and notes intervals to 120 seconds.
+Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
+This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
+Pane workers move under their dispatch lock with fresh pane evidence.
+An idle worker without an active dispatch closes its pane through `worker_panes.close` and keeps its conversation.
+The move writes no journal row for that worker.
+The next assign resumes it on the group account.
+A busy worker uses `restart.stop_row` and `worker_panes.start_or_resume` to keep its conversation and pane.
+A stopped worker with an active dispatch resumes in the same pane.
+A closed worker without an active dispatch has nothing to move.
+Only an active or refused pass receives resume text through the shared target check.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
@@ -233,6 +304,10 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, problems, and session input paths.
+Each account row exports `sessions` beside `role_counts`.
+Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
+The list reuses local count observations and reads no pane again.
+Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
 Status attributes a session to its account independently of the current role selection.
 This preserves visible off-target members during a move.
@@ -242,6 +317,8 @@ Local role counts read the registry, staff, pane launches, and worker records wi
 An exit record takes precedence over a pause record.
 A missing live session gives `exited`; live activity gives `busy` or `idle`.
 The workers role retains only `busy` and `idle`.
+Claude producers count under `showrunners` with the same hold and activity rules.
+Without a live session, they count on the selected showrunners account.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.
@@ -253,7 +330,7 @@ The board sums available machine counts and identifies an unavailable peer.
 `status --stored` reads saved usage, role maps, and peer counts.
 It does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
-The [board design](unit-board.md) owns the display contract and refresh lifecycle.
+The [pane design](accounts-queue-panes.md) owns the display contract and refresh lifecycle.
 
 Account notes use numbered filenames.
 Each note shows its roles and live session count.

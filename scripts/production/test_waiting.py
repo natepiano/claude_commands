@@ -33,7 +33,7 @@ from scripts.production import add_unit
 from scripts.production import dailies_render
 from scripts.production import merge_checkpoint
 from scripts.production import production_doc, staff
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 from scripts.production.fake_showrunner import write_timer
 from scripts.production import update_registration
@@ -523,7 +523,7 @@ class WaitingTests(unittest.TestCase):
         self.assertLess(verdict.index("stdout first"), verdict.index("stderr second"))
         self.assertLess(verdict.index("stderr second"), verdict.index("stdout third"))
 
-    def test_scratch_uses_no_worktree_cleanup_and_reuses_the_checkout(self) -> None:
+    def test_scratch_uses_no_worktree_cleanup_and_reuses_the_cache(self) -> None:
         _ = self.commit(self.alpha, "alpha.txt", "unit work\n")
         _ = self.commit(self.checkout, "merged.txt", "merge branch work\n")
         self.push_scratch_branches()
@@ -543,7 +543,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         wrapper.chmod(0o755)
         self.env["WAITING_TEST_REAL_GIT"] = real_git or "git"
         observed = self.state / "checkout-paths"
-        command = f"pwd -P >> {shlex.quote(str(observed))}; printf 'green marker\\n'"
+        command = f"pwd -P >> {shlex.quote(str(observed))}; realpath target >> {shlex.quote(str(observed))}; printf 'green marker\\n'"
         result = self.run_waiting("scratch-test", ALPHA, "--tests", command,
                                   "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -554,8 +554,11 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
                                   "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         paths = observed.read_text().splitlines()
-        self.assertEqual(len(paths), 2)
-        self.assertEqual(paths[0], paths[1])
+        self.assertEqual(len(paths), 4)
+        self.assertNotEqual(paths[0], paths[2])
+        self.assertFalse(any(Path(paths[index]).exists() for index in (0, 2)))
+        self.assertEqual(paths[1], paths[3])
+        self.assertTrue(Path(paths[1]).is_dir())
 
     def test_scratch_post_use_failure_preserves_green_and_red_verdicts(self) -> None:
         from scripts.copies import copies
@@ -566,18 +569,17 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         mark = copies.mark_target
         for code, verdict in ((0, "ok — green"), (7, "failed — red")):
             with self.subTest(code=code):
-                calls = 0
+                used = self.state / "gate-command-finished"
+                used.unlink(missing_ok=True)
 
                 def fail_after_use(tree: Path) -> None:
-                    nonlocal calls
-                    calls += 1
-                    if calls == 2:
+                    if used.exists():
                         raise OSError("cache marking refused")
                     mark(tree)
 
                 with mock.patch.object(copies, "mark_target", side_effect=fail_after_use):
                     result = self.run_waiting("scratch-test", ALPHA, "--tests",
-                                              f"printf 'tests ran\\n'; exit {code}",
+                                              f"printf 'tests ran\\n'; touch {shlex.quote(str(used))}; exit {code}",
                                               "--state-dir", str(self.state))
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 lines = result.stdout.splitlines()
@@ -695,57 +697,77 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(seen, {f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {"requested": True}})
 
     def test_eta_request_waits_for_its_state_lock(self) -> None:
-        # The child proves it reached the held lock, rather than racing startup
-        # against a short wait(). Keep the real blocking flock after the signal.
-        program = """import fcntl, os, runpy, sys
+        for unrelated in (False, True):
+            with self.subTest(unrelated=unrelated):
+                (self.state / "eta_seen.json").unlink(missing_ok=True)
+                # The child reports the selected lock before it waits for its release.
+                program = """import fcntl, os, runpy, sys
 ready = int(sys.argv.pop(1))
+target = os.stat(sys.argv.pop(1))
+unrelated_path = sys.argv.pop(1)
+reported_unrelated = False
 sys.argv.pop(0)
 original = fcntl.flock
 def observed_lock(fd, operation):
-    if operation == fcntl.LOCK_EX:
+    global reported_unrelated
+    identity = os.fstat(fd if isinstance(fd, int) else fd.fileno())
+    if operation == fcntl.LOCK_EX and os.path.samestat(identity, target):
         try:
             original(fd, operation | fcntl.LOCK_NB)
         except BlockingIOError:
             os.write(ready, b'blocked')
         else:
             raise RuntimeError('expected the parent to hold the state lock')
-    return original(fd, operation)
+    result = original(fd, operation)
+    if (operation == fcntl.LOCK_EX and not reported_unrelated and os.path.exists(unrelated_path)
+            and os.path.samestat(identity, os.stat(unrelated_path))):
+        os.write(ready, b'other!!')
+        reported_unrelated = True
+    return result
 fcntl.flock = observed_lock
 runpy.run_path(sys.argv[0], run_name='__main__')
 """
-        lock_path = self.state / "eta_seen.json.lock"
-        read_ready, write_ready = os.pipe()
-        try:
-            with lock_path.open("a+") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                process = subprocess.Popen(
-                    [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
-                     "eta-request", ALPHA, "--phase", PHASE,
-                     "--production", "showrunner-example", "--state-dir", str(self.state)],
-                    cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                )
-                os.close(write_ready)
-                write_ready = -1
+                records = self.state / "pane-records"
+                if unrelated:
+                    records.mkdir(exist_ok=True)
+                    _ = (records / "agents.json").write_text("{}")
+                self.env["HERDR_PANE_RECORD_DIR"] = str(records)
+                lock_path = self.state / "eta_seen.json.lock"
+                read_ready, write_ready = os.pipe()
                 try:
-                    readable, _, _ = select.select([read_ready], [], [], 300)
-                    self.assertEqual(readable, [read_ready], "child never reached the held lock")
-                    if os.read(read_ready, 7) != b"blocked":
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.fail("child exited before observing the state lock: " + stdout + stderr)
-                    self.assertIsNone(process.poll())
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                    stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    with lock_path.open("a+") as lock:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                        process = subprocess.Popen(
+                            [sys.executable, "-c", program, str(write_ready), str(lock_path),
+                             str(records / ".publication.lock") if unrelated else str(self.state / "unused.lock"), str(SCRIPT),
+                             "eta-request", ALPHA, "--phase", PHASE,
+                             "--production", "showrunner-example", "--state-dir", str(self.state)],
+                            cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        )
+                        os.close(write_ready)
+                        write_ready = -1
+                        try:
+                            readable, _, _ = select.select([read_ready], [], [], 300)
+                            self.assertEqual(readable, [read_ready], "child never reached the held lock")
+                            if unrelated:
+                                self.assertEqual(os.read(read_ready, 7), b"other!!")
+                            if os.read(read_ready, 7) != b"blocked":
+                                stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                                self.fail("child exited before observing the state lock: " + stdout + stderr)
+                            self.assertIsNone(process.poll())
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                            stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 finally:
-                    if process.poll() is None:
-                        process.kill()
-                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        finally:
-            os.close(read_ready)
-            if write_ready != -1:
-                os.close(write_ready)
-        self.assertEqual(process.returncode, 0, stdout + stderr)
-        self.assertIn(f"request /unit:eta: {ALPHA}", stdout)
+                    os.close(read_ready)
+                    if write_ready != -1:
+                        os.close(write_ready)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn(f"request /unit:eta: {ALPHA}", stdout)
 
     def test_waits_accepts_unconfigured_berth_and_still_reports_log_waits(self) -> None:
         now = datetime(2026, 10, 14, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles"))

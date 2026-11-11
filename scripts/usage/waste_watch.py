@@ -31,7 +31,7 @@ from scripts.usage import collect, outcomes, usage_report, weights
 from scripts.usage.agents_log import state_dir
 from scripts.usage.usage_report import UnitWorktree
 from scripts.production import session_staff, showrunners, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.message import send_budget, session_send
 from scripts.lib.codex_models_cache import ModelsCacheUnreadable, read_models_cache
 

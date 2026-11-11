@@ -14,7 +14,13 @@ A held target admits only work that its hold rules permit.
 
 ### Targets: `config/build_targets.conf` and `scripts/build_targets/target_config.py`
 
-- The config is in the `key=value` form `scripts/lib/conf.py` reads. `targets=mac,natedev,aws` lists the targets in the order a job tries them. natedev is `kind.natedev=local`, `platform.natedev=linux`. AWS is `kind.aws=ssh`, `platform.aws=linux`, `settings.aws=aws_target.conf`. The Mac is `kind.mac=ssh`, `platform.mac=macos`, `settings.mac=mac_test.conf`; its own settings (host, mirror, size budgets, CI switch, disk floor, `linux_only.<repo>`) stay in `config/mac_test.conf`.
+- `scripts/lib/conf.py` reads the config as `key=value` lines.
+  `targets=mac,natedev` lists the shipped targets in selection order.
+  natedev uses `kind.natedev=local` and `platform.natedev=linux`.
+  The Mac uses `kind.mac=ssh`, `platform.mac=macos`, and `settings.mac=mac_test.conf`.
+  `config/mac_test.conf` retains the Mac settings.
+  The user removed the permanent AWS builder.
+  Cloud gates remain separate from this target registry.
 - `target_config.py` reads configuration through `scripts.lib.conf` without importing coordination state readers.
   `LocalTarget(name, platform)` and `SshTarget(name, platform, settings)` form the `Target` union.
   `Platform` is `linux` or `macos`. `ConfigError` aliases `conf.Unusable`.
@@ -25,7 +31,15 @@ A held target admits only work that its hold rules permit.
   `BUILD_TARGETS_CONFIG` selects private test configuration.
 
 - `targets.py` re-exports those names, so callers import them from one place. `build_hold.py` imports `read_targets` from `target_config` directly; going through `targets` would form the import cycle `build_hold` → `targets` → `build_hold`.
-- A new `ssh` target is a new entry plus its own settings file, and it reuses the same runner (probe, copy, run, release). `mac_test.state_paths(target)` gives each target its own claim, block and backoff state: the Mac keeps `~/.local/state/mac-test`, and every other target uses `~/.local/state/build-targets/<target>/`. The AWS target is one such entry; see [builds-aws-target.md](builds-aws-target.md).
+- A new `ssh` target needs a registry entry and its own settings file.
+  It reuses the configured runner for probes, copies, execution, and release.
+  `mac_test.state_paths(target)` resolves each registered target's claim, block, and backoff state.
+  The Mac uses `~/.local/state/mac-test`.
+  Other targets use `~/.local/state/build-targets/<target>/`.
+  `BUILD_TARGETS_STATE_DIR` changes the root, and tests use it.
+  The former AWS target has no shipped registry entry.
+  Cloud gates and teardown read the AWS state folder without target registration.
+  [AWS cloud gates and the former build target](builds-aws-target.md) describes that state.
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
@@ -45,7 +59,7 @@ Every command checks holds through `target_state`. The sole holder may run its o
 | `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `; a held or running part whose holder session resolves adds ` (showrunner <name>, unit <name>)` after `since <HH:MM>`, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
 | `eligible --repo-root <p> --package <n> [--local <why>] [--kind <kind>] [--target <name>]` | Each target row has five tab-separated fields: name, eligibility, reason, settings path and platform. Eligibility is `eligible` or `excluded`. An eligible target has reason `-`. An SSH target has its settings path and platform (`macos` or `linux`). A local target has `-` for settings and platform. Errors print `build targets: <error>` and exit 2. |
 | `register-local --call-id <id> --pid <pid>` | A nonblocking hold check for routing. Stores no call record. |
-| `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force; release events wake it at once, with 15 s polling as a fallback. Prints the holder once and the 2 h notice once. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
+| `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force. Release events wake it at once; polling checks every 15 s as a fallback. Prints the holder once and the 2 h notice once. An unmatched run adds `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.` Without a session, it adds `<speaker>: build has no session; waits on <holder> hold for <purpose>.` It prints this line once and sends the same line to the holder once. `hold_sender_timeout_seconds` limits the send to 30 seconds by default. A failed send prints `<speaker>: could not tell <holder>: <reason>` and the wait continues. A timeout reason names the limit in seconds. Invalid sender bytes use replacement characters. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
 | `check-local [--caller <name>]` | A nonblocking hold check. Without a caller, records a refused launch session for its release notice. |
 | `interrupt-local --call-id <id> [--signal INT\|TERM]` | Signals a running `wait-local` for that call, checked by pid and process-start identity. |
 
@@ -74,7 +88,15 @@ Without a matching row, `target_platform` returns no answer and status 1.
 
 ### Hold checks and release
 
-- `owning_session() -> OwningSession(session_id) | NoOwningSession` names the session a call's build is credited to: the session whose active-run marker under `/tmp/claude/unit/active` or `/tmp/claude/delegate/active` (`UNIT_ACTIVE_DIR` replaces both) holds the call's run (`UNIT_RUN_DIR`, else `UNIT_SESSION_DIR`, compared as an exact string, newest marker first), else `CLAUDE_CODE_SESSION_ID`, else none. The marker comes first because a Codex worker's shell carries the id of the session that started its Codex server, and that id goes stale when the session restarts.
+- `run_resolution(environment) -> RunOwner(session_id) | NoRunNamed | RunNotInStaff(run: Path)` reads the staff row whose open run matches the call's run folder.
+  It checks `UNIT_RUN_DIR`, `PLAN_DELEGATE_BOARD_DIR`, `UNIT_SESSION_DIR`, and `PLAN_DELEGATE_SESSION_DIR` in that order, with exact path text.
+  A matching row with `current_session` returns `RunOwner`.
+  No run variable returns `NoRunNamed`.
+  An unmatched run or an unreadable staff snapshot returns `RunNotInStaff`.
+  `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
+  A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
+  Without either session, `owning_session` returns `NoOwningSession`.
+  A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
 - After the last holder file is gone, each recipient gets one release notice. No answer or allocation is awaited. The result names failed or unconfirmed deliveries: `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
@@ -90,7 +112,7 @@ The target table supplies each remote target's platform.
 3. Run other steps on the first eligible target in configured order.
 
 `test`, `check`, `doc`, `example`, and lint judgments use this order from their first step.
-The default order is Mac, natedev, AWS.
+The default order is Mac, then natedev.
 `--target <name>` pins movable steps to one target and waits for it.
 `--mac "<reason>"` pins movable steps to the Mac.
 `--local "<reason>"` pins all steps to natedev.
@@ -150,7 +172,12 @@ It saves no pass because a saved pass describes this machine.
 
 ### Installed-script guard: `scripts/build_hold/override_guard.sh` and `override_guard.py`
 
-- An installed script stops with one line on stderr and exit 2 when any of `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `MAC_TEST_STATE_DIR`, `MAC_TEST_CONFIG`, `BUILD_TARGETS_SCRIPT`, `BUILD_TARGETS_CONFIG`, `BUILD_TARGETS_NOW`, `UNIT_ACTIVE_DIR` is in the environment (an empty value included), or when `HOME` is set and is not the password database's home. A checkout's script runs with them, so tests keep their overrides.
+- An installed script writes one line to stderr and exits 2 when a guarded override is set, including an empty value.
+  The guard checks `ADMISSION_SOCKET`, `CONF_DIR`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `MAC_TEST_STATE_DIR`, and `MAC_TEST_CONFIG`.
+  It also checks `BUILD_TARGETS_SCRIPT`, `BUILD_TARGETS_CONFIG`, and `BUILD_TARGETS_NOW`.
+  It refuses a `HOME` value that differs from the account home.
+  A checkout's script accepts the overrides for tests.
+  Run ownership comes from the staff row's `run` field.
 - "Installed" means the same file (device and inode, links followed) as `<home>/.claude/scripts/<fixed path>`, where `<home>` comes from the password database, never from `HOME`. Shell uses `[[ a -ef b ]]`, Python `os.path.samefile`.
 - The line: `<file>: <NAME> is set to '<value>'; the installed scripts under <home>/.claude/scripts do not run with it. Unset it and run again.` The shell guard also refuses every script when `HOME` is read-only in the shell.
 - `override_guard.sh` is sourced, bash 3.2 syntax, builtins only. `verify.sh` and `memory_gate.sh` source it first, above any line that reads `HOME`, and call `build_override_refusal "${BASH_SOURCE[0]}" <path under scripts/> || exit 2`. Status 2 is also how a PreToolUse hook blocks its tool call, so the launch hook blocks with no code of its own.
@@ -454,7 +481,19 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - Remote commands use a non-login SSH shell outside the development checkout. They must set `MACOSX_DEPLOYMENT_TARGET` explicitly.
 - Below macOS 12.0, Swift concurrency linkage can fail at load. A changed deployment target requires a rebuild.
 - Guard limits: a checkout or any other copy of the scripts accepts the variables, so a worker that runs a copy still passes a hold. Report-only programs and variables outside the list (`VERIFY_MAC_RUNNER`, `LINT_CONFIG_READER`, `MAC_TEST_SESSIONS`, `MAC_TEST_SEND`, the `BUILDLOG_HOLD_*` files) are not guarded. A shell caller started through a link outside `scripts/` looks for `override_guard.sh` beside the link and stops with status 2.
-- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Shared test support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import. From the installed scripts it raises one error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` The home comes from the account database and links are followed. Run the suites from a worktree; the check does not skip tests. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
+- Tests use private `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `STAFF_FILE`, and run folders.
+  They clear `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`.
+  A fixture that reaches installed scripts through the real `HOME` can change the live release record.
+  Shared support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import.
+  Installed scripts raise this error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.`
+  The guard gets the home from the account database and follows links.
+  Run the suites from a worktree.
+  The guard does not skip tests.
+  Tests change `cycle.json` under `release_lock()` through `change_cycle`.
+  Tests that write hold events use a private `BUILDLOG_DIR`.
+  They wait for the detached recorder before they check that no further event appears.
+  The complete `scripts/direct` suite takes about 12.5 minutes.
+  It also checks sibling imports when tests import a module as `scripts.<dir>.<file>`.
 - The test stand-in for `mac_run.sh` answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the bundle-path cases depend on that.
 
 ## Why
@@ -527,7 +566,7 @@ It returns failure when the hash command fails.
 `lint_code_key` uses framed present or absent file bytes under `pipefail`.
 An unreadable file gives an empty key and a cache miss.
 
-`VERIFY_PY_TRACE=<file>` records one row per helper: helper name, wall milliseconds, and CPU milliseconds.
+`VERIFY_PY_TRACE=<file>` records one row per helper call: helper name, wall milliseconds, and CPU milliseconds.
 The CPU value excludes child processes.
 Inline helpers use `VERIFY_PY_HELPER` as their name.
 The trace runner records at exit, exec, or SIGTERM and preserves the signal status.
@@ -671,3 +710,30 @@ Other refused answers retain their refusal.
 The pinned interval closes before execution starts, and a remote reservation closes the Cargo-token interval.
 Pinned routing skips the ordinary remote retry delay.
 Token wait timestamps read `scripts/lib/user_zone.py` directly and need no `USER_ZONE_SCRIPT` variable.
+
+
+## Synchronous verify helpers
+
+`verify.sh` starts `verify_helper.py` with `coproc` before its first synchronous helper call.
+The helper imports each Python program once and calls its existing `main` on the main thread.
+Each request carries the arguments, environment, working directory, and input text.
+The helper restores this state after each call.
+It returns the exit status and captured output to the caller.
+The helper replays stderr when each call ends.
+The helper exits when its input pipe closes.
+Group signals can also end the helper.
+On Linux, the kernel sends SIGKILL to the helper when its parent exits.
+The helper checks its parent again after it sets this Linux option.
+It also checks for a changed parent after each one-second input timeout.
+Its idle process holds no caller output pipe.
+
+The background tree watcher keeps its own PID and signal handlers.
+The detached step recorders from `invoke.sh` also keep their own processes.
+Shell fixtures and scripts without `main` use their original process path.
+A failed helper request also uses that path.
+The change does not wrap or re-execute `verify.sh`.
+
+`VERIFY_PY_TRACE` retains one timing row for each helper call.
+The adjacent `.calls` file records each shared call's program file name and first argument, separated by a tab.
+Fallback calls appear only in the interpreter wrapper's observations.
+Calls inside `verify_helper.py` therefore remain visible without claiming another process start.

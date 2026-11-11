@@ -16,7 +16,7 @@ from unittest import mock
 
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 copy_to_mac = cast(Callable[..., None], getattr(staff, "_copy_to_mac"))
 
@@ -177,8 +177,7 @@ class MacCopyTests(StaffTestCase):
         copy_to_mac(detached=False)
         arguments, options = self.runner.sends[0]
         self.assertEqual(arguments[:-1], [
-            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "mac",
+            "ssh", "-o", "BatchMode=yes", "mac",
         ])
         command = arguments[-1]
         self.assertIn('directory="$HOME/.local/state/staff"', command)

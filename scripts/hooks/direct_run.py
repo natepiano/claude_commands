@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""Whether a /unit:direct run is currently active in a given Claude session.
+"""Read the open unit run from the director's staff row.
 
-`prepare_session.sh` drops a marker file named for `CLAUDE_CODE_SESSION_ID`
-(verified identical to the `session_id` in every hook payload) holding the
-unit session directory. `end_session.sh` removes it. Anything that needs to
-know "is this session mid-unit-run" reads the marker.
-
-Markers are in /tmp and a killed run never removes its own, so a run with no
-write inside MAX_AGE_SECONDS is treated as debris rather than an active run.
-Staleness is judged from the session directory's own contents, never from the
-marker's mtime -- see `_recently_active`.
+A run remains active while its own files have recent writes.
 """
 
 from __future__ import annotations
@@ -26,9 +18,6 @@ from typing import cast
 from scripts.lib import unit_runs
 from scripts.direct.worker_state import worker_status_paths
 
-# A test's own marker folder; unset, the marker is under either run-folder name.
-ACTIVE_OVERRIDE = unit_runs.environ("ACTIVE_DIR") or None
-
 # Long enough to span a slow worker build plus the user's time at a gate, short
 # enough that yesterday's abandoned run cannot block today's turns. It bounds
 # silence, not total run length: a multi-day run stays active as long as it keeps
@@ -36,20 +25,8 @@ ACTIVE_OVERRIDE = unit_runs.environ("ACTIVE_DIR") or None
 MAX_AGE_SECONDS = 12 * 60 * 60
 
 
-def marker_path(session_id: str) -> Path:
-    return unit_runs.marker(session_id, ACTIVE_OVERRIDE)
-
-
 def _recently_active(session_dir: Path) -> bool:
-    """True when the run itself wrote something inside MAX_AGE_SECONDS.
-
-    Liveness is read from the session directory, never from the marker's own
-    mtime. `prepare_session.sh` stamps the marker once at run start and nothing
-    refreshes it, so marker age measures how long ago the run *began* -- which
-    made every run silently unrecognizable to its own hooks twelve hours in,
-    while it was still writing state every few seconds. What actually stops
-    moving when a run dies is the run's own files.
-    """
+    """Return true when the run has a file written within MAX_AGE_SECONDS."""
     try:
         newest = max(
             (entry.stat().st_mtime for entry in session_dir.iterdir() if entry.is_file()),
@@ -65,12 +42,11 @@ def _recently_active(session_dir: Path) -> bool:
 def active_run(session_id: str) -> Path | None:
     """The unit session directory for an active run, or None."""
     try:
-        recorded = marker_path(session_id).read_text(encoding="utf-8").strip()
+        session_dir = unit_runs.open_run(session_id)
     except OSError:
         return None
-    if not recorded:
+    if session_dir is None:
         return None
-    session_dir = Path(recorded)
     return session_dir if _recently_active(session_dir) else None
 
 

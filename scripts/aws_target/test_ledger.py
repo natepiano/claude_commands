@@ -153,6 +153,23 @@ class LedgerTests(CostFixture):
         self.running(self.start)
         self.assertEqual(self.estimate(self.start + 3600).monthly.usd, Decimal("0.625"))
 
+    def test_daily_spend_preserves_provisional_bill_state(self) -> None:
+        self.inventory(self.start - 86400)
+        self.observe(self.start - 86400, 'stopped')
+        reading = ledger.ChargeRead('2026-01-14', self.start, self.start - 86400, self.start,
+            Decimal(1), Decimal(0), Decimal(0), (ledger.UsageTypeCost('storage', Decimal(1)),))
+        directory = self.state / 'charges'
+        directory.mkdir()
+        for provisional in (True, False):
+            with self.subTest(provisional=provisional):
+                _ = (directory / '2026-01-14.json').write_text(json.dumps(
+                    ledger.charge_record(replace(reading, provisional=provisional))))
+                days = {row.day: row for row in self.book.spend_days(config.read_settings(self.settings), self.start + 120)}
+                self.assertEqual(days['2026-01-14'].provisional_bill, provisional)
+                self.assertEqual(days['2026-01-14'].source, 'AWS bill')
+                self.assertFalse(days['2026-01-15'].provisional_bill)
+                self.assertEqual(days['2026-01-15'].source, 'estimated from the newest bill')
+
     def test_gate_cap_uses_bills_and_reprices_existing_boxes(self) -> None:
         now = self.start + 120
         self.inventory(self.start - 86400)

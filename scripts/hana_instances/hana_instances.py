@@ -137,7 +137,7 @@ def local_processes(
 ) -> list[HanaProcess]:
     if environment_reader is None:
         # Phase 43 uses this existing reader; its owning module keeps the private name.
-        from scripts.shutdown.inventory import _process_environment  # pyright: ignore[reportPrivateUsage]
+        from scripts.agents.inventory import _process_environment  # pyright: ignore[reportPrivateUsage]
         environment_reader = _process_environment
     current = time.time() if now is None else now
     boot = next(float(line.split()[1]) for line in (proc_root / "stat").read_text().splitlines() if line.startswith("btime "))
@@ -175,7 +175,8 @@ def elapsed_seconds(value: str) -> float:
 
 
 def darwin_environment(pid: int) -> dict[str, str]:
-    from scripts.herdr.herdr import HerdrFailure, darwin_process_environment
+    from scripts.herdr.herdr import darwin_process_environment
+    from scripts.herdr.herdr_types import HerdrFailure
     try:
         return darwin_process_environment(pid)
     except HerdrFailure as error:

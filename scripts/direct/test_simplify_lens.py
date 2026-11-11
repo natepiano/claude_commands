@@ -7,11 +7,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import unittest
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -40,10 +40,10 @@ class DailySimplifyTests(NixFixture):
         self.calls = self.root / "claude_calls.jsonl"
         self.env.update({
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-            "CLAUDE_PYTHON": sys.executable, "CLAUDE_CONFIG_DIR": str(self.home / ".claude1"),
+            **interpreter_cache_environment(self.root / "cache"), "CLAUDE_CONFIG_DIR": str(self.home / ".claude1"),
             "USAGE_STATE_DIR": str(self.root / "usage"), "USER_ZONE": "America/New_York",
             "AGENT_NOTES_DIR": str(self.root / "notes"),
-            "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"), 
             "SIMPLIFY_TEST_CALLS": str(self.calls), "SIMPLIFY_TEST_NOW": "2026-11-06T03:30:00+00:00",
             "TMPDIR": str(self.root / "tmp"),
         })

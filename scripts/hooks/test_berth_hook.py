@@ -26,7 +26,7 @@ from scripts.production.staff_test_support import (  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
-DIRECTOR = "sid-director"
+DIRECTOR = fixture_runtime_id("sid-director")
 RESERVATION = "01a13f9c-0000-7000-8000-000000000001"
 RUN = "01a13f9c-0000-7000-8000-0000000000aa"
 HEAD = "0123456789abcdef0123456789abcdef01234567"
@@ -79,8 +79,6 @@ class BerthHookTests(unittest.TestCase):
         _ = subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "base"], check=True, capture_output=True)
         self.session_dir = self.root / "unit" / "run-1"
         self.session_dir.mkdir(parents=True)
-        (self.root / "unit" / "active").mkdir()
-        _ = (self.root / "unit" / "active" / DIRECTOR).write_text(f"{self.session_dir}\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         fake = self.bin_dir / "cargo-berth"
@@ -90,7 +88,7 @@ class BerthHookTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "CLAUDE_CODE_SESSION_ID": DIRECTOR,
-            "UNIT_ACTIVE_DIR": str(self.root / "unit" / "active"),
+            "STAFF_FILE": str(self.root / "unit" / "staff.json"),
             "FAKE_BERTH_LOG": str(self.root / "berth.log"),
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
@@ -101,6 +99,8 @@ class BerthHookTests(unittest.TestCase):
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repo)
+        owner = staff.update_current_session(owner.id, staff.native_id(DIRECTOR))
+        _ = staff.set_run(owner.id, staff.OpenRun(self.session_dir))
         self.owner_id = owner.id
         self.recorder_phases("15")
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)

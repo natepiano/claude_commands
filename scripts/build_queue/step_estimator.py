@@ -150,6 +150,10 @@ def _test_scope(argv: list[str], step: str) -> TestScope:
                           word.split("=", 1)[1] if "=" in word else next(arguments, ""))
             if TEST_PREDICATE.search(expression):
                 return "filtered"
+        elif option == "--run-ignored":
+            value = word.split("=", 1)[1] if "=" in word else next(arguments, "")
+            if value == "only":
+                return "filtered"
         elif word in TEST_OPTION_VALUES:
             _ = next(arguments, "")
         elif not word.startswith("-"):

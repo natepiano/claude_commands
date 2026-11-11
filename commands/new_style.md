@@ -11,7 +11,12 @@ description: Create a global or local style rule.
 
 ## Why the metadata matters
 
-`~/.claude/scripts/style/rules.py` reads the frontmatter. A style showrunner such as cargo-liner-style assigns a tier B, C or D rule to the unit of its family, from that unit's next ticket. No other step is needed. A rule with wrong metadata fails validation, and the whole catalog stops loading. A local rule without frontmatter also fails.
+`~/.claude/scripts/style/rules.py` reads the frontmatter.
+The production document's `Style units` table names the owner of each tier B, C or D family.
+Refill selects the new rule for that owner from its next ticket.
+One unit can own several families.
+A rule with wrong metadata stops the catalog from loading.
+A local rule without frontmatter also fails.
 
 ## Fields
 
@@ -75,5 +80,7 @@ A `partial` surface also makes every file a tier C read for the `uncovered` part
 ```
 
    The command exits 2 on a validation error and names the file. Fix the field it names. The new rule must appear with the tier, family and scope you wrote.
-7. Tell the user which unit gets the rule: the unit of its family, for tier B, C or D. A family's row in `~/.claude/docs/style_production.md` describes that unit's work. It does not control the assignment.
+7. For tier B, C or D, read the family's owner from the production document's `Style units` table.
+   Tell the user which unit gets the rule.
+   The Families table in `~/.claude/docs/style_production.md` sets work order, not ownership.
 8. Do not commit or push `~/rust/nate_style` until the user says go. For a local rule, commit only when the user asks.

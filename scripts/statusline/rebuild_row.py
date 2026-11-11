@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import quote
 
+from scripts.lib import conf_reads
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
 
@@ -115,7 +116,7 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
         ("natedev", expected.natedev if isinstance(expected, ExpectedSystems) else "",
          ["realpath", "/run/current-system"]),
         ("mac", expected.mac if isinstance(expected, ExpectedSystems) else "",
-         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", settings.ssh, "realpath /run/current-system"]),
+         ["ssh", "-o", "BatchMode=yes", settings.ssh, "realpath /run/current-system"]),
     ):
         running = run(command)
         if system_path(path) and system_path(running) and running != path:
@@ -137,7 +138,7 @@ class RebuildAnswer:
 
 def config_values(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in conf_reads.read_text(path).splitlines():
         key, sep, value = line.partition("#")[0].partition("=")
         if sep:
             values[key.strip()] = value.strip()

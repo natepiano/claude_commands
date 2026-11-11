@@ -12,6 +12,8 @@ from scripts.production import staff, showrunners
 
 
 WRAPPED = "> **Status: PRODUCTION — wrapped.**"
+DEMOTED = ("> **Status: ended {date}.** The user demoted this production to the one unit {child} under {parent}. "
+           "That unit's plan is `{plan}`. This doc is a record and no session reads it as live state.")
 
 
 class Refusal(Exception):

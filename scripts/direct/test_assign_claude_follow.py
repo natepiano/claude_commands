@@ -84,8 +84,8 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         old = self.recorded_worker(run)
         with isolated_staff_file(self.root / "staff.json", {}):
             identity = staff.native_id(fixture_runtime_id("Codex source with an unknown dispatch state"))
-            fixture_session(identity, staff.CodexBackend(self.root / ".codex"))
             row = staff.update_current_session(old.current_session, identity)
+            fixture_session(identity, staff.CodexBackend(self.root / ".codex"))
         source, evidence = transcript_fixture(row, staff.CodexBackend(self.root / ".codex"))
         _ = (run / "impl_worker_impl.json").write_text(json.dumps({"staff_id": row.id, "slot": "impl", "model": "gpt-6"}))
         record_path = worker_admission.switch_record_path(run, row.name)

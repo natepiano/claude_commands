@@ -30,7 +30,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
-from scripts.lib import unit_runs
 from scripts.build_hold import override_guard
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
@@ -358,28 +357,44 @@ class Busy:
     reasons: tuple[str, ...]
 
 
-def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
-    """Find the session that owns this run before using the shell's session id."""
+@dataclass(frozen=True)
+class RunOwner:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoRunNamed:
+    pass
+
+
+@dataclass(frozen=True)
+class RunNotInStaff:
+    run: Path
+
+
+def run_resolution(environment: Mapping[str, str] = os.environ) -> RunOwner | NoRunNamed | RunNotInStaff:
+    """Find the staff session that owns the named run."""
     run = (environment.get("UNIT_RUN_DIR") or environment.get("PLAN_DELEGATE_BOARD_DIR")
            or environment.get("UNIT_SESSION_DIR") or environment.get("PLAN_DELEGATE_SESSION_DIR"))
     if run:
-        markers: list[Path] = []
-        for active in unit_runs.active_dirs(
-            environment.get("UNIT_ACTIVE_DIR") or environment.get("PLAN_DELEGATE_ACTIVE_DIR") or None
-        ):
-            try:
-                markers.extend(active.iterdir())
-            except OSError:
-                continue
-        matches: list[tuple[int, str]] = []
-        for marker in markers:
-            try:
-                if marker.is_file() and marker.read_text().strip() == run:
-                    matches.append((marker.stat().st_mtime_ns, marker.name))
-            except (OSError, UnicodeError):
-                continue
-        if matches:
-            return OwningSession(max(matches)[1])
+        from scripts.production import staff
+
+        try:
+            rows = staff.local_snapshot().rows
+        except staff.StaffUnreadable:
+            rows = ()
+        for row in rows:
+            if isinstance(row.run, staff.OpenRun) and str(row.run.path) == run and row.current_session:
+                return RunOwner(row.current_session)
+        return RunNotInStaff(Path(run))
+    return NoRunNamed()
+
+
+def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
+    """Find the session that owns this run before using the shell's session id."""
+    resolution = run_resolution(environment)
+    if isinstance(resolution, RunOwner):
+        return OwningSession(resolution.session_id)
     session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
     return OwningSession(session_id) if session_id else NoOwningSession()
 
@@ -510,6 +525,7 @@ def read_audit_processes(
         if isinstance(selection, FullBuildAudit):
             try:
                 in_build_scope = any("/builds.slice/" in line
+                                     and "/builds.slice/builds-detached.slice/" not in line
                                      for line in (directory / "cgroup").read_text(errors="replace").splitlines())
             except OSError:
                 pass
@@ -580,6 +596,8 @@ def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequen
 
 class HoldEnforcer(Protocol):
     def start(self) -> None: ...
+    def drain(self, holder: Holder, proc_root: Path = PROC_ROOT) -> int: ...
+    def working_drain_identities(self, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
     def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
                      action: Literal["audit", "stopped"]) -> None: ...
     def report(self, proc_root: Path, directory: Path) -> list[str]: ...
@@ -810,6 +828,28 @@ def natedev_holds(directory: Path) -> NatedevHolds:
     if isinstance(holders, NoHolders):
         return NatedevHolds(())
     return NatedevHolds(holders.holders)
+
+
+def caller_processes(proc_root: Path, pid: int) -> frozenset[ProcessIdentity]:
+    """Read the caller and its live ancestors without scanning other processes."""
+    lineage: set[ProcessIdentity] = set()
+    seen: set[int] = set()
+    child_start = float("inf")
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            fields = (proc_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            start = fields[19]
+            if fields[0] == "Z" or int(start) > child_start:
+                break
+            identity = ProcessIdentity(pid, start)
+            if process_start_time(pid, proc_root) != start:
+                break
+            lineage.add(identity)
+            pid, child_start = int(fields[1]), int(start)
+        except (OSError, ValueError, IndexError):
+            break
+    return frozenset(lineage)
 
 
 def release_eta_text(release: ReleaseEta) -> str:
@@ -1665,6 +1705,8 @@ def main(arguments: list[str]) -> int:
     _ = hold.add_argument("--target", type=parse_hold_target, default="natedev")
     _ = hold.add_argument("--proc-root", type=Path, default=PROC_ROOT)
     _ = hold.add_argument("--keep", type=int, action="append", default=[])
+    _ = hold.add_argument("--drain", action="store_true",
+                          help="stop waiting gate runs and wait for working runs; INT keeps the hold")
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
@@ -1693,6 +1735,8 @@ def main(arguments: list[str]) -> int:
                 target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
                 refused: list[str] = []
                 if action == "hold":
+                    if cast(bool, options.drain):
+                        refused.append("--drain")
                     if cast(list[int], options.keep):
                         refused.append("--keep")
                     if cast(object, options.release_eta) is not None:
@@ -1722,10 +1766,14 @@ def main(arguments: list[str]) -> int:
                 if not start:
                     raise ValueError(f"--keep {pid}: no live process with a start time")
                 keep.append(ProcessIdentity(pid, start))
+            if cast(bool, options.drain):
+                keep.extend(hold_enforcer().working_drain_identities(proc_root))
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
                              datetime.now(timezone.utc), keep))
             hold_enforcer().start()
             print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True)
+            if cast(bool, options.drain):
+                return hold_enforcer().drain(read_holder(holder_path(holder_directory(), identity.key)), proc_root)
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
             if isinstance(verdict, Busy):

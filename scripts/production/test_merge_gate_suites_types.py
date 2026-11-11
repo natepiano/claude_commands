@@ -48,7 +48,10 @@ class MergeGateTypesTests(GateSuitesFixture):
         python = self.state / "runner/typecheck-venv/bin/python"
         self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
         self.assertNotEqual(type_call["cwd"], str(self.checkout))
-        self.assertTrue(Path(type_call["cwd"]).is_relative_to(self.root / "copies"))
+        self.assertFalse(Path(type_call["cwd"]).exists())
+        records = list((self.root / "copies").glob("*/*/.gate.json"))
+        self.assertEqual(len(records), 1)
+        self.assertTrue((records[0].parent / "target").is_dir())
         self.assert_all_modules_started()
         self.assertIn("basedpyright: OK", result.stdout)
         history, = self.gate_history()
