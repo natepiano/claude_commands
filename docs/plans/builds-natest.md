@@ -2762,36 +2762,13 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 136 — Trend costs always match the cost ledger  · status: done
 **Depends on:** Phase 135
 
-#### Work Order
+#### As-built
 
-**Goal:** `/test_times trend` prints the cost of every day, cached or not, from the current cost ledger. The cache still saves the gate index work.
-
-**Decision:** Director, 2026-11-11, from the Phase 135 architect review: a defect in Phase 135. The cost ledger re-prices every stored gate reservation with its newest AWS bill at each reserve and resolve (`_price_gates`, `scripts/aws_target/ledger.py:997`, called at lines 1031 and 1057). On 2026-11-11, 699 reservations carried the rate of the 2026-11-09 bill and 9 carried the spot maximum. A day cached by Phase 135 keeps the cost of the bill that was newest when the day settled, and keeps its missing-cost note after the ledger prices those runs. No user action and no new flag: the fix keeps the report correct on each ordinary run.
-
-**Constraints from prior phases:**
-- Phase 135 built `trend` in `scripts/test_times/show.py`: `gate_costs()` (joins `"gate-" + GateReservation.attempt` to `gate_runs.id`; a `not priced` rate or a reservation that is not `GateTerminated` gives `CostNotRecorded`), `trend_day`, `trend`, `nearest_rank`, `read_trend_cache`, `write_trend_cache`, `refresh_trend_index`, and `TREND_CACHE_VERSION = 2` with the `gate-trend.json` cache under `file_lock.exclusive`.
-- A run that joins a reservation is an AWS run. Cost statistics use only costed runs; the note line is `<N> of <M> runs have no cost record.`.
-
-**Spec:**
-1. The cache keeps, for each done day and each place and selection group, the data that does not come from the ledger: runs, CPU mean and p95, wall mean and p95, median modules run, and the list of run ids in the group.
-2. Each `trend` run computes cost mean, cost p95, cost total and the missing-cost count from `gate_costs()` over the run ids, for cached days and open days alike. Read the ledger once per `trend` run.
-3. A place stays fixed once a day is cached. Keep the Phase 135 place rule for open days.
-4. Set `TREND_CACHE_VERSION` to 3, so a version 2 cache is rebuilt.
-5. In `commands/test_times.md`, state that cost comes from the ledger at each run and that the ledger re-prices old gates with its newest bill. Read `/succinct_style` rules before you edit the command file.
-6. Add no command, flag or config key.
+- The trend cache (`TREND_CACHE_VERSION = 3`) keeps, for each done day and each place and selection group, a `TrendDay` with the cost-free cells (day, runs, CPU mean and p95, wall mean and p95, median modules run) and `run_ids`.
+- Each `trend` run reads the ledger once through `gate_costs()` and computes cost mean, p95, total and the missing-cost count over the run ids, for cached and open days alike. The gate index is queried only for open days.
+- A cached day keeps the place it was cached with.
 
 **Files:**
-- `scripts/test_times/show.py` — cached rows keep run ids; cost cells come from the ledger at print time.
-- `scripts/test_times/test_show.py` — extend the settled-day case: settle a day with one uncosted run and one run at rate A, then price the uncosted run and change the rate to B in the ledger; the next `trend` run reads the day from the cache (no gate index query for that day) and prints the cost at rate B with no missing-cost note.
-- `commands/test_times.md` — the cost rule.
-
-**Workers:** 1 writer; the three files are one small change with show.py as the hub.
-- impl2: all files.
-
-**State:** the trend cache, version 3. It holds only derived rows and run ids and is rebuilt when it is absent or has another version.
-
-**Acceptance gate:**
-- `test_show.py` passes through `python3 scripts/test_times/module_run.py`.
-- `show.py trend --days 8` prints the same CPU and wall numbers as before the change, and the same costs as a run with no cache.
-- A second `show.py trend` run reads the done days from the cache.
-- basedpyright reports 0 errors, 0 warnings, 0 notes on every changed file.
+- `scripts/test_times/show.py` — `TrendRun.run_id`, `TrendDay.run_ids`, cost cells at print time in `trend`.
+- `scripts/test_times/test_show.py` — the settled-day case re-prices the ledger and checks the cached day's new cost and note.
+- `commands/test_times.md` — the ledger and cache rules.
