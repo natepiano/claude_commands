@@ -520,34 +520,42 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_new_worker_admission_completes_the_started_pane_home(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
-        homes: list[str] = []
+        for retained_launch in (True, False):
+            with self.subTest(retained_launch=retained_launch):
+                homes: list[str] = []
 
-        def started(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
-                    prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
-                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
-                    reported_unknown: str = "",
-                    agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
-            result = self.world.launch(session, destination, prepared, kind, arguments, opening, timeout_ms,
-                                       agent=agent, reported_unknown=reported_unknown, agent_name=agent_name)
-            process = self.world.processes[self.world.foreground[result.pane][0]]
-            identity = process.identity.id
-            self.assertIsNone(staff.snapshot().by_current_session(identity))
-            entry = pane_launch.launch(result.pane, identity, str(prepared.directory), prepared.env,
-                                       [kind, *arguments], kind=cast(Literal["claude", "codex"], kind))
-            homes.append(str(cast(staff.SessionHome, pane_launch.config_home(entry, record=staff.StaffSnapshot(()))).path))
-            pane_record.write("TEST-admission", entry)
-            self.assertIn("config_dir", entry)
-            return result
+                def started(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                            prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                            reported_unknown: str = "",
+                            agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+                    result = self.world.launch(session, destination, prepared, kind, arguments, opening, timeout_ms,
+                                               agent=agent, reported_unknown=reported_unknown, agent_name=agent_name)
+                    process = self.world.processes[self.world.foreground[result.pane][0]]
+                    identity = process.identity.id
+                    self.assertIsNone(staff.snapshot().by_current_session(identity))
+                    entry = pane_launch.launch(result.pane, identity, str(prepared.directory), prepared.env,
+                                               [kind, *arguments], kind=cast(Literal["claude", "codex"], kind))
+                    homes.append(str(cast(staff.SessionHome, pane_launch.config_home(entry, record=staff.StaffSnapshot(()))).path))
+                    if retained_launch:
+                        pane_record.write("TEST-admission", entry)
+                        self.assertIn("config_dir", entry)
+                    else:
+                        for path in pane_launch.record_directory().glob("*.json"):
+                            path.unlink()
+                    return result
 
-        with patch.object(herdr, "launch_prepared_agent", side_effect=started):
-            result = self.start("TEST-admission")
-        self.assertIsInstance(result, worker_panes.OpenWorker)
-        assert isinstance(result, worker_panes.OpenWorker)
-        self.assertEqual(result.row.home, staff.SessionHome(Path(homes[0])))
-        self.assertEqual(staff.by_id(result.row.id), result.row)
-        saved = pane_record.read_strict("TEST-admission")[result.pane]
-        self.assertNotIn("config_dir", saved)
-        self.assertEqual(saved["session_id"], result.row.id)
+                with patch.object(herdr, "launch_prepared_agent", side_effect=started):
+                    result = self.start(f"TEST-admission-{retained_launch}")
+                self.assertIsInstance(result, worker_panes.OpenWorker)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.assertEqual(result.row.home, staff.SessionHome(Path(homes[0])))
+                self.assertEqual(staff.by_id(result.row.id), result.row)
+                self.assertEqual(staff.backend(result.row), staff.CodexBackend(Path(homes[0])))
+                if retained_launch:
+                    saved = pane_record.read_strict("TEST-admission")[result.pane]
+                    self.assertNotIn("config_dir", saved)
+                    self.assertEqual(saved["session_id"], result.row.id)
 
     def test_recovered_worker_admission_completes_the_started_pane_home(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
