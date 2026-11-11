@@ -2678,7 +2678,7 @@ def pane_native_process(info: dict[str, object], kind: str,
             observed = NativeAgentProcess(UnreportedResume(observed.identity.id), observed.started, observed.environment)
         processes.append(observed)
     if len(processes) != 1:
-        raise HerdrFailure("native registry identity is unavailable or ambiguous")
+        raise HerdrFailure(f"expected one foreground {kind} process, found {len(processes)}")
     return processes[0]
 
 

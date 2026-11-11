@@ -2578,6 +2578,10 @@ class HerdrTests(unittest.TestCase):
                 with fake_unit_host.private_process_registry(), redirect_stderr(io.StringIO()):
                     scan = self.herdr.scan_row_panes(membership, [pane])
                 self.assertEqual(scan.found, {})
+                if arguments in ((["zsh"],), (["claude"],)):
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure,
+                                                "^expected one foreground codex process, found 0$"):
+                        _ = self.herdr.native_session("w1:p1", "codex", 1, pane_row=pane)
 
     def test_pane_report_and_resume_accept_an_empty_or_matching_identity(self) -> None:
         current = fixture_runtime_id("herdr-codex-launch")
