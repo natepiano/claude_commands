@@ -52,34 +52,20 @@
 
 ### Phase 1 — Send finds a unit by its unit form  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** `send.py --to queue-unit` reaches the unit whose staff name is `queue`. Every target that resolves today resolves the same way.
-
-**Spec:** change no file outside Files without a line in the summary.
-1. `send.resolve_staff_recipient`: when the name and path match finds no row, try the unit form.
-   - Apply it to the last part of the target only. `builds/queue-unit` and `queue-unit` both work.
-   - A candidate matches when it is of kind `unit` and `copies.unit_owner(candidate.name)` equals the target's last part, compared with the same case folding as today. Its parent chain must still match the earlier parts.
-   - Import `copies` inside this fallback only.
-   - More than one match keeps the existing ambiguous-row failure.
-2. Tests in `scripts/message/test_send.py`: add rows to the existing resolution test with their own snapshot:
-   - `queue-unit` resolves to the unit `queue`.
-   - `builds/queue-unit` resolves to the same unit.
-   - A unit whose staff name is `alpha-unit` still resolves by exact name, and a unit `alpha` beside it does not make it ambiguous.
-   - A worker named `queue` does not match `queue-unit`.
-3. Docs: add one sentence after the `resolve_staff_recipient` sentence in `docs/as-built/session-roster.md` that states the unit-form fallback.
+- `send.resolve_staff_recipient` matches a `<name>-unit` target, or the last part of a `/` path, to a row of kind `unit` when no exact row matches. The match uses `copies.unit_owner`, imported only on that fallback path. The parent chain must still match the earlier path parts. More than one match keeps the ambiguous-row failure.
+- `resolve_recipient.lookup` runs the same fallback after the live-name search finds nothing. It runs before the `LocalRosterIncomplete` and `RecipientSearchFailed` branches, so a roster failure does not skip it.
+- Internal callers (`matching_recipients`, `resolve_recipient.lookup`, `_send`) use the private exact-only `_staff_recipient_match`.
 
 **Files:**
-- `scripts/message/send.py` — the fallback.
-- `scripts/message/test_send.py` — the rows.
-- `docs/as-built/session-roster.md` — one sentence.
+- `scripts/message/send.py` — the unit-form fallback and the exact-only helper.
+- `scripts/message/test_send.py` — unit-form rows, exact-name priority rows, worker exclusion, roster-failure rows.
+- `docs/as-built/session-roster.md` — one sentence on the `<name>-unit` form.
 
-**Acceptance gate:**
-- The targeted test passes.
-- basedpyright on `scripts/message` reports 0 errors, 0 warnings, 0 notes.
-- A dry check with a test snapshot shows `queue-unit` resolves to `queue`.
+**Binds later work:** a `RecipientLookupFailed` comes only after the exact name, the live roster and the unit form all fail.
+
+**Gotchas:** a live session label with the exact name keeps priority over the unit form.
 
 ### Phase 2 — A failed lookup tells the owner  · status: todo
 
@@ -106,6 +92,9 @@
    - A sender `send.py` sends nothing.
    - Add one row to the existing `send.py` lookup-failure test that shows the exit and reason stay the same and `report` was called once.
 5. Docs: one paragraph in `docs/as-built/session-roster.md` beside the Phase 1 sentence.
+
+**Constraints from prior phases:**
+- `resolve_recipient.lookup` tries the unit form before its `LocalRosterIncomplete` and `RecipientSearchFailed` branches. A `RecipientLookupFailed` means the exact name, the live roster and the unit form all failed.
 
 **Files:**
 - `scripts/message/failed_lookup.py` — the detector.
