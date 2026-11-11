@@ -1,5 +1,9 @@
 """Compare pushed revisions on disposable gate instances."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections.abc import Callable, Sequence
@@ -15,7 +19,6 @@ import signal
 import statistics
 from types import FrameType
 import subprocess
-import tempfile
 import time
 from typing import Protocol, cast
 from uuid import uuid4
@@ -92,20 +95,26 @@ def pushed_request(repo: Path, base: str, changed: str, modules: Sequence[str], 
     parsed = urlsplit(url)
     if parsed.username or parsed.password or parsed.query:
         raise ValueError('The clone URL must contain no credential')
-    with tempfile.TemporaryDirectory(prefix='paired-history-') as temporary:
-        public = Path(temporary) / 'public.git'
-        _ = subprocess.run(['git', 'clone', '--bare', url, str(public)], check=True, capture_output=True)
-        revisions: list[PushedRevision] = []
-        for ref in (base, changed):
-            commit = checked_git(repo, 'rev-parse', '--verify', ref + '^{commit}')
-            if not checked_git(public, 'for-each-ref', '--contains=' + commit, '--format=%(refname)'):
-                raise ValueError('Both revisions must be pushed refs')
-            tree = checked_git(public, 'rev-parse', commit + '^{tree}')
-            for module in modules:
-                if checked_git(public, 'cat-file', '-t', commit + ':scripts/' + module) != 'blob':
-                    raise ValueError('The module is absent from a requested tree')
-            revisions.append(PushedRevision(commit, tree))
+    tips = {line.split()[0] for line in checked_git(repo, 'ls-remote', '--heads', '--tags', url).splitlines()}
+    revisions: list[PushedRevision] = []
+    for ref in (base, changed):
+        commit = checked_git(repo, 'rev-parse', '--verify', ref + '^{commit}')
+        if not any(pushed_in(repo, commit, tip) for tip in tips):
+            raise ValueError('Both revisions must be pushed refs')
+        tree = checked_git(repo, 'rev-parse', commit + '^{tree}')
+        for module in modules:
+            if checked_git(repo, 'cat-file', '-t', commit + ':scripts/' + module) != 'blob':
+                raise ValueError('The module is absent from a requested tree')
+        revisions.append(PushedRevision(commit, tree))
     return PairedTrialRequest(revisions[0], revisions[1], tuple(modules), rounds, url)
+
+
+def pushed_in(repo: Path, commit: str, tip: str) -> bool:
+    """A remote tip holds the commit; a tip absent locally holds nothing known."""
+    if tip == commit:
+        return True
+    ancestor = subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', commit, tip], capture_output=True)
+    return ancestor.returncode == 0
 
 
 def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires: int) -> dict[str, object]:

@@ -63,12 +63,14 @@ CPU includes all module attempts. Wall time comes from the gate run.
 The p95 uses nearest rank. Seconds have no decimals. USD has three decimals.
 AWS cost joins `gate_runs.id = "gate-" + GateReservation.attempt` in the local cost ledger.
 Cost includes the reservation lifetime at its applied hourly rate, plus its allowance.
+Each run reads costs from the current ledger, including costs for cached days.
+The ledger re-prices old gates with its newest bill.
 A matching reservation identifies an AWS run even when its host has a custom name.
 Cost statistics use only runs with a confirmed lifetime and an applied rate.
 An unpriced reservation has no cost record.
 AWS tables report missing cost counts below the table. A group with no cost records shows `—`.
 Other hosts show `—`. Missing cost records do not delay caching.
-`gate-trend.json` beside the gate index caches finished days.
+`gate-trend.json` beside the gate index caches finished days with their run ids and CPU and wall statistics.
 A day finishes after a complete refresh starts `TREND_SETTLE_MINUTES` after its end (default 60).
 The cache records that start after the refresh completes. An exclusive lock protects each cache update.
-Later runs compute only open days. A missing, unreadable or incompatible cache is rebuilt.
+Later runs query the index only for open days. A missing, unreadable or incompatible cache is rebuilt.

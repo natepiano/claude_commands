@@ -278,14 +278,22 @@ class CostTests(unittest.TestCase):
         with mock.patch.object(index, "update", side_effect=AssertionError("index updated")):
             self.assertEqual(mac_report.main(["--hours", "1e300"]), 2)
 
-    def test_removed_commands_print_usage_without_reading_the_index(self) -> None:
-        for command in ("costs", "charts"):
-            with self.subTest(command=command):
+    def test_unknown_commands_and_help_do_not_read_the_index(self) -> None:
+        cases: tuple[tuple[list[str], str, int], ...] = (
+            (["costs"], "buildlog: unknown command 'costs'; type buildlog to see the commands\n", 2),
+            (["charts"], "buildlog: unknown command 'charts'; type buildlog to see the commands\n", 2),
+            (["not-a-command"], "buildlog: unknown command 'not-a-command'; type buildlog to see the commands\n", 2),
+            ([], f"{cli.__doc__}\n", 2),
+            (["help"], f"{cli.__doc__}\n", 0),
+            (["-h"], f"{cli.__doc__}\n", 0),
+            (["--help"], f"{cli.__doc__}\n", 0),
+        )
+        for argv, expected, status in cases:
+            with self.subTest(argv=argv):
                 errors = io.StringIO()
                 with redirect_stderr(errors), mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
-                    self.assertEqual(cli.main([command, "--days", "7"]), 2)
-                self.assertEqual(errors.getvalue(), f"{cli.__doc__}\n")
-                self.assertNotIn(f"buildlog {command}", errors.getvalue())
+                    self.assertEqual(cli.main(argv), status)
+                self.assertEqual(errors.getvalue(), expected)
 
     def test_cli_help_does_not_import_collectors_or_the_report(self) -> None:
         command = ("import sys; from scripts.buildlog import cli; cli.main(['help']); "

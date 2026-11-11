@@ -2759,39 +2759,97 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:** The cost ledger re-prices every stored reservation with its newest AWS bill at each reserve and resolve, so a cost cached with a day goes stale.
 
-### Phase 136 — Trend costs always match the cost ledger  · status: todo
+### Phase 136 — Trend costs always match the cost ledger  · status: done
 **Depends on:** Phase 135
+
+#### As-built
+
+- The trend cache (`TREND_CACHE_VERSION = 3`) keeps, for each done day and each place and selection group, a `TrendDay` with the cost-free cells (day, runs, CPU mean and p95, wall mean and p95, median modules run) and `run_ids`.
+- Each `trend` run reads the ledger once through `gate_costs()` and computes cost mean, p95, total and the missing-cost count over the run ids, for cached and open days alike. The gate index is queried only for open days.
+- A cached day keeps the place it was cached with.
+
+**Files:**
+- `scripts/test_times/show.py` — `TrendRun.run_id`, `TrendDay.run_ids`, cost cells at print time in `trend`.
+- `scripts/test_times/test_show.py` — the settled-day case re-prices the ledger and checks the cached day's new cost and note.
+- `commands/test_times.md` — the ledger and cache rules.
+
+### Phase 137 — Find where the slowest test module spends its CPU  · status: done
+
+#### As-built
+
+- Research only; no repository file changed. `direct/test_verify_wait_holder.py` measures 76.0 CPU s, 5,404 processes and 27 tests at `4900e5d38`.
+- Recorder starts cost 19.6 CPU s in 88 starts; `build_targets.py` target selection costs 8.9 CPU s in 50 starts. Most CPU is in real Python children, not fixtures.
+- One local pair each: deferred recorder and staff imports save 16.4 CPU s; the seeded interpreter cache (`verify_hold_wait_test_support.py`) saves 2.2 CPU s; routing synchronous holder calls through the existing verify helper saves 7.3 CPU s; all three together save 9.0 CPU s. The isolated savings overlap.
+- Importing `progress_history` costs about 133 ms; 57 test modules and `verify.sh` start the recorder.
+
+**Binds later work:** The recorder import change ("Recorder commands import only what they use") is sdlc's code; sdlc gave the go after its owner lands on the same files.
+
+**Ruled out:** another class seed or a shorter fixture sleep (the dominant cost is child starts); a preloaded fork server (process ownership).
+
+### Phase 138 — Recorder commands import only what they use  · status: todo
+**Depends on:** Phase 134
+**Blocked by:** three lands on the same files — sdlc phase 22 (`plan_history.py`, progress_history tests), hierarchies staff-copies section 9 (`session_staff` readers), and the builds verify worker wait fix (`progress_history.py`). sdlc gave the go on 2026-11-11 and names when both reach main; start after builds carries them.
 
 #### Work Order
 
-**Goal:** `/test_times trend` prints the cost of every day, cached or not, from the current cost ledger. The cache still saves the gate index work.
+**Goal:** A recorder start costs less CPU, and the gate modules that start the recorder save at least 30 CPU s in sum, with the same tests.
 
-**Decision:** Director, 2026-11-11, from the Phase 135 architect review: a defect in Phase 135. The cost ledger re-prices every stored gate reservation with its newest AWS bill at each reserve and resolve (`_price_gates`, `scripts/aws_target/ledger.py:997`, called at lines 1031 and 1057). On 2026-11-11, 699 reservations carried the rate of the 2026-11-09 bill and 9 carried the spot maximum. A day cached by Phase 135 keeps the cost of the bill that was newest when the day settled, and keeps its missing-cost note after the ledger prices those runs. No user action and no new flag: the fix keeps the report correct on each ordinary run.
-
-**Constraints from prior phases:**
-- Phase 135 built `trend` in `scripts/test_times/show.py`: `gate_costs()` (joins `"gate-" + GateReservation.attempt` to `gate_runs.id`; a `not priced` rate or a reservation that is not `GateTerminated` gives `CostNotRecorded`), `trend_day`, `trend`, `nearest_rank`, `read_trend_cache`, `write_trend_cache`, `refresh_trend_index`, and `TREND_CACHE_VERSION = 2` with the `gate-trend.json` cache under `file_lock.exclusive`.
-- A run that joins a reservation is an AWS run. Cost statistics use only costed runs; the note line is `<N> of <M> runs have no cost record.`.
+**Decision:** Director, 2026-11-11, from the Phase 137 research: deferred imports saved 16.4 CPU s in `direct/test_verify_wait_holder.py` alone. Savings may join across modules.
 
 **Spec:**
-1. The cache keeps, for each done day and each place and selection group, the data that does not come from the ledger: runs, CPU mean and p95, wall mean and p95, median modules run, and the list of run ids in the group.
-2. Each `trend` run computes cost mean, cost p95, cost total and the missing-cost count from `gate_costs()` over the run ids, for cached days and open days alike. Read the ledger once per `trend` run.
-3. A place stays fixed once a day is cached. Keep the Phase 135 place rule for open days.
-4. Set `TREND_CACHE_VERSION` to 3, so a version 2 cache is rebuilt.
-5. In `commands/test_times.md`, state that cost comes from the ledger at each run and that the ledger re-prices old gates with its newest bill. Read `/succinct_style` rules before you edit the command file.
-6. Add no command, flag or config key.
+1. In `scripts/direct/progress_history.py`, `scripts/direct/plan_history.py` and `scripts/production/session_staff.py`, move each top-level import that only a function uses into that function.
+2. Keep each import that a module expression, class base or argument default uses at the top level.
+3. Keep every supported module attribute at the top level: explicit exports (`OPEN_PHASES_KEY`, `STATE_FILENAME`), names that tests patch (`progress_history.subprocess`, patched at `scripts/direct/test_progress_history.py:491` and near line 7557), decorator and module-expression names, and `session_staff`'s runtime aliases for staff types, configuration types and `HerdrPlace` (`session_staff.py:113` and near line 668). Import names used only in annotations under `TYPE_CHECKING`.
+4. Change no recorder, staff or holder decision. Keep every process boundary.
+5. Change no test body or assertion.
 
 **Files:**
-- `scripts/test_times/show.py` — cached rows keep run ids; cost cells come from the ledger at print time.
-- `scripts/test_times/test_show.py` — extend the settled-day case: settle a day with one uncosted run and one run at rate A, then price the uncosted run and change the rate to B in the ledger; the next `trend` run reads the day from the cache (no gate index query for that day) and prints the cost at rate B with no missing-cost note.
-- `commands/test_times.md` — the cost rule.
+- `scripts/direct/progress_history.py`
+- `scripts/direct/plan_history.py`
+- `scripts/production/session_staff.py`
 
-**Workers:** 1 writer; the three files are one small change with show.py as the hub.
-- impl2: all files.
+**Workers:** 1 writer; three small edits in one import chain.
+- impl: all three files.
 
-**State:** the trend cache, version 3. It holds only derived rows and run ids and is rebuilt when it is absent or has another version.
+**Constraints from prior phases:**
+- Phase 122 rejected a smaller recorder-only import change because real commands still loaded `staff`. That cause remains: `_read_state` calls `staff.initial_snapshot()` (`progress_history.py:485`), and the module constant near line 217 needs `models_registry`. Measure real commands, not an import probe.
+- Phase 137 research report: `phases/137/research_report.md` in the unit session. Its 16.4 CPU s is one local pair before Phase 134; Phase 134 already removes recorder starts in `merge_checkpoint_test_support.py`, so that number is not acceptance evidence.
+- Phase 134 gives the aws paired trial command for acceptance.
+
+**State:** none.
 
 **Acceptance gate:**
-- `test_show.py` passes through `python3 scripts/test_times/module_run.py`.
-- `show.py trend --days 8` prints the same CPU and wall numbers as before the change, and the same costs as a run with no cache.
-- A second `show.py trend` run reads the done days from the cache.
-- basedpyright reports 0 errors, 0 warnings, 0 notes on every changed file.
+- basedpyright reports zero errors and zero warnings on the three files and their callers.
+- The direct and production suites pass.
+- An aws paired trial, 3 rounds, over the named modules with the most recorder starts gives a summed paired median saving of at least 30 CPU s, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
+
+### Phase 139 — Find where the fast-track test module spends its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A measured report names where `production/test_fast_track.py` (median 48.2 CPU s, 52 tests) spends its CPU, and which changes save CPU with the same tests.
+
+**Decision:** Director, 2026-11-11: the next module in the descending sort after the Phase 137 module, whose change waits on sdlc lands. Research first, as in Phases 133 and 137. Savings may join across modules, so the report also names each candidate that reaches other modules.
+
+**Spec:**
+1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
+2. Name each fixed cost: interpreter starts, imports, real sleeps or wait intervals, subprocess trees, repeated setup.
+3. Measure one local pair for each candidate change in a scratch copy, and one pair for the candidates together. A test that proves a process boundary keeps its process.
+4. For each candidate in shared code, count the other test modules it reaches.
+5. Name the owning unit of each file a change would touch.
+6. Edit no repository file.
+
+**Files:**
+- `scripts/production/test_fast_track.py` — read only.
+
+**Workers:** 1 writer; research only.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 137: a recorder start costs about 0.22 CPU s, and Phase 138 defers recorder and staff imports. Do not count that saving again here.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report at `phases/139/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
