@@ -15,6 +15,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
 
 import unittest
@@ -116,7 +117,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fake-start")))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity",
                                               return_value=offload.KnownRepository("project")))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(mac_test, "start_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))

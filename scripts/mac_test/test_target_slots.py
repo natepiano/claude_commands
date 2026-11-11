@@ -18,6 +18,7 @@ import time
 from types import FrameType
 from typing import cast, override
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_start_test_support import process_reader
@@ -131,7 +132,7 @@ class RepositorySlotTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "utc_now", return_value=datetime(2026, 11, 1, tzinfo=timezone.utc)))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.git_reply))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected child process")))
