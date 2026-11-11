@@ -19,7 +19,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory`. With the tripwire set it resolves `$meminfo` and refuses a live path through `memory_admit.py tripwire <path>`. Then it reads `MemAvailable` itself from `${BUILDLOG_MEMINFO:-/proc/meminfo}` and starts `memory_admit.py check`. A checker that exits non-zero is refused with its last output line (`buildlog_memory_refuse`). On darwin with `BUILDLOG_MEMINFO` unset it grants at once and reads nothing.
   - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — sources `memory_gate.sh` and calls `buildlog_wait_for_memory` with no arguments (a launch: no reservation).
   - `scripts/hooks/test_brp_launch_gate.py` — `setUp` :53 takes `BUILDLOG_MEMINFO`, `BUILDLOG_MEMORY_PRESSURE` and `BUILDLOG_LIVE_MEMORY_TRIPWIRE` from `fake_memory_readings(self.root)` (:74). `test_low_memory_wait_leaves_old_release_record_unchanged` :159 writes its low value to the returned `meminfo` file.
-  - `scripts/production/merge_gate.py` — `test_module_environment` :755 gives each test module a private `BUILDLOG_DIR` and the build-tool tripwires (`cargo`, `rustc`, `rustdoc`, `rustup`, `cargo-nextest` first on `PATH`, each appends its argv to `<root>/build-tool-calls.jsonl` and exits 99). `finish_gate_job` reads that file, appends `a test started real <tool>: <args>` to the output, and sets status 1 and `GateJobResult.tripwire_tripped`. The gate never reruns a tripped module alone. Not in any unit's Owns cell: natedev showrunner's file.
+  - `scripts/production/merge_gate.py` — `test_module_environment` :762 gives each test module a private `BUILDLOG_DIR` and the build-tool tripwires (`cargo`, `rustc`, `rustdoc`, `rustup`, `cargo-nextest` first on `PATH`, each appends its argv to `<root>/build-tool-calls.jsonl` and exits 99). `finish_gate_job` reads that file, appends `a test started real <tool>: <args>` to the output, and sets status 1 and `GateJobResult.tripwire_tripped`. The gate never reruns a tripped module alone. Not in any unit's Owns cell: natedev showrunner's file.
   - `scripts/production/affected_modules.py` — affected-only module selection follows import edges (natedev c495a0b2): a change to a test helper selects every module that imports it. There is no `SHARED_TEST_HELPERS` list. natedev showrunner's file.
   - `scripts/production/test_merge_gate_suites_tripwires.py` — tests of the gate's build-tool tripwire: `test_module_tool_calls_fail_even_when_its_tests_pass` :22 (asserts `a test started real <tool>: <args>` and no `Rerun alone:`), `test_module_can_put_its_own_build_tool_stub_first` :35. Resource, admission, signal and `types` coverage live in `test_merge_gate_suites_resources.py`, `_admission.py`, `_signals.py` and `_types.py`. natedev 367da4f1 split `test_merge_gate.py` by subject into this module, `test_merge_gate_holds.py` and `test_merge_gate_ledger.py`. natedev showrunner's file.
   - Import idiom for a test helper: `from scripts.lib.nix_env_test_support import NixFixture` (`scripts/direct/test_verify_nix_shell.py` :13); the gate runs each module with the repo root as working directory.
@@ -36,7 +36,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   Run it from `~/.claude` main after a merge of `origin/builds`.
   Check `build_hold.py status` first.
   Run no tests during a natedev build hold that this unit does not hold.
-- **Lint:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <files>` from the worktree root. `<files>` is what the acceptance gate names; with no list, `scripts/lint scripts/hooks scripts/build_hold scripts/production` plus the directory of every other changed module. The interpreter is the merge gate's type-check venv (`merge_gate.py` `typecheck_python()` :622, pinned pillow and fake-bpy-module), so `bpy` and `PIL` resolve; a bare `basedpyright` reports false import errors. If the venv is absent, a merge gate run builds it. Every `basedpyright` line in an acceptance gate below means this form. Pass is its `0 errors, 0 warnings, 0 notes` line (exit status says nothing). `bash -n scripts/lint/memory_gate.sh`.
+- **Lint:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python <files>` from the worktree root. `<files>` is what the acceptance gate names; with no list, `scripts/lint scripts/hooks scripts/build_hold scripts/production` plus the directory of every other changed module. The interpreter is the merge gate's type-check venv (`merge_gate.py` `typecheck_python()` :629, pinned pillow and fake-bpy-module), so `bpy` and `PIL` resolve; a bare `basedpyright` reports false import errors. If the venv is absent, a merge gate run builds it. Every `basedpyright` line in an acceptance gate below means this form. Pass is its `0 errors, 0 warnings, 0 notes` line (exit status says nothing). `bash -n scripts/lint/memory_gate.sh`.
 - **Invariants:**
   - Admission and hold check errors stop the step; only an explicit admission answer starts it (`docs/as-built/build-memory-admission.md` → Invariants).
   - Outside a test the tripwire does nothing: it acts only when `BUILDLOG_LIVE_MEMORY_TRIPWIRE` is set, and no installed caller sets it. A live session's gate behaves as before, byte for byte in its output.
@@ -230,7 +230,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
-   `read_cycle()` (`build_hold.py:969`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:958`) returns `Path | None`, for the same no-current-cycle state.
+   `read_cycle()` (`build_hold.py:994`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:983`) returns `Path | None`, for the same no-current-cycle state.
    Return the existing `NoCycle` (`build_hold.py:83`) from both in place of `None`. Add no second type for this state.
    Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
    Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
@@ -239,7 +239,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1170) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1171) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
 6. Keep repository and step fields separate in service snapshots and queue queries.
    Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
@@ -1930,7 +1930,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Spec:**
 
 1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
-2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:68`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
+2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:77`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
    The readers of the room's `ci_keep_aside` lose their CI keep-aside text: `scripts/build_queue/queue_evidence.py` (lines 118 and 223-224) and `scripts/build_queue/memory_feed.py` (lines 555 and 828).
    `memory_feed.py` line 556 prints `CI builds do not wait in the queue yet.` Remove that line, because the runner activation makes it false.
    The key also leaves the test fixture `scripts/lint/fixtures/build_admission.conf` (line 17).
@@ -1938,9 +1938,9 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove or change the tests of the mixed rule only with an approved assertion change. Three modules hold such tests:
    - `scripts/lint/test_memory_admit.py`.
    - `scripts/build_queue/test_queue_evidence.py`: `test_release_advice_retains_the_running_ci_keep_aside` (line 481) expects the running CI margin to keep the head held and the room to fall from 15 GiB to 8 GiB.
-   - `scripts/build_queue/test_queue_view.py`: `test_running_ci_names_its_keep_aside_in_the_view_and_card` (line 608) expects `CI keep-aside 7.0 GiB` in the view and the card.
+   - `scripts/build_queue/test_queue_view.py`: `test_running_ci_names_its_keep_aside_in_the_view_and_card` (line 609) expects `CI keep-aside 7.0 GiB` in the view and the card.
 
-   Add a row to the `hana CI` page test in `scripts/build_queue/test_memory_feed.py`: the page has no `CI builds do not wait in the queue yet.` line, and it counts the CI job once.
+   No test covers the `hana CI` page text. Add one test in `scripts/build_queue/test_memory_feed.py` with a registered and an unregistered CI job: each job counts once, and the page has no `CI builds do not wait in the queue yet.` line and no CI margin text.
 
 **Files:**
 - `config/build_admission.conf`
@@ -1963,7 +1963,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
 
-Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6012`).
+Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6058`).
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
@@ -2209,25 +2209,13 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 102 — The stopped-run notice goes after the run's output  · status: done
 
-**Depends on:** none. Source: builds on 2026-11-11, from a hana report. During the fps hold (11-11, 01:48-03:00 EST), the notice wrote at offset 0 of the merge gate log `/tmp/claude/scratch/gate_f83.log` and erased its TREE and FMT lines.
+#### As-built
 
-#### Work Order
-
-**Goal:** When the hold enforcer stops a run, its notice goes after the output the run already wrote. No earlier line is lost.
-
-**Spec:**
-
-1. **The cause.** `write_refusal` (`scripts/build_hold/hold_enforcer.py:616`, called at line 684) opens `/proc/<pid>/fd/2` with `os.O_WRONLY | os.O_NONBLOCK`. That open makes a new file description at offset 0. When stderr is a file, the notice writes over the start of that file.
-2. **The fix.** Add `os.O_APPEND` to the open flags. The notice then goes at the end of a file. A pipe or a terminal is unchanged. Keep the best-effort rule: an error still writes nothing and raises nothing.
-3. **Proof.** In `scripts/build_hold/test_hold_enforcer.py`, change the existing test `test_stopped_run_writes_reason_and_log_registers_notice_then_terms_root_first_and_kills_survivor`: before the stop, the stopped root's `fd/2` holds two earlier lines (`TREE ok` and `FMT ok`). The assertion expects those two lines, then the notice. This is one new row of the same behavior, not a weaker assertion.
+- `write_refusal` (`scripts/build_hold/hold_enforcer.py`) opens the stopped run's `/proc/<pid>/fd/2` with `O_WRONLY | O_NONBLOCK | O_APPEND`. In a regular file the notice goes after the run's own output; a pipe or a terminal behaves as before. The write stays best-effort: an error writes nothing and raises nothing.
+- `test_stopped_run_writes_reason_and_log_registers_notice_then_terms_root_first_and_kills_survivor` puts `TREE ok` and `FMT ok` in the root's `fd/2` before the stop and expects them before the notice.
 
 **Files:**
-- `scripts/build_hold/hold_enforcer.py`
-- `scripts/build_hold/test_hold_enforcer.py`
+- `scripts/build_hold/hold_enforcer.py` — `write_refusal` writes the stop notice to the stopped run's stderr.
+- `scripts/build_hold/test_hold_enforcer.py` — the stop test with earlier log lines.
 
-**Workers:** `1 writer`
-- `impl` owns both files.
-
-**State:** none.
-
-**Gate:** the targeted test; `scripts/build_hold/test_hold_enforcer.py` passes; and `basedpyright` 0/0/0 on both files and each caller module of `write_refusal`.
+**Gotchas:** an open through `/proc/<pid>/fd/N` makes a new open file description at offset 0; only `O_APPEND` puts a write at the end of a regular file.
