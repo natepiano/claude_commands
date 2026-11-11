@@ -246,10 +246,18 @@ The flag survives state reloads and suppresses repeated ON notices during the sa
 Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
-An idle worker without an active dispatch closes its pane through `worker_panes.close` and keeps its conversation.
-The move writes no journal row for that worker.
+An idle worker without an active dispatch closes its pane through the shared `worker_panes.can_close` check.
+`worker_panes.close` repeats that check under its worker lock before it closes the pane.
+Live detached runs, held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
+The preview prints `kept open: <reason>;` before its resume text.
+A held worker lock instead prints `not moved: dispatch lock is held` and refuses the move.
+Every finished pass needs its dispatch DONE at the end of the last transcript turn before its open pane can close.
+This proof permits closure when herdr still reports a working agent.
+A later message removes that proof.
+Unknown process identity keeps its pane and reports its reason.
+Closing the idle pane writes no move journal row.
 The next assign resumes it on the group account.
-A busy worker uses `restart.stop_row` and `worker_panes.start_or_resume` to keep its conversation and pane.
+A busy worker or a kept worker uses `restart.stop_row` and `worker_panes.start_or_resume` to keep its conversation and pane.
 A stopped worker with an active dispatch resumes in the same pane.
 A closed worker without an active dispatch has nothing to move.
 Only an active or refused pass receives resume text through the shared target check.

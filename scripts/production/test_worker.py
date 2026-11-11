@@ -2709,6 +2709,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_end_closes_a_busy_worker_and_retires_its_row(self) -> None:
         opened = self.opened()
         self.fixture.world.locations[opened.pane]["agent_status"] = "working"
+        self.fixture.completed_dispatch(opened.row, "impl")
         with patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()), \
              patch("scripts.production.staff_sources.require_worker_stopped"):
             code, output, errors = self.command("end", "impl")

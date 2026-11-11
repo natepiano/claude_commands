@@ -7715,7 +7715,15 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.stop.assert_not_called()
 
     def test_worker_move_preview_lists_actions_and_refusals_and_counts_empty_rows(self) -> None:
+        from scripts.accounts import pane_moves
+        from scripts.lib.test_models_registry import write_registry
+        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.herdr import worker_panes
+
         opened = self.worker("open", family="codex")
+        kept = self.worker("kept", family="codex")
+        kept = staff.set_worker_role(kept.id, staff.KnownWorkerRole("impl"))
+        locked = self.worker("locked", family="codex")
         stopped = self.worker("stopped", family="codex", live=False)
         unknown = self.worker("unassigned", family="codex", live=False)
         closed = fixture_worker("closed", self.owner.id, backend=staff.CodexBackend(self.root / ".codex1"))
@@ -7726,13 +7734,21 @@ class PaneWorkerMoveTests(unittest.TestCase):
         record = staff.local_snapshot()
         record = replace(record, rows=tuple(replace(row, current_session=staff.StaffId(""))
                                            if row.id == empty.id else row for row in record.rows))
-        before = self.fixture.staff_state()
         role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture selection", datetime.now(timezone.utc).isoformat()))
-        with patch.object(staff, "local_snapshot", return_value=record):
+        with (patch.object(staff, "local_snapshot", return_value=record), live_detached_run(self.run_dir, kept),
+              worker_panes.worker_lock(self.owner.id, staff.WorkerName.parse(locked.name)) as hold):
+            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+            before = self.fixture.staff_state()
             result = accounts.move_workers("codex2", dry_run=True)
+            refused = pane_moves.move_worker(locked, record, "codex2", "quota", self.run_dir)
+            self.assertEqual(refused, accounts.SessionMoveRefused(locked.id, "dispatch lock is held"))
+            self.assertEqual(self.fixture.staff_state(), before)
         assert isinstance(result, accounts.GroupMoveDryRun)
         self.assertEqual(sorted(result.lines), sorted((
             f"{opened.name} ({opened.id}): would close its idle pane; the next assign resumes it on codex2",
+            f"{kept.name} ({kept.id}): kept open: a detached run is live; "
+            + "would stop and resume the same conversation on codex2 in its worker pane",
+            f"{locked.name} ({locked.id}): not moved: dispatch lock is held",
             f"{stopped.name} ({stopped.id}): would close its idle pane; the next assign resumes it on codex2",
             f"{unknown.name} ({unknown.id}): would close its idle pane; the next assign resumes it on codex2",
             "2 workers: nothing to move",
@@ -7743,6 +7759,15 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(self.world.stops, [])
         self.assertEqual(self.world.launches, [])
         self.assertEqual(self.world.requests, [])
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "codex"}}, update=True)
+        pane = next(pane for pane, process in self.world.foreground.items()
+                    if self.world.processes[process[0]].current_identity == kept.current_session)
+        with live_detached_run(self.run_dir, kept):
+            moved = pane_moves.move_worker(kept, record, "codex2", "quota", self.run_dir)
+        self.assertIsInstance(moved, stop_results.ClaudeUp)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.launches, [herdr.ExistingPane(pane, "terminal-" + pane)])
+        self.assertEqual(self.world.stops, [kept.current_session])
 
     def test_move_workers_catches_the_worker_panes_herdr_failure(self) -> None:
         from scripts.herdr import worker_panes
