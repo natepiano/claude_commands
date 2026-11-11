@@ -810,6 +810,29 @@ The folder uses task `gate:aws-routing-proof`.
 The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 
+Paired trials use the installed scaler service and the existing `cloud_gate.conf` settings.
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one box for all rounds.
+All module boxes run concurrently.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The command reserves the full trial cost before it permits any launch.
+A refused launch never uses a local runner.
+
+Stdout contains JSON lines: each run, each module summary, and the final cost.
+Progress goes to stderr.
+The final line has `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate uses each box's rate, minimum billed seconds, lifetime, allowance, and new bill-query fees.
+Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
+The paired trial adds no settings.
+The size/start trials and their settings remain available until the user decides whether to remove them.
+
 `deploy.py gate-trial` reads these keys when it uses them:
 
 | Key | Value | Reason |

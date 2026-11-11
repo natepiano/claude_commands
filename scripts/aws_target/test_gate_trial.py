@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import cast, final, override
 import unittest
 from unittest import mock
@@ -1453,3 +1454,218 @@ class SpendTests(CostFixture):
               mock.patch.object(trial, 'main', return_value=0) as dispatch):
             self.assertEqual(deploy.main(), 0)
             self.assertEqual(dispatch.call_args.args[0], ['--step', 'size', '--repo', '.', '--approve-resources', '--vcpus', '120'])
+
+
+@final
+class PairedTrialTests(CostFixture):
+    repo: Path = Path()
+    origin: Path = Path()
+    base: str = ''
+    changed: str = ''
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        shipped = Path(__file__).resolve().parents[2]
+        _ = (self.root / 'cloud_gate.conf').write_text((shipped / 'config/cloud_gate.conf').read_text())
+        self.repo = self.root / 'repo'
+        self.repo.mkdir()
+        for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
+            _ = trial.checked_git(self.repo, *args)
+        for relative in ('scripts/test_times/module_run.py', 'scripts/lib/descendants.py', 'scripts/lib/package_root.py'):
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes((shipped / relative).read_bytes())
+        (self.repo / 'config').mkdir()
+        (self.repo / 'scripts/fixture').mkdir()
+        _ = (self.repo / 'scripts/fixture/test_sample.py').write_text('''import json, os, pathlib, unittest
+class Sample(unittest.TestCase):
+    def test_sample(self):
+        self.assertFalse(pathlib.Path('generated').exists())
+        pathlib.Path('generated').touch()
+        with open(os.environ['PAIRED_TRACE'], 'a') as trace:
+            trace.write(json.dumps(dict(pid=os.getpid(), cwd=os.getcwd(), home=os.environ['HOME'],
+                                       temporary=os.environ['TMPDIR'], config=os.environ['CONF_DIR'])) + '\\n')
+''')
+        _ = trial.checked_git(self.repo, 'add', '.')
+        _ = trial.checked_git(self.repo, 'commit', '-qm', 'Base fixture')
+        self.base = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
+        _ = (self.repo / 'change').write_text('changed')
+        _ = trial.checked_git(self.repo, 'add', '.')
+        _ = trial.checked_git(self.repo, 'commit', '-qm', 'Changed fixture')
+        self.changed = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
+        self.origin = self.root / 'origin.git'
+        _ = subprocess.run(['git', 'clone', '--bare', str(self.repo), str(self.origin)], check=True, capture_output=True)
+        path = self.root / 'cloud_gate.conf'
+        _ = path.write_text(path.read_text().replace('clone_url=https://github.com/natepiano/claude_commands.git',
+                                                   'clone_url=' + str(self.origin)))
+
+    def request(self, modules: tuple[str, ...] = ('fixture/test_sample.py',), rounds: int = 3) -> trial.PairedTrialRequest:
+        return trial.pushed_request(self.repo, self.base, self.changed, modules, rounds)
+
+    def sample(self, variant: str, number: int, cpu: float) -> dict[str, object]:
+        return {'module': 'fixture/test_sample.py', 'variant': variant, 'round': number, 'cpu_s': cpu,
+                'peak_mib': 12.0, 'wall_s': 1.0, 'status': 0, 'tests': 1, 'failures': 0, 'errors': 0,
+                'instance_type': 'm7a.8xlarge', 'box': 'i-fixture'}
+
+    def test_pushed_refs_and_modules_do_not_change_checkout(self) -> None:
+        before = trial.checked_git(self.repo, 'show-ref')
+        request = self.request()
+        self.assertEqual(request.base.commit, self.base)
+        self.assertEqual(request.changed.commit, self.changed)
+        self.assertEqual(trial.checked_git(self.repo, 'show-ref'), before)
+        self.assertEqual(trial.checked_git(self.repo, 'status', '--porcelain'), '')
+        _ = (self.repo / 'private').write_text('local only')
+        _ = trial.checked_git(self.repo, 'add', '.')
+        _ = trial.checked_git(self.repo, 'commit', '-qm', 'Local fixture')
+        with self.assertRaises((ValueError, subprocess.SubprocessError)):
+            _ = trial.pushed_request(self.repo, self.base, 'HEAD', request.modules, 3)
+
+    def test_module_validation_rejects_duplicate_missing_and_traversal(self) -> None:
+        for modules in (('fixture/test_sample.py',) * 2, ('fixture/missing.py',), ('../test_sample.py',), ('/fixture/test_sample.py',)):
+            with self.subTest(modules=modules), self.assertRaises((ValueError, subprocess.SubprocessError)):
+                _ = self.request(modules)
+        with self.assertRaises(ValueError):
+            _ = self.request(rounds=0)
+
+    def test_paired_median_uses_pairs_and_keeps_partial_failures(self) -> None:
+        runs = [self.sample(variant, number, cpu) for number, pair in enumerate(((1, 0), (10, 9), (100, 2)), 1)
+                for variant, cpu in zip(('base', 'changed'), pair)]
+        summary = trial.module_summary('fixture/test_sample.py', 3, runs)
+        self.assertEqual(summary['paired_median_saving_cpu_s'], 1)
+        self.assertEqual(summary['base_median_cpu_s'], 10)
+        self.assertEqual(summary['changed_median_cpu_s'], 2)
+        self.assertTrue(summary['all_passed'])
+        runs[0]['status'] = 1
+        runs[1]['tests'] = 2
+        self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['all_passed'])
+        self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['same_test_count'])
+        partial = trial.module_summary('fixture/test_sample.py', 3, runs[1:])
+        self.assertFalse(partial['all_passed'])
+        self.assertFalse(partial['same_test_count'])
+        self.assertIsNone(trial.module_summary('fixture/test_sample.py', 3, [])['base_median_cpu_s'])
+
+    def test_result_validation_checks_identity_rounds_and_box(self) -> None:
+        request = trial.module_request(self.request(), 'fixture/test_sample.py', 'attempt', int(time.time()) + 600)
+        row = {**request, 'verdict': 'pass', 'runs': [self.sample('base', 1, 1)]}
+        trial.validate_paired_result(row, request, 'i-fixture')
+        for key, value in (('attempt', 'other'), ('base', dict[str, object]()), ('rounds', 99)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                trial.validate_paired_result({**row, key: value}, request, 'i-fixture')
+        with self.assertRaises(ValueError):
+            trial.validate_paired_result({**row, 'runs': [self.sample('base', 1, 1)] * 2}, request, 'i-fixture')
+        with self.assertRaises(ValueError):
+            trial.validate_paired_result(row, request, 'i-other')
+
+    def guest(self, *, limit: float = 10) -> tuple[dict[str, object], list[dict[str, object]]]:
+        from scripts.aws_target import gate_box, cloud_gate
+        box = self.root / 'box'
+        box.mkdir()
+        request = trial.module_request(self.request(), 'fixture/test_sample.py', 'attempt', int(time.time()) + 600)
+        request['module_time_limit_s'] = limit
+        cloud_gate.save(box / 'request.json', request)
+        cloud_gate.save(box / 'links.json', {'production': True, 'step': 'size', 'log': 'log', 'result': 'result',
+                                           'instance_type': 'm7a.8xlarge'})
+        tools = self.root / 'tools'
+        tools.mkdir()
+        curl = tools / 'curl'
+        _ = curl.write_text(f'''#!{sys.executable}
+import os, pathlib, sys
+pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buffer.read())
+''')
+        curl.chmod(0o755)
+        _ = (box / 'guest.py').write_text(gate_box.GUEST)
+        trace = self.root / 'trace.jsonl'
+        result = subprocess.run([sys.executable, str(box / 'guest.py')], capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GATE_BOX_DIR': str(box), 'PAIRED_TRACE': str(trace),
+                 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reply = cloud_gate.read(box / 'uploaded-result')
+        traces = [ledger.mapping(cast(object, json.loads(line))) for line in trace.read_text().splitlines()] if trace.exists() else []
+        return reply, traces
+
+    def test_local_guest_uses_two_trees_alternating_isolated_processes(self) -> None:
+        reply, traces = self.guest()
+        runs = ledger.rows(reply, 'runs')
+        self.assertEqual(reply['verdict'], 'pass', reply)
+        self.assertEqual([row['variant'] for row in runs], ['base', 'changed', 'changed', 'base', 'base', 'changed'])
+        self.assertEqual([row['round'] for row in runs], [1, 1, 2, 2, 3, 3])
+        self.assertEqual(len({row['pid'] for row in traces}), 8)
+        self.assertEqual(len({row['temporary'] for row in traces}), 8)
+        self.assertEqual(len({row['home'] for row in traces}), 8)
+        self.assertEqual(len({row['cwd'] for row in traces}), 2)
+        self.assertTrue(all(row['tests'] == 1 and row['status'] == 0 for row in runs))
+        self.assertTrue(all(isinstance(row['cpu_s'], float) and isinstance(row['peak_mib'], float) for row in runs))
+        self.assertTrue((self.root / 'box/measure').exists())
+        self.assertEqual(set(runs[0]), trial.RUN_FIELDS)
+
+    def test_guest_warms_both_trees_without_result_rows_or_measurements(self) -> None:
+        reply, traces = self.guest()
+        self.assertEqual(len(traces), 8)
+        self.assertEqual([Path(str(row['cwd'])).name for row in traces[:2]], ['base', 'changed'])
+        runs = ledger.rows(reply, 'runs')
+        self.assertEqual(len(runs), 6)
+        self.assertTrue(all(row['round'] in (1, 2, 3) for row in runs))
+        log = (self.root / 'box/gate.log').read_text()
+        self.assertEqual(sum(line.startswith('{"module":') for line in log.splitlines()), 6)
+        summary = trial.module_summary('fixture/test_sample.py', 3, runs)
+        self.assertEqual(summary['rounds'], 3)
+        self.assertTrue(summary['all_passed'])
+
+    def test_guest_timeout_keeps_runs_with_missing_cpu(self) -> None:
+        reply, _ = self.guest(limit=0)
+        runs = ledger.rows(reply, 'runs')
+        self.assertEqual(len(runs), 6)
+        self.assertTrue(all(row['status'] == 124 and row['cpu_s'] is None for row in runs))
+        self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['all_passed'])
+
+    def test_slot_limit_refuses_before_service_or_admin_access(self) -> None:
+        with mock.patch.object(subprocess, 'call', side_effect=AssertionError('service start')):
+            output = StringIO()
+            with redirect_stdout(output):
+                status = trial.paired_main(['--base', self.base, '--changed', self.changed,
+                    '--modules', *[f'fixture/test_{number}.py' for number in range(10)]], self.state)
+        self.assertEqual(status, 1)
+        self.assertEqual(json.loads(output.getvalue()), {'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True})
+
+    def test_terminal_signals_stop_the_owning_service(self) -> None:
+        from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            script = '''import signal, sys
+from unittest import mock
+from scripts.aws_target import gate_trial
+with mock.patch.object(gate_trial.subprocess, 'call', side_effect=lambda command: signal.raise_signal(int(sys.argv[1]))), mock.patch.object(gate_trial.subprocess, 'run') as stop:
+    assert gate_trial.paired_service(['fixture'], 'fixture-unit') == 1
+    stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
+'''
+            reply = subprocess.run([sys.executable, '-c', script, str(number)], capture_output=True, text=True,
+                                   timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(reply.returncode, 0, reply.stderr)
+
+    def test_guest_failed_sample_keeps_measurements_and_counts(self) -> None:
+        module = self.repo / 'scripts/fixture/test_sample.py'
+        _ = module.write_text(module.read_text().replace("self.assertFalse(pathlib.Path('generated').exists())", "self.fail('fixture failure')"))
+        _ = trial.checked_git(self.repo, 'add', '.')
+        _ = trial.checked_git(self.repo, 'commit', '-qm', 'Failing fixture')
+        self.changed = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
+        _ = trial.checked_git(self.repo, 'push', str(self.origin), 'HEAD:refs/heads/failure')
+        reply, _ = self.guest()
+        runs = ledger.rows(reply, 'runs')
+        self.assertEqual(len(runs), 6)
+        self.assertEqual([row['status'] for row in runs], [0, 1, 1, 0, 0, 1])
+        self.assertTrue(all(row['cpu_s'] is not None and row['tests'] == 1 for row in runs))
+        self.assertFalse(trial.module_summary('fixture/test_sample.py', 3, runs)['all_passed'])
+
+    def test_paired_cli_uses_scaler_without_admin_or_new_settings(self) -> None:
+        from scripts.aws_target import cloud_gate
+        cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture'})
+        with (mock.patch.object(admin_secrets.AdminSecretSession, 'get', side_effect=AssertionError('admin read')),
+              mock.patch.object(trial, 'paired_service', return_value=0) as service):
+            self.assertEqual(trial.main(['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
+                '--modules', 'fixture/test_sample.py'], self.settings, self.state), 0)
+        command = cast(list[str], service.call_args.args[0])
+        self.assertIn('--property=KillMode=mixed', command)
+        self.assertTrue(any(value.startswith('--setenv=AWS_SHARED_CREDENTIALS_FILE=') for value in command))
+        paths = list((self.state / 'paired-trials').glob('*/*/request.json'))
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(cloud_gate.read(paths[0])['rounds'], 3)

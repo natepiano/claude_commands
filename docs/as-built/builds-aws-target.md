@@ -489,3 +489,39 @@ CREATE reservation failures and UPDATE failures include current failed resource 
 A stable failure reconciles the compute request at once. A timeout or uncertain stack status keeps the request pending.
 The helper redacts the notification address from the prepared parameters. It does not read the private address file during failure reporting.
 The same administrator session reads failure details without another passphrase prompt.
+
+## Paired speed trials
+
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one disposable gate box.
+All boxes launch after the full trial obtains its cloud slots and cost reservations.
+The trial refuses costs above the daily or monthly room.
+It does not change either limit.
+It uses the scaler service, the existing launch template, and presigned transfers.
+It reads no administrator secret.
+
+Each box checks both trees and runs a separate `module_run.py` process for every sample.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The installed guest supplies the environment and memory sampler.
+Each tested tree supplies `module_run.py` and the test module.
+Periodic log transfers stop before measurement.
+The guest transfers each sample between measurements.
+
+Stdout contains run JSON lines, module JSON lines, and one final cost JSON line.
+The module summary gives the median CPU saving across complete pairs.
+A failed or missing sample makes `all_passed` false.
+The final line contains `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate counts only this trial's boxes, allowances, and new bill-query fees.
+Unconfirmed termination uses the reserved lifetime and returns a nonzero status.
+The command terminates boxes after results, errors, or cancellation.
+Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
+
+The size/start trials and the twelve `gate_trial_*` settings remain available.
+Their removal is a separate optional change.
