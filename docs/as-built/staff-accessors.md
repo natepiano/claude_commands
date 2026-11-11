@@ -23,6 +23,9 @@ The fixed `id` identifies a member across session changes.
 `StaffSnapshot` derives backend evidence from session records, transcripts, and live processes.
 `ClaudeBackend.family` is `claude`.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
+The worker's recorded `SessionHome` supplies `codex_home` when that home contains its transcript.
+A Codex transcript without a matching recorded home gives `BACKEND_UNAVAILABLE`, including when the row has no recorded home.
+Shared session folders do not select an account, and these rows never become `ClaudeBackend`.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
 A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.

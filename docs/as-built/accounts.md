@@ -139,10 +139,42 @@ All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
 A selected caller delegates the batch to a detached process before any signal.
 The notes timer delegates its moves through the same boundary before its part deadline can kill them.
+For workers, the notes job writes the role and starts the moves in their own process.
+The request stays pending until the detached process ends.
+A later notes pass starts an unfinished move again; workers already on the target stay unchanged.
+The detached process confirms registered requests for its final target, with the target home.
+It fails registered requests for other targets with `superseded by <label>`.
+Replay consumes the queued entry after either completion result.
+Each worker row records its own move result.
+Worker refusals do not keep the group request open.
+The next assign moves a refused or stopped worker to the selected account, so a lasting anomaly cannot cause endless group retries.
+One `accounts-workers-move` unit serves every target.
+The runner reads the role before each worker and repeats after a changed final role.
+A run lock serializes worker moves, including the fallback without systemd.
+Direct Codex worker moves use this runner and read the selected role before each worker.
+Both direct preview and execution refuse a Codex target that differs from the workers role.
+The refusal says `workers role is <role>; run accounts.py swap workers <codexN> to select it`.
+The swap preview shares the worker preview helper and can show a new target without changing the role.
+Claude worker moves use this runner with a fixed Claude label under the same run lock.
+Only Codex moves read or complete pending group requests and their marker.
+A short schedule lock protects startup, the pending marker, the final role check, and group completion.
+Both locks use `file_lock.exclusive`.
+The marker is `~/.local/state/accounts/workers_move.json`.
+Startup writes the role and marker while it holds the schedule lock.
+A new handoff during unit exit retains this marker for the next notes pass.
+A failed start leaves the request pending; the existing blocked-entry notice reports the cause once.
 Requests use each session's observed process account, including members outside their selected group account.
 Blocked notices check the queue head and target again before delivery.
 Quota recipients use one session address for both names and IDs.
 Workers keep their threads when their Claude owner moves.
+An assignment compares the process account home with the selected account home for Claude and Codex.
+It uses one process environment read for this check and the run check.
+An unreadable environment permits reuse only for a worker whose pass is active in the current run.
+A different account follows the existing close checks, stop, and resume in the same pane.
+Workers moves and previews omit workers of the other family.
+The preview shares the move decision and lists workers that would resume or receive a refusal, with each reason.
+One count line covers workers with nothing to move.
+These include closed workers without an active dispatch, workers without a current session, and workers already on the target.
 
 A group move validates the destination before changing the selection or stopping members.
 It selects the account for future launches and moves live off-target members.

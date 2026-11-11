@@ -54,7 +54,7 @@ from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
 from scripts.whoami.quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown,
-                         StoppedWorkerCommand, StoppedCommandUnknown)
+                         StoppedWorker, StoppedWorkerUnknown)
 from scripts.whoami.run_out import READINGS_LOG
 from scripts.whoami import usage_store
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
@@ -632,7 +632,7 @@ def main() -> None:
         _ = parser.add_argument("identity", nargs="+", metavar="HOME LOGIN LABEL | HOME REASON")
         _ = parser.add_argument("--window", choices=("weekly", "five_hour", "unknown"), default="unknown")
         _ = parser.add_argument("--refused-at", default="", metavar="AWARE_ISO_TIME")
-        _ = parser.add_argument("--stopped", nargs=3, metavar=("SESSION_ID", "WORKER", "COMMAND"))
+        _ = parser.add_argument("--stopped", nargs=2, metavar=("SESSION_ID", "WORKER"))
         parsed = parser.parse_args(sys.argv[2:], namespace=RefusalCommandLine())
         arguments = parsed.identity
         if len(arguments) == 3:
@@ -655,8 +655,8 @@ def main() -> None:
             refused_at = RefusedAt(parsed_time)
         window = (refusals.KnownWindow("weekly") if parsed.window == "weekly" else
                   refusals.KnownWindow("five_hour") if parsed.window == "five_hour" else refusals.UnknownWindow())
-        stopped = (StoppedWorkerCommand(*parsed.stopped) if parsed.stopped is not None
-                   else StoppedCommandUnknown())
+        stopped = (StoppedWorker(*parsed.stopped) if parsed.stopped is not None
+                   else StoppedWorkerUnknown())
         for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at, stopped=stopped):
             print(line)
         return

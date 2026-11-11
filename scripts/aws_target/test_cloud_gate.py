@@ -10,6 +10,7 @@ import base64
 import gzip
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -121,8 +122,10 @@ class CloudGateTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         repository = Path(__file__).resolve().parents[2]
-        _ = (self.root / 'cloud_gate.conf').write_bytes(
-            (repository / 'config/cloud_gate.conf').read_bytes())
+        # The fixture keeps two sizes, so the shipped type list can change without these cases.
+        shipped = (repository / 'config/cloud_gate.conf').read_text()
+        _ = (self.root / 'cloud_gate.conf').write_text(
+            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(int(self.now) - 1,

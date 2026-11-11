@@ -981,7 +981,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 try:
                     native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
-                    row = pane_launch.staff_admitted(worker_admission.publish(allowed, native).row)
+                    row = worker_admission.publish(allowed, native).row
                     lock.bind(row)
                 except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     return UnpublishedWorker(identity, str(error))
@@ -1001,14 +1001,29 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             if isinstance(matches, UncertainWorker):
                 return matches
             same_run = True
-            if owner.kind == "unit" and matches and not passed:
+            same_account = True
+            check_run = owner.kind == "unit" and not passed
+            if matches:
                 try:
                     pane_row = next(pane for pane in evidence.panes if pane.get("pane_id") == current.pane)
                     launched = client.native_pane_process(current.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane_row)
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    return _uncertain(current.row, f"running launch environment is unproved: {error}")
-                same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
-            if matches and same_run:
+                    if passed.get("status") != "active":
+                        return _uncertain(current.row, f"running launch environment is unproved: {error}")
+                else:
+                    if check_run:
+                        same_run = launched.environment.get("UNIT_RUN_DIR") == str(allowed.run)
+                    expected = launch_environment(policy, account, True)
+                    if isinstance(expected, StartRefused):
+                        return expected
+                    from scripts.accounts import accounts
+
+                    key = "CODEX_HOME" if policy.settings.kind == "codex" else "CLAUDE_CONFIG_DIR"
+                    default_home = str(Path.home() / ".codex" if policy.settings.kind == "codex" else accounts.main_config_dir())
+                    running_home = Path(launched.environment.get(key, default_home)).expanduser().resolve()
+                    selected_home = Path(expected.get(key, default_home)).expanduser().resolve()
+                    same_account = running_home == selected_home
+            if matches and same_run and same_account:
                 _layout(owner.id, evidence)
                 return current
             closable = can_close(current, lock=lock)
@@ -1143,13 +1158,13 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             request = hashlib.sha256(f"{row.current_session if row else ''}:{policy.settings.kind}".encode()).hexdigest()
             published = worker_admission.switch_worker(allowed, policy.settings.kind, start=start,
                 dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request)
-            row = pane_launch.staff_admitted(published.row)
+            row = published.row
         else:
             identity = start(worker_admission.NoFamilyHandoff())
             if row is not None and identity != row.current_session:
                 return _uncertain(row, "launch proves another native session; pane retained")
             if row is None:
-                row = pane_launch.staff_admitted(worker_admission.publish(allowed, identity).row)
+                row = worker_admission.publish(allowed, identity).row
                 lock.bind(row)
     except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if not launches:

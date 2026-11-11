@@ -21,6 +21,18 @@ from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_worker_home_uses_the_recorded_account_with_shared_sessions(self) -> None:
+        fixture = self.row_production()
+        shared = Path.home() / ".codex" / "sessions"
+        shared.mkdir(parents=True)
+        numbered = Path.home() / ".codex1"
+        numbered.mkdir()
+        (numbered / "sessions").symlink_to(shared, target_is_directory=True)
+        (shared / f"{fixture.worker.current_session}.jsonl").touch()
+        row = staff.set_home(fixture.worker.id, staff.SessionHome(numbered))
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}):
+            self.assertEqual(labels.worker_home({"staff_id": row.id}, staff.local_snapshot()), str(numbered))
+
     def test_worker_directory_reports_only_unavailable_worktree_states(self) -> None:
         fixture = self.row_production()
         checkout = fixture.doc.parents[1]

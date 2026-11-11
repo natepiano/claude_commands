@@ -192,6 +192,31 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         registry.unlink()
         self.assertIsInstance(staff.backend(worker), staff.BackendUnavailable)
 
+    def test_codex_backend_requires_the_recorded_home_to_hold_the_transcript(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
+        shared = Path.home() / ".codex" / "sessions"
+        shared.mkdir(parents=True)
+        numbered = Path.home() / ".codex1"
+        numbered.mkdir()
+        (numbered / "sessions").symlink_to(shared, target_is_directory=True)
+        absent = Path.home() / ".codex2"
+        absent.mkdir()
+        for label, home, expected in (
+            ("recorded", staff.SessionHome(numbered), staff.CodexBackend(numbered)),
+            ("unknown", staff.HomeUnknown(), staff.BACKEND_UNAVAILABLE),
+            ("absent", staff.SessionHome(absent), staff.BACKEND_UNAVAILABLE),
+        ):
+            with self.subTest(home=label):
+                native = staff.native_id(fixture_runtime_id(label))
+                row = staff.ensure_worker(native, label, unit.id)
+                (shared / f"{native}.jsonl").touch()
+                if isinstance(home, staff.SessionHome):
+                    row = staff.set_home(row.id, home)
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}):
+                    self.assertEqual(staff.backend(row), expected)
+                    self.assertEqual(staff.local_snapshot().backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
+
     def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
         environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
                        "MODELS_REGISTRY_EDIT_BASE": "editor-generation", "KEEP": "agent-value"}

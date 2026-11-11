@@ -98,7 +98,8 @@ The command adds the gate bucket, role, profile, security group, launch template
 It preserves Rust parameters and refuses a change set that changes a Rust resource.
 It records a priced shared resource entry before creation.
 It saves the image, template version, public subnets, and nixpkgs revision locally.
-This phase prepares tools at boot. A prepared image belongs to plan phase 7.
+Gates boot the official NixOS image and prepare tools at boot.
+A prepared gate image was built and then taken out of use, because it did not make gates faster.
 
 | Scaler grant | Scope |
 | --- | --- |
