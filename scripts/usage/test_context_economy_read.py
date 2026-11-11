@@ -263,8 +263,10 @@ class ContextEconomyReadTests(unittest.TestCase):
             (instant("2026-11-01T10:30:00Z"), timeline, 2),
             (timeline[2].at, [*timeline, later], 3),
         ):
-            with self.subTest(start=start):
-                self.assertEqual(reader.settings_for(start, choices), choices[index])
+            for resolved in (choices, reader.ReportSettingsTimeline(choices)):
+                with self.subTest(start=start, cached=isinstance(resolved, reader.ReportSettingsTimeline)):
+                    self.assertEqual(reader.settings_for(start, resolved), choices[index])
+                    self.assertEqual(reader.settings_for(start, resolved), choices[index])
         self.assertIsInstance(reader.settings_for(timeline[0].at - timedelta(seconds=1), timeline), reader.SettingsUnknown)
         self.assertIsInstance(reader.settings_for(self.since, []), reader.SettingsUnknown)
 
@@ -323,25 +325,33 @@ class ContextEconomyReadTests(unittest.TestCase):
         return path
 
     def test_codex_requests_keep_the_model_version_tokens_and_compaction_evidence(self) -> None:
-        path = self.codex_rollout()
-        session, = reader.read_codex([path.parents[3]], self.since, self.until, "fixture-machine")
-        self.assertEqual((session.machine, session.family, session.session_id, session.agent_id),
-                         ("fixture-machine", "codex", "codex-fixture", "codex-fixture"))
-        self.assertEqual([(item.at, item.model, item.cli_version, item.input, item.cache_read,
-                           item.cache_write_5m, item.cache_write_1h, item.output, item.context)
-                          for item in session.requests], [
-            (self.since, "gpt-6.1-sol", "0.101.0", 200, 800, 0, 0, 100, 1000),
-            (instant("2026-11-01T10:11:00Z"), "gpt-6-astra", "0.101.0", 200, 100, 0, 0, 50, 300),
-            (instant("2026-11-01T10:21:00Z"), "gpt-6-astra", "0.102.0", 300, 50, 0, 0, 5, 350),
-        ])
-        event, = session.compactions
-        self.assertEqual((event.at, event.kind, event.trigger), (instant("2026-11-01T10:05:00Z"), "unknown", None))
-        self.assertIsInstance(event.pre_tokens, reader.SizeNotReported)
-        self.assertIsInstance(event.post_tokens, reader.SizeNotReported)
-        self.assertEqual(session.first_record_at, instant("2026-11-01T09:20:00Z"))
-        later, = reader.read_codex([path.parents[3]], self.since + timedelta(seconds=15), self.until, "fixture-machine")
-        self.assertEqual([item.at for item in later.requests],
-                         [instant("2026-11-01T10:11:00Z"), instant("2026-11-01T10:21:00Z")])
+        for compacted, token_count in ((b'"type":"compacted","timestamp"', b'token_count'),
+                                        (b'"payload":{"item":{"type":"contextCompaction"}},"timestamp"',
+                                         b'token_\\u0063ount')):
+            with self.subTest(compacted=compacted):
+                path = self.codex_rollout()
+                content = path.read_bytes().replace(b'"type":"compacted","timestamp"', compacted)
+                if b'"item"' in compacted:
+                    content = content.replace(b',"payload":{}}', b'}')
+                _ = path.write_bytes(content.replace(b'token_count', token_count))
+                session, = reader.read_codex([path.parents[3]], self.since, self.until, "fixture-machine")
+                self.assertEqual((session.machine, session.family, session.session_id, session.agent_id),
+                                 ("fixture-machine", "codex", "codex-fixture", "codex-fixture"))
+                self.assertEqual([(item.at, item.model, item.cli_version, item.input, item.cache_read,
+                                   item.cache_write_5m, item.cache_write_1h, item.output, item.context)
+                                  for item in session.requests], [
+                    (self.since, "gpt-6.1-sol", "0.101.0", 200, 800, 0, 0, 100, 1000),
+                    (instant("2026-11-01T10:11:00Z"), "gpt-6-astra", "0.101.0", 200, 100, 0, 0, 50, 300),
+                    (instant("2026-11-01T10:21:00Z"), "gpt-6-astra", "0.102.0", 300, 50, 0, 0, 5, 350),
+                ])
+                event, = session.compactions
+                self.assertEqual((event.at, event.kind, event.trigger), (instant("2026-11-01T10:05:00Z"), "unknown", None))
+                self.assertIsInstance(event.pre_tokens, reader.SizeNotReported)
+                self.assertIsInstance(event.post_tokens, reader.SizeNotReported)
+                self.assertEqual(session.first_record_at, instant("2026-11-01T09:20:00Z"))
+                later, = reader.read_codex([path.parents[3]], self.since + timedelta(seconds=15), self.until, "fixture-machine")
+                self.assertEqual([item.at for item in later.requests],
+                                 [instant("2026-11-01T10:11:00Z"), instant("2026-11-01T10:21:00Z")])
 
     def test_codex_starts_keep_one_earlier_anchor_and_the_starts_inside_the_window(self) -> None:
         path = self.codex_rollout()
@@ -386,7 +396,7 @@ class ContextEconomyReadTests(unittest.TestCase):
         self.assertEqual({session.family for session in cold}, {"claude", "codex"})
         with (patch.object(reader, "_read_transcript", side_effect=AssertionError("warm Claude parse")),
               patch.object(reader, "_read_codex_file", side_effect=AssertionError("warm Codex parse")),
-              patch.object(cache_module, "prefix_hash", side_effect=AssertionError("warm prefix read"))):
+              patch.object(cache_module, "prefix_anchor", side_effect=AssertionError("warm prefix read"))):
             self.assertEqual(self.cached_families(self.since), cold)
 
     def test_appends_resume_both_parsers_at_the_last_complete_line(self) -> None:
@@ -444,19 +454,19 @@ class ContextEconomyReadTests(unittest.TestCase):
         self.clear_summary_cache()
         self.assertEqual(self.cached_families(self.since), updated)
 
-    def test_prefix_hash_covers_all_blocks_and_stops_at_the_saved_offset(self) -> None:
+    def test_prefix_anchor_checks_both_blocks_and_stops_at_the_saved_offset(self) -> None:
         path = self.projects / "blocks.jsonl"
         prefix = b"a" * (2 * 1024 * 1024 + 17)
         _ = path.write_bytes(prefix + b"unparsed tail")
-        digest = cache_module.prefix_hash(path, len(prefix))
-        self.assertEqual(digest, hashlib.blake2b(prefix).hexdigest())
+        anchor = cache_module.prefix_anchor(path, len(prefix))
         _ = path.write_bytes(prefix + b"different tail")
-        self.assertEqual(cache_module.prefix_hash(path, len(prefix)), digest)
-        middle = len(prefix) // 2
-        _ = path.write_bytes(prefix[:middle] + b"b" + prefix[middle + 1:] + b"different tail")
-        self.assertNotEqual(cache_module.prefix_hash(path, len(prefix)), digest)
+        self.assertEqual(cache_module.prefix_anchor(path, len(prefix)), anchor)
+        for position, detects in ((0, True), (len(prefix) - 1, True), (len(prefix) // 2, False)):
+            with self.subTest(position=position):
+                _ = path.write_bytes(prefix[:position] + b"b" + prefix[position + 1:] + b"different tail")
+                self.assertEqual(cache_module.prefix_anchor(path, len(prefix)) != anchor, detects)
 
-    def test_middle_request_rewrite_then_growth_matches_a_cold_parse(self) -> None:
+    def test_middle_request_edit_outside_the_anchors_keeps_the_saved_summary(self) -> None:
         path = self.transcript("parent-fixture.jsonl", "project/middle.jsonl")
         request = next(line for line in path.read_bytes().splitlines(keepends=True)
                        if b'"requestId":"request-b"' in line)
@@ -468,15 +478,20 @@ class ContextEconomyReadTests(unittest.TestCase):
         self.assertLess(position + len(marker), len(original) - 4096)
         _ = path.write_bytes(original)
         cold = self.cached_families(self.since)
+        database = self.root / "home/.cache/context_economy/summaries.sqlite3"
+        with closing(sqlite3.connect(database)) as saved:
+            row = cast(tuple[int, str], saved.execute("SELECT offset, payload FROM summaries WHERE path = ?",
+                                                      (str(path.resolve()),)).fetchone())
+        held = cache_module.ParseCheckpoint(*row)
         changed = original.replace(marker, b'"input_tokens":9')
         self.assertEqual(len(changed), len(original))
         _ = path.write_bytes(changed + b"{}\n")
         with patch.object(reader, "_read_transcript", wraps=getattr(reader, "_read_transcript")) as parse:
             updated = self.cached_families(self.since)
-        parse.assert_called_once_with(path.resolve(), cache_module.ParseCheckpoint())
-        self.assertNotEqual(updated, cold)
+        parse.assert_called_once_with(path.resolve(), held)
+        self.assertEqual(updated, cold)
         self.clear_summary_cache()
-        self.assertEqual(self.cached_families(self.since), updated)
+        self.assertNotEqual(self.cached_families(self.since), updated)
 
     def test_resume_checks_both_ends_of_the_saved_prefix(self) -> None:
         path = self.projects / "samples.jsonl"
@@ -501,7 +516,12 @@ class ContextEconomyReadTests(unittest.TestCase):
         with closing(cache_module.TranscriptCache()) as first, closing(cache_module.TranscriptCache()) as second:
             _ = second.database.execute("PRAGMA busy_timeout = 0")
             self.assertEqual(first.read(path, "claude", lambda path, held: checkpoint), checkpoint)
-            self.assertEqual(first.read(path, "claude", lambda path, held: checkpoint), checkpoint)
+            transactions: list[str] = []
+            first.database.set_trace_callback(transactions.append)
+            for access in range(4):
+                with self.subTest(access=access):
+                    self.assertEqual(first.read(path, "claude", lambda path, held: checkpoint), checkpoint)
+            self.assertFalse(any(statement.startswith("BEGIN") for statement in transactions))
             self.assertFalse(first.database.in_transaction)
 
             def parse_other(source: Path, held: cache_module.ParseCheckpoint) -> cache_module.ParseCheckpoint:

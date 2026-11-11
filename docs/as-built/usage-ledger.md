@@ -246,12 +246,16 @@ The Mac reader uses one SSH call.
 It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac returns summary JSON lines.
 Both machines keep parsed events and complete-line checkpoints under `~/.cache/context_economy/`.
 A warm read reuses unchanged files; an appended file resumes with its saved parser state.
-Before resuming a grown file, the cache checks a BLAKE2b hash of every byte before the saved offset.
-The hash reader uses blocks of up to 1 MiB.
-A changed prefix causes a full parse.
-Unchanged files need no prefix read.
-Each access update and entry write uses a short transaction; parsing holds no database transaction.
+Before resuming a grown file, the cache checks its device, inode, saved size, and complete-line offset.
+It compares BLAKE2b hashes of the first 4 KiB and the last 4 KiB before that offset.
+A failed check causes a full parse.
+These anchors assume append-only transcripts; they do not detect edits between the two blocks.
+Unchanged files need no anchor read.
+The cache batches access updates at close and uses durable SQLite WAL transactions for entry writes.
+Parsing holds no database transaction.
+Eviction reads payload lengths only when the cache exceeds its size bound.
 The cache stores all events before the report applies its time window.
+Each report reuses settings lookups for the same start time and machine.
 The cache uses resolved logical paths; `x.jsonl` and `x.jsonl.zst` share one entry.
 Summaries remain available after their transcript files are deleted.
 The cached source mtime still controls the old-file skip rule.

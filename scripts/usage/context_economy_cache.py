@@ -53,18 +53,23 @@ def logical_path(path: Path) -> Path:
     return resolved.with_suffix("") if resolved.suffix == ".zst" else resolved
 
 
-def prefix_hash(path: Path, offset: int) -> str:
-    """Hash every byte before the saved complete-line offset in large blocks."""
-    digest = hashlib.blake2b()
-    remaining = offset
+ANCHOR_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class PrefixAnchor:
+    """Hashes of the first block and the block before a saved offset."""
+    first: str
+    last: str
+
+
+def prefix_anchor(path: Path, offset: int) -> PrefixAnchor:
+    """Read at most two fixed-size blocks before the saved offset."""
     with path.open("rb") as source:
-        while remaining:
-            block = source.read(min(remaining, 1024 * 1024))
-            if not block:
-                break
-            digest.update(block)
-            remaining -= len(block)
-    return digest.hexdigest()
+        first = source.read(min(offset, ANCHOR_BYTES))
+        _ = source.seek(max(0, offset - ANCHOR_BYTES))
+        last = source.read(min(offset, ANCHOR_BYTES))
+    return PrefixAnchor(hashlib.blake2b(first).hexdigest(), hashlib.blake2b(last).hexdigest())
 
 
 @final
@@ -80,18 +85,15 @@ class TranscriptCache:
         folder = Path.home() / ".cache/context_economy"
         folder.mkdir(parents=True, exist_ok=True)
         self.database = sqlite3.connect(folder / "summaries.sqlite3")
+        _ = self.database.execute("PRAGMA journal_mode=WAL")
         self.database.row_factory = sqlite3.Row
+        self.accessed: dict[str, int] = {}
         _ = self.database.execute("""CREATE TABLE IF NOT EXISTS summaries (
             path TEXT PRIMARY KEY, family TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL,
             size INTEGER NOT NULL, mtime INTEGER NOT NULL, ctime INTEGER NOT NULL,
             offset INTEGER NOT NULL, payload TEXT NOT NULL, accessed INTEGER NOT NULL, final INTEGER NOT NULL,
-            prefix_hash TEXT NOT NULL DEFAULT ''
+            first_hash TEXT NOT NULL DEFAULT '', last_hash TEXT NOT NULL DEFAULT ''
         )""")
-        columns = {cast(str, row["name"]) for row in cast(list[sqlite3.Row], self.database.execute(
-            "PRAGMA table_info(summaries)").fetchall())}
-        if "prefix_hash" not in columns:
-            with self.database:
-                _ = self.database.execute("ALTER TABLE summaries ADD COLUMN prefix_hash TEXT NOT NULL DEFAULT ''")
 
     def paths(self, family: Family, roots: Sequence[Path], found: Sequence[Path], since: float) -> list[Path]:
         """Include retained summaries under the requested roots, using the last source mtime."""
@@ -115,7 +117,8 @@ class TranscriptCache:
              parse: Callable[[Path, ParseCheckpoint], ParseCheckpoint]) -> ParseCheckpoint | SummaryUnavailable:
         path = logical_path(path)
         row = cast(sqlite3.Row | None, self.database.execute(
-            "SELECT * FROM summaries WHERE path = ? AND family = ?", (str(path), family)).fetchone())
+            "SELECT device, inode, size, mtime, ctime, offset, payload, first_hash, last_hash "
+            + "FROM summaries WHERE path = ? AND family = ?", (str(path), family)).fetchone())
         held = (ParseCheckpoint(cast(int, row["offset"]), cast(str, row["payload"]))
                 if row is not None else ParseCheckpoint())
         if not path.exists():
@@ -133,20 +136,21 @@ class TranscriptCache:
                 return held
             resumed = False
         if resumed and row is not None:
-            resumed = prefix_hash(path, held.offset) == cast(str, row["prefix_hash"])
+            resumed = prefix_anchor(path, held.offset) == PrefixAnchor(
+                cast(str, row["first_hash"]), cast(str, row["last_hash"]))
         parsed = parse(path, held if resumed else ParseCheckpoint())
-        digest = prefix_hash(path, parsed.offset)
+        anchor = prefix_anchor(path, parsed.offset)
         with self.database:
             _ = self.database.execute("""INSERT OR REPLACE INTO summaries
-                (path, family, device, inode, size, mtime, ctime, offset, payload, accessed, final, prefix_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (path, family, device, inode, size, mtime, ctime, offset, payload, accessed, final, first_hash, last_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(path), family, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
-                 parsed.offset, parsed.payload, time.time_ns(), 0, digest))
+                 parsed.offset, parsed.payload, time.time_ns(), 0, anchor.first, anchor.last))
+        _ = self.accessed.pop(str(path), 0)
         return parsed
 
     def touch(self, path: Path) -> None:
-        with self.database:
-            _ = self.database.execute("UPDATE summaries SET accessed = ? WHERE path = ?", (time.time_ns(), str(path)))
+        self.accessed[str(path)] = time.time_ns()
 
     def mark_final(self, path: Path) -> None:
         """Let the compressor mark the logical transcript's saved summary as final."""
@@ -155,11 +159,18 @@ class TranscriptCache:
 
     def close(self) -> None:
         try:
+            with self.database:
+                _ = self.database.executemany("UPDATE summaries SET accessed = ? WHERE path = ?",
+                                             ((at, path) for path, at in self.accessed.items()))
             page_size = cast(int, self.database.execute("PRAGMA page_size").fetchone()[0])
             pages = cast(int, self.database.execute("PRAGMA page_count").fetchone()[0])
             free_pages = cast(int, self.database.execute("PRAGMA freelist_count").fetchone()[0])
             size = (pages - free_pages) * page_size
             removed = False
+            if size <= self.limit:
+                if pages * page_size > self.limit and free_pages:
+                    _ = self.database.execute("VACUUM")
+                return
             for row in cast(list[sqlite3.Row], self.database.execute(
                     "SELECT path, length(CAST(payload AS BLOB)) AS bytes FROM summaries ORDER BY accessed").fetchall()):
                 if size <= self.limit:

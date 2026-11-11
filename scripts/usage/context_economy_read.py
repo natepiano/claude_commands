@@ -97,6 +97,14 @@ class SettingsUnknown:
     """The timeline has no settings set at or before this start."""
 
 
+class ReportSettingsTimeline(list[SettingsSet]):
+    """Keep resolved start settings for one report's timeline."""
+
+    def __init__(self, entries: Sequence[SettingsSet]) -> None:
+        super().__init__(entries)
+        self.by_start: dict[datetime, SettingsSet | SettingsUnknown] = {}
+
+
 @dataclass(frozen=True)
 class MacSessions:
     sessions: list[Session]
@@ -179,13 +187,16 @@ def _read_transcript(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint
     request_keys = _wire_list(state.get("request_keys", []))
     completed = checkpoint.offset
     first = session.first_record_at
-    with path.open("rb") as source:
+    with path.open("rb", buffering=1024 * 1024) as source:
         completed = source.seek(checkpoint.offset)
         for offset, line in complete_lines(source):
             position = number
             number += 1
             completed = offset + len(line)
-            version_match = _CLI_VERSION.search(line)
+            version_position = line.find(b'"version"')
+            version_match = _CLI_VERSION.match(line, version_position) if version_position >= 0 else None
+            if version_position >= 0 and version_match is None:
+                version_match = _CLI_VERSION.search(line, version_position)
             version_changed = version_match is not None and version_match[1] != previous_version
             first_timestamp = isinstance(first, SessionBeginningUnknown) and b'"timestamp"' in line
             if not (first_timestamp or version_changed
@@ -282,10 +293,14 @@ def _read_codex_file(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint
     starts = {start.at: start for start in session.starts}
     previous_total = _object(state.get("previous_total"))
     completed = checkpoint.offset
-    with path.open("rb") as stream:
+    with path.open("rb", buffering=1024 * 1024) as stream:
         completed = stream.seek(checkpoint.offset)
         for offset, line in complete_lines(stream):
             completed = offset + len(line)
+            if not isinstance(first, SessionBeginningUnknown) and not any(marker in line for marker in (
+                    b'"session_meta"', b'"turn_context"', b'"token_count"',
+                    b'"compacted"', b'"contextCompaction"', b'\\u')):
+                continue
             record = decode_rollout(line.decode("utf-8"))
             if record is None:
                 continue
@@ -419,8 +434,14 @@ def settings_timeline(checkout: Path, since: datetime, until: datetime) -> list[
 
 def settings_for(session_start: datetime, timeline: Sequence[SettingsSet]) -> SettingsSet | SettingsUnknown:
     """Select the latest settings; later timeline entries win equal times."""
-    eligible = [entry for entry in timeline if entry.at <= _utc(session_start)]
-    return max(reversed(eligible), key=lambda entry: entry.at) if eligible else SettingsUnknown()
+    session_start = _utc(session_start)
+    if isinstance(timeline, ReportSettingsTimeline) and session_start in timeline.by_start:
+        return timeline.by_start[session_start]
+    eligible = [entry for entry in timeline if entry.at <= session_start]
+    resolved = max(reversed(eligible), key=lambda entry: entry.at) if eligible else SettingsUnknown()
+    if isinstance(timeline, ReportSettingsTimeline):
+        timeline.by_start[session_start] = resolved
+    return resolved
 
 
 def label(current: SettingsSet, previous: SettingsSet | SettingsUnknown) -> str:

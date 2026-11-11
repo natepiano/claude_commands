@@ -18,6 +18,9 @@ Use `--where KEY=JSON` on `report`, `save` or `compare`; repeat it for more sett
 
 Both machines cache parsed transcript events under `~/.cache/context_economy/`.
 Warm reads reuse unchanged files; appended files resume at the last complete line with their saved parser state.
+Append checks hash only the first 4 KiB and the last 4 KiB before the saved offset.
+A failed anchor, size, device, or inode check causes a full parse.
+The anchors assume append-only files and do not detect edits between the blocks.
 The report applies its time window after the cache read.
 Summaries survive file deletion and share one entry with the `.jsonl.zst` form.
 Compressed files without a summary are skipped in this phase.

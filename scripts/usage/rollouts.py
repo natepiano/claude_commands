@@ -239,10 +239,9 @@ def is_compaction(record: RolloutRecordJson) -> bool:
 
 
 def complete_lines(source: BinaryIO) -> Iterator[tuple[int, bytes]]:
-    while True:
-        offset = source.tell()
-        line = source.readline()
-        if not line or not line.endswith(b"\n"):
+    offset = source.tell()
+    for line in source:
+        if not line.endswith(b"\n"):
             return
         yield offset, line
-
+        offset += len(line)
