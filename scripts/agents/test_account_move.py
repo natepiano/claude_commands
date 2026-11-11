@@ -23,7 +23,7 @@ from scripts.whoami.note_file import note_name
 from scripts.agents import inventory
 from scripts.message import sessions
 from scripts.production import showrunners
-from scripts.production.staff_test_support import recorded_showrunner
+from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
@@ -287,7 +287,8 @@ class AccountMoveTests(ShutdownTestCase):
         from scripts.agents import remote
         from scripts.lib.test_models_registry import write_registry
 
-        for state in ("interrupted", "unknown home", "control paused", "control remote", "control codex"):
+        for state in ("interrupted", "early exit after home write", "unreadable account", "unknown home",
+                      "control paused", "control remote", "control codex"):
             with self.subTest(state=state):
                 self.moves.calls.clear()
                 identity = staff.StaffId("stopped-producer")
@@ -295,25 +296,53 @@ class AccountMoveTests(ShutdownTestCase):
                     current_session=identity, home=staff.HomeUnknown() if state == "unknown home" else staff.SessionHome(self.root / ".claude1"),
                     doc=staff.LiveDoc("mac" if state == "control remote" else "natedev", self.root / "plan.md"),
                     paused=staff.Paused("now", "user", "hold") if state == "control paused" else staff.Active())
+                if state in ("early exit after home write", "unreadable account"):
+                    row = fixture_member("producer", name=row.name, doc=row.doc)
+                    identity = row.current_session
+                    row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude1"))
+                if state == "unreadable account":
+                    row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude3"))
+                    self.moves.failures[identity] = "live process account is unreadable"
                 family = "codex:gpt-test:high" if state == "control codex" else "claude:opus:max"
                 registry = write_registry(self.root / "producer-models.conf", {"producers": {row.name: family}})
                 live = [accounts.LiveGroupMember(identity, row.name, "showrunners", self.root / ".claude1")] if state == "interrupted" else []
-                with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
+                move = self.moves.move
+                def start(session: str, target: str, *, why: str) -> stop_resume.MoveResult:
+                    nonlocal row
+                    result = move(session, target, why=why)
+                    if state == "early exit after home write" and len(self.moves.calls) == 1:
+                        row = staff.set_home(row.id, staff.SessionHome(self.root / f".{target}"))
+                        return stop_resume.ResumePending(session, target, "start confirmation failed")
+                    return result
+                with (patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
+                      patch.object(self.moves, "move", side_effect=start),
                       patch.object(remote, "other_machine", return_value="mac"),
-                      patch.object(sessions, "running_sessions", return_value=[]),
+                      patch.object(sessions, "running_sessions", return_value=[sessions.SessionRecord(
+                          pid=998071, sessionId=identity, name=row.name, messagingSocketPath="", updatedAt=1,
+                          tmux="", formerNames=[])] if state == "unreadable account" else []),
                       patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}),
                       patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": live})):
-                    if state == "interrupted":
-                        self.moves.failures[identity] = "resume pending"
+                    if state in ("interrupted", "early exit after home write"):
+                        if state == "interrupted":
+                            self.moves.failures[identity] = "resume pending"
                         first = accounts.move_group("showrunners", "claude3", why="retry")
                         self.assertIsInstance(first, accounts.GroupMoveStartFailed)
                         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
+                        if state == "early exit after home write":
+                            self.assertEqual(row.home, staff.SessionHome(self.root / ".claude3"))
                         self.moves.failures.clear()
                         live.clear()
                     retry = accounts.move_group("showrunners", "claude3", why="retry")
+                if state == "unreadable account":
+                    self.assertIsInstance(retry, accounts.GroupMoveStartFailed)
+                    assert isinstance(retry, accounts.GroupMoveStartFailed)
+                    self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "retry")])
+                    self.assertIn("live process account is unreadable", retry.stderr)
+                    self.moves.failures.clear()
+                    continue
                 self.assertIsInstance(retry, accounts.GroupMoveStarted)
                 assert isinstance(retry, accounts.GroupMoveStarted)
-                expected = 2 if state == "interrupted" else 1 if state == "unknown home" else 0
+                expected = 2 if state in ("interrupted", "early exit after home write") else 1 if state == "unknown home" else 0
                 self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "retry")] * expected)
                 if state == "unknown home":
                     self.assertIn("saved account is unknown", retry.stdout)

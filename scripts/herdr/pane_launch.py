@@ -630,7 +630,7 @@ class ClaudeArguments:
 
 # Claude options used by launch commands; all consumers share this parse.
 CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--settings",
-    "--model", "--name", "-n", "--permission-mode", "--session-id", "--plugin-dir"})
+    "--model", "--name", "-n", "--effort", "--permission-mode", "--session-id", "--plugin-dir"})
 RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 

@@ -512,7 +512,8 @@ class PaneRestoreTests(unittest.TestCase):
         pane_record.write("agents", pane_record.launch("w1:p1", str(row.current_session), str(fixture.root),
             {"CODEX_HOME": str(fixture.root / "codex")}, ["codex", "resume", str(row.current_session)], kind="codex"))
         before = fixture.world.panes()
-        with (mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+        parent_pid = fixture.world.foreground["w1:p0"][0]
+        with (mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (parent_pid,))),
               mock.patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
