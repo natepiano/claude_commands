@@ -368,7 +368,7 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
                         key=lambda entry: entry["written_at"], default=None)
             if entry is not None and entry["pane_id"] in pane_ids:
                 found.append((row, entry["pane_id"]))
-        missing = [row for row in rows if row.kind == "agent" and not any(item.id == row.id for item, _pane in found)]
+        missing = [row for row in rows if row.kind == "producer" and not any(item.id == row.id for item, _pane in found)]
         if missing:
             scan = client.scan_row_panes(staff.StaffSnapshot(tuple(missing)), [dict(pane) for pane in panes])
             found.extend((row, str(pane["pane_id"])) for row in missing for pane in scan.found.get(row.id, []))

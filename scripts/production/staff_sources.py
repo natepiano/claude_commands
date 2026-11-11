@@ -421,14 +421,14 @@ def live() -> dict[str, object]:
                     unregistered.append(pending.identity)
                     incomplete = True
                     _problem(pending.identity, "backend publication is unfinished")
-    active_ids = {row.id for kind in ("unit", "showrunner", "agent") for row in staff.active(record, kind)}
+    active_ids = {row.id for kind in ("unit", "showrunner", "producer") for row in staff.active(record, kind)}
     resolver = session_staff.RowResolver(record, dependencies=dependencies)
     for row in record.rows:
         identity = scan.identities.get(row.id) if row.id in active_ids else None
         if row.kind != "worker" and identity is not None and row.current_session in identity.values():
             problems: list[str] = []
             document = resolver.production_doc(row)
-            if row.kind != "agent" and not isinstance(document, session_staff.ProductionDoc):
+            if row.kind != "producer" and not isinstance(document, session_staff.ProductionDoc):
                 problems.append(f"production doc could not be read: {document.reason}")
             if row.kind == "unit":
                 branch = resolver.unit_branch(row)

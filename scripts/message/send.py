@@ -3580,7 +3580,7 @@ def repeat_notice_owner(sender: str) -> str:
     """Follow staff parents to the sender's showrunner."""
     membership = staff.snapshot()
     member = resolve_staff_recipient(sender, membership)
-    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "agent":
+    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "producer":
         return rca.owner_address("")
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)

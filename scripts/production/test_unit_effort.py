@@ -102,7 +102,7 @@ class UnitEffortTests(unittest.TestCase):
         ]
         identities = {unit.session: unit.marks["CODEX_THREAD_ID"] for unit in units
                       if "CODEX_THREAD_ID" in unit.marks}
-        notes = fixture_member("agent", name="notes", runtime_id=fixture_runtime_id("notes"))
+        notes = fixture_member("producer", name="notes", runtime_id=fixture_runtime_id("notes"))
         identities["notes"] = notes.current_session
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
