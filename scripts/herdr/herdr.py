@@ -62,8 +62,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
-
-NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS, HerdrFailure, HerdrMissing
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
@@ -146,20 +145,8 @@ def _platform() -> str:
     return os.environ.get("HERDR_PLATFORM", _PLATFORM)
 
 
-class HerdrFailure(Exception):
-    """An external command failure or malformed herdr response."""
-
-    def __init__(self, message: str, code: str = "") -> None:
-        super().__init__(message)
-        self.code: str = code
-
-
 class NativeRegistryUnavailable(ValueError):
     """The process has no native registry identity."""
-
-
-class HerdrMissing(HerdrFailure):
-    """No herdr binary is available."""
 
 
 class _DarwinProcessGone(HerdrFailure):
@@ -2474,7 +2461,8 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str, *, target: str,
-               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED,
+               on_submission: Callable[[], object] = lambda: None) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
@@ -2482,6 +2470,7 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        _ = on_submission()
         self._prompt(pane, text, proof=proof)
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:

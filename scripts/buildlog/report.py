@@ -25,7 +25,6 @@ from scripts.buildlog.moments import COLD_BUILD_MIN_CRATES
 from scripts.buildlog import store
 from scripts.buildlog import record
 from scripts.buildlog import sync, rust_release, aws_report
-from scripts.mac_test import mac_test
 from scripts.buildlog.mac_outcome import (
     DECLINE_REASONS,
     CacheReuse,
@@ -53,7 +52,7 @@ from scripts.buildlog.mac_outcome import (
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.aws_target import config as aws_config, ledger, measurement
-from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
+from scripts.build_targets.target_config import ssh_target_state_directory
 
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
@@ -2311,28 +2310,23 @@ def peer_sync_lines() -> list[str]:
 
 def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
-    configured = tuple(item for item in read_targets() if isinstance(item, SshTarget) and is_aws_target(item))
-    return [line for target in configured for line in aws_target_section(connection, day, target, len(configured) > 1)]
-
-
-def aws_target_section(connection: sqlite3.Connection, day: str, configured: SshTarget, multiple: bool) -> list[str]:
-    target = configured.name
-    directory = mac_test.state_paths(target).directory
+    settings = conf.path('aws_target')
+    directory = ssh_target_state_directory('aws')
     instant = int(time.time())
     spends: tuple[ledger.DailySpend, ...] = ()
     daily_limit = Decimal(0)
     try:
         inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
-        snapshot = measurement.read_measurement(configured.settings, directory, instant, inputs=inputs)
-        usage = measurement.daily_usage(configured.settings, directory, day, instant, inputs=inputs)
+        snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
+        usage = measurement.daily_usage(settings, directory, day, instant, inputs=inputs)
         if isinstance(snapshot, measurement.AwsMeasurement) and isinstance(snapshot.costs, ledger.CostEstimate) and not isinstance(inputs.settings, measurement.MeasurementUnavailable):
             spends = ledger.CostLedger(directory).spend_days(inputs.settings, instant)
             daily_limit = inputs.settings.daily_limit_usd
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
-    saving = aws_report.estimate_wait_saved(connection, day, target, bounds=day_range(day))
-    lines = [f'### AWS: {target}' if multiple else '### AWS', '']
+    saving = aws_report.estimate_wait_saved(connection, day, 'aws', bounds=day_range(day))
+    lines = ['### AWS', '']
     dollars = uptime = 'unavailable'
     ratio = 'cost per saved hour unavailable'
     if isinstance(usage, measurement.DailyUsage):
@@ -2361,26 +2355,11 @@ def aws_target_section(connection: sqlite3.Connection, day: str, configured: Ssh
         for spend in spends:
             if spend.source == 'AWS bill' or (current_report and spend.day == today):
                 lines.extend(aws_report.spend_lines(spend, daily_limit, today=spend.day == today))
-        if isinstance(snapshot.go_live_at, int):
-            boundary = store.utc_iso(snapshot.go_live_at)
-            periods: list[list[object]] = []
-            for relation in ('<', '>='):
-                rows = fetch(connection, "SELECT sum(coalesce(mem_wait_s,0)) FROM steps WHERE "
-                             + natedev_step_predicate() + f' AND started_at {relation} ?'
-                             + " GROUP BY date(started_at,'localtime') ORDER BY date(started_at,'localtime')", boundary)
-                periods.append([row[0] for row in rows])
-            before, after = periods
-            lines.append('Natedev daily summed queue wait before go-live: '
-                         + (', '.join(seconds(value) for value in before) if before else 'unavailable')
-                         + '; after go-live: ' + (', '.join(seconds(value) for value in after) if after else 'unavailable')
-                         + '; unmatched for load.')
-        else:
-            lines.append('Natedev daily queue wait before and after go-live: unavailable; unmatched for load.')
-    status = sync.read_status(target)
-    if isinstance(status, sync.SyncStatus) and isinstance(status.last_good, sync.LastSynced):
-        lines.append(f'AWS report data synchronized at {sync.sync_time(status.last_good.at, datetime.fromtimestamp(instant))}.')
-    else:
-        lines.append('AWS report data never synchronized; run buildlog sync.')
+    try:
+        days = conf.read(settings).whole('gate_type_window_days')
+        lines.extend(aws_report.gate_type_lines(directory, day, days))
+    except (OSError, ValueError, ArithmeticError, KeyError) as error:
+        lines.append(f'Gate type comparison unavailable: {error}.')
     return [*lines, '']
 
 

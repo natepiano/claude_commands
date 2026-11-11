@@ -187,6 +187,13 @@ class SelectedModules:
     paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class TreeSelection:
+    """Hold selected paths and the Git tree that the selection read."""
+    paths: tuple[str, ...]
+    tree: str
+
+
 ALL_MODULES = AllModules()
 SHARED_MACHINE = SharedMachine()
 
@@ -462,7 +469,7 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = bool(holds.in_force) and not build_targets.caller_holds_only_own()
+            held = build_targets.caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:
@@ -973,6 +980,21 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
 
 
+def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | UnrecordableTestTree,
+                            modules: Sequence[tuple[str, Path]], *,
+                            source: Literal["tests-only", "checkpoint"] = "tests-only"
+                            ) -> tuple[AffectedSelection | FullSuite, PassedTreeLedger]:
+    """Select affected tests against the tree that the caller will test."""
+    if not modules:
+        raise GateRefused("the test list is empty")
+    ledger = PassedTreeLedger(repo, source, tested_tree, sorted({suite for suite, _ in modules}))
+    dirty = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set[str]()
+    selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
+                                state_dir=gate_state_dir())
+    report_selection(selection, len(modules))
+    return selection, ledger
+
+
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],
                     results: Sequence[GateJobResult], suite_started: dict[str, float],
                     suite_finished: dict[str, float], *, started_at: float, wall_s: float,
@@ -1095,10 +1117,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             elif mode is SuiteMode.MERGE_GATE:
                 selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
             else:
-                dirty: set[str] = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set()
-                selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
-                                            state_dir=gate_state_dir())
-            report_selection(selection, len(modules))
+                selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+            if mode is SuiteMode.MERGE_GATE or full:
+                report_selection(selection, len(modules))
             if isinstance(selection, AffectedSelection):
                 selected_paths = set(selection.modules)
                 modules = [(suite, path) for suite, path in modules if path in selected_paths]
@@ -1548,7 +1569,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
               f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
-        result = subprocess.run([args.ssh, "-o", "ConnectTimeout=10", args.mac_host, remote],
+        result = subprocess.run([args.ssh, args.mac_host, remote],
                                 cwd=main_repo, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, check=False, timeout=25)
     except (GateRefused, KeyboardInterrupt, OSError, subprocess.SubprocessError) as error:
@@ -1898,7 +1919,9 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
 class CloudGateRoute(Protocol):
     """Define the cloud route boundary without coupling the local runner to AWS."""
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float) -> GateRun | str: ...
+              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES) -> GateRun | str: ...
+
+    def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -1906,8 +1929,33 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.MERGE_GATE) -> GateRun:
     """Use the scaler service and retain the permitted local fallback."""
+    absent = [name for name in type_dirs if not (repo / name).exists()]
+    if absent:
+        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
-    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s)
+    selected: AllModules | TreeSelection = ALL_MODULES
+    if mode is SuiteMode.TARGETED_TEST and not full:
+        try:
+            tree, dirty = cloud.working_tree(repo)
+        except affected_modules.GraphError as error:
+            raise GateRefused(str(error)) from error
+        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
+        modules = discover_test_modules(repo)
+        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
+        if isinstance(selection, AffectedSelection) and not selection.modules:
+            if type_dirs:
+                return run_suites(repo, type_dirs, module_time_limit_s, source=source, mode=mode)
+            reused = ledger.reuse()
+            if not reused:
+                ledger.record_pass(selection)
+            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
+                            hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
+                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
+            return GateRun((), 0.0, 0.0, selection_certified=True)
+    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
     if isinstance(outcome, str):
         print('Cloud gate uses natedev: ' + outcome, flush=True)
         return run_suites(repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode)

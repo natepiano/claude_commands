@@ -36,6 +36,8 @@ def write_aws_claim(directory: Path, *, kept: bool, remote: bool = True) -> Path
     owner = process_start.process_start(os.getpid())
     assert isinstance(owner, process_start.Started)
     record: mac_test.ProcessBoundClaim = {
+        'claim_id': 'fixture-claim', 'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
+        'submitting_session': '',
         'pid': os.getpid(), 'proc_start': 'ended-owner' if kept else owner.start,
         'what': 'fixture tests', 'worktree': str(directory), 'since': '2026-11-06T09:00:00+00:00',
         'repo_name': 'fixture', 'repo_key': 'fixture',

@@ -46,7 +46,7 @@ Send at most one pending inquiry per item. Save the expected reply time before s
 Use `send_later.py` to wake morty, not to send an automatic demand to a showrunner.
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to morty --from morty --text 'Read ~/.claude/commands/associate-producer.md. Read current.md and checkins.json. Handle due items from fresh evidence first. Batch missing status requests by showrunner. Schedule the next wake.'
+~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to morty --from morty --text 'Read ~/.claude/commands/producer/morty.md. Read current.md and checkins.json. Handle due items from fresh evidence first. Group missing status requests by showrunner. Schedule the next wake.'
 ```
 
 Read back the timer with `systemctl --user show <timer> -p NextElapseUSecRealtime`.

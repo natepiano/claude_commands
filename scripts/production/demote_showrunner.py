@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.accounts import accounts
+from scripts.herdr import herdr_types
 from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
@@ -115,10 +116,16 @@ def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
     if isinstance(marked, unit_lookup.NoSession) or not isinstance(marked.claude, unit_lookup.LiveClaude):
         raise Refusal(f"{name}: cannot read the live pane")
     worktree = child.checkout
-    promote_showrunner.check_director(name, marked, marked.claude, worktree)
     relative_plan = plan.relative_to(child.checkout).as_posix()
-    if add_unit.git(child, "cat-file", "-e", f"{child.merge_branch}:{relative_plan}", check=False).returncode != 0:
-        raise Refusal(f"plan {relative_plan} is missing on {child.merge_branch}")
+    if not plan.is_file():
+        raise Refusal(f"plan {relative_plan} is missing in {child.checkout}")
+    tracked = add_unit.git(child, "ls-files", "--error-unmatch", "--", relative_plan, check=False)
+    if (tracked.returncode == 0
+            and add_unit.git(child, "cat-file", "-e", f"{child.merge_branch}:{relative_plan}", check=False).returncode != 0):
+        branch = add_unit.git(child, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        raise Refusal(f"plan {relative_plan} is committed only on {branch}; "
+                      + f"commit it on {child.merge_branch} or keep it untracked")
+    promote_showrunner.check_director(name, marked, marked.claude, worktree, skip_path=plan)
     check_units(child, record)
     return Demotion(parent, child, marked, marked.claude, worktree, child.merge_branch, plan, port)
 
@@ -288,7 +295,7 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
     if completed < Step.STARTED:
         try:
             started = launch(request)
-        except (OSError, ValueError, Refusal, accounts.AccountsError, herdr.HerdrFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
+        except (OSError, ValueError, Refusal, accounts.AccountsError, herdr_types.HerdrFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
             print(f"{request.child.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
             started = 1
         if started:
@@ -361,7 +368,7 @@ def main(argv: list[str]) -> int:
             except (Refusal, unit_config.ConfigRefused) as error:
                 print(f"demote_showrunner: {error}", file=sys.stderr)
                 return 2
-            except (OSError, ValueError, accounts.AccountsError, update_registration.RegistrationFailure, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, accounts.AccountsError, update_registration.RegistrationFailure, herdr_types.HerdrFailure) as error:
                 print(f"demote_showrunner: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 return 1
     return staff.cli_result(run)

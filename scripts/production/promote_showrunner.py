@@ -25,6 +25,7 @@ from typing import NamedTuple, cast
 
 
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
+from scripts.herdr import herdr_types
 from scripts.agents import remote, stop_resume
 from scripts.agents import worker_lifecycle
 
@@ -43,6 +44,13 @@ from scripts.production.production_doc import Production, ProductionDocument, Re
 
 class ProductionDocumentDefault(NamedTuple):
     """The request needs the unit's production document."""
+
+
+class CheckAllFiles(NamedTuple):
+    """The worktree check includes every file."""
+
+
+CHECK_ALL_FILES = CheckAllFiles()
 
 
 class Promotion(NamedTuple):
@@ -80,11 +88,13 @@ def _quiet(unit: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.Li
         raise Refusal(f"{unit}'s pane: {verdict.reason}")
 
 
-def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path) -> None:
-    """Refuse a unit with a run open, whose workers end only with the run, or with work uncommitted."""
+def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path, *,
+             skip_path: Path | CheckAllFiles = CHECK_ALL_FILES) -> None:
+    """Refuse an open run or uncommitted work outside the skipped path."""
     if unit_runs.open_run(claude.session_id) is not None:
         raise Refusal(f"{unit} has a /unit:direct run open, and its workers with it; the run finishes first")
-    status = _git(worktree, "status", "--porcelain")
+    paths = ["--", ".", f":(top,exclude,literal){skip_path.relative_to(worktree).as_posix()}"] if isinstance(skip_path, Path) else []
+    status = _git(worktree, "status", "--porcelain", *paths)
     if status.returncode != 0:
         raise Refusal(f"cannot read {unit}'s worktree {worktree}: {status.stderr.strip()}")
     if status.stdout.strip():
@@ -98,10 +108,10 @@ def _committed(doc: Path) -> None:
 
 
 def check_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude,
-                   worktree: Path) -> None:
-    """Require an idle director and a clean worktree."""
+                   worktree: Path, *, skip_path: Path | CheckAllFiles = CHECK_ALL_FILES) -> None:
+    """Require an idle director and no uncommitted work outside the skipped path."""
     _quiet(name, marked, claude)
-    _settled(name, claude, worktree)
+    _settled(name, claude, worktree, skip_path=skip_path)
 
 
 def checked(name: str, child_name: str, doc: Path, *,
@@ -225,7 +235,7 @@ def stop_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lo
             tabs = {pane.get("tab_id", "") for pane in panes if pane["pane_id"] == place.pane}
             workers: set[str] = {worker.name for worker in record.find(kind="worker", parent=row.id)} if row is not None else set()
             shells = [pane for pane in panes if pane.get("tab_id", "") in tabs and pane.get("label") in workers]
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
             shells = []
         for pane in shells:
@@ -233,12 +243,12 @@ def stop_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lo
                 if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell) and not client.close_tab_confirmed(
                         pane["pane_id"], terminal=pane.get("terminal_id", "")):
                     print(f"anomaly: {pane.get('label')}: old worker shell close failed", file=sys.stderr)
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"anomaly: {pane.get('label')}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         try:
             if not client.close_tab_confirmed(place.pane, target=claude.session_id):
                 print(f"anomaly: {name}: old director tab close failed", file=sys.stderr)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
     return stopped
 
@@ -394,7 +404,7 @@ def _main(argv: list[str]) -> int:
                                                "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refusal, OSError, herdr.HerdrFailure) as error:
+    except (Refusal, OSError, herdr_types.HerdrFailure) as error:
         print(f"promote_showrunner: {error}", file=sys.stderr)
         return 1
     if started == 2:

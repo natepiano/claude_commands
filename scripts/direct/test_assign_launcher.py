@@ -444,9 +444,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         write_text_atomic(self.ready, "ready\n")
         self.assertEqual(self.fixture.finish("review", turn_end.EventKind.STAGE_READY), turn_end.TurnOutcome.SUBMITTED)
         first, second = self.fixture.agent.submitted
-        dispatch_id = first[1].split("DONE ")[-1].split(".")[0]
+        dispatch_id = first[1].split("DONE ")[-1].split()[0].removesuffix(".")
         self.assertEqual(first[0], second[0])
-        self.assertIn(f"DONE {dispatch_id}-2.", second[1])
+        self.assertIn(f"DONE {dispatch_id}-2\n", second[1])
         self.assertIn(str(self.ready.with_suffix(".diff")), second[1])
         self.assertEqual(summary.read_text(), "The previous full report.\n")
         self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
@@ -484,7 +484,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(self.fixture.agent.waited, [])
         self.fixture.agent.complete(submitted[-1][0])
         self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
-        second_id = submitted[-1][1].split("DONE ")[-1].split(".")[0]
+        second_id = submitted[-1][1].split("DONE ")[-1].split()[0].removesuffix(".")
         self.assertTrue((self.phase / "review_summary_1.txt").read_text().endswith(f"DONE {second_id}\n"))
 
     def test_review_stage_one_done_does_not_complete_stage_two_or_replace_the_report(self) -> None:
@@ -675,7 +675,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertIsInstance(staff.backend(moved), staff.CodexBackend)
                 self.assertEqual(moved.parent, row.parent)
                 self.assertEqual(moved.to_json() | {"current_session": row.current_session},
-                                 replace(row, role=staff.KnownWorkerRole("impl")).to_json())
+                                 replace(row, role=staff.KnownWorkerRole("impl"),
+                                         home=staff.SessionHome(self.native.fixture.root / "codex")).to_json())
                 self.assertNotEqual(self.native.agent.submitted[-1][0], "w1:p1")
                 self.assertIsInstance(world.launches[-1], herdr.SplitPane)
                 extract = worker_admission.handoff_path(self.session_dir, row)
@@ -732,9 +733,14 @@ class AssignLauncherTests(HookAssignmentFixture):
                      "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
         result = invoke_assignment(arguments, os.environ.copy())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        submitted = self.native.agent.submitted.copy()
+        self.native.fixture.world.locations[submitted[0][0]]["agent_status"] = "working"
+        repeated = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.native.agent.submitted, submitted)
         self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
-        passed = assign.object_map(assign.object_map(state["pass"])["impl"])
+        passed = assign.object_map(assign.object_map(state["pass"])["impl2"])
         self.assertEqual((passed["worker_name"], passed["worker_id"], passed["status"]),
                          ("impl2", opened.row.id, "completed"))
         phase = self.session_dir / "phases/7"

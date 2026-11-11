@@ -23,6 +23,9 @@ The fixed `id` identifies a member across session changes.
 `StaffSnapshot` derives backend evidence from session records, transcripts, and live processes.
 `ClaudeBackend.family` is `claude`.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
+The worker's recorded `SessionHome` supplies `codex_home` when that home contains its transcript.
+A Codex transcript without a matching recorded home gives `BACKEND_UNAVAILABLE`, including when the row has no recorded home.
+Shared session folders do not select an account, and these rows never become `ClaudeBackend`.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
 A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
@@ -93,7 +96,7 @@ The shared pane launch builder uses `set_home`.
 | `commands/plan/shrink.md` | read | runtime_id; unit_runs.open_run reads the run pointer |
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
 | `commands/showrunner/units.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
-| `docs/associate-producer/operations.md` | read | staff.json (shell) |
+| `docs/producer/morty-operations.md` | read | staff.json (shell) |
 | `docs/as-built/showrunner-automation.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
 | `docs/as-built/session-notifier.md` | write | staff.py clear-run (documented shell command) |
 | `docs/production_format.md` | read | staff.py get (shell) |
@@ -161,6 +164,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/message/escalate.py` | read | active, snapshot |
+| `scripts/message/failed_lookup.py` | read | snapshot |
 | `scripts/message/morty_identity.py` | read | native_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |

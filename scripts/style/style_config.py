@@ -78,6 +78,7 @@ def _assignments(lines: list[str]) -> tuple[StyleUnitAssignment, ...]:
         if line.strip().startswith("|"):
             rows.append([cell.strip().strip("`") for cell in line.strip().strip("|").split("|")])
     assignments: list[StyleUnitAssignment] = []
+    has_retired_rows = False
     units: set[str] = set()
     owners: dict[rules.Family, str] = {}
     families = cast(tuple[rules.Family, ...], get_args(rules.Family))
@@ -85,6 +86,9 @@ def _assignments(lines: list[str]) -> tuple[StyleUnitAssignment, ...]:
         if row == ["Unit", "Families", "Open tickets"] or all(re.fullmatch(r":?-+:?", cell) for cell in row):
             continue
         unit, family_text, capacity = (row + ["", "", ""])[:3]
+        if re.fullmatch(r".+ \(retired .+\)", unit):
+            has_retired_rows = True
+            continue
         if unit in units:
             raise StyleConfigError(f"{unit}: duplicate style unit")
         units.add(unit)
@@ -105,6 +109,8 @@ def _assignments(lines: list[str]) -> tuple[StyleUnitAssignment, ...]:
             owners[family] = unit
             owned.append(family)
         assignments.append(StyleUnitAssignment(unit, tuple(owned), open_tickets))
+    if has_retired_rows and not assignments:
+        return ()
     for family in families:
         if family not in owners:
             raise StyleConfigError(f"{family}: no style owner")

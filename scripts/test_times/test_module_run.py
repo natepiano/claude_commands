@@ -18,6 +18,7 @@ from typing import ClassVar, cast, override
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
@@ -285,7 +286,7 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
         _ = env.pop(key, None)
     temporary = root / f"{name}_temporary"
     temporary.mkdir()
-    env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+    env.update({**interpreter_cache_environment(root / "cache"), "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
                 "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONPATH": os.pathsep.join((str(root), str(folder))), "TMPDIR": str(temporary)})
     args = [f"{name}.test_fixture"]
@@ -331,6 +332,30 @@ class ModuleRunnerTests(unittest.TestCase):
             [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def test_config_reads_include_python_and_shell_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
+            config = root / "config"
+            config.mkdir()
+            for stem in ("alpha", "beta", "gamma"):
+                _ = (config / (stem + ".conf")).write_text("value=one\n")
+            repository = RUNNER.parents[2]
+            source = f"""import os, subprocess, sys, unittest
+from scripts.lib import conf
+conf.read('alpha').text('value')
+class Reads(unittest.TestCase):
+    def test_reads(self):
+        conf.read('alpha').text('value')
+        subprocess.run([sys.executable, '-c', "from scripts.lib import conf; conf.read('gamma').text('value')"],
+                       env={{**os.environ, 'PYTHONPATH': {str(repository)!r}}}, check=True)
+        subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
+                       {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
+"""
+            fixture = run_fixture(root, "config_reads", source)
+            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+            self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
 
     def sender_fixture(self, mode: str) -> FixtureRun:
         with tempfile.TemporaryDirectory() as directory:

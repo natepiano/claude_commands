@@ -63,7 +63,7 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 - Before a power-off, run `agents stop --all`. It saves each local live staff row before its stop.
 - After login, run `agents restart`. Stop starts nothing.
 - `agents restart --all` uses the same selection and stop loop, then starts the selected rows.
-- The selection includes freestanding agents. A live session without a staff row prints one line and stays unsaved.
+- The selection includes producers. A live session without a staff row prints one line and stays unsaved.
 - `agents restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
 - Restart sends no work prompt and does not restore unrelated panes.

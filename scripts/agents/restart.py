@@ -24,6 +24,7 @@ from typing import Literal, Protocol, TypedDict, cast
 from importlib import import_module
 
 from scripts.herdr import herdr
+from scripts.herdr import herdr_types
 from scripts.message import sessions, codex_daemon
 from scripts.production import staff, session_staff
 from scripts.accounts import accounts
@@ -142,7 +143,7 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
                 # End the restore entry before the signal, so no restore revives the stopped session.
                 pane_record.end(client.session, panes[0]["pane_id"], str(row.current_session),
                                 record=staff.StaffSnapshot((row,)))
-        except (herdr.HerdrFailure, OSError, ValueError) as error:
+        except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             _anomaly(row, error)
             return False
         shared: StopReadArguments = {"codex": codex} if codex is not None else {}
@@ -302,7 +303,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 if (retained is not None and (terminal := retained.get("terminal_id", ""))
                         and isinstance(client.pane_activity(retained["pane_id"]), herdr.PaneAtShell)):
                     target = herdr.ExistingPane(retained["pane_id"], terminal)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             _anomaly(row, error)
         # Read liveness again immediately before the launch.
         current = (herdr.read_conversation(str(row.current_session), kind) if observed is None else
@@ -336,14 +337,14 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 try:
                     pane_launch.finish_restore(path, original, pane_launch.resume_attempt(path, result.pane),
                                                names.resume_proof(original, projected), close=client.close_tab_confirmed)
-                except (OSError, ValueError, herdr.HerdrFailure) as error:
+                except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                     _anomaly(row, error)
         try:
             client.remember_row_tab(str(row.id), result.pane)
             if present:
                 client.focus_tab_of(result.pane)
                 client.close_startup_workspaces(result.pane.split(":", 1)[0])
-        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             _anomaly(row, error)
         if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
             _ = (_restore_workers(row, record) if observed is None else
@@ -367,12 +368,12 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
                         key=lambda entry: entry["written_at"], default=None)
             if entry is not None and entry["pane_id"] in pane_ids:
                 found.append((row, entry["pane_id"]))
-        missing = [row for row in rows if row.kind == "agent" and not any(item.id == row.id for item, _pane in found)]
+        missing = [row for row in rows if row.kind == "producer" and not any(item.id == row.id for item, _pane in found)]
         if missing:
             scan = client.scan_row_panes(staff.StaffSnapshot(tuple(missing)), [dict(pane) for pane in panes])
             found.extend((row, str(pane["pane_id"])) for row in missing for pane in scan.found.get(row.id, []))
         return found
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
         return []
 
@@ -435,12 +436,12 @@ def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
     resolved_tabs: set[str] = set()
     try:
         panes = client.listed("pane")
-    except (OSError, ValueError, herdr.HerdrFailure):
+    except (OSError, ValueError, herdr_types.HerdrFailure):
         return PaneConversations(herdr.codex_conversations(), names)
     try:
         tabs = {herdr.json_text(tab.get("tab_id"), "tab id"):
                 herdr.json_text(tab.get("label") or "", "tab label") for tab in client.listed("tab")}
-    except (OSError, ValueError, herdr.HerdrFailure):
+    except (OSError, ValueError, herdr_types.HerdrFailure):
         tabs = {}
     for pane in panes:
         try:
@@ -458,7 +459,7 @@ def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
             live[identity] = ()
             names[identity] = display
             resolved_tabs.add(f"{tab_name} (Codex thread unknown)")
-        except (OSError, ValueError, herdr.HerdrFailure):
+        except (OSError, ValueError, herdr_types.HerdrFailure):
             continue
     observed = herdr.codex_conversations()
     return PaneConversations(herdr.CodexConversations(
@@ -503,12 +504,12 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     if save_tabs:
         try:
             client.save_layout()
-        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
         for row, pane in row_panes(selected, client):
             try:
                 client.remember_row_tab(str(row.id), pane)
-            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
                 _anomaly(row, error)
     return selected
 
@@ -539,7 +540,7 @@ def _after_unconfirmed_stop(row: staff.StaffRow, before: herdr.CodexConversation
                 if current.started != process.started and current.current_identity != identity:
                     continue
                 raise ValueError(f"pid {pid}: generation changed without proof that the target exited")
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
@@ -622,7 +623,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 try:
                     workspace, index, tab = client.pane_tab(pane)
                     positions[str(row.id)] = f"workspace {workspace}, tab {index} ({tab['name']})"
-                except (OSError, ValueError, herdr.HerdrFailure) as error:
+                except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                     _anomaly(row, error)
             for row in selected:
                 action = "; would stop and save" if after_stop == AfterStop.KEEP_STOPPED else ""
@@ -630,7 +631,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             for row in {row.id: row for row, _pane in visible if row not in selected}.values():
                 print(f"{row.name}: left alone; no proved local restart target")
             return 0
-    errors = (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure, subprocess.SubprocessError)
+    errors = (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []
     started: list[str] = []
     worker_scope = (WorkerRestartScope.SELECTED_ROWS if only or not isinstance(account, AllRestartAccounts)

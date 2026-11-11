@@ -343,7 +343,7 @@ def sync_target(target: str) -> None:
             ledger = TransferLedger()
             parent = active_transfers.get()
             with measure_transfers(ledger):
-                _ = sync_peer(peer, store.root(), store.host_name(), ssh_options(),
+                _ = sync_peer(peer, store.root(), store.host_name(), ssh_options(peer.host),
                               configured_timeout(settings, "sync.reach_timeout_s"),
                               configured_timeout(settings, "sync.rsync_timeout_s"))
             if isinstance(parent, TransferLedger):
@@ -369,11 +369,10 @@ def _sync_locked() -> int:
     settings = record.sync_config()
     reach_timeout = configured_timeout(settings, "sync.reach_timeout_s")
     rsync_timeout = configured_timeout(settings, "sync.rsync_timeout_s")
-    options = ssh_options()
     status = 0
     for peer in peers:
         with measure_transfers(TransferLedger()):
-            status = max(status, sync_peer(peer, root, host, options, reach_timeout, rsync_timeout))
+            status = max(status, sync_peer(peer, root, host, ssh_options(peer.host), reach_timeout, rsync_timeout))
     return status
 
 
@@ -384,7 +383,9 @@ def configured_timeout(settings: dict[str, str], key: str) -> float:
     return value
 
 
-def ssh_options() -> list[str]:
+def ssh_options(host: str) -> list[str]:
+    if any(host in record.target_hosts(target) for target in ("mac", "natedev")):
+        return ["-o", "BatchMode=yes"]
     timeout = configured_timeout(record.sync_config(), "sync.connect_timeout_s")
     return ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout:g}"]
 

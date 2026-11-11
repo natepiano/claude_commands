@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from scripts.agents import remote
+from scripts.herdr import herdr_types
 
 import io
 import fcntl
@@ -180,7 +181,7 @@ class StopResumeTests(unittest.TestCase):
         before = worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(worker_panes, "observe", return_value=[before]),
-              patch.object(self.client, "panes", side_effect=herdr.HerdrFailure("unreadable")),
+              patch.object(self.client, "panes", side_effect=herdr_types.HerdrFailure("unreadable")),
               patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("native-worker", 123))):
             result = stop_resume.stop(row.id)
         self.assertIsInstance(result, stop_resume.StopFailed)
@@ -341,7 +342,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_stop_uses_the_runtime_from_an_ended_launch_with_a_fixed_staff_id(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("fixed-agent"), "agent", "alpha", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("fixed-agent"), "producer", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         for kind in ("claude", "codex"):
             entry = self.entry.copy()
@@ -425,11 +426,11 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_uses_the_group_account_unless_the_target_is_explicit(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        for kind in ("unit", "showrunner", "agent", "missing"):
+        for kind in ("unit", "showrunner", "producer", "missing"):
             for target in (None, "claude3"):
                 with self.subTest(kind=kind, target=target):
                     pane_record.save("agents", {self.entry["pane_id"]: self.entry})
-                    row = staff.StaffRow(identity, "agent" if kind == "missing" else kind, "alpha",
+                    row = staff.StaffRow(identity, "producer" if kind == "missing" else kind, "alpha",
                                          staff.STAFF_ROOT, current_session=identity)
                     expected = target or "claude4"
                     rows = () if kind == "missing" else (row,)
@@ -532,7 +533,7 @@ class StopResumeTests(unittest.TestCase):
 
     def resume_codex_staff(self, observed: herdr.LiveConversation | herdr.UnknownConversation) -> tuple[stop_resume.ResumeResult, Mock, Mock, Mock, str]:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("codex-holder"), "agent", "alpha", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("codex-holder"), "producer", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity), home=staff.SessionHome(self.root / ".codex2"))
         self.entry["kind"] = "codex"
         self.entry["config_dir"] = str(self.root / ".codex2")
@@ -817,7 +818,7 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_staff_home_changes_only_after_the_target_pane_starts(self) -> None:
-        row = staff.ensure("agent", name="TEST-account-home", runtime_id=self.entry["session_id"],
+        row = staff.ensure("producer", name="TEST-account-home", runtime_id=self.entry["session_id"],
             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         row = pane_launch.staff_admitted(row)
         running_home = self.root / ".claude3"
@@ -852,7 +853,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_account_change_keeps_pane_data_until_the_start_publication(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity), home=staff.SessionHome(self.root / ".claude3"))
         self.entry["session_id"] = row.id
         pane_record.save("agents", {"w1:p2": self.entry})
@@ -869,7 +870,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_own_pane_resume_saves_pane_data_with_the_fixed_staff_reference(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity))
         self.entry["session_id"] = row.id
         pane_record.save("agents", {"w1:p2": self.entry})
@@ -885,7 +886,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_own_pane_resume_by_old_tab_label_keeps_the_fixed_staff_reference(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "renamed-alpha", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "renamed-alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity))
         self.entry["session_id"] = row.id
         pane_record.save("agents", {"w1:p2": self.entry})
@@ -937,7 +938,7 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_failed_title_change_reports_an_anomaly_and_resumes(self) -> None:
-        with (patch.object(self.client, "retitle", side_effect=herdr.HerdrFailure("fixture")),
+        with (patch.object(self.client, "retitle", side_effect=herdr_types.HerdrFailure("fixture")),
               redirect_stderr(io.StringIO()) as output):
             result = stop_resume.resume("alpha")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -1014,7 +1015,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_codex_record_uses_workers_home_without_claude_trust(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "agent", "alpha", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "producer", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity))
         home = self.root / ".codex2"
         workers = self.root / ".codex1"
@@ -1038,7 +1039,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_codex_own_pane_exec_publishes_the_target_home(self) -> None:
         source, target = self.root / ".codex1", self.root / ".codex2"
-        row = fixture_member("agent", name="own-codex", runtime_id=self.entry["session_id"])
+        row = fixture_member("producer", name="own-codex", runtime_id=self.entry["session_id"])
         _ = staff.set_home(row.id, staff.SessionHome(source))
         entry = self.entry.copy()
         entry.update(kind="codex", config_dir=str(source), environment={"CODEX_HOME": str(target)})
@@ -1052,7 +1053,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_codex_own_pane_exec_has_no_prompt_and_uses_workers_home(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "agent", "alpha", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "producer", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity))
         home = self.root / ".codex2"
         workers = self.root / ".codex1"
@@ -1082,7 +1083,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_saved_codex_resume_uses_explicit_account(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "agent", "alpha", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("saved-codex-owner"), "producer", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity))
         home = self.root / ".codex2"
         target = self.root / ".codex3"
@@ -1222,7 +1223,7 @@ class StopResumeTests(unittest.TestCase):
     def test_resume_reuses_the_open_shell_with_the_fixed_row_id(self) -> None:
         fixed = staff.StaffId(self.entry["session_id"])
         current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
-        row = staff.StaffRow(fixed, "agent", "row-name", staff.StaffRoot(), current_session=current)
+        row = staff.StaffRow(fixed, "producer", "row-name", staff.StaffRoot(), current_session=current)
         self.client.rows[0]["agent_session"] = {"kind": "none"}
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "open_tab") as opened):
@@ -1899,7 +1900,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual([pane["pane_id"] for pane in self.client.panes() if select(pane)], ["w1:p2"])
 
     def test_move_resume_failure_is_pending_and_rerun_finishes_without_restopping(self) -> None:
-        self.start.side_effect = herdr.HerdrFailure("registry temporarily unreadable")
+        self.start.side_effect = herdr_types.HerdrFailure("registry temporarily unreadable")
         with patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("019b3a40-4250-7000-8000-000000000102", 123)):
             pending = stop_resume.move("alpha", "claude4", why="limit")
         self.assertIsInstance(pending, stop_resume.ResumePending)
@@ -1927,7 +1928,7 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_shutdown_resume_with_an_explicit_target_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
-        self.start.side_effect = herdr.HerdrFailure("cannot start yet")
+        self.start.side_effect = herdr_types.HerdrFailure("cannot start yet")
         self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
         self.start.side_effect = None
         for iteration in range(2):
@@ -1983,7 +1984,7 @@ class StopResumeTests(unittest.TestCase):
             _ = stop_resume.move_sessions(["019b3a40-4250-7000-8000-000000000102", "sid-beta"], "claude4", why="limit")
         self.assertEqual(order, ["seed", "stop", "stop"])
         self.launched.clear()
-        self.seed.side_effect = herdr.HerdrFailure("no reply")
+        self.seed.side_effect = herdr_types.HerdrFailure("no reply")
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
 
     def test_proof_workspace_refuses_a_stop_outside_its_panes(self) -> None:
@@ -2076,7 +2077,7 @@ class StopResumeTests(unittest.TestCase):
         self.signal_guard.stop()
         replies: tuple[dict[str, object] | Exception, ...] = (
             {}, {"process_info": {"foreground_processes": [{"pid": 123.0}]}},
-            herdr.HerdrFailure("pane unavailable"), OSError("herdr unavailable"))
+            herdr_types.HerdrFailure("pane unavailable"), OSError("herdr unavailable"))
         for reply in replies:
             with self.subTest(reply=reply):
                 self.live.return_value = sessions.LiveSessionProcess(123)
@@ -2279,7 +2280,7 @@ class StopResumeTests(unittest.TestCase):
         self.entry["kind"] = "codex"
         pane_record.write("agents", self.entry)
         self.client.rows.insert(0, {"pane_id": "w1:p1", "workspace_id": "w1", "label": "unnamed"})
-        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("stable-row"), "producer", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         self.process.side_effect = self.alive_until_kill
         self.client.process_info = {"foreground_processes": [
@@ -2306,7 +2307,7 @@ class StopResumeTests(unittest.TestCase):
         identity = self.entry["session_id"]
         self.entry["kind"] = "codex"
         pane_record.write("agents", self.entry)
-        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("stable-row"), "producer", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         _ = self.client.rows[0].pop("agent_session")
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
@@ -2323,7 +2324,7 @@ class StopResumeTests(unittest.TestCase):
         identity = self.entry["session_id"]
         self.entry["kind"] = "codex"
         pane_record.write("agents", self.entry)
-        row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("stable-row"), "producer", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         _ = self.client.rows[0].pop("agent_session")
         observations: list[tuple[dict[str, tuple[int, ...]], list[str]]] = [
@@ -2416,7 +2417,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = fixture_member("agent", name="alpha", runtime_id=self.entry["session_id"])
+        _ = fixture_member("producer", name="alpha", runtime_id=self.entry["session_id"])
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         self.add_beta()
         for platform in ("linux", "darwin"):
@@ -2445,7 +2446,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_self_move_uses_the_current_session_of_a_saved_staff_reference(self) -> None:
         current = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(current))
         saved = self.entry.copy()
         saved["session_id"] = row.id
@@ -2542,7 +2543,7 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_resume_identity_mismatch_or_missing_proof_dispatches_no_work(self) -> None:
-        for proof in ("019b3a40-4250-7000-8000-000000000199", herdr.HerdrFailure("registry unavailable")):
+        for proof in ("019b3a40-4250-7000-8000-000000000199", herdr_types.HerdrFailure("registry unavailable")):
             with self.subTest(proof=proof):
                 self.launched.clear()
                 self.client.prompts.clear()
@@ -2571,7 +2572,7 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "native_session", side_effect=[
-                  herdr.HerdrFailure("registry unavailable"), self.entry["session_id"]]) as observed,
+                  herdr_types.HerdrFailure("registry unavailable"), self.entry["session_id"]]) as observed,
               redirect_stderr(errors)):
             result = stop_resume.resume("alpha", why="maintenance")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -2604,7 +2605,7 @@ class StopResumeTests(unittest.TestCase):
                              home=staff.SessionHome(self.root / ".claude3"))
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
-              patch.object(self.client, "native_session", side_effect=herdr.HerdrFailure(
+              patch.object(self.client, "native_session", side_effect=herdr_types.HerdrFailure(
                   "registry unavailable")) as observed,
               redirect_stderr(errors)):
             result = stop_resume.resume("alpha", why="maintenance")
@@ -2989,7 +2990,7 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_not_called()
 
     def test_a_failed_pane_run_never_reports_resume_success(self) -> None:
-        self.start.side_effect = herdr.HerdrFailure("pane run refused")
+        self.start.side_effect = herdr_types.HerdrFailure("pane run refused")
         self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ResumeFailed("019b3a40-4250-7000-8000-000000000102", "pane run refused"))
         self.assertEqual(self.client.closed, [])
 
@@ -3071,7 +3072,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_move_logs_the_live_source_and_final_account_with_its_cause(self) -> None:
         identity = self.entry["session_id"]
-        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "agent", "alpha", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         self.entry["config_dir"] = str(self.root / ".claude1")
         pane_record.write("agents", self.entry)

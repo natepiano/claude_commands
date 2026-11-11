@@ -15,18 +15,19 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture, write_pressure_reading
-from scripts.message.unit_labels import UnitLabels
-from scripts.message import roster
-from scripts.build_queue import head_facts, queue_view
 from scripts.build_queue.queue_lines import Line, plain
 from scripts.build_queue.scope_activity import LiveBuildRun, IdleService, RunningServiceJob, NotServiceSlice
+
+if TYPE_CHECKING:
+    from scripts.build_queue import queue_view
+    from scripts.message.unit_labels import UnitLabels
 
 NOW = datetime(2026, 10, 30, 14, 46, 12, tzinfo=UTC).timestamp()
 ZONE = ZoneInfo("America/New_York")
@@ -264,6 +265,9 @@ class QueueFixture(ExitStack):
     """Private files for every renderer, card and CLI fixture consumer."""
 
     def __init__(self, *, captured: bool = True) -> None:
+        from scripts.message import roster
+        from scripts.message.unit_labels import UnitLabels
+
         super().__init__()
         _ = self.enter_context(mock.patch.object(store, "host_name", return_value="fixture-host"))
         self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory()))
@@ -367,6 +371,8 @@ class QueueFixture(ExitStack):
         return fixture_queue_read(self.directory, gate.process_table(self.proc), NOW)
 
     def model(self) -> queue_view.QueueModel:
+        from scripts.build_queue import head_facts, queue_view
+
         reading = self.read()
         return queue_view.QueueModel(reading, self.labels, head_facts.read_head_facts(reading),
                                      head_facts.read_pace(NOW), ZONE, queue_view.HostLoadUnavailable(),

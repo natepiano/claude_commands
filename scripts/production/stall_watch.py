@@ -34,6 +34,7 @@ from uuid import uuid4
 
 
 from scripts.agents import detached_runs
+from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
 from scripts.message import session_send
 from scripts.lib.atomic_file import write_text_atomic
@@ -43,6 +44,8 @@ from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners, staff, session_staff
 from scripts.production import unit_lookup
 from scripts.production.session_pane import HerdrFailure, agent_status, read_place
+from scripts.whoami import account, usage_store
+from scripts.whoami.agent_accounts import UsageReadOutcome
 
 from scripts.hooks import context_usage  # noqa: E402
 from scripts.notify import push_texts  # noqa: E402
@@ -120,6 +123,7 @@ class Stretch(TypedDict):
     bump_sent: bool
     tell_sent: bool
     reported_status: str
+    login_since: NotRequired[float]
 
 
 class PaneInspection(NamedTuple):
@@ -392,6 +396,23 @@ def latest_transcript_activity(session_id: str) -> float:
     return latest
 
 
+def login_restored(pid: int, session_id: str) -> bool:
+    """A successful usage read after the session's last activity proves login recovery."""
+    try:
+        folder = account.process_config_dir(pid)
+        if not isinstance(folder, account.ConfiguredClaudeFolder):
+            return False
+        stored = usage_store.load()
+        login = stored.directory_logins[usage_store.directory_key("Claude", str(folder.path))]
+        usage = stored[login]
+        if usage_store.latest_read_outcome(usage) != UsageReadOutcome.OK or "weekly" not in usage:
+            return False
+        read_at = datetime.fromisoformat(usage["weekly"]["at"])
+        return read_at.tzinfo is not None and read_at.timestamp() > latest_transcript_activity(session_id)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return False
+
+
 def context_near_compaction(session_id: str) -> bool:
     """Wake at the context hook's shared handoff threshold using its bounded tail reading."""
     try:
@@ -569,7 +590,7 @@ def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) 
     fields: dict[str, str] = {}
     for source in paths:
         try:
-            content = source.read_text(encoding="utf-8")
+            content = conf_reads.read_text(source)
         except FileNotFoundError:
             if status_defaults and source != defaults:
                 continue
@@ -1103,7 +1124,7 @@ def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
     try:
         old = saved_stretch(path)
         if (old["pane_hash"] == pane_hash or old["bump_sent"] or old["tell_sent"]
-                or old.get("reported_status")):
+                or old.get("reported_status") or "login_since" in old):
             return old
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -1385,8 +1406,32 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 continue
             if blocked is not None and (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
-            stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
+            pane_hash = hashlib.sha256(pane.encode()).hexdigest()
+            stretch = read_stretch(path, pane_hash, now)
             turns = list(TURN_END.finditer(pane))
+            latest_pane = pane[turns[-1].end():] if turns else pane
+            try:
+                login_limit = re.search(watch_config(status_defaults=True)["login_limit_pattern"].strip(),
+                                        latest_pane, re.IGNORECASE)
+            except (OSError, UnicodeError, KeyError, ValueError, re.error) as error:
+                print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
+                continue
+            if login_limit and not login_restored(pid, session_id):
+                report.decision = "login limit"
+                if "login_since" not in stretch:
+                    stretch = Stretch(pane_hash=pane_hash, since=now, bump_sent=False, tell_sent=False,
+                                      reported_status="", login_since=now)
+                stretch["since"] = now
+                save_stretch(path, stretch)
+                if not stretch["tell_sent"]:
+                    text = f"{name}: the Claude login reached its time limit and needs /login."
+                    login_since = stretch.get("login_since", now)
+                    key = f"stall-watch:{row.id}:login:{int(login_since)}:tell"
+                    pending.append(delivery(path, "tell", showrunner_socket, key, text))
+                continue
+            if "login_since" in stretch:
+                stretch = Stretch(pane_hash=pane_hash, since=now, bump_sent=False, tell_sent=False,
+                                  reported_status="")
             # A resumed or compacted pane can retain an older turn. The session's last
             # assistant text is authoritative when it supplies a turn-end status.
             turn = transcript_turn_end(session_id) or (turns[-1] if turns else None)

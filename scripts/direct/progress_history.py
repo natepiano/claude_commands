@@ -34,7 +34,7 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -295,6 +295,7 @@ def _config_digest() -> str:
         text = (models_registry.launch_configuration(os.environ).text
                 if os.environ.get(models_registry.OPERATION_ENVIRONMENT[0]) else models_registry.registry_text())
         registry = text.encode("utf-8")
+        conf_reads.record(_config_path().stem)
         contents = registry + _config_path().read_bytes()
     except (OSError, ValueError, UnicodeError):
         return ""
@@ -1500,6 +1501,21 @@ def _finish_activity(args: argparse.Namespace) -> None:
     )
 
 
+def _claim_run_pointer(owner: staff.StaffRow, session_dir: Path) -> None:
+    """Point the owner at this run, unless the owner holds another active run.
+
+    A helper run, such as an Astra review folder, then never moves its director's run.
+    """
+    if isinstance(owner.run, staff.OpenRun) and owner.run.path.resolve() != session_dir.resolve():
+        try:
+            held = _json_object(_state_path(owner.run.path).read_text(encoding="utf-8"))
+        except OSError:
+            held = None
+        if held is not None and held.get("status") == "active":
+            return
+    _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+
+
 def _start_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     existing = _state_path(session_dir)
@@ -1565,7 +1581,7 @@ def _start_run(args: argparse.Namespace) -> None:
     owner = unit_runs.run_owner(state, record)
     if isinstance(owner, staff.StaffRow):
         state[unit_runs.OWNER_FIELD] = owner.id
-        _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+        _claim_run_pointer(owner, session_dir)
     _write_state(session_dir, state)
     _append_event(state, _event(state, "run_started", now))
     print(history_file)
@@ -1644,7 +1660,7 @@ def _start_phase(args: argparse.Namespace) -> None:
         if director:
             row = staff.by_current_session(director)
             if row is not None:
-                _ = staff.set_run(row.id, staff.OpenRun(session_dir))
+                _claim_run_pointer(row, session_dir)
         previous_status = _string(state.get("status"))
         state["status"] = "active"
         _ = state.pop("finished_at", None)
@@ -1842,19 +1858,33 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
     return MatchedDispatch(_string(active.get("worker_name")), _string(active.get("instance_id")))
 
 
+def launch_slot(session_dir: Path, slot: str, launcher_command: list[str]) -> str:
+    """Name the slot whose pass this launcher command started, or the given slot."""
+    if not _state_path(session_dir).is_file():
+        return slot
+    return _launch_slot(_pass_slots(_read_state(session_dir)), slot, launcher_command)
+
+
+def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_command: list[str]) -> str:
+    return next((name for name, passed in passes.items()
+                 if launcher_command and passed.get("launcher_command") == launcher_command), slot)
+
+
 def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                     prompt: Path, launcher_command: list[str]) -> MatchedDispatch | NoMatchedDispatch:
     """Find the worker for this dispatch retry without changing recorder state."""
     if not _state_path(session_dir).is_file():
         return NoMatchedDispatch()
     state = _read_state(session_dir)
+    passes = _pass_slots(state)
+    slot = _launch_slot(passes, slot, launcher_command)
     recorded_phase = _open_phase_named(state, phase)
     if recorded_phase is None:
-        recorded_phase = _object_dict(_pass_slots(state).get(slot, {}).get("phase"))
+        recorded_phase = _object_dict(passes.get(slot, {}).get("phase"))
         if recorded_phase is None or _string(recorded_phase.get("id")) != phase:
             return NoMatchedDispatch()
     return _dispatch_match(
-        _pass_slots(state).get(slot), recorded_phase,
+        passes.get(slot), recorded_phase,
         {"kind": role, "prompt_file": str(prompt), "launcher_command": launcher_command},
         launcher_command, dispatch_owned=True,
     )
@@ -2143,6 +2173,11 @@ def dispatch_completed(run: Path, slot: str, instance_id: str) -> bool:
 def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> None:
     """Record a notice only after its message succeeds."""
     _update_dispatch(session_dir, instance_id, "hook_notice", notice)
+
+
+def record_quota_refusal(session_dir: Path, instance_id: str, refusal_id: str) -> None:
+    """Record a reported quota refusal so the timer reports it once."""
+    _update_dispatch(session_dir, instance_id, "quota_refusal", refusal_id)
 
 
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
