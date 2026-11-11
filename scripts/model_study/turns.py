@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
+from scripts.lib.transcripts import open_transcript, uncompressed_path
+
 # The roster's `switched_by_pdt` and `director_from_pdt` columns are Pacific wall times, as they were
 # recorded. This is the zone of that stored data, never the zone a time is shown in.
 RECORDED_ZONE = ZoneInfo("America/Los_Angeles")
@@ -201,7 +203,7 @@ def prompt_kind(record: Record | None) -> str:
 
 def read_session(path: Path, name: str, director_from: str | None) -> SessionRead:
     records: list[Record] = []
-    with path.open() as source:
+    with open_transcript(path) as source:
         for line in source:
             try:
                 value = cast(object, json.loads(line))
@@ -229,7 +231,7 @@ def read_session(path: Path, name: str, director_from: str | None) -> SessionRea
     if first_at is None:
         return SessionRead([], [], Dropped(sidechain=sidechain), None, True)
     boundary, director_at, whole_session = director_boundary(records, director_from, first_at)
-    session = path.stem
+    session = uncompressed_path(path).stem
     events: list[tuple[int, str, str]] = []
     for request_id, blocks in groups.items():
         events.append((blocks[0][0], "request", request_id))

@@ -20,6 +20,7 @@ import threading
 from typing import Literal, cast
 
 from scripts.lib import conf
+from scripts.lib.transcripts import open_transcript
 from scripts.usage.context_economy_cache import (
     FileProgress, ParseCheckpoint, SummaryUnavailable, TranscriptCache,
     TranscriptReadSettings, TranscriptSettingsSource, read_settings,
@@ -187,7 +188,7 @@ def _read_transcript(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint
     request_keys = _wire_list(state.get("request_keys", []))
     completed = checkpoint.offset
     first = session.first_record_at
-    with path.open("rb", buffering=1024 * 1024) as source:
+    with open_transcript(path) as source:
         completed = source.seek(checkpoint.offset)
         for offset, line in complete_lines(source):
             position = number
@@ -293,7 +294,7 @@ def _read_codex_file(path: Path, checkpoint: ParseCheckpoint) -> ParseCheckpoint
     starts = {start.at: start for start in session.starts}
     previous_total = _object(state.get("previous_total"))
     completed = checkpoint.offset
-    with path.open("rb", buffering=1024 * 1024) as stream:
+    with open_transcript(path) as stream:
         completed = stream.seek(checkpoint.offset)
         for offset, line in complete_lines(stream):
             completed = offset + len(line)
@@ -627,6 +628,7 @@ def _mac_payload(since: datetime, until: datetime) -> str:
     modules = {name: (root / path).read_text(encoding="utf-8") for name, path in (
         ("scripts.lib.conf_reads", "scripts/lib/conf_reads.py"),
         ("scripts.lib.conf", "scripts/lib/conf.py"),
+        ("scripts.lib.transcripts", "scripts/lib/transcripts.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.context_economy_cache", "scripts/usage/context_economy_cache.py"),
         ("scripts.usage.context_economy_read", "scripts/usage/context_economy_read.py"),

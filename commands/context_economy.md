@@ -23,8 +23,8 @@ A failed anchor, size, device, or inode check causes a full parse.
 The anchors assume append-only files and do not detect edits between the blocks.
 The report applies its time window after the cache read.
 Summaries survive file deletion and share one entry with the `.jsonl.zst` form.
-Compressed files without a summary are skipped in this phase.
+Compressed files without a summary use the shared zstd reader once.
 `cache_max_megabytes` in `config/context_economy.conf` bounds reproducible entries by least recent access.
-Entries whose source files are gone remain protected from eviction.
+Entries whose plain source files are compressed or deleted remain protected from eviction.
 Long reads show file progress on stderr, including the Mac read.
 `progress_seconds` in the same config sets the update interval.

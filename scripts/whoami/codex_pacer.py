@@ -50,6 +50,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from typing import Protocol, TypedDict, cast
 
 from scripts.lib import models_registry  # noqa: E402
@@ -233,25 +234,29 @@ def rollout_files(now: datetime, days: int) -> Iterator[Path]:
     for back in range(days, -1, -1):
         day = local - timedelta(days=back)
         # Paths share one parent. Filename order keeps the same ingestion order.
-        yield from sorted((SESSIONS / day.strftime("%Y/%m/%d")).glob("rollout-*.jsonl"), key=str)
+        yield from transcript_paths(SESSIONS / day.strftime("%Y/%m/%d"), "rollout-*.jsonl")
 
 
 def ingest(state: State, files: Iterator[Path]) -> None:
     """Read what each rollout appended since the last pass into the hourly buckets."""
     readings: list[tuple[datetime, float, str]] = []
     for path in files:
-        key = str(path)
+        key = str(uncompressed_path(path))
         known = state["files"].get(key)
         try:
             size = path.stat().st_size
+            if path.suffix != ".zst" and known and known["offset"] == size:
+                continue
+            with open_transcript(path) as handle:
+                if path.suffix == ".zst":
+                    size = handle.seek(0, os.SEEK_END)
+                offset = known["offset"] if known and known["offset"] <= size else 0
+                if known and offset == size:
+                    continue
+                _ = handle.seek(offset)
+                data = handle.read()
         except OSError:
             continue
-        offset = known["offset"] if known and known["offset"] <= size else 0
-        if known and offset == size:
-            continue
-        with path.open("rb") as handle:
-            _ = handle.seek(offset)
-            data = handle.read()
         end = data.rfind(b"\n") + 1
         entry: FileState = known or {"offset": 0, "tier": "", "model": ""}
         entry["offset"] = offset + end
@@ -469,7 +474,7 @@ def prune(state: State, now: datetime, retained_rollouts: Iterable[Path]) -> Non
     oldest = hour_key(now - timedelta(days=FIT_DAYS + 1))
     state["buckets"] = {k: b for k, b in state["buckets"].items() if k >= oldest}
     # A rollout deleted during ingestion must not leave an offset for its replacement.
-    keep = {str(p) for p in retained_rollouts if p.exists()}
+    keep = {str(uncompressed_path(p)) for p in retained_rollouts if p.exists()}
     state["files"] = {k: f for k, f in state["files"].items() if k in keep}
     hour = now.timestamp() / 3600
     state["windows"] = {k: v for k, v in state["windows"].items() if float(k) > hour - 24}
