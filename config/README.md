@@ -831,22 +831,23 @@ The final line has `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_comp
 The estimate uses each box's rate, minimum billed seconds, lifetime, allowance, and new bill-query fees.
 Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
 The paired trial adds no settings.
-The size/start trials and their settings remain available until the user decides whether to remove them.
 
-`deploy.py gate-trial` reads these keys when it uses them:
+The paired trial replaces the size/start trials.
+The following settings are removed:
 
-| Key | Value | Reason |
-| --- | --- | --- |
-| `gate_trial_size_reserve_usd` | `4` | Limit the spend of the size step. |
-| `gate_trial_start_reserve_usd` | `3` | Limit the spend of the start step. |
-| `gate_trial_lifetime_minutes` | `30` | Set the guest shutdown time and the attempt deadline. |
-| `gate_trial_url_lifetime_s` | `7200` | Keep presigned URLs valid through a stop and start. |
-| `gate_trial_target_gate_s` | `420` | Select the cheapest size that meets the 7-minute goal. |
-| `gate_trial_default_sizes` | `8,16,32,64` | Set the vCPU sizes of the size step. |
-| `gate_trial_size_runs` | `3` | Set the attempts for each size. |
-| `gate_trial_start_runs` | `5` | Set the attempts of the start step. |
-| `gate_trial_poll_pause_s` | `2` | Set the pause between state and result reads. |
-| `gate_trial_group_delete_wait_s` | `120` | Limit the security group delete retries. |
+1. `gate_trial_size_reserve_usd`.
+1. `gate_trial_start_reserve_usd`.
+1. `gate_trial_lifetime_minutes`.
+1. `gate_trial_url_lifetime_s`.
+1. `gate_trial_target_gate_s`.
+1. `gate_trial_module_limit_s`.
+1. `gate_trial_default_sizes`.
+1. `gate_trial_size_runs`.
+1. `gate_trial_start_runs`.
+1. `gate_trial_poll_pause_s`.
+1. `gate_trial_log_push_s`.
+1. `gate_trial_group_delete_wait_s`.
+
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.
 `deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.

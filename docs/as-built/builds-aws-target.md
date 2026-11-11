@@ -523,5 +523,6 @@ Unconfirmed termination uses the reserved lifetime and returns a nonzero status.
 The command terminates boxes after results, errors, or cancellation.
 Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
 
-The size/start trials and the twelve `gate_trial_*` settings remain available.
-Their removal is a separate optional change.
+The paired trial replaces the size/start trials.
+The twelve `gate_trial_*` settings are removed.
+The paired trial uses the existing `cloud_gate.conf` settings.
