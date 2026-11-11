@@ -229,10 +229,11 @@ class WorkerResumeTests(unittest.TestCase):
 @final
 class StopResumeTests(unittest.TestCase):
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
-        cases: tuple[tuple[Literal["claude", "codex"], bool, str], ...] = (
-            ("claude", False, "opus"), ("codex", False, "gpt-test"), ("claude", True, "opus"),
-            ("claude", False, "claude-opus-producer-fixture"))
-        for kind, existing, expected_model in cases:
+        cases: tuple[tuple[Literal["claude", "codex"], bool, str, bool], ...] = (
+            ("claude", False, "opus", False), ("codex", False, "gpt-test", False), ("claude", True, "opus", False),
+            ("claude", False, "claude-opus-producer-fixture", False),
+            ("claude", False, "opus", True))
+        for kind, existing, expected_model, check_binding in cases:
             with self.subTest(kind=kind, existing=existing, model=expected_model), producer_first_fixture(kind) as world:
                 if expected_model == "claude-opus-producer-fixture":
                     environment = claude_catalog_environment(world.case.root / "caller-claude",
@@ -261,6 +262,10 @@ class StopResumeTests(unittest.TestCase):
                 publication = pane_record.read("agents")["w1:p3"]
                 self.assertEqual(publication["session_id"], row.id)
                 self.assertTrue(publication.get("producer_binding", False))
+                if check_binding:
+                    self.assertEqual([(tab.get("row_id"), tab.get("terminal_id"))
+                        for space in herdr.saved_layout("agents")["workspaces"] for tab in space["tabs"]],
+                        [(row.id, world.case.client.rows[-1]["terminal_id"])])
                 for reference in ("dwight", str(row.id)):
                     self.assertIsInstance(stop_resume.resume(reference), stop_resume.ClaudeUp)
                 self.assertEqual(len(world.arguments), 1)
@@ -409,7 +414,10 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(staff.initial_snapshot().rows[0].current_session, world.identity)
                 self.assertEqual(len(staff.initial_snapshot().rows), 1)
                 self.assertEqual(len(world.arguments), 2 if stage in resumed_stages else 1)
-                self.assertEqual(len(world.case.client.opened), 2 if stage in lost_stages | first_ownership_stages else 1)
+                self.assertEqual(len(world.case.client.opened), 2 if stage in lost_stages | first_ownership_stages | {"unrecorded"} else 1)
+                if stage == "unrecorded":
+                    self.assertEqual([pane["pane_id"] for pane in world.case.client.rows
+                                      if pane["pane_id"] in world.started_panes or pane["label"] == "dwight"], [world.pane])
                 self.assertTrue(pane_record.read("agents")[world.pane].get("producer_binding", False))
                 self.assertEqual(list((world.case.root / "panes").glob(".producer-admission-*")), [])
                 if stage in resumed_stages:
@@ -1702,7 +1710,8 @@ class StopResumeTests(unittest.TestCase):
                 ("morty", False, (), False, False, True))]
         cases.extend(("morty", False, ("editor",), False, True, False, family, True)
                      for family in ("claude", "codex"))
-        for workspace, shared, commands, refuse_close, metadata, cross, family, stale in cases:
+        cases.append(("producers", False, (), False, False, False, "claude", False))
+        for case, (workspace, shared, commands, refuse_close, metadata, cross, family, stale) in enumerate(cases):
             shell = not commands
             with self.subTest(workspace=workspace, shared=shared, commands=commands, refuse_close=refuse_close, family=family, stale=stale):
                 _ = write_registry(self.root / "configuration/models.conf", {"producers": {
@@ -1713,6 +1722,11 @@ class StopResumeTests(unittest.TestCase):
                 saved = self.entry.copy()
                 saved.update(kind=family, environment={variable: str(source_home)})
                 self.client.rows[:] = [dict(retained)]
+                if workspace == "producers" and not shared and shell:
+                    herdr._write_layout("agents", herdr.SavedLayout(at=time.time(), workspaces=[  # pyright: ignore[reportPrivateUsage]
+                        herdr.SavedSpace(name="producers", seen=time.time(), tabs=[herdr.SavedName(
+                            name=row.id, row_id=row.id, terminal_id=herdr.json_text(retained["terminal_id"], "producer terminal"),
+                            seen=time.time())])]))
                 if metadata:
                     self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
                 self.client.closed.clear()
@@ -1736,7 +1750,7 @@ class StopResumeTests(unittest.TestCase):
                 def close_source(pane: str) -> bool:
                     source.close_tab_of(pane)
                     return True
-                self.tab_titles["w1:t9"] = row.name
+                self.tab_titles["w1:t9"] = "another-producer" if case == len(cases) - 1 else row.name
                 if shared:
                     self.client.rows.append({"pane_id": "w1:p3", "tab_id": "w1:t9", "label": "other work",
                                              "workspace_id": "w1", "agent_session": {"kind": "none"}})

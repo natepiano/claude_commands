@@ -318,7 +318,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if projected is not None:
             environment = {**names.environment(projected), **environment}
         workspace = herdr.row_workspace(row, record, row.name)
-        destination = (client.producer_row_tab(str(row.id), row.name, workspace) if row.kind == "producer" else
+        destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
                        client.saved_row_tab(str(row.id), row.name, workspace))
         prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
