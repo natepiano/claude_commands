@@ -235,9 +235,9 @@ The user, 2026-11-03: tables do not work for them. Lower priority. Design a char
 #### As-built
 
 - Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
-- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.py` and prints the tailnet link (Phase 22). The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- The charts are on the shared build page. `/build:page` prints its link, and `charts.page_data` (`scripts/buildlog/charts.py`) feeds it. Phase 47 removed the `buildlog charts` command. The charts have light, dark and Auto themes and daily buckets in the user's zone.
 - Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
-- `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
+- `costs.py` is the cost reader for `charts.page_data`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
 - `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
 - Speed, as process CPU time (user+sys): 7 days 0.60–0.71 s (limit 1.5 s); 30 days 1.76–1.82 s (limit 3 s).
 - The fresh design check found two label defects; Phase 10 fixes them.
@@ -320,14 +320,14 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 - `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
 - Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
 - `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
-- `buildlog charts` output is unchanged; `main` and `page_data` share `read_index`, and `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
+- `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
 **Files:**
 - `scripts/buildlog/charts.py` — `page_data`, its types, the snapshot and index helpers.
 - `scripts/buildlog/test_charts.py` — `PageDataTests`.
 - `config/buildlog.conf` — recent days, actions and owners.
 
-**Binds later work:** queue's build page feed calls `charts.page_data`; it stays when `buildlog charts` moves to the shared page.
+**Binds later work:** queue's build page feed calls `charts.page_data`; it stays.
 
 **Ruled out:** a `read_costs` keyword that skips phase rows (one read makes it unnecessary); a snapshot inside `read_costs` for every reader (`buildlog costs` is its only unsnapshotted reader and goes away with the shared page).
 
@@ -446,6 +446,8 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 #### As-built
 
+- Phase 26 removed `present_page`. Phase 47 removed `buildlog charts` and `local_display`. The bullets below are history.
+
 - `buildlog charts` writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.snapshot`, and prints only the bare tailnet link. It prints no file path. Two runs print the same link.
 - `charts.present_page(series, path, no_open) -> int` puts the page write and the snapshot under one handler of `review_link.SNAPSHOT_ERRORS`. A failure prints one stderr line (`buildlog charts: publication failed: <reason>`) and returns 1.
 - `charts.local_display(environ, platform) -> bool`: false in any ssh session (`SSH_CONNECTION` set); otherwise true on darwin, or with `DISPLAY` or `WAYLAND_DISPLAY`. Only then does `webbrowser.open(link)` run, under `suppress(OSError, webbrowser.Error)`. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip the open.
@@ -534,6 +536,8 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 ### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: done
 
 #### As-built
+
+- Phase 47 removed `buildlog charts` and `charts.main`. `/build:page` is the one way to the build page. The `buildlog charts` bullets below are history.
 
 - `buildlog charts` publishes no page of its own. `charts.main` runs `scripts/build_queue/memory_feed.py link` (the `/build:page` command) from the same checkout and prints its one URL line. It opens the URL when a local display exists and `--no-open` is absent. `--days 7|30` stays.
 - No link prints `buildlog charts: <reason>` to stderr and exits 1. No link means: a non-zero exit, a missing command, or stdout that is not one printable `http`/`https` URL with a valid port. The reason is the command's stderr when it gave one.
@@ -970,3 +974,42 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Ruled out:**
 - A separate module for the `disk.py` writers needs caller and test edits and saves no more.
+
+### Phase 47 — buildlog charts is removed; /build:page is the one way to the build page · status: done
+**Depends on:** none.
+
+From the builds showrunner (not the user), 2026-11-11, with the user's words on change C1317: "this is ridiculous to have this". `buildlog charts` only prints the `/build:page` link, so it is a duplicate. Remove the subcommand. Keep `charts.page_data`, which the build page feed calls.
+
+#### Work Order
+
+**Goal:** `buildlog charts` no longer exists. `/build:page` is the one way to get the shared build page link. The build page data does not change.
+
+**Spec:**
+- `scripts/buildlog/cli.py` has no `charts` branch, and its usage text has no `buildlog charts` line. `buildlog charts` then takes the unknown-command path: the usage text on stderr and exit 2, as `buildlog costs` does since Phase 26.
+- `scripts/buildlog/charts.py` loses `main`, `local_display`, `MEMORY_FEED`, and every import that only they use. `page_data` and the code it calls stay, with the same output.
+- `scripts/buildlog/test_charts.py` loses the tests of `charts.main`, `local_display` and `cli.main(["charts", ...])`. The `page_data` tests stay.
+- `scripts/buildlog/test_costs.py`: the removed-command test gets `charts` as a second row, with the same assertions as `costs`.
+- Docs say how things are now. `docs/as-built/build-report-session.md`, `docs/as-built/build-targets.md` and `docs/as-built/mac-test-offload.md` name `/build:page` and do not name `buildlog charts`. `docs/plans/builds-report-charts-design.md` states that the charts live on the shared build page, that `/build:page` prints its link, and that `charts.page_data` feeds it. It names no `buildlog charts` command, `--no-open`, `BUILDLOG_CHARTS_NO_OPEN` or `latest.html`.
+- `scripts/build_queue/test_memory_feed.py` keeps its `charts` import case: the module stays.
+- The director updates the current-state lines of `docs/plans/builds-report.md`. The worker does not edit it.
+
+**Files:**
+- `scripts/buildlog/cli.py`
+- `scripts/buildlog/charts.py`
+- `scripts/buildlog/test_charts.py`
+- `scripts/buildlog/test_costs.py`
+- `docs/as-built/build-report-session.md`
+- `docs/as-built/build-targets.md`
+- `docs/as-built/mac-test-offload.md`
+- `docs/plans/builds-report-charts-design.md`
+
+**Workers:** `1 writer`
+- writer — all files and the tests.
+
+**State:** none.
+
+**Acceptance gate:**
+- `buildlog charts` prints the usage text to stderr and exits 2, by the `test_costs` row.
+- `grep -rn "buildlog charts"` over `scripts`, `commands`, `config` and `docs`, without `docs/plans/builds-report.md` and `docs/plans/builds-report-rounds.md`, finds nothing.
+- `scripts.buildlog.test_charts`, `test_costs` and `scripts.build_queue.test_memory_feed` pass.
+- `basedpyright` reports 0 errors and 0 warnings on the four Python files.

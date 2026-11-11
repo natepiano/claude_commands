@@ -56,14 +56,14 @@ class DirectorStopFixture:
 def director_stop_fixture() -> Generator[DirectorStopFixture]:
     with tempfile.TemporaryDirectory(prefix="stop-hook-") as temporary:
         root = Path(temporary)
-        run = root / "run"
-        run.mkdir()
+        run = root / "unit" / "run"
+        run.mkdir(parents=True)
         history = root / "history" / "run.jsonl"
         history.parent.mkdir()
         _ = history.write_text("", encoding="utf-8")
         _ = (run / "progress_history_state.json").write_text(json.dumps({
             "run_id": "fixture-run", "history_file": str(history),
-            "working_dir": str(root), "status": "active",
+            "working_dir": str(root),
             "main_agent": {"session_id": SESSION},
             "phase": {"id": "1", "instance_id": "fixture-phase", "status": "active"},
             "pass": {}, "open_phases": [],
@@ -80,6 +80,7 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
             "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
             "XDG_STATE_HOME": str(root / "state"), 
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
+            "SCRATCH_ROOT": str(root / "scratch"),
             "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k", "STAFF_FILE": str(root / "staff.json"),
         }

@@ -589,7 +589,7 @@ def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
     return row.role.value if isinstance(row.role, staff.KnownWorkerRole) else WorkerRoleUnavailable("dispatch role is unavailable")
 
 
-def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kept:
+def _transcript_messages(row: staff.StaffRow) -> list[str] | Kept:
     try:
         backend = staff.backend(row)
         if isinstance(backend, staff.BackendUnavailable):
@@ -598,14 +598,29 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
         entries = list(worker_admission.transcript_entries(source, set()))
         if any(isinstance(entry, worker_admission.TornTranscriptRecord) for entry in entries):
             return Kept("worker transcript has incomplete records")
-        messages = [entry for entry in entries if isinstance(entry, str) and entry]
-        if (not isinstance(dispatch, str) or not dispatch or not messages
-                or not messages[-1].startswith("assistant:\n")
-                or not any(worker_admission.reply_ends_dispatch(messages[-1], identity)
-                           for identity in (dispatch, stage_two_completion_id(dispatch)))):
-            return Kept("last turn does not end with the dispatch DONE line")
+        return [entry for entry in entries if isinstance(entry, str) and entry]
     except (OSError, ValueError) as error:
         return Kept(f"completion evidence is unavailable: {error}")
+
+
+def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kept:
+    messages = _transcript_messages(row)
+    if isinstance(messages, Kept):
+        return messages
+    if (not isinstance(dispatch, str) or not dispatch or not messages
+            or not messages[-1].startswith("assistant:\n")
+            or not any(worker_admission.reply_ends_dispatch(messages[-1], identity)
+                       for identity in (dispatch, stage_two_completion_id(dispatch)))):
+        return Kept("last turn does not end with the dispatch DONE line")
+    return CloseAllowed()
+
+
+def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
+    messages = _transcript_messages(row)
+    if isinstance(messages, Kept):
+        return messages
+    if not messages or not messages[-1].startswith("assistant:\n"):
+        return Kept("last turn does not end with an assistant reply")
     return CloseAllowed()
 
 
@@ -633,12 +648,14 @@ def check_worker_lock(row: staff.StaffRow,
     """Check the worker lock without creating a file."""
     if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
         path = _worker_lock_path(row.id)
-        if path.exists():
+        try:
             with path.open("r") as handle:
                 try:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     return Kept("dispatch lock is held")
+        except FileNotFoundError:
+            pass
     return CloseAllowed()
 
 
@@ -710,7 +727,8 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     if isinstance(worker, (StoppedWorker, ClosedWorker)):
         return _idle_checks(worker.row, directory, lock)
     state = worker_dispatch_state(worker.row, directory, lock)
-    completion: CloseAllowed | Kept = Kept(f"agent state is {worker.status.value}")
+    if isinstance(state, DispatchHoldsWorker):
+        return Kept(state.blocker)
     if isinstance(state, CompletedWorkerPass):
         completion = _completed_turn(worker.row, state.dispatch_id)
     elif state is ReleasedWorkerPass.ENDED:
@@ -720,10 +738,10 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
         hook = progress_history.hook_completion(passed)
         if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "done":
             completion = _completed_turn(worker.row, passed.get("instance_id"))
-        elif worker.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-            return CloseAllowed()
-    elif worker.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-        return Kept(state.blocker) if isinstance(state, DispatchHoldsWorker) else CloseAllowed()
+        else:
+            return _final_reply(worker.row)
+    else:
+        return _final_reply(worker.row)
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         if isinstance(completion, Kept):
             return Kept(f"agent state is {worker.status.value}")

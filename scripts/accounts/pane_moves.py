@@ -157,8 +157,7 @@ def _move_decision(move: WorkerMove, *, lock: worker_panes.WorkerLockHold | work
     if isinstance(active, progress_history.NoActiveDispatch) and isinstance(state, worker_panes.ClosedWorker):
         return accounts.SessionMoveRefused(move.row.id, "nothing to move", 0)
     close_check: worker_panes.CloseAllowed | worker_panes.Kept = worker_panes.CloseAllowed()
-    if (isinstance(active, progress_history.NoActiveDispatch)
-            and isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
+    if (isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
             and worker_panes.worker_state(state) == "idle"):
         close_check = worker_panes.can_close(state, run=worker_panes.DispatchRun(move.run), lock=lock)
         if isinstance(close_check, worker_panes.CloseAllowed):

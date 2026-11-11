@@ -74,7 +74,6 @@ class AdmissionPolicy:
     pressure: PressurePolicy
     peak_hold: PeakHold
     safety_bytes: int = 3 * GIB
-    ci_memory_margin_bytes: int = field(default=0, kw_only=True)
     progress_lookahead_percent: float = field(kw_only=True)
 
 
@@ -634,11 +633,6 @@ class CapUnavailable:
 
 
 @dataclass(frozen=True)
-class CIKeepAside:
-    bytes: int = 0
-
-
-@dataclass(frozen=True)
 class MemoryRoom:
     available: int
     safety: int
@@ -648,7 +642,6 @@ class MemoryRoom:
     cap: int | CapUnavailable
     runs: tuple[RunKeepAside, ...]
     total: int | UnknownHostTotal = field(default_factory=UnknownHostTotal, kw_only=True)
-    ci_keep_aside: CIKeepAside = field(default_factory=CIKeepAside, kw_only=True)
     ci_use: int = field(default=0, kw_only=True)
 
     @property
@@ -1191,7 +1184,6 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
-                                       ci_memory_margin_bytes=value("ci_memory_margin_gib", lambda raw: int(float(raw) * GIB)),
                                        progress_lookahead_percent=number("progress_lookahead_percent")),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),

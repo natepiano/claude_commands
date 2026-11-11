@@ -463,16 +463,18 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
 Pane workers move under their worker locks.
-An idle worker without an active dispatch closes its pane only when the shared close check allows it.
+An idle worker closes its pane only when the shared close check allows it.
 The check keeps the pane open for a live detached run, a held dispatch lock, or a live launcher.
 It also keeps the pane open while a submitted pass awaits completion.
 Every finished pass needs its dispatch DONE at the end of the last transcript turn before its open pane can close.
 This proof permits closure when herdr still reports a working agent.
+Without a dispatch pass, the last transcript turn must end with the agent's final reply.
+Unavailable transcript evidence keeps the pane open and reports its reason.
 A later message removes that proof.
 Closing the idle pane writes no move journal row.
 The next assign resumes the conversation on the group account.
 A busy worker or a kept worker stops at the shell before its conversation resumes on the target account in the same terminal.
-A stopped worker with an active dispatch keeps its terminal.
+A stopped worker with a held dispatch keeps its terminal.
 A closed worker with an active dispatch resumes its conversation in a new pane.
 An active or refused pass receives one resume message.
 A closed worker without an active dispatch has nothing to move.
