@@ -482,8 +482,8 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
     try:
         _compact_before_dispatch(client, current)
     except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
-        print(f"{current.row.name}: compaction failed: {error}; no prompt sent", file=sys.stderr)
-        return ExitCode.UNCERTAIN
+        reason = " ".join(str(error).splitlines())
+        print(f"{current.row.name}: compaction failed: {reason}; prompt is sent without compaction", file=sys.stderr)
     try:
         _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:
