@@ -594,6 +594,13 @@ The configured allowance supplies the cost when no needed bill rows exist or the
 The spending limits do not change.
 
 The prices command prints regional Spot prices without resource identities.
+`deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
+The reads use the encrypted administrator key through the admin executor.
+A region whose quota is below the largest configured type prints a request for a quota increase.
+The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
+A type with another size has no known count, and the check skips it.
+A failed read prints the quota as unknown with the redacted reason, and the command continues.
+The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.

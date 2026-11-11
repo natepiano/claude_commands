@@ -276,6 +276,8 @@ elif operation == 'start-instances':
 elif operation == 'describe-spot-price-history':
     reply({'SpotPriceHistory': [{'Timestamp': datetime.datetime.fromtimestamp(clock, datetime.UTC).isoformat(),
                                  'SpotPrice': '0.1'}]})
+elif operation == 'get-service-quota':
+    reply({'Quota': {'Value': 128}})
 elif operation == 'get-cost-and-usage':
     period = args[args.index('--time-period') + 1]
     assert all(len(part.split('=')[1]) == 10 for part in period.split(','))
@@ -503,6 +505,9 @@ class DeploymentTests(CostFixture):
         })
         for key, value in values.items():
             self.replace(key, value)
+        gates = self.root / 'cloud_gate.conf'
+        _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        text_setting(gates, 'regions', 'us-east-1')
         _ = cast(object, self.enterContext(mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=
             admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-client', 'fixture-oauth-secret'))))
         self.credentials = self.root / 'credentials'
@@ -1011,8 +1016,10 @@ sys.exit(7)
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
             region = args[args.index('--region') + 1]
-            if 'describe-availability-zones' in args:
-                reply: dict[str, object] = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
+            if 'get-service-quota' in args:
+                reply: dict[str, object] = {'Quota': {'Value': 128}}
+            elif 'describe-availability-zones' in args:
+                reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
             else:
                 reply = {'SpotPriceHistory': [{'InstanceType': 'm7a.8xlarge', 'AvailabilityZone': region + 'a',
                                               'SpotPrice': '.25', 'Timestamp': 'fixture'}]}
@@ -1023,9 +1030,96 @@ sys.exit(7)
         lines = output.getvalue().splitlines()
         self.assertIn('us-east-2 m7a.8xlarge us-east-2a .25', lines)
         for region in ('us-east-2', 'us-west-2'):
+            self.assertIn(f'{region}: Spot quota 128 vCPUs', lines)
             for size in ('r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge'):
                 self.assertIn(f'{region} {size} {region}a unavailable', lines)
         self.assertTrue(all('ami-' not in line and 'arn:' not in line for line in lines))
+
+    def test_prices_and_up_report_regional_quotas_through_the_admin_executor(self) -> None:
+        cases: tuple[tuple[str, dict[str, int | str], int], ...] = (
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 32}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 16}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 'AccessDenied: fixture-admin-secret'}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 64, 'us-west-2': 32}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 'AccessDenied: fixture-admin-secret', 'us-west-2': 64}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 'timeout', 'us-west-2': 32}, 32),
+            ('m7a.xlarge', {'us-east-1': 2, 'us-west-2': 4}, 4),
+            ('m7a.large', {'us-east-1': 1, 'us-west-2': 2}, 2),
+            ('m7a', {'us-east-1': 1, 'us-west-2': 32}, 0),
+            ('m7a.metal', {'us-east-1': 1, 'us-west-2': 32}, 0),
+            ('m7a.unknown', {'us-east-1': 1, 'us-west-2': 32}, 0),
+            ('m7a m7a.metal m7a.large m7a.8xlarge m7a.xlarge', {'us-east-1': 16, 'us-west-2': 32}, 32))
+        for command in ('prices', 'up'):
+            for instance_types, quotas, largest in cases:
+                with self.subTest(command=command, quotas=quotas, instance_types=instance_types):
+                    gates = self.root / 'cloud_gate.conf'
+                    text_setting(gates, 'regions', ' '.join(quotas))
+                    text_setting(gates, 'instance_types', instance_types)
+                    subject = self.deployment()
+                    subject.admin.credentials = subject.admin.get()
+                    calls: list[str] = []
+                    execute = subject.execute
+
+                    def quota_execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                                      timeout: float, check: bool,
+                                      env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                        region = arguments[arguments.index('--region') + 1] if '--region' in arguments else ''
+                        if 'get-service-quota' in arguments:
+                            self.assertNotIn('--profile', arguments)
+                            self.assertIsNotNone(env)
+                            self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+                            self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
+                            self.assertEqual(list(arguments[arguments.index('service-quotas'):]),
+                                ['service-quotas', 'get-service-quota', '--service-code', 'ec2',
+                                 '--quota-code', 'L-34B43A08', '--output', 'json'])
+                            calls.append(region)
+                            quota = quotas[region]
+                            if quota == 'timeout':
+                                raise subprocess.TimeoutExpired('fixture-admin-secret', timeout)
+                            return subprocess.CompletedProcess(arguments, 1 if isinstance(quota, str) else 0,
+                                '' if isinstance(quota, str) else json.dumps({'Quota': {'Value': quota}}),
+                                quota if isinstance(quota, str) else '')
+                        if 'describe-availability-zones' in arguments:
+                            return subprocess.CompletedProcess(arguments, 0,
+                                json.dumps({'AvailabilityZones': [{'ZoneName': region + 'a'}]}), '')
+                        if 'describe-spot-price-history' in arguments and '--availability-zone' not in arguments:
+                            return subprocess.CompletedProcess(arguments, 0, json.dumps({'SpotPriceHistory': []}), '')
+                        self.assertNotIn('describe-instance-types', arguments)
+                        return execute(arguments, capture_output=capture_output, text=text,
+                                       timeout=timeout, check=check, env=env)
+
+                    subject.execute = quota_execute
+                    with mock.patch.object(deploy, 'largest_gate_vcpus', wraps=deploy.largest_gate_vcpus) as count_vcpus:
+                        if command == 'up':
+                            success, output = self.up_output(subject)
+                            self.assertTrue(success, output)
+                            self.assertIn('scaler-key:', output)
+                        else:
+                            with redirect_stdout(StringIO()) as captured:
+                                subject.prices()
+                            output = captured.getvalue()
+                            self.assertIn('us-east-1 r7a.8xlarge us-east-1a unavailable', output)
+                        count_vcpus.assert_called_once_with(tuple(instance_types.split()))
+                    self.assertEqual(calls, list(quotas))
+                    lines = [line for line in output.splitlines()
+                             if ': Spot' in line or ': cannot run' in line or ': gate vCPU' in line]
+                    expected: list[str] = []
+                    for region, quota in quotas.items():
+                        if isinstance(quota, str):
+                            line = next(line for line in lines if line.startswith(region + ': Spot vCPU quota unknown:'))
+                            if quota == 'timeout':
+                                self.assertIn('timed out', line)
+                            else:
+                                self.assertIn('AccessDenied: [redacted]', line)
+                            expected.append(line)
+                        else:
+                            expected.append(f'{region}: Spot quota {quota} vCPUs')
+                            if largest == 0:
+                                expected.append(f'{region}: gate vCPU count is unknown')
+                            elif quota < largest:
+                                expected.append(f'{region}: cannot run one gate ({largest} vCPUs); ask AWS for a Spot vCPU quota increase in this region.')
+                    self.assertEqual(lines, expected)
+                    self.assertNotIn('fixture-admin-secret', output)
 
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()
@@ -1146,6 +1240,7 @@ sys.exit(7)
 
     def test_down_removes_regional_stack_and_copied_image_before_snapshot(self) -> None:
         from scripts.aws_target import teardown
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
         cloud_gate_record = {'deployment_id': 'fixture', 'regions': [{'region': 'us-east-2'},
             {'region': 'us-west-2', 'stack': 'fixture-gates-us-west-2'}]}
         _ = (self.state / 'gate-deployment.json').write_text(json.dumps(cloud_gate_record))
@@ -1873,7 +1968,8 @@ sys.exit(7)
         settings = self.settings.read_bytes()
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
-        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
+        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['us-east-1: Spot quota 128 vCPUs',
+            'price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
         commands = self.commands()
         operations = [cast(list[str], row['args'])[5] for row in commands]
         self.assertLess(operations.index('describe-spot-price-history'), operations.index('deploy'))
@@ -1885,7 +1981,8 @@ sys.exit(7)
         before = len(self.commands())
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
-        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
+        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['us-east-1: Spot quota 128 vCPUs',
+            'price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
         later = self.commands()[before:]
         self.assertEqual(sum('describe-spot-price-history' in cast(list[str], row['args']) for row in later), 1)
         for row in later:
