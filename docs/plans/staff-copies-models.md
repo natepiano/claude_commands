@@ -41,52 +41,24 @@
 
 ### Phase 2 — Production records keep staff ids  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** `add_showrunner.json`, `review-paused/*.json` and `wrap_release.json` keep staff ids. Session, document, home and recipient address come from the staff row.
-
-**Spec:**
-
-1. `scripts/production/add_showrunner.py` `published`: the receipt has no `session_id`. A receipt for an owner with no staff row carries `doc` and `config_dir` as its creation claim. A receipt for a staff owner carries neither. After `ensure_staff_showrunner` admits the owner, `published` rewrites the receipt without the claim.
-2. `scripts/production/completion_receipt.py` `read_launch_receipt`: an unpublished receipt is one whose `owner` has no staff row. Its native session is `owner`.
-3. `add_showrunner.py` readers: an owned receipt takes session from `row.current_session`, document from `row.doc` and home from `row.home`. Only an unpublished receipt reads `doc` and `config_dir`. `ShowrunnerLaunch.from_receipt` takes the receipt variant, not `session_id`.
-4. `scripts/production/review_pause.py`: the record path is `review-paused/<owner staff id>.json`. `pause`, `status` and `resume` select the owner by production name through staff, then use the id. Output shows the name.
-5. `scripts/hooks/showrunner_footer.py` `review_pause_path` and `scripts/hooks/conversation_pause.py` `_review_names` read the id-keyed file. Tell hierarchies before this edit.
-6. `scripts/production/showrunner_tree.py` `edges_to_release` and `scripts/production/production_lifecycle.py` `save_release`: the capture stores recipient staff ids. `release_edges` resolves each current row at delivery through `showrunners.current_address`.
-7. Deploy program: rename `~/.local/state/showrunner/review-paused/<name>.json` to `<owner id>.json`; strip `session_id` from any `add_showrunner.json`, and `doc` and `config_dir` from one with a staff owner; convert any `wrap_release.json` names to ids. natedev holds 1 pause file and 0 of the others.
-8. Add no other guard, refusal or scan.
+- `add_showrunner.json` has no `session_id`. A new receipt carries `doc` and `config_dir` as its creation claim. `finish_publication` saves `config_dir` as the row home with `staff.set_home`, then rewrites the receipt without `doc` and `config_dir`. The first launch and a rerun of an owned receipt that still holds the claim both run `finish_publication`, so a stop between admission and the home write recovers on the next run.
+- `completion_receipt.read_launch_receipt`: a receipt whose `owner` has no staff row is unpublished, and its native session is `owner`. An owned receipt reads session, document and home from the staff row. `ShowrunnerLaunch.from_receipt` takes the receipt variant.
+- `review_pause.py` keeps `review-paused/<owner staff id>.json`. `pause`, `status` and `resume` select the owner by production name through staff; output shows the name. `showrunner_footer.review_pause_path` and `conversation_pause._review_names` read the id-keyed file.
+- `wrap_release.json` stores recipient staff ids in `former_parent`, `former_children` and `told`. `release_edges` reads each recipient's current name from staff at its own delivery, and reads the names again for the final report.
+- A one-off deploy program outside the repository renames old pause files, strips the copied receipt fields and converts release names to ids.
 
 **Files:**
-- `scripts/production/add_showrunner.py` — receipt writer and readers.
+- `scripts/production/add_showrunner.py` — receipt writer, `finish_publication` and readers.
 - `scripts/production/completion_receipt.py` — receipt decode.
-- `scripts/production/review_pause.py` — pause key.
-- `scripts/hooks/showrunner_footer.py` — pause reader.
-- `scripts/hooks/conversation_pause.py` — pause reader.
-- `scripts/production/showrunner_tree.py` — release capture.
-- `scripts/production/production_lifecycle.py` — release save and delivery.
-- `scripts/production/test_add_showrunner.py` — receipt rows.
-- `scripts/production/test_completion_receipt.py` — receipt rows.
-- `scripts/production/test_production_lifecycle.py` — release rows.
-- `scripts/production/test_tidy_wrapped.py` — pause cleanup rows.
-- `scripts/production/test_review_pause.py` — pause rows (new file).
-- `scripts/production/test_showrunner_parent.py` — wrap release rows.
-- `scripts/production/test_showrunner_tree.py` — release capture rows.
-- `scripts/hooks/test_showrunner_footer.py` — pause reader rows.
-- `scripts/hooks/test_conversation_pause.py` — pause reader rows.
+- `scripts/production/review_pause.py` — id-keyed pause record.
+- `scripts/hooks/showrunner_footer.py`, `scripts/hooks/conversation_pause.py` — pause readers.
+- `scripts/production/showrunner_tree.py` — release capture with ids.
+- `scripts/production/production_lifecycle.py` — release save and per-delivery name lookup.
+- `scripts/production/test_add_showrunner.py`, `test_completion_receipt.py`, `test_production_lifecycle.py`, `test_review_pause.py`, `test_showrunner_parent.py`, `test_showrunner_tree.py`, `scripts/hooks/test_conversation_pause.py` — rows for the three record shapes.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — the source files above.
-- `test` — the test files above. Rows: a dead owned launch recovers with the session and home from staff after a rename; an unpublished launch recovers from `owner`; a pause by name writes and reads the id file; a wrap release delivers to a recipient's current session after its session changes.
-
-**State:** the three record shapes; deploy program above.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-1. The unittest line passes for the nine test modules above.
-2. basedpyright over the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** resolving all recipient names once before delivery — a rename during an earlier notice sends to a stale name.
 
 ### Phase 3 — Scheduled prompts are built at delivery  · status: todo
 
