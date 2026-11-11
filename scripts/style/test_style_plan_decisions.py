@@ -11,7 +11,7 @@ import subprocess
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import final
+from typing import cast, final
 from unittest import mock
 
 
@@ -20,8 +20,11 @@ from scripts.style import style_proposals
 
 from scripts.style import rules
 from scripts.style import style_ledger
+from scripts.style import unit_plans
 
 from scripts.style.style_plan_test_support import StylePlanFixture
+from scripts.production import proposal_issue
+from scripts.production.staff_test_support import fixture_member
 
 
 @final
@@ -249,10 +252,18 @@ class StylePlanTests(StylePlanFixture):
         blob = next(rule_.blob for rule_ in rules.load_rules(self.repo) if rule_.rule_id == rule)
         second = ledger.hold(rule, self.sources[0], 1, "another value", "restructure", "42", "LIMIT", blob, "outside")
         ledger.file_held(second.finding_id, issue)
-        _ = self.refill_decisions()
-        ticket, = ledger.ticket_open(ticket_owner_id("names"))
-        self.assertEqual(ticket["files"], list(self.sources[:2]))
-        self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue)})
+        owner = ledger.unit_row(ticket_owner_id("names"))
+        retired = fixture_member("unit", name="retired-names", parent=owner.parent)
+        for approved_unit in (owner.id, retired.id):
+            with self.subTest(approved_unit=approved_unit):
+                text, _ = proposal_issue.set_fields(issue.read_text(), {"unit": approved_unit}, issue)
+                _ = issue.write_text(text)
+                _ = self.refill_decisions()
+                ticket, = ledger.ticket_open(ticket_owner_id("names"))
+                self.assertEqual(ticket["files"], list(self.sources[:2]))
+                self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue)})
+                ledger.ticket_drop(ticket["id"])
+                _ = self.plan.write_text(self.plan_header())
 
     def test_queued_and_new_decisions_share_unchanged_site_proof_and_followed_coordinates(self) -> None:
         _ = self.types_unit()
@@ -319,17 +330,97 @@ class StylePlanTests(StylePlanFixture):
         self.assertFalse(any(t["kind"] == "proposal" for t in ledger.ticket_open(ticket_owner_id("names"))))
 
     def test_decision_refill_skips_a_rule_that_left_the_catalog_and_coverage_goes_on(self) -> None:
-        gone = self.rule("gone-decision")
-        _ = self.rule("read")
-        self.sync()
-        issue = self.approved_decision(gone, (self.sources[0],), "rename")
-        (self.rule_dir / "gone-decision.md").unlink()
-        with mock.patch.object(style_proposals, "proposal_command") as start:
-            code, output, errors = self.run_next()
-        self.assertEqual(code, 0, errors)
-        self.assertEqual(output.count(f"waiting {issue}: rule {gone} not in the catalog\n"), 1)
-        start.assert_not_called()
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["kind"], "read")
+        # Each row uses the original Git paths from the fixture snapshot.
+        _ = self.doCleanups()
+        for suffix, queued_busy in (("", False), ("#uncovered", False), ("#uncovered", True)):
+            with self.subTest(suffix=suffix, queued_busy=queued_busy):
+                case = StylePlanTests()
+                case.setUp()
+                try:
+                    gone = case.rule("gone-decision")
+                    metadata = ("tier: B\nfamily: names\ncandidates:\n"
+                                + "  kind: regex\n  pattern: absent\n  surface: partial\n"
+                                + "  uncovered: Read every name.\n") if suffix else (
+                                    "tier: C\nfamily: names\ninput_scope: file\n")
+                    rule = case.rule("read", metadata)
+                    types_rule = case.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+                    case.write(case.sources[0], "pub enum Outcome { Old }\n")
+                    case.commit_to_every_checkout()
+                    types_plan = case.types_unit()
+                    missing = case.approved_decision(gone, (case.sources[1],), "rename", name="removed")
+                    issue = case.approved_decision(rule, (), "rename", name="approved")
+                    ledger = case.ledger()
+                    blob = next(item.blob for item in rules.load_rules(case.repo) if item.rule_id == rule)
+                    finding = ledger.hold(rule + suffix, case.sources[0], 1, "pub enum Outcome { Old }", "rename",
+                                          "Outcome::Old", "Outcome::New", blob, "outside")
+                    ledger.file_held(finding.finding_id, issue)
+                    ledger.record(rule + suffix, case.sources[0], case.tip, blob, "held", ticket="outside",
+                                  input_scope=style_ledger.DeclaredInputScope.RULE)
+                    if suffix:
+                        text, _ = proposal_issue.set_fields(issue.read_text(), {"style_rule": rule + suffix}, issue)
+                        _ = issue.write_text(text)
+                    (case.rule_dir / "gone-decision.md").unlink()
+                    for unit, expected in (("names", (issue,)), ("types", ())):
+                        with self.subTest(unit=unit):
+                            selected = tuple(item.path for item in style_proposals.approved_decisions(issue.parent, unit))
+                            self.assertEqual(selected, expected)
+                            self.assertEqual(len(selected), len(set(selected)))
+                            self.assertNotIn(missing, selected)
+                    with (mock.patch.object(style_proposals, "proposal_command") as start,
+                          mock.patch.object(style_proposals, "workspace_directories",
+                                            wraps=style_proposals.workspace_directories) as directories):
+                        self.assertIsInstance(style_plan.next_phase("types", types_plan, case.repo), style_plan.PhaseWritten)
+                        directories.assert_not_called()
+                    start.assert_not_called()
+                    types_ticket, = ledger.ticket_open(ticket_owner_id("types"))
+                    self.assertEqual(types_ticket["kind"], "read")
+                    ledger.ticket_drop(types_ticket["id"])
+                    for path in case.sources:
+                        case.record(types_rule, path, case.tip)
+                    definitions = {definition.rule_id: definition for definition in rules.load_rules(case.repo)}
+                    measured_at = "2026-11-10T22:00:00+00:00"
+                    for blocked, expected in (((), (1, 0, 0, 0)), ((case.sources[0],), (0, 0, 0, 1))):
+                        with self.subTest(blocked=blocked):
+                            split = style_plan.classify_split(
+                                ledger, "names", case.doc, case.base(), unit_plans.AllCrates(),
+                                style_plan.BusyFiles(case.board(*blocked), frozenset(blocked)), definitions,
+                                style_ledger.GitReadCache(case.repo), measured_at)
+                            self.assertEqual((split.ready, split.changed, split.structure, split.other), expected)
+                    if queued_busy:
+                        ledger.ticket_add("99", ticket_owner_id("names"), "proposal", "names", "crates/alpha",
+                                          [case.sources[0]], [rule + suffix], proposal=str(issue),
+                                          finding_ids=(finding.finding_id,))
+                        with (mock.patch.object(style_plan, "busy_files",
+                                                return_value=style_plan.BusyFiles(
+                                                    case.board(case.sources[0]), frozenset({case.sources[0]}))),
+                              mock.patch.object(style_proposals, "proposal_command")):
+                            code, output, errors = case.run_next()
+                        self.assertEqual(code, 0, errors)
+                        self.assertIn("dropped 99: files busy", output)
+                        self.assertIn(f"waiting {issue}: {case.sources[0]} busy", output)
+                        self.assertEqual(ledger.ticket_get("99")["state"], "dropped")
+                        self.assertFalse(any(ticket["kind"] == "proposal"
+                                             for ticket in ledger.ticket_open(ticket_owner_id("names"))))
+                        for ticket in ledger.ticket_open(ticket_owner_id("names")):
+                            ledger.ticket_drop(ticket["id"])
+                    with mock.patch.object(style_plan, "fill_decision_batch",
+                                           wraps=style_plan.fill_decision_batch) as batch:
+                        output = case.refill_decisions()
+                    self.assertEqual(batch.call_count, 1, output)
+                    candidates = cast(tuple[style_plan.BuildableDecision, ...], batch.call_args_list[0].args[2])
+                    self.assertEqual(tuple(candidate.issue for candidate in candidates), (issue,))
+                    self.assertNotIn(str(missing), output)
+                    ticket, = ledger.ticket_open(ticket_owner_id("names"))
+                    self.assertEqual((ticket["kind"], ticket["rules"], ticket["finding_ids"]),
+                                     ("proposal", [rule + suffix], [finding.finding_id]))
+                    self.assertEqual(ledger.ticket_proposals(ticket["id"]), (issue,))
+                    case.write(case.sources[0], "pub enum Outcome { New }\n")
+                    case.commit_to_every_checkout()
+                    ledger.ticket_checkpoint(ticket["id"], case.tip)
+                    self.assertEqual(ledger.ticket_merge(ticket["id"]), ())
+                    self.assertIsInstance(ledger.proposal_findings(issue)[0].state, style_ledger.Built)
+                finally:
+                    _ = case.doCleanups()
 
     def test_decision_refill_waives_a_finding_whose_file_is_gone_so_the_decision_can_close(self) -> None:
         rule = self.rule("read")

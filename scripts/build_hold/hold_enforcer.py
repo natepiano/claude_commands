@@ -30,6 +30,269 @@ from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 from scripts.direct import step_record
 from scripts.buildlog import store
 from scripts.lib.boot_identity import boot_identity
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_group import send_process_group
+
+
+@dataclass(frozen=True)
+class WaitingRun:
+    process: build_hold.AuditProcess
+    owner: build_hold.OwningSession | build_hold.NoOwningSession
+
+
+@dataclass(frozen=True)
+class WorkingRun:
+    process: build_hold.AuditProcess
+    owner: build_hold.OwningSession | build_hold.NoOwningSession
+    reason: str
+
+
+@dataclass(frozen=True)
+class StoppedRun:
+    run: WaitingRun
+
+
+@dataclass(frozen=True)
+class RunIdentityChanged:
+    run: WaitingRun
+
+
+@dataclass(frozen=True)
+class DetachedRun:
+    supervisor: build_hold.AuditProcess
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoDetachedRun:
+    pass
+
+
+@dataclass(frozen=True)
+class DetachedRunChanged:
+    pass
+
+
+@dataclass(frozen=True)
+class NoStoppedRun:
+    pass
+
+
+NO_STOPPED_RUN = NoStoppedRun()
+
+
+def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> frozenset[build_hold.ProcessIdentity]:
+    """Read local claim records without contacting the Mac or AWS."""
+    from scripts.build_targets import target_config
+    from scripts.mac_test import claim_state
+
+    claimed: set[build_hold.ProcessIdentity] = set()
+    for target in target_config.read_targets():
+        if not isinstance(target, target_config.SshTarget):
+            continue
+        paths = claim_state.state_paths(target.name)
+        for claim in claim_state.read_claims(paths):
+            identity = build_hold.ProcessIdentity(claim.record["pid"], claim.record["proc_start"])
+            if build_hold.process_start_time(identity.pid, proc_root) == identity.start_time:
+                claimed.add(identity)
+    return frozenset(claimed)
+
+
+def classify_drain_runs(
+    processes: Mapping[int, build_hold.AuditProcess],
+    admitted: frozenset[build_hold.ProcessIdentity], claimed: frozenset[build_hold.ProcessIdentity],
+) -> tuple[WaitingRun | WorkingRun, ...]:
+    """Classify each gate by its descendants, reservations, and target claims."""
+    runs: list[WaitingRun | WorkingRun] = []
+    ancestors = {pid: build_hold.audit_ancestors(process, processes) for pid, process in processes.items()}
+    for process in processes.values():
+        if not is_waiting_gate(process) or any(is_waiting_gate(parent) for parent in ancestors[process.identity.pid]):
+            continue
+        owner = build_hold.audit_owner(process, ancestors[process.identity.pid])
+        family = [item for item in processes.values()
+                  if item.identity == process.identity or process in ancestors[item.identity.pid]]
+        identities = {item.identity for item in (*family, *ancestors[process.identity.pid])}
+        reason = ("cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
+                                        for item in family) else
+                  "admission reservation" if identities & admitted else
+                  "Mac or AWS claim" if identities & claimed else "")
+        if reason:
+            runs.append(WorkingRun(process, owner, reason))
+        else:
+            runs.append(WaitingRun(process, owner))
+    return tuple(runs)
+
+
+def working_drain_identities(proc_root: Path) -> tuple[build_hold.ProcessIdentity, ...]:
+    """Keep existing work through the enforcer when the drain hold starts."""
+    runs = classify_drain_runs(build_hold.read_audit_processes(proc_root),
+                               build_hold.admitted_processes(), claimed_processes(proc_root))
+    return tuple(run.process.identity for run in runs if isinstance(run, WorkingRun))
+
+
+def detached_run(
+    process: build_hold.AuditProcess, processes: Mapping[int, build_hold.AuditProcess],
+) -> DetachedRun | NoDetachedRun | DetachedRunChanged:
+    """Find the supervisor by ancestry or the command's recorded environment."""
+    lineage = (process, *build_hold.audit_ancestors(process, processes))
+    for parent in lineage:
+        for index, argument in enumerate(parent.argv[:-2]):
+            if Path(argument).name == "detached_runs.py" and parent.argv[index + 1] == "supervise":
+                path = Path(parent.argv[index + 2])
+                return DetachedRun(parent, path if path.is_absolute() else Path(parent.cwd) / path)
+    record_path = next((item.environment["UNIT_DETACHED_RECORD"] for item in lineage
+                        if item.environment.get("UNIT_DETACHED_RECORD")), "")
+    candidates = [Path(record_path)] if record_path else sorted({
+        path for item in lineage if item.environment.get("UNIT_RUN_DIR")
+        for path in (Path(item.environment["UNIT_RUN_DIR"]) / "detached_runs").glob("*.json")
+    })
+    for path in candidates:
+        try:
+            raw = cast(object, json.loads(path.read_text()))
+        except FileNotFoundError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        record = cast(dict[str, object], raw)
+        pid = record.get("pid")
+        if isinstance(pid, int) and pid in processes and (record_path or any(item.identity.pid == pid for item in lineage)):
+            return DetachedRun(processes[pid], path)
+    return DetachedRunChanged() if record_path else NoDetachedRun()
+
+
+def supervisor_args(pid: int, proc_root: Path) -> tuple[str, ...]:
+    try:
+        return tuple(part.decode("utf-8", "replace") for part in
+                     (proc_root / str(pid) / "cmdline").read_bytes().split(b"\0") if part)
+    except OSError:
+        return ()
+
+
+def supervisor_matches(argv: tuple[str, ...], path: Path, cwd: str) -> bool:
+    """Match the supervisor script, verb, and record argument in their argv positions."""
+    if len(argv) != 4 or Path(argv[1]).name != "detached_runs.py" or argv[2] != "supervise":
+        return False
+    argument = Path(argv[3])
+    record_path = argument if argument.is_absolute() else Path(cwd) / argument
+    return record_path.resolve() == path.resolve()
+
+
+def stop_waiting_run(
+    run: WaitingRun, holder: build_hold.Holder, processes: Mapping[int, build_hold.AuditProcess], proc_root: Path,
+    *, signal_process: Callable[[int, int], None] = os.kill,
+    signal_group: Callable[[int, int], None] = send_process_group,
+    supervisor_args: Callable[[int, Path], tuple[str, ...]] = supervisor_args,
+) -> StoppedRun | RunIdentityChanged:
+    """Check process identities before TERM and record each stopped gate."""
+    from scripts.agents import detached_runs
+
+    process = run.process
+    identity = process.identity
+    if build_hold.process_start_time(identity.pid, proc_root) != identity.start_time:
+        return RunIdentityChanged(run)
+    detached = detached_run(process, processes)
+    if isinstance(detached, DetachedRunChanged):
+        return RunIdentityChanged(run)
+    if isinstance(detached, DetachedRun):
+        supervisor = detached.supervisor.identity
+        if (build_hold.process_start_time(supervisor.pid, proc_root) != supervisor.start_time
+                or not supervisor_matches(supervisor_args(supervisor.pid, proc_root), detached.path, detached.supervisor.cwd)):
+            return RunIdentityChanged(run)
+    classification: build_hold.BuildClass = "other_session" if isinstance(run.owner, build_hold.OwningSession) else "no_session"
+    record_build(build_hold.AuditedBuild(process, run.owner, classification, ()), holder, proc_root, "stopped",
+                 stopped_run=identity)
+    reason = f"stopped for {holder.purpose}; run again after the release"
+
+    def still_current() -> bool:
+        current = build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
+        if isinstance(detached, DetachedRun):
+            supervisor = detached.supervisor.identity
+            current = current and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
+        return current
+
+    def signal_run() -> None:
+        if isinstance(detached, DetachedRun):
+            signal_group(detached.supervisor.identity.pid, signal.SIGTERM)
+        else:
+            signal_process(identity.pid, signal.SIGTERM)
+
+    try:
+        if isinstance(run.owner, build_hold.OwningSession):
+            _ = build_hold.register_wait(run.owner.session_id)
+        if isinstance(detached, DetachedRun):
+            sent = detached_runs.stop_with_reason(detached.path, reason, still_current=still_current, signal_run=signal_run)
+        else:
+            sent = still_current()
+            if sent:
+                signal_run()
+        if not sent:
+            set_stop_status(holder, identity, "not_stopped")
+            return RunIdentityChanged(run)
+    except ProcessLookupError:
+        set_stop_status(holder, identity, "not_stopped")
+        return RunIdentityChanged(run)
+    except BaseException:
+        set_stop_status(holder, identity, "not_stopped")
+        raise
+    set_stop_status(holder, identity, "stopped")
+    if isinstance(detached, NoDetachedRun):
+        for item in processes.values():
+            if (process in build_hold.audit_ancestors(item, processes)
+                    and build_hold.process_start_time(item.identity.pid, proc_root) == item.identity.start_time):
+                try:
+                    signal_process(item.identity.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+    return StoppedRun(run)
+
+
+def drain(
+    holder: build_hold.Holder, proc_root: Path = build_hold.PROC_ROOT, *,
+    sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+) -> int:
+    """Stop waiting gates and wait for working gates while the hold stays active."""
+    attempted: set[build_hold.ProcessIdentity] = set()
+    signalled: set[build_hold.ProcessIdentity] = set()
+    heartbeat = clock()
+    try:
+        while True:
+            processes = build_hold.read_audit_processes(proc_root)
+            runs = classify_drain_runs(processes, build_hold.admitted_processes(), claimed_processes(proc_root))
+            if not runs:
+                print("drained", flush=True)
+                return 0
+            report = clock() >= heartbeat
+            for run in runs:
+                owner = run.owner.session_id if isinstance(run.owner, build_hold.OwningSession) else "no session"
+                if isinstance(run, WaitingRun) and run.process.identity not in attempted:
+                    outcome = stop_waiting_run(run, holder, processes, proc_root)
+                    label = "stopped" if isinstance(outcome, StoppedRun) else "skipped: identity changed"
+                    print(f"{label}: {owner}, pid {run.process.identity.pid}", flush=True)
+                    attempted.add(run.process.identity)
+                    if isinstance(outcome, StoppedRun):
+                        signalled.add(run.process.identity)
+                if report:
+                    try:
+                        uptime = float((proc_root / "uptime").read_text().split()[0])
+                    except (OSError, ValueError, IndexError):
+                        uptime = clock()
+                    age = max(0, uptime - int(run.process.identity.start_time) / os.sysconf("SC_CLK_TCK"))
+                    if isinstance(run, WorkingRun):
+                        state = "working"
+                    elif run.process.identity in signalled:
+                        state = "TERM sent; still alive"
+                    else:
+                        state = "skipped: identity changed"
+                    detail = f": {run.reason}" if isinstance(run, WorkingRun) else ""
+                    print(f"{state}: {owner}, pid {run.process.identity.pid}, age {age:.0f}s{detail}", flush=True)
+            if report:
+                print(f"draining: {len(runs)} runs remain", flush=True)
+                heartbeat = clock() + 60
+            sleep(1)
+    except KeyboardInterrupt:
+        print("drain interrupted; the hold remains active", flush=True)
+        return 130
+
 
 @dataclass(frozen=True)
 class AllowedBuild:
@@ -281,9 +544,32 @@ def decide_builds(
     return tuple(decisions)
 
 
+def hold_build_log(holder: build_hold.Holder) -> Path:
+    hold_id = hashlib.sha256(json.dumps([holder.key, holder.since.isoformat()]).encode()).hexdigest()
+    return store.root() / store.host_name() / f"hold-builds-{hold_id}.jsonl"
+
+
+def set_stop_status(holder: build_hold.Holder, identity: build_hold.ProcessIdentity,
+                    status: Literal["stopped", "not_stopped"]) -> None:
+    """Complete or cancel the durable stop request under its existing log lock."""
+    path = hold_build_log(holder)
+    with path.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        lines: list[str] = []
+        for line in path.read_text().splitlines():
+            entry = cast(dict[str, object], json.loads(line))
+            if (entry.get("pid") == identity.pid and entry.get("proc_start") == identity.start_time
+                    and entry.get("action") == "stopped" and "stopped_run" in entry):
+                entry["stop_status"] = status
+                entry["action"] = status
+            lines.append(json.dumps(entry))
+        write_text_atomic(path, "\n".join(lines) + "\n")
+
+
 def record_build(
     build: build_hold.AuditedBuild, holder: build_hold.Holder, proc_root: Path,
     action: Literal["audit", "stopped"],
+    *, stopped_run: build_hold.ProcessIdentity | NoStoppedRun = NO_STOPPED_RUN,
 ) -> None:
     """Audit and enforcement use the same permanent log and append writer."""
     try:
@@ -291,10 +577,9 @@ def record_build(
     except (OSError, ValueError):
         boot = ""
     identity = build.process.identity
-    hold_id = hashlib.sha256(json.dumps([holder.key, holder.since.isoformat()]).encode()).hexdigest()
     build_id = hashlib.sha256(json.dumps([boot, str(identity.pid), identity.start_time]).encode()).hexdigest()
     host = store.host_name()
-    path = store.root() / host / f"hold-builds-{hold_id}.jsonl"
+    path = hold_build_log(holder)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Keep duplicate reads and the shared append in one lock, without nesting the append writer's file lock.
     with path.with_suffix(".lock").open("a+") as lock:
@@ -309,14 +594,18 @@ def record_build(
                 row = cast(dict[str, object], value)
                 if row.get("id") == build_id and row.get("action", "audit") == action:
                     return
-        store.append_line(path, {
+        entry: dict[str, object] = {
             "kind": "hold_build", "v": 1, "id": build_id, "at": store.utc_iso(time.time()), "host": host,
             "hold_key": holder.key, "hold_since": holder.since.isoformat(), "boot_id": boot,
             "pid": identity.pid, "proc_start": identity.start_time, "class": build.classification,
             "session": build.owner.session_id if isinstance(build.owner, build_hold.OwningSession) else "",
             "command": shlex.join(build.process.argv) or build.process.command, "cwd": build.process.cwd,
             "action": action, "call_id": build.process.environment.get("BUILDLOG_CALL_ID", ""),
-        })
+        }
+        if isinstance(stopped_run, build_hold.ProcessIdentity):
+            entry["stopped_run"] = {"pid": stopped_run.pid, "proc_start": stopped_run.start_time}
+            entry["stop_status"] = "requested"
+        store.append_line(path, entry)
 
 
 def refusal_line(build: WouldStopBuild) -> str:

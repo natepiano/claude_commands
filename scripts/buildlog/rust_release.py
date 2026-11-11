@@ -22,7 +22,7 @@ from scripts.lib import process_group
 
 from scripts.build_hold import override_guard
 from scripts.copies import copies
-from scripts.lib import cargo_output, scratch
+from scripts.lib import cargo_output, conf_reads, scratch
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush
 
@@ -205,7 +205,7 @@ def mapping(value: object) -> dict[str, object]:
 def free_floor_gib() -> float:
     values: dict[str, str] = {}
     try:
-        for raw in LINT_CONFIG.read_text().splitlines():
+        for raw in conf_reads.read_text(LINT_CONFIG).splitlines():
             line = raw.split("#", 1)[0].strip()
             if line and not (line.startswith("[") and line.endswith("]")) and "=" in line:
                 key, _, value = line.partition("=")
