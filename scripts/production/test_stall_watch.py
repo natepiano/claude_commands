@@ -458,7 +458,7 @@ always=natedev
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         for run_id, events in self.run_records.items():
             _ = (runs / f"{run_id}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-        for history in runs.iterdir():
+        for history in sorted(runs.iterdir()):
             folder = self.root / "held" / history.stem
             if history.stem in self.unheld_runs:
                 continue
@@ -483,7 +483,7 @@ always=natedev
                 history_events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
                 if any(event.get("event_type") == "run_finished" for event in history_events):
                     if isinstance(owner.run, staff.OpenRun):
-                        _ = staff.clear_run(owner.id, owner.run.path)
+                        _ = staff.clear_run(owner.id, folder)
                 else:
                     _ = staff.set_run(owner.id, staff.OpenRun(folder))
 
