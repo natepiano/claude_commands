@@ -3029,117 +3029,25 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 160 — The waiting tests build their Git trees once for each class  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_waiting.py` builds its bare origin, production checkout and two worktrees once for each class. Each test copies them. Every test and assertion stays.
+- Checkpoint `61579526f`. `production/test_waiting.py` builds the bare origin, production checkout and two worktrees once in `setUpClass`. Each test restores them at the same paths and refreshes the three indexes. Live hosts, sockets, staff records, board files, unit files and logs stay per test. aws pairs: 28.91 to 27.76 CPU s (1.15 s, 4%); 34 tests pass.
+- The two parallel ETA tests (about 14.4 s each) are now the main cost. Next item 6b takes them.
 
-**Decision:** Architect review after Phase 159, finding 3. builds go (current), 2026-11-11. sdlc go for the file, 2026-11-11.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 production/test_waiting.py`. Report the CPU of the Git setup in `setUp` (line 171 on: `git init --bare`, `init`, three `config` calls, `remote add`, `add`, `commit`, `push`, two `worktree add`).
-2. Build the static Git trees once in `setUpClass`: `origin.git`, the production checkout with its initial commit and push, and the `alpha` and `beta` worktrees. Keep them in a class `tempfile.TemporaryDirectory`.
-3. In `setUp`, copy the seed to the same absolute paths each test uses (`copytree(..., symlinks=True)`), so the worktree links stay valid. Phase 158 (`style/test_standing_checkpoint.py`) is the model: it binds the fixture paths once for the class.
-4. After the copy, run `git update-index --refresh` in each of the three checkouts. Copied indexes carry old stat data.
-5. Keep per test: the environment, the fake herdr host, live host pids, held sockets (`claude()` at line 239), the board file, `.unit.toml` files, the production doc and log, and `ensure_excluded`. Only the static Git trees go in the seed.
-6. Keep every test and assertion. Change no production script.
-7. Measure local CPU before and after with the step 1 command. The director runs three aws pairs; only aws pairs decide.
-
-**Files:**
-- `scripts/production/test_waiting.py` — all items.
-
-**Workers:** 1 writer; one file.
-- impl4: `scripts/production/test_waiting.py`.
-
-**Constraints from prior phases:**
-- Phase 158: copied Git indexes need `git update-index --refresh`. Local CPU showed 38% less where aws showed 12%.
-- Phase 153: a class seed at the same absolute paths keeps worktree links valid.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.production.test_waiting` passes with 34 tests, three runs.
-- basedpyright on the file reports 0 errors and 0 warnings.
-- The module leaves no process and no folder behind.
-- aws pairs show a CPU gain; with no gain, the phase lands nothing.
+**Gotchas:** a class seed must copy every environment isolation that the old per-test setup made. Review found the seed builder kept the user's `XDG_CONFIG_HOME`; the seed now sets it to `root/config`, the folder `isolated_staff_file` uses.
 
 ### Phase 161 — Three style test modules build their sample repository once for each class  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_coverage_report.py`, `style/test_mechanical_classes.py` and `style/test_order_waste.py` each build their sample Git repository once for each class. Each test copies it. Every test and assertion stays.
-
-**Decision:** Architect review after Phase 159, finding 3. builds go (current), 2026-11-11. style-unit go, 2026-11-11: the seed stays in a `tempfile.TemporaryDirectory`; any measured saving ships.
-
-**Spec:**
-1. Profile each module first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 <folder>/<file>`. Report the CPU of the Git setup in `setUp`.
-2. `test_coverage_report.py` (line 78 on): build the configured repository, workspace files and initial commit once in `setUpClass`. Keep report baselines, staff, ledgers, the patched environment and `style_rules.NATE_STYLE_DIR` private to each test.
-3. `test_mechanical_classes.py` (`MechanicalProofTests`, line 121 on): build the configured project and its initial commit once in `setUpClass`. Keep `maintenance.auto false` and `gc.auto 0` in the seed. Keep the private home and `private_class_catalog` per test.
-4. `test_order_waste.py` (line 52 on): build the configured empty repository once in `setUpClass`. Keep its unborn HEAD. Open a new SQLite connection for each test.
-5. Each test copies the seed into its own temporary folder (`copytree(..., symlinks=True)`). Where a test reads Git status after the copy, run `git update-index --refresh` first.
-6. Keep every test and assertion. Change no production script.
-7. Measure local CPU before and after with the step 1 command. The director runs three aws pairs per module; only aws pairs decide, per module.
-
-**Files:**
-- `scripts/style/test_coverage_report.py` — item 2.
-- `scripts/style/test_mechanical_classes.py` — item 3.
-- `scripts/style/test_order_waste.py` — item 4.
-
-**Workers:** 2 writers; the modules share no fixture.
-- impl: `scripts/style/test_coverage_report.py`.
-- impl3: `scripts/style/test_mechanical_classes.py`, `scripts/style/test_order_waste.py`.
-
-**Constraints from prior phases:**
-- Phase 158: copied Git indexes need `git update-index --refresh`. Local CPU overstated the aws saving.
-- Phase 153: aws gains were 4.7% and 1.7% on two modules and none on a third. A module with no aws gain lands nothing.
-- style-unit's manifest batching (`ca17f3dca`) is in this branch.
-
-**State:** none.
-
-**Acceptance gate:**
-- Each module passes with its current test count (20, 22 and 14), three runs.
-- basedpyright on the three files reports 0 errors and 0 warnings.
-- No module leaves a folder behind.
-- aws pairs show a CPU gain per module; a module with no gain keeps its old file.
+- Checkpoint `36044a56d`. `style/test_coverage_report.py`, `style/test_mechanical_classes.py` and `style/test_order_waste.py` each build one sample Git repository in a class `tempfile.TemporaryDirectory`. Each test copies it. aws pairs: 13.76 to 13.58, 3.11 to 2.97 and 2.16 to 2.08 CPU s; 20, 22 and 14 tests pass. Every saving ships (style-unit: any measured saving ships).
+- Git setup is no longer the main cost in these modules. Next item 6b names the costs in the test bodies.
 
 ### Phase 162 — The last three merge checkpoint test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `test_merge_checkpoint.py`, `test_merge_checkpoint_batch.py` and `test_merge_checkpoint_history.py` lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
-
-**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way"; no CPU or money bar. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. sdlc freed these three modules on 2026-11-11 at `7f70931cb` (batch-held-items), merged here from builds. builds asked for this phase, 2026-11-11.
-
-**Spec:**
-1. For each test, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
-2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
-3. Merge checkpoints move branches, write receipts and promote main. Keep the coverage of recovery, interruption, publication, saved history and the new batch-held-items behavior.
-4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in `merge_checkpoint_test_support.py` may go only when `grep -rn <name> scripts` finds no other user. Do not change production code.
-5. Do not merge tests into table rows in this phase.
-6. Write `phases/162/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case, the fixture outputs it used and the reason no user harm follows. Give the counts before and after for each module.
-7. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Check that no other module (for example `test_merge_checkpoint_promotion.py`) is the only remaining cover before you cite it.
-8. Run the required checks on the final merged tree, and name the tested revision in the report.
-
-**Files:**
-- `scripts/production/test_merge_checkpoint.py` — 38 tests.
-- `scripts/production/test_merge_checkpoint_history.py` — 12 tests.
-- `scripts/production/test_merge_checkpoint_batch.py` — 3 tests.
-- `scripts/production/merge_checkpoint_test_support.py` — shared support; cleanup only.
-
-**Workers:** 1 writer; 53 tests in one fixture family, and the support file is the hub.
-- test: all three modules; hub: `merge_checkpoint_test_support.py`.
-
-**Constraints from prior phases:**
-- Phase 159: a notice runs before the completion writers in `merge_checkpoint.py` `run`, so a test of notice error handling guards saved records. Check where a tested step sits before state writes.
-- Phases 145–156: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom. Spec item 7 carries this.
-- Phase 145: search code, docs and inventories before a path is deleted.
-- Phase 156: run the checks on the final merged tree. Spec item 8 carries this.
-
-**State:** none.
-
-**Acceptance gate:**
-- Each listed test module passes; basedpyright reports 0 errors and 0 warnings on each edited file.
-- Every other module that imports `merge_checkpoint_test_support` passes when the support file changes.
-- `phases/162/removed_tests.md` lists every removed test with its reason, and the counts.
-- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+- Checkpoint `f8b27fda5`. Rule 2 removes `test_example_without_a_manifest_has_no_step` from `test_merge_checkpoint.py`: a missing crate manifest gives a visible failure before publication. The three modules go from 53 to 52 tests. The history and batch modules keep all their tests; each guards saved completion records or the checkpoints that lifecycle and CI decisions use.
+- The merge checkpoint family review is complete (Phases 159 and 162).
