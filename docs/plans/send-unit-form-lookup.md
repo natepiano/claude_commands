@@ -69,46 +69,23 @@
 
 ### Phase 2 — A failed lookup tells the owner  · status: done
 
-**Depends on:** Phase 1 (same file, `scripts/message/send.py`).
+#### As-built
 
-#### Work Order
-
-**Goal:** when `send.py` cannot find a recipient, the sender's owner gets one notice at once. It names the sender, the failed name, the count and the caller. The same sender and name gets at most one notice per day.
-
-**Spec:** change no file outside Files without a line in the summary.
-1. New `scripts/message/failed_lookup.py`:
-   - `report(sender: str, failed_name: str) -> None`: record the failure; when a notice is due, send it.
-   - Record: one JSON file under `repeat_guard.message_state()`, `failed_lookups.json`, keyed by sender and failed name, with the count since the last notice and the last notice time. Write it atomically under a file lock, as `repeat_guard` does.
-   - Owner: per the Decisions above (worker → unit director; unit → showrunner; other staff → parent showrunner; no row → `failed_lookup_owners`, else `UNIT_ANOMALIES_TO`).
-   - Notice text, in STE: sender, failed name, count, caller command line, config file when known, and the reason line the send printed.
-   - Send the notice through `send.py`'s normal path with sender `send.py`. A failed lookup whose sender is `send.py` records nothing and sends nothing.
-   - A failure inside the detector prints one line on stderr and never changes the failed send's exit or output.
-2. `send.py`: call `failed_lookup.report` once where a `RecipientLookupFailed` route ends the send. Keep the exit code and the printed reason as today.
-3. `config/send.conf`: add `failed_lookup_owners=aws-spending-guard=builds` with a comment line in the file's style.
-4. Tests in a new `scripts/message/test_failed_lookup.py`, with a temporary staff file (`STAFF_FILE`) and a temporary `XDG_STATE_HOME`. They never send a real message:
-   - A worker sender's notice goes to its unit director; a unit sender's goes to its showrunner.
-   - A sender with no row goes to its `failed_lookup_owners` owner, else to `UNIT_ANOMALIES_TO`.
-   - A second failure of the same pair inside 24 h sends no notice and raises the count; after 24 h the notice names the count.
-   - A sender `send.py` sends nothing.
-   - Add one row to the existing `send.py` lookup-failure test that shows the exit and reason stay the same and `report` was called once.
-5. Docs: one paragraph in `docs/as-built/session-roster.md` beside the Phase 1 sentence.
-
-**Constraints from prior phases:**
-- `resolve_recipient.lookup` tries the unit form before its `LocalRosterIncomplete` and `RecipientSearchFailed` branches. A `RecipientLookupFailed` means the exact name, the live roster and the unit form all failed.
+- `failed_lookup.report(sender, failed_name, reason_line="")` records each failure in `failed_lookups.json` under `repeat_guard.message_state()`, under a file lock with an atomic write. Each sender and name keeps `count`, `last_notice` and an optional `notice_started`.
+- A notice goes on the first failure, then again only 24 h after the last confirmed notice. It names the failed name, the sender, the count since the last notice, the caller command line, each `.conf`, `--config` or `--config-file` path in that command line, and the printed reason.
+- The count stays until `send.py --from send.py` confirms the notice as sent, queued or kept. A `notice_started` mark blocks a second notice for one send budget. A failed send clears the mark and keeps the count.
+- Owner: a worker's parent row; any other staff sender's first showrunner ancestor; both as a staff id, so two units with one name stay distinct. A sender with no staff row uses `failed_lookup_owners` (`sender=owner` pairs) in `config/send.conf`, else `UNIT_ANOMALIES_TO`.
+- Sender `send.py` records nothing. A detector error prints one `failed lookup notice:` line on stderr and never changes the failed send's exit or output.
+- `send.py` reports both failure paths: a missing name with healthy rosters raises `RecipientNameMissing(SystemExit)` (exit 2), which `_send` reports and re-raises; a `RecipientLookupFailed` route reports and exits 3. The printed reasons stay as before.
 
 **Files:**
 - `scripts/message/failed_lookup.py` — the detector.
-- `scripts/message/send.py` — the one call.
-- `config/send.conf` — the new key.
-- `scripts/message/test_failed_lookup.py` — the detector tests.
-- `scripts/message/test_send.py` — the one row.
-- `docs/as-built/session-roster.md` — the paragraph.
+- `scripts/message/send.py` — `RecipientNameMissing` and the two `report` calls.
+- `config/send.conf` — `failed_lookup_owners=aws-spending-guard=builds`.
+- `scripts/message/test_failed_lookup.py` — owner, daily count, interrupted notice, failure during delivery, config paths, `send.py` sender.
+- `scripts/message/test_send.py` — `missing-name` and `missing-peer` rows with one `report` call each.
+- `docs/as-built/session-roster.md` — the failed-lookup paragraph.
 
-**Workers:** 1 writer + 1 tester.
-- `impl`: `scripts/message/failed_lookup.py`, `scripts/message/send.py`, `config/send.conf`, `docs/as-built/session-roster.md`.
-- `test`: `scripts/message/test_failed_lookup.py`, `scripts/message/test_send.py`.
+**Gotchas:** `test_send.py` `setUpModule` patches `failed_lookup.send_notice`, so no send test delivers a real notice.
 
-**Acceptance gate:**
-- The targeted test passes.
-- basedpyright on each slot's files reports 0 errors, 0 warnings, 0 notes.
-- A test run with a temporary state shows one notice for 3 failures of one pair in one day.
+**Ruled out:** a search of the disk for the sender's config file; only the caller's arguments and the owner entry name it.
