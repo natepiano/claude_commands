@@ -271,16 +271,52 @@ class AccountMoveTests(ShutdownTestCase):
         members = [replace(self.current_listing()[0], session_id="first", kind="showrunner"),
                    replace(self.current_listing()[0], session_id="second", kind="showrunner", login="default@example.invalid", config_dir=self.root / ".claude2"),
                    replace(self.current_listing()[0], session_id="already", kind="showrunner", login="target@example.invalid", config_dir=self.root / ".claude3")]
+        producer = accounts.LiveGroupMember("producer", "producer", "showrunners", self.root / ".claude2")
         with (patch.object(inventory, "listing", return_value=members),
-              patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": members}),
+              patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": [*members, producer]}),
               patch.object(inventory, "unregistered_showrunners", return_value=[])):
             result = accounts.move_group("showrunners", "claude3", why="manual group move")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
-        self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second")])
-        self.assertEqual(self.moves.batches, [["first", "second"]])
+        self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second", "producer")])
+        self.assertEqual(self.moves.batches, [["first", "second", "producer"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
-        self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)
+        self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 3)
+
+        from scripts.production import staff
+        from scripts.agents import remote
+        from scripts.lib.test_models_registry import write_registry
+
+        for state in ("interrupted", "unknown home", "control paused", "control remote", "control codex"):
+            with self.subTest(state=state):
+                self.moves.calls.clear()
+                identity = staff.StaffId("stopped-producer")
+                row = staff.StaffRow(staff.StaffId("producer-row"), "producer", "producer-retry", staff.STAFF_ROOT,
+                    current_session=identity, home=staff.HomeUnknown() if state == "unknown home" else staff.SessionHome(self.root / ".claude1"),
+                    doc=staff.LiveDoc("mac" if state == "control remote" else "natedev", self.root / "plan.md"),
+                    paused=staff.Paused("now", "user", "hold") if state == "control paused" else staff.Active())
+                family = "codex:gpt-test:high" if state == "control codex" else "claude:opus:max"
+                registry = write_registry(self.root / "producer-models.conf", {"producers": {row.name: family}})
+                live = [accounts.LiveGroupMember(identity, row.name, "showrunners", self.root / ".claude1")] if state == "interrupted" else []
+                with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
+                      patch.object(remote, "other_machine", return_value="mac"),
+                      patch.object(sessions, "running_sessions", return_value=[]),
+                      patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}),
+                      patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": live})):
+                    if state == "interrupted":
+                        self.moves.failures[identity] = "resume pending"
+                        first = accounts.move_group("showrunners", "claude3", why="retry")
+                        self.assertIsInstance(first, accounts.GroupMoveStartFailed)
+                        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
+                        self.moves.failures.clear()
+                        live.clear()
+                    retry = accounts.move_group("showrunners", "claude3", why="retry")
+                self.assertIsInstance(retry, accounts.GroupMoveStarted)
+                assert isinstance(retry, accounts.GroupMoveStarted)
+                expected = 2 if state == "interrupted" else 1 if state == "unknown home" else 0
+                self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "retry")] * expected)
+                if state == "unknown home":
+                    self.assertIn("saved account is unknown", retry.stdout)
 
     def test_move_sessions_continues_after_one_member_fails(self) -> None:
         base = self.current_listing()[0]
