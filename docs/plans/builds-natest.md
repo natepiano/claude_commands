@@ -2670,40 +2670,10 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 133 — Find where the two slowest source scans spend their CPU  · status: done
 **Depends on:** Phase 132
 
-#### Work Order
+#### As-built
 
-**Goal:** For the copy guard and process group source scans, paired local runs give the CPU of each stage: start, list and read, parse, one walk, and check. The director brings the numbers and a chosen design to builds before any code.
-
-**Decision:** Builds showrunner, 2026-11-11: revert the first Phase 133 (one shared parse helper with a full node index). It cost CPU and memory and saved none. Profile by stage with paired runs first. The bar stays at least 30 CPU s saved per full gate. If the profile shows no path to that bar, say so and the work is dropped. Run no measure while an fps hold is in force. Director call: profile the two largest scans, which hold about half of the scan CPU; a one-line revert to one module if builds disagrees.
-
-**Measured before (research, natedev, HEAD 205e08142; `phases/133/research_report.md` in the unit session):**
-- The twelve scan modules cost 93.3 CPU s. Python parse is 28.5 s. Listing and reading cost 0.6 s together.
-- Each module runs in its own gate process. A parse shared across modules saves at most 15.7 s, and only in one process.
-- A one-process trial that kept every tree in memory was 31 to 36 s slower, with a 3.5 GB peak.
-
-**Reverted attempt (patch `phases/133/phase133_reverted.patch` in the unit session):** one helper listed, read and parsed each file and built a parent and scope index of every node. Paired runs against a8cc82d0b (1 to 3 rounds; fps holds stopped the rest): copy guard sources 18.5 -> 18.7 s, process group sources 10.6 -> 14.4 s, process failure 2.8 -> 4.6 s, one hang guard 3.6 -> 5.3 s, six other scans 26.4 -> 28.9 s. Peak memory rose about 20 MiB in each scan module. Do not build a full node index for each file again.
-
-**Spec:**
-1. Measure `scripts/copies/test_copy_guard_sources.py` and `scripts/lib/test_process_group_sources.py` on the phase base. Change no repository file.
-2. For each module, measure these stages as separate processes, each one adding one stage to the last:
-   1. start: the interpreter plus the module's imports, with no test run;
-   2. list and read: the same files the module's scan reads, in the same way;
-   3. parse: the same, plus `ast.parse` of each Python file the scan parses;
-   4. one walk: the same, plus one `ast.walk` over each tree;
-   5. full: the module through `scripts/test_times/module_run.py`.
-   The check cost is full minus one walk. Name each other walk or hot function inside the check only from a measured difference, never from cProfile totals.
-3. Run 3 alternating paired rounds on the same host. Report the median CPU s and peak MiB of each stage.
-4. From the numbers, list each design that could save at least 30 CPU s per full gate across the scan modules, with the saving each stage numbers support. Say plainly when none can.
-
-**Files:** none in the repository. The harness and its output stay in a `scratch.py new --worker` folder.
-
-**Workers:** 1 writer. The work is one measure harness and does not split.
-- impl: the stage harness, the paired runs and the report.
-- impl2: opens as impl; not used.
-
-**State:** none.
-
-**Stage profile (natedev, 2026-11-11, 3 paired rounds, median CPU s of each added stage; repository unchanged):**
+- No code changed. The phase is a stage profile of the two largest source scan modules, `scripts/copies/test_copy_guard_sources.py` and `scripts/lib/test_process_group_sources.py`. Each stage ran as a separate process over 3 alternating paired rounds on natedev, 2026-11-11.
+- Median CPU s of each added stage:
 
 | Added work | copy guard sources | process group sources |
 | --- | ---: | ---: |
@@ -2714,13 +2684,44 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 | check (full minus one walk) | 22.49 | 5.62 |
 | full module | 26.6 | 21.5 |
 
-- Removing all of the parse and one walk in both modules saves 18.3 s at most, so no shared-parse or shared-walk design reaches 30 s.
-- The copy guard check is 22.5 s. It parses each file twice (1,012 parse calls for 506 files). The rest of its check cost is not split yet.
+- Removing all of the parse and one walk in both modules saves 18.3 CPU s at most. No shared-parse or shared-walk design reaches the 30 CPU s bar, so builds dropped the source-scan speed work.
+- The copy guard check is 22.5 CPU s of non-parse work. It parses each file twice (1,012 parse calls for 506 files). This item is in the next-items file for verify-unit.
+
+**Files:**
+- `docs/plans/builds-natest-next.md` — the copy guard check item for verify-unit.
+
+**Gotchas:**
+- Each scan module runs in its own gate process. A parse that a shared helper caches does not cross modules.
+- Name a cost inside a check only from a measured stage difference, never from cProfile totals.
+
+**Ruled out:**
+- A shared helper that parses each file and builds a full parent and scope node index: paired runs showed no saving (process group sources 10.6 -> 14.4 CPU s) and about 20 MiB more peak memory in each scan module.
+- A one-process run that keeps every tree in memory: 31 to 36 CPU s slower, with a 3.5 GB peak.
+- Any shared-parse or shared-walk design across the scan modules: at most 18.3 CPU s.
+
+### Phase 134 — The next slowest test module uses at least 30 CPU s less  · status: todo
+**Depends on:** Phase 133
+
+#### Work Order
+
+**Goal:** One test module from the top of the CPU sort uses at least 30 CPU s less per gate in paired local runs, with the same tests and assertions.
+
+**Decision:** Builds showrunner, 2026-11-11: the next speed phase takes the next slowest module from the descending sort, with the same 30 CPU s bar in paired runs. Next-items item 6a: pick by the CPU a test change can remove, and profile before any code.
+
+**Spec:**
+1. Research (worker, read-only): profile the leading eligible modules from `show.py top` (2026-11-11 08:12 EST) with `module_cost.py --tests 10 --commands 10`: `style/test_style_sync.py` (66.0 CPU s), `style/test_bulk_run.py` (38.0), `style/test_standing_checkpoint.py` (36.4), `direct/test_progress_history.py` (35.1), `production/test_merge_checkpoint.py` (32.9). Floor and hold rows in the next-items file are not eligible.
+2. For each, name the removable CPU by test, fixture and command, with the measure it rests on, and the owner of the code.
+3. The director picks the module with the largest measured removable cost, gets the owner's go, and completes this Work Order before any code.
+
+**Files:** none until the pick.
+
+**Workers:** 1 writer for the research; the code split follows the pick.
+- impl: the research.
+- impl2: opens as impl.
+
+**State:** none.
 
 **Acceptance gate:**
-- A table of the five stages for each of the two modules: median CPU s and peak MiB over 3 paired rounds.
-- Each design claim names the stage numbers it rests on.
-- No repository file changes.
-- Builds' answer on the design, or its decision to drop the work, is recorded here before any code.
-
-**Result:** Builds showrunner, 2026-11-11: drop. No design reaches 30 CPU s, so the source-scan speed work closes with no code. The copy guard check note goes to the backlog for verify-unit. The next speed phase takes the next slowest module, with the same 30 CPU s bar in paired runs.
+- The chosen module passes through `python3 scripts/test_times/module_run.py` with the same test count as before.
+- Paired local runs (median of 3 rounds) show at least 30 CPU s less. Below that, the director brings the numbers to builds before the checkpoint.
+- basedpyright reports 0 errors, 0 warnings, 0 notes on every changed file.
