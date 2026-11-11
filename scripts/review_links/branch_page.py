@@ -14,10 +14,10 @@ import secrets
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.direct import plan_history
@@ -33,6 +33,17 @@ PAGE_NAME = "branches.html"
 
 
 @dataclass(frozen=True)
+class ActiveUnitBranch:
+    branch: str
+    state: Literal["active"] = field(default="active", init=False)
+
+
+@dataclass(frozen=True)
+class InactiveUnit:
+    state: Literal["not active"] = field(default="not active", init=False)
+
+
+@dataclass(frozen=True)
 class MergedUnitBranch:
     name: str
     unit: str
@@ -40,6 +51,7 @@ class MergedUnitBranch:
     commit_date: str
     merge: str
     merge_date: str
+    unit_status: ActiveUnitBranch | InactiveUnit
 
 
 @dataclass(frozen=True)
@@ -232,19 +244,22 @@ def list_branches(repository: Path, record: staff.StaffSnapshot,
     former = former_units(repository, scope)
     recorded = recorded_branches(record, roots, resolver, scope, former)
     protected = {"main"}
+    active_branches: dict[str, ActiveUnitBranch] = {}
     for row in record.rows:
         if isinstance(row.worktree, staff.PresentWorktree):
             tree = row.worktree
             if tree.machine == "natedev" and tree.path in scope.registered:
-                protected.add(scope.registered[tree.path])
+                active_branch = scope.registered[tree.path]
             else:
                 branch = resolver.unit_branch(row)
                 if not isinstance(branch, session_staff.Branch):
                     if row.id not in recorded.latest_by_owner:
                         raise ValueError(f"{row.name}: cannot read the active branch: {branch.reason}")
-                    protected.add(recorded.latest_by_owner[row.id].branch)
+                    active_branch = recorded.latest_by_owner[row.id].branch
                 else:
-                    protected.add(branch.name)
+                    active_branch = branch.name
+            protected.add(active_branch)
+            active_branches[row.name] = ActiveUnitBranch(active_branch)
         if row.kind == "showrunner" and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
             document = resolver.production_doc(row)
             if not isinstance(document, session_staff.ProductionDoc):
@@ -272,7 +287,8 @@ def list_branches(repository: Path, record: staff.StaffSnapshot,
         merge = mainline[low]
         rows.append(MergedUnitBranch(name, recorded.units[name], tip,
                                     git_text(repository, "show", "-s", "--format=%cI", tip),
-                                    merge, git_text(repository, "show", "-s", "--format=%cI", merge)))
+                                    merge, git_text(repository, "show", "-s", "--format=%cI", merge),
+                                    active_branches.get(recorded.units[name], InactiveUnit())))
     return tuple(rows)
 
 
@@ -298,9 +314,20 @@ def page_at(root: Path, request_path: str) -> BranchPage:
             raise ValueError("invalid branch row")
         row = cast(dict[str, object], raw)
         keys = ("name", "unit", "tip", "commit_date", "merge", "merge_date")
-        if set(row) != set(keys) or not all(isinstance(row[key], str) and row[key] for key in keys):
+        if set(row) != {*keys, "unit_status"} or not all(isinstance(row[key], str) and row[key] for key in keys):
             raise ValueError("invalid branch row")
-        rows.append(MergedUnitBranch(*(cast(str, row[key]) for key in keys)))
+        raw_status = row["unit_status"]
+        if not isinstance(raw_status, dict):
+            raise ValueError("invalid unit status")
+        status_fields = cast(dict[str, object], raw_status)
+        if status_fields == {"state": "not active"}:
+            unit_status = InactiveUnit()
+        elif (set(status_fields) == {"state", "branch"} and status_fields["state"] == "active"
+              and isinstance(status_fields["branch"], str) and status_fields["branch"]):
+            unit_status = ActiveUnitBranch(status_fields["branch"])
+        else:
+            raise ValueError("invalid unit status")
+        rows.append(MergedUnitBranch(*(cast(str, row[key]) for key in keys), unit_status=unit_status))
     return BranchPage(Path(repository), tuple(rows), token)
 
 
@@ -309,9 +336,11 @@ def render(page: BranchPage, results: tuple[DeleteResult, ...] = (), *,
     rows: list[str] = []
     for row in page.rows:
         name = html.escape(row.name, quote=True)
+        unit_status = (f"active, now on branch {html.escape(row.unit_status.branch)}"
+                       if isinstance(row.unit_status, ActiveUnitBranch) else "not active")
         checked = " checked" if isinstance(selected, InitialSelection) or row.name in selected else ""
         rows.append(f'''<section><label><input type="checkbox" name="branch" value="{name}"{checked}>
-<strong>{name}</strong></label><p>Unit: {html.escape(row.unit)}
+<strong>{name}</strong></label><p>Unit: {html.escape(row.unit)} — {unit_status}
 Last commit: {html.escape(row.commit_date)}
 Merged into main: {html.escape(row.merge[:12])} · {html.escape(row.merge_date)}</p></section>''')
     notices = "".join(f"<li>{html.escape(result.name)}: {html.escape(result.message)}</li>" for result in results)
