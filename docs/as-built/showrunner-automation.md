@@ -185,7 +185,7 @@ The queue survives a unit rename because its key is the fixed staff id.
 
 `merge_checkpoint.py --production <showrunner name> <unit> <phase> <hash> --started <ISO>` accepts these options:
 
-- `--review-trial "<line>"`, `--parallel "<line>"`, and `--delivers "<line>"`.
+- `--review-trial "<line>"` and `--delivers "<line>"`.
 - `--shrink` or `--as-built`.
 - `--trailer <line>` (repeatable), `--regime after|trial`, `--holds K`, and `--merge-defects D`.
 - `--excluded "<why>"`, `--cancel-prior`, `--bump`, and `--scratch <dir>`.
@@ -203,8 +203,6 @@ Each local Promote checkout must exist before the command pushes.
 
 - **Input rules.** A code checkpoint needs a `--review-trial` line and a one-line `--delivers`; a shrink refuses `--delivers`.
   [Review regime records](review-regime-trial.md) define the line.
-  The checkpoint also needs `--parallel` matching `Parallel: Phase <N>[, Phase <M>…] could start` or `Parallel: none — <reason>`.
-  `Parallel: unknown` is refused with instructions to add the plan's `**Depends on:**` lines and rerun `check_parallel`.
   `--cancel-prior` is refused with `Push: git`.
   `MergeRequest.delivers` and `excluded` use `str`, with `""` for an absent value.
 - **User bump.** `--bump` accepts only code checkpoints.

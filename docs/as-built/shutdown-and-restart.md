@@ -445,6 +445,17 @@ A failed row prints one anomaly line. Other rows continue.
 
 `agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
+A restarted unit director or showrunner gets one continuation message in its current conversation.
+The shared resume message builder supplies the text.
+The default cause is "agents restart ran".
+The restart option `--why TEXT` replaces that cause.
+The message asks the session to continue its work.
+If Codex message delivery fails after launch, restart reports one anomaly line with the director's name and the first error line.
+The director counts as started and leaves the restart record.
+A paused or exited director stays stopped and keeps its hold record and restart entry.
+A running row gets no continuation message.
+Producers keep their existing start behavior.
+Herdr server restore keeps its existing start behavior.
 A row leaves the saved list when it starts or already runs.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
@@ -486,3 +497,34 @@ Stop selects workers from their current staff parent.
 An unconfirmed worker stop needs targeted proof of process absence before restart can launch that worker.
 Live or unknown evidence leaves the worker pending.
 The worker check uses the same function as the Codex row check.
+
+### Gates during a session restart
+
+A session stop sends TERM, then KILL after the grace period, to the one proved agent PID (`stop_resume.py`).
+It sends no signal to the process group, the child processes, or the build cgroup.
+A normal stop keeps the pane and its shell.
+
+A detached run continues across a session stop or restart.
+`detached_runs.py start` starts its supervisor in a new process session.
+The command runs in a `builds-detached.slice` scope when systemd is available.
+The record, the log and the exit code stay in the run folder's `detached_runs` directory.
+The result goes to the worker's fixed staff row and its current conversation.
+A stopped worker's result goes to its parent. A stopped parent's result waits in its queue.
+
+`verify.sh final` detaches by itself only for a registered Codex worker.
+A bare call from a Claude director stays attached.
+`assign.sh` does not detach the commands that its worker starts later.
+
+A merge gate in a Claude background shell has no proved survival.
+`copies.py run` starts the gate attached, and `merge_gate.py` stops its module groups on TERM or HUP.
+Before another run, check for a complete saved gate result.
+Put a gate that must survive a restart in a detached run.
+
+The cloud gate runs as its own user service and on a remote guest.
+A local stop does not end it. Its outcome stays under the Git `cloud-gates` folder.
+The local import and type checks after the cloud result still need the local caller.
+
+A surviving run keeps its memory queue place and its age.
+A new process does not take over the place of a dead waiter.
+
+A session restart is not a machine restart. A reboot or power-off can end local supervisors and waiting processes.

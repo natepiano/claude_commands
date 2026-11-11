@@ -122,6 +122,7 @@ class StylePlanTests(StylePlanFixture):
         pending = style_ledger.publication_path(self.unit, "pending-sync")
         self.assertFalse(pending.exists())
         self.sync()
+        self.unit_takes_tip()
         ticket = ledger.ticket_get("1")
         head = self.git("rev-parse", "HEAD", cwd=self.unit)
         self.record(ticket["rules"][0], ticket["files"][0], head, "1")

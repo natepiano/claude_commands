@@ -287,6 +287,15 @@ class MergeStyleBranchFirst:
 
 
 @dataclass(frozen=True)
+class UnitNeedsSyncedTip:
+    """The unit tip lacks the synced tip, which the pushed style branch contains."""
+
+    unit_tip: str
+    synced_tip: str
+    families: tuple[FamilyIdleReason, ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True)
 class UnitBranchTip:
     """The commit where the unit's next ticket starts."""
 
@@ -366,7 +375,7 @@ class BusyFiles:
 
 
 NextPhase = (PhaseWritten | Resumed | PhasesReady | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure
-             | MergeStyleBranchFirst | berth_board.BoardUnavailable)
+             | MergeStyleBranchFirst | UnitNeedsSyncedTip | berth_board.BoardUnavailable)
 
 
 def style_document(repo: Path, unit: str = "") -> Path:
@@ -2691,7 +2700,7 @@ def _select_phase(
     predecessor: WaitingCheckpoint | NoCheckpointBlock = _NO_CHECKPOINT_BLOCK,
     *, family: rules.Family,
     selection: FamilySelection = FamilySelection.OWN, families: tuple[rules.Family, ...] = (),
-) -> BuildableFindings | PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge:
+) -> BuildableFindings | PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge:
     families = families or (family,)
     queued: list[style_ledger.TicketRecord] = []
     for ticket in ledger.queued_tickets(unit) if selection == FamilySelection.OWN else ():
@@ -2740,6 +2749,27 @@ def _select_phase(
     base = unit_base(repo, branch)
     edits = EditedFiles(repo, ledger, base)
     tip = synced_tip(ledger)
+    if isinstance(base, UnitBranchTip):
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", tip, base.commit],
+            capture_output=True, text=True, check=False,
+        )
+        if ancestry.returncode == 1:
+            branch = synced_style_branch(ledger)
+            if not branch:
+                return WaitingForSync(len(ledger.unclassified_rules()))
+            pushed = style_ledger.pushed_branch_point_tip(repo, branch)
+            available = subprocess.run(
+                ["git", "-C", str(repo), "merge-base", "--is-ancestor", tip, pushed],
+                capture_output=True, text=True, check=False,
+            )
+            if available.returncode == 0:
+                return UnitNeedsSyncedTip(base.commit, tip)
+            if available.returncode == 1:
+                return WaitingForSync(len(ledger.unclassified_rules()))
+            raise style_ledger.CheckCouldNotRun(available.stderr.strip() or "git merge-base --is-ancestor failed")
+        if ancestry.returncode:
+            raise style_ledger.CheckCouldNotRun(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
     cells = tuple(ledger.cells())
     scopes = family_pilot_scopes(doc, repo)
     ranked_work = style_proposals.ranked_work(ledger, cells, scopes)
@@ -3133,14 +3163,14 @@ def _select_phase(
 
 
 def family_idle_reason(family: rules.Family, result: PhaseWritten | NoAvailableWork | WaitingForStructure |
-                       MergeStyleBranchFirst | WaitingForSync | WaitingForMerge) -> FamilyIdleReason:
+                       MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge) -> FamilyIdleReason:
     if isinstance(result, WaitingForSync):
         reason = "waiting for sync" + (f" ({result.reason})" if result.reason else "")
     elif isinstance(result, WaitingForMerge):
         reason = "waiting for merge" + (f" ({result.reason})" if result.reason else "")
     elif isinstance(result, WaitingForStructure):
         reason = "waiting for structure: " + ", ".join(result.crates)
-    elif isinstance(result, MergeStyleBranchFirst):
+    elif isinstance(result, MergeStyleBranchFirst | UnitNeedsSyncedTip):
         reason = "merge the style branch first"
     else:
         reason = "no available work"
@@ -3151,7 +3181,7 @@ def select_family_work(ledger: style_ledger.Ledger, unit: str, branch: str, plan
                        doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
                        definitions: Mapping[str, rules.Rule], changes: MainChanges | UnknownMainChanges,
                        predecessor: WaitingCheckpoint | NoCheckpointBlock) -> (PhaseWritten | NoAvailableWork |
-                       WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge):
+                       WaitingForStructure | MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge):
     config = style_config.config_for_unit(unit, ledger.staff_resolver().record)
     families = config.assignment(ledger.unit_name(unit)).families
     family = min(families, key=family_rank)
@@ -3310,7 +3340,7 @@ def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch)
             ledger.clear_sync_wait(unit)
             return Resumed(assigned[0]["id"])
         # The catalog read above serves reconciliation and both refill passes.
-        def select(busy: BusyFiles) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge:
+        def select(busy: BusyFiles) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge:
             try:
                 result = select_family_work(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
                                             definitions, changes_on_main, predecessor)
@@ -3333,7 +3363,7 @@ def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch)
                 return WaitingForMerge(predecessor.ticket_id, predecessor.commit, "no disjoint ticket available",
                                        selected.families)
             # A unit told to merge the style branch acts at once, so it records no sync wait.
-            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
+            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst | UnitNeedsSyncedTip):
                 ledger.clear_sync_wait(unit)
                 return selected
             if isinstance(selected, WaitingForSync):
@@ -3351,7 +3381,7 @@ def _next_phase(unit: str, plan: Path, repo: Path, run: Path | NoWorkerDispatch)
             if isinstance(predecessor, WaitingCheckpoint) and not isinstance(selected, PhaseWritten):
                 return WaitingForMerge(predecessor.ticket_id, predecessor.commit, "no disjoint ticket available",
                                        selected.families)
-            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
+            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst | UnitNeedsSyncedTip):
                 ledger.clear_sync_wait(unit)
                 return selected
             if isinstance(selected, WaitingForStructure | WaitingForSync):
@@ -3627,7 +3657,7 @@ def refill_outcome(result: NextPhase) -> str:
             return "waiting for sync" + (f": {reason}" if reason else "")
         case WaitingForStructure(crates):
             return f"waiting for structure: {', '.join(crates)}"
-        case MergeStyleBranchFirst():
+        case MergeStyleBranchFirst() | UnitNeedsSyncedTip():
             return "merge the style branch first"
         case berth_board.BoardUnavailable():
             return "board unavailable"
@@ -3750,6 +3780,9 @@ def main(argv: list[str]) -> int:
             case WaitingForStructure(crates, _):
                 print(f"waiting for structure: {', '.join(crates)}")
                 return 3
+            case UnitNeedsSyncedTip(unit_tip, synced_tip):
+                print(f"merge the style branch first: unit tip {unit_tip[:7]} is behind the synced tip {synced_tip[:7]}")
+                return 6
             case MergeStyleBranchFirst(cell_count, unit_tip, style_branch):
                 print(f"merge the style branch first: {cell_count} cell{'' if cell_count == 1 else 's'} judged at {unit_tip[:7]} "
                       + f"wait for {style_branch.removeprefix('refs/heads/')}")

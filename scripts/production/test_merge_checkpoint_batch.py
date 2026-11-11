@@ -11,7 +11,7 @@ from typing import final
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import (
-    DELIVERS, MergeCheckpointFixture, PARALLEL, STARTED, STUB, TRIAL, configure_test_environment,
+    DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment,
 )
 
 
@@ -22,7 +22,7 @@ def setUpModule() -> None:
 @final
 class MergeCheckpointBatchTests(MergeCheckpointFixture):
     def batch_line(self, unit: str, phase: str, checkpoint: str, *flags: str) -> str:
-        code_flags = [] if "--shrink" in flags or "--as-built" in flags else ["--parallel", PARALLEL, "--delivers", DELIVERS]
+        code_flags = [] if "--shrink" in flags or "--as-built" in flags else ["--delivers", DELIVERS]
         return shlex.join([unit, phase, checkpoint, "--started", STARTED,
                            "--review-trial", TRIAL, *code_flags, "--scratch", str(self.state), *flags])
 

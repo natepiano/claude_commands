@@ -37,7 +37,7 @@ from scripts.production.production_doc import Production
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment
 
 
 MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -734,7 +734,7 @@ with lock.open("a") as held:
               mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
                 production="example", unit="alpha", phase="2", hash=sha,
-                also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
+                also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
             ))
