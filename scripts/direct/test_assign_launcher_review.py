@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import cast, final, override
 from unittest.mock import patch
 from scripts.agents import codex_test_support as codex_fixture
+from scripts.astra import astra_roles
 from scripts.astra.design_role_test_support import HeldRolePaneCase
 from scripts.direct import assign, progress_history, recorder_state
 from scripts.production import staff, worker
@@ -187,6 +188,71 @@ class PaneAstraReviewTests(HeldRolePaneCase):
 
     def test_failed_pane_review_ends_its_row_and_hold(self) -> None:
         self.assert_review_lifetime(True)
+
+    def test_failed_reviewer_setup_closes_only_its_new_pane(self) -> None:
+        for failure, existing in (("hold error", False), ("hold unavailable", False),
+                                  ("hold error", True), ("hold unavailable", True),
+                                  ("close", False), ("dispatch", False), ("dispatch", True), ("incomplete", False)):
+            with self.subTest(failure=failure, existing=existing):
+                case = PaneAstraReviewTests("runTest")
+                case.setUp()
+                try:
+                    commands = case.panes.command_case
+                    world = case.panes.world
+                    if existing:
+                        opened = commands.opened("astra-reviewer", "astra-reviewer")
+                        case.assertIsNotNone(staff.by_id(opened.row.id))
+                    before = staff.snapshot()
+                    rows: list[staff.StaffRow] = []
+                    def hold(role: astra_roles.AstraRole, lifetime: astra_roles.ExecProcess,
+                             staff_id: str = "") -> astra_roles.HeldRole | astra_roles.HoldWorkerUnavailable:
+                        rows.extend(staff.find(kind="worker"))
+                        if failure == "dispatch":
+                            return real_hold(role, lifetime, staff_id)
+                        if failure == "hold unavailable":
+                            print("TEST hold unavailable", file=sys.stderr)
+                            return astra_roles.HoldWorkerUnavailable("TEST hold unavailable")
+                        raise ValueError("TEST hold unavailable")
+                    real_hold = astra_roles.hold
+                    real_launch = assign.launch
+                    def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
+                               policy: worker_panes.LaunchPolicy) -> worker_panes.WorkerStart:
+                        result = real_launch(target, policy)
+                        if failure == "incomplete":
+                            assert isinstance(result, worker_panes.OpenWorker)
+                            rows.append(result.row)
+                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST hold unavailable")
+                        return result
+                    with (patch.object(astra_roles, "hold", side_effect=hold),
+                          patch.object(assign, "launch", side_effect=launch)):
+                        if failure == "close":
+                            with (patch.object(world, "close_tab_confirmed", return_value=False),
+                                  patch.object(world, "close_terminal_pane", return_value=False)):
+                                result = case.run_review()
+                        elif failure == "dispatch":
+                            with patch.object(worker, "dispatch", return_value=worker.ExitCode.REFUSED):
+                                result = case.run_review()
+                        else:
+                            result = case.run_review()
+                    case.assertEqual(result.returncode, 2 if failure == "dispatch" else 8 if failure == "incomplete" else 1, result.stdout + result.stderr)
+                    row, = rows
+                    case.assertEqual(commands.agent.submitted, [])
+                    if existing or failure == "close":
+                        case.assertEqual(staff.by_id(row.id), before.by_id(row.id) if existing else row)
+                        case.assertEqual(world.closed, [])
+                    else:
+                        case.assertIsNone(staff.by_id(row.id))
+                        case.assertEqual(len(world.closed), 1)
+                    if failure != "dispatch":
+                        case.assertIn("TEST hold unavailable", result.stderr)
+                    if failure == "close":
+                        state = worker_panes.observe_worker(commands.fixture.parent.id, row, staff.snapshot())
+                        assert isinstance(state, worker_panes.OpenWorker)
+                        case.assertIn(f"anomaly: {state.pane}: cleanup failed:", result.stderr)
+                        case.assertEqual(result.stderr.count("anomaly:"), 1)
+                        case.assertIn("pane close is incomplete", result.stderr)
+                finally:
+                    case.doCleanups()
 
     def test_recording_failure_returns_an_error_and_attempts_remaining_finishes(self) -> None:
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
