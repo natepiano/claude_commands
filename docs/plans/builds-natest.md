@@ -2704,24 +2704,76 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 #### Work Order
 
-**Goal:** One test module from the top of the CPU sort uses at least 30 CPU s less per gate in paired local runs, with the same tests and assertions.
+**Goal:** `style/test_standing_checkpoint.py` and `production/test_merge_checkpoint.py` together use at least 30 CPU s less per gate in paired runs, with the same tests and assertions.
 
-**Decision:** Builds showrunner, 2026-11-11: the next speed phase takes the next slowest module from the descending sort, with the same 30 CPU s bar in paired runs. Next-items item 6a: pick by the CPU a test change can remove, and profile before any code.
+**Decision:** Builds showrunner, 2026-11-11: go with both changes under a joined 30 CPU s bar (the bar is per full gate; savings may join). The owner goes come from sdlc through builds; the writers start only after builds relays them. Paired trials run on isolated AWS gate boxes in parallel, one box for each module, never on natedev (user point, 2026-11-11). The aws unit builds the paired trial command; natest accepts it.
+
+**Measured before (research, natedev, scripts at `4c18561ef`; `phases/134/research_report.md` in the unit session):**
+- Standing checkpoint: 67 `python -c` starts cost 29.4 CPU s. A trial through the existing direct adapter saved 29.1 CPU s, median of 3 pairs (37.5 -> 9.0). All 15 tests passed.
+- Merge checkpoint: 88 `progress_history.py` starts cost 14.4 CPU s. A trial that sent them to `invoke_recorder` saved 12.3 CPU s in 1 pair (24.6 -> 12.3). All 39 tests passed.
+- Not taken: progress history parser reuse (6.9 s, 1 pair), style sync Git seed (2.6 s), bulk run Git seed (-1.5 s).
 
 **Spec:**
-1. Research (worker, read-only): profile the leading eligible modules from `show.py top` (2026-11-11 08:12 EST) with `module_cost.py --tests 10 --commands 10`: `style/test_style_sync.py` (66.0 CPU s), `style/test_bulk_run.py` (38.0), `style/test_standing_checkpoint.py` (36.4), `direct/test_progress_history.py` (35.1), `production/test_merge_checkpoint.py` (32.9). Floor and hold rows in the next-items file are not eligible.
-2. For each, name the removable CPU by test, fixture and command, with the measure it rests on, and the owner of the code.
-3. The director picks the module with the largest measured removable cost, gets the owner's go, and completes this Work Order before any code.
+1. Standing checkpoint. `StandingCheckpointTests.cli` (`scripts/style/test_standing_checkpoint.py`) starts a fresh interpreter through `style_cli_command` for each ledger and planner call. Route these calls through the existing in-process adapter: `StylePlanFixture.run_command` and `invoke_cli` in `scripts/style/style_plan_test_support.py`. Nested `style_footprint.py` calls run in process the same way. Real parsers, handlers, Git processes, ledger files, stdout, stderr and exit codes stay. A case that `process_boundary_for_case` marks keeps its real child process. The notification CLI test keeps its child processes.
+2. Merge checkpoint. `invoke_checkpoint` (`scripts/production/merge_checkpoint_test_support.py`) takes a command as a Python call only when the executable name starts with `python`. The production command starts the recorder with `scripts/lib/py`, so these calls start a new interpreter. Make the adapter also take the repository launcher `scripts/lib/py` as the interpreter, so `progress_history.py` calls reach `invoke_recorder`. Git fetches, pushes, hooks, branch moves and durable history stay real. Tests of locks, signals or competing processes keep real child processes.
+3. Change no production script. Remove no test, matrix row or assertion. Each module keeps its test count (15 and 39).
 
-**Files:** none until the pick.
+**Files:**
+- `scripts/style/test_standing_checkpoint.py` — `cli` routes through the in-process adapter.
+- `scripts/style/style_plan_test_support.py` — only if the adapter needs a hook for this module.
+- `scripts/production/merge_checkpoint_test_support.py` — `invoke_checkpoint` takes `scripts/lib/py` as the interpreter.
 
-**Workers:** 1 writer for the research; the code split follows the pick.
-- impl: the research.
-- impl2: opens as impl.
+**Workers:** 2 writers, split by module; no shared file.
+- impl: standing checkpoint; hub: `scripts/style/style_plan_test_support.py`.
+- impl2: merge checkpoint.
 
 **State:** none.
 
 **Acceptance gate:**
-- The chosen module passes through `python3 scripts/test_times/module_run.py` with the same test count as before.
-- Paired local runs (median of 3 rounds) show at least 30 CPU s less. Below that, the director brings the numbers to builds before the checkpoint.
+- Both modules pass through `python3 scripts/test_times/module_run.py` with 15 and 39 tests.
+- The aws paired trial command, 3 rounds, both modules: the summed paired median saving is at least 30 CPU s, with the same test counts. Below that, the director brings the numbers to builds before the checkpoint.
+- No local paired trial runs on natedev.
+- basedpyright reports 0 errors, 0 warnings, 0 notes on every changed file.
+
+### Phase 135 — One cached command shows the daily trend of gate CPU, wall time and cost  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `/test_times trend` prints, for each day, the mean and p95 of total CPU, wall time and cost for full and targeted gates, on AWS and on natedev. It computes only days that are not done.
+
+**Decision:** User, 2026-11-11:
+1. Show the daily trend of merge gate and targeted test time (mean, p95), to check that the speed work reduces real time.
+2. Cache each done day; compute only days that are not done.
+3. Attach it to a skill, so the user can read it at any time.
+4. Every table has the same columns. Only targeted tables add extra information, such as median modules.
+5. Add cost as soon as possible.
+This phase runs beside Phase 134, which waits on the aws unit's trial command. A one-off query in the director's scratch proved the CPU and wall data is in the gate index (`gate_runs`, `gate_modules`).
+
+**Spec:**
+1. Add the `trend` subcommand to `scripts/test_times/show.py`: `trend [--days N]`. A new key `TREND_DAYS` in `config/test_times.conf` sets the default.
+2. Use passing runs that are not aborted and that ran at least one module. Group by place, selection and day in the user's zone. Place is `aws` for an EC2 host and the host name for any other host. Selection is `full` or `affected`.
+3. Run CPU is the sum of `gate_modules.cpu_s` over all attempts of that run. Run wall is `gate_runs.wall_s`.
+4. Run cost is for AWS runs only. Read it from the aws_target cost ledger (`scripts/aws_target/ledger.py`, `GateReservation`): the charged lifetime (reservation start to termination) times the applied hourly rate, plus the attempt allowance. Find the key that joins a gate run to its reservation. If no key exists, stop and report to the director; the director asks the aws unit to record one. Change no aws_target code. A natedev run has no cost per run and shows `—`.
+5. Print one table for each place and selection. Every table has these columns in this order: day, runs, CPU mean, CPU p95, wall mean, wall p95, cost mean, cost p95, cost total. A targeted (`affected`) table adds one last column: median modules run. Use the existing `print_table`. A day with no runs prints no row.
+6. p95 is the nearest-rank p95 of the day's runs. Seconds print as whole numbers; cost prints in USD with 3 decimals.
+7. Cache. Keep one JSON file beside the gate index under `store.root()`. It holds the finished rows of each done day, with a format version. A day is done when the gate index's newest complete update started at least `TREND_SETTLE_MINUTES` (new key in `config/test_times.conf`, default 60) after that day ended in the user's zone. The command reads done days from the cache and computes only the other days, then adds newly done days to the cache. Write the cache atomically. A cache with another format version is rebuilt. A missing or unreadable cache is rebuilt and prints no error.
+8. Add `trend` to `commands/test_times.md`: the usage line, the columns, the cost source and the cache rule. Read `/succinct_style` rules before you edit the command file.
+
+**Files:**
+- `scripts/test_times/show.py` — the `trend` command and its cache.
+- `scripts/test_times/test_show.py` — rows for grouping, p95, aborted and red runs, place, cost join, `—` cost, the targeted extra column, cache hit, cache miss, the settle rule and a version change.
+- `config/test_times.conf` — `TREND_DAYS` and `TREND_SETTLE_MINUTES`.
+- `commands/test_times.md` — the `trend` command.
+
+**Workers:** 1 writer; the second writer holds the Phase 134 repair.
+- impl2: all files.
+
+**State:** the trend cache file beside the gate index. It holds only derived rows and is rebuilt when it is absent.
+
+**Acceptance gate:**
+- `test_show.py` passes through `python3 scripts/test_times/module_run.py`.
+- `show.py trend --days 8` prints the same CPU and wall numbers as the director's scratch query for the same days.
+- A second `show.py trend` run reads the done days from the cache and computes only the open days.
+- AWS rows show a cost; natedev rows show `—`.
 - basedpyright reports 0 errors, 0 warnings, 0 notes on every changed file.
