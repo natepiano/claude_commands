@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import BinaryIO, Literal, cast, override
+from typing import Literal, cast, override
 
 from scripts.lib import unit_runs
 from scripts.usage.activity import (
@@ -34,7 +34,7 @@ from scripts.usage.activity import (
 )
 from scripts.usage.agents_log import Assignment, Lens, Role, RoleLog, assignments, state_dir
 from scripts.usage.rollouts import (
-    KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
+    KnownThreadOpening, ThreadRolloutBuilder, complete_lines as complete_lines, decode_rollout, is_compaction,
     is_edit, parse_timestamp, token_usage,
 )
 
@@ -719,15 +719,6 @@ def cursor_at(db: sqlite3.Connection, machine: str, path: str) -> int:
     value = cast(object, db.execute("SELECT offset FROM cursors WHERE machine = ? AND path = ?",
                                     (machine, path)).fetchone())
     return cast(int, cast(sqlite3.Row, value)[0]) if value is not None else 0
-
-
-def complete_lines(source: BinaryIO) -> Iterator[tuple[int, bytes]]:
-    while True:
-        offset = source.tell()
-        line = source.readline()
-        if not line or not line.endswith(b"\n"):
-            return
-        yield offset, line
 
 
 def claude_identity(machine: str, path: Path) -> ClaudeSession | ClaudeSubagent:
