@@ -445,6 +445,17 @@ A failed row prints one anomaly line. Other rows continue.
 
 `agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
+A restarted unit director or showrunner gets one continuation message in its current conversation.
+The shared resume message builder supplies the text.
+The default cause is "agents restart ran".
+The restart option `--why TEXT` replaces that cause.
+The message asks the session to continue its work.
+If Codex message delivery fails after launch, restart reports one anomaly line with the director's name and the first error line.
+The director counts as started and leaves the restart record.
+A paused or exited director stays stopped and keeps its hold record and restart entry.
+A running row gets no continuation message.
+Producers keep their existing start behavior.
+Herdr server restore keeps its existing start behavior.
 A row leaves the saved list when it starts or already runs.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
