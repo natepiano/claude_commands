@@ -637,6 +637,11 @@ notice to the unit director before any merge command runs:
    --review-trial "<the complete review trial: line>"
    --parallel "<the notice's Parallel: line>"
    --delivers "<one line of what the phase delivers>"`.
+   When several checkpoint notices wait, land them in one batch, in arrival order.
+   Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
+   Run `merge_checkpoint.py --production <showrunner name> --batch <file>` through the same Python launcher.
+   Keep each item's flags on its line.
+   Use single commands for `--bump` and child handoffs.
    Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
    review used the craft lens, `--holds <K>` (this phase's held checkpoints)
    and `--merge-defects <D>` (the defect rows its merge design checks found in
@@ -657,8 +662,9 @@ notice to the unit director before any merge command runs:
    and `--from-child`. The script checks ancestry,
    origin, scope and conflicts, reports overlaps with other units, merges,
    tests, reruns red packages, pushes, promotes, and records the result. Its
-   first `held` or `failed` line stops the run. Send its final `send <unit>:`
-   message to the unit director.
+   first `held` or `failed` line stops a single-item run.
+   A batch drops stopped items and retries the remaining items once.
+   Send each final `send <unit>:` message to its unit director.
 
 <ChangeReviewFeatureLog>
 Run only for a project that closes out by change review, after
