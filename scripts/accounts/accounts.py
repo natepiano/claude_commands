@@ -3185,15 +3185,20 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
 
 
 def detached_move_context(identity: str) -> str:
-    """Find a worker's live runs through its stable or native identity."""
+    """Find a worker's live runs by staff id, session id, or name."""
     from scripts.production import staff
 
     try:
         record = staff.local_snapshot()
     except staff.StaffAbsent:
         return ""
-    row = record.by_id(staff.StaffId(identity)) or record.by_current_session(identity)
-    if row is None or row.kind != "worker":
+    row = record.by_member_reference(identity)
+    if row is None:
+        matches = [member for member in record.find() if member.name == identity]
+        if len(matches) != 1:
+            return ""
+        row = matches[0]
+    if row.kind != "worker":
         return ""
     pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
     context = cast(Callable[[Path, str], str], import_module("scripts.agents.detached_runs").resume_context)

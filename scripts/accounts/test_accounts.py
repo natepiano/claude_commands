@@ -7895,6 +7895,76 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(result, accounts.MoveDryRun(str(row.id), (
             f"{row.id}: would resume on claude2 if its saved tab is local; {context}",)))
 
+    def test_worker_name_preview_keeps_the_same_run_context_as_its_staff_id(self) -> None:
+        from scripts.agents import inventory
+        from scripts.herdr.test_worker_panes import live_detached_run
+
+        row = self.worker("w74", live=False)
+        with (live_detached_run(self.run_dir, row),
+              patch.object(inventory, "listing", return_value=[])):
+            context = accounts.detached_move_context(str(row.id))
+            self.assertIn(f"Detached run {row.name} remains live.", context)
+            for reference in (row.name, str(row.id), str(row.current_session)):
+                with self.subTest(reference=reference):
+                    self.assertEqual(accounts.detached_move_context(reference), context)
+                    result = accounts.move(reference, "claude2", dry_run=True)
+                    self.assertEqual(result, accounts.MoveDryRun(reference, (
+                        f"{reference}: would resume on claude2 if its saved tab is local; {context}",)))
+        self.assertEqual(self.world.commands, [])
+        self.assertEqual(self.world.launches, [])
+        self.stop.assert_not_called()
+
+    def test_worker_name_collision_between_units_has_no_detached_context(self) -> None:
+        from scripts.herdr.test_worker_panes import live_detached_run
+
+        row = self.worker("w74", live=False)
+        other_unit = fixture_member("unit", name="other-director", parent=self.owner.parent)
+        other_worker = fixture_worker(row.name, other_unit.id)
+        with live_detached_run(self.run_dir, row):
+            self.assertIn(f"Detached run {row.name} remains live.", accounts.detached_move_context(str(row.id)))
+            self.assertEqual(accounts.detached_move_context(row.name), "")
+        self.assertNotEqual(row.id, other_worker.id)
+
+    def test_worker_name_collision_with_a_non_worker_has_no_detached_context(self) -> None:
+        from scripts.herdr.test_worker_panes import live_detached_run
+
+        row = self.worker("w74", live=False)
+        other_member = fixture_member("unit", name=row.name, parent=self.owner.parent)
+        with live_detached_run(self.run_dir, row):
+            self.assertIn(f"Detached run {row.name} remains live.", accounts.detached_move_context(str(row.id)))
+            self.assertEqual(accounts.detached_move_context(row.name), "")
+            self.assertEqual(accounts.detached_move_context(str(other_member.id)), "")
+
+    def test_worker_name_move_puts_the_run_context_in_the_resume_text(self) -> None:
+        from scripts.agents import inventory, pane_record
+        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.lib.script_envelope import script_prompt
+
+        row = self.worker("w74", live=False)
+        self.dispatch(row)
+        atomic_file.write_text_atomic(self.root / "conf/shutdown.conf",
+            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        pane_record.write(self.world.session, pane_record.launch("w1:p1", str(row.current_session), str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, ["claude", "-n", row.name]))
+        result_path = self.run_dir / f"detached_runs/{row.name}.json"
+        log_path = result_path.with_suffix(".log")
+        context = (f"Detached run {row.name} remains live. Result: {result_path}; log: {log_path}. "
+                   + f"Read it with: `cat -- {result_path} {log_path}`. Its result follows this worker after the move.")
+        with (live_detached_run(self.run_dir, row),
+              patch.object(inventory, "listing", return_value=[]),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "_stop", return_value=stop_results.NotRunning(str(row.current_session))),
+              patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(123)) as launch,
+              patch.object(stop_resume, "_confirm_move_start", return_value=stop_results.ClaudeUp(
+                  str(row.current_session), "w1:p1", "claude2"))):
+            result = accounts.move(row.name, "claude2", why="quota")
+        self.assertIsInstance(result, accounts.MoveStarted, result)
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[3], script_prompt(
+            "You were stopped and resumed because quota. You were moved from claude1 to claude2.\n"
+            + f"Continue pass dispatch-{row.name} in this conversation. Keep the same pass id.\n{context}"))
+
     def test_move_workers_catches_the_worker_panes_herdr_failure(self) -> None:
         from scripts.herdr import worker_panes
 
