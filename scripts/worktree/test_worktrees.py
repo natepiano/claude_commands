@@ -523,6 +523,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertEqual(self.git(self.repository, "branch", "--list", branch), "")
                     self.assertEqual(self.git(self.repository, "config", "--local", "--get", f"branch.{branch}.merge"),
                                      f"refs/heads/{branch}")
+                    (self.root / "bin/git").unlink()
+
+                    results = self.finish_landed()
+
+                    self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
+                    self.assert_ended(tree, branch)
                     continue
                 if landing == "local-race":
                     self.assertFalse(tree.exists())

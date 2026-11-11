@@ -216,6 +216,16 @@ class DeletionRerunTests(unittest.TestCase):
                     self.assertFalse(worktree.exists())
                     self.assertEqual(git("branch", "--list", "topic"), "")
                     self.assertEqual(git("config", "--local", "--get", "branch.topic.merge"), "refs/heads/topic\n")
+                    (root / "bin/git").unlink()
+                    _ = subprocess.run(["bash", str(scripts / "record_confirmation.sh"), str(worktree), "topic"],
+                                       cwd=repo, capture_output=True, text=True, check=True)
+
+                    second = attempt()
+
+                    self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+                    self.assertFalse(worktree.exists())
+                    self.assertEqual(git("branch", "--list", "topic"), "")
+                    self.assertEqual(git("ls-remote", "--heads", "origin", "topic"), "")
                 elif state == "cleanup-changed":
                     self.assertNotEqual(first.returncode, 0)
                     self.assertIn("the tree changed after the cleanup check", first.stdout)
@@ -246,7 +256,7 @@ class DeletionRerunTests(unittest.TestCase):
                     self.assertEqual(git("for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"), before_branches)
                     self.assertEqual(git("ls-remote", "--heads", "origin"), before_origin)
                     self.assertEqual(git("worktree", "list", "--porcelain"), before_worktrees)
-                if state in ("confirmed-rerun", "cleanup", "confirmed-no-origin", "without-branch-config"):
+                if state in ("confirmed-rerun", "cleanup", "confirmed-no-origin", "without-branch-config", "config-error"):
                     config = subprocess.run(["git", "-C", str(repo), "config", "--local", "--get", "branch.topic.merge"],
                                             capture_output=True, text=True, check=False)
                     self.assertEqual(config.returncode, 1, config.stdout + config.stderr)

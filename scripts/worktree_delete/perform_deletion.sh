@@ -147,15 +147,14 @@ if [[ -n "$CHECKED_LOCAL_TIP" ]]; then
         echo "Error: the local branch changed after the cleanup check; the local branch stays."
         exit 1
     fi
-    git config --local --list >/dev/null
-    if CONFIG_ERROR=$(LC_ALL=C git config --local --remove-section "branch.$BRANCH_NAME" 2>&1); then
-        :
-    else
-        CONFIG_STATUS=$?
-        if [[ "$CONFIG_STATUS" -ne 128 || "$CONFIG_ERROR" != "fatal: no such section: branch.$BRANCH_NAME" ]]; then
-            printf '%s\n' "$CONFIG_ERROR" >&2
-            exit "$CONFIG_STATUS"
-        fi
+fi
+if CONFIG_ERROR=$(LC_ALL=C git config --local --remove-section "branch.$BRANCH_NAME" 2>&1); then
+    :
+else
+    CONFIG_STATUS=$?
+    if [[ "$CONFIG_STATUS" -ne 128 || "$CONFIG_ERROR" != "fatal: no such section: branch.$BRANCH_NAME" ]]; then
+        printf '%s\n' "$CONFIG_ERROR" >&2
+        exit "$CONFIG_STATUS"
     fi
 fi
 echo "Branch deleted."
