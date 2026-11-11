@@ -2997,7 +2997,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:** a merge of origin/builds landed between the work and the review, so the worker's checks covered an older tree. Run the checks on the final merged tree and record its revision.
 
-### Phase 157 — The Mac-only verify tests start fewer processes and the offload fixture scans `/proc` once on a clean exit  · status: todo
+### Phase 157 — The Mac-only verify tests start fewer processes and the offload fixture scans `/proc` once on a clean exit  · status: done
 **Depends on:** none
 
 #### Work Order
