@@ -148,7 +148,7 @@ def read_details(row: staff.StaffRow, holder: staff.StaffRow, machine: str) -> M
         "rows=json.load(sys.stdin); "
         "print(json.dumps(asdict(local_details(*(staff.StaffRow.from_json(row) for row in rows)))))"
     )
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination,
+    command = ["ssh", "-o", "BatchMode=yes", destination,
                "~/.claude/scripts/lib/py -B -c " + shlex.quote(code)]
     try:
         result = subprocess.run(command, input=json.dumps([row.to_json(), holder.to_json()]),

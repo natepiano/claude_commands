@@ -385,7 +385,7 @@ def authority_request(operation: str, payload: dict[str, object]) -> dict[str, o
     authority = config.get('ownership', 'host')
     if authority == local_host():
         return _authority_local(operation, payload)
-    command = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', authority,
+    command = ['ssh', '-o', 'BatchMode=yes', authority,
                '~/.claude/scripts/lib/py ~/.claude/scripts/astra/design_roles.py authority ' + shlex.quote(operation)]
     result = subprocess.run(command, input=json.dumps(payload), capture_output=True, text=True, timeout=30, check=False)
     if result.returncode:

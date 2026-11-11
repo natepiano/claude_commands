@@ -2616,6 +2616,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
         result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), owner=ci_memory_slice, diagnostic=ci_group.reason))
     children.extend(group for group in ci_groups if group not in children)
     for child in children:
+        if child.name == "builds-detached.slice":
+            continue
         required = child in ci_groups
         if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue

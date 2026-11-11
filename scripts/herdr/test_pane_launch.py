@@ -54,7 +54,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
         self.assertEqual(entry["environment"], {})
 
     def test_readout_keeps_a_staffed_pane_with_an_unknown_home(self) -> None:
-        row = staff.StaffRow(staff.StaffId("TEST-unknown-home"), "agent", "TEST-unknown-home", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("TEST-unknown-home"), "producer", "TEST-unknown-home", staff.STAFF_ROOT,
                              current_session=staff.StaffId("TEST-unknown-home"))
         entry = pane_launch.launch("TEST-pane", row.id, "/work", {}, ["claude"])
         _ = entry.pop("config_dir", None)

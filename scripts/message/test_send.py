@@ -3023,7 +3023,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
              mock.patch.object(send, "machine", return_value="macbook"):
             code, lines = self.clear_check()
         command = cast(list[str], channel.call_args.args[0])
-        self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "natedev"])
+        self.assertEqual(command[:-1], ["ssh", "-o", "BatchMode=yes", "natedev"])
         self.assertEqual(command[-1], f"{send.REMOTE} retire --to user --from hana --key github-cold")
         self.assertEqual((code, lines), (0, ["retired: github-cold from hana: its check passed; on natedev:"
                                              + " cancelled: the emergency push for github-cold stopped"]))
@@ -3096,7 +3096,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(send.pending(send.CodexQueueOwner(thread)), "")
 
     def test_codex_pending_follows_the_stable_owner_after_a_thread_change(self) -> None:
-        member = staff.StaffRow(staff.StaffId("fixed"), "agent", "Agent", staff.StaffRoot(),
+        member = staff.StaffRow(staff.StaffId("fixed"), "producer", "Agent", staff.StaffRoot(),
                                current_session=staff.StaffId("next-thread"))
         self.staff_rows = {"fixed": member}
         for thread, owner, text in (("old-thread", "fixed", "Keep this review."),
@@ -5770,7 +5770,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         """Add one private Codex agent and its pane route."""
         from scripts.herdr import herdr
 
-        row = fixture_member("agent", name="pane-agent")
+        row = fixture_member("producer", name="pane-agent")
         self.fixture.world.add(row, "w2:p1", family="codex", workspace="w2", tab="w2:t1")
         pane_result = self.fixture.world.result
 

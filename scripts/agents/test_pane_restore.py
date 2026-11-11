@@ -185,7 +185,7 @@ class FakeClient(herdr.Herdr):
 
 @final
 class PaneRestoreTests(unittest.TestCase):
-    row = staff.StaffRow(staff.StaffId("restore-row"), "agent", "alpha", staff.StaffRoot(),
+    row = staff.StaffRow(staff.StaffId("restore-row"), "producer", "alpha", staff.StaffRoot(),
         current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"),
         worktree=staff.PresentWorktree("natedev", Path("/work/alpha")))
 

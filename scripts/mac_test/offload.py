@@ -2742,8 +2742,12 @@ def main() -> int:
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
     settings = arguments.settings
-    if not settings and arguments.target:
-        settings = str(configured_ssh_target(arguments.target).settings)
+    if arguments.target:
+        target_settings = configured_ssh_target(arguments.target).settings.expanduser().resolve()
+        if settings and Path(settings).expanduser().resolve() != target_settings:
+            cli.error(f"--settings {Path(settings).expanduser().resolve()} differs from "
+                      + f"--target {arguments.target} settings {target_settings}")
+        settings = str(target_settings)
     config = read_config(Path(settings)) if settings else read_config()
     controller = ProcessController()
     started = time.monotonic()

@@ -415,16 +415,6 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "curl"],
                          ["http://192.0.2.46:17462/jsonrpc"])
 
-    def test_mac_connect_timeout_uses_the_shared_fraction_and_rounds_up(self) -> None:
-        _ = write_config_fixture(self.config_path, "connect_timeout_s=2.5\n")
-
-        result = self.mac_run(extra={"MAC_RUN_REACHABLE": "0"})
-
-        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
-        calls = self.events()
-        self.assertEqual([event["command"] for event in calls], ["ssh"])
-        self.assertIn("ConnectTimeout=3", calls[0]["args"])
-
     def test_unreachable_mac_keeps_exit_three(self) -> None:
         result = self.mac_run(extra={"MAC_RUN_REACHABLE": "0"})
 
@@ -726,10 +716,8 @@ class MacRunTests(unittest.TestCase):
                 cleanup = cleanup_events[0]
                 self.assertTrue(cleanup["claimed"], cleanup)
                 self.assertEqual(
-                    cleanup["args"][:5],
+                    cleanup["args"][:3],
                     [
-                        "-o",
-                        "ConnectTimeout=6",
                         "-o",
                         "BatchMode=yes",
                         "natemccoy@mac",

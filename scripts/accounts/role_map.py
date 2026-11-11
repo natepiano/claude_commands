@@ -316,7 +316,7 @@ def ssh_role_map(arguments: tuple[str, ...], *, machine: str = ROLE_MAP_HOST) ->
     """Only transport boundary; callers never invoke remote account launches."""
     account_config = conf.read('accounts')
     command = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py " + shlex.join(arguments)
-    result = subprocess.run(("ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={account_config.whole("role_map_connect_timeout_seconds")}",
+    result = subprocess.run(("ssh", "-o", "BatchMode=yes",
                              machine, command), capture_output=True, text=True, timeout=account_config.whole("role_map_timeout_seconds"))
     if result.returncode:
         message = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
