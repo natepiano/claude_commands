@@ -479,6 +479,14 @@ always=natedev
                 assert parent is not None
                 run_state[unit_runs.OWNER_FIELD] = owner.id
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
+            if owner is not None:
+                history_events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+                if any(event.get("event_type") == "run_finished" for event in history_events):
+                    if isinstance(owner.run, staff.OpenRun):
+                        _ = staff.clear_run(owner.id, owner.run.path)
+                else:
+                    _ = staff.set_run(owner.id, staff.OpenRun(folder))
+
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
         if subprocess_cli:
@@ -651,16 +659,15 @@ always=natedev
         self.assertEqual(self.tick(START).returncode, 0)
         path = self.watches["unit-one"].stretch_path
         saved = path.read_bytes()
-        scan = unit_runs.held_by_session
+        lookup = unit_lookup.HeldRunLookup.unfinished_held_run
         damaged = self.root / "history/runs/unit-one.jsonl"
 
-        def damage() -> dict[str, list[str]]:
-            folders = scan()
-            with damaged.open("ab") as handle:
-                _ = handle.write(b"\xff\n")
-            return folders
+        def damage(runs: unit_lookup.HeldRunLookup, session: str) -> unit_lookup.HeldRun | unit_lookup.HeldRunUnknown | unit_lookup.NoUnfinishedRun:
+            if session == unit_session("unit-one"):
+                _ = damaged.write_bytes(b"\xff\n")
+            return lookup(runs, session)
 
-        with mock.patch.object(unit_runs, "held_by_session", side_effect=damage):
+        with mock.patch.object(unit_lookup.HeldRunLookup, "unfinished_held_run", damage):
             result = self.tick(START + 600)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(path.read_bytes(), saved)
@@ -724,7 +731,7 @@ always=natedev
               mock.patch.object(stall_watch, "read_place") as panes):
             result = self.tick(START + 600)
         self.assertEqual(result.returncode, 0, result.stderr)
-        scan.assert_called_once_with()
+        scan.assert_not_called()
         self.assertEqual(sessions, [unit_session("unit-one")])
         panes.assert_not_called()
         self.assertEqual({path: path.read_bytes() for path in saved}, saved)
@@ -789,7 +796,7 @@ always=natedev
               mock.patch.object(stall_watch, "send_all") as send):
             _ = stall_watch.tick(START)
             scans.assert_called_once_with(record=mock.ANY)
-            reads.assert_called_once_with()
+            reads.assert_not_called()
             self.assertEqual(forget.call_count, 4)
             send.assert_called_once_with(
                 [], START, deadline=mock.ANY,

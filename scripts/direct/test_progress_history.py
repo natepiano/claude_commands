@@ -101,6 +101,9 @@ class ProgressHistoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
+        unit_runs.RUN_ROOT.mkdir()
+        _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
         cache = self.root / "cache"
         seed_interpreter_cache(cache)
         self.enterContext(patch.dict(os.environ, {"CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache)}))
@@ -509,8 +512,9 @@ print('two homes isolated; recorder lock retained; caller restored')
         document = self.working_dir / "docs" / "example-production.md"
         if not document.exists():
             _ = document.write_text("# Production — Example\n")
-        _ = recorded_unit("Example", "unit-a", self.working_dir, document,
-                          plan=str(plan_path.relative_to(self.working_dir)))
+        member = recorded_unit("Example", "unit-a", self.working_dir, document,
+                               plan=str(plan_path.relative_to(self.working_dir)))
+        _ = staff.set_run(member.id, staff.OpenRun(session_dir))
 
     def start_run(self, name: str, started_at: int, *, unit_owned: bool = False, staff_owned: bool = False) -> Path:
         main_session = f"main-{name}"
@@ -524,8 +528,8 @@ print('two homes isolated; recorder lock retained; caller restored')
             row = fixture_member("unit", name="reservation", parent=owner.id,
                                  worktree=staff.PresentWorktree(remote.local_machine(), self.working_dir))
             main_session = row.current_session
-        session_dir = self.root / name
-        session_dir.mkdir()
+        session_dir = (unit_runs.RUN_ROOT if unit_owned or staff_owned else unit_runs.ASTRA_RUN_ROOT) / name
+        session_dir.mkdir(parents=True)
         plan_path = self.working_dir / "docs" / f"{name}.md"
         plan_path.parent.mkdir(exist_ok=True)
         plan_text = "\n".join(
@@ -1336,6 +1340,31 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
 
     def test_start_activity_distinguishes_missing_phase_from_finished_run(self) -> None:
+        stale_run = self.start_run("stale-local-pointer", 20_000, staff_owned=True)
+        record = staff.initial_snapshot()
+        stale = replace(record, rows=tuple(replace(row, run=staff.NoRun()) for row in record.rows))
+        with patch.object(staff, "local_snapshot", return_value=stale):
+            _ = self.run_command("finish-run", "--session-dir", str(stale_run),
+                                 "--status", "completed", at=20_030)
+        self.assertEqual(self.read_state(stale_run).get("status"), "completed")
+        self.assertEqual(self.read_events(stale_run.name)[-1]["event_type"], "run_finished")
+
+        run = self.start_run("pointer-without-outcome", 21_000, unit_owned=True)
+        self.start_phase(run, 21_010)
+        state = self.read_state(run)
+        _ = state.pop("status", None)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps(state))
+        owner = unit_runs.run_owner(state, staff.snapshot())
+        assert isinstance(owner, staff.StaffRow)
+        _ = staff.set_run(owner.id, staff.OpenRun(run))
+        _ = self.run_command("start-activity", "--session-dir", str(run), "--label", "Check",
+                             "--activity", "check the pointer", at=21_020)
+        _ = self.run_command("finish-run", "--session-dir", str(run), "--status", "completed", at=21_030)
+        self.assertEqual(self.read_state(run)["status"], "completed")
+        self.assertIn("finished_at", self.read_state(run))
+        self.assertEqual(self.read_events(run.name)[-1]["event_type"], "run_finished")
+        self.assertIsNone(unit_runs.open_run(owner.current_session))
+
         started_at = 22_000
         no_phase = self.start_run("activity-without-phase", started_at)
         refused = self.run_failing_command(
@@ -1712,7 +1741,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                              self.root / "example-production.md", plan="docs/old.md")
         original = unit_config.read(self.working_dir)
         assert isinstance(original, unit_config.UnitConfig)
-        session_dir = self.root / "new-plan"
+        session_dir = unit_runs.RUN_ROOT / "new-plan"
         plan = self.working_dir / "docs/new.md"
         plan.parent.mkdir()
         _ = plan.write_text(
@@ -3432,9 +3461,11 @@ with patch.object(fcntl, "flock", admission):
         return invoke_recorder(self.valid_launch_arguments(arguments), environment, Path.cwd())
 
     def test_starting_a_phase_reactivates_a_finished_run_without_replacing_its_workers(self) -> None:
-        for status, failed_write in (("completed", False), ("error", False), ("completed", True)):
-            with self.subTest(status=status, failed_write=failed_write):
-                name = f"reactivate-{status}-{failed_write}"
+        for status, failure in (("completed", "none"), ("error", "none"),
+                                ("completed", "stale-pointer"), ("completed", "claim"),
+                                ("completed", "state-write")):
+            with self.subTest(status=status, failure=failure):
+                name = f"reactivate-{status}-{failure}"
                 session_dir = self.start_run(name, 20_000, staff_owned=True)
                 roster = session_dir / "mesh_roster.json"
                 original = json.dumps({"unrelated-address": {
@@ -3444,7 +3475,20 @@ with patch.object(fcntl, "flock", admission):
                 _ = roster.write_text(original, encoding="utf-8")
                 _ = self.run_command("finish-run", "--session-dir", str(session_dir),
                                      "--status", status, at=20_020)
-                if failed_write:
+                owner = unit_runs.run_owner(self.read_state(session_dir), staff.initial_snapshot())
+                assert isinstance(owner, staff.StaffRow)
+                if failure == "stale-pointer":
+                    _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+                if failure == "state-write":
+                    with patch.object(progress_history, "_write_state", side_effect=OSError("state write failed")):
+                        with self.assertRaisesRegex(OSError, "state write failed"):
+                            _ = self.run_command(
+                                "start-phase", "--session-dir", str(session_dir),
+                                "--phase-id", "4", "--phase-title", "Resume the unit", at=20_025,
+                            )
+                    self.assertIsNone(unit_runs.open_run(owner.current_session))
+                    self.assertEqual(self.read_state(session_dir)["status"], status)
+                if failure == "claim":
                     lock = self.root / "staff.json.lock"
                     lock.unlink()
                     lock.mkdir()
@@ -3456,20 +3500,29 @@ with patch.object(fcntl, "flock", admission):
                             )
                     finally:
                         lock.rmdir()
+                    self.assertIsNone(unit_runs.open_run(owner.current_session))
+                    self.assertNotIn("status", self.read_state(session_dir))
+                    self.assertNotIn("finished_at", self.read_state(session_dir))
                 _ = self.run_command(
                     "start-phase", "--session-dir", str(session_dir),
                     "--phase-id", "4", "--phase-title", "Resume the unit", at=20_030,
                     claude_session=f"main-{name}",
                 )
                 state = self.read_state(session_dir)
-                self.assertEqual(state["status"], "active")
+                self.assertNotIn("status", state)
                 self.assertNotIn("finished_at", state)
                 self.assertEqual(unit_runs.open_run(fixture_runtime_id(f"main-{name}")), session_dir)
                 self.assertEqual(roster.read_text(encoding="utf-8"), original)
                 events = self.read_events(name)
                 self.assertEqual(len([event for event in events
-                                     if event.get("event_type") == "reopened"]), 1)
+                                     if event.get("event_type") == "reopened"]),
+                                 2 if failure in ("claim", "state-write") else 1)
                 self.assertEqual(events[-1]["event_type"], "phase_started")
+                _ = self.run_command("finish-run", "--session-dir", str(session_dir),
+                                     "--status", "stopped", at=20_050)
+                self.assertEqual(self.read_state(session_dir)["status"], "stopped")
+                self.assertEqual(len([event for event in self.read_events(name)
+                                     if event.get("event_type") == "run_finished"]), 2)
 
     def test_starting_the_same_phase_twice_records_only_one_run_reactivation(self) -> None:
         session_dir = self.start_run("reactivate-once", 20_000, staff_owned=True)
@@ -3609,7 +3662,7 @@ with patch.object(fcntl, "flock", admission):
         self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,
                              "--worker-id", worker.id, worker_name="renamed-worker")
         latest = self.pass_events("dispatch-history", "pass_started")[-1]
-        with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(self.root)}):
+        with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(unit_runs.RUN_ROOT)}):
             dispatch = progress_history.last_dispatch(worker.id)
         self.assertEqual(dispatch, progress_history.RecordedDispatch(
             "test", "3", progress_history.DispatchDetailNotRecorded.UNRECORDED,
@@ -4203,6 +4256,28 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(self.pass_slots(session_dir)[""]["status"], "completed")
 
     def test_finishing_a_prepared_run_clears_pointers_for_every_staff_kind(self) -> None:
+        unit_run = self.start_run("helper-owner", 45_000, unit_owned=True)
+        owner = unit_runs.run_owner(self.read_state(unit_run), staff.snapshot())
+        assert isinstance(owner, staff.StaffRow)
+        for index, pointer in enumerate((staff.OpenRun(unit_run), staff.NoRun())):
+            with self.subTest(pointer=pointer):
+                helper = unit_runs.ASTRA_RUN_ROOT / f"helper-{index}"
+                helper.mkdir(parents=True)
+                if isinstance(pointer, staff.OpenRun):
+                    _ = staff.set_run(owner.id, pointer)
+                else:
+                    _ = staff.clear_run(owner.id, unit_run)
+                with patch.object(unit_runs, "RUN_ROOT", self.root / "units"):
+                    _ = self.run_command("start-run", "--session-dir", str(helper),
+                                         "--working-dir", str(self.working_dir), "--main-session-id", owner.current_session,
+                                         "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh", at=45_100)
+                    self.assertTrue(unit_runs.run_is_open(helper))
+                    _ = self.run_command("finish-run", "--session-dir", str(helper), "--status", "completed", at=45_200)
+                    self.assertFalse(unit_runs.run_is_open(helper))
+                updated = staff.snapshot().by_id(owner.id)
+                assert updated is not None
+                self.assertEqual(updated.run, pointer)
+
         kinds: tuple[staff.Kind, ...] = ("producer", "worker", "unit", "showrunner")
         for kind in kinds:
             with self.subTest(kind=kind):
@@ -4211,7 +4286,7 @@ with patch.object(fcntl, "flock", admission):
                     parent = fixture_member("unit", name="prepared-unit", parent=parent.id)
                 owner = fixture_member(kind, name=f"prepared-{kind}",
                                        parent=parent.id if kind in ("unit", "worker") else None)
-                run = self.root / f"prepared-{kind}"
+                run = unit_runs.RUN_ROOT / f"prepared-{kind}"
                 run.mkdir()
                 _ = staff.set_run(owner.id, staff.OpenRun(run))
                 _ = self.run_command(
@@ -6688,7 +6763,7 @@ with patch.object(fcntl, "flock", admission):
         def at(hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 16, hour, minute, tzinfo=UTC).timestamp())
 
-        session_dir = self.start_run(name, at(16, 0))
+        session_dir = self.start_run(name, at(16, 0), unit_owned=True)
         plan_path = self.working_dir / "docs" / f"{name}.md"
         lines = [
             "### Phase 4 — Finished delivery  · status: done", "",
@@ -8745,7 +8820,7 @@ class LastDispatchTests(StaffTestCase):
         _ = history.write_bytes(b"\xff\n")
         self.write_json(run.with_name("other-run") / unit_runs.STATE_FILE, {
             "owner_staff_id": parent.id, "main_agent": {"session_id": parent.current_session},
-            "status": "active", "history_file": str(history)})
+            "history_file": str(history)})
         self.write_json(run.with_name("unavailable-owner") / unit_runs.STATE_FILE, {
             "owner_staff_id": fixture_runtime_id("unavailable-dispatch-owner"), "history_file": str(history)})
         calls = self.root / "git-calls"
@@ -8801,13 +8876,21 @@ class StaffProgressHistoryTests(StaffTestCase):
         row = fixture_member("unit", name="progress", parent=owner.id,
                              worktree=staff.PresentWorktree(remote.local_machine(), first))
         run = self.root / "run"
-        state: dict[str, object] = {"status": "active", "owner_staff_id": row.id,
+        state: dict[str, object] = {"owner_staff_id": row.id,
                                    "main_agent": {"session_id": row.current_session},
                                    "working_dir": str(first), "branch": "old-branch"}
         write = cast(Callable[[Path, dict[str, object]], None], getattr(progress_history, "_write_state"))
         read = cast(Callable[[Path], dict[str, object]], getattr(progress_history, "_read_state"))
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root))
+        _ = staff.set_run(row.id, staff.OpenRun(run))
         write(run, state)
+        _ = staff.clear_run(row.id, run)
+        with patch.object(unit_runs, "run_is_open", side_effect=AssertionError("state writes must not read run openness")):
+            write(run, {**state, "production": "progress", "unit": "progress"})
         path = run / unit_runs.STATE_FILE
+        stored = cast(dict[str, object], json.loads(path.read_text()))
+        for key in ("production", "unit", "branch"):
+            self.assertNotIn(key, stored)
         before = path.read_bytes(), path.stat().st_mtime_ns
         replacement = fixture_runtime_id("replacement-run-director")
         _ = staff.update_current_session(row.id, staff.StaffId(replacement))
@@ -8817,8 +8900,10 @@ class StaffProgressHistoryTests(StaffTestCase):
         self.assertEqual((current["working_dir"], current["branch"]), (str(second), "current-branch"))
         self.assertEqual(unit_runs.director(run), replacement)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-        current["status"] = "completed"
+        current["status"] = "custom-outcome"
+        current["finished_at"] = 100
         write(run, current)
+        _ = staff.clear_run(row.id, run)
         _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), first),
                                expected=staff.PresentWorktree(remote.local_machine(), second))
         finished = read(run)

@@ -275,10 +275,16 @@ The staff JSON key `run` holds the path string. An absent key reads as `NoRun`.
 
 `prepare_session.sh` publishes the pointer through `staff.py set-run`.
 A session with no staff row prints one line and continues. An unreadable staff record stops the script.
-`progress_history.py start-run` and its reopen path publish the pointer before they write the `active` status.
-A rerun after a failed write therefore publishes the pointer.
-They keep the pointer when it names another run whose status is `active`.
-A second run of the same director, such as an Astra review folder, therefore never moves its run.
+`progress_history.py start-run` and its reopen path publish the pointer for unit run folders.
+A rerun after a failed write publishes the pointer again.
+A helper folder never changes a staff pointer.
+`unit_runs.run_is_open(folder)` reads the unit owner's pointer.
+Lifecycle commands supply the current staff owner's record instead of using a retained local copy.
+The reopen path writes the cleared state and the `reopened` event before it claims the pointer.
+Run state stores an outcome and `finished_at` after the run finishes.
+Open run state has no `status`.
+Folders outside `unit_runs.run_roots()` are helper runs.
+They use the absence of an outcome because staff does not record their runs.
 `finish-run` and `end_session.sh` clear matching pointers for every staff row kind.
 A repeated finish also attempts to clear matching pointers.
 An old run cannot clear a pointer that names a newer run.
