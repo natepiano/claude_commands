@@ -72,6 +72,22 @@ class AgentsLogTests(unittest.TestCase):
         rows.append(row.to_json())
         _ = path.write_text(json.dumps(fields))
 
+    def run_workers(self, run: Path, workers: dict[str, str]) -> None:
+        path = self.root / "staff.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        rows = cast(list[dict[str, object]], fields["rows"])
+        parent = staff.native_id(fixture_runtime_id("run-owner:" + str(run)))
+        if not any(row["id"] == parent for row in rows):
+            rows.append(staff.StaffRow(staff.native_id(parent), "showrunner", run.name,
+                                      staff.StaffRoot(), current_session=parent).to_json())
+        for row in rows:
+            for name, identity in workers.items():
+                if row["id"] == identity:
+                    row.update(name=name, parent=parent)
+                    _ = (run / f"impl_worker_{name}.json").write_text(json.dumps({"staff_id": identity, "slot": name}))
+        _ = path.write_text(json.dumps(fields))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": parent}))
+
     def backfill_fixture(self) -> tuple[Path, Path]:
         rows: list[staff.StaffRow] = []
         for identity, role in ((ARCHIVED_THREAD, "review"), (LIVE_THREAD, "test"),
@@ -82,29 +98,23 @@ class AgentsLogTests(unittest.TestCase):
                                        staff.StaffRoot(), current_session=parent))
             member = staff.native_id(identity)
             rows.append(staff.StaffRow(member, "worker", role, staff.ReportsTo(parent),
-                                       current_session=member))
+                                       current_session=member, role=staff.KnownWorkerRole(cast(staff.WorkerRole, role))))
         _ = (self.root / "staff.json").write_text(json.dumps({
             "schema": 2, "rows": [row.to_json() for row in rows],
         }), encoding="utf-8")
         archive = self.root / "archive"
         archived_run = archive / "archived-run"
         archived_run.mkdir(parents=True)
-        roster = archived_run / "mesh_roster.json"
-        _ = roster.write_text(json.dumps({
-            "project-test": {
-                "staff_id": ARCHIVED_THREAD, "status": "done",
-            },
-        }), encoding="utf-8")
-        roster_stamp = 1_700_000_000
-        os.utime(roster, (roster_stamp, roster_stamp))
+        self.run_workers(archived_run, {"project-test": ARCHIVED_THREAD})
+        state_path = archived_run / "progress_history_state.json"
+        recorded_at = 1_700_000_000
+        os.utime(state_path, (recorded_at, recorded_at))
         _ = (archived_run / "review_agent_adversary.log").write_text(
             "Review worker project-test starts\n", encoding="utf-8")
         live = self.root / "live"
         live_run = live / "live-run"
         live_run.mkdir(parents=True)
-        _ = (live_run / "mesh_roster.json").write_text(json.dumps({
-            "project-impl": {"staff_id": LIVE_THREAD, "status": "done"},
-        }), encoding="utf-8")
+        self.run_workers(live_run, {"project-impl": LIVE_THREAD})
         self.director_run("director-session", live_run)
         return archive, live
 
@@ -550,10 +560,18 @@ for index in range(20):
         former = self.root / "former"
         former_run = former / "former-run"
         former_run.mkdir(parents=True)
-        _ = (former_run / "mesh_roster.json").write_text(json.dumps({
-            "project-fix": {"staff_id": FORMER_THREAD, "status": "done"},
-        }), encoding="utf-8")
+        self.run_workers(former_run, {"project-fix": FORMER_THREAD})
         self.director_run("former-director", former_run)
+        path = self.root / "staff.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        rows = cast(list[dict[str, object]], fields["rows"])
+        owner = cast(str, json.loads((former_run / "progress_history_state.json").read_text())["owner_staff_id"])
+        for role in ("astra-designer", "astra-reviewer"):
+            identity = staff.native_id(fixture_runtime_id(role))
+            rows.insert(0, staff.StaffRow(identity, "worker", role, staff.ReportsTo(staff.StaffId(owner)),
+                        current_session=identity, role=staff.KnownWorkerRole(cast(staff.WorkerRole, role))).to_json())
+            _ = (former_run / f"impl_worker_{role}.json").write_text(json.dumps({"staff_id": identity, "slot": role}))
+        _ = path.write_text(json.dumps(fields))
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live), "--live", str(former))
 
@@ -582,12 +600,22 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
 
     def test_backfill_rerun_adds_nothing_even_if_mtime_changes(self) -> None:
         archive, live = self.backfill_fixture()
+        state = cast(dict[str, object], json.loads((archive / "archived-run/progress_history_state.json").read_text()))
+        later = staff.native_id(fixture_runtime_id("later-worker"))
+        path = self.root / "staff.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        rows = cast(list[object], fields["rows"])
+        rows.append(staff.StaffRow(later, "worker", "later", staff.ReportsTo(staff.StaffId(cast(str, state["owner_staff_id"]))),
+                    current_session=later, role=staff.KnownWorkerRole("impl")).to_json())
+        _ = path.write_text(json.dumps(fields))
         arguments = ("backfill", "--archive", str(archive), "--live", str(live))
         first = self.cli(*arguments)
         self.assertEqual((first.returncode, first.stderr), (0, ""))
+        self.assertEqual(set(agents_log.assignments(self.log_path).assignments),
+                         {ARCHIVED_THREAD, LIVE_THREAD, fixture_runtime_id("director-session")})
         before = self.log_path.read_bytes()
-        roster = archive / "archived-run/mesh_roster.json"
-        os.utime(roster, (1_700_001_000, 1_700_001_000))
+        state_path = archive / "archived-run/progress_history_state.json"
+        os.utime(state_path, (1_700_001_000, 1_700_001_000))
 
         second = self.cli(*arguments)
 
@@ -597,9 +625,9 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
     def test_backfill_preserves_exact_history_despite_a_newer_roster(self) -> None:
         archive, live = self.backfill_fixture()
         agents_log.append(ARCHIVED_THREAD, "review", "adversary", AT)
-        roster = archive / "archived-run/mesh_roster.json"
+        state_path = archive / "archived-run/progress_history_state.json"
         rewritten_at = (AT + timedelta(minutes=1)).timestamp()
-        os.utime(roster, (rewritten_at, rewritten_at))
+        os.utime(state_path, (rewritten_at, rewritten_at))
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
@@ -630,10 +658,12 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
     def test_backfill_recovers_swapped_review_lenses_from_logs_naming_each_worker(self) -> None:
         archive, live = self.backfill_fixture()
         run = archive / "archived-run"
-        _ = (run / "mesh_roster.json").write_text(json.dumps({
-            "project-test": {"staff_id": CONTRACT_THREAD},
-            "project-impl": {"staff_id": ADVERSARY_THREAD},
-        }), encoding="utf-8")
+        fields = cast(dict[str, object], json.loads((self.root / "staff.json").read_text()))
+        rows = cast(list[dict[str, object]], fields["rows"])
+        archived = next(row for row in rows if row["id"] == ARCHIVED_THREAD)
+        archived["parent"] = fixture_runtime_id("owner:" + ARCHIVED_THREAD)
+        _ = (self.root / "staff.json").write_text(json.dumps(fields))
+        self.run_workers(run, {"project-test": CONTRACT_THREAD, "project-impl": ADVERSARY_THREAD})
         _ = (run / "review_agent_adversary.log").write_text(
             "Review worker project-impl starts\n", encoding="utf-8")
         _ = (run / "review_agent_1_contract.log").write_text(

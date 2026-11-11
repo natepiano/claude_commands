@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 import subprocess
 import sys
 import time
-from threading import Timer
-from collections.abc import Callable, Iterator
+from threading import Event, Timer, current_thread
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import replace
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import patch
@@ -414,6 +415,49 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(active.call_count, 2)
         self.assertEqual(searches.call_count, 0)
         self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+
+    def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
+        self.assert_restore_live_run(active=False)
+
+    def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
+        self.assert_restore_live_run(active=True)
+
+    def assert_restore_live_run(self, *, active: bool) -> None:
+        from scripts.whoami import agent_accounts
+
+        opened = self.opened("active-run" if active else "idle-run")
+        dispatch_id = ""
+        if active:
+            dispatch_id = progress_history.begin_dispatch(self.run_dir, slot=opened.row.name, phase="8", role="impl",
+                worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                prompt=self.prompt, kind="impl", lens="")
+            self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch_id}.")
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        run = self.run_dir / "detached_runs" / opened.row.name
+        context = (f"Detached run {opened.row.name} remains live. "
+                   + f"Result: {run}.json; log: {run}.log. Read it with: `cat -- {run}.json {run}.log`. "
+                   + "Its result follows this worker after the move.")
+        target = self.fixture.root / ".codex2"
+        target.mkdir()
+        (target / "sessions").symlink_to(self.fixture.root / "codex/sessions", target_is_directory=True)
+        with (pane_fixtures.live_detached_run(self.run_dir, opened.row), redirect_stdout(io.StringIO()),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex2", self.fixture.root / ".codex2", "fixture")),
+              patch.object(accounts, "account_directory_readiness", return_value=accounts.AccountDirectoryReady("fixture"))):
+            code = worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({opened.row.id}))
+        self.assertEqual(code, worker.ExitCode.OK)
+        self.assertEqual(self.fixture.world.requests[-1][2]["CODEX_HOME"], str(self.fixture.root / ".codex2"))
+        prompt = self.fixture.prompts()[-1]
+        self.assertEqual(prompt[2], opened.pane)
+        self.assertEqual(prompt[3], (
+            '<system-reminder source="script">\nYou were stopped and resumed because .\n'
+            + f"Continue pass {dispatch_id} in this conversation. Keep the same pass id.\n"
+            + context + "\n</system-reminder>" if active else
+            '<system-reminder source="script"> ' + context + " </system-reminder>"))
+        self.assertEqual(self.fixture.world.closed, [])
+        current = staff.snapshot().by_id(opened.row.id)
+        assert current is not None
+        self.assertEqual(current.current_session, opened.row.current_session)
 
     def test_restore_starts_only_the_worker_with_an_active_dispatch(self) -> None:
         idle = self.opened("review", "review")
@@ -956,9 +1000,47 @@ class WorkerCommandTests(unittest.TestCase):
         path = self.run_dir / "progress_history_state.json"
         before = path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()
         reply = self.reply.read_bytes(), self.reply.stat().st_mtime_ns
-        for repeated in (1, 2):
-            with self.subTest(repeated=repeated):
-                self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        for repeated in (1, 2, 3, 4):
+            with self.subTest(repeated=repeated), ExitStack() as sends:
+                if repeated == 4:
+                    row = self.agent.row(pane)
+                    passed = worker_panes.worker_pass(row, self.run_dir)
+                    delivery = progress_history.dispatch_delivery(passed)
+                    status = self.run_dir / "shared-status"
+                    progress_history.save_dispatch_delivery(self.run_dir, str(passed["instance_id"]),
+                        replace(delivery, actions=replace(delivery.actions, status_file=str(status))))
+                    with ExitStack() as notices:
+                        self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.prompt,
+                            session_dir=self.run_dir, slot="impl", phase="8", kind="impl",
+                            launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)], reply=self.reply,
+                            notices=notices), worker.DispatchSubmission.SUBMITTED)
+                        self.agent.finish_after = 1
+                        self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse("next-pass"), "impl", self.prompt,
+                            session_dir=self.run_dir, slot="next-pass", phase="8", kind="impl", launcher_command=["next-assign"],
+                            reply=self.run_dir / "next-reply.md",
+                            completion_actions=progress_history.CompletionActions(status_file=str(status)),
+                            on_submission=lambda: atomic_file.write_text_atomic(status, "running\n")), worker.DispatchSubmission.SUBMITTED)
+                    self.assertEqual(status.read_text(), "running\n")
+                    continue
+                if repeated == 3:
+                    send_notice = send.send
+
+                    def send_unlocked(options: send.Options) -> send.Result:
+                        with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as acquired:
+                            self.assertIsInstance(acquired, worker_panes.WorkerLockHold)
+                        return send_notice(options)
+
+                    _ = sends.enter_context(patch.object(send, "send", side_effect=send_unlocked))
+                    with ExitStack() as notices, worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as hold:
+                        self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                        assert isinstance(hold, worker_panes.WorkerLockHold)
+                        result = worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.prompt,
+                            session_dir=self.run_dir, slot="impl", phase="8", kind="impl",
+                            launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)], reply=self.reply,
+                            lock=hold, notices=notices)
+                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                else:
+                    self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
                 self.assertEqual(self.agent.notices, [notice] * (repeated + 1))
                 self.assertEqual(len(self.agent.submitted), 1)
                 self.assertEqual(len(self.fixture.world.launches), 1)
@@ -966,7 +1048,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()), before)
                 self.assertEqual((self.reply.read_bytes(), self.reply.stat().st_mtime_ns), reply)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.IGNORED)
-        self.assertEqual(len(self.agent.notices), 3)
+        self.assertEqual(len(self.agent.notices), 5)
 
     def test_dispatch_rerun_before_prompt_records_one_submission(self) -> None:
         target = herdr.check_target
@@ -1827,7 +1909,9 @@ class WorkerCommandTests(unittest.TestCase):
                             session_dir=case.run_dir, slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"])
                     case.assertEqual(code, worker.ExitCode.REFUSED)
                     case.assertEqual(staff.find(kind="worker", parent=case.fixture.parent.id), [])
-                    case.assertEqual(len(case.fixture.world.closed), 4)
+                    case.assertEqual(len(case.fixture.world.closed), 3)
+                    case.assertNotIn("unit-impl", [destination.label for destination in case.fixture.world.launches
+                                                  if isinstance(destination, herdr.SplitPane)])
                     case.assertEqual(case.agent.submitted, [])
                     case.assertNotIn("cleanup failed", errors.getvalue())
                 finally:
@@ -2020,12 +2104,66 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(added.row.name, "impl2")
 
     def test_first_standard_assignment_creates_the_default_team(self) -> None:
-        code = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
-            slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"], reply=self.reply)
-        self.assertEqual(code, worker.ExitCode.OK)
-        self.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)},
-                         {"impl", "fix", "review", "test"})
-        self.assertEqual(len(self.agent.submitted), 1)
+        for role, ready_hooks in (("impl", False), ("test", True)):
+            with self.subTest(role=role, ready_hooks=ready_hooks):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    assignment_thread = current_thread()
+                    hook_acquired = Event()
+                    release_hook = Event()
+                    pending: dict[str, Future[turn_end.TurnOutcome]] = {}
+                    acquire = worker_panes.worker_lock
+                    bind = worker_panes.WorkerLockHold.bind
+                    guard = LauncherHangGuard("first assignment ready hooks")
+                    with ThreadPoolExecutor(max_workers=4) as hooks:
+                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow) -> None:
+                            bind(hold, row)
+                            if current_thread() is assignment_thread and ready_hooks and row.name not in pending:
+                                pending[row.name] = hooks.submit(turn_end.handle,
+                                    turn_end.WorkerEvent(str(row.current_session), reply="ready"))
+
+                        @contextmanager
+                        def queued_ready_hooks(parent: staff.StaffId, name: staff.WorkerName, *,
+                                               blocking: bool = False) -> Generator[worker_panes.WorkerLockHold | worker_panes.Kept]:
+                            with acquire(parent, name, blocking=blocking) as hold:
+                                if current_thread() is not assignment_thread and name.value == role:
+                                    hook_acquired.set()
+                                    case.assertTrue(release_hook.wait(guard.remaining()))
+                                yield hold
+                            if (current_thread() is assignment_thread and ready_hooks
+                                    and isinstance(hold, worker_panes.WorkerLockHold) and name.value in pending):
+                                if name.value == role:
+                                    case.assertTrue(hook_acquired.wait(guard.remaining()))
+                                else:
+                                    case.assertIs(pending[name.value].result(timeout=guard.remaining()), turn_end.TurnOutcome.IGNORED)
+
+                        def prompt_during_ready_hook() -> None:
+                            case.assertEqual(set(pending), {"impl", "fix", "review", "test"})
+                            case.assertFalse(pending[role].done())
+                            case.assertFalse(hook_acquired.is_set())
+
+                        if ready_hooks:
+                            case.agent.during_prompt = prompt_during_ready_hook
+                        try:
+                            with (patch.object(worker_panes.WorkerLockHold, "bind", queue_ready_hook),
+                                  patch.object(worker_panes, "worker_lock", queued_ready_hooks)):
+                                code = worker.assign(case.fixture.parent.id, cast(staff.WorkerRole, role), case.prompt,
+                                    session_dir=case.run_dir, slot=role, phase="8", kind=role,
+                                    launcher_command=["assign.sh"], reply=case.reply)
+                        finally:
+                            release_hook.set()
+                        for future in pending.values():
+                            case.assertIs(future.result(timeout=guard.remaining()), turn_end.TurnOutcome.IGNORED)
+                    case.assertEqual(code, worker.ExitCode.OK)
+                    case.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=case.fixture.parent.id)},
+                                     {"impl", "fix", "review", "test"})
+                    case.assertEqual(len(case.agent.submitted), 1)
+                    case.assertEqual(case.agent.row(case.agent.submitted[0][0]).name, role)
+                    if ready_hooks:
+                        case.assertEqual(set(pending), {"impl", "fix", "review", "test"})
+                finally:
+                    case.doCleanups()
 
     def test_assignment_continues_after_a_default_split_interruption(self) -> None:
         row = self.fixture.worker("impl", family="codex")

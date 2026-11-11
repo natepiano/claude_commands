@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.usage import collect, context_economy as economy
+from scripts.usage import agents_log, collect, context_economy as economy
 from scripts.usage.context_economy_read import (
     CompactionEvent, MacReadFailed, MacSessions, Request, Session, SettingsSet, SizeNotReported, Start,
 )
@@ -75,6 +75,13 @@ def sample_session(name: str, count: int, scale: int = 1, *, version: str = "2.1
     ], [], [Start(at(offset), "startup", version)], at(offset))
 
 
+def change_session(name: str, scale: int = 1, *, offset: int = 0) -> Session:
+    """Include a compaction so every change measure has a session sample."""
+    return replace(sample_session(name, 4, scale, offset=offset), compactions=[
+        CompactionEvent(at(offset + 120), "auto", 1000, 100, "normal"),
+    ])
+
+
 def quantity_rows(output: str, quantity: str) -> list[list[str]]:
     """Read the data rows in one quantity's Markdown table."""
     rows: list[list[str]] = []
@@ -129,12 +136,18 @@ class ContextEconomyTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.object(economy, "read_mac", return_value=MacSessions([], []))))
         _ = cast(object, self.enterContext(patch.object(socket, "gethostname", return_value="fixture")))
 
-    def configure(self, *, min_requests: int = 1, active_gap_seconds: int = 600) -> None:
+    def configure(self, *, min_requests: int = 1, active_gap_seconds: int = 600,
+                  changes_min_sessions: int = 3, changes_min_percent: int = 10,
+                  changes_window_hours: int = 1) -> None:
         _ = (self.root / "config/context_economy.conf").write_text(
             "settings_keys = autoCompactWindow precomputeCompactionEnabled model\n"
+            + "codex_settings_keys = codexContextWindow\n"
             + "files = commands/unit/direct.md\n"
             + f"# whole: 1..\nmin_requests = {min_requests}\n"
             + f"# whole: 1..\nactive_gap_seconds = {active_gap_seconds}\n"
+            + f"# whole: 1..\nchanges_window_hours = {changes_window_hours}\n"
+            + f"# whole: 1..\nchanges_min_sessions = {changes_min_sessions}\n"
+            + f"# whole: 1..100\nchanges_min_percent = {changes_min_percent}\n"
             + "# whole: 1..\nhourly_recent_hours = 1\n# whole: 1..\nhourly_baseline_days = 1\n"
             + "# whole: 1..\ncache_max_megabytes = 512\n# whole: 1..\nprogress_seconds = 1\n", encoding="utf-8")
 
@@ -232,6 +245,279 @@ class ContextEconomyTests(unittest.TestCase):
         }
         actual = economy.quantity_samples(quantity_session(), active_gap_seconds=600)
         self.assertEqual(actual, expected)
+
+    def test_changes_compare_session_means_and_state_the_noise_rule(self) -> None:
+        for before_scale, after_scale, count, confounded, verdict in (
+            (2, 1, 3, False, "better"),
+            (1, 2, 3, False, "worse"),
+            (1, 1, 3, False, "no clear change"),
+            (2, 1, 2, False, "too few sessions"),
+            (2, 1, 3, True, "better"),
+        ):
+            with self.subTest(verdict=verdict, count=count, confounded=confounded):
+                old, new = settings(0), settings(7200, enabled=False)
+                if confounded:
+                    new = replace(new, values={**new.values, "commands/unit/direct.md": {"bytes": 200, "sha": "new-file"}})
+                sessions = [change_session(f"{side}-{index}", scale, offset=offset)
+                    for side, offset, scale in (("before", 3600, before_scale), ("after", 7200, after_scale))
+                    for index in range(count)]
+                analyses = economy.analyze_changes(sessions, {"fixture": [old, new]}, self.store, at(0), at(10800))
+                analysis, = [entry for entry in analyses if entry.change.key == "precomputeCompactionEnabled"]
+                self.assertEqual(analysis.verdict, verdict)
+                row, = analysis.comparisons
+                self.assertEqual(row.verdict, verdict)
+                self.assertEqual((row.before.sessions, row.after.sessions), (count, count))
+                self.assertEqual((row.before.requests, row.after.requests), (4 * count, 4 * count))
+                self.assertEqual(row.before.quantities["cost_per_request"], [97.5 * before_scale] * count)
+                self.assertEqual(row.after.quantities["context_per_request"], [100.0 * after_scale] * count)
+                output = economy.render_changes([analysis], since=at(0), detail=True)
+                self.assertIn("at least 3 sessions", output)
+                self.assertIn("noise limit 10%", output)
+                self.assertIn(f": {verdict}" if count == 3 else "not judged:", output)
+                self.assertIn("compactions_per_active_hour: 20 -> 20 (+0.0%)", output)
+                if confounded:
+                    self.assertIn("direct.md: 1 edit", output)
+                elif count == 3 and before_scale == 2:
+                    self.assertIn("cost_per_request: 195 -> 97.5 (-50.0%)", output)
+                    self.assertIn("after_compaction: 200 -> 100 (-50.0%)", output)
+
+    def test_changes_keep_roles_exposure_and_window_bounds_separate(self) -> None:
+        old, new = settings(0), settings(7200, enabled=False)
+        newer = replace(new, at=at(20000), commit="later", values={**new.values, "autoCompactWindow": 200000})
+        sessions = [sample_session(f"{side}-{role}-{index}", 4, scale, offset=offset)
+                    for side, offset in (("before", 3600), ("after", 7200))
+                    for role, scale in (("worker", 1), ("unit director", 2)) for index in range(3)]
+        for session in sessions:
+            self.record_role(session, "unit director" if "unit director" in session.agent_id else "worker")
+        stale = replace(sample_session("old-settings-after", 4, 99, offset=7200),
+                        starts=[Start(at(3600), "startup", "2.1.0")], first_record_at=at(3600))
+        outside = sample_session("outside", 4, 99, offset=0)
+        analyses = economy.analyze_changes([*sessions, stale, outside], {"fixture": [old, new, newer]},
+                                           self.store, at(0), at(24000))
+        analysis, = analyses
+        self.assertEqual(analysis.change.key, "precomputeCompactionEnabled")
+        self.assertEqual({row.role for row in analysis.comparisons}, {"worker", "unit director"})
+        self.assertTrue(all(row.before.sessions == row.after.sessions == 3 for row in analysis.comparisons))
+        self.assertEqual(analysis.verdict, "no clear change")
+        spanning = [replace(sample_session(f"spanning-{index}", 3, offset=3600),
+                            requests=[request(3660, 1), request(3720, 1), request(3780, 1), request(7260, 99)],
+                            starts=[Start(at(3600), "startup", "2.1.0"), Start(at(7200), "resume", "2.1.0")])
+                    for index in range(5)]
+        for session in spanning:
+            self.record_role(session, "worker")
+        independent, = economy.analyze_changes([*sessions, *spanning], {"fixture": [old, new]},
+                                               self.store, at(0), at(10800))
+        worker, = [row for row in independent.comparisons if row.role == "worker"]
+        self.assertEqual((worker.before.sessions, worker.after.sessions), (8, 3))
+        self.assertEqual((worker.before.requests, worker.after.requests), (27, 12))
+        self.assertEqual(worker.after.quantities["context_per_request"], [100.0] * 3)
+        self.assertEqual(economy.analyze_changes(spanning, {"fixture": [old, new]}, self.store, at(0), at(10800)), [])
+        for stale_count in (0, 100):
+            with self.subTest(old_setting_requests_after_change=stale_count):
+                director = replace(sample_session("delayed-resume", 20, offset=3600),
+                                   requests=[*[request(3600 + 60 * number, 1) for number in range(1, 21)],
+                                             *[request(7201 + number, 99) for number in range(stale_count)],
+                                             *[request(7500 + 60 * number, 99) for number in range(1, 6)]],
+                                   starts=[Start(at(3600), "startup", "2.1.0"), Start(at(7500), "resume", "2.1.0")])
+                self.record_role(director, "unit director")
+                matching, = economy.analyze_changes([*sessions, director], {"fixture": [old, new]},
+                                                    self.store, at(0), at(10800))
+                director_row, = [row for row in matching.comparisons if row.role == "unit director"]
+                self.assertEqual((director_row.before.sessions, director_row.after.sessions), (4, 3))
+                self.assertEqual((director_row.before.requests, director_row.after.requests), (32, 12))
+                self.assertEqual(director_row.before.quantities["context_per_request"], [200.0] * 3 + [100.0])
+                self.assertEqual(director_row.after.quantities["context_per_request"], [200.0] * 3)
+        self.configure(changes_window_hours=3)
+        wider, = economy.analyze_changes([*sessions, outside], {"fixture": [old, new]}, self.store, at(0), at(10800))
+        self.assertEqual(sum(row.before.sessions for row in wider.comparisons), 7)
+
+    def test_changes_judge_each_role_without_a_short_role_blocking_it(self) -> None:
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                sessions: list[Session] = []
+                for side, offset, scale in (("before", 3600, 2), ("after", 7200, 1)):
+                    for role, count in (("director", 3), ("showrunner", 1)):
+                        for number in range(count):
+                            session = change_session(f"{side}-{role}-{number}", scale, offset=offset)
+                            if mixed and side == "after":
+                                session = replace(session, requests=[replace(item, input=0, cache_read=300,
+                                    cache_write_5m=0, cache_write_1h=0, output=0) for item in session.requests])
+                            self.record_role(session, role)
+                            sessions.append(session)
+                analysis, = economy.analyze_changes(sessions, {"fixture": [settings(0), settings(7200, enabled=False)]},
+                                                    self.store, at(0), at(10800))
+                verdict = "mixed" if mixed else "better"
+                self.assertEqual(analysis.verdict, verdict)
+                rows = {row.role: row for row in analysis.comparisons}
+                self.assertEqual(rows["director"].verdict, verdict)
+                self.assertEqual(rows["showrunner"].verdict, "too few sessions")
+                output = economy.render_changes([analysis], since=at(0))
+                self.assertIn(f"director (3 -> 3 sessions): {verdict}", output)
+                self.assertIn("not judged: showrunner (1 -> 1 sessions)", output)
+                self.assertEqual(len(output.splitlines()), 5)
+                self.assertNotIn("compactions per active hour", output)
+                if mixed:
+                    self.assertIn("worse: context per request +50%", output)
+                    self.assertIn("better: cost per request", output)
+
+    def test_changes_judge_available_measures_without_compaction_samples(self) -> None:
+        for count, before_compactions, after_compactions, after_scale, verdict in (
+            (100, 0, 0, 1, "better"),
+            (3, 2, 3, 1, "mixed"),
+            (3, 3, 2, 1, "better"),
+            (3, 3, 3, 1, "better"),
+            (3, 0, 0, 2, "no clear change"),
+        ):
+            with self.subTest(count=count, before_compactions=before_compactions,
+                              after_compactions=after_compactions, after_scale=after_scale):
+                sessions: list[Session] = []
+                for side, offset, scale, compactions in (("before", 3600, 2, before_compactions),
+                                                         ("after", 7200, after_scale, after_compactions)):
+                    for number in range(count):
+                        session = change_session(f"{side}-director-{number}", scale, offset=offset)
+                        if number >= compactions:
+                            session = replace(session, compactions=[])
+                        self.record_role(session, "director")
+                        sessions.append(session)
+                analysis, = economy.analyze_changes(sessions, {"fixture": [settings(0), settings(7200, enabled=False)]},
+                                                    self.store, at(0), at(10800))
+                self.assertEqual(analysis.verdict, verdict)
+                row, = analysis.comparisons
+                self.assertEqual(row.verdict, verdict)
+                self.assertEqual((row.before.sessions, row.after.sessions), (count, count))
+                self.assertEqual((len(row.before.quantities["after_compaction"]),
+                                  len(row.after.quantities["after_compaction"])),
+                                 (before_compactions, after_compactions))
+                missing = min(before_compactions, after_compactions) < 3
+                self.assertEqual(row.unjudged, ("after_compaction",) if missing else ())
+                if verdict != "no clear change":
+                    self.assertIn("cost_per_request", row.better)
+                    self.assertIn("context_per_request", row.better)
+                else:
+                    self.assertEqual(row.better, ())
+                    self.assertEqual(row.worse, ())
+                output = economy.render_changes([analysis], since=at(0))
+                self.assertIn(f"director ({count} -> {count} sessions): {verdict}", output)
+                self.assertNotIn("not judged: director", output)
+                if missing:
+                    self.assertIn("(context after compaction: too few samples)", output)
+                else:
+                    self.assertNotIn("too few samples", output)
+                if before_compactions == after_compactions == 0 and verdict == "better":
+                    self.assertIn("cost per request -50% (195 -> 97.5)", output)
+                    self.assertIn("context per request -50% (200 -> 100)", output)
+
+    def test_changes_limit_setting_families_and_group_file_edits(self) -> None:
+        old = replace(settings(0), values={**settings(0).values, "codexContextWindow": 200,
+                                           "commands/unit/direct.md": {"bytes": 116000, "sha": "first"}})
+        first_edit = replace(old, at=at(6000), commit="first-edit", values={
+            **old.values, "commands/unit/direct.md": {"bytes": 100000, "sha": "second"},
+        })
+        changed = replace(first_edit, at=at(7200), commit="settings-edit", values={
+            **first_edit.values, "precomputeCompactionEnabled": False, "codexContextWindow": 100,
+        })
+        last_edit = replace(changed, at=at(9000), commit="last-edit", values={
+            **changed.values, "commands/unit/direct.md": {"bytes": 42000, "sha": "third"},
+        })
+        sessions = [replace(change_session(f"{family}-{offset}-{number}", offset=offset), family=family)
+                    for family in ("claude", "codex") for offset in (3600, 6000, 7200, 9000) for number in range(3)]
+        timeline = {"fixture": [old, first_edit, changed, last_edit]}
+        analyses = economy.analyze_changes(sessions, timeline, self.store, at(0), at(12600))
+        self.assertEqual({entry.change.key for entry in analyses}, {"precomputeCompactionEnabled", "codexContextWindow"})
+        for analysis in analyses:
+            expected = "codex" if analysis.change.key == "codexContextWindow" else "claude"
+            self.assertEqual({row.family for row in analysis.comparisons}, {expected})
+            self.assertEqual([entry for entry in analysis.confounds if entry.startswith("direct.md:")],
+                             ["direct.md: 2 edits, 116 KB -> 42 KB"])
+            self.assertFalse(any("codexContextWindow" in entry for entry in analysis.confounds))
+        with_files = economy.analyze_changes(sessions, timeline, self.store, at(0), at(12600), files=True)
+        edits = [entry for entry in with_files if entry.change.key == "commands/unit/direct.md"]
+        self.assertEqual(len(edits), 2)
+        self.assertTrue(all({row.family for row in entry.comparisons} == {"claude", "codex"} for entry in edits))
+        output = economy.render_changes(analyses, since=at(0))
+        self.assertIn("2 settings changes since 2026-11-02", output.splitlines()[0])
+
+    def test_changes_use_recorded_local_roles_without_inventing_missing_roles(self) -> None:
+        old = replace(settings(0), values={**settings(0).values, "codexContextWindow": 200})
+        new = replace(old, at=at(7200), values={**old.values, "codexContextWindow": 100})
+        sessions = [replace(change_session(f"{machine}-{side}-{index}", offset=offset), machine=machine, family="codex")
+                    for machine in ("fixture", "mac") for side, offset in (("before", 3600), ("after", 7200))
+                    for index in range(3)]
+        for session in sessions:
+            if session.machine == "fixture":
+                agents_log.append(session.agent_id, "impl", None, at(0))
+        analyses = economy.analyze_changes(sessions, {"fixture": [old, new], "mac": [old, new]}, self.store, at(0), at(10800))
+        self.assertEqual({entry.change.machine: {row.role for row in entry.comparisons} for entry in analyses},
+                         {"fixture": {"impl"}, "mac": {"unknown"}})
+        for session in sessions:
+            if session.machine == "fixture":
+                self.record_role(session, "review")
+        recorded = economy.analyze_changes(sessions, {"fixture": [old, new]}, self.store, at(0), at(10800))
+        self.assertEqual({row.role for entry in recorded for row in entry.comparisons}, {"review"})
+
+    def test_changes_apply_configured_limits_and_name_model_confounds(self) -> None:
+        old, new = settings(0), settings(7200, enabled=False)
+        before = [change_session(f"before-{index}", 10, offset=3600) for index in range(3)]
+        after = [change_session(f"after-{index}", 9, offset=7200) for index in range(3)]
+        for threshold, minimum, verdict in ((10, 3, "better"), (11, 3, "no clear change"),
+                                             (10, 4, "too few sessions")):
+            with self.subTest(threshold=threshold, minimum=minimum):
+                self.configure(changes_min_percent=threshold, changes_min_sessions=minimum)
+                analysis, = economy.analyze_changes([*before, *after], {"fixture": [old, new]}, self.store, at(0), at(10800))
+                self.assertEqual(analysis.verdict, verdict)
+        self.configure()
+        changed = [replace(session, requests=[replace(item, model="claude-opus-4-5", cli_version="new-cli")
+                                              for item in session.requests]) for session in after]
+        analysis, = economy.analyze_changes([*before, *changed], {"fixture": [old, new]}, self.store, at(0), at(10800))
+        self.assertEqual(analysis.verdict, "better")
+        row, = analysis.comparisons
+        self.assertEqual(row.worse, ())
+        self.assertIn("cost_per_request", row.better)
+        self.assertIn("context_per_request", row.better)
+        self.assertIn("model", " ".join(analysis.confounds))
+        self.assertIn("CLI version", " ".join(analysis.confounds))
+
+    def test_changes_command_reads_the_before_window_and_prints_newest_first(self) -> None:
+        self.command_inputs(sample_session("input", 4))
+        timeline = [settings(0), settings(7200, enabled=False), settings(14400, enabled=False, window=200000)]
+        sessions = [sample_session(f"at-{offset}-{index}", 4, offset=offset)
+                    for offset in (3600, 7200, 10800, 14400) for index in range(3)]
+        with (patch.object(economy, "read_claude", return_value=sessions) as read,
+              patch.object(economy, "settings_timeline", return_value=timeline)):
+            status, output, errors = self.cli("changes", "--since", at(3600).isoformat(), "--until", at(18000).isoformat())
+        self.assertEqual(status, 0, errors)
+        self.assertLess(output.index("autoCompactWindow:"), output.index("precomputeCompactionEnabled:"))
+        self.assertIn("2 settings changes since 2026-11-02: 0 better, 0 worse, 0 mixed, 2 no clear change, 0 not judged", output)
+        read.assert_called_once_with(self.projects, at(0), at(18000), "fixture")
+        edit = replace(timeline[1], at=at(10800), commit="file-edit", values={
+            **timeline[1].values, "commands/unit/direct.md": {"bytes": 200, "sha": "new-file"},
+        })
+        last = replace(timeline[2], values={**timeline[2].values,
+                                           "commands/unit/direct.md": edit.values["commands/unit/direct.md"]})
+        for flags, expected in (((), 2), (("--files",), 3), (("--detail",), 2), (("--files", "--detail"), 3)):
+            with self.subTest(flags=flags):
+                with (patch.object(economy, "read_claude", return_value=sessions),
+                      patch.object(economy, "settings_timeline", return_value=[timeline[0], timeline[1], edit, last])):
+                    status, output, errors = self.cli("changes", "--since", at(3600).isoformat(),
+                                                      "--until", at(18000).isoformat(), *flags)
+                self.assertEqual(status, 0, errors)
+                self.assertTrue(output.startswith(f"{expected} " + ("changes" if "--files" in flags else "settings changes")))
+                self.assertEqual("cost_per_request:" in output, "--detail" in flags)
+                headings = [line for line in output.splitlines() if line.startswith("2026-")]
+                self.assertEqual(sum("commands/unit/direct.md:" in line for line in headings), int("--files" in flags))
+
+    def test_filtered_report_names_the_selected_value_and_omits_empty_quantities(self) -> None:
+        old = settings(0, enabled=False)
+        new = replace(old, at=at(600), commit="file-change", values={
+            **old.values, "commands/unit/direct.md": {"bytes": 200, "sha": "new-file"},
+        })
+        report = economy.build_report([sample_session("selected", 4, offset=600)], {"fixture": [old, new]},
+                                      self.store, at(0), at(3600),
+                                      where=[economy.SettingsValueMatch("precomputeCompactionEnabled", False)])
+        output = economy.render_report(report)
+        row, = quantity_rows(output, "context_per_request")
+        self.assertIn("precomputeCompactionEnabled=false", row[2])
+        self.assertEqual(quantity_rows(output, "after_compaction"), [])
 
     def test_the_active_gap_threshold_excludes_equal_and_longer_gaps(self) -> None:
         for threshold, expected in ((60, []), (600, [30.0]), (1200, [30.0]), (1201, [90 / 13])):

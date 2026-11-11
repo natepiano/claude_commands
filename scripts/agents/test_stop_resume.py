@@ -192,6 +192,8 @@ class ResumeClock(local):
 
 class WorkerResumeTests(unittest.TestCase):
     def test_resume_without_a_worker_record_returns_the_restored_pane(self) -> None:
+        from scripts.herdr.test_worker_panes import live_detached_run
+
         case = test_worker.WorkerCommandTests("runTest")
         case.setUp()
         self.addCleanup(case.doCleanups)
@@ -215,6 +217,7 @@ class WorkerResumeTests(unittest.TestCase):
 
         with (patch.object(stop_resume, "running_on_account", side_effect=running) as proof,
               patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              live_detached_run(case.run_dir, opened.row),
               redirect_stdout(io.StringIO())):
             result = stop_resume.resume(str(opened.row.id))
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -225,6 +228,10 @@ class WorkerResumeTests(unittest.TestCase):
         self.assertEqual(world.closed, [])
         self.assertEqual(result.start_state, ClaudeStartState.STARTED)
         self.assertEqual(proof.call_args.args, (opened.row.current_session, result.pane_id))
+        prompt = next(command[-1] for command in reversed(world.commands) if command[:2] == ("agent", "prompt"))
+        self.assertIn(f"Detached run {opened.row.name} remains live.", prompt)
+        self.assertIn(f"{case.run_dir}/detached_runs/{opened.row.name}.json", prompt)
+        self.assertNotIn("ended with no result", prompt)
 
 
 @final
