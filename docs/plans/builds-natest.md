@@ -2951,41 +2951,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 146 — Four style test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The style ledger tickets, style proposals, style ledger sites and bulk rename test modules lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+- Rule 2 sweep, as in Phase 147. Removed 30 rare-case tests: `test_style_ledger_tickets.py` 196 → 176, `test_style_proposals.py` 187 → 182, `test_style_ledger_sites.py` 169 → 167, `test_bulk_rename.py` 118 → 115.
+- Removals were documentation wording, refusal order, lock timing, call counts, failure context and exception types. None of them changes saved state.
+- `ledger_test_support.py` lost `record_while_stalled`, which had no user after the removals.
+- Held (sdlc): `test_style_footprint.py` and `test_style_ledger_findings.py` wait for owner branches to reach main. `test_style_sync.py` stays with Phase 142.
 
-**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". The user approved the Rule 2 sweep with no CPU or money bar: fewer tests is the goal. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Work order: the folders with the most tests first (production 2,805, style 2,356, direct 1,597), the largest modules first. `test_staff.py` is out: Phase 87 swept it.
-
-**Spec:**
-1. For each test in the listed modules, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
-2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
-3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
-4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. Do not change production code.
-5. Do not merge tests into table rows in this phase. Remove no test that a held speed phase changes.
-6. Write `phases/146/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case and the reason no user harm follows. Give the counts before and after for each module.
-
-**Files:**
-- `scripts/style/test_style_ledger_tickets.py` — 196 tests.
-- `scripts/style/test_style_proposals.py` — 187 tests.
-- `scripts/style/test_style_ledger_sites.py` — 169 tests.
-- `scripts/style/test_bulk_rename.py` — 118 tests.
-
-**Held (sdlc, 2026-11-11):** `test_style_footprint.py` and `test_style_ledger_findings.py` wait for owner branches to reach main. `test_style_sync.py` stays with Phase 142.
-
-**Workers:** 1 writer; one reader keeps one standard across the four modules.
-- impl: the four modules and the removal table.
-
-**Constraints from prior phases:**
-- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
-- Phase 87: Rule 2 removal saved no CPU in Git-heavy modules. CPU is not this phase's measure.
-
-**State:** none.
-
-**Acceptance gate:**
-- Each of the four modules passes; basedpyright reports 0 errors and 0 warnings on each.
-- `phases/146/removed_tests.md` lists every removed test with its reason, and the counts.
-- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+**Gotchas:** an argument refusal is not always a rare case. Both reviews restored two `--by` refusals in `test_style_proposals.py`: without them, a blank name reaches the ledger write and erases who acted. Check where a refused value lands before removing its test.
 
 ### Phase 147 — Four direct test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
