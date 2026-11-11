@@ -968,6 +968,9 @@ Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.
 A rule with `approval: always` creates approved decisions through `file` without asking the user.
 The `Style units` table names the family owner. Staff supplies its unit id, and `.unit.toml` supplies its plan.
+The decision's `unit` field names the unit that filed it; no reader routes work by that field.
+Refill selects each approved decision for the current owner of its rule's family.
+A decision whose rule has no catalog entry has no owner, so no unit selects it.
 The receiving production supplies `showrunner` and `approved_in`; `approved_by` is `rule <rule id>`.
 The command prints `approved <decision>: rule <rule id> is always approved`.
 With no live owner, it prints `skipped <decision>: rule <rule id> is always approved, but no <family> unit builds it`.
