@@ -401,91 +401,62 @@ def _wait_folder_rows(observe: Callable[[], set[staff.StaffId]], wanted: set[sta
             time.sleep(min(poll, remaining))
 
 
-class NoPendingMove(Enum):
-    CURRENT = "no pending folder move"
+def _worktree_lock(folder: Path) -> Path:
+    """Locate the native Git lock without copying a worktree path."""
+    admin = Path(git(folder, "rev-parse", "--absolute-git-dir"))
+    return admin / "locked"
 
 
-class FolderMove(NamedTuple):
-    destination: Path
-    branch: str | KeepBranch
-
-
-class PendingRename(NamedTuple):
-    destination: Path
-    branch: str | KeepBranch
-    name: str
-
-
-def pending_move(unit: staff.StaffId) -> FolderMove | PendingRename | NoPendingMove:
-    path = staff.folder_move_path(unit)
-    if not path.exists():
-        return NoPendingMove.CURRENT
-    progress = json_object(read_json(path))
-    branch = str(progress.get("branch", ""))
-    destination = Path(str(progress["destination"]))
-    name = str(progress.get("name", ""))
-    if progress.get("kind") == "rename" or ("kind" not in progress and name):
-        return PendingRename(destination, branch or KeepBranch.CURRENT, name)
-    return FolderMove(destination, branch or KeepBranch.CURRENT)
-
-
-def prepare_move(row: staff.StaffRow, destination: Path, branch: str | KeepBranch,
-                 name: str = "") -> None:
-    """Save the move before the first staff write or session stop."""
-    if isinstance(row.worktree, staff.WorktreeUnfilled):
-        raise ValueError(f"{row.id}: no unit worktree")
-    source = row.worktree.path.expanduser().resolve()
-    folder = source if source.exists() else destination
-    admin_path = ""
-    if (folder / ".git").is_file():
-        admin = Path((folder / ".git").read_text().strip().removeprefix("gitdir: "))
-        admin_path = str((admin if admin.is_absolute() else folder / admin).resolve())
-    write_json(staff.folder_move_path(row.id), {
-        "source": str(source), "destination": str(destination), "admin": admin_path,
-        "branch": branch if isinstance(branch, str) else "",
-        "kind": "rename" if name else "folder", **({"name": name} if name else {})})
-
-
-def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, old: Path,
-                        destination: Path, branch: str | KeepBranch) -> bool:
-    """Require the journal identity and the unit's registered branch."""
+def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, destination: Path) -> bool:
+    """Require the owner's repository and the fixed staff identity in Git."""
     owner = record.parent_of(row)
     if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
         return False
     try:
         repository = Path(git(owner.doc.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        target_repository = Path(git(destination, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        if (target_repository != repository
-                or Path(git(destination, "rev-parse", "--show-toplevel")).resolve() != destination):
-            return False
-        allowed = {"refs/heads/" + branch} if isinstance(branch, str) else set[str]()
-        # Git keeps the admin path when it moves a worktree.
-        admin = Path((destination / ".git").read_text().strip().removeprefix("gitdir: "))
-        if not admin.is_absolute():
-            admin = destination / admin
-        admin = admin.resolve()
-        if admin.parent != repository / "worktrees":
-            return False
-        progress_path = staff.folder_move_path(row.id)
-        raw: object = read_json(progress_path) if progress_path.exists() else dict[str, object]()
-        progress = cast(dict[str, object], raw) if isinstance(raw, dict) else dict[str, object]()
-        if (progress.get("source") != str(old) or progress.get("destination") != str(destination)
-                or progress.get("admin") != str(admin)):
-            return False
-        _check_move_deadline()
-        head = (admin / "HEAD").read_text().strip()
-        if head.startswith("ref: refs/heads/"):
-            allowed.add(head.removeprefix("ref: "))
-        registered = git(destination, "worktree", "list", "--porcelain", "-z")
-        for entry in registered.split("\0\0"):
-            fields = entry.split("\0")
-            if (f"worktree {destination}" in fields
-                    and any(f"branch {name}" in fields for name in allowed)):
-                return True
-    except RenameRefused:
+        target = Path(git(destination, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        identity = _worktree_lock(destination)
+        return (repository == target and identity.parent.parent == repository / "worktrees"
+                and identity.read_text().strip() == f"staff:{row.id}"
+                and Path(git(destination, "rev-parse", "--show-toplevel")).resolve() == destination)
+    except (RenameRefused, OSError):
         return False
-    return False
+
+
+def require_move_destination(record: staff.StaffSnapshot, row: staff.StaffRow, destination: Path) -> None:
+    """Refuse an occupied destination before a caller changes displays or sessions."""
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise ValueError(f"{row.id}: no unit worktree")
+    old = row.worktree.path.expanduser().resolve()
+    if old != destination and exists(destination):
+        if exists(old) or not _recoverable_folder(record, row, destination):
+            raise RenameRefused(f"destination already exists: {destination}")
+
+
+def move_locked(unit: staff.StaffId, folder: Path) -> bool:
+    """Read the fixed unit identity from the native Git worktree lock."""
+    lock = _worktree_lock(folder)
+    return lock.exists() and lock.read_text().strip() == f"staff:{unit}"
+
+
+def _lock_move(folder: Path, unit: staff.StaffId) -> None:
+    """Keep only the fixed unit identity in Git during a folder move."""
+    lock = _worktree_lock(folder)
+    if lock.exists():
+        if lock.read_text().strip() != f"staff:{unit}":
+            raise RenameRefused(f"worktree is locked: {folder}")
+    else:
+        _ = git(folder, "worktree", "lock", "--reason", f"staff:{unit}", str(folder))
+
+
+def _unlock_move(folder: Path, unit: staff.StaffId) -> bool:
+    """Release only this unit's native lock after staff records the destination."""
+    lock = _worktree_lock(folder)
+    if not lock.exists() or lock.read_text().strip() != f"staff:{unit}":
+        return False
+    _ = git(folder, "worktree", "unlock", str(folder))
+    return True
 
 
 def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
@@ -494,7 +465,9 @@ def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBra
 
 
 def _push_moved_branch(checkout: Path, branch: str) -> None:
-    _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
+    upstream = git(checkout, "for-each-ref", "--format=%(upstream:short)", f"refs/heads/{branch}")
+    if upstream != f"origin/{branch}" or remote_tip(checkout, branch) != branch_tip(checkout, branch):
+        _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
 
 
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
@@ -508,12 +481,10 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         if row is None or row.kind != "unit" or isinstance(row.worktree, staff.WorktreeUnfilled):
             raise ValueError(f"{unit}: move-folder requires a unit with a worktree")
         location = row.worktree
-        pending = pending_move(unit)
         if location.machine != remote.local_machine():
             raise ValueError(f"{unit}: run move-folder on {location.machine}")
         old = location.path.expanduser().resolve()
-        if old != destination and exists(old) and exists(destination):
-            raise RenameRefused(f"destination already exists: {destination}")
+        require_move_destination(record, row, destination)
         folder = old if old.exists() else destination
         if not folder.exists():
             changed = isinstance(location, staff.RemovedWorktree) and location.path != destination
@@ -523,15 +494,14 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 _check_move_deadline()
             missing = destination if isinstance(location, staff.RemovedWorktree) else old
             print(f"anomaly: folder is absent: {missing}", file=sys.stderr)
-            staff.folder_move_path(unit).unlink(missing_ok=True)
-            return changed or not isinstance(pending, NoPendingMove)
-        recovering = folder == destination
-        if recovering and old != destination and not _recoverable_folder(record, row, old, destination, branch):
-            raise RenameRefused(f"destination already exists: {destination}")
+            return changed
         current_branch = git(folder, "branch", "--show-current")
         move_complete = old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
-        if move_complete and isinstance(pending, NoPendingMove):
-            return False
+        if move_complete:
+            if not move_locked(unit, folder):
+                if isinstance(branch, str):
+                    _push_moved_branch(folder, branch)
+                return False
         members = [row, *record.find(kind="worker", parent=row.id)]
         for member in members[1:]:
             _check_move_deadline()
@@ -559,10 +529,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         if move_complete:
             if isinstance(branch, str):
                 _push_moved_branch(folder, branch)
-            staff.folder_move_path(unit).unlink(missing_ok=True)
+            _ = _unlock_move(folder, unit)
             return True
-        if isinstance(pending, NoPendingMove):
-            prepare_move(row, destination, branch)
         changed = False
         reported = set[staff.StaffId]()
 
@@ -578,6 +546,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                     for member in members if member.id in live
                     for pane in panes if pane["session_id"] == member.current_session}
         try:
+            if folder != destination:
+                _lock_move(folder, unit)
             stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
             with worker_lifecycle.operation_deadline(deadline=stop_deadline):
                 for member in members:
@@ -595,7 +565,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             if folder != destination:
                 _check_move_deadline()
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                _ = git(folder, "worktree", "move", str(folder), str(destination))
+                _ = git(folder, "worktree", "move", "--force", "--force", str(folder), str(destination))
                 folder = destination
                 changed = True
             if isinstance(branch, str) and git(folder, "branch", "--show-current") != branch:
@@ -612,8 +582,10 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 current = staff.snapshot()
                 _check_move_deadline()
                 latest_unit = current.by_id(unit)
-                if folder == destination and latest_unit is not None and latest_unit.worktree != replace(location, path=destination):
-                    updated = replace(location, path=destination)
+                updated = replace(location, path=destination)
+                if folder == destination and isinstance(updated, staff.RemovedWorktree) and isinstance(branch, str):
+                    updated = replace(updated, branch=staff.ParkedBranch(git(folder, "branch", "--show-current")))
+                if folder == destination and latest_unit is not None and latest_unit.worktree != updated:
                     latest_unit = replace(latest_unit, worktree=updated)
                     current = staff.StaffSnapshot(tuple(latest_unit if item.id == unit else item for item in current.rows))
                     try:
@@ -623,6 +595,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                         _check_move_deadline()
                     except (OSError, ValueError, staff.StaffRefused) as error:
                         raise OSError(f"staff worktree write failed for {row.name}: {error}") from error
+                if folder == destination:
+                    _ = _unlock_move(folder, unit)
             finally:
                 try:
                     start_deadline = time.monotonic() + _move_timeout("RENAME_LIVE_WAIT_SECONDS")
@@ -655,8 +629,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                         if member.id in live - observed_live:
                             restart_notice(member, error)
         _check_move_deadline()
-        staff.folder_move_path(unit).unlink(missing_ok=True)
-        return changed or not isinstance(pending, NoPendingMove)
+        return changed
 
 
 def main(argv: Sequence[str] | None = None) -> int:

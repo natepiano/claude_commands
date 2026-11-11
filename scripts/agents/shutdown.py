@@ -21,7 +21,7 @@ from io import StringIO
 from zoneinfo import ZoneInfo
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, TypedDict, NamedTuple, cast
+from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
 from scripts.accounts import accounts
 from scripts.herdr import herdr_types
@@ -1115,7 +1115,7 @@ def retirement_find_unit(production_name: str, given: str, *,
     location = member.worktree
     if isinstance(location, staff.WorktreeUnfilled):
         raise ValueError(f"{member.name}: staff worktree is unfilled")
-    branch = ""
+    branch = location.branch.value if isinstance(location, staff.RemovedWorktree) and isinstance(location.branch, staff.ParkedBranch) else ""
     if unit_machine_is_local(location.machine) and location.path.is_dir():
         result = retirement_run(["git", "-C", str(location.path), "branch", "--show-current"], settings=settings)
         branch = result.stdout.strip()
@@ -1207,6 +1207,7 @@ class LocalUnitOutcome(TypedDict):
     machine: str
     worktree: str
     output: str
+    branch: NotRequired[str]
 
 
 def unit_machine_is_local(machine: str) -> bool:
@@ -1244,8 +1245,12 @@ def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSna
                 or any(not isinstance(fields.get(key), str) for key in ("identity", "session", "machine", "worktree", "output"))
                 or any(fields.get(key) != value for key, value in expected.items())):
             raise ValueError("remote unit result does not match the request")
-        result["code"] = status
         result["output"] = cast(str, fields["output"])
+        if "branch" in fields:
+            if not isinstance(fields["branch"], str):
+                raise ValueError("remote parked branch must be a string")
+            result["branch"] = fields["branch"]
+        result["code"] = status
         if result["output"]:
             print(result["output"], end="" if result["output"].endswith("\n") else "\n")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -1325,6 +1330,7 @@ def unit_local_command() -> int:
                 else:
                     print(f"anomaly: {row.name}: worktree and retirement journal are absent; branch is unknown")
                     retained = {"checkout": str(location.path.parent), "branch": "", "config": ""}
+                result["branch"] = retained["branch"]
                 production = Production(Path(), "", retained.get("merge_branch", str(fields["merge_branch"])),
                                         Path(retained["checkout"]), Path(), ZoneInfo("UTC"), row)
                 unit = RetiringUnit(production, row.name, location.path, retained["branch"], row)
@@ -1343,7 +1349,7 @@ def unit_local_command() -> int:
                     previous = unit_config.read_parked(row.id, cleanup=False)
                     facts = (previous.retired if isinstance(previous, unit_config.UnitConfig)
                              and isinstance(previous.retired, unit_config.RetiredSession) else
-                             unit_config.RetiredSession(retained["date"], row.current_session, unit_config.Branch(retained["branch"])))
+                             unit_config.RetiredSession(retained["date"], row.current_session))
                     _ = unit_config.write_parked(row.id, replace(config, retired=facts))
             else:
                 raise ValueError("unknown remote lifecycle action")
@@ -1464,8 +1470,16 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
         print(f"anomaly: {error}".replace("\n", " "))
         if require_cleanup:
             return 1
+    if (not isinstance(row.worktree, staff.WorktreeUnfilled)
+            and not require_cleanup and unit_machine_is_local(row.worktree.machine) and unit.branch):
+        retained = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, unit.worktree,
+                                                                  staff.ParkedBranch(unit.branch)), expected=row.worktree)
+        unit = replace(unit, staff_member=retained)
     failed = retirement_remove(unit, settings=settings)
     if failed:
+        if (isinstance(row.worktree, staff.PresentWorktree) and unit.worktree.is_dir()
+                and isinstance(unit.staff_member.worktree, staff.RemovedWorktree)):
+            _ = staff.set_worktree(row.id, row.worktree, expected=unit.staff_member.worktree)
         print("\n".join(f"anomaly: {reason}" for reason in failed))
         return 1
     return 0
@@ -1474,7 +1488,9 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
            record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     row = unit.staff_member
-    if not isinstance(row.worktree, staff.WorktreeUnfilled) and not unit_machine_is_local(row.worktree.machine):
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise ValueError(f"{row.id}: staff worktree is unfilled")
+    if not unit_machine_is_local(row.worktree.machine):
         if isinstance(row.worktree, staff.RemovedWorktree):
             _ = unit_remote_command("retire-complete", row, record)
             print("unchanged")
@@ -1482,13 +1498,25 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
         outcome = unit_remote_command("retire", row, record, merge_branch=unit.production.merge_branch, zone=unit.production.zone.key)
         if outcome["code"]:
             return outcome["code"]
-        retired = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, row.worktree.path), expected=row.worktree)
+        branch = outcome.get("branch", unit.branch)
+        retained_branch = staff.ParkedBranch(branch) if branch else staff.BranchUnrecorded()
+        retired = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, row.worktree.path, retained_branch),
+                                     expected=row.worktree)
         updated = staff.StaffSnapshot(tuple(retired if member.id == row.id else member for member in record.rows))
         _ = unit_remote_command("retire-complete", retired, updated)
         print(f"{unit.name} retired")
         return 0
     pane = retirement_pane(row, record)
     if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
+        if unit.branch:
+            refused = retirement_refusals(unit, settings=settings, check_absent_branch=True)
+            if refused:
+                print("\n".join(f"refused: {reason}" for reason in refused))
+                return 1
+            failed = retirement_remove(unit, settings=settings)
+            if failed:
+                print("\n".join(f"anomaly: {reason}" for reason in failed))
+                return 1
         try:
             copies.remove_trees(str(row.id))
         except copies.CopyError as error:
@@ -1506,7 +1534,7 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
         facts = (saved.retired if isinstance(saved, unit_config.UnitConfig)
                  and isinstance(saved.retired, unit_config.RetiredSession) else
                  unit_config.RetiredSession(datetime.now(unit.production.zone).date().isoformat(),
-                                            row.current_session, unit_config.Branch(unit.branch)))
+                                            row.current_session))
         _ = unit_config.write_parked(row.id, replace(config, retired=facts))
     pane_workers, reasons = retirement_stop_members(unit.staff_member, record)
     for reason in reasons:
@@ -1514,7 +1542,9 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     if retirement_clear_worktree(unit, settings=settings, record=record, pane_workers=pane_workers,
                                  pane=pane):
         return 1
-    _ = staff.set_worktree(row.id, staff.RemovedWorktree(local_machine(), unit.worktree), expected=row.worktree)
+    retained_branch = staff.ParkedBranch(unit.branch) if unit.branch else staff.BranchUnrecorded()
+    _ = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, unit.worktree, retained_branch),
+                           expected=row.worktree)
     print(f"{unit.name} retired")
     retirement_close_idle_shell(pane)
     return 0
@@ -1872,9 +1902,11 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
             if isinstance(row.worktree, staff.WorktreeUnfilled):
                 raise RenameRefused(f"{old}: no unit worktree")
             checkout = row.worktree.path.expanduser().resolve()
-            pending = unit_move.pending_move(row.id)
-            if not checkout.exists() and isinstance(pending, (unit_move.FolderMove, unit_move.PendingRename)):
-                checkout = pending.destination
+            if not checkout.exists():
+                target = unit_names.swap_stem(checkout.name, row.name, name)
+                destination = checkout.with_name(target) if target is not None else checkout
+                unit_move.require_move_destination(record, row, destination)
+                checkout = destination
             return RenamePlan(row, name, UnitBranchMove(rename_check_branch(checkout, to_branch), to_branch))
         return RenamePlan(row, name, KeepDocBranch())
     if bool(to_doc) != bool(to_branch):
@@ -2078,57 +2110,69 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
         return request
 
 
+@dataclass(frozen=True)
+class RequestedUnitFolderMove:
+    destination: Path
+    branch: str | unit_move.KeepBranch
+
+
+@dataclass(frozen=True)
+class NoRequestedUnitFolderMove:
+    """The rename request has no folder operation."""
+
+
 def rename_apply_unit(request: RenamePlan) -> RenamePlan:
     with staff.row_operation(str(request.member.id)):
-        if (row := staff.by_id(request.member.id)) is None:
+        record = staff.snapshot()
+        if (row := record.by_id(request.member.id)) is None:
             raise ValueError(f"{request.member.id}: no unit staff row")
         changed = row.name != request.name
         branch_move = isinstance(request.move, UnitBranchMove) and request.move.old_branch != request.move.branch
-        pending = unit_move.pending_move(row.id)
-        if (isinstance(request.move, UnitBranchMove)
-                and isinstance(pending, (unit_move.FolderMove, unit_move.PendingRename))
-                and pending.branch != request.move.branch):
-            pending_branch = pending.branch if isinstance(pending.branch, str) else pending.branch.value
-            raise ValueError(f"{row.name}: finish the pending move to branch {pending_branch}")
-        if isinstance(pending, unit_move.FolderMove) and (changed or branch_move):
-            if not unit_move.move_folder(row.id, pending.destination, branch=pending.branch):
-                print("unchanged")
-                return request
-            if (row := staff.by_id(request.member.id)) is None:
-                raise ValueError(f"{request.member.id}: no unit staff row")
-            pending = unit_move.pending_move(row.id)
-        movement = pending
-        if isinstance(pending, unit_move.PendingRename) and pending.name != request.name:
-            raise ValueError(f"{row.name}: finish the pending rename to {pending.name}")
-        if isinstance(pending, unit_move.NoPendingMove) and (changed or branch_move):
-            if isinstance(row.worktree, staff.WorktreeUnfilled):
+        movement: RequestedUnitFolderMove | NoRequestedUnitFolderMove = NoRequestedUnitFolderMove()
+        if isinstance(row.worktree, staff.WorktreeUnfilled):
+            if changed or branch_move:
                 print(f"anomaly: {request.name}: the staff worktree is unfilled", file=sys.stderr)
-            else:
-                if row.worktree.machine != remote.local_machine():
-                    raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
-                folder = row.worktree.path.expanduser().resolve()
-                target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
-                destination = folder.with_name(target) if target is not None else folder
-                checkout = folder if folder.exists() else destination
-                branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
-                renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
-                                  unit_names.swap_stem(branch, row.name, request.name))
-                if target is None:
-                    print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
-                if renamed_branch is None:
-                    print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
-                target_branch = renamed_branch if renamed_branch is not None else unit_move.KeepBranch.CURRENT
-                if target is not None or renamed_branch is not None:
-                    movement = unit_move.PendingRename(destination, target_branch, request.name)
-                    unit_move.prepare_move(row, destination, target_branch, request.name)
-        row = rename_owner(row, request.name)
+        else:
+            if row.worktree.machine != remote.local_machine():
+                raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
+            folder = row.worktree.path.expanduser().resolve()
+            target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
+            if target is None:
+                target = unit_names.swap_stem(folder.name, request.name, request.name)
+            destination = folder.with_name(target) if target is not None else folder
+            unit_move.require_move_destination(record, row, destination)
+            checkout = folder if folder.exists() else destination
+            branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
+            renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
+                              unit_names.swap_stem(branch, row.name, request.name))
+            if renamed_branch is None:
+                renamed_branch = unit_names.swap_stem(branch, request.name, request.name)
+            if changed and target is None:
+                print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
+            if changed and renamed_branch is None:
+                print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
+            target_branch = renamed_branch if renamed_branch is not None else unit_move.KeepBranch.CURRENT
+            if (changed or branch_move or isinstance(request.move, UnitBranchMove)
+                    or (checkout.exists() and unit_move.move_locked(row.id, checkout))):
+                movement = RequestedUnitFolderMove(destination, target_branch)
+        display_row = replace(row, name=request.name)
         try:
-            changed = rename_repair_displays(row) or changed
+            changed = rename_repair_displays(display_row) or changed
         except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: display: {error}", file=sys.stderr)
             changed = True
-        if isinstance(movement, (unit_move.FolderMove, unit_move.PendingRename)):
-            changed = unit_move.move_folder(row.id, movement.destination, branch=movement.branch) or changed
+        if isinstance(movement, RequestedUnitFolderMove):
+            moved = unit_move.move_folder(row.id, movement.destination, branch=movement.branch)
+            if not moved:
+                current = staff.by_id(row.id)
+                if (current is None or isinstance(current.worktree, staff.WorktreeUnfilled)
+                        or current.worktree.path.expanduser().resolve() != movement.destination
+                        or (movement.destination.exists() and isinstance(movement.branch, str)
+                            and unit_move.git(movement.destination, "branch", "--show-current") != movement.branch)):
+                    print("unchanged")
+                    return request
+            changed = moved or changed
+        row = rename_owner(row, request.name)
         print("done" if changed else "unchanged")
         return request
 

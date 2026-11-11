@@ -118,10 +118,7 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
 
 
 def unit_branch(row: staff.StaffRow, resolver: session_staff.RowResolver) -> session_staff.Branch | session_staff.BranchUnreadable | session_staff.LocationUnfilled | session_staff.RetiredFactsUnavailable:
-    """Read the parked branch first, then use the staff location."""
-    parked = unit_config.read_parked(row.id, cleanup=False)
-    if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
-        return session_staff.Branch(parked.retired.branch.value)
+    """Read the branch from staff or the current Git worktree."""
     return resolver.unit_branch(row)
 
 
@@ -532,9 +529,9 @@ def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tup
             raise LifecycleStop("retire", "held", f"{unit.name}: the staff row has no director session for retirement")
         else:
             retirement = unit_config.RetiredSession(datetime.now(production.zone).date().isoformat(),
-                                                   unit.member.current_session, unit_config.Branch(unit.branch))
+                                                   unit.member.current_session)
         if unit.worktree.exists():
-            if isinstance(location, staff.RemovedWorktree):
+            if isinstance(location, staff.RemovedWorktree) and not isinstance(location.branch, staff.ParkedBranch):
                 raise LifecycleStop("retire", "held", f"{unit.name}: removed worktree path is occupied")
             require_untracked_ignored(unit.worktree, ".unit.toml")
             actual = checked(unit.worktree, "retire", "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -627,12 +624,12 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             held = True
             continue
         _ = unit_config.park(unit.member.id, unit.worktree, item.retirement)
+        _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree, staff.ParkedBranch(unit.branch)),
+                               expected=unit.member.worktree)
         if unit.worktree.exists():
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
             report("retire", "ok", f"removed {unit.name} worktree")
-        _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree),
-                               expected=unit.member.worktree)
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
             if not branch_is_landed(production.checkout, unit.branch, production.merge_branch):
                 raise LifecycleStop("retire", "held", f"{unit.branch} has work absent from {production.merge_branch}")

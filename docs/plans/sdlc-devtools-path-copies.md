@@ -19,9 +19,9 @@ The staff row owns the current unit folder. Other records must use the staff ide
 | Rename journal, deleted | No new record | Removed from `production/rename_unit.py` | Staff supplies the folder |
 | Transfer journal, deleted | No new record | Removed from `production/transfer_unit.py` | Staff supplies the unit and parent |
 | Production rename unit moves, deleted | No folder fields in new or rewritten journals | `production/rename.py:unit` | Recovery takes the current folder from staff |
-| Folder move journal, deleted | No new record | Removed in Phase 4v | The move reads the current staff worktree |
+| Folder move journal, removed | No journal | `production/unit_move.py` uses a native Git lock with only the staff id | Recovery reads staff, Git, and the explicit destination |
 | Units table | production document: `Worktree` | `add_unit`, `resume_unit`, `rename_unit`, `unit_move`, `production_units` | compatibility readers and display; location readers already use staff |
-| Unit start facts | `.unit.toml`: `retired.folder` | `production/unit_config.py` | `resume_unit`, `retire_unit`, `production_lifecycle`, `staff_sources`; readers now use staff |
+| Parked retirement facts | Parked TOML: `retired.date`, `retired.session` | `production/unit_config.py` | Folder readers use staff; branch readers use `RemovedWorktree.branch` |
 | Retirement note | Units Plan cell: `folder` in the retired note | `production/retire_unit.py:retired_note` | former retirement recovery readers; these now use staff |
 | Showrunner promotion journal | promotion journal: `worktree` | `production/promote_showrunner.py` | promotion recovery |
 | Showrunner launch receipt | Legacy `add_showrunner.json`: `cwd` | Removed from `production/add_showrunner.py` | Launch recovery uses the owner and session identities |
@@ -46,9 +46,13 @@ The staff row owns the current unit folder. Other records must use the staff ide
 
 Shutdown records omit unit `cwd` and checkout `path`. Their parser joins session ids to staff and supplies runtime paths.
 
-Retirement records omit `retired.folder` and the note's `folder`. Resume finds transcripts by session id and uses the staff worktree.
+Parked retirement records omit `retired.folder` and `retired.branch`. Staff retains the parked branch in `RemovedWorktree.branch`.
 
-Rename and transfer no longer write journals. Rename changes the staff name, moves the folder, renames the Git branch, and sets displays.
+Resume finds transcripts by session id and uses the staff worktree. The deploy migration converts old parked files once.
+
+Unit rename and transfer no longer write journals. Rename sets displays, moves the folder, renames the Git branch, and changes the staff name.
+
+Folder moves read the explicit destination and the current staff folder. A native Git lock retains only the fixed staff id during recovery.
 
 Transfer changes the staff parent, sends the member its new production name, and reconciles the tab. It moves no Units row.
 
