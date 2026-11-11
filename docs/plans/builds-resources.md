@@ -1921,53 +1921,21 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 ### Phase 88 — The hana CI margin key goes after the runner activation  · status: done
 
-**Depends on:** Phase 100, queue's 10d (landed 2026-11-10, e9fe34ff1), natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
+#### As-built
 
-**Answers (2026-11-11):**
-- Runner activation: builds reported at 08:03 EST that the user ran `restart_admission_socket.sh`. The socket is `natepiano:build-admission 0660`, the admission health check is valid, and `hana-linux-1` and `hana-linux-2` connect.
-- Key deletion: the user, via builds: "yes — delete the hana CI memory margin key ci_memory_margin_gib."
-
-#### Work Order
-
-**Goal:** A registered CI job is charged only through its reservation. The fixed CI margin is gone.
-
-**Spec:**
-
-1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
-2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:77`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
-   The readers of the room's `ci_keep_aside` lose their CI keep-aside text: `scripts/build_queue/queue_evidence.py` (lines 118 and 223-224) and `scripts/build_queue/memory_feed.py` (lines 555 and 828).
-   `memory_feed.py` line 556 prints `CI builds do not wait in the queue yet.` Remove that line, because the runner activation makes it false.
-   The key also leaves the test fixture `scripts/lint/fixtures/build_admission.conf` (line 17).
-3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
-4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove or change the tests of the mixed rule only with an approved assertion change. Three modules hold such tests:
-   - `scripts/lint/test_memory_admit.py`.
-   - `scripts/build_queue/test_queue_evidence.py`: `test_release_advice_retains_the_running_ci_keep_aside` (line 481) expects the running CI margin to keep the head held and the room to fall from 15 GiB to 8 GiB.
-   - `scripts/build_queue/test_queue_view.py`: `test_running_ci_names_its_keep_aside_in_the_view_and_card` (line 609) expects `CI keep-aside 7.0 GiB` in the view and the card.
-
-   No test covers the `hana CI` page text. Add one test in `scripts/build_queue/test_memory_feed.py` with a registered and an unregistered CI job: each job counts once, and the page has no `CI builds do not wait in the queue yet.` line and no CI margin text.
+- Admission keeps no fixed CI margin. `ci_memory_margin_gib` is gone from `config/build_admission.conf` and `scripts/lint/fixtures/build_admission.conf`; `AdmissionPolicy` has no `ci_memory_margin_bytes`; `CIKeepAside`, `MemoryRoom.ci_keep_aside`, `memory_admit.ci_keep_aside` and `NO_CI_KEEP_ASIDE` are gone.
+- Room is free memory minus safety minus run keep-asides. A registered CI job counts in its run reservation. An unregistered CI job counts once, through its live use in the cap. A CI job the cargo front cannot cover has no keep-aside; `MemoryMax=34G` is its limit.
+- The queue view, the queue card and the build memory page show no CI keep-aside. The page has no `ci_kept` or `shown_ci_kept` field and no `CI builds do not wait in the queue yet.` line.
+- The deletion followed the runner activation (both hana Linux runners connect to the admission socket) and the user's approval of the key deletion, both on 2026-11-11.
 
 **Files:**
-- `config/build_admission.conf`
-- `scripts/build_queue/admission_records.py`
-- `scripts/lint/memory_admit.py`
-- `scripts/lint/test_memory_admit.py`
-- `scripts/build_queue/test_queue_evidence.py`
-- `scripts/build_queue/queue_evidence.py`
-- `scripts/build_queue/memory_feed.py`
-- `scripts/build_queue/test_queue_view.py`
-- `scripts/build_queue/test_memory_feed.py`
-- `scripts/lint/fixtures/build_admission.conf`
-- `docs/as-built/build-memory-admission.md`
+- `scripts/lint/memory_admit.py` — the room calculation.
+- `scripts/build_queue/admission_records.py` — policy and room records.
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html` — queue and page text with no CI keep-aside.
+- `docs/as-built/build-memory-admission.md` — the room calculation and the 34 GiB limit.
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_memory_feed.py` — room, release advice, view and page rows; the page test covers zero, one and two registered jobs.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `config/build_admission.conf`, `admission_records.py`, `memory_admit.py`, `queue_evidence.py`, `memory_feed.py` and the as-built doc.
-- `test` owns `test_memory_admit.py`, `test_queue_evidence.py`, `test_queue_view.py`, `test_memory_feed.py` and `scripts/lint/fixtures/build_admission.conf`.
-
-**Gate:** the targeted test; `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_view.py` and `scripts/build_queue/test_memory_feed.py` pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
-
-**Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
-
-Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6058`).
+**Gotchas:** the reader ignores the old key in a live config and the old fields in saved records, so no migration runs.
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
