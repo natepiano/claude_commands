@@ -52,6 +52,7 @@ A new account's "All Standard Spot Instance Requests" quota (`L-34B43A08`) defau
 The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 
 - `RegionFloor` allows only `us-east-1`, `us-east-2` and `us-west-2`. The policy denies most actions in `us-east-1`, the Pricing API included. Use `us-east-2`, and read prices from the public AWS price pages.
+- The region policy is `AdvancedModeRegionRestrictionSecurityControlPolicy`. It had a `UsWest2Partitional` statement that denied EC2 in `us-west-2`. The user removed it on 2026-11-11 for the gate fallback region. `RegionFloor` and `UsEast1Partitional` remain.
 - No policy denies Spot. Activation removed the Paid Plan policy. A `run-instances --dry-run` with `MarketType=spot` in `us-east-2` succeeded on 2026-11-03.
 - The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
 - The four `BudgetsSpendLimit*` policies must have no target. In the Organizations console, open each policy's Targets tab, and detach the project account if it is listed.
