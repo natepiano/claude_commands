@@ -1,11 +1,10 @@
-"""Chart calculations and shared build-page links over isolated history."""
+"""Chart calculations over isolated history."""
 
 from __future__ import annotations
 
 import os
 import sys
 import unittest
-import webbrowser
 from contextlib import closing
 from io import StringIO
 from datetime import UTC, datetime, timedelta
@@ -16,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 
 from scripts.lib import conf
-from scripts.buildlog import charts, cli, costs, index, moments, record
+from scripts.buildlog import charts, costs, index, moments, record
 from scripts.buildlog import test_moments as fixtures
 from scripts.buildlog.test_holds import hold_event
 from scripts.buildlog.test_index import Record, call, ci_job, ci_run
@@ -435,10 +434,6 @@ class ChartTests(ChartFixture):
                                        if (r.machine, r.cause) == (row.machine, row.cause)), row.seconds)
 
 
-    def test_invalid_cli_window_never_opens_the_index(self) -> None:
-        with mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
-            self.assertEqual(charts.main(["--days", "8"]), 2)
-
     def test_absent_mac_coverage_keeps_candidate_waits_unknown_in_both_views(self) -> None:
         with closing(self.fixture.connection(
             call("eligible", mac="declined", mac_reason="busy", mac_s=0.0),
@@ -527,141 +522,3 @@ class ChartTests(ChartFixture):
             "at": event.at.timestamp()*1000, "name": "zone marker", "scope": "all",
             "local": event.at.strftime("%b %d %H:%M UTC"),
         }])
-
-
-class ChartOpenTests(ChartFixture):
-    LINK: str = "http://100.100.100.100:8765/build/memory_live.html"
-
-    def link_command(self, stdout: str | bytes, *, stderr: str = "", status: int = 0) -> Path:
-        command = self.fixture.fixture.root / "shared-link.py"
-        output = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
-        _ = command.write_text(
-            "import sys\nassert sys.argv[1:] == ['link'], sys.argv\n"
-            + f"sys.stdout.buffer.write({output!r})\nsys.stderr.write({stderr!r})\nraise SystemExit({status})\n")
-        _ = self.enterContext(mock.patch.object(charts, "MEMORY_FEED", command))
-        return command
-
-    def check_link(self, environment: dict[str, str], *, browser_opens: bool,
-                   args: tuple[str, ...] = (), url: str = LINK,
-                   browser_result: bool | OSError | webbrowser.Error = True) -> str:
-        root = self.fixture.fixture.root
-        _ = self.link_command(url + "\n")
-        before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
-        output, errors = StringIO(), StringIO()
-        browser = (mock.Mock(return_value=browser_result) if isinstance(browser_result, bool)
-                   else mock.Mock(side_effect=browser_result))
-        settings = {name: value for name, value in os.environ.items()
-                    if name not in ("SSH_CONNECTION", "DISPLAY", "WAYLAND_DISPLAY", "BUILDLOG_CHARTS_NO_OPEN")}
-        settings.update({"XDG_CACHE_HOME": str(root / "cache"), **environment})
-        with mock.patch.dict(os.environ, settings, clear=True), \
-             mock.patch("scripts.buildlog.charts.sys.platform", "linux"), \
-             mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors), \
-             mock.patch.object(webbrowser, "open", browser), \
-             mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
-            self.assertEqual(cli.main(["charts", *args]), 0)
-        self.assertEqual(output.getvalue(), url + "\n")
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual({path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}, before)
-        if browser_opens:
-            browser.assert_called_once_with(url)
-        else:
-            browser.assert_not_called()
-        return output.getvalue()
-
-    def test_cli_prints_the_shared_link_without_writing_a_page(self) -> None:
-        for args, url in (((), self.LINK), (("--days", "7"), self.LINK),
-                          (("--days", "30", "--no-open"), self.LINK.replace("http:", "https:"))):
-            with self.subTest(args=args, url=url):
-                _ = self.check_link({}, browser_opens=False, args=args, url=url)
-
-    def test_local_display_excludes_every_ssh_session(self) -> None:
-        cases: tuple[tuple[dict[str, str], str, bool], ...] = (
-            ({}, "darwin", True), ({}, "linux", False),
-            ({"DISPLAY": ":1"}, "linux", True), ({"WAYLAND_DISPLAY": "wayland-0"}, "linux", True),
-            ({"DISPLAY": "", "WAYLAND_DISPLAY": ""}, "linux", False),
-            ({"SSH_CONNECTION": "client 1 server 2"}, "darwin", False),
-            ({"SSH_CONNECTION": ""}, "darwin", False),
-            ({"SSH_CONNECTION": "client 1 server 2", "DISPLAY": ":1"}, "linux", False),
-            ({"SSH_CONNECTION": "client 1 server 2", "WAYLAND_DISPLAY": "wayland-0"}, "linux", False),
-            ({"SSH_CONNECTION": "client 1 server 2", "DISPLAY": ":1"}, "darwin", False),
-        )
-        for environment, platform, expected in cases:
-            with self.subTest(environment=environment, platform=platform):
-                self.assertEqual(charts.local_display(environment, platform), expected)
-
-    def test_local_display_opens_the_printed_link(self) -> None:
-        _ = self.check_link({"DISPLAY": ":1"}, browser_opens=True)
-
-    def test_sessions_without_a_local_display_print_the_link_without_opening(self) -> None:
-        for environment in ({}, {"SSH_CONNECTION": "client 1 server 2", "DISPLAY": ":1"}):
-            with self.subTest(environment=environment):
-                _ = self.check_link(environment, browser_opens=False)
-
-    def test_browser_failures_preserve_the_printed_link(self) -> None:
-        for result in (False, OSError("browser unavailable"), webbrowser.Error("browser unavailable")):
-            with self.subTest(result=result):
-                _ = self.check_link({"DISPLAY": ":1"}, browser_opens=True, browser_result=result)
-
-    def test_no_open_controls_print_only_the_link(self) -> None:
-        for args, environment in ((("--no-open",), {}), ((), {"BUILDLOG_CHARTS_NO_OPEN": "1"})):
-            with self.subTest(args=args, environment=environment):
-                _ = self.check_link({"DISPLAY": ":1", **environment}, browser_opens=False, args=args)
-
-    def test_repeated_runs_print_the_same_link(self) -> None:
-        first = self.check_link({}, browser_opens=False, args=("--no-open",))
-        second = self.check_link({}, browser_opens=False, args=("--no-open",))
-        self.assertEqual(first, second)
-
-    def test_failed_link_command_prints_its_reason_and_exits_nonzero(self) -> None:
-        _ = self.link_command(self.LINK + "\n", stderr="shared page unavailable\n", status=7)
-        output, errors = StringIO(), StringIO()
-        with mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors), \
-             mock.patch.object(webbrowser, "open") as browser:
-            self.assertEqual(charts.main([]), 1)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(errors.getvalue(), "buildlog charts: shared page unavailable\n")
-        browser.assert_not_called()
-
-    def test_missing_link_command_prints_one_reason_and_exits_nonzero(self) -> None:
-        command = self.link_command(self.LINK)
-        command.unlink()
-        output, errors = StringIO(), StringIO()
-        with mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors):
-            self.assertEqual(charts.main(["--no-open"]), 1)
-        self.assertEqual(output.getvalue(), "")
-        self.assertIn(str(command), errors.getvalue())
-        self.assertTrue(errors.getvalue().startswith("buildlog charts: "))
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertNotIn("Traceback", errors.getvalue())
-
-    def test_link_command_requires_one_http_or_https_url(self) -> None:
-        cases: tuple[tuple[str, str | bytes], ...] = (
-            ("empty", ""), ("text", "no link"), ("file", "file:///tmp/page.html"),
-            ("missing_host", "http:///missing-host"), ("empty_host", "http://:8765"),
-            ("invalid_ipv6", "http://[bad"), ("two_lines", self.LINK + "\n" + self.LINK),
-            ("two_urls", self.LINK + " " + self.LINK),
-            ("bad_port", "https://example.com:bad/build"),
-            ("out_of_range_port", "https://example.com:99999/build"),
-            ("nul", "https://example.com/build\x00"), ("invalid_utf8", b"\xff"),
-        )
-        for name, stdout in cases:
-            with self.subTest(name=name):
-                _ = self.link_command(stdout)
-                output, errors = StringIO(), StringIO()
-                with mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors):
-                    self.assertEqual(charts.main(["--no-open"]), 1)
-                self.assertEqual(output.getvalue(), "")
-                if isinstance(stdout, bytes):
-                    self.assertTrue(errors.getvalue().startswith("buildlog charts: "))
-                    self.assertIn("can't decode byte 0xff", errors.getvalue())
-                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                    self.assertNotIn("Traceback", errors.getvalue())
-                else:
-                    self.assertEqual(errors.getvalue(), "buildlog charts: link command did not return one http/https URL\n")
-
-    def test_link_command_without_stderr_names_its_exit_status(self) -> None:
-        _ = self.link_command("", status=9)
-        errors = StringIO()
-        with mock.patch.object(sys, "stderr", errors):
-            self.assertEqual(charts.main(["--no-open"]), 1)
-        self.assertEqual(errors.getvalue(), "buildlog charts: link command exited 9\n")
