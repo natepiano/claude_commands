@@ -34,7 +34,7 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -295,6 +295,7 @@ def _config_digest() -> str:
         text = (models_registry.launch_configuration(os.environ).text
                 if os.environ.get(models_registry.OPERATION_ENVIRONMENT[0]) else models_registry.registry_text())
         registry = text.encode("utf-8")
+        conf_reads.record(_config_path().stem)
         contents = registry + _config_path().read_bytes()
     except (OSError, ValueError, UnicodeError):
         return ""
@@ -1515,6 +1516,29 @@ def _claim_run_pointer(owner: staff.StaffRow, session_dir: Path) -> None:
     _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
 
 
+def _assign_unit_plan(member: staff.StaffRow | unit_runs.RunOwnerUnrecorded | None, working_dir: Path, plan_doc: str) -> None:
+    """Name the plan in a unit's `.unit.toml`; other owners have no unit config."""
+    if isinstance(member, staff.StaffRow) and member.kind == "unit":
+        unit_config.set_plan(working_dir, plan_history.resolve_plan_path(working_dir, plan_doc).relative_to(working_dir))
+
+
+def _record_plan(session_dir: Path, state: dict[str, object], plan_doc: str) -> dict[str, object]:
+    """Point a reused run at the plan its start-run names; the same plan changes nothing."""
+    working_dir = Path(_string(state.get("working_dir"))).resolve()
+    recorded = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
+    wanted = plan_history.resolve_plan_path(working_dir, plan_doc)
+    if recorded and plan_history.resolve_plan_path(working_dir, recorded) == wanted:
+        return state
+    _assign_unit_plan(unit_runs.run_owner(state, staff.initial_snapshot()), working_dir, plan_doc)
+    timing = _explicit_plan_timing(working_dir, plan_doc, plan_history.now_epoch())
+    state["plan_doc"] = plan_doc
+    state["project_started_at"] = timing["started_at"]
+    state["project_start_source"] = timing["source"]
+    state["project_plan_doc"] = timing["plan_doc"]
+    _write_state(session_dir, state)
+    return state
+
+
 def _start_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     existing = _state_path(session_dir)
@@ -1524,6 +1548,8 @@ def _start_run(args: argparse.Namespace) -> None:
             _read_state(session_dir),
             plan_history.now_epoch(),
         )
+        if plan_doc := _arg_string(args, "plan_doc"):
+            state = _record_plan(session_dir, state, plan_doc)
         print(_string(state.get("history_file"), str(existing)))
         return
 
@@ -1546,10 +1572,8 @@ def _start_run(args: argparse.Namespace) -> None:
         short_hash = _git_value(working_dir, "rev-parse", "--short", "HEAD")
         branch = f"detached@{short_hash or 'unknown'}"
     plan_doc = _arg_string(args, "plan_doc")
-    member = record.by_member_reference(main_agent["session_id"])
-    if plan_doc and member is not None and member.kind == "unit":
-        plan = plan_history.resolve_plan_path(working_dir, plan_doc).relative_to(working_dir)
-        unit_config.set_plan(working_dir, plan)
+    if plan_doc:
+        _assign_unit_plan(record.by_member_reference(main_agent["session_id"]), working_dir, plan_doc)
     project_timing = _resolve_project_timing(working_dir, branch, plan_doc, now)
     history_file = plan_history.history_root() / "runs" / f"{run_id}.jsonl"
     state: dict[str, object] = {

@@ -56,7 +56,12 @@ LOOKUP_STATUS=0
 export VERIFY_LINT_VERSIONS_FILE="$PACKAGE_ROOT/direct-lint-versions"
 export VERIFY_LINT_RUSTFMT_VERSION_FILE="$PACKAGE_ROOT/direct-rustfmt-version"
 rm -f "$VERIFY_LINT_VERSIONS_FILE" "$VERIFY_LINT_RUSTFMT_VERSION_FILE"
-LINT_LOADED_CODE_KEY="$(lint_code_key)"
+LINT_LOADED_CODE_KEY="$(
+    if [[ -n "${TEST_CODE_KEY_READ_LOG:-}" ]]; then
+        CONF_READ_LOG="$TEST_CODE_KEY_READ_LOG"
+    fi
+    lint_code_key
+)"
 if cache_lookup; then
     exit "$LOOKUP_STATUS"
 fi
@@ -99,7 +104,11 @@ exit "$EXIT_STATUS"
                 self.assertTrue(self.clippy_ran())
 
     def test_mend_version_invalidates_passes_and_failures(self) -> None:
+        reads = self.root / "config-reads"
+        _ = reads.write_text("")
+        self.environment["TEST_CODE_KEY_READ_LOG"] = str(reads)
         self.check_version_change("MEND")
+        self.assertIn(self.config.stem, reads.read_text().splitlines())
 
     def test_rustfmt_version_invalidates_passes_and_failures(self) -> None:
         self.check_version_change("RUSTFMT")

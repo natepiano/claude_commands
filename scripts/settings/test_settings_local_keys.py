@@ -94,7 +94,7 @@ class SettingsFilterTests(unittest.TestCase):
             (self.root / folder).mkdir(parents=True)
         for source in KEYS.parent.glob("*.sh"):
             _ = shutil.copy2(source, self.root / "scripts/settings" / source.name)
-        for name in ("conf.sh", "conf.py", "conf_reads.py", "atomic_file.py", "py"):
+        for name in ("conf.sh", "conf_record.sh", "conf.py", "conf_reads.py", "atomic_file.py", "py"):
             _ = shutil.copy2(KEYS.parents[1] / "lib" / name, self.root / "scripts/lib" / name)
         for name in ("settings", "send", "postmaster", "codex_daemon"):
             source = KEYS.parents[2] / "config" / f"{name}.conf"

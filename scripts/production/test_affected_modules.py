@@ -114,7 +114,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertIn("unreadable index", result.reason)
         self.write("config/limits.conf", "value=one\n")
         (self.repo / "scripts/checks/test_new.py").unlink()
-        with mock.patch.object(affected, "latest_config_reads", side_effect=AssertionError("No config changed")):
+        with mock.patch.object(affected, "latest_module_reads", side_effect=AssertionError("No config changed")):
             _ = affected.select_affected(self.repo, self.base, self.modules[:-1], set())
 
     def test_config_selection_skips_a_newer_full_gate_without_config_records(self) -> None:
@@ -132,6 +132,76 @@ class AffectedModulesTests(unittest.TestCase):
         _ = log.write_text("".join(json.dumps(row) + "\n" for row in (recorded, unrecorded)))
         self.write("config/limits.conf", "value=two\n")
         self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
+
+    def test_folder_records_select_added_changed_and_removed_paths(self) -> None:
+        self.add_test("production/test_staff_accessors.py", "VALUE = 1\n")
+        self.add_test("checks/test_folder.py", "VALUE = 1\n")
+        self.write("scripts/component/seed.txt", "base\n")
+        self.write("assets/kept.txt", "base\n")
+        self.write("docs/kept.txt", "base\n")
+        cases: tuple[tuple[str, str, object, bool, tuple[str, ...]], ...] = (
+            ("added accessor", "scripts/component/new_accessor.py", [], False, ("test_staff_accessors.py",)),
+            ("removed file", "assets/removed.txt", ["assets"], True, ("test_folder.py",)),
+            ("removed directory", "assets/old/only.txt", ["assets"], True, ("test_folder.py",)),
+            ("changed file", "assets/changed.txt", ["assets"], False, ()),
+            ("changed recursive file", "scripts/component/seed.txt", ["scripts/"], False, ("test_folder.py",)),
+            ("changed config", "config/limits.conf", ["config"], False, ()),
+            ("new directory", "docs/new/deep/page.md", ["docs"], False, ("test_folder.py",)),
+            ("unlisted directory", "other/place.txt", [], False, ()),
+            ("recursive boundary", "scripts-extra/file.txt", ["scripts/"], False, ()),
+            ("null record", "other/unknown.txt", None, False, ("test_folder.py",)),
+            ("repository prefix", "other/all.txt", ["/"], False, ("test_folder.py",)),
+        )
+        for label, path, folders, removed, expected in cases:
+            with self.subTest(case=label):
+                if removed or label in {"changed file", "changed recursive file", "changed config"}:
+                    self.write(path, "base\n")
+                self.certify()
+                log = self.repo / ".git/buildlog/mac/fixture.jsonl"
+                run = cast(dict[str, object], json.loads(log.read_text()))
+                module_rows = cast(list[dict[str, object]], run["modules"])
+                for row in module_rows:
+                    row["folder_scans"] = (["scripts/", "commands/", "docs/"]
+                                           if row["module"] == "test_staff_accessors.py" and label == "added accessor"
+                                           else folders if row["module"] == "test_folder.py" else [])
+                _ = log.write_text(json.dumps(run) + "\n")
+                if removed:
+                    (self.repo / path).unlink()
+                    if label == "removed directory":
+                        (self.repo / path).parent.rmdir()
+                else:
+                    self.write(path, "from scripts.production import staff\n" if label == "added accessor" else "changed\n")
+                _ = self.commit()
+                self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
+
+    def test_folder_and_config_records_use_independent_latest_full_gates(self) -> None:
+        self.write("config/limits.conf", "value=one\n")
+        self.write("assets/kept.txt", "base\n")
+        self.add_test("checks/test_config.py", "VALUE = 1\n")
+        self.add_test("checks/test_folder.py", "VALUE = 1\n")
+        self.add_test("checks/test_unrecorded.py", "VALUE = 1\n")
+        self.certify()
+        self.record_configs({"test_config.py": ["limits"]})
+        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
+        config_gate = cast(dict[str, object], json.loads(log.read_text()))
+        config_rows = cast(list[dict[str, object]], config_gate["modules"])
+        folder_rows = [{key: value for key, value in row.items() if key != "config_reads"} for row in config_rows]
+        for row in folder_rows:
+            row["folder_scans"] = ["assets"] if row["module"] == "test_folder.py" else []
+            if row["module"] == "test_unrecorded.py":
+                row["folder_scans"] = None
+        folder_gate = {**config_gate, "id": "folder-full", "started_at": "2030-01-01T00:00:00Z", "modules": folder_rows}
+        empty_gate = {**folder_gate, "id": "newer-no-records", "started_at": "2031-01-01T00:00:00Z",
+                      "modules": [{key: value for key, value in row.items() if key != "folder_scans"} for row in folder_rows]}
+        for selection, aborted in (("full", True), ("affected", False)):
+            ignored = {**folder_gate, "id": "ignored", "started_at": "2032-01-01T00:00:00Z",
+                       "selection": selection, "aborted": aborted,
+                       "modules": [{**row, "folder_scans": ["/"]} for row in folder_rows]}
+            _ = log.write_text("".join(json.dumps(run) + "\n" for run in (config_gate, folder_gate, empty_gate, ignored)))
+            self.write("config/limits.conf", "value=two\n")
+            self.write("assets/new.txt", "added\n")
+            self.assertEqual({module.name for module in self.selection().modules},
+                             {"test_config.py", "test_folder.py", "test_unrecorded.py"})
 
     def test_landing_bases_exclude_changes_that_already_passed_the_merge_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")

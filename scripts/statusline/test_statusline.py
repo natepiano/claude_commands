@@ -484,7 +484,8 @@ class RoleTests(unittest.TestCase):
     def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
         seed_rebuild_cache(self.home)
-        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **marks}
+        read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **read_log, **marks}
         result = subprocess.run(
             [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
             check=True, env=env, cwd=self.home,
@@ -506,12 +507,18 @@ class RoleTests(unittest.TestCase):
     def test_reset_times_take_the_zone_from_the_setting_and_its_label(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
         payload = limits({"used_percentage": 95, "resets_at": reset}, {"used_percentage": 60})
-        conf = self.home / "user_zone.conf"
+        conf = self.home / "override-zone.conf"
         _ = conf.write_text("# the user's zone\nzone=America/Curacao\n", encoding="utf-8")
-        for shell in SHELLS:
-            with self.subTest(shell=shell):
-                line = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf))[1]
+        reads = self.home / "config-reads"
+        for shell in (*SHELLS, shutil.which("dash")):
+            with self.subTest(shell=shell or "dash unavailable"):
+                if shell is None:
+                    self.skipTest("dash is not on PATH")
+                _ = reads.write_text("")
+                line = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf), CONF_READ_LOG=str(reads))[1]
                 self.assertIn("5-hour \x1b[91m5% left\x1b[0m until 08:00 AST", line)
+                self.assertIn("statusline", reads.read_text().splitlines())
+                self.assertIn(conf.stem, reads.read_text().splitlines())
                 pinned = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf),
                                             USER_ZONE="Europe/Paris")[1]
                 self.assertIn("until 13:00 CET", pinned)

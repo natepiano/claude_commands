@@ -884,16 +884,18 @@ class WorkerCommandTests(unittest.TestCase):
                         session_dir=self.run_dir, slot="impl", phase="8", kind="impl", launcher_command=["assign.sh", str(following)],
                         reply=self.reply)
                 if failure:
-                    self.assertEqual(result, worker.ExitCode.UNCERTAIN)
-                    self.assertEqual(len(self.agent.submitted), before)
+                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                    self.assertEqual(len(self.agent.submitted), before + 1)
                     self.assertIn(failure, errors.getvalue())
+                    self.assertIn(f"{name}: compaction failed:", errors.getvalue())
+                    self.assertIn("prompt is sent without compaction", errors.getvalue())
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
                     self.assertNotIn("prompt delivered to pane", errors.getvalue())
-                    continue
                 self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                 reopened = self.agent.submitted[-1][0]
                 self.assertNotEqual(reopened, pane)
                 self.assertEqual(self.agent.row(reopened).current_session, row.current_session)
-                expected = [(reopened, before)] if tokens > 43000 else []
+                expected = [(reopened, before)] if tokens > 43000 and not failure else []
                 self.assertEqual(self.agent.compactions, expected)
                 self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
                 self.agent.compactions.clear()
@@ -1566,7 +1568,9 @@ class WorkerCommandTests(unittest.TestCase):
                                     assert isinstance(result, worker_panes.OpenWorker)
                                     return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed", result.created_pane)
                                 _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=incomplete))
-                            elif failure == "target":
+                            elif failure in ("target", "compact"):
+                                if failure == "compact":
+                                    _ = patches.enter_context(patch.object(worker, "_compact_before_dispatch", side_effect=OSError("TEST compact failed")))
                                 check = cast(Callable[..., bool], herdr.check_target)
                                 def refuse(*arguments: object, **options: object) -> bool:
                                     return False if options.get("action") == "keys" and options.get("text") else check(*arguments, **options)
@@ -1593,8 +1597,6 @@ class WorkerCommandTests(unittest.TestCase):
                                     result = start(*arguments, **options)
                                     return replace(result, status=herdr.AgentStatus.UNKNOWN) if isinstance(result, worker_panes.OpenWorker) else result
                                 _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=busy))
-                            elif failure == "compact":
-                                _ = patches.enter_context(patch.object(worker, "_compact_before_dispatch", side_effect=OSError("TEST compact failed")))
                             if failure in ("recorder", "delivery"):
                                 with case.assertRaisesRegex((OSError, ValueError), "TEST .* failed"):
                                     case.assertIsInstance(case.dispatch(), worker.ExitCode)
@@ -1603,6 +1605,9 @@ class WorkerCommandTests(unittest.TestCase):
                                 case.assertEqual(code, worker.ExitCode.REFUSED if failure == "dispatch id" else
                                                  worker.ExitCode.BUSY if failure == "busy" else worker.ExitCode.UNCERTAIN)
                         case.assertEqual(case.agent.submitted, [])
+                        if failure == "compact":
+                            case.assertIn("TEST compact failed; prompt is sent without compaction", errors.getvalue())
+                            case.assertIn("dispatch target is unproved", errors.getvalue())
                         if existing:
                             case.assertEqual(staff.snapshot().rows, before[0])
                             case.assertEqual(set(case.fixture.world.locations), before[1])

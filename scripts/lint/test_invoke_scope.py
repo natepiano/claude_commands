@@ -156,7 +156,12 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
     def test_absent_key_uses_default_silently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = write_lint_config(Path(directory), 650, include_adjustment=False)
-            self.assert_readers(config, 500, warns=False)
+            override = config.rename(config.with_name("override.conf"))
+            reads = Path(directory) / "config-reads"
+            _ = reads.write_text("")
+            with patch.dict(os.environ, {"CONF_READ_LOG": str(reads)}):
+                self.assert_readers(override, 500, warns=False)
+            self.assertEqual(reads.read_text().splitlines(), [override.stem])
 
     def test_python_reader_recovers_committed_values_and_refuses_without_history(self) -> None:
         from scripts.lint.memory_test_support import commit_config_fixture
