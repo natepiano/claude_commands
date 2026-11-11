@@ -2802,35 +2802,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 139 — Find where the fast-track test module spends its CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** A measured report names where `production/test_fast_track.py` (median 48.2 CPU s, 52 tests) spends its CPU, and which changes save CPU with the same tests.
+- Research only; no repository file changed. `production/test_fast_track.py` measures 45.7 CPU s, 8,618 processes and 52 tests at `bcda46a2e`. Git commands use 13.9 CPU s in 7,703 starts; repeated setup uses 1.0 CPU s.
+- The module is at its Git floor. devtools-unit owns the Git read path.
 
-**Decision:** Director, 2026-11-11: the next module in the descending sort after the Phase 137 module, whose change waits on sdlc lands. Research first, as in Phases 133 and 137. Savings may join across modules, so the report also names each candidate that reaches other modules.
+**Gotchas:** One local pair on natedev can vary by more than 10 CPU s. Check process and exec counts before trusting a local saving.
 
-**Spec:**
-1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
-2. Name each fixed cost: interpreter starts, imports, real sleeps or wait intervals, subprocess trees, repeated setup.
-3. Measure one local pair for each candidate change in a scratch copy, and one pair for the candidates together. A test that proves a process boundary keeps its process.
-4. For each candidate in shared code, count the other test modules it reaches.
-5. Name the owning unit of each file a change would touch.
-6. Edit no repository file.
-
-**Files:**
-- `scripts/production/test_fast_track.py` — read only.
-
-**Workers:** 1 writer; research only.
-- impl: the report.
-
-**Constraints from prior phases:**
-- Phase 137: a recorder start costs about 0.22 CPU s, and Phase 138 defers recorder and staff imports. Do not count that saving again here.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report at `phases/139/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
-
-**Result:** No change. Baseline 45.7 CPU s, 8,618 processes, 52 tests; Git commands use 13.9 CPU s in 7,703 starts, and repeated setup uses 1.0 CPU s. Direct fixture calls and retained immutable Git reads each measured slower alone (-2.6 and -4.9 CPU s); together they removed only 16 of 8,618 processes, so the 10.1 and 13.0 CPU s combined readings are host noise. The module is at its Git floor; devtools-unit owns the Git read path.
+**Ruled out:** direct fixture calls (-2.6 CPU s alone); retained immutable Git reads (-4.9 CPU s alone); both together remove only 16 of 8,618 processes.
 
 ### Phase 140 — Find where the style sync test module spends its CPU  · status: todo
 **Depends on:** none
