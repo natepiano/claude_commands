@@ -713,7 +713,7 @@ The user approved aws-unit's design on 2026-11-08. Builds moved it to report, wh
 3. **Cause (checked 2026-11-09).** `ssh -G mac` shows `ServerAliveInterval 15` and `ServerAliveCountMax 3`, set under `Host *` on both machines, so a dead outbound link ends in 45 s. `ConnectTimeout` has no shared value. The 13:40 hang ran inbound: the Mac opened ssh to natedev, and `floor_claims.py` held `state.lock` in `sys.stdin.read()`. Nothing on natedev checks that an inbound client is alive. The stdin wait is an inference from the code, because the process and its journal are gone.
 4. **Lock (verify).** Verify's phase 42c, tip `e990e8be7`, releases the lock before the print and removes the stdin wait. Queue adds no lock code.
 5. **One place for link bounds (natedev).** `ConnectTimeout 10` goes under `Host *` in `/etc/nixos/modules/linux/ssh.nix` and `modules/darwin/ssh.nix`. Natedev removes the per-call value in `rebuild.nix` and `remote-desktop.nix`.
-6. **Callers outside `scripts/mac_test` (queue).** Remove `-o ConnectTimeout` and `-o ServerAlive*`. Keep each whole-call limit and `BatchMode`. Delete the two config keys that set the same bound, `codex_update_connect_timeout_seconds` and `role_map_connect_timeout_seconds`. `scripts/buildlog/sync.py` chooses its options by destination host, from `sync.hosts.mac` and `sync.hosts.natedev`, so an AWS destination keeps its connect option. Land only after item 5 is live on natedev.
+6. **Callers outside `scripts/mac_test` (queue).** Remove `-o ConnectTimeout` and `-o ServerAlive*`. Keep each whole-call limit and `BatchMode`. Delete the two config keys that set the same bound, `codex_update_connect_timeout_seconds` and `role_map_connect_timeout_seconds`. The user approved the deletion through builds on 2026-11-10. `scripts/buildlog/sync.py` chooses its options by destination host, from `sync.hosts.mac` and `sync.hosts.natedev`, so an AWS destination keeps its connect option. Land only after item 5 is live on natedev.
 7. **Callers in `scripts/mac_test` (verify).** The same removal, on top of 42c (tip `e990e8be7`), after queue tells verify that the shared `ConnectTimeout` is live.
 8. **Inbound check (queue).** The check listed each command the Mac runs on natedev. Besides `floor_claims.py`, one command held a lock while it waited on the link: `staff.py apply-seed` read stdin inside the staff operation lock. It now reads stdin before it takes the lock. An offload `mirror-receive` holds its mirror lease across the rsync pipe only when natedev is the target, which the loopback proof alone does.
 9. **Retained remote claims stay.** A claim stays while the Mac is off and frees `claim_idle_minutes` after the Mac returns, with no person. Verify found that the 1 h 52 min wait was the same held `state.lock` as the 13:40 case, from 13:34:30 to about 15:52:38, so no claim change is necessary.
@@ -1881,6 +1881,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - `scripts/direct/verify_step_routes_test_support.py` — Extend compiling-step placement fixtures.
 - `scripts/mac_test/offload_test_support.py` — pinned placement fixture setup
 - `scripts/direct/verify_mac_offload_test_support.py` — pinned placement fixture setup
+- `scripts/direct/test_verify_lint_local_writes.py` — pinned local repair rows
 - `docs/as-built/build-memory-admission.md` — Document the placement, retry, identity, and recovery contracts.
 - `docs/as-built/mac-test-offload.md` — Document assigned offload execution and provider-owned cleanup.
 
@@ -1911,7 +1912,7 @@ Use the following deploy procedure:
 
 1. Prepare `deploy_convert.py` outside the repository in the director’s Phase 44 record folder.
 2. Prove conversion against private copies of admission state and provider records.
-3. Drain old verify shells, offload adapters, copy watchers, and manual claim commands.
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py hold --drain --for 'Phase 44 deploy'` (Phase 44b). Continue only on exit 0 and a last line `drained`. Keep the hold until step 12 ends. The drain covers verify.sh, merge_gate.py and targeted_test.py only: drain standalone offload adapters, copy watchers and manual claim commands separately.
 4. Prevent new launches through their units, timers, sockets, and supervising directors.
 5. Stop `build-admission.service`, `build-admission.socket`, and `build-memory-feed.service`.
 6. Keep their activation sources disabled or runtime-masked throughout conversion and installation.
@@ -1961,6 +1962,9 @@ A root-owned service stops and starts only by the user or under a sudo rule that
    Gate routing remains Phase 45 work.
 8. Correct accounting and Machine labels ship with each converted path.
    Phase 46 cannot defer these corrections.
+9. Phase 44b (on builds before this checkpoint) made `build_targets.hold_waited_on` skip a hold whose keep list holds the caller or an ancestor. It reads that lineage from `os.getpid()`.
+   The admission service calls it for a requester (`admission_service._read_host_evidence`), so it reads the service's lineage. Merge builds, then pass the checked requesting process's lineage, with semantic confirmed and unavailable states.
+   Include the requesting process identity in the cached hold decision. Test a kept descendant, an unrelated caller of the same session, a reused pid, and two holds.
 
 9. These files are read only in this phase: `admission_code.py`, `claim_state.py`, `copies.py`, `linux_runner.py`, `target_config.py`, `store.py` and `config/`.
    `claim_state.py` keeps its stored claim shape.
@@ -2062,13 +2066,72 @@ Contact no live service, session, Mac, or AWS account.
 32. **Caller coverage:** Exercise test, check, build, doc, example, lint, and `final` through converted paths.
     Exercise direct offload and fixed local shared lint callers.
 
+### Phase 44a — The queue page shows the AWS costs that matter most  · status: todo
+**Depends on:** the aws-unit change that removes the `aws` build target and makes `aws_section` stop needing it: commit `1b1fa1842`, on builds since 2026-11-10. Starts after Phase 44. Ordered by builds 2026-11-10 from the user's request: "tell queue i want it to build an aws costs pane into its html page and surface the costs that are most important to me". The Work Order follows at phase start; ask aws-unit about any ledger field.
+
+The pane leads with these, in this order:
+1. Yesterday's real AWS charge, and today so far against the daily cap (`daily_limit_usd` in `config/aws_target.conf`).
+2. Month to date against the monthly cap.
+3. Where the spend goes: full merge gates against targeted tests, by unit, and the cost of one gate.
+4. Fixed costs that run with no gates, such as the gate image snapshot and other kept gate resources.
+
+Rules (public repository):
+1. Show no AWS account id, instance id, subnet, volume, snapshot or ARN.
+2. Show no cost-ledger `recipient` field and no notification email.
+3. Make no AWS call from the page. Read only the saved ledger and bill records (`scripts/buildlog/report.py` `aws_section` reads them now).
+
+Also in this phase, approved by the user through builds 2026-11-10: the memory page row "worker background runs" becomes "unowned processes". Change the group name in `scripts/build_queue/memory_feed.py` (line 893 on main) and its text in `scripts/build_queue/memory_live.html` (line 446 on main, "Worker background runs hold this memory outside the build queue.").
+
+**Workers:** 1 writer + 1 tester.
+- Writer: the saved cost projection, `memory_feed.py` and `memory_live.html`.
+- Tester: cost fixtures, public-data exclusions, missing-data behavior, and the group label.
+
+### Phase 44b — One hold command drains natedev for a service deploy  · status: done
+
+#### As-built
+
+- `build_hold.py hold --drain [--for <purpose>] [--keep <pid>]` sets the hold, then stops each live verify.sh, merge_gate.py and targeted_test.py run that waits: no cargo child, no admission reservation, no live Mac or AWS claim. `hold` without `--drain` is unchanged.
+- A stop checks the process start time from discovery. For a detached run it checks the `detached_runs.py supervise` argv structure (script name, `supervise`, record path resolved against the supervisor's cwd) and signals the run group through `send_process_group`. A changed identity is skipped and named.
+- `detached_runs.stop_with_reason` writes the stop reason, rechecks identity, and signals or removes the reason in one `record_lock` section. The worker's result reads "stopped for <purpose>; run again after the release" only when the signal was sent.
+- The drain records each stopped run and registers its owner (`audit_owner`) before TERM, with `stop_status` "stopped" or "not_stopped". Release sends each stopped owner one notice; a second release sends none. `step_record.consume_stopped_build` counts only "stopped".
+- After the stops it waits for working runs, names each with owner and age, prints a heartbeat each 60 s, and ends with `drained`, exit 0. INT ends the wait and keeps the hold. Only the outermost gate in each process family counts (verify.sh forks subshells).
+- `build_targets.caller_waits_on_hold(holds, directory)` is the one start-check question. `hold_waited_on` skips the caller's own hold and a hold whose keep list holds the caller or an ancestor; it reads the caller lineage once per check. A kept caller and its children pass every start check; status and report readers show every hold in force.
+
+**Files:**
+- `scripts/build_hold/build_hold.py`, `hold_enforcer.py`, `hold_applies.py` — drain, stop record, start check
+- `scripts/agents/detached_runs.py` — stop reason under `record_lock`
+- `scripts/build_targets/build_targets.py` — `hold_waited_on`, `caller_waits_on_hold`
+- `scripts/direct/step_record.py` — stopped-build consumption
+- `scripts/production/merge_gate.py:472` — one-line start check
+- `commands/build/hold.md` — drain usage
+- Tests: `test_build_hold.py`, `test_hold_enforcer.py`, `test_hold_applies.py`, `test_detached_runs.py`, `test_build_targets.py`, `test_step_record.py`
+
+**Binds later work:** a deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert and continues only on `drained`. The drain covers verify.sh, merge_gate.py and targeted_test.py only. `hold_waited_on` reads the keep lineage from `os.getpid()`, so a caller in another process must pass the requester's lineage. `holds_only_own`, `caller_holds_only_own` and `holds_apply_to_caller` are gone.
+
+**Gotchas:** never take `record_lock` twice in one process: `flock` on a second open file blocks the same process. The deploy stop script keeps its own refusal as the last guard.
+
 ### Phase 45 — Merge gates take their route from the queue  · status: todo
-**Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first and keep its selection lines before the `cloud.route` call. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
+**Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner before this phase edits `merge_gate.py`, because natest phase 119 changed `run_gate_suites`. Phase 119 is at 14581684f on builds-natest: merge builds first, keep its selection lines before the `cloud.route` call, and keep its empty-selection result. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
 
 **Constraints from 10g (architect review of 10g, 2026-11-10).** aws-unit's repair is commit `0ab15ffc4` (on builds and main): it keeps `GateLaunchPending` after an uncertain launch and adds reconciliation tests. Build on it and keep its tests through the scaler cutover. Reuse Phase 44's completion and retry contract and its claim ownership and deploy constraints (Phase 44 items 3 to 5).
 
+**Constraints from 44b (architect review of 44b, 2026-11-10).**
+1. The hold check at `merge_gate.py:472` is `build_targets.caller_waits_on_hold(holds, directory)`; `caller_holds_only_own` is gone. Keep this check when gate routing moves to the queue.
+2. Keep Phase 44 constraint 9: a hold decision uses the checked requesting process's lineage, never the service's.
+3. The deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert, as Phase 44 deploy step 3 does.
+
+**Workers:** 2 writers.
+- Queue writer: placement types, protocol, service policy, and their tests.
+- Adapter writer: `merge_gate.py`, `cloud_gate.py`, and their route and lifecycle tests.
+
 ### Phase 46 — Every view names the machine a step runs on, and the old route code is gone  · status: todo
 **Depends on:** 45. Checkpoint 4 of section 8 in `docs/plans/builds-queue-placement.md`. The Work Order follows at phase start. It switches the remaining readers first and deletes the old selectors only after their last caller switches. Phase 44 item 4 (claim ownership) applies.
+
+**Constraints from 44b.** The hold-policy helpers in `build_targets.py` (`hold_waited_on`, `caller_waits_on_hold`) are not host selectors: keep them. Status and report readers keep the complete list of holds in force. The deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert.
+
+**Workers:** 1 writer + 1 tester.
+- Writer: the remaining readers, and deletion of the old selectors after their last caller switches.
+- Tester: reader coverage, Machine labels, restart behavior, and lost-authorization cases.
 
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 
