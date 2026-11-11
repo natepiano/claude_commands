@@ -54,7 +54,7 @@ from scripts.style.style_ledger import publication_lock, publication_path
 from scripts.style import approved_renames
 from scripts.style import style_footprint
 from scripts.style import style_proposals
-from scripts.production.issues import Issue, frontmatter, open_issues
+from scripts.production.issues import Issue, frontmatter
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
 from scripts.production.proposal_issue import ApprovedDecision, decision_answer, require_generated_body
@@ -2706,27 +2706,24 @@ def _select_phase(
         if not folder.is_absolute():
             folder = doc.parent.parent / folder
         decisions = tuple(issue for issue in style_proposals.approved_decisions(folder, ledger.unit_name(unit))
-                          if (definition := definitions.get(issue.value("style_rule"))) is None
-                          or definition.family in families)
-        decisions += tuple(issue for issue in open_issues(folder, "style")
-                           if style_proposals.is_decision(issue)
-                           and isinstance(decision_answer(issue), ApprovedDecision)
-                           and issue.value("style_rule") not in definitions)
+                          if (definition := definitions.get(style_ledger.base_rule(issue.value("style_rule")))) is not None
+                          and definition.family in families)
     def decision_members(issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
-        definition = definitions.get(frontmatter(issue).get("style_rule", [""])[0])
+        definition = definitions.get(style_ledger.base_rule(frontmatter(issue).get("style_rule", [""])[0]))
         if definition is None or definition.family not in families:
             return ()
         return tuple(finding for finding in _unbuilt_findings(ledger, issue)
-                     if (member_rule := definitions.get(finding.rule)) is not None
+                     if (member_rule := definitions.get(style_ledger.base_rule(finding.rule))) is not None
                      and member_rule.family == definition.family)
 
-    unbuilt = {issue.path: decision_members(issue.path) for issue in decisions if issue.value("style_rule") in definitions}
+    unbuilt = {issue.path: decision_members(issue.path) for issue in decisions
+               if style_ledger.base_rule(issue.value("style_rule")) in definitions}
     if selection != FamilySelection.OWN:
         for issue in decisions:
             findings = unbuilt.get(issue.path, ())
             current = tuple(finding for finding in findings if not style_ledger.rule_changed_since_judged(finding, definitions))
             refusals["all stale"] += len(findings) - len(current)
-            definition = definitions.get(issue.value("style_rule"))
+            definition = definitions.get(style_ledger.base_rule(issue.value("style_rule")))
             unbuilt[issue.path] = current if definition is not None and definition.family in families else ()
             refusals["held by build ticket"] += sum(
                 isinstance(finding.state, style_ledger.Filed) and isinstance(finding.build_ticket, style_ledger.BuildTicket)
@@ -2900,7 +2897,7 @@ def _select_phase(
         print(waits[path].line())
     for issue in decisions:
         rule = issue.value("style_rule")
-        definition = definitions.get(rule)
+        definition = definitions.get(style_ledger.base_rule(rule))
         if definition is None:
             print(f"waiting {issue.path}: rule {rule} not in the catalog")
             continue
