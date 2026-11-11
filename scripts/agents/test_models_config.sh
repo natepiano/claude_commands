@@ -9,6 +9,7 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 
 export HOME="$TEST_DIR/home"
 mkdir -p "$HOME"
+export CLAUDE_CONFIG_DIR="$TEST_DIR/claude-config"
 
 MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
 MODELS_CONFIG_PUBLISH=0
@@ -347,6 +348,71 @@ EOF
         [[ "$cache_state" != unreadable ]] || chmod 600 "$CODEX_MODELS_CACHE_FILE"
     done
     rm -f "$CODEX_MODELS_CACHE_FILE"
+
+    for catalog_case in at-minimum above-minimum below-minimum no-catalog newest-catalog \
+        null-minimum absent-minimum missing-target malformed-catalog; do
+        for word in fable opus sonnet haiku; do
+            export CLAUDE_CONFIG_DIR="$TEST_DIR/claude-$catalog_case-$word"
+            catalog_dir="$CLAUDE_CONFIG_DIR/cache/model-catalog"
+            mkdir -p "$catalog_dir" "$CLAUDE_CONFIG_DIR/bin"
+            cat > "$CLAUDE_CONFIG_DIR/bin/claude" <<'EOF'
+#!/bin/sh
+printf '%s (Claude Code)\n' "$TEST_CLAUDE_VERSION"
+EOF
+            chmod +x "$CLAUDE_CONFIG_DIR/bin/claude"
+            export TEST_CLAUDE_VERSION=2.1.319
+            minimum='"2.1.319"'
+            target="claude-$word-fixture-current"
+            expected_model="$target"
+            case "$catalog_case" in
+                above-minimum) TEST_CLAUDE_VERSION=2.1.1000 ;;
+                below-minimum) TEST_CLAUDE_VERSION=2.1.99; expected_model="$word" ;;
+                no-catalog|missing-target|malformed-catalog) expected_model="$word" ;;
+                null-minimum) minimum=null; TEST_CLAUDE_VERSION=1.0.0 ;;
+                absent-minimum) minimum=null; TEST_CLAUDE_VERSION=1.0.0 ;;
+            esac
+            write_test_registry "$MODELS_CONFIG_FILE" --replace-provided-sections \
+                assignments/launch=claude \
+                "launch.claude/work=$word:high" \
+                "claude.agents/$word=low,medium,high,max" \
+                "claude.families/$word=$word"
+            if [[ "$catalog_case" != no-catalog ]]; then
+                jq -n --arg word "$word" --arg target "$target" --argjson minimum "$minimum" \
+                    --arg catalog_case "$catalog_case" '
+                    {fetchedAt: 2000, catalog: {config: {
+                        provider_alias_targets: {($word): {default: $target}},
+                        models: [
+                            {id: "claude-unrelated-fixture", min_claude_code_version: "999.0.0"},
+                            ({id: $target, min_claude_code_version: $minimum}
+                             | if $catalog_case == "absent-minimum" then del(.min_claude_code_version) else . end)
+                        ]
+                    }}}' > "$catalog_dir/a-current-cc.json"
+            fi
+            if [[ "$catalog_case" == newest-catalog ]]; then
+                jq --arg word "$word" --arg target "claude-$word-fixture-old" '
+                    .fetchedAt = 1000
+                    | .catalog.config.provider_alias_targets[$word].default = $target
+                    | .catalog.config.models = [{id: $target}]' \
+                    "$catalog_dir/a-current-cc.json" > "$catalog_dir/z-old-cc.json"
+                jq '.fetchedAt = 3000' "$catalog_dir/z-old-cc.json" > "$catalog_dir/newest-web.json"
+            fi
+            if [[ "$catalog_case" == missing-target ]]; then
+                jq --arg word "$word" 'del(.catalog.config.provider_alias_targets[$word])' \
+                    "$catalog_dir/a-current-cc.json" > "$catalog_dir/without-target.json"
+                mv "$catalog_dir/without-target.json" "$catalog_dir/a-current-cc.json"
+            elif [[ "$catalog_case" == malformed-catalog ]]; then
+                printf '%s\n' '{invalid' > "$catalog_dir/a-current-cc.json"
+            fi
+            PATH="$CLAUDE_CONFIG_DIR/bin:$PATH" agents_resolve launch.work \
+                || fail "$catalog_case: $word did not resolve"
+            [[ "$AGENT_FAMILY" == claude && "$AGENT_MODEL" == "$word" && "$AGENT_EFFORT" == high ]] \
+                || fail "$catalog_case: $word did not preserve its family word and effort"
+            resolved_model="$(PATH="$CLAUDE_CONFIG_DIR/bin:$PATH" _agents_model_slug claude "$AGENT_MODEL")" \
+                || fail "$catalog_case: $word did not resolve at launch"
+            [[ "$resolved_model" == "$expected_model" ]] \
+                || fail "$catalog_case: $word resolved to $resolved_model; expected $expected_model"
+        done
+    done
     echo "models_config model-family tests passed"
 )
 

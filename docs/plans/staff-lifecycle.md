@@ -18,6 +18,9 @@ Every unit cuts its staff and lifecycle code to this page. A phase in this work 
 | `worktree` | Machine and folder for a unit or producer. | Folder move, rename. |
 | `doc` | Machine and document for a showrunner or producer. | Document move. |
 | `home` | Account configuration folder. | Account selection or proved process evidence. |
+| `run` | The open run folder, or no run. | Run start, reopen, or finish. |
+| `paused` | The session pause state. | Pause or resume. |
+| `exited` | The session exit state. | Exit or resume. |
 
 A producer has no parent and can start a staff path.
 Morty, brain, and dwight use kind `producer`.

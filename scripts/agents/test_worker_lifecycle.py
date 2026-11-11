@@ -208,7 +208,9 @@ class RunEvidenceTests(unittest.TestCase):
             path = Path(folder) / STATE_FILE
             for value, expected in (({}, ""), ({"status": "ended"}, ""),
                     ({"status": "ended", "finished_at": "now"}, "ended"),
-                    ({"status": "active", "finished_at": "now"}, "")):
+                    ({"status": "custom-outcome", "finished_at": "now"}, "custom-outcome"),
+                    ({"status": "", "finished_at": "now"}, ""),
+                    ({"status": 1, "finished_at": "now"}, "")):
                 with self.subTest(value=value):
                     _ = path.write_text(json.dumps(value))
                     self.assertEqual(worker_lifecycle.finished_run_status(folder), expected)

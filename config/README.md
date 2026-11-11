@@ -810,20 +810,44 @@ The folder uses task `gate:aws-routing-proof`.
 The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 
-`deploy.py gate-trial` reads these keys when it uses them:
+Paired trials use the installed scaler service and the existing `cloud_gate.conf` settings.
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one box for all rounds.
+All module boxes run concurrently.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The command reserves the full trial cost before it permits any launch.
+A refused launch never uses a local runner.
 
-| Key | Value | Reason |
-| --- | --- | --- |
-| `gate_trial_size_reserve_usd` | `4` | Limit the spend of the size step. |
-| `gate_trial_start_reserve_usd` | `3` | Limit the spend of the start step. |
-| `gate_trial_lifetime_minutes` | `30` | Set the guest shutdown time and the attempt deadline. |
-| `gate_trial_url_lifetime_s` | `7200` | Keep presigned URLs valid through a stop and start. |
-| `gate_trial_target_gate_s` | `420` | Select the cheapest size that meets the 7-minute goal. |
-| `gate_trial_default_sizes` | `8,16,32,64` | Set the vCPU sizes of the size step. |
-| `gate_trial_size_runs` | `3` | Set the attempts for each size. |
-| `gate_trial_start_runs` | `5` | Set the attempts of the start step. |
-| `gate_trial_poll_pause_s` | `2` | Set the pause between state and result reads. |
-| `gate_trial_group_delete_wait_s` | `120` | Limit the security group delete retries. |
+Stdout contains JSON lines: each run, each module summary, and the final cost.
+Progress goes to stderr.
+The final line has `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate uses each box's rate, minimum billed seconds, lifetime, allowance, and new bill-query fees.
+Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
+The paired trial adds no settings.
+
+The paired trial replaces the size/start trials.
+The following settings are removed:
+
+1. `gate_trial_size_reserve_usd`.
+1. `gate_trial_start_reserve_usd`.
+1. `gate_trial_lifetime_minutes`.
+1. `gate_trial_url_lifetime_s`.
+1. `gate_trial_target_gate_s`.
+1. `gate_trial_module_limit_s`.
+1. `gate_trial_default_sizes`.
+1. `gate_trial_size_runs`.
+1. `gate_trial_start_runs`.
+1. `gate_trial_poll_pause_s`.
+1. `gate_trial_log_push_s`.
+1. `gate_trial_group_delete_wait_s`.
+
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.
 `deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.

@@ -154,7 +154,7 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str]) -> str:
     arguments = [binary, "--bg", "--name", turn.name, "--dangerously-skip-permissions", "--settings",
                  json.dumps({"sandbox": {"enabled": False}, "env": models_registry.agent_environment(settings)})]
     if turn.model:
-        arguments += ["--model", turn.model]
+        arguments += ["--model", models_registry.claude_model(turn.model, loaded.env)]
     if turn.effort:
         arguments += ["--effort", turn.effort]
     start_env = models_registry.agent_environment(loaded.env)

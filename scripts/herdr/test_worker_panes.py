@@ -31,12 +31,14 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import models_registry, process_start, unit_runs
 from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.direct import progress_history
 from scripts.agents import detached_run_process
+
+LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 
 
 @final
@@ -264,6 +266,36 @@ class PaneWorld(herdr.Herdr):
                     herdr.PaneSessionReport(process.identity.id), process.started, process.environment)
         info = herdr.json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"), "fixture processes")
         return herdr.pane_native_process(info, kind, self.locations[pane])
+
+    def launch_through_herdr(self, name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                            prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
+                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                            reported_unknown: str = "",
+                            agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+        """Use the real command builder with the private pane transport."""
+        server_result = self.result
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("pane", "split"):
+                number = 1 + max((int(pane.split(":p")[-1]) for pane in self.used_panes
+                                  if pane.split(":p")[-1].isdigit()), default=0)
+                return {"pane": {"pane_id": "w1:p" + str(number)}}
+            return server_result(*arguments, deadline=deadline)
+
+        def start(session: str, pane: str, family: str, arguments: list[str],
+                  prompt: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *,
+                  agent: str) -> herdr.PromptSubmitOutcome | herdr.PromptSubmissionNotRequired:
+            launched = self.launch(session, destination, prepared, family, arguments, prompt, timeout,
+                                   agent=agent, agent_name=agent_name)
+            if launched.pane != pane:
+                raise AssertionError(f"fixture started {launched.pane}; expected {pane}")
+            return launched.outcome
+
+        with (patch.object(self, "result", side_effect=result), patch.object(self, "run_in_pane"),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(herdr, "start_agent", side_effect=start)):
+            return LAUNCH_PREPARED_AGENT(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
+                agent=agent, reported_unknown=reported_unknown, agent_name=agent_name)
 
     def launch(self, name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
@@ -664,6 +696,21 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(),
                         runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
                 prompt.assert_not_called()
+
+        for live in (True, False):
+            with self.subTest(cause="idle worker has no active dispatch", live=live):
+                idle = self.worker("idle-restore-" + str(live))
+                pane = "w1:p-idle-" + str(live)
+                self.world.add(idle, pane, live=live)
+                launches = list(self.world.launches)
+                with patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt:
+                    self.assertEqual(worker.restore(self.parent.id, record=staff.snapshot(), only=frozenset({idle.id}),
+                        runs={str(self.parent.current_session): [str(self.root / "run")]}), worker.ExitCode.OK)
+                prompt.assert_not_called()
+                self.assertNotIn(pane, self.world.locations)
+                self.assertIn((pane, "terminal-" + pane), self.world.closed)
+                self.assertEqual(self.world.launches, launches)
+                self.assertEqual(staff.by_id(idle.id), idle)
 
     def test_restore_checks_the_transcript_before_offering_an_unsubmitted_assignment(self) -> None:
         from scripts.production import worker
@@ -1114,6 +1161,30 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.locations, locations)
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.stops, [])
+
+        selected_home = self.root / "selected-claude"
+        caller = claude_catalog_environment(self.root / "caller-claude", {"opus": "claude-opus-caller-fixture"})
+        _ = claude_catalog_environment(selected_home, {"opus": "claude-opus-reuse-fixture"})
+        policy = worker_panes.worker_policy(models_registry.LaunchSettings("claude", "opus", "high", ""))
+        selected = accounts.NamedAccount("claude2", selected_home)
+        for status in ("idle", "working"):
+            with (self.subTest(status=status, policy="explicit"), patch.dict(os.environ, caller),
+                  patch.object(herdr, "launch_prepared_agent", side_effect=self.world.launch_through_herdr)):
+                name = staff.WorkerName.parse("catalog-" + status)
+                opened = worker_panes.start_or_resume(self.parent.id, name, "impl", account=selected, policy=policy)
+                self.assertIsInstance(opened, worker_panes.OpenWorker)
+                assert isinstance(opened, worker_panes.OpenWorker)
+                arguments = self.world.foreground[opened.pane][2]
+                self.assertEqual(arguments[arguments.index("--model") + 1], "claude-opus-reuse-fixture")
+                if status == "idle":
+                    self.completed_dispatch(opened.row, "impl")
+                else:
+                    self.dispatch(opened.row, "impl")
+                self.world.locations[opened.pane]["agent_status"] = status
+                before = self.staff_state(), len(self.world.launches), self.world.stops.copy(), self.world.closed.copy()
+                repeated = worker_panes.start_or_resume(self.parent.id, name, "impl", account=selected, policy=policy)
+                self.assertEqual(repeated, replace(opened, status=herdr.AgentStatus(status)))
+                self.assertEqual((self.staff_state(), len(self.world.launches), self.world.stops, self.world.closed), before)
 
     def test_open_worker_follows_its_family_account_in_the_same_pane(self) -> None:
         for family in ("codex", "claude"):
@@ -2321,6 +2392,9 @@ class WorkerPaneTests(StaffTestCase):
                     claude_role.assert_not_called()
 
     def test_typed_account_selections_reach_their_launch_homes_without_label_resolution(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, claude_catalog_environment(
+            self.root / "caller-claude", {"opus": "claude-opus-caller-fixture"}))))
+        _ = claude_catalog_environment(self.root / ".claude", {"opus": "claude-opus-selected-fixture"})
         for family in ("codex", "claude"):
             with self.subTest(family=family):
                 _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
@@ -2331,7 +2405,8 @@ class WorkerPaneTests(StaffTestCase):
                 selected = (accounts.CodexWorkersAccount("codex", destination) if family == "codex" else
                             accounts.NamedAccount("claude", destination))
                 with (patch.object(agent_accounts, "codex_account_home", wraps=agent_accounts.codex_account_home) as codex,
-                      patch.object(accounts, "prepare_claude_launch", wraps=accounts.prepare_claude_launch) as claude):
+                      patch.object(accounts, "prepare_claude_launch", wraps=accounts.prepare_claude_launch) as claude,
+                      patch.object(herdr, "launch_prepared_agent", side_effect=self.world.launch_through_herdr)):
                     result = self.start(row.name, account=selected)
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 assert isinstance(result, worker_panes.OpenWorker)
@@ -2339,6 +2414,9 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(result.pane, pane)
                 self.assertEqual(self.world.requests[-1][2]["CODEX_HOME" if family == "codex" else
                                                           "CLAUDE_CONFIG_DIR"], str(destination))
+                if family == "claude":
+                    arguments = self.world.requests[-1][1]
+                    self.assertEqual(arguments[arguments.index("--model") + 1], "claude-opus-selected-fixture")
                 codex.assert_not_called()
                 claude.assert_not_called()
 
@@ -2637,9 +2715,10 @@ class WorkerPaneTests(StaffTestCase):
         run = self.run_state()
         for family in ("codex", "claude"):
             _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
-            for live, busy in ((False, False), (True, False), (True, True)):
-                with self.subTest(family=family, live=live, busy=busy):
-                    name = f"move-{family}-{live}-{busy}"
+            for live, busy, passed in ((False, False, "none"), (True, False, "none"), (True, True, "none"),
+                                       (True, False, "stale active"), (True, False, "completed")):
+                with self.subTest(family=family, live=live, busy=busy, passed=passed):
+                    name = f"move-{family}-{live}-{busy}-{passed.replace(' ', '-')}"
                     if live:
                         opened = self.start(name)
                         assert isinstance(opened, worker_panes.OpenWorker)
@@ -2653,6 +2732,14 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertEqual(row.role, staff.KnownWorkerRole("impl"))
                     if busy:
                         self.world.locations[pane]["agent_status"] = "working"
+                    if passed == "stale active":
+                        self.dispatch(row, "impl")
+                        path = run / "progress_history_state.json"
+                        state = cast(dict[str, object], json.loads(path.read_text()))
+                        cast(dict[str, dict[str, object]], state["pass"])[name]["launcher_command"] = ["assign.sh"]
+                        write_text_atomic(path, json.dumps(state))
+                    elif passed == "completed":
+                        self.completed_dispatch(row, "impl")
                     target = self.root / (family + "2")
                     move = pane_moves.WorkerMove(row, self.parent.id, family, family + "2", "", run, self.world)
                     common = moves.MoveCommon(at="2026-11-09T00:00:00+00:00", tool=family,
@@ -2673,6 +2760,9 @@ class WorkerPaneTests(StaffTestCase):
                           patch.object(worker_panes, "close", wraps=worker_panes.close) as close,
                           patch.object(self.world, "close_tab_confirmed", side_effect=AssertionError("no close check")),
                           patch.object(self.world, "pane_activity", side_effect=AssertionError("no activity check"))):
+                        if passed != "none":
+                            self.assertIsInstance(pane_moves.preview_worker(row, staff.snapshot(), family + "2", "", run),
+                                                  accounts.IdleWorkerPaneClose)
                         result = pane_moves.move_worker(row, staff.snapshot(), family + "2", "", run)
                     if busy:
                         self.assertIsInstance(result, stop_results.ClaudeUp)
