@@ -2,7 +2,14 @@
 
 ## What it is
 
-A phase table shows one unit's current phase with its ETA, and every plan phase with its start and finish, recorded or predicted. The user asked for a phase's ETA and an overview of upcoming phases often enough to want a standing place to read them, kept current by scripts so that no agent re-reads or rewrites a note and its format cannot drift (user, 2026-10-08). `scripts/direct/phase_table.py` rebuilds the table from the events [the recorder](unit-progress-history.md) writes for a unit run. The recorder calls it at every report, and the result is one note per production unit under `showrunners/<showrunner>/<unit session>.md` in the vault. A unit that states an ETA records it as one event in the same stream. [The dailies builder](showrunner-automation.md) asks the same script for every live unit's record, so the chart and the note read the same events.
+A phase table shows one unit's current phase and ETA.
+It also shows each plan phase with recorded or predicted start and finish times.
+The user requested a standing phase overview on 2026-10-08.
+`scripts/direct/phase_table.py` builds it from [the recorder](unit-progress-history.md) events.
+The recorder refreshes one vault note per production unit after each report.
+The note path is `showrunners/<showrunner>/<unit session>.md`.
+A stated ETA enters the same event stream.
+Use [/showrunner:units](../../commands/showrunner/units.md) for the production's unit phases, ETAs, workers, and queued work.
 
 ## How it works
 
@@ -13,10 +20,8 @@ A phase table shows one unit's current phase with its ETA, and every plan phase 
 | `scripts/direct/phase_table.py` | Builds a `PhaseRecord` from run events, renders it as Markdown or JSON, and writes, moves and archives the notes. It writes no event. |
 | `scripts/direct/progress_history.py` | The recorder: the `eta` command, the `eta_stated` event and the note hook. |
 | `scripts/direct/plan_history.py` | The plan and run readers the table and the recorder share. `phase_table` imports it, never `progress_history`; `progress_history` imports `phase_table` only inside function bodies (`_project_chain_eta`, `_phase_eta_line`). |
-| `scripts/production/dailies_input.py` | Calls `show --production-doc` once per build and fills each unit's start and ETA from its record. |
 | `scripts/production/prune_phase_notes.py` | Runs `prune` in-process for every update timer's production; the agent-notes job runs it on the interval in `config/agent_notes.toml`. |
 | `commands/unit/report.md`, `commands/unit/eta.md`, `commands/unit/eta_breakdown.md` | Where a unit reports progress and records a stated ETA. |
-| `commands/showrunner/dailies.md` | The `eta` row of the judgment contract and the meaning of `phase tables: unavailable`. |
 
 ```text
 phase_table.py show    --session-dir <dir> [--zone <IANA>] [--json]
@@ -157,40 +162,17 @@ A run whose plan file was removed, as for ad hoc work after the as-built, writes
 - **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`, with `history_root`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME` and `PlanPhase`. Tests patch `plan_history.now_epoch` for the clock.
 - **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `<ProgressContract>` in `commands/unit/direct.md` records every ETA the unit director states before stating it (`--phase-id` for a phase other than the active one) and states the recorder's printed time. `docs/direct/phase_end.md` step 2 and `docs/production_format.md` item 3 record the next phase's ETA with `--phase-id <next> --basis checkpoint` before the checkpoint notice. `commands/unit/eta.md` records the ETA, range and `--basis eta-command` before the answer is sent, as `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command on every answer, with the bullets' last end time and no range.
 
-### Dailies side
+### Production unit status
 
-[The dailies builder](showrunner-automation.md) (its **ETA** and **Order** bullets) covers the whole build and the renderer. This is the part that reads the records.
-
-```python
-phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesAvailable | PhaseTablesUnavailable
-unit_phase_state(value: object, where: str, zone: ZoneInfo) -> NumberedOpenPlanPhase | NoNumberedOpenPlanPhase
-
-NumberedOpenPlanPhase(number: int, started: datetime,
-    percent: ReportedPhasePercent | PhasePercentNotReported,
-    eta: CurrentStatedPhaseEta | CurrentProjectedPhaseEta | CurrentPhaseEtaUnavailable,
-    first_stated: FirstStatedEtaTarget | EtaNeverStated)
-NoNumberedOpenPlanPhase(reason: NoOpenPhase | OpenPhaseOutsidePlan | NonNumericPhaseId | UnitPhaseRecordUnavailable)
-
-record_clock(moment: datetime, now: datetime) -> str
-record_eta_stated(target: datetime, source: datetime, rendered_time: str) -> datetime
-record_eta_range(target, earliest, latest, source, rendered_time, now) -> RendererSafeRecordEtaRange | RecordEtaRangeOmitted
-```
-
-- **Order.** `run` calls `phase_tables` once, after `units_from_doc`. It writes nothing to the vault. Record times are converted to `Production.zone`.
-- **Which units.** A unit is record-backed when its open phase id is all digits, that phase has a `running` row in `phases`, and its number equals the one in the judgment's phase text (`judgment_phase_number`, `^Phase (\d+) of \d+: `). The record fills an absent `started`, and the ETA unless the judgment's `eta` holds `time` or `none`. Every other unit keeps the status-capture path (`eta_state`, `eta_value`).
-- **State.** `record_eta_state` returns `EtaFresh | EtaStale | EtaPassed | EtaNone` in this order: no ETA and no first target is `EtaNone`; no ETA with a first target is `EtaPassed`; held, unchanged and not already requested is `EtaFresh`; a target at or before the build time is `EtaPassed`; a source time (`stated_at` or `as_of`) over one hour old is `EtaStale`; else `EtaFresh`. It keeps the `eta_seen.json` record under `<unit>|<phase text>` with `text` as the target in `YYYY-MM-DDTHH:MM`. A record whose `text` has another form came from a screen capture and is adopted with its `first_seen` and `requested`.
-- **Value.** `record_eta_value` writes `time` as `record_clock` gives it (`HH:MM`, with `+N` when the target falls N days after the build's date), `stated`, the range, `percent` (the reported percent or `null`), `first` and `fixes` when the record holds a first stated target, and `why`: a stated ETA's `basis` with whitespace collapsed, or `it is now projected from <N>% done`. The judgment's own `eta` fields overwrite these, and a stale ETA gets `detail: set HH:MM` when the judgment gave none.
-- **Renderer fit.** `record_eta_stated` returns the anchor the renderer reads a bare clock against: the source minute, or the target's own minute when `parse_time(rendered_time, source)` would land elsewhere. `record_eta_range` writes `earliest` and `latest` only when the renderer's `parse_range_end` reads both back as the record's minutes; else `RecordEtaRangeOmitted` and neither end is written.
-- **Repair rounds.** The builder's `FirstStatedEtaTarget(time, repair_rounds)` mirrors the record's. `unit_phase_state` reads `repair_rounds_since_first_stated_eta` only when the first target is not `null`, and requires an `int` (not a `bool`) of 0 or more; anything else raises `ValueError("<where>.current.repair_rounds_since_first_stated_eta: expected a whole number from 0")`. `EtaPassed`, `EtaNone` and an unavailable ETA carry no `fixes`.
-- **Parallel check.** For each kept unit, `run` prints `parallel check: <unit>: Phase <N> could start` per id in the record's `parallel.could_start`; a record without `parallel` prints nothing.
-- **Failure.** A failed or unparsable `show`, or a record that fails decoding, prints `phase tables: unavailable — <reason>` and the build continues from the status capture.
+`/showrunner:units` reads unit progress and ETAs from the run records.
+It also shows worker runs, work outside plan phases, and queued work.
+Dailies and their separate ETA judgments were retired on 2026-11-11.
 
 ### Roots and overrides
 
 - `PHASE_TABLE_VAULT`: the vault root (`_vault_root`), default `~/rust/hanadocs/showrunners`.
 - `UNIT_HISTORY_DIR`: the recorder's history root (`_history_root`), default `~/.local/state/unit-history` (`~/.local/state/plan-delegate` until `unit_runs.py move-history` moves it); run files sit in its `runs/`. `UNIT_NOW_EPOCH` replaces the clock (`now_epoch`).
 - `NOTIFIER_STATE_DIR`, `NOTIFIER_SESSIONS_DIR`: where `scripts/production/showrunners.py` finds a showrunner, defaults `~/.local/state/notifier` and `~/.claude/sessions`.
-- `DAILIES_PHASE_TABLE`: the table script the dailies builder calls (`phase_table_path`), default `scripts/direct/phase_table.py`.
 
 ## Invariants
 
@@ -199,24 +181,26 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - No session name is stored. A unit has a fixed staff id; the unit's and the showrunner's names are a file's and a folder's name, looked up again at each write (user, 2026-10-08).
 - Scripts own the note's format. No command file tells an agent to write or edit the note.
 - The events are the authority. The session state file supplies the plan path and nothing else; a phase in state with no `phase_started` event does not exist for the table.
-- Open means started and not finished in the events. It is never proof that the unit's session is alive, and each caller decides liveness: the dailies keep `StatusBlock.state` for it.
+- Open means started and not finished in the events.
+  It does not prove that the unit's session is alive.
+  Each caller decides liveness separately.
 - `refresh` never calls the recorder's CLI and never takes its session lock, which the recorder holds for the whole command the hook runs in.
 - A note is moved, replaced or removed only when its frontmatter carries `phase_table: true`, a `production_file` naming a production doc (or, on an older note, a `production`) and a `unit`. A hand-written file is never changed.
 - `_json_record` is the only JSON form, and nothing stores it. The first stated target has one place in it: `current.first_stated_eta_target`.
 - A state is a named type, never an optional field or a placeholder `datetime`.
 - The production JSON uses the user’s zone setting. The tracked note has no times.
-- In the dailies a judgment value always wins, and a judgment `time` or `none` decides the ETA entirely.
-- A phase-table failure in the dailies reads `unavailable`, never `failed`: `dailies.md` stops the report on a `<step>: failed` line.
-- The dailies builder fits the renderer. `scripts/production/dailies_render.py` is not changed to suit a record.
 - Tests never write to the real vault or state directory: every root has an override, and tests set it.
 
 ## Calibration and gotchas
 
-- The hook's limit is 10 s and each Git call in `refresh` has 5 s. The dailies' stale threshold is one hour, for a stated and a projected ETA alike.
+- The hook's limit is 10 seconds.
+  Each Git call in `refresh` has a 5-second limit.
 - The reader takes a shared lock on each run file and the recorder appends under an exclusive lock on the same file, so a read started while the recorder holds its lock blocks. `plan_runs` reads each run's first line with no lock.
 - `_start_phase` writes session state before it appends `phase_started`. `start-phase` for the phase already active and `finish-phase` with no active phase return before the hook.
 - Recorded history reuses phase numbers and rewords headings. Of 219 recorded phase starts, 177 match a plan heading by id and title, 29 by id only, 1 by title only and 12 not at all (ad hoc and follow-up ids). `_plan_finish` therefore looks at every row, not the last one.
-- A stated ETA that passes stays the stated ETA with its time advanced to now (`source` `stated`), and the passing writes no event: it is computed at read time. The dailies read a target at or before the build time as `EtaPassed`, which asks for a new ETA once. The promise itself stays in `eta_trail`; only scheduling uses the advanced time.
+- A stated ETA that passes keeps its stated source.
+  The reader advances its displayed time to now without writing an event.
+  The original promise stays in `eta_trail`.
 - A stated ETA with no progress report has `current.percent` `null` and stays record-backed. `basis` is never blank and may hold `|` or line breaks. A predicted row's JSON `status` is `todo`; only the Markdown says `predicted`.
 - `show --production-doc` reads neither `--zone` nor `--json`. It turns only an unreadable plan into `unavailable`; an unreadable production doc fails the whole call.
 - An `eta` call reads a typed time in the user's zone setting, never the machine's zone or the process `TZ` (2026-10-12). `HH:MM` means today only; a later-day ETA needs the full date. `eta.md` and `eta_breakdown.md` call the recorder installed under `~/.claude`, so a recorder change reaches them only once it is on main.
@@ -228,7 +212,6 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - The archive sits outside `showrunners/`. Live-note scans use `vault_root.glob("*/*.md")` and do not include archive files.
 - `refresh` deletes, not archives, the older copy of a moved unit's note; the newer note carries the same phases.
 - Repair-round starts go through `_moment` to datetimes, the representation of `stated_at`. A raw float epoch compared against the microsecond-rounded `stated_at` would count an equal-moment round as later.
-- The renderer reads a bare range end on the ETA's own day and moves it at most one day. An end more than a day from its ETA cannot be written, so both ends are left out.
 - **Pruning (2026-10-13; user: "Yes do the part C").** `prune_phase_notes.py` reads each `showrunner-*` folder under `NOTIFIER_STATE_DIR` and takes the production doc from the staff row that the folder's id names; no session record is read, so a stopped showrunner's production is pruned too. It calls `phase_table.prune(doc)` for each, in one process, and uses the standard library alone. A timer with no readable doc, or a prune that raises `Refusal`, `OSError` or `UnicodeError`, prints `phase notes not pruned for <showrunner name>: <reason>` to stderr and the next production still runs; the exit is 1 when any failed. Success prints nothing. `scripts/maintenance/agent_notes_job.py` runs it as its own process with the interval and limit in `config/agent_notes.toml`, so a failure never costs another maintenance part. Natedev owns this job; nothing prunes on the Mac (accepted 2026-10-13: no Mac production needed it). Before this, a dailies pruned, so a production that built none kept its retired units' notes.
 - A live run of `prune_phase_notes.py` archives retired notes in the real vault unless `PHASE_TABLE_VAULT` points elsewhere.
 - The recorder's tests (`scripts/direct/test_progress_history.py`) run `progress_history.main()` in-process through `recorder_fixture.py` and are still among the merge gate's slowest modules; the table suite takes about six seconds. See [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md).
@@ -243,9 +226,6 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - **The first target sits outside `eta`.** `current.eta` alone cannot tell a passed promise from a phase that never stated one. One key carries it, present whether or not `eta` is `null`.
 - **`os.link` for a first write.** Two names that become one path cannot take each other's note.
 - **Stable tracked notes.** Phase changes update notes. Time, ETA, and progress changes do not update notes. Existing content commits carry note changes to the Mac.
-- **A projection writes its own `why`.** The renderer refuses an ETA move of 15 minutes or more with no reason. Refusing the build instead would bring back hand-typed reasons.
-- **The builder checks against the renderer's own parser.** The range and stated-moment rules live in the renderer, so the builder writes only what `parse_range_end` reads back. `RecordEtaRangeOmitted` stays reachable for an end more than a day from its ETA.
-- **Older `eta_seen.json` text is adopted, not parsed.** Adoption keeps `first_seen` and `requested`, so a held unit is not asked twice.
 
 
 ## Recording ETAs and chained predictions

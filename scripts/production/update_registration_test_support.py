@@ -19,12 +19,10 @@ from pathlib import Path
 from typing import ClassVar, TypedDict, cast, override
 
 
-
 from scripts.production import update_registration
 registration = update_registration
 from scripts.production import showrunners as showrunners
 from scripts.production import staff, unit_names
-from scripts.production import dailies_render as dailies_render
 from scripts.production.production_doc import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
@@ -333,7 +331,7 @@ class RegistrationFixture(unittest.TestCase):
             rows = registration.open_entries(read_production("example"), registration.QuestionStaff.read())
             return cast(list[dict[str, str]], cast(object, rows))
 
-    def read_items(self, path: Path | None = None) -> list[dailies_render.Outstanding]:
+    def read_items(self, path: Path | None = None) -> list[registration.Outstanding]:
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             return registration.read_open_items(path or self.outstanding(), document=self.doc)
 
@@ -358,5 +356,5 @@ class RegistrationFixture(unittest.TestCase):
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
               redirect_stdout(io.StringIO()) as output):
-            registration.ask(read_production("example"), text, question, unit, dailies_render.Ranking())
+            registration.ask(read_production("example"), text, question, unit, registration.Ranking())
         return output.getvalue()

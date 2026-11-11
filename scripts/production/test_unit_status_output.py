@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
-from scripts.production.dailies_input import ClaudeNotRunning, Decision, SessionGone, StillWaiting
+from scripts.production.unit_status import ClaudeNotRunning, Decision, SessionGone, StillWaiting
 
 
 class UnitStatusTests(UnitStatusFixture):
@@ -13,7 +13,7 @@ class UnitStatusTests(UnitStatusFixture):
         stated = [line for line in outputs[0].splitlines() if "ETA" in line]
         self.assertEqual(stated, ["Phase ETA: 12:55 EDT", "ETA 11:00", "ETA 10:00 PDT"])
 
-    def test_real_gate_outputs_become_dailies_flags_or_activity(self) -> None:
+    def test_real_gate_outputs_become_status_flags_or_activity(self) -> None:
         gate = "● Choose the release path\n\n— gate: approve the blue path\n"
         outputs, _, _ = self.run_statuses(
             None, "ok", 0,

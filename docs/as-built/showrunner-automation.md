@@ -1,4 +1,4 @@
-# Showrunner automation: unit start, checkpoint merge, lifecycle, updates, dailies and waits
+# Showrunner automation: unit start, checkpoint merge, lifecycle, questions and waits
 
 Codex code reviews use the unit's persistent `review` and `review2` workers through `assign.sh --role review`.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
@@ -36,7 +36,7 @@ Callers share one staff snapshot within an operation.
 
 - **Retired units**: `agents retire NAME` records a completed retirement as a `RemovedWorktree`.
   The row stays in `staff.json` with its fixed identity and parent.
-  Status, the board, dailies, waits, and the stall watch exclude retired units.
+  Status, the board, status reports, waits, and the stall watch exclude retired units.
   `unit_lookup.doc_units(doc, record)` returns every recorded unit in staff order.
   `merge_checkpoint.py`, `ci_points.py`, and `production_lifecycle.py` retain access to retired rows.
   `agents resume NAME` refuses a retired unit and names `--retired`.
@@ -57,12 +57,7 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 - **Merged work.** Git ancestry proves whether a checkpoint reached the merge branch. Git merge bases supply the last shared unit commit. Unit checkpoint records supply CI counts. Unit `phase_started` records supply phase starts. Commit subjects supply no state.
 
-- **Step lines**: each command prints `<step>: ok|held|failed — <one line>` and stops at the first `held` or `failed`. The dailies builder also prints `<step>: unavailable — <reason>` and continues, for the steps `phase tables`, `bevy upgrade`, `children`, `counts` and `saved report`. `add_unit.py`, `production_lifecycle.py`, `update_registration.py`, `ci_points.py`, `waiting.py` and `dailies_input.py` exit 0, or 2 on a refusal. `merge_checkpoint.py` exits 1 on a hold or failure, and its last line is always `send <unit>: <message>`.
-
 - **Named states**: every optional or alternative value crossing a reader boundary is a `NamedTuple` union (`FieldPresent | FieldAbsent`, `PushedTip | NotYetPushed`, `EtaFresh | EtaStale | EtaPassed | EtaNone`, and so on), never a string or `None`.
-
-- **Session state**: `showrunners.session_state_dir(<staff id>)` is `~/.local/state/showrunner/<staff id>/session` (`STATE_DIR` in `produce.md`). It holds `showrunner_state.json`, `dailies_judgment.json`, `dailies_state.json`, `unit_status/` and `dailies_input_state/`, which a scratchpad held before. A new session id, a restart and a reboot keep it; a rename preserves the staff id folder, and a wrap deletes that folder. `showrunners.copy_session_state` copies each of the five that a scratchpad holds and the folder does not; a completed copy never replaces a file. Each copy goes to a temporary sibling first, then moves into place. A rerun discards an incomplete sibling and copies again. It runs with no step by anyone: `update_registration.adopt_moved_state`, which every `update_registration.py` call and every `dailies_input.py` run calls first, looks for the files the folder lacks in the scratchpad of the session the update timer's TARGET names (`/tmp/claude-*/*/<session id>/scratchpad`), and rewrites `prompt.txt` when it differs from what `produce.md` gives now. `load --scratch <SCRATCH>` runs the same copy from a named scratchpad.
-- **State directory**: `DAILIES_STATE_DIR` (`<STATE_DIR>/dailies_input_state`, in `produce.md`'s State list) is the one `--state-dir` for the dailies builder, every stateful `ci_points.py` call and every stateful `waiting.py` call. It holds `eta_seen.json`, `ci_points.json`, `ci_run.json`, `review_watch.json`, `agenda_seen.json` and the scratch-test logs.
 
 ### Unit start: `add_unit.py` and `/showrunner:add_unit`
 
@@ -478,76 +473,13 @@ The caller's working directory stays unchanged.
   The showrunner carries the reviewed text in its reply.
   The [question review design](message-clarity.md#question-review-in-showrunner-replies) defines the review.
 
-### Dailies: `dailies_input.py` and `dailies_render.py`
+### Production status
 
-`dailies_input.py --production <showrunner name> --status <file> --judgment <file> --state-dir <dir> --out <file> --render-state <file> [--length gantt|simple|page|elaborate] [--holders <dir>] [--notifier <path>] [--user-run] [--at <time>]` writes `dailies_input.json` from the saved `unit_status.sh` output plus the showrunner's judgment file. `dailies.md` runs it, then `dailies_render.py <out> --state <render-state> --log <LOG> --outstanding <OUTSTANDING>`. The scheduled prompt saves `<SCRATCH>/unit_status.txt` and runs `/showrunner:dailies gantt`. `--notifier` takes one script path and exists for tests; the default is the `notifier.sh` beside the builder, so `dailies.md` passes none. The call it documented until 2026-10-08, `--notifier <NOTIFIER>`, failed as written: `NOTIFIER` is two words (`zsh …/notifier.sh`), refused by the argument parser unquoted and run as one file name quoted.
-
-- **Units.** `units_from_doc` reads `unit_lookup.doc_units`, so the builder asks for no status block and no judgment for a retired unit. The judgment's `unit` is the staff unit id, never the session's current name; status blocks and phase records join on it. A unit with no readable folder or branch is reported and left out.
-- **Status parse.** Each `== <session>` opens a unit block after the file's timestamp.
-  Unknown sessions, duplicate blocks, missing blocks, and unclosed decision blocks refuse the input.
-  Staff supplies the live unit membership.
-  Parsed states distinguish a missing session, stopped Claude, and running Claude.
-  Form, decision, waiting, block, and usage-limit flags precede activity lines.
-  A form, decision, or waiting flag supplies `needs_user` when the judgment omits it.
-- **Filled by the builder:** `length`, `zone`, each unit's `unit`, a matching numbered open phase's absent `started` and ETA fields, `build_hold` (true for every unit except a holder's own, which gets `holds_builds: true` in its place, while holder files exist in `--holders`, default `~/.local/state/build-hold/`; a judgment that supplies it, or markers and holders that disagree, is refused), the `Review watch` topic (via `ci_points.review_watch`, until the line starts `acknowledged`), the `Bevy upgrade` topic (via `bevy_upgrade_watch`, while [the Bevy upgrade watch](bevy-upgrade.md) is open or its lookup fails), the `Merge branch` topic (only when held, testing or not pushed), and `next_run`. A judgment value wins; an ETA `time` or `none` keeps the record out entirely. The builder names five required judgment fields itself (`project`, `phase`, `started`, `held`, `update`), with `started` satisfied by the matching record; the renderer names the rest. `then` passes through unchanged.
-- **ETA.** `phase_table.py show --production-doc <doc> --json` is called once. Its offset-aware times are converted to the user's zone. A record is used only when its open phase is numeric, has the matching running plan row, and its number equals the judgment's `Phase <N>`; the title and total remain the judgment's. The record supplies the start, ETA, range, percent, first stated target, the repair rounds started since that first statement (`eta.fixes`) and reason, each overwritten by a judgment value, so the pane needs no ETA line. A stated basis is collapsed to one line; a projection says `it is now projected from <N>% done`. Every other case follows the pane path unchanged: `unit_status.sh`'s last three distinct ETA lines, normalized by `in_report_zone`. Both paths finish as `EtaNone | EtaStale | EtaPassed | EtaFresh`; a source over an hour old gets `detail: set HH:MM`, and a stale or passed ETA queues one `request /unit:eta: <unit>` per `<unit>|<phase>`. A held, unchanged ETA stays fresh unless already requested. For a record-backed ETA, `eta_seen.json.text` is its User-zone `YYYY-MM-DDTHH:MM`; the first such build adopts older screen text as unchanged, keeps its `first_seen` and `requested`, and replaces only the text. Screen-backed entries retain the captured line and `also` lines. `requested` survives either path. A timed record also writes `eta.stated` as its stated or projected source minute in the user's zone; `record_eta_stated` substitutes the target minute only when the source would make a bare clock resolve to the wrong day. `record_eta_range` omits both recorded range ends when the renderer would place either on the wrong day. No time means no `stated`.
-- **Order.** The builder reads the production, units, phase tables, and judgment before changing the report state.
-  Unavailable phase data produces a diagnostic and uses the status capture and supplied judgment.
-  The builder then reads holds, review watches, Bevy status, counts, and merge state.
-  It validates the report and render state before restarting the update clock.
-  ETA requests and output writes follow those checks.
-  A refusal preserves the clock, output, and ETA request state.
-  A user-run report restarts `showrunner-<staff id>` and appends its next due time to LOG.
-- **Production counts (2026-10-10).** `dailies_counts.production_counts(staff_id)` reads `config/dailies.conf` (`DAILIES_COUNTS_CONFIG`, else `~/.claude/config/dailies.conf`) and returns the production's `[{"label", "count"}]`, or `{"label", "not_found": true}` for a missing file, a `files` glob whose folder is missing, or a missing issues folder. Each line is `<staff id>.<label>=lines <file> <regex>` (`re.search` per line), `files <glob>` (regular files only) or `issues <folder> <tag>` (open issues directly in the folder whose tags hold the tag, read by `issues.open_issues`), with `~` expanded and the label's hyphens read as spaces. `dailies_input.py` puts a non-empty list in the input as `counts`. On `CountsFailure`, a bad line, it prints `counts: unavailable — dailies.conf line <n>: …` and builds the report without counts. `dailies_render.parse_report` reads `counts` into `ProductionCount(label, number | None)` and refuses a count that is not a whole number of 0 or more. `render` prints `counts: <label> <n> · …` just above the chart in every length.
-- **Renderer state check.** `dailies_render.check_render_state(value, state_path, at=None) -> StateClear | StateRefused(field, why)` wraps the renderer's private `load_state`, `resolve_eta_moments`, `check_changes` and `check_idle`.
-- **`then`.** `parse_upcoming_work` accepts only a non-empty list of one-line items and returns `UpcomingWork(items) | NoUpcomingWork()`. A string, an item chaining phases (`, then `, `; then`, ` then Phase`, any case) and an item with two `Phase <N>:` heads are refused, naming the item's index. Each item passes `check_words` and `check_then_order` (a leading `<N>:` or `<N>–<M>:` label is this plan's phase even when the item names another plan's doc). A follow-up needs an item naming `the plan at Phase <N>` or `plan done`; a last phase needs the list. `simple` prints `- then: <first item>`; `page` and `elaborate` print each item as `  - <item>` under `- then:`; a single item stays on the `- then:` line.
-- **One ETA moment.** `Previous = LastUnitReport(phase, eta: LastReportedEta(text, moment) | NoLastReportedEta, held, first) | NoLastUnitReport`. `resolve_eta_moment` reads a time that names no day on the day it was stated, before anything else: `parse_time(time, eta.stated)`, where `stated` is the builder's anchor: a screen line's `first_seen`, or for a record the source or the corrective target minute described above (2026-10-08). The stated moment comes before the last report's because the same clock stated again a day later is a new time: kept on the equal text, an Oct 6 16:00 target resolved to Oct 5 and read as unchanged and overdue. With no `stated` (an input written by hand) or a `+N` time, it keeps the last moment when the ETA text equals the last report's for the same phase (`same_phase` compares titles after `: `, so a renumber keeps it), at any later time and across midnight; a changed text resolves by `parse_time`. `parse_range_end` puts `earliest` and `latest` on the resolved ETA's own day, then moves one a day so that earliest is at or before the ETA and latest at or after; a `+N` end counts days from the report. Placed from the report's time, the latest end of an ETA that had passed landed a day late. Read against the report's own time instead, a held unit's ETA from hours ago came out as tomorrow. A `+N` time still counts days from the report. `resolve_eta_moments` runs once per report, and the change check and note (`unchanged, overdue`; `overdue` alone when there is no last ETA to compare with and the moment has passed), display, ordering, chart row, saved state (`eta`, `eta_text`), `log_line` and first-ETA drift all read its result. A saved entry with no `eta_text` reads as `NoLastReportedEta`.
-- **`idle`.** A unit takes an optional `idle` object, `{"waits_for": "<what it waits for>", "until": "YYYY-MM-DDTHH:MM"}`, which the showrunner's judgment supplies only while the unit waits on a clock gate, a data window or another unit with nothing of its own running; a unit with no known return time gets none. `parse_idle(fields: JsonMap, where: str) -> IdleWait | NotIdle` reads it at every length into `Unit.idle`. `IdleWait(waits_for: str, until: datetime)` and `NotIdle()` are frozen dataclasses. Absent or `null` is `NotIdle`; otherwise the keys are exactly `waits_for` and `until`, `until` matches `STARTED`, and `waits_for` is at most `IDLE_LIMIT` characters and passes `check_words`. `check_idle(report: Report, now: datetime) -> None` raises `InputError` naming `units[{index}].idle.until` when `until <= now`. `main` and `check_render_state` (as `StateRefused`) both call it after `check_changes`, so the builder refuses a passed `until` before it changes the clock.
-- **Finished units.** The builder shares one run-state snapshot across staff units.
-  It excludes a finished unit when its status has no form, decision, or waiting flag for the user.
-  An excluded unit needs no judgment entry and has no chart row.
-  A finished unit with a user question remains visible until the question is answered.
-  `WAITS_ON_USER` supplies the shared flag set for visibility and `needs_user`.
-- **No unit to mark under a build hold (2026-10-12).** A report renders when a hold is active and no unit can be marked: every unit was left out, or every unit in it holds the builds itself. Before, the builder refused both with `holder files and unit markers disagree`, and behind that check the renderer refused again (its own comparison, `input.units … cannot be empty`, and a chart that failed on no rows). The builder's comparison is gone: it writes the markers itself from the holder files and refuses a supplied one, so it could fail only in these two cases. For each unit under an active hold it writes `build_hold: true`, or `holds_builds: true` when the unit's session name or unit name is a holder's; a holder is named by its session, which the renderer never sees. `parse_report` builds `holding` (units with `holds_builds`, or named as a holder) and refuses `holder files are active but no unit is marked` only when some unit is outside it; `holds the build hold itself` uses the same set. An empty unit list is accepted. `render` draws the chart only when it has a row; with no unit and no production below it writes `NO_ROWS` ("No unit is working: every run has finished.") in the chart's place. `last_report` then saves `units: 0` and no rows, so a parent's row for it reads `0 units, 0 held`. Seen on hanadocs-info under another session's hold, with its only unit's run finished.
-- **User zone.** `scripts.lib.user_zone` supplies `user_zone`, `user_zone_name`, and `zone_label`.
-  `config/user_zone.conf` supplies the configured zone.
-  `USER_ZONE` overrides that value, and `USER_ZONE_CONF` selects another file.
-  Production documents do not select a zone.
-  Scripts use package imports; shell displays call the helper through `scripts/lib/py`.
-  A stored time retains its original zone when that zone identifies the recorded instant.
-  Tests select a private zone when their expected output requires it.
-- **`/zone`:** `commands/zone.md` runs `scripts/lib/zone.py`.
-  Bare, it prints the configured zone, label, UTC offset, and current time.
-  `set NAME` resolves an IANA name, city, or current seasonal label.
-  Ambiguous or unknown names exit 2 with the candidate offsets.
-  Publication runs on natedev through `main_publish`, shared with `/tune`.
-  It updates `zone=` while preserving comments, commits only that file, and pushes main.
-  A failed commit keeps the new text when the file already matches HEAD.
-  Otherwise, it restores the previous text and refuses publication.
-  The Mac pulls through the shared helper, and the broadcast reaches both machines.
-  A failed pull queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
-  Pending pulls retain each Mac path and source.
-  A bare call drains the queue before it returns.
-  Promotion runs `zone.py drain --pulled <path>` after a successful pull.
-  The drain skips only that path and pulls every other pending target before sending the notice.
-  Clearing one target preserves other targets and an undelivered notice.
-  A legacy queue without `pulls` represents one default `~/.claude` pull.
-  `ZONE_SSH`, `ZONE_BROADCAST`, and `ZONE_STATE` select private test dependencies.
-  A repeated request commits an uncommitted zone even when its stored value already matches.
-- **Status line assignment.** `statusline.sh` sends the native session ID and staff data to `scripts/statusline/assignment.py`.
-  `StaffSnapshot.by_current_session` selects the row.
-  The row supplies the current name, kind, and parent name.
-  A showrunner displays `<name> showrunner`; a worker displays `worker`.
-  A unit displays `<name> unit`, with `for <parent>` when the parent exists.
-  Missing or damaged staff data displays `unassigned`.
-  Copied `STAFF_ID`, timer targets, folders, and names do not select a row.
-  Quota and notifier refresh paths keep their own behavior.
-
-- **Fixed zones removed (2026-10-21).** The status line wrote reset times in EDT/EST from rules in `statusline.jq`. `statusline.sh` now exports `TZ` from `USER_ZONE`, else the `zone=` line of `USER_ZONE_CONF` or `config/user_zone.conf` (shell builtins only), and `TZDIR=/etc/zoneinfo` when unset, since NixOS's glibc finds zone files only through it. `user_time` uses `strflocaltime`; in the hour a clock repeats, glibc's mktime can give the other pass's label, so the label comes from the first of the second and two hours either side whose own `%z`, read in the same call, is the offset the clock shows. `send_later.py --at` is read in the user's zone and passed to systemd in UTC. `verify.sh`'s recorded-result line stamps the user's zone with its label. `dailies_input.ETA_ZONES` knows AST and ADT.
-- **No display in the machine's zone (2026-10-12).** The Mac's zone is Pacific and natedev's Eastern, so a bare `astimezone()` printed a different time on each. Every time shown to the user now passes `user_zone()`: the Mac test and build target status lines, history, the lint sweep, the build reports, the account tables, the progress tables and the proposals table. `buildlog`'s `cli.main()` sets the process zone to the setting first (`run_in_user_zone()`), because its SQL takes days with `localtime`; the build report skills pass no `TZ=`. `agent_accounts.user_zone()` falls back to the setting, and `phase_table.py show` defaults to it. `progress_history.py` reads the setting too. A time stored with its offset, compared, or used to find a file by the machine's date stays as it was; `scripts/lib/test_user_zone.py` lists those scripts in `USES_THE_MACHINE_ZONE` and fails when another script calls a bare `astimezone()`. A test that sets `TZ` for its expected times sets `USER_ZONE` to the same zone.
-- **A unit's ETA (2026-10-08).** `Eta = TimedEta(time, spread: EtaRange(earliest, latest) | None, percent, why, detail, first, fixes, stated) | NoEta(reason, detail)`. `parse_eta` is the one place that builds either, and it still refuses the input the two states cannot hold: both or neither of `time` and `none`, half a range, and `percent`, `why`, `first` or `fixes` without a time. `percent`, `why`, `detail`, `first` and `stated` stay optional in `TimedEta`: each is its own unstated fact, and `stated` is absent from an input written by hand.
-- **Gantt length (2026-10-08, the default).** `LENGTHS` is `gantt`, `simple`, `page`, `elaborate`; `dailies_input.py --length` and `/showrunner:dailies` default to `gantt`, and the scheduled prompt names it. The phase-record join, input, checks, saved state and `dailies ETAs:` log line are the same for every length; `gantt` takes `simple`'s update limit. `render` prints the first line, the section of each topic and unit with `needs_user`, the lines of `major_changes(unit, last, resolved, now, zone_name)` for the other units (phase not `same_phase` as the last report's; `held` differs; `change_minutes` of at least `MAJOR_ETA_MINUTES`, 15, printed by `eta_text`), one line for each unit the saved state has and the report lacks, then the chart and footer as for every length. A unit with no last report has no change line. The prompt is read from `produce.md` at `register`, so a showrunner gets the new default when it runs `register` again.
-- **Idle group.** `grouped_wait(length: str, unit: Unit) -> IdleWait | NotIdle` returns the unit's `IdleWait` only when `length == "simple"`, `needs_user` is false, and `needed` and `held` are both `None`; any other unit keeps its full section. `render` gives a grouped unit no `### <unit>: <project>` section and prints `### Waiting and idle` after the last full section and before the topics that do not need the user, one line per unit, `- {unit.name} until {idle_clock(until, now)}: {waits_for}`, ordered by `until`, ties in report order. `idle_clock(moment: datetime, now: datetime) -> str` counts whole days between the two dates: `HH:MM` on the same day, weekday and time (`Sat 22:44`) one to six days ahead, weekday, date and time (`<Day> YYYY-MM-DD HH:MM`) at seven or more, with no zone because the report's first line states it. The timeline, the footer, the saved state and the `dailies ETAs:` line carry every unit; `page` and `elaborate` print every full section and no group.
+`/showrunner:units` shows production status.
+The report renderer, report schedule, child report rows, and report interval command are retired.
+`unit_status.py` owns the shared unit-status parser.
+`update_registration.py` owns question types, reading, and due filtering.
+Registration retains a stopped timer for discovery and session ownership.
 
 ### CI points and review watch: `ci_points.py`
 
@@ -556,9 +488,9 @@ The caller's working directory stays unchanged.
 - `due` counts distinct recorded unit checkpoints that reached the merge branch. Five checkpoints after the last CI point produce `CiDue`. A collected point saves the count and tip in `ci_points.json`. Shrink commits and child hand-offs have no unit checkpoint record.
 - `ci start`: `bash validate_and_push.sh --to <merge branch> --fix-commit "ci(<showrunner name>): validation fixes after <unit> phase <N>|production wrap" [--cancel-prior]`; reads `repo`, `sha` and `run_id` from the `=== CI HANDOFF TO AGENT ===` block (`run_id: none` fails); the sha must be the merge-branch tip; writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`.
 - `ci collect`: takes the tip and its code-merge count before `gh run watch --exit-status`, then `gh run view --json headSha,status,conclusion,jobs`. It passes only when `headSha` equals the validated tip and the current tip, the run is `completed` and concluded `success`, job `Test Suite` succeeded, and every other job succeeded or was skipped. Then it records `{count, tip}` and prints `--ci-green <tip>` as the last line, which `promote-main` and `wrap` take as is. Anything else is `ci collect: failed — rerun <check> on <tip>: …`, with no flag; a missing or empty `headSha` is never a pass.
-- `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The dailies builder calls the same function, so the first alert happens once whichever caller reaches it first.
+- `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The shared state prevents repeated first alerts.
 - `notice clear <gate>` drafts `send <waiting unit>: From the showrunner: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.` (refused until that code merge exists); `notice lift <gate> --log <path>` drafts `… <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.` Gates rows read `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
-- Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `DAILIES_REVIEW_REGIME`.
+- Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `CI_POINTS_REVIEW_REGIME`.
 
 ### Unit configuration formatting
 
@@ -586,7 +518,7 @@ The lookup resolves live process evidence through that native ID.
 The [staff identity contract](staff-accessors.md#staff-identity-and-backends) defines the stored facts.
 Saved progress state uses the fixed staff reference instead of a copied session name.
 
-- **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `dailies_input.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (dailies ETAs, judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
+- **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
   The command prints one row per production staff unit.
@@ -741,14 +673,6 @@ A unit uses its Unit value or its current session name.
 `search` and `agenda` skip retired units.
 `named_unit` (`scratch-test`, `eta-request`) refuses a retired unit as `unknown unit <name>`.
 
-- `scratch-test <unit> --tests "<command>" --state-dir <dir>`: a detached temporary worktree at the unit's branch tip, `merge --no-commit --no-ff <merge branch>`, then `sh -c <tests>` into `<state-dir>/scratch-test-<unit>-<YYYYmmdd-HHMMSS-ffffff>.log`. `ScratchGreen(log) | ScratchRed(last 4 lines, log) | ScratchConflict`; the verdict prints first; the worktree and merge state are always removed; nothing is committed or pushed. A red never says `blocked`; a conflict is a `failed` line, not a red. The log path feeds `ci_points.py notice lift`.
-- `waits`: `cargo-berth board --json` overlaps (an `unconfigured` envelope reads `berth not configured`) and the LOG's `block: <waiting> on <unit> (code|files: …), clears ~HH:MM` / `block cleared: …` pairs as `WaitOpen(since) | WaitCleared`. Each open wait prints its age and `act now` at 60 minutes open or 30 minutes past its clear time. A `block:` or `block cleared:` line whose waiting unit is in `retired_units` is dropped; a live unit's wait on a retired unit stays.
-- `search <old> <new>`: `git grep -n -F <old> <branch>` and `rg -n -F --hidden --glob !.git <old> <worktree>` for every unit; one line per site.
-- `agenda --state-dir <dir>`: `AgendaOpen(unit, phase) | AgendaNotDue` when the current phase (from the last `### STATE` block line `<unit>: Phase …|follow-up …`) began over eight hours ago, or its ETA (from `dailies ETAs:` lines through `phase_eta`) is over eight hours after its start. The start is the unit's previous code merge line in `LOG`, else its `added …` line. Deduplicated by `<unit>|<phase>` in `agenda_seen.json`. It prints new items before saving their seen marks, while holding the state lock.
-- `eta-request <unit> --phase <phase> --state-dir <dir>`: `EtaRequested | EtaNotYetRequested`; once per `<session>|<phase>` it prints `request /unit:eta: <session>` and then writes `{"requested": true}` in `eta_seen.json`, under the same state lock.
-- `update_state(path, change)` is the one locked writer for all three state files: `fcntl.flock` on `<path>.lock`, re-read under the lock, no write when unchanged, a unique temp file, then `os.replace`. `dailies_input.py` imports it with `eta_requested`.
-- `eta_moment(text, line_moment)` resolves a weekday ETA to its nearest occurrence within three days of the log line, and `HH:MM <ZONE>[ tomorrow]` on the line's day.
-
 ### Status and stall watch
 
 Permission prompts notify their owning showrunner after 60 seconds, retrying until delivered; the saved `told` mark stops repeats. A still-blocked prompt alerts the user at its start plus 60 seconds plus `prompt_grace_seconds` from `config/stall_watch.conf`, independently of owner delivery. Missing or invalid grace prints an error and uses zero grace. A prompt cleared during the grace sends no push. Units whose showrunner is not running remain unwatched; notices grant no permission to answer another pane. Prompt state stores the owning session id, an immutable wall-clock observation-start time (taken before the pane and blocked-status reads), and its alert key; `since` only measures the wait. Stop and move call `stall_watch.retire_session_prompt`, which atomically publishes `{session_id, at}` without any lookup, watcher lock or send. At tick entry, the watcher scans saved prompts for that session and retires their stored keys only when `created <= at`. A prompt observed after a completed stop is untouched; a pane read that spans stop/resume can be retired, and the next tick observes the resumed prompt afresh. Launch deletion or parent changes cannot lose the old alert. The local write is synchronous; a failure is printed on its own line and never fails stop or move. Requests are removed after confirmed retirement, or when no matching prompt and no unresolved ownership remain. One reader classifies current, legacy and invalid prompt files for all consumers, reporting each bad file once per tick. Recoverable legacy ownership is migrated; orphan alerts with known keys retire independently of live unit discovery, and unusable keyless state is removed with a warning. Unreadable content and its cancellation obligation remain for retry without blocking identified retirements; each malformed request is reported and retained independently, including timestamp overflow, while other requests and alerts continue. Relays share the `sender_batch_seconds` limit (90 seconds in config), capped before the pass's 110-second deadline to leave `sender_cleanup_seconds` (two seconds in config) for cleanup. Showrunner discovery, owner socket lookup and RCA case locks share that deadline; failed work remains for the next pass. RCA first notices and reminders send concurrently within the remaining budget, below the notifier's 120-second watchdog.
@@ -792,13 +716,10 @@ Copied pane marks do not select rows.
   Main is pushed only when it holds no commits outside `origin/main` and `origin/<merge branch>`.
   Publication never uses force.
 
-- The dailies builder's one pre-check write is idempotent pruning of this production's retired generated phase notes. Every other write waits until every check has passed. Every builder call passes `--render-state`, the same file the renderer gets as `--state`.
 
-- One state directory: `eta_seen.json` and `review_watch.json` live in `DAILIES_STATE_DIR` for every caller; a second directory forks the once-per-phase and first-alert records. A doc-contract test pins `produce.md` and `dailies.md` to the same path.
+- One state directory: `eta_seen.json` and `review_watch.json` live in `WAITING_STATE_DIR` for every caller; a second directory forks the once-per-phase and first-alert records. The command document names this shared path.
 
 - `then` reaches the renderer unchanged; the renderer refuses, it never rewrites.
-
-- The idle group changes only which sections a `simple` dailies prints. The timeline, the footer, the saved state and the `dailies ETAs:` line carry every unit at every length.
 
 - An activity on a closed phase leaves that phase's record as `finish-phase` wrote it: status, `finished_at` and elapsed time. The printed `review trial:` line keeps its form, which `merge_checkpoint.py` parses.
 
@@ -840,17 +761,12 @@ Copied pane marks do not select rows.
 
 - `review_watch.json` is written after the LOG line: a crash between them repeats the log entry once (at least once).
 
-- Dailies: an ETA first seen over 1 hour ago is stale; an ETA move of 15 minutes or more (`CHANGE_NEEDS_WHY_MINUTES`) needs `eta.why`; `parse_time` treats a time over two hours past as tomorrow; updates are capped at 240 characters for `simple` and 480 for `page`.
-
-- The renderer's ETA-change check reads its own state; `check_render_state` runs before the clock restart, so a refused user-run dailies leaves the clock where it was.
 
 - The renderer exposes no list of required fields, which is why the builder names five itself.
 
 - Agenda threshold is 8 hours; waits act at 60 minutes open or 30 minutes past the clear time; the weekday ETA window is ±3 days.
 
 - `log_events` dates a date-less LOG line by walking backward across midnights; a gap over 24 hours between timestamped lines is invisible.
-
-- Producer output shapes are not the obvious ones: the unconfigured berth board is a JSON envelope with exit 4, the ETA line is `dailies ETAs: <unit> <phase> <eta>; …`, and account labels use one spelling (`codex1`). Test fixtures come from calling the producers.
 
 - `unit_status.sh` routes `gate:` exactly as `decision:` and `blocked:`. The stall watch keeps `done`, `gate` and `decision` silent at every context level. Only a blocked turn can receive a compaction wake. The status script still flags a gate to the user.
 
@@ -877,61 +793,6 @@ Copied pane marks do not select rows.
 - Sandboxed workers have no writable temporary directory and cannot run the stall-watch suite; run it from the main tree.
 
 ## Why
-
-- **Scripts hold mechanics; command docs hold judgment.** Each showrunner step was given a script-or-judgment verdict. Script: zone time, log and STATE, questions, open/load/wrap, registration and prompt, merge/test/push/promote/record, CI counting and collection, review-watch escalation, gate notices, scratch tests, wait ages, agenda thresholds, rename search, the dailies input. Judgment: relaying the user's words, verifying a unit's claims, compacting a blocked pane, the overlap notice and restructure holds, whether a new public item has a consumer, design-check freshness and defects, the repair owner for red CI, classifying a wait as code, files or preference, landing order, permission blocks, close-out approvals, open topics and who acts next, `then` and goal text, and phone-alert urgency and wording.
-- `recorded_mode` reads the add-unit commit subject, then the configured plan, then the brief stub.
-  Existing staff membership remains authoritative.
-- **Code commit before the shrink.** The code-ready notice can go out the moment the phase's code commits; the shrink runs beside the next phase's workers and lands as a plan-doc-only merge with no tests, ledger row or CI count.
-- **Merged state comes from Git.** Git ancestry identifies merged checkpoints. Unit records supply phase starts and checkpoint identities. Commit subjects supply no state.
-- **A finished run is a named state.** `run-finished` is read from the run record's `run_finished` event; the stall watch reads that named variant and does not infer completion from production-row prose.
-- `RemovedWorktree` marks retirement on the retained staff row.
-  Status readers exclude retired units without changing command arguments.
-- **A live unit's wait on a retired unit still prints.** Hiding it would hide a stuck unit.
-- **`merge_checkpoint.py`, `ci_points.py` and `production_lifecycle.py` do not skip retired rows.** A retired unit sends no checkpoint, and the wrap already passes a unit whose branch is gone.
-- **No named type carries an activity's phase.** `_event` already stamps the phase in state on every event.
-- **The renderer refuses a chained or string `then`** rather than rewriting it: a silent rewrite would hide the defect from the showrunner who wrote it.
-- **The review alert is at least once.** Writing `review_watch.json` before the alert would make it at most once, and a lost alert is the worse failure. The alert writes its LOG line directly; routing it through `update_registration.py log` would add a stray `log: ok` line and couple two commands.
-- **No `queue` command.** Arrivals are messages in the showrunner's own session, and ordering them is judgment.
-- **One verdict type per flag.** `--ci-green` and `--smoke-passed` are separate flags, each checked at its own step against the same tip; a mismatch is a hold line, not a user topic.
-- **Resume flags come from a checked `bash -c`, not a one-line substitution:** a failed substitution would run `claude --resume` with no flags and skip the family check.
-- **No `[production.codex]`** and no Codex director: unit directors launch only on Claude. Pinning a one-family function keeps every-function switches (`/default_models` "all on codex") from breaking director launches.
-- **Unit directors default to `opus:xhigh`** (the user, 2026-10-07, moved back from `sonnet:xhigh`). Test fixtures write their own rows, so they test that a row changes the launch, not the live default.
-- **The showrunner settles a unit's designs and add-ons (user, 2026-10-12: "when it comes to designs you absolutely should be able to tell units what to do and change. I do not have to be the one to approve").** A unit in a production brings a design choice, a Pending decision about how something is built, and its pending add-ons to the showrunner, whose answer settles them; the showrunner may also change a unit's design unasked. The user keeps two kinds: an action that cannot be undone, and a choice only they know the answer to. The rule is written once per reader: `docs/production_format.md` → `<ProductionUnit/>` item 2 for the unit, `/unit:add_ons` → `<ReviewPendingAddOns/>` for the add-on message and its answer, and `/showrunner:produce` → Throughout → Designs and add-ons for the showrunner. A run outside a production still asks the user. `docs/decision_criteria.md` is unchanged.
-- **Open question display.** The showrunner files each reviewed question before asking it once in full.
-  Later replies carry no question footer.
-  The status line shows the number of due items across that session's productions.
-  The full list appears when the user requests it.
-  Dailies retain their user-action sections.
-- **Rebuild items share one cache with Morty.** The `For you:` row puts adhoc items first, then questions, changes and rebuild items.
-  Rebuild items read `rebuild natedev` and `rebuild mac`.
-  The background check compares each running system outPath with the system from the configured main ref.
-  A matching outPath clears that machine's item after the next check.
-  A failed evaluation or an unreachable machine produces no item for that machine.
-  `config/statusline.conf` sets `rebuild.cache=~/.local/state/showrunner/rebuilds`.
-  The reader expands `~` to the current user's home directory each time it reads the setting.
-  The cache extends the counts cache format.
-  Line 1 contains `rebuild natedev, rebuild mac`, one rebuild item, or an empty string.
-  Line 2 contains the next refresh time as an epoch second.
-  Line 3 contains the configuration source path.
-  Line 4 contains JSON with `commit`, `source`, `natedev`, and `mac` fields.
-  `commit` identifies the evaluated ref commit.
-  `source` records the repository, ref, and configuration names used for that evaluation.
-  `natedev` and `mac` contain the expected system outPaths, or empty strings when evaluation fails.
-  Each refresh resolves the ref with `git rev-parse` and reads both running system paths.
-  One Nix evaluation computes both expected paths when the commit or evaluation source changes.
-  An unchanged commit and source reuse the cached expected paths.
-  The reader keeps the last answer visible while the background refresh runs.
-  The answer changes only when a refresh writes a new result.
-  Read the machines with `/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/statusline/rebuild_row.py read`.
-  This command prints one machine per line, or nothing when no machine needs a rebuild.
-  Both results return exit 0.
-  The command and the status line use `rebuild_row.read` to read the same file.
-  Missing, invalid, or unreadable answers produce no machines.
-  Only the status line starts a background refresh.
-- **One source for the zone (2026-10-12).** The user's zone is `config/user_zone.conf`, read through `scripts/lib/user_zone.py`, and nothing else. A production doc's `- **User zone:**` line was parsed in three places: `showrunners.py` (the registry's zone), `add_unit.py` (`Production.zone`, which `merge_checkpoint`, `ci_points`, the dailies builder, `waiting`, `stall_watch` and `update_registration` use) and `hooks/showrunner_footer.py`. Each now returns the setting. A doc that still carries the line loads as before and the line is ignored; a doc without it registers, where before it was refused. `/producer:to_production` no longer writes the line. `progress_history.py eta` reads a typed time in the setting's zone and no longer in the process `TZ`, so `/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`. The shell displays in `message/notifier.sh` (`next_due`), `validate_and_push/ci_tick.sh` and `production/smoke_launch.sh` read the helper as well. Tests whose expected times are Pacific pin `USER_ZONE` at module level.
-- **LOG backups (2026-10-12).** On each scheduled update tick, `production_check.sh <staff id>` passes that same argument to `scripts/production/log_backup.py` for a running production. `log_backup.py <production name or staff id>` resolves the showrunner's staff row and reads its production document. `backup(log: Path, directory: Path, now: datetime) -> Path | None` copies LOG and keeps the newest 48 copies (`KEEP`). Copies use `<SHOWRUNNER_STATE_DIR or ~/.local/state/showrunner>/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`, with timestamps in the production's zone. An empty, missing, or unchanged LOG produces no copy. A failed copy prints `log_backup: <reason>` to stderr and does not change the check's exit code. To restore LOG, copy the selected backup over LOG. This feature followed an accidental LOG deletion without a backup.
-- **`dailies_render.py --footer --nothing-needed`** replaced a scan for an invented `needed` key.
-- `LastUnitReport.held` and `first` retain their earlier optional types.
 
 ## Session hosting
 

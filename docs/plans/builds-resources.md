@@ -232,7 +232,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    Refuse mixed private and real directories before either real directory changes.
    `read_cycle()` (`build_hold.py:994`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:983`) returns `Path | None`, for the same no-current-cycle state.
    Return the existing `NoCycle` (`build_hold.py:83`) from both in place of `None`. Add no second type for this state.
-   Update every caller: `read_cycle_for_change()`, and `scripts/production/dailies_render.py` (`read_cycle()` near line 1570, and `hold_line()`'s `cycle: HoldCycle | None = None` at line 1408).
+   Update `read_cycle_for_change()` and its test callers.
+   Dailies callers were retired on 2026-11-11.
    Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
    Replace each one with `assert not isinstance(cycle, build_hold.NoCycle)`. `HoldCycle` is a `TypedDict`, so `isinstance` against it raises `TypeError`. This change keeps the assertion's intent.
 5. Route callers through the installed copy.
@@ -277,8 +278,6 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/direct/verify.sh`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_nix_shell.py` — installed helper routing.
 - `scripts/message/top_level.py`, `scripts/agents/shutdown.py` — installed hold writer routing.
 - `scripts/message/test_top_level.py`, `scripts/agents/test_shutdown_cli.py` — caller tests.
-- `scripts/production/dailies_render.py` — `NoCycle` from `read_cycle()` in the hold lines.
-- `scripts/production/test_dailies_render_holds.py`, `scripts/production/test_dailies_render.py` — hold line tests.
 - `docs/as-built/build-memory-admission.md` — installed-copy rule and separate row fields.
 
 **Workers:** `1 writer + 1 tester`

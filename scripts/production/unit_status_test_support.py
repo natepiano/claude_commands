@@ -23,12 +23,11 @@ from unittest import mock
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.sessions_test_support import copy_session_modules
-from scripts.production import staff, unit_names
+from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
 )
-from scripts.production.dailies_input import StatusBlock, UnitRow, status_blocks
-from scripts.production.unit_lookup import UnitState
+from scripts.production.unit_status import StatusBlock, status_blocks
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit
 from scripts.message.sessions import SessionRecord
@@ -265,4 +264,4 @@ class UnitStatusFixture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "status.txt"
             _ = path.write_text(output, encoding="utf-8")
-            return status_blocks(path, tuple(UnitRow(unit, unit, UnitState.RUNNING, self.unit_ids[unit_names.name(unit)]) for unit in units))
+            return status_blocks(path, units)

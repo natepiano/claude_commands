@@ -635,22 +635,6 @@ Unset values differ from empty values.
 The new inputs do not change build keys or other command keys.
 Mac and SSH nextest runs receive the same values, including copy runs.
 
-## dailies.conf
-
-The counts each production's dailies show on one line above the chart, in
-every length: `counts: nightly queue 8 · proposals 3`. A line is
-`<staff id>.<label>=lines <file> <regex>`, which counts the file's lines
-matching the regex, `<staff id>.<label>=files <glob>`, which counts the
-matching files, or `<staff id>.<label>=issues <folder> <tag>`, which
-counts the issues directly in the folder whose frontmatter is open and tagged
-with the tag. The key uses the showrunner staff id. `~` expands, and a hyphen in the label reads as a space.
-`scripts/production/dailies_counts.py` reads it each time the dailies input is
-built, so an edit applies to the next dailies. A missing file or folder shows as
-`not found`. A bad line leaves out the counts line, and the builder prints
-`counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
-overrides the path. Today it holds build-followups' nightly review queue and
-plan backlog, and hana's open hanadocs proposal issues (user, 2026-10-10).
-
 ## user_zone.conf
 
 The zone every time shown to the user is written in: `zone=<IANA zone name>`,
@@ -670,8 +654,7 @@ file named.
 - `/zone <place>` changes it on both machines and tells every session; a bare
   `/zone` shows it. The status line reads the file in `statusline.sh`.
 
-A production keeps its own `User zone` line in its production doc, and the
-dailies read that. A time stored without an offset keeps the zone it was
+A production document's old `User zone` line is ignored. A time stored without an offset keeps the zone it was
 recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
 roster.
 

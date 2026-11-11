@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.lib import names
 from scripts.lib.test_names import NAMES_TOML
 
-from scripts.production.update_registration_test_support import RegistrationFixture, registration, dailies_render, review, read_production
+from scripts.production.update_registration_test_support import RegistrationFixture, registration, review, read_production
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -482,8 +482,8 @@ class RegistrationTests(RegistrationFixture):
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout",
                                         "question": "Keep this layout?", "asked_by": "alpha"})
         _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "x", "asked_by": self.fixture_staff_id("alpha")}]))
-        with self.assertRaisesRegex(dailies_render.InputError, "question required"):
-            _ = dailies_render.read_outstanding(self.outstanding())
+        with self.assertRaisesRegex(registration.InputError, "question required"):
+            _ = registration.read_open_items(self.outstanding())
 
 
 if __name__ == "__main__":

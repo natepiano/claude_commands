@@ -20,7 +20,11 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 10. Locate the builds merge for hierarchies-unit Phase 30 deletion commit `ce529466f`. Builds revision `a87536252` and worktree merge `d7234eaac` contain the deletion. Compare the gate CPU and test count before and after that builds merge. Historical baseline: `agents/test_codex_mesh.py`, 736 tests and 194.3 CPU s median per gate (`show.py top`, 2026-11-07 14:50 EST). Also compare the `config/postmaster.conf` selection count and the cold-cache and warm-cache selection times. Phase 96 baseline: 574 of 738 modules selected; 572 reach `send_budget.py` and 570 reach `codex_mesh.py`. Keep the Phase 96 counts as history. Phase 127 applies the user's answer B (2026-11-10): select recorded readers, unrecorded modules, and modules whose own text names the config. Use the newest full, non-aborted gate with at least one config record.
 
-11. Rule 2 cleanup (the user, 2026-11-07: "do rules 1 and 2"). After Phase 87 measures the yield, the cleanup takes the next modules by CPU s spent on rare-case tests: `production/test_dailies_render_holds.py`, `agents/test_models_conf_publish.py`, `direct/test_progress_history.py`, `lint/test_memory_admit.py`, then the rest. Skip modules that a speed phase holds.
+11. Apply Rule 2 cleanup after Phase 87 measures the yield.
+    The user approved rules 1 and 2 on 2026-11-07.
+    Rank rare-case test modules by CPU seconds.
+    The next candidates are `agents/test_models_conf_publish.py`, `direct/test_progress_history.py`, and `lint/test_memory_admit.py`.
+    Skip modules held by a speed phase.
 
 `style/test_style_sync.py`, 66.6 CPU s, is free: the style unit's multi-unit hash reached main on 2026-11-09. Never: `types/basedpyright`, 238.4 CPU s.
 
@@ -56,7 +60,10 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
   - Use Phase 130's 327 recorded scanning modules as the parent-process baseline. Their 3,100 CPU s measure executed modules, not removable CPU. Keep the static scanner inventory to find unobserved scan paths. Record each source gate separately for config reads, folder scans and content reads, because `latest_module_reads` can combine three gates. Keep each gate's id, host, revision, time and module records. Separate missing records, empty records, listed folders, recursive prefixes, whole-repository records and recorded content paths. Use Phase 131's first cloud gate as the content baseline: 748 records, 487 readers, 907 KB of JSON per gate. Over the last 10 builds merges, content reads raised the selection from 978 to 1,072 modules (8,368 to 9,214 CPU s); measure the share of the readers of about 1,700 files. Report selection CPU apart from executed test CPU: 1.2-2.6 CPU s per warm selection, 99 CPU s for the schema 38 rebuild, and +0.14 CPU s per selection from content records are the baselines. Recheck the staff-importer miss against a full run of the same tree.
   - Known miss (sdlc, 2026-11-10): hierarchies added `scripts/message/failed_lookup.py`, which imports staff. The targeted test did not select `production/test_staff_accessors.py`, which checks that `docs/as-built/staff-accessors.md` lists every staff importer. The full merge gate caught it. A new or changed file whose text matches a scanner's pattern must select that scanner.
   - Document `targeted_test.py --full` as the available full-coverage check for scan-dependent changes.
-  - Phase 129 made the nine raw config readers record their reads (`scripts/lib/conf_record.sh` for shell). Raw reads that still record nothing: `production/dailies_counts.py` `read_specs`, generic file hashing in `direct/tree_watch.py` and `direct/progress_history.py`, and fixture readers in five `*_test_support.py` files.
+  - Phase 129 made the nine raw config readers record their reads.
+    Shell readers use `scripts/lib/conf_record.sh`.
+    Generic file hashing in `direct/tree_watch.py` and `direct/progress_history.py` still records nothing.
+    Fixture readers in five `*_test_support.py` files also record nothing.
   - Classify the three failures that Phase 127's targeted run missed and its full gate found: `aws_target/test_admin_secrets.py`, `whoami/test_profile_notes_pass.py`, `usage/test_context_economy_read.py`. Record why each was not selected.
   - Completion condition: after a day on builds, report missed failures, confirmed unnecessary selections and their measured CPU.
   - Submit any selector change with its coverage cases for separate approval.

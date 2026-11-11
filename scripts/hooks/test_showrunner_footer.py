@@ -63,7 +63,7 @@ class QuestionLibraryTests(unittest.TestCase):
                 with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as read_staff:
                     production = showrunner_footer.read_production(instance)
                 self.assertEqual(production, showrunner_footer.Production(
-                    owner.name, doc, "UTC", showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED, owner))
+                    owner.name, doc, "UTC", owner))
                 read_staff.assert_called_once_with()
 
     def test_deferred_time_reports_missing_owner_and_keeps_a_known_owner(self) -> None:
@@ -130,13 +130,11 @@ class QuestionLibraryTests(unittest.TestCase):
                   mock.patch.dict(os.environ, environment)):
                 owner = fixture_member("showrunner", name="display-name", runtime_id=fixture_runtime_id("footer-owner"))
                 _ = staff.update_current_session(owner.current_session, staff.native_id(fixture_runtime_id("footer-current")))
-                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
-                                 root / "showrunner/review-paused" / f"{owner.id}.json")
                 self.assertEqual(showrunner_footer.outstanding_path(owner.id),
                                  root / "showrunner/outstanding" / f"{owner.id}.json")
                 _ = staff.rename(owner.id, "renamed-owner")
-                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
-                                 root / "showrunner/review-paused" / f"{owner.id}.json")
+                self.assertEqual(showrunner_footer.outstanding_path(owner.id),
+                                 root / "showrunner/outstanding" / f"{owner.id}.json")
 
     def test_read_production_skips_wrapped_doc(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

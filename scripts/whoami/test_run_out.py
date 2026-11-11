@@ -1,4 +1,4 @@
-"""The readings log and the weighted pace the dailies footer extends to 100% used."""
+"""Test the readings log and the weighted pace toward 100% usage."""
 
 import json
 import math

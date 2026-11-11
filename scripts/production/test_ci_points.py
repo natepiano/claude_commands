@@ -163,7 +163,7 @@ class CiPointsTests(unittest.TestCase):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
-                    "DAILIES_REVIEW_REGIME": str(self.bin / "review_regime.py"),
+                    "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -708,12 +708,11 @@ PY
         self.assertFalse((self.stub_state / "validate-calls").exists())
         self.assertEqual(self.calls("gh"), [])
 
-    def test_showrunner_and_dailies_share_review_watch_state_directory(self) -> None:
+    def test_showrunner_uses_one_review_watch_state_directory(self) -> None:
         root = Path(__file__).resolve().parents[2]
         produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
         state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
-        self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<STATE_DIR>/dailies_input_state`")
+        self.assertRegex(state_list, r"`WAITING_STATE_DIR`\s+—\s+`<STATE_DIR>/waiting_state`")
         calls = cast(list[tuple[str, str]], re.findall(
             r"ci_points\.py\s+(due|watch|ci start|ci collect)\b([^`]*)`",
             produce, flags=re.DOTALL))
@@ -723,9 +722,8 @@ PY
         self.assertEqual(len(stateful), 4, calls)
         for command, body in stateful:
             with self.subTest(command=command):
-                self.assertRegex(body, r"--state-dir\s+DAILIES_STATE_DIR\b")
+                self.assertRegex(body, r"--state-dir\s+WAITING_STATE_DIR\b")
                 self.assertNotRegex(body, r"--state-dir\s+SCRATCH\b")
-        self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<STATE_DIR>/dailies_input_state\b")
 
     def test_ci_start_passes_cancel_prior_only_when_requested(self) -> None:
         tip = self.git("rev-parse", "HEAD")
