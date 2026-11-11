@@ -4177,7 +4177,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(self.pass_slots(session_dir)[""]["status"], "completed")
 
     def test_finishing_a_prepared_run_clears_pointers_for_every_staff_kind(self) -> None:
-        kinds: tuple[staff.Kind, ...] = ("agent", "worker", "unit", "showrunner")
+        kinds: tuple[staff.Kind, ...] = ("producer", "worker", "unit", "showrunner")
         for kind in kinds:
             with self.subTest(kind=kind):
                 parent = fixture_member("showrunner", name=f"prepared-parent-{kind}")
