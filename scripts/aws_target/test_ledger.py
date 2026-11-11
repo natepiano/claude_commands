@@ -170,7 +170,31 @@ class LedgerTests(CostFixture):
                 self.assertFalse(days['2026-01-15'].provisional_bill)
                 self.assertEqual(days['2026-01-15'].source, 'estimated from the newest bill')
 
+    def test_gate_prices_use_the_saved_region_and_highest_unknown_region_rate(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'stopped')
+        _ = (self.root / 'cloud_gate.conf').write_text('regions=us-east-2 us-west-2\n')
+        reading = ledger.ChargeRead('2026-01-14', self.start, self.start - 86400, self.start,
+            Decimal('.6'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.1'), Decimal(1), 'Hrs'),
+                ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('.5'), Decimal(1), 'Hrs')))
+        directory = self.state / 'charges'
+        directory.mkdir()
+        _ = (directory / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
+        for region, expected in (('us-east-2', '.1'), ('us-west-2', '.5'), ('', '.5')):
+            with self.subTest(region=region):
+                reply = self.book.reserve_gate(self.settings, ledger.GateReservation(
+                    region or 'unknown', self.start, self.start + 3600, Decimal('.8'), Decimal(0),
+                    instance_type='m7a.8xlarge', region=region))
+                self.assertIsInstance(reply, ledger.GateReserved)
+                saved = self.book.read_snapshot().gate_reservations[-1]
+                self.assertEqual(saved.rate.usd_per_hour, Decimal(expected))
+        # A region without a usable bill retains the configured ceiling.
+        self.assertEqual(ledger.gate_rate((reading,), 'm7a.8xlarge', Decimal('.8'), self.start, 'eu-north-1'),
+                         ledger.BoxRate(Decimal('.8'), 'spot_max_usd_per_hour'))
+
     def test_gate_cap_uses_bills_and_reprices_existing_boxes(self) -> None:
+        _ = (self.root / 'cloud_gate.conf').write_text('regions=us-east-2\n')
         now = self.start + 120
         self.inventory(self.start - 86400)
         self.observe(self.start - 86400, 'stopped')

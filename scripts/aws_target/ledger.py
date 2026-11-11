@@ -100,6 +100,7 @@ class GateReservation:
     state: GateLaunchPending | GateRunning | GateAbsent | GateTerminated = GateLaunchPending()
     instance_type: str = ''
     rate: BoxRate = BoxRate(Decimal(0), 'not priced')
+    region: str = ''
 
 
 @dataclass(frozen=True)
@@ -402,7 +403,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state,
             str(item.get('instance_type', '')),
             BoxRate(money(str(item.get('applied_usd_per_hour', item['usd_per_hour']))),
-                    str(item.get('rate_source', 'spot_max_usd_per_hour')))))
+                    str(item.get('rate_source', 'spot_max_usd_per_hour'))), str(item.get('region', ''))))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     for inventory in evidence.inventories:
@@ -448,7 +449,7 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
         "charge_refresh_at": state.charge_refresh_at,
         'gate_reservations': [
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
-             'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type,
+             'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
              'applied_usd_per_hour': str(r.rate.usd_per_hour), 'rate_source': r.rate.source, 'state':
              {'kind': 'pending'} if isinstance(r.state, GateLaunchPending) else
              {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
@@ -722,18 +723,29 @@ def is_billed_day(reading: ChargeRead) -> bool:
     return reading.account_bill and reading.actual_usd.quantize(Decimal('.01')) >= Decimal('.01')
 
 
-def box_rate(readings: Sequence[ChargeRead], instance_type: str, fallback: Decimal, now: int) -> BoxRate:
+def box_rate(readings: Sequence[ChargeRead], instance_type: str, fallback: Decimal, now: int, *, region: str = '') -> BoxRate:
     """Use the newest completed bill with a positive Spot rate for this instance type."""
+    prefixes = {'us-east-1': ('', 'USE1'), 'us-east-2': ('USE2',),
+                'us-west-1': ('USW1',), 'us-west-2': ('USW2',)}
     for reading in sorted(readings, key=lambda row: row.day, reverse=True):
         if not is_billed_day(reading) or reading.period_end > now:
             continue
         rows_for_type = [row for row in reading.usage_types
-                         if row.usage_type.partition('SpotUsage:')[2] == instance_type and instance_type]
+                         if row.usage_type.partition('SpotUsage:')[2] == instance_type and instance_type
+                         and (not region or row.usage_type.partition('SpotUsage:')[0].removesuffix('-')
+                              in prefixes.get(region, ()))]
         hours = sum((row.quantity for row in rows_for_type), Decimal(0))
         usd = sum((row.usd for row in rows_for_type), Decimal(0))
         if hours > 0 and usd > 0:
             return BoxRate(usd / hours, 'AWS bill ' + reading.day)
     return BoxRate(fallback, 'spot_max_usd_per_hour')
+
+
+def gate_rate(readings: Sequence[ChargeRead], instance_type: str, fallback: Decimal, now: int, region: str = '') -> BoxRate:
+    """Use the box region or reserve the highest configured regional rate."""
+    regions = (region,) if region else conf.read_or_repository('cloud_gate').words('regions')
+    return max((box_rate(readings, instance_type, fallback, now, region=item) for item in regions),
+               key=lambda rate: rate.usd_per_hour, default=BoxRate(fallback, 'spot_max_usd_per_hour'))
 
 
 def box_cost(rate: BoxRate, running_seconds: int, minimum_seconds: int) -> Decimal:
@@ -1003,7 +1015,7 @@ class CostLedger:
             size = text(launch, 'instance_type') if launch is not None else reservation.instance_type
             at = int(float(str(launch['time']))) if launch is not None else reservation.at
             priced.append(replace(reservation, at=at, instance_type=size,
-                                  rate=box_rate(readings, size, reservation.usd_per_hour, now)))
+                                  rate=gate_rate(readings, size, reservation.usd_per_hour, now, reservation.region)))
         state.gate_reservations = priced
 
     def spend_days(self, settings: SpendingSettings, now: int) -> tuple[DailySpend, ...]:
@@ -1049,6 +1061,13 @@ class CostLedger:
                 return GateCapReached(reason)
             self._save(state)
             return GateReserved(state.gate_reservations[-1])
+
+    def gate_region(self, attempt: str, region: str) -> None:
+        """Retain the region before AWS can accept a launch."""
+        with self._locked() as state:
+            state.gate_reservations = [replace(row, region=region) if row.attempt == attempt else row
+                                       for row in state.gate_reservations]
+            self._save(state)
 
     def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
         """Release a reservation only after AWS confirms its final state."""
