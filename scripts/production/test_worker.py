@@ -13,7 +13,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import patch
@@ -1543,6 +1543,227 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(len(self.fixture.world.launches), 1)
         self.assertEqual(json.loads((self.run_dir / "progress_history_state.json").read_text())["pass"], {})
+
+    def test_failed_dispatch_preparation_ends_only_a_new_pane(self) -> None:
+        failures = ("recorder", "dispatch id", "delivery", "receipt", "wait", "observation", "busy", "compact", "target", "incomplete")
+        for failure in failures:
+            for existing in (False, True, "closed"):
+                with self.subTest(failure=failure, existing=existing):
+                    case = WorkerCommandTests("runTest")
+                    case.setUp()
+                    try:
+                        if existing:
+                            opened = case.opened()
+                            if existing == "closed":
+                                case.assertTrue(case.fixture.world.close_terminal_pane(opened.pane, opened.terminal))
+                        before = staff.snapshot().rows, set(case.fixture.world.locations)
+                        closed = len(case.fixture.world.closed)
+                        with ExitStack() as patches, redirect_stderr(io.StringIO()) as errors:
+                            if failure == "incomplete":
+                                start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
+                                def incomplete(*arguments: object, **options: object) -> worker_panes.WorkerStart:
+                                    result = start(*arguments, **options)
+                                    assert isinstance(result, worker_panes.OpenWorker)
+                                    return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed", result.created_pane)
+                                _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=incomplete))
+                            elif failure == "target":
+                                check = cast(Callable[..., bool], herdr.check_target)
+                                def refuse(*arguments: object, **options: object) -> bool:
+                                    return False if options.get("action") == "keys" and options.get("text") else check(*arguments, **options)
+                                _ = patches.enter_context(patch.object(herdr, "check_target", side_effect=refuse))
+                            elif failure == "recorder":
+                                _ = patches.enter_context(patch.object(progress_history, "begin_dispatch", side_effect=ValueError("TEST recorder failed")))
+                            elif failure == "delivery":
+                                _ = patches.enter_context(patch.object(progress_history, "save_dispatch_delivery", side_effect=OSError("TEST delivery failed")))
+                            elif failure == "receipt":
+                                _ = patches.enter_context(patch.object(worker, "dispatch_receipt", return_value=worker.DispatchEvidenceUnknown("TEST receipt failed")))
+                            elif failure in ("wait", "observation"):
+                                start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
+                                def working(*arguments: object, **options: object) -> worker_panes.WorkerStart:
+                                    result = start(*arguments, **options)
+                                    if failure == "wait":
+                                        _ = patches.enter_context(patch.object(case.fixture.world, "wait_turn_end", side_effect=OSError("TEST wait failed")))
+                                    return replace(result, status=herdr.AgentStatus.WORKING) if isinstance(result, worker_panes.OpenWorker) else result
+                                _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=working))
+                                if failure == "observation":
+                                    _ = patches.enter_context(patch.object(worker_panes, "observe_worker", return_value=worker_panes.ClosedWorker(case.fixture.parent)))
+                            elif failure == "busy":
+                                start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
+                                def busy(*arguments: object, **options: object) -> worker_panes.WorkerStart:
+                                    result = start(*arguments, **options)
+                                    return replace(result, status=herdr.AgentStatus.UNKNOWN) if isinstance(result, worker_panes.OpenWorker) else result
+                                _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=busy))
+                            elif failure == "compact":
+                                _ = patches.enter_context(patch.object(worker, "_compact_before_dispatch", side_effect=OSError("TEST compact failed")))
+                            if failure in ("recorder", "delivery"):
+                                with case.assertRaisesRegex((OSError, ValueError), "TEST .* failed"):
+                                    case.assertIsInstance(case.dispatch(), worker.ExitCode)
+                            else:
+                                code = case.dispatch(dispatch_id="TEST-other-pass" if failure == "dispatch id" else "")
+                                case.assertEqual(code, worker.ExitCode.REFUSED if failure == "dispatch id" else
+                                                 worker.ExitCode.BUSY if failure == "busy" else worker.ExitCode.UNCERTAIN)
+                        case.assertEqual(case.agent.submitted, [])
+                        if existing:
+                            case.assertEqual(staff.snapshot().rows, before[0])
+                            case.assertEqual(set(case.fixture.world.locations), before[1])
+                            case.assertEqual(len(case.fixture.world.closed), closed + (existing == "closed"))
+                        else:
+                            case.assertEqual(staff.find(kind="worker", parent=case.fixture.parent.id), [])
+                            case.assertEqual(len(case.fixture.world.closed), 1)
+                        case.assertNotIn("cleanup failed", errors.getvalue())
+                    finally:
+                        case.doCleanups()
+
+    def test_failed_dispatch_closes_its_new_pane_with_a_named_target(self) -> None:
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
+                    rows: list[staff.StaffRow] = []
+                    targets: list[str] = []
+                    close = case.fixture.world.close_tab_confirmed
+                    def refuse_empty_target(pane: str, *, target: str = "", terminal: str = "") -> bool:
+                        if pane in case.fixture.world.locations:
+                            targets.append(target)
+                            if not target:
+                                raise herdr_types.HerdrFailure("TEST close needs a named target")
+                        return close(pane, target=target, terminal=terminal)
+                    def fail(*_arguments: object, **_options: object) -> str:
+                        row, = staff.find(kind="worker", parent=case.fixture.parent.id)
+                        rows.append(row)
+                        if family == "claude":
+                            path = case.fixture.root / "pane-records/agents.json"
+                            entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
+                            case.assertEqual(entries, {})
+                        raise ValueError("TEST recorder failed")
+                    with (patch.object(progress_history, "begin_dispatch", side_effect=fail),
+                          patch.object(case.fixture.world, "close_tab_confirmed", side_effect=refuse_empty_target),
+                          redirect_stderr(io.StringIO()) as errors):
+                        with case.assertRaisesRegex(ValueError, "TEST recorder failed"):
+                            _ = case.dispatch()
+                    row, = rows
+                    case.assertEqual(targets, [str(row.current_session)])
+                    case.assertIsNone(staff.by_id(row.id))
+                    case.assertEqual(len(case.fixture.world.closed), 1)
+                    case.assertEqual(case.agent.submitted, [])
+                    case.assertNotIn("cleanup failed", errors.getvalue())
+                finally:
+                    case.doCleanups()
+
+    def test_dispatch_keeps_a_replacement_terminal_after_preparation_fails(self) -> None:
+        def replace_terminal(*_arguments: object, **_options: object) -> str:
+            row, = staff.find(kind="worker", parent=self.fixture.parent.id)
+            state = worker_panes.observe_worker(self.fixture.parent.id, row, staff.snapshot())
+            assert isinstance(state, worker_panes.OpenWorker)
+            self.fixture.world.locations[state.pane]["terminal_id"] = "TEST-replacement"
+            raise ValueError("TEST recorder failed")
+        with (patch.object(progress_history, "begin_dispatch", side_effect=replace_terminal),
+              redirect_stderr(io.StringIO()) as errors):
+            with self.assertRaisesRegex(ValueError, "TEST recorder failed"):
+                _ = self.dispatch()
+        self.assertEqual(self.fixture.world.closed, [])
+        self.assertEqual(len(staff.find(kind="worker", parent=self.fixture.parent.id)), 1)
+        self.assertEqual(errors.getvalue().count("anomaly:"), 1)
+        self.assertIn("terminal identity changed", errors.getvalue())
+
+    def test_dispatch_uses_saved_start_ownership_without_a_pane_read(self) -> None:
+        for incomplete in (False, True):
+            with self.subTest(incomplete=incomplete):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
+                    arm = worker.arm_launch_cleanup
+                    def launch(*arguments: object, **options: object) -> worker_panes.WorkerStart:
+                        result = start(*arguments, **options)
+                        if incomplete:
+                            assert isinstance(result, worker_panes.OpenWorker)
+                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed", result.created_pane)
+                        return result
+                    def arm_without_read(cleanup: ExitStack, before: frozenset[staff.StaffId],
+                                         result: worker_panes.WorkerStart) -> None:
+                        with patch.object(worker, "_client", side_effect=AssertionError("no ownership pane read")):
+                            arm(cleanup, before, result)
+                    with (patch.object(worker_panes, "start_or_resume", side_effect=launch),
+                          patch.object(worker, "arm_launch_cleanup", side_effect=arm_without_read),
+                          redirect_stderr(io.StringIO()) as errors):
+                        case.assertEqual(case.dispatch(), worker.ExitCode.UNCERTAIN if incomplete else worker.DispatchSubmission.SUBMITTED)
+                    case.assertEqual(len(case.agent.submitted), 0 if incomplete else 1)
+                    case.assertEqual(len(case.fixture.world.closed), int(incomplete))
+                    if incomplete:
+                        case.assertIn("TEST startup failed", errors.getvalue())
+                finally:
+                    case.doCleanups()
+
+    def test_failed_first_assignment_ends_only_its_new_team_panes(self) -> None:
+        for failure in ("selection", "dispatch"):
+            with self.subTest(failure=failure):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    with ExitStack() as patches, redirect_stderr(io.StringIO()) as errors:
+                        if failure == "selection":
+                            _ = patches.enter_context(patch.object(worker, "select_worker", return_value=worker_panes.StartRefused(
+                                worker_panes.StartRefusal.BUSY_ROLE_CHANGE, "TEST selection failed")))
+                        else:
+                            _ = patches.enter_context(patch.object(worker, "dispatch", return_value=worker.ExitCode.REFUSED))
+                        code = worker.assign(case.fixture.parent.id, "impl", case.prompt,
+                            session_dir=case.run_dir, slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"])
+                    case.assertEqual(code, worker.ExitCode.REFUSED)
+                    case.assertEqual(staff.find(kind="worker", parent=case.fixture.parent.id), [])
+                    case.assertEqual(len(case.fixture.world.closed), 4)
+                    case.assertEqual(case.agent.submitted, [])
+                    case.assertNotIn("cleanup failed", errors.getvalue())
+                finally:
+                    case.doCleanups()
+
+    def test_failed_restore_before_submission_ends_only_its_new_pane(self) -> None:
+        for existing, incomplete, refused in ((False, False, False), (True, False, False),
+                                               (False, True, False), (False, False, True)):
+            with self.subTest(existing=existing, incomplete=incomplete, refused=refused):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    opened = case.opened()
+                    _ = progress_history.begin_dispatch(case.run_dir, slot="impl", phase="8", role="impl",
+                        worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                        prompt=case.prompt, kind="impl", lens="")
+                    if not existing:
+                        case.assertIsInstance(worker_panes.close(case.fixture.parent.id, staff.WorkerName.parse(opened.row.name)),
+                                              worker_panes.Closed)
+                    closed = len(case.fixture.world.closed)
+                    director = herdr.TabSession("w1:p0", "unit", "w1", str(case.fixture.parent.current_session))
+                    start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
+                    def launch(*arguments: object, **options: object) -> worker_panes.WorkerStart:
+                        result = start(*arguments, **options)
+                        if incomplete:
+                            assert isinstance(result, worker_panes.OpenWorker)
+                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST resume read failed", result.created_pane)
+                        return result
+                    check = cast(Callable[..., bool], herdr.check_target)
+                    def target(*arguments: object, **options: object) -> bool:
+                        return False if refused and options.get("action") == "keys" else check(*arguments, **options)
+                    step = (worker.UnsubmittedAssignment("TEST-pass", ("assign.sh",)) if refused else
+                            worker.DispatchEvidenceUnknown("TEST resume read failed"))
+                    with (patch.object(worker_panes, "start_or_resume", side_effect=launch),
+                          patch.object(worker, "resume_step", return_value=step),
+                          patch.object(herdr, "check_target", side_effect=target),
+                          patch.object(case.fixture.world, "tab_sessions", return_value=[director]),
+                          redirect_stderr(io.StringIO()) as errors):
+                        code = worker.restore(case.fixture.parent.id)
+                    case.assertEqual(code, worker.ExitCode.UNCERTAIN)
+                    case.assertIn("would send keys to an unproved target" if refused else "TEST resume read failed", errors.getvalue())
+                    case.assertEqual(case.agent.submitted, [])
+                    if existing:
+                        case.assertEqual(staff.by_id(opened.row.id), opened.row)
+                        case.assertEqual(len(case.fixture.world.closed), closed)
+                    else:
+                        case.assertEqual(staff.by_id(opened.row.id), opened.row)
+                        case.assertEqual(len(case.fixture.world.closed), closed + 1)
+                finally:
+                    case.doCleanups()
 
     def test_publication_failure_reports_that_its_new_pane_was_closed(self) -> None:
         with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),

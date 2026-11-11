@@ -2461,7 +2461,8 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str, *, target: str,
-               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED,
+               on_submission: Callable[[], object] = lambda: None) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
@@ -2469,6 +2470,7 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        _ = on_submission()
         self._prompt(pane, text, proof=proof)
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:

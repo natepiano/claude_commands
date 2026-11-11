@@ -59,7 +59,8 @@
       "Bash(sudo kill:*)",
       "Bash(ps -co pid,comm)",
       "Bash(ps:*)",
-      "Bash(xargs -I{} ps -o pid,etime,command -p {})"
+      "Bash(xargs -I{} ps -o pid,etime,command -p {})",
+      "Bash(git ls-remote *)"
     ],
     "deny": [],
     "ask": []

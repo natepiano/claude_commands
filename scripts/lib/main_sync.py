@@ -4,7 +4,8 @@
 Changes that match origin/main can come from an interrupted update. Prove every
 candidate's content, mode, and index state before changing any file. Remove proved
 untracked files before restoring tracked paths to HEAD. Then finish the update
-with git merge --ff-only. A blocked report names every path that fails the proof.
+with git merge --ff-only. A blocked report names every path that fails the proof
+or collides with an incoming path.
 
 Each run appends a JSON line to SYNC_LOG. Each blocked run with --notify calls
 send.py with a key for the host and state. send.py limits delivery to one message
@@ -120,7 +121,12 @@ def _has_untracked_update(checkout: Path, blocking_details: list[str]) -> bool:
         blocking_details.append(_first_line(added))
         return False
     added_paths = set(added.stdout.split("\0")) - {""}
-    return bool(set(untracked.stdout.split("\0")) & added_paths)
+    untracked_paths = set(untracked.stdout.split("\0")) - {""}
+    collisions = sorted(name for name in untracked_paths
+                        if any(name.startswith(added_path + "/") or added_path.startswith(name + "/")
+                               for added_path in added_paths))
+    blocking_details.extend(collisions)
+    return bool(untracked_paths & added_paths) or bool(collisions)
 
 
 def _finish_interrupted_update(checkout: Path, blocking_details: list[str]) -> bool:
@@ -228,7 +234,7 @@ def sync(checkout: Path) -> Outcome:
     blocking_details: list[str] = []
     if status.returncode:
         blocking_details.append(_first_line(status))
-    elif status.stdout.strip() or _has_untracked_update(checkout, blocking_details):
+    elif _has_untracked_update(checkout, blocking_details) or status.stdout.strip():
         interrupted = _finish_interrupted_update(checkout, blocking_details)
     if blocking_details:
         return Outcome("dirty", f"{checkout} has local changes that block the update ({', '.join(blocking_details)})")

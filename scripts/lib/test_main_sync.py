@@ -133,6 +133,17 @@ class MainSyncTests(unittest.TestCase):
             self.assertEqual((self.checkout / "c").read_text(), "local addition")
             (self.checkout / "c").unlink()
 
+        with self.subTest(case="untracked file blocks an incoming directory"):
+            (self.writer / "dir").mkdir()
+            _ = self.commit("dir/file")
+            _ = (self.checkout / "dir").write_text("local file")
+            outcome = main_sync.sync(self.checkout)
+            self.assertEqual(outcome.state, "dirty")
+            self.assertEqual(outcome.detail, f"{self.checkout} has local changes that block the update (dir)")
+            self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), before)
+            self.assertEqual((self.checkout / "dir").read_text(), "local file")
+            (self.checkout / "dir").unlink()
+
         _ = (self.checkout / "a").write_text("local edit")
         self.assertEqual(main_sync.sync(self.checkout).state, "dirty")
         self.assertEqual((self.checkout / "a").read_text(), "local edit")

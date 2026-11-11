@@ -152,6 +152,7 @@ The two flags together cause a usage error.
 
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
 A typed name first matches an exact canonical staff path or short name. Unit names use the staff name.
+A `<name>-unit` target finds the unit `<name>` when no staff row or live session has that exact name.
 A bare worker name selects a worker under the sender's own unit.
 A match only in another unit refuses delivery and lists the full paths.
 One selected staff row supplies its `current_session`. Several matching rows produce a named ambiguity error and no delivery.
