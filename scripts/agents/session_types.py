@@ -182,7 +182,7 @@ class ShowrunnerSession(SessionFields):
 
 class UnitSession(SessionFields):
     kind: Literal["unit"]
-    host: UnitHost | LegacyTmuxUnitHost
+    host: Host
 
 
 class WorkerSession(SessionFields):
@@ -191,12 +191,17 @@ class WorkerSession(SessionFields):
     owner: WorkerOwner
 
 
+class ProducerSession(SessionFields):
+    kind: Literal["producer"]
+    host: SessionHost
+
+
 class TopLevelSession(SessionFields):
     kind: Literal["top-level"]
     host: SessionHost
 
 
-Session = ShowrunnerSession | UnitSession | WorkerSession | TopLevelSession
+Session = ShowrunnerSession | UnitSession | WorkerSession | ProducerSession | TopLevelSession
 
 
 class TimerRestore(TypedDict):
@@ -457,7 +462,7 @@ def parse_session(value: object, place: str) -> Session:
     """Validate and return one session from an inventory or shutdown record."""
     data = wire_object(value, place)
     kind = wire_kind(data, place)
-    if kind not in {"showrunner", "unit", "worker", "top-level"}:
+    if kind not in {"showrunner", "unit", "worker", "producer", "top-level"}:
         raise InvalidInventory(f"{place}.kind is invalid")
     if kind in {"unit", "worker"}:
         identity = wire_string(wire_required(data, "session_id", place), f"{place}.session_id")

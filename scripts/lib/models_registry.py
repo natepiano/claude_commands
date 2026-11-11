@@ -14,7 +14,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
@@ -129,6 +129,31 @@ class LaunchSettings(NamedTuple):
     model: str
     effort: str
     service_tier: str
+
+
+def claude_model(model: str, environment: Mapping[str, str]) -> str:
+    """Resolve a model with the selected launch account's catalog."""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1" && _agents_model_slug claude "$2"', "claude-model",
+             str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), model],
+            env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return model
+    return result.stdout.strip()
+
+
+def claude_arguments(arguments: Sequence[str], environment: Mapping[str, str]) -> list[str]:
+    """Resolve model options after the caller selects the launch account."""
+    resolved = list(arguments)
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if argument == "--model":
+            resolved[index + 1] = claude_model(arguments[index + 1], environment)
+        elif argument.startswith("--model="):
+            resolved[index] = "--model=" + claude_model(argument.partition("=")[2], environment)
+    return resolved
 
 
 def launch_settings(section: str, key: str) -> LaunchSettings:

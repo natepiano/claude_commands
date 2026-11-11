@@ -105,6 +105,7 @@ agents_exec_main() {
             else
                 claude_launch_environment workers || return 1
             fi
+            AGENT_MODEL="$(_agents_model_slug claude "$AGENT_MODEL")" || return 1
             [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]] || : > "$log_file"
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
