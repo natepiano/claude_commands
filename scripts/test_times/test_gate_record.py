@@ -51,6 +51,24 @@ class GateRecordTests(unittest.TestCase):
             self.fail("Invalid timing output must return NoModuleTimes")
         self.assertTrue(result.reason.strip(), "A missing result must explain the failure")
 
+    def test_config_reads_preserve_empty_records_and_missing_records(self) -> None:
+        for reads in (["z", "a", "z"], [], None):
+            with self.subTest(reads=reads):
+                value: dict[str, object] = dict(module_times())
+                if reads is not None:
+                    value["config_reads"] = reads
+                self.write_json(value)
+                times = gate_record.read_module_times(self.timing_path)
+                self.assertNotIsInstance(times, gate_record.NoModuleTimes)
+                assert not isinstance(times, gate_record.NoModuleTimes)
+                execution = gate_record.Execution("suite", "test_fixture.py", 1, 1, 1, 0, "", times, "")
+                row = gate_record.module_runs([execution], 0)[0]
+                if reads is None:
+                    self.assertNotIn("config_reads", row)
+                else:
+                    self.assertEqual(times.get("config_reads"), sorted(set(reads)))
+                    self.assertEqual(row.get("config_reads"), sorted(set(reads)))
+
     def test_valid_module_and_empty_module_preserve_the_runner_data(self) -> None:
         populated = module_times()
         empty: ModuleTimes = {"wall_s": 0.1, "cpu_s": 0.0, "tests_s": 0.0,

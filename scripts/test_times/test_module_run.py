@@ -333,6 +333,30 @@ class ModuleRunnerTests(unittest.TestCase):
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
+    def test_config_reads_include_python_and_shell_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
+            config = root / "config"
+            config.mkdir()
+            for stem in ("alpha", "beta", "gamma"):
+                _ = (config / (stem + ".conf")).write_text("value=one\n")
+            repository = RUNNER.parents[2]
+            source = f"""import os, subprocess, sys, unittest
+from scripts.lib import conf
+conf.read('alpha').text('value')
+class Reads(unittest.TestCase):
+    def test_reads(self):
+        conf.read('alpha').text('value')
+        subprocess.run([sys.executable, '-c', "from scripts.lib import conf; conf.read('gamma').text('value')"],
+                       env={{**os.environ, 'PYTHONPATH': {str(repository)!r}}}, check=True)
+        subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
+                       {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
+"""
+            fixture = run_fixture(root, "config_reads", source)
+            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+            self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+
     def sender_fixture(self, mode: str) -> FixtureRun:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
