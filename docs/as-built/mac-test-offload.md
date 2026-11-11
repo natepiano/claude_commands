@@ -256,7 +256,9 @@ The default verb is `nextest`.
 Claims use the verb and the package name, or `workspace`.
 Remote doc sets `LINT_CONFIG_FORCE=1`.
 Workspace verbs use the same manifest-based Linux-only check as eligibility.
-`--settings` selects the target's configuration.
+With `--target`, the target record gives the settings for both the platform choice and the copy host.
+A `--settings` path that resolves to another file is refused before any copy.
+Without `--target`, `--settings` selects the configuration.
 `--last-decline` suppresses an unchanged retry notice.
 
 `write_result` writes `mac`, `reason`, and `seconds` from the typed run outcome.
