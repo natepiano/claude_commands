@@ -33,35 +33,16 @@ The user's words, from the sdlc showrunner on 2026-11-11:
 
 ### Phase 1 — Branch after the worktree folder  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A unit director's first status line reads `<assignment> | <folder> | <branch>`.
-
-**Spec:**
-
-1. When the role is `unit-director`, the first line adds the current branch as a third field after the folder: `unit-board unit for sdlc | ~/worktrees/claude-natedev-unit-board | natedev-unit-board`.
-2. Read the branch from files, with no `git` process:
-   - Start at the session folder the line shows: `workspace.current_dir`, else `cwd`, else the process folder (`--arg pwd`). Walk up to the first folder with a `.git` entry.
-   - A `.git` folder holds `HEAD`. A `.git` file holds `gitdir: <path>` (a worktree); read `HEAD` in that path, relative to the `.git` file's folder when not absolute.
-   - `ref: refs/heads/<name>` gives `<name>`.
-   - Any other `HEAD` (detached) gives `detached <first 7 characters>`.
-   - No `.git`, or an unreadable file, gives no branch field.
-3. Other roles keep their first line unchanged.
-4. Update the "Status line assignment" item in `docs/as-built/showrunner-automation.md` in the same commit.
+- A unit director's first status line reads `<assignment> | <folder> | <branch>`, for example `unit-board unit for sdlc | ~/worktrees/claude-natedev-unit-board | natedev-unit-board`. Other roles keep their first line.
+- `current_branch(payload, pwd)` in `assignment.py` reads the branch from files, with no `git` process. It starts at `workspace.current_dir`, else `cwd`, else `--arg pwd`, resolves symbolic links, and walks up to the first `.git` entry.
+- A `.git` folder holds `HEAD`; a `.git` file gives `gitdir:`, relative to that file's folder unless absolute. `ref: refs/heads/<name>` gives `<name>`; a detached `HEAD` gives `detached <7 chars>`. No repository or an unreadable file gives no field.
 
 **Files:**
-- `scripts/statusline/assignment.py` — read the branch for a unit director and pass it to `jq` as `--arg branch`.
-- `scripts/statusline/statusline.jq` — add `$ARGS.named.branch` to `$first_line` when not empty.
-- `scripts/statusline/test_statusline.py` — rows for each rule.
-- `docs/as-built/showrunner-automation.md` — the status line text.
+- `scripts/statusline/assignment.py` — reads the branch for the `unit-director` role and passes it to `jq` as `--arg branch`.
+- `scripts/statusline/statusline.jq` — `$first_line` adds a non-empty `$ARGS.named.branch` as the third field.
+- `scripts/statusline/test_statusline.py` — branch rows: checkout, worktree with relative and absolute `gitdir`, subfolder, detached, no repository, symbolic link, showrunner.
+- `docs/as-built/showrunner-automation.md` — the "Status line assignment" item.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `assignment.py`, `statusline.jq`, the as-built doc.
-- `test` — `test_statusline.py`: a unit row in a normal checkout, in a worktree (`.git` file with a relative and an absolute `gitdir`), from a subfolder, detached `HEAD`, and no repository; a showrunner row that shows no branch. Update existing unit first-line expectations.
-
-**State:** none
-
-**Acceptance gate:**
-1. `basedpyright scripts/statusline`: 0 errors, 0 warnings, 0 notes.
-2. `env HERDR_BIN=/nonexistent/herdr PYTHONPATH="$PWD" scripts/lib/py -m unittest scripts.statusline.test_statusline` passes.
-3. Live: this unit's status line first line ends with `| natedev-unit-board`.
+**Gotchas:** The status line runs at every Claude Code refresh, so it starts no `git` process. `Path.absolute()` keeps symbolic links and can miss the repository; resolve the folder first.
