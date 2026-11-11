@@ -343,6 +343,7 @@ class WorkerCommandTests(unittest.TestCase):
             "phase": {"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active", "started_at": 1},
             "pass": {}, "events": [], "project": {}, "unit": "unit",
             "history_file": str(self.run_dir / "history.jsonl"),
+            "owner_staff_id": self.fixture.parent.id,
             "main_agent": {"session_id": str(self.fixture.parent.current_session),
                            "family": "claude", "model": "fixture", "effort": "high"},
         }))
@@ -528,7 +529,9 @@ class WorkerCommandTests(unittest.TestCase):
         idle = self.opened("review", "review")
         self.fixture.dispatch(busy.row, "impl")
         path = self.run_dir / "progress_history_state.json"
-        fields = {"pass": {"impl": {"status": "active", "instance_id": "dispatch-impl", "worker_name": "impl", "launcher_command": ["assign.sh", "same command"]}}}
+        fields = {"owner_staff_id": self.fixture.parent.id,
+                  "pass": {"impl": {"status": "active", "instance_id": "dispatch-impl",
+                                    "worker_id": busy.row.id, "launcher_command": ["assign.sh", "same command"]}}}
         atomic_file.write_text_atomic(path, json.dumps(fields))
         with patch.object(unit_runs, "held", return_value=[str(self.run_dir)]):
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
@@ -1964,8 +1967,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(assign("rerun"), worker.ExitCode.OK)
         self.assertNotEqual(self.agent.submitted[1][0], busy)
         self.assertEqual(passes()["review"], held)
-        self.assertEqual((held["worker_name"], held["status"]), ("review", "active"))
-        self.assertEqual((passes()["review2"]["worker_name"], passes()["review2"]["status"]), ("review2", "active"))
+        members = {row.name: row.id for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)}
+        self.assertEqual((held["worker_id"], held["status"]), (members["review"], "active"))
+        self.assertEqual((passes()["review2"]["worker_id"], passes()["review2"]["status"]), (members["review2"], "active"))
 
     def test_add_uses_the_lowest_free_name(self) -> None:
         _ = self.opened("impl")
@@ -2193,7 +2197,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(snapshots.call_count, 1)
         self.assertEqual(local_snapshots.call_count, 0)
         self.assertEqual(enumerated, [self.fixture.root])
-        self.assertEqual(roles.call_count, 1)
+        self.assertEqual(roles.call_count, 0)
         print(f"herdr list with three workers: {elapsed:.6f} seconds")
 
     def test_assign_shares_role_history_reads_before_selecting_an_unknown_worker(self) -> None:
@@ -2215,7 +2219,7 @@ class WorkerCommandTests(unittest.TestCase):
                 slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"])
         self.assertEqual(result, worker.ExitCode.UNCERTAIN)
         self.assertEqual(snapshots.call_count, 0)
-        self.assertEqual(roles.call_count, 1)
+        self.assertEqual(roles.call_count, 0)
         self.assertEqual(enumerated, [self.fixture.root])
         self.assertEqual(self.agent.submitted, [])
 
@@ -2389,8 +2393,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_list_all_resolves_a_fixed_manager_id_after_its_session_changes(self) -> None:
         first, _second, paths = self.recorded_list_fixture()
         state = cast(dict[str, object], json.loads(paths[0].read_text()))
-        _ = state.pop("owner_staff_id")
-        state["main_agent"] = {"session_id": self.fixture.parent.id}
+        self.assertEqual(state["owner_staff_id"], self.fixture.parent.id)
+        state["main_agent"] = {}
         state["pass"] = {}
         history = self.fixture.root / "legacy-history.jsonl"
         state["history_file"] = str(history)

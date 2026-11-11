@@ -166,7 +166,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
 
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
     """Find the named worker under its staff parent."""
-    return next((row for row in record.find(kind="worker", parent=owner) if row.name == name), None)
+    return next((row for row in record.find(kind="worker", parent=owner) if name in (row.name, row.id)), None)
 
 
 def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:

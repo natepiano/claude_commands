@@ -22,7 +22,7 @@ from typing import NamedTuple, cast
 from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
-from scripts.agents import remote
+from scripts.agents import remote, worker_lifecycle
 from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
@@ -108,7 +108,7 @@ def morty_thread(identity: str) -> bool:
     return bool(identity) and morty_identity.matches(f"codex:{identity}")
 
 
-WORKER_FACT_KEYS = ("thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
+WORKER_FACT_KEYS = ("name", "thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
 
 PresentWorktree = staff.PresentWorktree
 RemovedWorktree = staff.RemovedWorktree
@@ -154,7 +154,8 @@ def codex_thread(entry: Mapping[str, object], record: staff.StaffSnapshot | None
 
 def worker_row(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> staff.StaffRow | None:
     record = record if record is not None else staff.local_snapshot()
-    return record.by_id(staff.StaffId(str(entry.get("staff_id", ""))))
+    row = record.by_id(staff.StaffId(str(entry.get("staff_id", ""))))
+    return row if row is not None and row.kind == "worker" else None
 
 
 def worker_session(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
@@ -181,6 +182,14 @@ def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) ->
         paths.append(Path(current))
     found: dict[staff.StaffId, WorkerRunEvidence] = {}
     for run in sorted(dict.fromkeys(paths), key=lambda run: run.stat().st_mtime if run.exists() else 0):
+        fields = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        reference = fields.get(unit_runs.OWNER_FIELD)
+        owner = record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else None
+        if not isinstance(owner, staff.StaffRow):
+            owner = next((row for row in owners.values()
+                          if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == run.resolve()), owner)
+        if not isinstance(owner, staff.StaffRow):
+            continue
         records: dict[staff.StaffId, dict[str, object]] = {}
         try:
             entries = [cast(object, json.loads(path.read_text())) for path in run.glob("impl_worker_*.json")]
@@ -189,6 +198,9 @@ def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) ->
         except (OSError, ValueError) as error:
             report_anomaly(f"{run}: {error}")
         for identity in records.keys() | marked.get(run, set[staff.StaffId]()):
+            row = record.by_id(identity)
+            if row is None or row.kind != "worker" or row.parent != staff.ReportsTo(owner.id):
+                continue
             evidence = found.setdefault(identity, WorkerRunEvidence([], []))
             evidence.runs.append(run)
             if identity in records:
@@ -231,9 +243,9 @@ def worker_home(entry: Mapping[str, object], record: staff.StaffSnapshot | None 
 
 def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
     """Store fixed references and run details without copying staff facts."""
-    return {name: {key: value for key, value in cast(dict[str, object], raw).items()
-                   if key not in WORKER_FACT_KEYS}
-            for name, raw in entries.items() if isinstance(raw, dict)}
+    return {str(cast(dict[str, object], raw)["staff_id"]): {
+                key: value for key, value in cast(dict[str, object], raw).items() if key not in WORKER_FACT_KEYS}
+            for raw in entries.values() if isinstance(raw, dict) and cast(dict[str, object], raw).get("staff_id")}
 
 
 def read_worker_roster(path: Path) -> dict[str, object]:

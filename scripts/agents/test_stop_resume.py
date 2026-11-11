@@ -951,7 +951,7 @@ class StopResumeTests(unittest.TestCase):
             agents_log.append(child.current_session, "impl", None, datetime.now(timezone.utc))
         fixture.write_json(run / "progress_history_state.json", {
             "owner_staff_id": owner.id, "pass": {child.name: {
-                "worker_name": child.name, "status": "active", "instance_id": f"dispatch-{child.name}",
+                "worker_id": child.id, "status": "active", "instance_id": f"dispatch-{child.name}",
                 "launcher_command": ["assign.sh", "--to", child.name],
             } for child in (codex, claude, foreign)}})
         for child in (codex, claude):
@@ -2071,6 +2071,7 @@ class StopResumeTests(unittest.TestCase):
                           staff_id="019b3a40-4250-7000-8000-000000000104", turn_live=True, launcher_command=[])
         for role in ("review", "test"):
             with self.subTest(role=role):
+                seat["role"] = role
                 missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
                 dispatch = progress_history.RecordedDispatch(
                     role, "3t", "contract" if role == "review" else missing,
@@ -2080,7 +2081,7 @@ class StopResumeTests(unittest.TestCase):
                 read.assert_called_once_with(staff.StaffId(seat["staff_id"]))
                 self.assertEqual(command[:2], ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh")])
                 options = dict(zip(command[2::2], command[3::2]))
-                self.assertEqual(options["--role"], role)
+                self.assertEqual(options["--role"], seat["role"])
                 self.assertEqual(options["--phase"], "3t")
                 self.assertEqual(options["--cwd"], "/current/tree")
                 self.assertEqual(options["--prompt"], str(run / "worker.resume-prompt.md"))

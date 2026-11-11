@@ -48,6 +48,15 @@ Pending unit admission and director role records keep the selected type until th
 5. Production: the `parent` chain.
 6. Workers of a unit: the rows whose `parent` is the unit.
 
+Run state keeps fixed owner and dispatch participant IDs.
+Worker records keep fixed staff IDs and dispatch telemetry.
+Mesh roster entries use fixed staff IDs as keys.
+Run-owner lookup requires a fixed staff ID.
+Pass lookup requires a fixed worker ID and a matching current parent.
+Historical reads preserve the recorded folder, branch, session, and family.
+Current readers validate each worker against its staff parent.
+Historical identities, roles, folders, and branches describe past events only.
+
 Displays (the herdr tab label, the Claude session title) show `name`. Rename sets them. No code reads them back.
 
 Producer launches select their family from `[producers]` in `config/models.conf`.
