@@ -48,10 +48,38 @@ def add_bootstrap(file: Path) -> bool:
     lines = source.splitlines(keepends=True)
     block = [b"try:", line, b"except FileNotFoundError:", b"    pass"]
     stripped = [existing.rstrip(b"\r\n") for existing in lines]
-    if any(stripped[index:index + len(block)] == block for index in range(len(lines))):
+    bootstrap_lines: set[int] = set()
+    for node in tree.body:
+        bootstrap = node
+        if isinstance(node, ast.Try):
+            if len(node.body) != 1 or len(node.handlers) != 1 or node.orelse or node.finalbody:
+                continue
+            handler = node.handlers[0]
+            if (not isinstance(handler.type, ast.Name) or handler.type.id != "FileNotFoundError"
+                    or handler.name is not None or len(handler.body) != 1
+                    or not isinstance(handler.body[0], ast.Pass)):
+                continue
+            bootstrap = node.body[0]
+        if (not isinstance(bootstrap, ast.With) or len(bootstrap.items) != 1
+                or len(bootstrap.body) != 1):
+            continue
+        statement = bootstrap.body[0]
+        if (not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call)
+                or not isinstance(statement.value.func, ast.Name) or statement.value.func.id != "exec"):
+            continue
+        item = bootstrap.items[0]
+        if (isinstance(item.optional_vars, ast.Name) and item.optional_vars.id == "_package_root"
+                and isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name) and item.context_expr.func.id == "open"
+                and item.context_expr.args and any(
+                    isinstance(part, ast.Constant) and isinstance(part.value, str)
+                    and part.value.endswith("package_root.py")
+                    for part in ast.walk(item.context_expr.args[0]))):
+            bootstrap_lines.update(range(node.lineno - 1, node.end_lineno or node.lineno))
+    if len(bootstrap_lines) == len(block) and any(
+            stripped[index:index + len(block)] == block for index in range(len(lines))):
         return False
-    lines = [existing for existing in lines
-             if b'lib/package_root.py") as _package_root: exec(' not in existing]
+    lines = [existing for index, existing in enumerate(lines) if index not in bootstrap_lines]
     tree = ast.parse(b"".join(lines))
     position = tree.body[0].lineno - 1 if tree.body else len(lines)
     for index, node in enumerate(tree.body):

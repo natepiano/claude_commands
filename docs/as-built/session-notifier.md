@@ -277,6 +277,8 @@ The staff JSON key `run` holds the path string. An absent key reads as `NoRun`.
 A session with no staff row prints one line and continues. An unreadable staff record stops the script.
 `progress_history.py start-run` and its reopen path publish the pointer before they write the `active` status.
 A rerun after a failed write therefore publishes the pointer.
+They keep the pointer when it names another run whose status is `active`.
+A second run of the same director, such as an Astra review folder, therefore never moves its run.
 `finish-run` and `end_session.sh` clear matching pointers for every staff row kind.
 A repeated finish also attempts to clear matching pointers.
 An old run cannot clear a pointer that names a newer run.

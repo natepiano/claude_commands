@@ -67,10 +67,19 @@ def is_decision(issue: Issue) -> bool:
             and {"proposal", "style"} <= set(issue.fields.get("tags", [])))
 
 
+def owned_decision_rules(unit: str) -> frozenset[str]:
+    """Return the catalog rules that the unit's current family assignment owns."""
+    row = staff_reference(unit, "unit")
+    config = style_config.config_for_unit(row, staff.snapshot())
+    families = config.assignment(row.name).families
+    return frozenset(rule.rule_id for rule in rules.load_rules(config.route.checkout) if rule.family in families)
+
+
 def approved_decisions(folder: Path, unit: str) -> tuple[Issue, ...]:
+    owned_rules = owned_decision_rules(unit)
     return tuple(sorted((issue for issue in open_issues(folder, "style")
                          if is_decision(issue) and isinstance(decision_answer(issue), ApprovedDecision)
-                         and issue.value("unit") == staff_reference(unit, "unit").id),
+                         and issue.value("style_rule").removesuffix("#uncovered") in owned_rules),
                         key=lambda issue: (issue.value("date_created"), issue.path.name)))
 
 

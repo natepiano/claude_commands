@@ -8,7 +8,7 @@ Usage: user_zone.py            print the zone's IANA name, for `TZ="$(…)" date
 """
 from __future__ import annotations
 try:
-    with open(__file__[:__file__.rfind("/") + 1] + "package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
 
