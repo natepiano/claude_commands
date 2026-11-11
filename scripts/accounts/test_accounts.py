@@ -779,6 +779,11 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows["claude4"]["roles"], ["units"])
         self.assertEqual(rows["claude4"]["selected_roles"], [])
         self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "idle": 1, "paused": 0, "exited": 0, "total": 2}])
+        self.assertEqual(rows["claude4"]["sessions"], sorted([
+            {"session": members[0].current_session, "state": "busy"},
+            {"session": members[2].current_session, "state": "idle"},
+        ], key=lambda entry: entry["session"]))
+        self.assertIn({"session": members[3].current_session, "state": "exited"}, rows["claude2"]["sessions"])
         table = accounts.render_status_table(reading)
         for text in ("units ✓ 2 (busy 1, idle 0, paused 0, exited 1)", "units 2 (busy 1, idle 1, paused 0, exited 0)",
                      "showrunners ✓ 1 (busy 0, idle 0, paused 0, exited 1)"):
@@ -5568,7 +5573,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         document = cast(dict[str, object], json.loads(output))
         self.assertEqual(set(document), {"accounts", "problems", "session_inputs", "upcoming_moves"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "sessions", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -9063,7 +9068,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
             "label": "fixture", "tool": "codex", "roles": ["workers"], "selected_roles": [], "role_counts": [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
-            "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {},
+            "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {}, "sessions": [],
         })
 
 

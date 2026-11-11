@@ -4180,6 +4180,11 @@ class RoleSessionCountsDocument(TypedDict):
     total: int
 
 
+class AccountSessionDocument(TypedDict):
+    session: str
+    state: session_state.SessionState
+
+
 @dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
@@ -4199,6 +4204,7 @@ class StatusRow:
     role_counts: tuple[RoleSessionCounts | NoRoleCount, ...] = ()
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
     selected_roles: tuple[str, ...] = ()
+    sessions: tuple[AccountSessionDocument, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4219,6 +4225,7 @@ class StatusAccountDocument(TypedDict):
     roles: list[str]
     selected_roles: list[str]
     role_counts: list[RoleSessionCountsDocument | None]
+    sessions: list[AccountSessionDocument]
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
@@ -4346,6 +4353,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
                 idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
                 if isinstance(count, RoleSessionCounts) else None for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
+            sessions=list(row.sessions),
             role_counts_by_machine=row.role_counts_by_machine,
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
@@ -5161,7 +5169,7 @@ def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_U
 class LocalRoleSessions:
     """One local observation supplies counts and detail output."""
 
-    counts: dict[tuple[Path, str], dict[str, str]]
+    counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]
     members: dict[ClaudeGroup, list[LiveGroupMember]]
     inputs: tuple[str, ...]
     session_lines: tuple[str, ...]
@@ -5204,7 +5212,7 @@ def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.No
     return account.ConfiguredClaudeFolder(Path(directory)) if directory else account.NoAccountSetting()
 
 
-def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]:
+def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, session_state.SessionState]], tuple[str, ...]]:
     with role_map.stored_role_map():
         observed = _read_local_role_sessions(group_accounts())
     return observed.counts, observed.inputs
@@ -5226,7 +5234,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
     from scripts.production import session_staff, staff
 
     inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
-    counts: dict[tuple[Path, str], dict[str, str]] = {}
+    counts: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
     try:
         membership = staff.local_snapshot()
@@ -5292,7 +5300,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             if role == "workers":
-                state = "busy" if session.get("status") == "busy" else "idle"
+                state = session_state.classify(session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")))
             else:
                 member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
                 state = session_state.classify(
@@ -5312,7 +5321,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             continue
         directory = account_dir(selected)
         state = session_state.classify(member, session_state.NoLiveSession())
-        counts.setdefault((directory, role), {})[str(member.id)] = state
+        counts.setdefault((directory, role), {})[member.current_session] = state
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
     if include_workers and (parents := session_staff.pane_parents(membership)):
@@ -5331,7 +5340,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                     continue
                 if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
-                    counts.setdefault((directory, "workers"), {})[state.row.current_session] = status
+                    counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
+                        session_state.UnrecordedStaff(), session_state.LiveActivity(status))
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
@@ -5344,7 +5354,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if isinstance(setting, account.ProcessEnvironmentUnread):
                     continue
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
-                counts.setdefault((directory, "workers"), {})[member.current_session] = process.activity
+                counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
+                    session_state.UnrecordedStaff(), session_state.LiveActivity(process.activity))
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), ())
 
@@ -5357,7 +5368,11 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
         roles = tuple(dict.fromkeys((*row.roles, *(role for folder, role in observed.counts if folder == directory))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
-        counted.append(replace(row, roles=roles, selected_roles=tuple(role for role in row.roles if role != "spare"),
+        members: dict[str, session_state.SessionState] = {identity: state for role in roles
+                   for identity, state in observed.counts.get((directory, role), {}).items()}
+        counted.append(replace(row, roles=roles,
+            sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
+            selected_roles=tuple(role for role in row.roles if role != "spare"),
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
                 tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
     return tuple(counted), observed.inputs
@@ -5378,8 +5393,8 @@ def _session_counts_machine() -> str:
     return "mac" if remote.other_machine() == "natedev" else "natedev"
 
 
-def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
-    mapped: dict[tuple[str, str], dict[str, str]] = {}
+def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]) -> MachineSessionCounts:
+    mapped: dict[tuple[str, str], dict[str, session_state.SessionState]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
         if re.fullmatch(r"codex(?:[1-9][0-9]*)?", label):
