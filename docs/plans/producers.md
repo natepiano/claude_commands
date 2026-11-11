@@ -138,45 +138,25 @@ dwight=claude:fable:high
 
 **Depends on:** Phase 3a
 
-#### Work Order
+#### As-built
 
-**Goal:** after a herdr restart or a reboot, each producer comes back through the Phase 3 start path, with no hand step.
-
-**Spec:**
-
-1. The herdr upkeep run first brings the shared herdr server back through the existing server restore, because resume needs pane access.
-2. It then selects the active, local, unpaused producer rows from staff and calls `stop_resume.resume(str(row.id))`, the same code as `resume <name>`.
-3. A paused producer stays down. The pause is the user's off switch.
-4. It reads settings with `accounts.producer_settings` inside one `settings_report_scope` per upkeep run. A bad `[producers]` line skips that producer with one warning; the others still start.
-5. A start that fails is reported once per upkeep run and retried on the next upkeep run. One failed producer does not stop the others.
-6. Starts use the existing operation deadlines and stay inside the upkeep worker budget in `config/herdr_upkeep.toml` (60 seconds today; one start can take 20 seconds).
-7. Keep the layout save and the detection-rule refresh.
-8. If the upkeep timer does not run at boot on natedev, name the nixos change for the showrunner; do not push nixos.
-9. Add rows to the existing upkeep tests with a fake herdr: an absent server, both families, a paused row, a remote row, a bad settings line, a failed start, and a repeated upkeep run.
-
-**Constraints from prior phases:**
-- Phase 3 gives the account choice, the `[producers]` launch settings, the same conversation and the producer tab. Phase 3a gives the one shared resume and move path. Add the automatic start through that path only.
-- `stop_resume.resume` returns `LiveAccountUnproved` (a `ResumeFailed`) for a live Codex producer whose process account cannot be read. The producer is live: report it and start nothing. A resume in the same pane on an unchanged account writes no staff `home`.
-- Start admitted staff rows only. Phase 5 owns a first start.
-- Keep the difference between a stopped and an unknown liveness. Reuse the existing liveness evidence and launch functions.
-- Add no new checks and no stored failure record.
-- The nixos module starts `herdr-upkeep` from a graphical login. That alone does not prove a start before login.
+- Each herdr upkeep run restores the shared herdr server, saves the layout, refreshes the detection rules, then calls `stop_resume.resume(str(row.id))` for each producer from `accounts.producer_upkeep_members()`, inside one `settings_report_scope`.
+- `accounts.producer_upkeep_members()` returns the eligible Claude and Codex producers (active, local, unpaused) from the local staff snapshot, without rows that have an exit request. It returns `()` when staff is absent.
+- A failed start, a `ResumeFailed` result, an unknown session or any `Exception` from one producer gives one stderr line; the other producers still start, and the next upkeep run tries again. No failure record is stored.
+- The start order rotates by the wall-clock interval count, so each producer gets the first place in turn.
+- `run_job` passes `HERDR_UPKEEP_DEADLINE` to the worker. Each start runs under `min(run deadline, now + [shutdown] START_SECONDS)`; at the run deadline the loop stops with "producer budget ended".
+- A paused producer stays down: the pause is the user's off switch.
 
 **Files:**
-- `scripts/maintenance/herdr_upkeep.py` — the automatic start and the existing upkeep operations
-- `scripts/maintenance/test_herdr_upkeep.py` — rows
-- `config/herdr_upkeep.toml` — the existing cadence and worker budget
-- `scripts/agents/stop_resume.py` — the shared `resume` entry and its result
-- `scripts/agents/test_stop_resume.py` — shared resume rows
-- `scripts/accounts/accounts.py` — `producer_settings` and `settings_report_scope`
-- `scripts/herdr/herdr.py` — the existing server restore
-- `scripts/herdr/test_herdr.py` — the existing server tests
+- `scripts/maintenance/herdr_upkeep.py` — `upkeep` producer resume, rotation and deadlines
+- `scripts/maintenance/test_herdr_upkeep.py` — `test_producer_restore_retries_failures_and_keeps_live_sessions`
+- `scripts/accounts/accounts.py` — `producer_upkeep_members`
 
-**Workers:** 1 writer.
+**Binds later work:** the upkeep timer resumes each admitted, active, local, unpaused producer about every two minutes through `stop_resume.resume`; a resume of a live producer starts nothing.
 
-**State:** none.
-
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`. A test row proves that another eligible producer starts when one producer fails. A test row proves that a later upkeep run retries the failed producer and does not start a second copy of a running conversation.
+**Gotchas:**
+- The nixos module starts `herdr-upkeep` from a graphical login. A start before login needs `users.users.${username}.linger = true` and `nate.jobs.herdr-upkeep.needsDesktop = false`.
+- With four or more producers and a run spacing that is a multiple of producers × interval, the rotation can give the same producer the first place each run.
 
 ### Phase 5 — dwight's first start  · status: pending
 
@@ -198,6 +178,7 @@ dwight=claude:fable:high
 - After an interrupted admission, reuse the existing native identity and launch evidence.
 - Keep the family and model choice apart from the shared launch code.
 - Run the tests with fixture staff and a fake herdr before the live dwight start.
+- The herdr upkeep timer calls `stop_resume.resume` for each admitted, active, local, unpaused producer about every two minutes (`scripts/maintenance/herdr_upkeep.py`). Admit dwight's row only after his first start is live; a resume of a live producer starts nothing.
 
 **Files:**
 - `scripts/agents/stop_resume.py` — first-start selection at the shared resume entry
