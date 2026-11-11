@@ -1313,7 +1313,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         selected_home = staff.SessionHome(target_dir.absolute())
         if row is not None and row.home != selected_home:
             try:
-                _ = staff.set_home(row.id, selected_home)
+                # The launch hook can publish the new home before the start returns.
+                current = staff.by_id(row.id)
+                if current is None or current.home != selected_home:
+                    _ = staff.set_home(row.id, selected_home)
             except (staff.StaffUnreadable, staff.StaffNotFound) as error:
                 print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
         if original is not None:

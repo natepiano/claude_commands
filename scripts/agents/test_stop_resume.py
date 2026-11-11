@@ -858,6 +858,7 @@ class StopResumeTests(unittest.TestCase):
             row = replace(row, home=home)
             return row
         with (patch.object(staff, "initial_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
+              patch.object(staff, "snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
               patch.object(staff, "set_home", side_effect=record_home),
               patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
@@ -2550,16 +2551,47 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_shutdown_resume_with_an_explicit_target_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
-        self.start.side_effect = herdr_types.HerdrFailure("cannot start yet")
-        self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
-        self.start.side_effect = None
-        for iteration in range(2):
-            output = io.StringIO()
-            with redirect_stdout(output):
-                status = shutdown.main(["resume", "alpha", "--why", "finish move", "--to", "claude4"])
-            self.assertEqual(status, 0, output.getvalue())
-            self.assertEqual(len(output.getvalue().splitlines()), 1)
-            self.assertIn("Claude is up on claude4" if iteration == 0 else "unchanged; Claude runs on claude4", output.getvalue())
+        for state in ("pending move", "paused account change"):
+            with self.subTest(state=state), ExitStack() as scope:
+                case = StopResumeTests("runTest")
+                _ = scope.callback(case.doCleanups)
+                case.setUp()
+                if state == "pending move":
+                    case.start.side_effect = herdr_types.HerdrFailure("cannot start yet")
+                    self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
+                    case.start.side_effect = None
+                else:
+                    parent = fixture_member("showrunner", name="demo")
+                    owner = fixture_member("unit", name="alpha", parent=parent.id,
+                        runtime_id=case.entry["session_id"],
+                        worktree=staff.PresentWorktree(remote.local_machine(), case.root))
+                    _ = staff.set_home(owner.id, staff.SessionHome(case.root / ".claude3"))
+                    _ = staff.pause(str(owner.id), "review")
+
+                    def launch(pane: str, command: list[str], *, terminal: str = "") -> None:
+                        case.run_in_pane(pane, command, terminal=terminal)
+                        arguments = case._typed(case.start.call_args.args)
+                        environment = dict(item.split("=", 1) for item in arguments[:arguments.index("exec")] if "=" in item)
+                        publication = pane_record.launch(pane, owner.current_session, str(case.root), environment,
+                            ["claude", *arguments[arguments.index("exec") + 2:]])
+                        pane_record.write("agents", publication)
+
+                    _ = scope.enter_context(patch.object(case.client, "run_in_pane", side_effect=launch))
+                for iteration in range(2):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        status = shutdown.main(["resume", "alpha", "--why", "finish move", "--to", "claude4"])
+                    self.assertEqual(status, 0, errors.getvalue() + output.getvalue())
+                    self.assertEqual(len(output.getvalue().splitlines()), 1)
+                    self.assertIn("Claude is up on claude4" if iteration == 0 else "unchanged; Claude runs on claude4", output.getvalue())
+                    self.assertNotIn("unchanged", errors.getvalue())
+                    if iteration == 0:
+                        self.assertNotIn("unchanged", output.getvalue())
+                    if state == "paused account change":
+                        current = staff.by_current_session(case.entry["session_id"])
+                        assert current is not None
+                        self.assertEqual(current.home, staff.SessionHome(case.root / ".claude4"))
+                        self.assertIsInstance(current.paused, staff.Active)
 
     def test_move_writes_target_trust_before_start(self) -> None:
         target = self.root / ".claude4/.claude.json"
