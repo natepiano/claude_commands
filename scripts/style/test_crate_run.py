@@ -103,7 +103,7 @@ class CrateRunTests(CargoProjectTests):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        super().setUpClass()
+        # Build the complete class seed without the base class seed.
         cls.fixture_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="crate-run-seed-"))) / "seed"
         fixture = cls(methodName="runTest")
         environment = os.environ.copy()
@@ -116,6 +116,10 @@ class CrateRunTests(CargoProjectTests):
             _ = shutil.copytree(fixture.root, cls.fixture_seed, symlinks=True)
         finally:
             fixture.doCleanups()
+
+    @override
+    def set_up_project(self) -> None:
+        self.create_project()
 
     @override
     def setUp(self) -> None:

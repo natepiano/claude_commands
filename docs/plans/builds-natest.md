@@ -2994,6 +2994,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `style/test_bulk_rename.py`, `style/test_bulk_run.py` and `style/test_crate_run.py` pass with their current test counts.
 - basedpyright on the edited files: 0 errors, 0 warnings, 0 notes.
 - The report gives Git starts and CPU before and after for each module.
+- Three aws paired rounds over all three modules, after the final edit, show a positive summed median CPU saving. Both revisions include manifest batching (`ca17f3dca`). The report names any module that is unchanged or slower.
 
 ### Phase 154 — Find what the Mac-only verify tests spend their CPU on  · status: done
 **Depends on:** none
@@ -3119,6 +3120,90 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Acceptance gate:**
 - `direct/test_verify_mac_only.py` passes with its test count plus the item 3 row, if that row is a new test.
-- Two other modules that use the fixture pass.
+- Every module that imports `verify_mac_offload_test_support`, directly or through another fixture, passes. This includes the detached-recorder and stopped-child cases.
 - basedpyright on both files: 0 errors, 0 warnings, 0 notes.
 - aws pairs show a CPU gain; with no gain, the phase lands nothing.
+
+### Phase 158 — The standing checkpoint tests build their sample repository once for each class  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `style/test_standing_checkpoint.py` builds its catalog, Git repository, two worktrees and ledger tip once per class, and each test restores a private copy at the same paths. Every test and assertion stays.
+
+**Decision:** Architect review 156, next phase 1. sdlc owner go, 2026-11-11. The module is sixth by gate CPU (39.9 s median) with 15 tests.
+
+**Spec:**
+1. Measure first: run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <tree> style/test_standing_checkpoint.py --tests 15 --commands 10`. Report setup CPU against test CPU.
+2. `setUp` (lines 57–128) writes the catalog, runs `git init`, two `git config`, `git add`, `git commit`, two `git worktree add`, writes the production docs, staff and unit config, and runs `style_ledger.py set-tip` as a subprocess. Build this once per class at a fixed class root.
+3. In `setUp`, restore a private copy at the same absolute paths, so the worktree links stay valid. Use the restore pattern that `merge_checkpoint_test_support.py` and `tree_watch_test_support.py` already use; do not write a new copy helper if a shared one fits.
+4. Each test must see fresh files, Git state, ledger state and staff file. A test that changes the class seed is a blocker.
+5. Keep every test and assertion.
+6. When step 1 shows that setup is less than 10% of module CPU, stop and report; change nothing.
+
+**Files:**
+- `scripts/style/test_standing_checkpoint.py` — the fixture and its 15 tests.
+
+**Workers:** 1 writer; one module.
+- impl: `test_standing_checkpoint.py`.
+
+**Constraints from prior phases:**
+- Phase 153: a class seed copied for each test kept all 319 bulk and crate tests isolated. The reviewers checked Git config, refs, objects and index for leaks.
+- Phase 154: local CPU pairs on the shared host vary by up to 50%. Only aws pairs decide a saving.
+
+**State:** none.
+
+**Acceptance gate:**
+- `style/test_standing_checkpoint.py` passes with 15 tests.
+- basedpyright on the file: 0 errors, 0 warnings, 0 notes.
+- The report gives process starts, Git starts and local CPU, before and after.
+- Three aws paired rounds show a CPU saving.
+
+### Phase 159 — Eight merge checkpoint test modules keep only the tests that pay their way  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** Eight merge checkpoint test modules lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+
+**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". The user approved the Rule 2 sweep with no CPU or money bar: fewer tests is the goal. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. sdlc freed these modules and their support file on 2026-11-11 at main `e705d14d7`, which is on builds `5b715d548`. Architect review 156 asks for one family review.
+
+**Spec:**
+1. For each test in the listed modules, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
+2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
+3. Merge checkpoints move branches, write receipts and promote main. Keep the coverage of recovery, interruption, publication and saved history.
+4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in `merge_checkpoint_test_support.py` may go only when `grep -rn <name> scripts` finds no other user. Do not change production code.
+5. Do not merge tests into table rows in this phase.
+6. Write `phases/159/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case, the fixture outputs it used and the reason no user harm follows. Give the counts before and after for each module.
+7. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser.
+8. Run the required checks on the final merged tree, and name the tested revision in the report.
+
+**Files:**
+- `scripts/production/test_merge_checkpoint_promotion.py` — 36 tests.
+- `scripts/production/test_merge_checkpoint_bump.py` — 23 tests.
+- `scripts/production/test_merge_checkpoint_validation.py` — 22 tests.
+- `scripts/production/test_merge_checkpoint_handoff.py` — 16 tests.
+- `scripts/production/test_merge_checkpoint_rerun.py` — 12 tests.
+- `scripts/production/test_merge_checkpoint_receipts.py` — 10 tests.
+- `scripts/production/test_merge_checkpoint_tree_cancel.py` — 5 tests.
+- `scripts/production/test_merge_checkpoint_ledger.py` — 3 tests.
+- `scripts/production/merge_checkpoint_test_support.py` — shared support; cleanup only.
+
+**Held (sdlc, 2026-11-11):** `test_merge_checkpoint.py`, `test_merge_checkpoint_batch.py` and `test_merge_checkpoint_history.py` wait for fix-rounds batch-held-items.
+
+**Workers:** 2 writers; split by module. The support file goes to one writer, after both module groups are done.
+- impl3: `test_merge_checkpoint_bump.py`, `test_merge_checkpoint_validation.py`, `test_merge_checkpoint_handoff.py`, `test_merge_checkpoint_rerun.py`, `test_merge_checkpoint_receipts.py`; hub: `merge_checkpoint_test_support.py`.
+- test: `test_merge_checkpoint_promotion.py`, `test_merge_checkpoint_tree_cancel.py`, `test_merge_checkpoint_ledger.py`.
+
+**Constraints from prior phases:**
+- Phases 145–156: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom, and tests whose code a live tool still calls. Spec item 7 carries this.
+- Phase 145: a deleted path stayed in the staff accessor inventory and turned a builds chain red. Search code, docs and inventories before a path is deleted.
+- Phase 156: a merge between work and review made the worker's checks stale. Spec item 8 carries this.
+
+**State:** none.
+
+**Acceptance gate:**
+- Each listed test module passes; basedpyright reports 0 errors and 0 warnings on each edited file.
+- Every other module that imports `merge_checkpoint_test_support` passes when the support file changes.
+- `phases/159/removed_tests.md` lists every removed test with its reason, and the counts.
+- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
