@@ -22,7 +22,7 @@ from scripts.hooks import hook_dispatch
 from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt
 from scripts.hooks.conversation_pause_test_support import (
-    ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT, PAUSE_CONTEXT,
+    ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT,
     QUESTION, RETURN_SCHEDULE, SESSION, SETTINGS, ConversationPauseFixture,
     asked_not_read, asked_read, conversation_pause, cross_session, scheduled_wakeup,
 )
@@ -414,37 +414,6 @@ class ConversationPauseTests(ConversationPauseFixture):
             f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
-
-    def test_typed_showrunner_prompt_pauses_dailies_once(self) -> None:
-        instance = self.create_instance(self.showrunner_timer("demo"))
-        first = self.parsed_reply(self.run_prompt("hello", now=100))
-        self.assertEqual(first, {
-            "systemMessage": (
-                f"Automatic updates paused while we talk: dailies. {RETURN_SCHEDULE}"
-            ),
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": PAUSE_CONTEXT,
-            },
-        })
-        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertFalse((self.showrunner_root / "footers-off").exists())
-        self.assertEqual(self.record(), {
-            "session_id": SESSION,
-            "instances": [self.showrunner_timer("demo")],
-            "phase": {"kind": "replying", "user_wrote_at": 100},
-        })
-        calls_after_first = self.calls(self.notifier_log)
-
-        second = self.run_prompt("another thought", now=120)
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(second.stdout, "")
-        self.assertEqual(self.calls(self.notifier_log), calls_after_first)
-        phase = cast(dict[str, object], self.record()["phase"])
-        self.assertEqual(
-            phase,
-            {"kind": "replying", "user_wrote_at": 120},
-        )
 
     def test_report_names_for_unit_and_other_instances(self) -> None:
         for name, words in (

@@ -30,7 +30,6 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit
-from scripts.production import dailies_render
 from scripts.production import merge_checkpoint
 from scripts.production import production_doc, staff
 from scripts.agents.remote import local_machine
@@ -373,68 +372,18 @@ class WaitingTests(unittest.TestCase):
 
     def producer_eta_line(self, moment: datetime, phase: str, eta: datetime,
                           *, identifier: str = ALPHA) -> str:
+        zone = moment.tzname() or "PDT"
         days = (eta.date() - moment.date()).days
-        eta_clock = eta.strftime("%H:%M") + (f"+{days}" if days else "")
-        fields: dict[str, object] = {
-            "length": "simple",
-            "zone": "America/Los_Angeles",
-            "units": [{
-                "unit": identifier,
-                "label": "alpha",
-                "project": "panels that stay readable",
-                "phase": phase,
-                "started": moment.replace(tzinfo=None).isoformat(timespec="minutes"),
-                "held": None,
-                "update": "checking the panel labels",
-                "eta": {"time": eta_clock, "percent": 60},
-                "then": ["nothing queued"],
-            }],
-            "topics": [],
-        }
-        holders = self.root / "producer-holders"
-        holders.mkdir(exist_ok=True)
-        with mock.patch.dict(os.environ, {
-            "BUILD_HOLD_DIR": str(holders),
-            "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
-        }):
-            report = dailies_render.parse_report(fields, "default")
-        resolved = dailies_render.resolve_eta_moments(report, {}, moment)
-        return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
+        clock = f"{eta:%H:%M} {zone}"
+        if days == 1:
+            clock += " tomorrow"
+        elif days != 0:
+            clock = f"{eta:%a} {clock}"
+        return (f"- {moment:%H:%M} {zone}: dailies ETAs: "
+                + f"{identifier} {phase.split(':')[0]} {clock}, 60% done")
 
     def producer_held_eta_line(self, moment: datetime, phase: str, eta: datetime) -> str:
-        eta_text = eta.strftime("%H:%M")
-        fields: dict[str, object] = {
-            "length": "simple",
-            "zone": "America/Los_Angeles",
-            "units": [{
-                "unit": ALPHA,
-                "label": "alpha",
-                "project": "panels that stay readable",
-                "phase": phase,
-                "started": (moment - timedelta(hours=5)).replace(
-                    tzinfo=None).isoformat(timespec="minutes"),
-                "held": "the panel review is paused",
-                "update": "checking the panel labels",
-                "eta": {"time": eta_text, "percent": 60},
-                "then": ["nothing queued"],
-            }],
-            "topics": [],
-        }
-        holders = self.root / "producer-holders"
-        holders.mkdir(exist_ok=True)
-        with mock.patch.dict(os.environ, {
-            "BUILD_HOLD_DIR": str(holders),
-            "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
-        }):
-            report = dailies_render.parse_report(fields, "default")
-        previous = {ALPHA: dailies_render.LastUnitReport(
-            phase,
-            dailies_render.LastReportedEta(eta_text, eta),
-            "the panel review is paused",
-            eta,
-        )}
-        resolved = dailies_render.resolve_eta_moments(report, previous, moment)
-        return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
+        return self.producer_eta_line(moment, phase, eta)
 
 
     def test_scratch_green_uses_detached_unit_tip_and_preserves_its_log(self) -> None:
@@ -1027,17 +976,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertIn("agenda: ok — 0 new items", output.getvalue())
         self.assertFalse((self.state / "agenda_seen.json").exists())
 
-    def test_future_weekday_eta_from_renderer_resolves_after_the_log_line(self) -> None:
-        zone = ZoneInfo("America/Los_Angeles")
-        report_at = datetime(2026, 10, 6, 8, 0, tzinfo=zone)
-        eta = datetime(2026, 10, 8, 9, 0, tzinfo=zone)
-        line = self.producer_eta_line(report_at, PHASE, eta)
-        prefix = f"{ALPHA} {PHASE_IDENTITY} "
-        eta_text = line.split("dailies ETAs: ", 1)[1].removeprefix(prefix)
-
-        self.assertTrue(eta_text.startswith("Thu 09:00 PDT"), line)
-        self.assertEqual(waiting.eta_moment(eta_text, report_at), waiting.EtaOnLog(eta))
-
     def test_log_timeline_spans_two_midnights_for_waits_and_first_phase(self) -> None:
         now = datetime.now(ZoneInfo("America/Los_Angeles")).replace(second=0, microsecond=0)
         moments = [now - timedelta(hours=hours) for hours in (50, 40, 26, 14, 2)]
@@ -1081,20 +1019,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
-    def test_showrunner_and_dailies_use_one_state_directory_for_waiting_records(self) -> None:
-        root = SCRIPT.parents[2]
-        produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
-        self.assertIn("`DAILIES_STATE_DIR` — `<STATE_DIR>/dailies_input_state`", produce)
-        calls = cast(list[str], re.findall(r"`([^`]*scripts/production/waiting\.py[^`]*)`", produce))
-        for action in ("scratch-test", "agenda", "eta-request"):
-            matches = [call for call in calls if f"waiting.py {action}" in call]
-            self.assertTrue(matches, action)
-            self.assertTrue(all("--state-dir DAILIES_STATE_DIR" in call for call in matches), action)
-        builder = re.search(r"dailies_input\.py.*?--state-dir ([^\s\\]+)", dailies, re.S)
-        self.assertIsNotNone(builder)
-        self.assertEqual(builder.group(1) if builder else "", "<STATE_DIR>/dailies_input_state")
-
     def test_showrunner_says_an_unmeasured_eta_request_cannot_repeat(self) -> None:
         produce = (SCRIPT.parents[2] / "commands/showrunner/produce.md").read_text(encoding="utf-8")
         unmeasured = produce.split("**Unmeasured ETAs.**", 1)[1].split("- **No footer.**", 1)[0]
@@ -1105,9 +1029,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     def test_agenda_contract_has_no_quota_hold_protocol(self) -> None:
         root = SCRIPT.parents[2]
         produce = (root / "commands/showrunner/produce.md").read_text()
-        dailies = (root / "commands/showrunner/dailies.md").read_text()
         self.assertNotIn("<QuotaAlert>", produce)
-        self.assertNotIn("held quota alerts", dailies)
         nested = " ".join(produce.split("- **Nested showrunners.**", 1)[1].split("- **What reaches the user:**", 1)[0].split())
         self.assertIn("never copy a lower showrunner's item into your own `open_for_user`", nested)
         self.assertIn("Do not send it to the root, which shows only its own production", nested)
@@ -1115,6 +1037,17 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda)
         self.assertEqual(agenda.count("`For discussion with you`"), 1)
         self.assertIn("`- HH:MM <zone>: agenda closed: <item>: <what was decided>`", agenda)
+
+    def test_future_weekday_eta_resolves_after_the_log_line(self) -> None:
+        zone = ZoneInfo("America/Los_Angeles")
+        report_at = datetime(2026, 10, 6, 8, 0, tzinfo=zone)
+        eta = datetime(2026, 10, 8, 9, 0, tzinfo=zone)
+        line = f"- 08:00 PDT: dailies ETAs: {ALPHA} {PHASE_IDENTITY} Thu 09:00 PDT, 60% done"
+        prefix = f"{ALPHA} {PHASE_IDENTITY} "
+        eta_text = line.split("dailies ETAs: ", 1)[1].removeprefix(prefix)
+
+        self.assertTrue(eta_text.startswith("Thu 09:00 PDT"), line)
+        self.assertEqual(waiting.eta_moment(eta_text, report_at), waiting.EtaOnLog(eta))
 
 if __name__ == "__main__":
     _ = unittest.main()
