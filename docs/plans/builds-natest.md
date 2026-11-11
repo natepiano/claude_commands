@@ -2699,7 +2699,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - A one-process run that keeps every tree in memory: 31 to 36 CPU s slower, with a 3.5 GB peak.
 - Any shared-parse or shared-walk design across the scan modules: at most 18.3 CPU s.
 
-### Phase 134 — The next slowest test module uses at least 30 CPU s less  · status: todo
+### Phase 134 — The next slowest test module uses at least 30 CPU s less  · status: done
 **Depends on:** Phase 133
 
 #### Work Order
