@@ -6,13 +6,14 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from contextlib import redirect_stderr
 from typing import Literal, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts
-from scripts.agents import pane_record, remote, test_stop_resume
+from scripts.agents import pane_record, remote, test_stop_resume, worker_lifecycle
 from scripts.maintenance import herdr_upkeep as job
 from scripts.herdr import herdr, detection_rules, herdr_types
 from scripts.lib import operation_deadline
@@ -21,6 +22,21 @@ from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.whoami import account
+
+
+@dataclass
+class ProducerRestoreClock:
+    elapsed: float
+    interval_time: float = 0
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def time(self) -> float:
+        return self.interval_time
+
+    def advance(self, seconds: float) -> None:
+        self.elapsed += seconds
 
 
 class UpkeepTests(unittest.TestCase):
@@ -107,12 +123,15 @@ class UpkeepTests(unittest.TestCase):
         launches: dict[str, tuple[Literal["claude", "codex"], str, dict[str, str]]] = {}
         fail = True
         slow = False
-        clock = [time.monotonic()]
+        clock = ProducerRestoreClock(time.monotonic())
+        outside_clock_reads = 0
 
         def restore(name: str, timeout_ms: int, *, session_kind: herdr.SecuritySession
                     ) -> herdr.ServerCreated | herdr.ServerAdopted:
             nonlocal ready
             del session_kind
+            for read_clock in (time.monotonic,) * outside_clock_reads:
+                _ = read_clock()
             self.assertGreater(timeout_ms, 0)
             restores.append(name)
             result = herdr.ServerAdopted() if ready else herdr.ServerCreated()
@@ -139,9 +158,9 @@ class UpkeepTests(unittest.TestCase):
             self.assertIn(row.current_session, arguments)
             attempts.append(agent)
             self.assertLessEqual(operation_deadline.remaining(), 20)
-            start_deadlines.append(time.monotonic() + operation_deadline.remaining())
+            start_deadlines.append(clock.monotonic() + operation_deadline.remaining())
             if slow:
-                clock[0] += operation_deadline.remaining()
+                clock.advance(operation_deadline.remaining())
                 operation_deadline.check()
             if agent == "failed" and fail:
                 raise herdr_types.HerdrFailure("fixture start failed")
@@ -170,10 +189,11 @@ class UpkeepTests(unittest.TestCase):
         def live(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
             return sessions.LiveSessionProcess(456) if identity in launches else sessions.SessionNotLive()
 
-        def now() -> float:
-            return clock[0]
-
-        with (patch.object(herdr, "restore_server", side_effect=restore),
+        with (patch.object(job, "time", clock),
+              patch.object(operation_deadline, "time", clock),
+              patch.object(worker_lifecycle, "time", clock),
+              patch.object(staff, "time", clock),
+              patch.object(herdr, "restore_server", side_effect=restore),
               patch.object(herdr, "prepare_session_environment", side_effect=prepare),
               patch.object(herdr, "launch_prepared_agent", side_effect=launch),
               patch.object(herdr, "read_conversation", side_effect=conversation),
@@ -218,8 +238,7 @@ class UpkeepTests(unittest.TestCase):
                 _ = errors.truncate(0)
                 _ = errors.seek(0)
                 with (staff.row_operation(str(busy.id)),
-                      patch.dict(os.environ, {f"STAFF_ROW_FD_{busy.id}": ""}),
-                      patch.object(time, "time", return_value=0)):
+                      patch.dict(os.environ, {f"STAFF_ROW_FD_{busy.id}": ""})):
                     job.upkeep()
                 self.assertEqual(set(launches),
                     {rows[name].current_session for name in ("alpha", "failed", "own-codex")} - {busy.current_session})
@@ -232,8 +251,9 @@ class UpkeepTests(unittest.TestCase):
                 self.assertNotIn("another operation holds this row", errors.getvalue())
 
             slow = True
-            for budget, expected in ((60, 3), (15, 1), (20, 1)):
-                with self.subTest(budget=budget):
+            for budget, expected, outside_clock_reads in ((60, 3, 0), (15, 1, 0), (20, 1, 0), (60, 3, 1000)):
+                with self.subTest(budget=budget, outside_clock_reads=outside_clock_reads):
+                    clock.interval_time = 0
                     _ = (self.root / "config.toml").write_text(
                         f"[job]\ninterval_seconds=120\ntimeout_seconds={budget}\n")
                     launches.clear()
@@ -242,9 +262,7 @@ class UpkeepTests(unittest.TestCase):
                     pane_record.save("agents", {})
                     _ = errors.truncate(0)
                     _ = errors.seek(0)
-                    with (patch.object(time, "monotonic", side_effect=now),
-                          patch.object(time, "time", return_value=0)):
-                        job.upkeep()
+                    job.upkeep()
                     self.assertEqual(len(attempts), expected)
                     self.assertEqual(len(set(attempts)), expected)
                     self.assertLessEqual(set(attempts), {"alpha", "failed", "own-codex"})
@@ -255,9 +273,8 @@ class UpkeepTests(unittest.TestCase):
                         served = set(attempts)
                         for at in (120, 240):
                             attempts.clear()
-                            with (patch.object(time, "monotonic", side_effect=now),
-                                  patch.object(time, "time", return_value=at)):
-                                job.upkeep()
+                            clock.interval_time = at
+                            job.upkeep()
                             served.update(attempts)
                         self.assertEqual(served, {"alpha", "failed", "own-codex"})
 
@@ -266,22 +283,20 @@ class UpkeepTests(unittest.TestCase):
                 worker = case.root / "deadline_worker.py"
                 _ = worker.write_text("import os\nfrom pathlib import Path\n"
                     + "_ = Path(__file__).with_suffix('.deadline').write_text(os.environ.get('HERDR_UPKEEP_DEADLINE', ''))\n")
-                parent_started = clock[0]
-                with (patch.object(job, "__file__", str(worker)),
-                      patch.object(time, "monotonic", side_effect=now)):
+                parent_started = clock.monotonic()
+                with patch.object(job, "__file__", str(worker)):
                     self.assertEqual(job.run_job(), 0)
                 inherited_deadline = worker.with_suffix(".deadline").read_text()
                 parent_deadline = float(inherited_deadline)
                 self.assertLessEqual(parent_deadline, parent_started + 60)
-                clock[0] = parent_deadline - 5
+                clock.advance(parent_deadline - 5 - clock.monotonic())
                 slow = False
                 launches.clear()
                 attempts.clear()
                 start_deadlines.clear()
                 case.client.rows.clear()
                 pane_record.save("agents", {})
-                with (patch.dict(os.environ, {"HERDR_UPKEEP_DEADLINE": inherited_deadline}),
-                      patch.object(time, "monotonic", side_effect=now)):
+                with patch.dict(os.environ, {"HERDR_UPKEEP_DEADLINE": inherited_deadline}):
                     job.upkeep()
                 self.assertEqual(set(attempts), {"alpha", "failed", "own-codex"})
                 self.assertLessEqual(max(start_deadlines), parent_deadline)
