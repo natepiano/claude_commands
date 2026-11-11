@@ -494,9 +494,15 @@ The command uses file mtime and skips every session that the local staff record 
 It also skips subagents under those sessions.
 Compression writes a neighboring `.jsonl.zst`, preserves mtime and permissions, then removes the plain file.
 Deletion removes either form after the second age limit.
-`--dry-run` measures compression in temporary storage and prints each action without changing the source tree or summary cache.
-Each root gets counts, the staff skip count, and the bytes freed or planned.
-No timer starts this command.
+A real run prints a flushed start line for each root with its compression and deletion counts.
+Each run prints one summary per transcript root and one total line.
+Each summary gives compression, deletion, and staff skip counts, plus freed GB with two decimals.
+`--files` also prints each file action.
+`--dry-run` reports "would compress", "would delete", and "would free about" without changing transcripts or the summary cache.
+The dry run estimates compression savings from bounded samples instead of compressing every candidate.
+`sample_files` and `sample_bytes` in `config/transcript_retention.conf` limit each root to 20 samples of at most 1 MiB each.
+Deletion sizes remain exact, and a real run measures compression savings exactly.
+The shared `modules/common/transcript-retention.nix` in the nixos repo schedules the command daily at 04:30 local time on both machines.
 
 `scripts/lib/transcripts.py` owns the seekable binary reader for both forms.
 Decompression uses zstd and temporary disk storage rather than holding the transcript in memory.
