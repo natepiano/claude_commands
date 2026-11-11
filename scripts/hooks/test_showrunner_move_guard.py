@@ -1,7 +1,7 @@
 """The move guard names agents and preserves its showrunner scope."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -73,8 +73,8 @@ class RefusalTest(unittest.TestCase):
         for command in (MOVE,
                         "tmux send-keys -t merge-gate 'run the gate' Enter",
                         "kill 5151",
-                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py stop sid",
-                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py resume sid --why 'continue now'",
+                        "~/.claude/scripts/lib/py ~/.claude/scripts/agents/shutdown.py stop sid",
+                        "~/.claude/scripts/lib/py ~/.claude/scripts/agents/shutdown.py resume sid --why 'continue now'",
                         "claude --resume abc",
                         "CLAUDE_CONFIG_DIR=~/.claude1 claude --version"):
             self.assertEqual(self.refused(command), "", command)

@@ -88,10 +88,11 @@ class AwsCli:
         self.timeout_s = timeout_s
         self.execute = execute
 
-    def call(self, operation: str, *arguments: str, service: str = 'ec2') -> dict[str, object]:
+    def call(self, operation: str, *arguments: str, service: str = 'ec2',
+             timeout_s: float | None = None) -> dict[str, object]:
         result = self.execute(['aws', '--profile', self.profile, '--region', self.region,
                                service, operation, *arguments, '--output', 'json'], capture_output=True, text=True,
-                              timeout=self.timeout_s, check=False)
+                              timeout=self.timeout_s if timeout_s is None else timeout_s, check=False)
         if result.returncode:
             raise AwsUnavailable(result.stderr.strip() or f'{operation}: failed')
         if not result.stdout.strip() or service == 'cloudformation' and operation == 'deploy':
@@ -130,7 +131,7 @@ def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
     token = ''
     pages = 0
     while True:
-        arguments = ['--time-period', period, '--granularity', 'DAILY', '--metrics', 'UnblendedCost',
+        arguments = ['--time-period', period, '--granularity', 'DAILY', '--metrics', 'UnblendedCost', 'UsageQuantity',
                      '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--filter', USAGE_ONLY, '--no-paginate']
         if token:
             arguments.extend(('--next-page-token', token))
@@ -145,19 +146,23 @@ def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
             usage: list[ledger.UsageTypeCost] = []
             for group in ledger.rows(item, 'Groups'):
                 keys = cast(list[str], group['Keys'])
-                cost = ledger.mapping(ledger.mapping(group['Metrics'])['UnblendedCost'])
+                metrics = ledger.mapping(group['Metrics'])
+                cost = ledger.mapping(metrics['UnblendedCost'])
+                quantity = ledger.mapping(metrics['UsageQuantity'])
                 if cost.get('Unit') != 'USD':
                     raise ValueError('Cost Explorer requires USD')
-                usage.append(ledger.UsageTypeCost(keys[0], conf.decimal(ledger.text(cost, 'Amount'))))
+                usage.append(ledger.UsageTypeCost(keys[0], conf.decimal(ledger.text(cost, 'Amount')),
+                                                  conf.decimal(ledger.text(quantity, 'Amount')), ledger.text(quantity, 'Unit')))
             previous = days.get(day)
-            combined: dict[str, Decimal] = {}
+            combined: dict[str, ledger.UsageTypeCost] = {}
             for row in (*previous.usage_types, *usage) if previous else usage:
-                combined[row.usage_type] = combined.get(row.usage_type, Decimal(0)) + row.usd
-            types = tuple(ledger.UsageTypeCost(name, usd) for name, usd in sorted(combined.items()))
+                old = combined.get(row.usage_type, ledger.UsageTypeCost(row.usage_type, Decimal(0)))
+                combined[row.usage_type] = replace(row, usd=old.usd + row.usd, quantity=old.quantity + row.quantity)
+            types = tuple(row for _, row in sorted(combined.items()))
             days[day] = ledger.ChargeRead(day, now,
                 int(datetime.fromisoformat(day).replace(tzinfo=UTC).timestamp()),
                 int(datetime.fromisoformat(ledger.text(bounds, 'End')).replace(tzinfo=UTC).timestamp()),
-                sum(combined.values(), Decimal(0)), Decimal(0), Decimal(0), types,
+                sum((row.usd for row in types), Decimal(0)), Decimal(0), Decimal(0), types,
                 item['Estimated'] is True or bool(previous and previous.provisional))
         token = str(reply.get('NextPageToken', ''))
         if not token:
@@ -261,12 +266,6 @@ class Controller:
                                             money(str(row['SpotPrice'])), 'DescribeSpotPriceHistory') for row in rows)
         _ = ledger.CostLedger(self.directory).refresh_prices(self.settings_path, now, fetch)
 
-    def _release(self, evidence: InstanceEvidence) -> None:
-        paths = mac_test.state_paths(self.target)
-        captured = mac_test.capture_release_evidence(paths, evidence.generation, evidence.state, evidence.observed_at)
-        if captured.claims:
-            _ = mac_test.release_stopped_claims(paths, captured)
-
     def refresh_charges(self, api: AwsCli, now: int) -> measurement.ChargeRead | measurement.MeasurementUnavailable:
 
         def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
@@ -286,8 +285,6 @@ class Controller:
         _ = self._save(state, ControlResult('stopping', reason, now, evidence.generation))
         _ = api.call('stop-instances', '--instance-ids', evidence.instance_id)
         confirmed = api.observe(evidence.instance_id, int(self.clock()))
-        if confirmed.state in mac_test.RELEASE_STATES:
-            self._release(confirmed)
         if confirmed.state in ('stopped', 'terminated'):
             self._clear_drain(state)
         return self._save(state, ControlResult(confirmed.state, reason, now, confirmed.generation))
@@ -323,7 +320,6 @@ class Controller:
                 state = self._read()
                 api = AwsCli(settings.credentials_profile, settings.region, settings.aws_timeout_s, self.execute)
                 evidence = api.observe(settings.instance_id, now)
-                self._release(evidence)
                 previous_generation = state.get('permitted_generation')
                 state['instance_evidence'] = asdict(evidence)
                 unpublished = UnpublishedPermissionSince.read(state, evidence.generation, now)
@@ -336,7 +332,7 @@ class Controller:
                 if state.get('stop_generation') == evidence.generation and evidence.state in ('running', 'pending'):
                     return self._stop(api, state, evidence, 'recorded_stop_intent')
                 if action == 'stop':
-                    if evidence.state in mac_test.RELEASE_STATES:
+                    if evidence.state in ('stopping', 'stopped', 'terminated'):
                         return self._save(state, ControlResult(evidence.state, 'manual_stop', now, evidence.generation))
                     return self._stop(api, state, evidence, 'manual_stop')
                 ledger.CostLedger(self.directory).observe(ledger.InstanceObservation(now, evidence.state, 'DescribeInstances'))

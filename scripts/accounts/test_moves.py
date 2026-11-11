@@ -18,14 +18,14 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, pane_moves, role_map, worker_names
-from scripts.herdr import worker_panes
+from scripts.herdr import herdr, worker_panes
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
 from scripts.production import staff, session_staff
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
 )
-from scripts.shutdown import inventory, stop_results
+from scripts.agents import inventory, stop_results
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
@@ -83,6 +83,30 @@ class SingleSessionMoveNoticeTests(unittest.TestCase):
             with self.subTest(dry_run=dry_run):
                 lines = self.move_lines("top-level", "claude3", dry_run=dry_run)
                 self.assertFalse(any("returns to" in line for line in lines))
+
+    def test_preview_reads_detached_context_only_for_listed_workers(self) -> None:
+        kinds: tuple[Literal["unit", "showrunner", "top-level", "worker"], ...] = (
+            "unit", "showrunner", "top-level", "worker")
+        for kind in kinds:
+            owner = inventory.ListedSession("session-alpha", 123, "fixture-start", "alpha", kind,
+                                           self.home / ".claude1", "", "fixture", "")
+            with (self.subTest(kind=kind),
+                  patch.object(accounts, "detached_move_context", return_value="fixture run context") as context):
+                line = accounts.move_preview_line(owner, "claude3")
+                self.assertEqual(line, "alpha: session-alpha · stop, then resume on claude3 (from claude1)"
+                                 + ("; fixture run context" if kind == "worker" else ""))
+                if kind == "worker":
+                    context.assert_called_once_with(owner.session_id)
+                else:
+                    context.assert_not_called()
+
+    def test_stopped_personal_session_preview_needs_no_staff_record(self) -> None:
+        checked = accounts.MoveTargetReady(accounts.NamedAccount("claude3", self.home / ".claude3"))
+        with (patch.object(inventory, "listing", return_value=[]),
+              patch.object(accounts, "check_move_target", return_value=checked)):
+            result = accounts.move("personal-session", "claude3", dry_run=True)
+        self.assertEqual(result, accounts.MoveDryRun("personal-session", (
+            "personal-session: would resume on claude3 if its saved tab is local",)))
 
 
 class MoveJournalTests(unittest.TestCase):
@@ -393,6 +417,10 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(loaded[0].get("from"), "codex2")
         self.assertEqual(loaded[1].get("to"), "codex2")
         self.assertEqual(loaded[2].get("label"), "codex2")
+        replay = moves.read_replay_evidence()
+        self.assertIsInstance(replay, moves.MoveReplayEvidence)
+        assert isinstance(replay, moves.MoveReplayEvidence)
+        self.assertEqual(list(replay.entries), loaded)
         for entry, home in ((loaded[3], self.home / ".codex"), (loaded[4], self.home / ".codex"),
                             (loaded[5], self.home / ".claude")):
             unresolved = entry.get("label")
@@ -717,6 +745,13 @@ class WorkerGroupPendingTests(StaffTestCase):
         ]
         self.addCleanup(patches.clear)
         _ = self.enterContext(patch.object(accounts, "SCRIPTS", self.root / "no-launchers"))
+        _ = self.enterContext(patch.object(herdr, "Herdr", autospec=True))
+        _ = self.enterContext(patch.object(worker_panes, "observe", side_effect=self.stopped_workers))
+
+    @staticmethod
+    def stopped_workers(parent: staff.StaffId, record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+        return [worker_panes.StoppedWorker(row, "fixture-pane", "fixture-terminal")
+                for row in record.find(kind="worker", parent=parent)]
 
     def stop_worker(self, move: pane_moves.WorkerMove,
                     hold: worker_panes.WorkerLockHold) -> accounts.SessionMoveOutcome:
@@ -733,6 +768,10 @@ class WorkerGroupPendingTests(StaffTestCase):
         backend = staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(Path(os.environ["HOME"]) / ".codex")
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(Path.home() / ".claude")}):
             row = fixture_worker(name, unit.id, backend=backend)
+        if isinstance(backend, staff.CodexBackend):
+            transcript = backend.codex_home / "sessions" / f"{row.current_session}.jsonl"
+            _ = transcript.rename(transcript.with_name("rollout-" + transcript.name))
+        row = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
         run = self.root / "old-runs" / name
         run.mkdir(parents=True)
         write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": unit.id}))
@@ -746,15 +785,17 @@ class WorkerGroupPendingTests(StaffTestCase):
                 with self.subTest(family=family, target=target):
                     self.stop_requests.clear()
                     row, run = self.worker("worker-" + family + target, family)
+                    if target.startswith("codex"):
+                        role_map.write_role_map(role_map.RoleMapChange("workers", target, "fixture selection", datetime.now(timezone.utc).isoformat()))
                     before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
                     result = accounts.move_workers(target, dry_run=True)
                     assert isinstance(result, accounts.GroupMoveDryRun)
                     same_family = target.startswith(family)
-                    preview = (f"would stop and resume the same conversation on {target} in its worker pane" if same_family
-                               else f"not moved: cannot restart on {target} through assign.sh")
-                    self.assertEqual(result.lines, (f"{row.name} ({row.id}): {preview}",))
-                    self.assertIn(str(row.id), "\n".join(result.lines))
-                    self.assertIn(target, "\n".join(result.lines))
+                    preview = f"would close its idle pane; the next assign resumes it on {target}"
+                    self.assertEqual(result.lines, (f"{row.name} ({row.id}): {preview}",) if same_family else ())
+                    if same_family:
+                        self.assertIn(str(row.id), "\n".join(result.lines))
+                        self.assertIn(target, "\n".join(result.lines))
                     self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
                     self.assertEqual(staff.by_id(row.id), row)
                     self.assertEqual(self.stop_requests, [])
@@ -765,20 +806,18 @@ class WorkerGroupPendingTests(StaffTestCase):
                     saved = self.staff_file.read_bytes()
                     with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
                         code = accounts.main(["move", "workers", target])
-                    self.assertEqual(code, 1, output.getvalue() + errors.getvalue())
+                    self.assertEqual(code, 1 if same_family else 0, output.getvalue() + errors.getvalue())
                     self.assertEqual(self.stop_requests, [row.id] if same_family else [])
                     self.assertEqual(staff.by_id(row.id), row)
                     self.assertEqual(self.staff_file.read_bytes(), saved)
                     self.assertEqual(((run / "progress_history_state.json").read_bytes(), inbox.read_bytes()), reference)
                     self.assertEqual(session_staff.worker_directory(staff.local_snapshot(), row.id), self.root)
                     lines = (output.getvalue() + errors.getvalue()).splitlines()
-                    self.assertEqual(len(lines), 1, lines)
-                    self.assertIn(str(row.id), lines[0])
-                    self.assertIn(target, lines[0])
+                    self.assertEqual(len(lines), 1 if same_family else 0, lines)
                     if same_family:
+                        self.assertIn(str(row.id), lines[0])
+                        self.assertIn(target, lines[0])
                         self.assertIn("pending", lines[0])
-                    else:
-                        self.assertIn(f"cannot restart on {target} through assign.sh", lines[0])
                     self.assertEqual(staff.retire(row.id), row)
 
     def test_one_failed_stop_reports_the_worker_and_keeps_other_moves_pending(self) -> None:

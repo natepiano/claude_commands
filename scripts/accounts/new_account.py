@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.accounts import accounts  # noqa: E402
-from scripts.lib import conf  # noqa: E402
+from scripts.lib import conf, conf_reads  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
@@ -228,6 +228,7 @@ def nightly_review_step(account: NewAccount) -> Step:
 def statusline_color_step(account: NewAccount) -> Step:
     path = accounts.main_config_dir() / "config" / "statusline.conf"
     try:
+        conf_reads.record(path.stem)
         text = path.read_bytes().decode("utf-8")
     except FileNotFoundError:
         return Step(True, f"{account.label} stays uncolored (no status line config {path})")

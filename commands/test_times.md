@@ -5,12 +5,14 @@ description: Show suite, module and test times.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/test_times/show.py $ARGUMENTS` and show its lines unchanged.
 
 - `top [--limit N] [--repo PATH] [--host NAME]`: rank the slowest tests of the working repository, or of PATH. This is the default command.
+- `trend [--days N]`: show daily gate CPU, wall time and cost. The default is `TREND_DAYS`.
 - `suites [--days N]`: show recent gate runs.
 - `suite <folder> [--days N]`: show one folder suite's history.
 - `module <folder>/<file> [--runs N]`: show each module execution and its slowest kept tests.
 - `test <text> [--runs N]`: show kept test names that contain the text and later missing measurements.
 
 In the ~/.claude repository, `top` ranks live gate modules by median CPU time.
+The nightly type check has a footnote with its latest passed CPU and wall time. It does not count toward the limit.
 In another repository, `top` ranks recorded nextest tests on the current host within `TOP_MAX_AGE_DAYS`.
 The repository key follows its origin, so worktrees share the same test history.
 Each list holds the records from the last complete index update.
@@ -52,3 +54,23 @@ The table counts process starts and includes each thread's CPU.
 `unassigned` shows the run's child CPU less the CPU of all command rows, including rows below the limit.
 The number keeps its sign.
 These command measures come from a separate run, so they can differ from the time run.
+
+`trend` groups passing, non-aborted runs by place, selection and day in the user's zone.
+It prints one table for each place and selection.
+Columns: day, runs, CPU mean, CPU p95, wall mean, wall p95, cost mean, cost p95, cost total.
+Targeted (`affected`) tables add median modules run.
+CPU includes all module attempts. Wall time comes from the gate run.
+The p95 uses nearest rank. Seconds have no decimals. USD has three decimals.
+AWS cost joins `gate_runs.id = "gate-" + GateReservation.attempt` in the local cost ledger.
+Cost includes the reservation lifetime at its applied hourly rate, plus its allowance.
+Each run reads costs from the current ledger, including costs for cached days.
+The ledger re-prices old gates with its newest bill.
+A matching reservation identifies an AWS run even when its host has a custom name.
+Cost statistics use only runs with a confirmed lifetime and an applied rate.
+An unpriced reservation has no cost record.
+AWS tables report missing cost counts below the table. A group with no cost records shows `—`.
+Other hosts show `—`. Missing cost records do not delay caching.
+`gate-trend.json` beside the gate index caches finished days with their run ids and CPU and wall statistics.
+A day finishes after a complete refresh starts `TREND_SETTLE_MINUTES` after its end (default 60).
+The cache records that start after the refresh completes. An exclusive lock protects each cache update.
+Later runs query the index only for open days. A missing, unreadable or incompatible cache is rebuilt.

@@ -28,7 +28,6 @@ from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.checkpoint_gate import report
-from scripts.production.merge_checkpoint import merged_checkpoints
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
@@ -42,7 +41,7 @@ from scripts.usage import agents_log
 
 from scripts.lib import names
 from scripts.lib.process_failure import failure_detail
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 
 
 class InputError(Exception):
@@ -504,6 +503,14 @@ def command(step: str, arguments: list[str], *, cwd: Path | None = None) -> str:
 def notifier(arguments: list[str]) -> str:
     script = Path.home() / ".claude/scripts/message/notifier.sh"
     return command("notifier", ["zsh", str(script), *arguments])
+
+
+def remove_updates(owner: staff.StaffRow) -> None:
+    """Remove the generated schedule files and retain reminders and history."""
+    _ = notifier(["remove", f"showrunner-{owner.id}"])
+    root = _showrunner_state_root()
+    (root / owner.id / "prompt.txt").unlink(missing_ok=True)
+    (root / "counts" / owner.id).unlink(missing_ok=True)
 
 
 def instance(name: str) -> InstancePresent | InstanceAbsent:
@@ -1310,6 +1317,8 @@ def withdraw(production: Production, words: str, *, identities: QuestionStaff | 
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
+    from scripts.production.merge_checkpoint import merged_checkpoints
+
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
     record = staff.snapshot()
@@ -1525,7 +1534,7 @@ def main() -> int:
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "questions-table", "migrate-questions"):
         subcommand = commands.add_parser(action)
-        _ = subcommand.add_argument("--production", type=str, required=action != "questions-table")
+        _ = subcommand.add_argument("--production", type=str, required=action not in ("ask", "questions-table"))
         if action == "register":
             # Accepted and unused: a showrunner started before its name was looked up still passes it.
             _ = subcommand.add_argument("--session")
@@ -1543,19 +1552,25 @@ def main() -> int:
             _ = subcommand.add_argument("--text", required=True, help="the one-line item the count and lists name")
             _ = subcommand.add_argument("--question", required=True,
                                         help="what is asked, why, each choice and what it does, the recommended choice")
-            _ = subcommand.add_argument("--unit", default="", help="the asking unit; absent, the showrunner asks")
+            _ = subcommand.add_argument("--unit", default="", help="the asking unit's staff id; without --production, select its parent")
             _ = subcommand.add_argument("--urgency", default="", help="user, blocks, soon (with --due), normal or later")
             _ = subcommand.add_argument("--due", default="")
     args = parser.parse_args()
     action = cast(str, args.action)
     try:
-        identities = QuestionStaff.read() if action == "questions-table" else None
+        identities = QuestionStaff.read() if action in ("ask", "questions-table") else None
         name = cast(str | None, args.production)
         if name is None:
             assert identities is not None
-            name = identities.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
-            if name is None:
-                raise RegistrationFailure(action, "this session is no production's showrunner; pass --production <name>")
+            if action == "ask":
+                unit = cast(str, args.unit)
+                if not unit:
+                    raise RegistrationFailure(action, "pass --unit <staff id> or --production <name>")
+                name = unit_lookup.unit_parent(unit, session_staff.StoredReference(unit), record=identities.record).name
+            else:
+                name = identities.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+                if name is None:
+                    raise RegistrationFailure(action, "this session is no production's showrunner; pass --production <name>")
         production = read_production(name, identities.record if identities else None)
         for line in adopt_moved_state(production, record=identities.record if identities is not None else None):
             report("state-dir", "ok", line)
@@ -1580,7 +1595,8 @@ def main() -> int:
                 level = urgency.read(cast(str, args.urgency), cast(str, args.due))
             except urgency.UrgencyError:
                 raise RegistrationFailure("ask", "--urgency is user, blocks, soon with --due, normal or later") from None
-            ask(production, cast(str, args.text), cast(str, args.question), cast(str, args.unit), Ranking(level))
+            ask(production, cast(str, args.text), cast(str, args.question), cast(str, args.unit), Ranking(level),
+                identities=identities)
         elif action == "questions-table":
             questions_table(production, identities=identities)
         elif action == "migrate-questions":

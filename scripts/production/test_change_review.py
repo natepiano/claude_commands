@@ -17,6 +17,7 @@ import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -27,7 +28,7 @@ from scripts.lib import copy_record
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
@@ -452,12 +453,37 @@ class ProducerWriterTests(ProducerFixture):
             self.assertEqual([row["Change"] for row in rows],
                              ["A visible change", "Queued change", "Final change", "Queued later"])
 
+        for location in ("unfilled", "other-machine", "absent", "remote-parent"):
+            with self.subTest(location=location):
+                _ = self.git("checkout", "-b", f"producer-{location}")
+                _ = self.git("commit", "--allow-empty", "-m",
+                             f"queue(8): delivery\n\nChange-Review: {location} | Read | Fixed producer")
+                _ = self.git("checkout", "main")
+                _ = self.git("merge", "--no-ff", f"producer-{location}", "-m", "Merge delivery")
+                _ = self.git("push", "origin", "main")
+                merged = self.git("rev-parse", "HEAD")
+                member = replace(self.unit, worktree=(staff.WorktreeUnfilled() if location == "unfilled"
+                                 else staff.PresentWorktree(remote.other_machine(), self.root / "unit")))
+                if location == "remote-parent":
+                    parent = fixture_member("showrunner", name="remote-parent",
+                        doc=staff.LiveDoc(remote.other_machine(), self.root / "remote-production.md"))
+                    member = replace(member, parent=staff.ReportsTo(parent.id))
+                rows = tuple(member if row.id == self.unit.id else row for row in staff.snapshot().rows
+                             if row.id != self.unit.id or location != "absent")
+                merge_checkpoint.record_publication_changes(production, record=staff.StaffSnapshot(rows),
+                    known_producer=change_review.KnownMergeProducer(merged, self.unit.id))
+                row = change_review.pending(self.listing)[-1]
+                self.assertEqual(row["Change"], location)
+                self.assertEqual(row["Producer"], self.unit.id)
+                if location == "remote-parent":
+                    self.assertEqual(row["Production"], production.owner.id)
+
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
-        _ = self.merge()
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         output = io.StringIO()
         with (mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(
                   tuple(staff.snapshot().find(kind="showrunner")))), redirect_stdout(output)):
+            _ = self.merge()
             merge_checkpoint.record_publication_changes(production)
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
         self.assertEqual(len(notes), 1)
@@ -999,6 +1025,40 @@ class ReadyListTests(ProducerFixture):
             self.assertEqual(self.ready()[0], 0)
             self.assertEqual(self.listing.read_bytes(), before)
 
+        for owner_record in ("fixed", "legacy-session", "inner-unrecorded"):
+            with self.subTest(owner_record=owner_record, checkpoint="repair after the visible checkpoint"):
+                branch = f"repair-{owner_record}"
+                _ = self.git("checkout", "-b", branch)
+                _ = self.git("commit", "--allow-empty", "-m",
+                             f"checkpoint(unrelated-slug): visible change\n\nChange-Review: {branch} | Read | Proof")
+                if owner_record == "inner-unrecorded":
+                    _ = self.git("checkout", "-b", f"side-{branch}")
+                    _ = self.git("commit", "--allow-empty", "-m",
+                                 f"checkpoint(other): visible change\n\nChange-Review: side-{branch} | Read | Other result")
+                    _ = self.git("checkout", branch)
+                    _ = self.git("merge", "--no-ff", f"side-{branch}", "-m", "Merge another unit")
+                _ = self.git("commit", "--allow-empty", "-m", "fix: repair\n\nChange-Review: none — fixture repair")
+                tip = self.git("rev-parse", "HEAD")
+                history = self.root / f"history/runs/{branch}.jsonl"
+                owner = ({"main_agent": {"session_id": self.unit.current_session}} if owner_record == "legacy-session"
+                         else {"owner_staff_id": self.unit.id})
+                _ = history.write_text(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "checkpoint_commit": tip, **owner}) + "\n")
+                _ = self.git("checkout", "integration")
+                _ = self.git("merge", "--no-ff", branch, "-m", "Merge delivery")
+                _ = self.git("push", "origin", "integration")
+                self.promote()
+                self.assertEqual(self.ready()[0], 0)
+                rows = change_review.pending(self.listing)
+                row = (next(row for row in rows if row["Change"] == branch)
+                       if owner_record == "inner-unrecorded" else rows[-1])
+                self.assertEqual(row["Change"], branch)
+                self.assertEqual(row["Producer"], self.unit.id)
+                if owner_record == "inner-unrecorded":
+                    row = next(row for row in rows if row["Change"] == f"side-{branch}")
+                    self.assertEqual(row["Producer"], "")
+                    self.assertEqual(row["Production"], unit_lookup.doc_owner(self.doc, staff.snapshot()).id)
+
     def test_a_second_scan_of_an_unregistered_unit_adds_no_row_or_staff_note(self) -> None:
         _ = self.merge_change("Change-Review: First | Read | First result\n"
                               + "Change-Review: Second | Read | Second result\n"
@@ -1106,21 +1166,43 @@ class ReadyListTests(ProducerFixture):
         merged = self.merge_change("Change-Review: Plain | Read | Ready\n"
                                    + "Change-Review: Restarted | Open | New service | after restart")
         self.promote()
-        code, output, error = self.ready()
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
-        notices = [line for line in output.splitlines() if "restart" in line]
-        self.assertEqual(len(notices), 1)
-        self.assertIn(merged[:8], notices[0])
-        self.assertIn(f"live --merged {merged[:8]}", notices[0])
-        self.assertIn(f"--repo {self.repo}", notices[0])
-        self.assertIn("--production top", notices[0])
-        self.assertEqual(self.live(merged)[0], 0)
-        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain", "Restarted"])
-        written = self.listing.read_bytes()
-        self.assertEqual(self.live(merged)[0], 0)
-        self.assertEqual(self.ready()[0], 0)
-        self.assertEqual(self.listing.read_bytes(), written)
+        for layout in ("not-imported", "imported", "later-side-checkpoint"):
+            with self.subTest(layout=layout):
+                if layout == "imported":
+                    outside_doc = self.root / "outside.md"
+                    _ = outside_doc.write_text(f"# Outside\n- **Repository:** `{self.repo}`\n"
+                        + "- **Merge branch:** `outside-integration`\n"
+                        + f"- **Change review:** `{self.root / 'change-review - outside.md'}`\n")
+                    _ = recorded_showrunner("outside", outside_doc)
+                    _ = self.git("checkout", "-b", "outside-integration", "main")
+                    _ = self.git("commit", "--allow-empty", "-m", "Independent outside work")
+                    _ = self.git("merge", "--no-ff", "integration", "-m", "Import published work")
+                    _ = self.git("push", "origin", "outside-integration")
+                    _ = self.git("checkout", "integration")
+                elif layout == "later-side-checkpoint":
+                    _ = self.git("checkout", "-b", "later-side", "old-branch")
+                    _ = self.git("commit", "--allow-empty", "-m",
+                                 "checkpoint(old-branch): later phase\n\nChange-Review: none — fixture continuation")
+                    _ = self.git("checkout", "outside-integration")
+                    _ = self.git("merge", "--no-ff", "later-side", "-m", "Merge later phase")
+                    _ = self.git("push", "origin", "outside-integration")
+                    _ = self.git("checkout", "integration")
+                _ = self.listing.write_text(change_review.skeleton(self.listing, self.doc, change_review.today()))
+                code, output, error = self.ready()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
+                notices = [line for line in output.splitlines() if "restart" in line]
+                self.assertEqual(len(notices), 1)
+                self.assertIn(merged[:8], notices[0])
+                self.assertIn(f"live --merged {merged[:8]}", notices[0])
+                self.assertIn(f"--repo {self.repo}", notices[0])
+                self.assertIn("--production top", notices[0])
+                self.assertEqual(self.live(merged)[0], 0)
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain", "Restarted"])
+                written = self.listing.read_bytes()
+                self.assertEqual(self.live(merged)[0], 0)
+                self.assertEqual(self.ready()[0], 0)
+                self.assertEqual(self.listing.read_bytes(), written)
 
     def test_the_live_command_uses_tools_outside_the_production_repository(self) -> None:
         merged = self.merge_change("Change-Review: Restarted | Open | New service | after restart")

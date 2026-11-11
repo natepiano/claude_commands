@@ -5,20 +5,18 @@ from __future__ import annotations
 
 import json
 import os
-import resource
-import sqlite3
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 from contextlib import closing
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import cast, override
 from unittest import mock
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
+from scripts.buildlog.cli_probe_test_support import MeasuredCliRun, measure_cli_work
 
 from scripts.buildlog import disk, ci
 from scripts.buildlog import index
@@ -31,7 +29,6 @@ from scripts.buildlog import store
 from scripts.buildlog.record import TARGET_DIR_UNSET
 from scripts.buildlog.test_holds import timed_hold_events, write_holder, write_mac_block
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
-from scripts.lib import test_hang_guard
 from scripts.buildlog.test_record_rerun import refresh_machine_health
 from scripts.buildlog.test_memory_window import isolated_journal, configured_host_cli, configured_local_host
 
@@ -53,73 +50,6 @@ def cargo_build(record_id: str, **fields: object) -> Record:
         "crates_compiled": 1,
         **fields,
     })
-
-
-class CliWork(TypedDict):
-    cpu_seconds: float
-    statements: int
-    step_reads: int
-    instructions: int
-    index_updates: int
-    launch_collections: int
-
-
-@dataclass(frozen=True)
-class MeasuredCliRun:
-    result: subprocess.CompletedProcess[str]
-    work: CliWork
-
-
-def probe_cli() -> None:
-    """Instrument the real CLI entry point, including its preparation work."""
-    from scripts.buildlog import cli, launches
-
-    statements: list[str] = []
-    instruction_batches = 0
-    instruction_limit = int(os.environ["BUILDLOG_TEST_INSTRUCTION_LIMIT"])
-    read_only = index.read_only
-
-    def count_instructions() -> int:
-        nonlocal instruction_batches
-        instruction_batches += 1
-        # Stop pathological plans by work count rather than waiting for a timeout.
-        return int(instruction_batches * 1000 > instruction_limit)
-
-    def traced_read_only() -> sqlite3.Connection:
-        connection = read_only()
-        connection.set_trace_callback(statements.append)
-        connection.set_progress_handler(count_instructions, 1000)
-        return connection
-
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    began = time.process_time()
-    with mock.patch.object(index, "read_only", traced_read_only), mock.patch.object(index, "update", wraps=index.update) as updating, mock.patch.object(launches, "collect", wraps=launches.collect) as collecting:
-        status = cli.main(sys.argv[1:])
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    work: CliWork = {
-        "cpu_seconds": time.process_time() - began + after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime,
-        "statements": len(statements),
-        "step_reads": sum("JOIN steps" in sql or "FROM steps" in sql for sql in statements),
-        "instructions": instruction_batches * 1000,
-        "index_updates": updating.call_count,
-        "launch_collections": collecting.call_count,
-    }
-    print("CLI_WORK=" + json.dumps(work), file=sys.stderr)
-    raise SystemExit(status)
-
-
-def measure_cli_work(command: str, environment: dict[str, str], row_count: int) -> MeasuredCliRun:
-    # Importing test_index installs its own paths; restore this fixture afterwards.
-    result = subprocess.run(
-        [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", "import os; environment = dict(os.environ); from scripts.buildlog.test_report import probe_cli; os.environ.update(environment); from scripts.buildlog import record, store; store.host_name = lambda: record.local_step_identity().hosts[0]; probe_cli()", command],
-        cwd=Path(__file__).resolve().parents[2],
-        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parents[2]), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
-        capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-    )
-    if result.returncode != 0:
-        raise AssertionError(f"CLI failed: {result.stderr}\n{result.stdout}")
-    metrics = next(line.removeprefix("CLI_WORK=") for line in result.stderr.splitlines() if line.startswith("CLI_WORK="))
-    return MeasuredCliRun(result, cast(CliWork, json.loads(metrics)))
 
 
 def setUpModule() -> None:
@@ -455,7 +385,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(lines[lines.index("### Tests by target") + len(targets)], "### Mac")
         _ = index.update()
         with closing(index.read_only()) as connection:
-            self.assertEqual(report.mac_section(connection, local_day(STAMP)) + ["Mac copies: none started.", ""], mac)
+            self.assertEqual(report.mac_section(connection, local_day(STAMP)), mac)
+            self.assertEqual(self.section_lines(text, "### AWS")[-2:], ["Mac copies: none started.", ""])
             nextest_runs = cast(int, connection.execute(
                 "SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'"
                 + " AND date(started_at, 'localtime') = ?", (local_day(STAMP),),
@@ -490,8 +421,9 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         self.assertEqual(
             self.section_lines(text, "### Mac"),
-            ["### Mac", "", "No steps recorded on the Mac.", "", "Mac copies: none started.", ""],
+            ["### Mac", "", "No steps recorded on the Mac.", ""],
         )
+        self.assertEqual(self.section_lines(text, "### AWS")[-2:], ["Mac copies: none started.", ""])
         self.assertIn("### nextest", text)
 
     def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
@@ -1801,7 +1733,13 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         lines = text.splitlines()
         mac = self.section_lines(text, "### Mac")
-        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### Mac copies")
+        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### AWS")
+        aws = self.section_lines(text, "### AWS")
+        self.assertEqual(aws.count('No spend days.'), 1)
+        self.assertNotIn('| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Storage | Other | Gate runs | Source |', aws)
+        self.assertNotIn('AWS: up ', '\n'.join(aws))
+        self.assertFalse(any(line.startswith('**') for line in aws))
+        self.assertEqual(lines[lines.index("### AWS") + len(aws)], "### Mac copies")
         section = self.section_lines(text, "### Mac copies")
         self.assertEqual(section[2], "| Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved"
                          + " | Mac time on copies that did not win |")

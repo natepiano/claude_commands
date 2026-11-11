@@ -11,13 +11,14 @@ import shutil
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
-from contextlib import redirect_stderr
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
@@ -36,6 +37,7 @@ from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
+from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.message import send
 from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
@@ -59,7 +61,33 @@ REGISTRY = registry_text({
 
 REAL_RECIPIENTS = quota_alert.recipients
 REAL_TELL_USER = quota_alert.tell_user
+REAL_SWAP = accounts.swap
+REAL_LAUNCH_WORKER_MOVES = cast(Callable[[str, str], None], getattr(accounts, "_launch_worker_moves"))
 REFUSAL_ACTION = "At chatgpt.com/codex/settings/usage, add credits for account codex1."
+
+
+@contextmanager
+def worker_mode_broadcasts() -> Generator[list[list[str]]]:
+    """Record notice requests without starting transient units."""
+    sent: list[list[str]] = []
+
+    def record(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if "--no-block" in arguments:
+            sent.append(arguments[arguments.index("--from"):])
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        return run(arguments, **options)
+
+    class NoticeProcesses:
+        @staticmethod
+        def run(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            return record(arguments, **options)
+
+        def __getattr__(self, name: str) -> object:
+            return cast(object, getattr(subprocess, name))
+
+    with mock.patch.object(quota_alert, "subprocess", NoticeProcesses()):
+        yield sent
 
 
 def running(*names: str) -> list[quota_alert.Showrunner]:
@@ -93,16 +121,24 @@ class QuotaReminderFixture(unittest.TestCase):
         self.push_errors: list[quota_alert.PushDelivery] = []
         self.pushed: list[tuple[str, str, quota_alert.Ask]] = []
         self.noted: list[RenderedPush] = []
+        self.broadcasts: list[list[str]] = []
 
     @override
     def setUp(self) -> None:
         self.root = self.fixture_root()
+        _ = self.enterContext(mock.patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST))
+        self.broadcasts = self.enterContext(worker_mode_broadcasts())
+        _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
         environment_context = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
+            "XDG_STATE_HOME": str(self.root / "state"),
         })))
         del environment_context
         self.prepare_files()
+        _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.conf"
@@ -329,8 +365,16 @@ class SeededQuotaReminderFixture(QuotaReminderFixture):
         pass
 
 
+def complete_worker_moves(readings: quota_alert.CodexAlertPassReadings,
+                          now: datetime) -> quota_alert.CodexAlertPassReadings:
+    """Run the private detached move, then let the next pass consume its result."""
+    _ = accounts.move_workers(role_map.read_role_map().workers, follow_role=True)
+    return quota_alert.run_workers_next_moves(readings, now)
+
+
 class CodexZeroEpisodeFixture(unittest.TestCase):
     root: Path = Path()
+    broadcasts: list[list[str]] = []
 
     now: datetime = datetime.now(timezone.utc)
 
@@ -343,9 +387,14 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.broadcasts = self.enterContext(worker_mode_broadcasts())
+        _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",
+            "XDG_STATE_HOME": str(self.root / "state"),
             "CODEX_CONFIG_FILE": str(self.root / "absent"), "CODEX_MODELS_CACHE_FILE": str(self.root / "absent"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "synced"),
         })))
@@ -375,7 +424,7 @@ always=director
         _ = self.enterContext(mock.patch.object(quota_alert, "showrunners_now", return_value=running("runner")))
         self.phone = self.enterContext(mock.patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         self.relay = self.enterContext(mock.patch.object(quota_alert, "relay", return_value=None))
-        self.swap = self.enterContext(mock.patch.object(accounts, "swap", return_value=["workers move to codex2"]))
+        self.swap = self.enterContext(mock.patch.object(accounts, "swap", autospec=True, return_value=accounts.WorkersSwapStarted(())))
         _ = self.enterContext(mock.patch.object(agent_accounts, "prepare_codex_home", return_value=agent_accounts.CodexHomePrepared()))
         for number, folder in ((1, ".codex1"), (2, ".codex"), (3, ".codex3")):
             home = self.root / folder

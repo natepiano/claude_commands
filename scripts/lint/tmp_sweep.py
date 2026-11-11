@@ -48,7 +48,7 @@ both are true:
   * no process has its working folder, an open file or a mapped file inside it
     (one /proc scan per run; where no /proc exists, one lsof scan).
 
-These stay too: runs named by active markers, runs with any worker not ended (including
+These stay too: runs named by staff rows, runs with any worker not ended (including
 paused workers), and runs using a live or paused session worktree. Unreadable ownership records
 keep runs too, including their temp entries. These runs also keep folders named by cwd in their
 detached_runs/*.json records. Empty detached_runs files are not records. Pending files are not read.
@@ -57,12 +57,12 @@ An unreadable worker record keeps scratch entries and top-level /tmp/claude entr
 the record in the log. Before an idle entry can go, a git check searches
 three folder levels without following links. Uncommitted work, a stash, commits absent from remote
 and clone-source refs, or a failed git check keep it. Git commands have a timeout and never fetch.
-Timed and hand cleanup use the same checks. The roots and their active/ run-marker folders stay; a unit run
-folder whose own record names a running session: that session's marker in an
-active/ folder, else the folder's `director` file, else the `run_started` event
-that opens its history (unit_runs.director), so an idle run that no worker has
-dispatched in yet stays too; a session folder named
-for a running session, though an entry of SESSION_ENTRY_MIN_BYTES or more in
+Timed and manual cleanup use the same checks. The roots stay.
+Staff records each director's open run.
+A run also stays when its ownership record identifies a running director.
+The `unit_runs.director` reader resolves that owner through staff.
+A session folder stays when its name identifies a running session.
+An entry of SESSION_ENTRY_MIN_BYTES or more in
 its folders (scratchpad/, tasks/) is judged like any other: a live session
 keeps small files there that it only reads, and a read does not move mtime;
 each of those when a session record cannot be read; a scratch folder of a change review
@@ -107,7 +107,7 @@ from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -136,14 +136,17 @@ SESSION_TEMP_ROOT = _session_temp.ROOT
 RUN_TEMP_NAME = unit_runs.RUN_TEMP_NAME
 # Claude Code keeps each session's scratch in /tmp/claude-<uid>/<project>/<session id>/.
 SESSION_SCRATCH_PREFIX = "claude-"
-RUN_MARKERS = "active"
 PROC_DIR = "/proc"
 # Where no /proc exists (the Mac), one lsof scan lists what each process uses.
-LSOF = ("lsof", "-n", "-P", "-w", "-F", "pfn")
+LSOF = ("lsof", "-n", "-P", "-w", "-F", "pfan")
 LSOF_TIMEOUT_SECONDS = 120
 # lsof's fd names for a working folder and for mapped files (program text, memory maps).
 LSOF_CWD = "cwd"
 LSOF_MAPPED = ("txt", "mem")
+WORKS_IN = "works in it"
+MAPS_FILE = "maps a file in it"
+HOLDS_FILE = "holds a file open in it"
+WRITES_FILE = "holds a file open for writing in it"
 # The folder names tempfile makers give by default: Rust's tempfile crate ".tmp" and 6 letters or
 # digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
 # Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
@@ -185,7 +188,7 @@ STAMP_NAME = "tmp-sweep.stamp"
 TARGET_DELETES_NAME = "target-deletes.json"
 DRY_RUN_FLAG = "--dry-run"
 
-ROOT = "a root or a run-marker folder"
+ROOT = "a root"
 SESSION_RUNS = "its session runs"
 DIRECTOR_RUNS = "its unit director runs"
 ROW_WAITS = "its change review row waits for a verdict"
@@ -526,7 +529,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
         except OSError:
             continue
         if cwd.startswith(prefix):
-            found.append((cwd, pid, "works in it"))
+            found.append((cwd, pid, WORKS_IN))
         fds = os.path.join(entry.path, "fd")
         for fd in listing(fds):
             try:
@@ -534,13 +537,21 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
             except OSError:
                 continue
             if target.startswith(prefix):
-                found.append((target.removesuffix(DELETED_SUFFIX), pid, "holds a file open in it"))
+                how = HOLDS_FILE
+                try:
+                    with open(os.path.join(entry.path, "fdinfo", fd.name), encoding="utf-8") as info:
+                        for line in info:
+                            if line.startswith("flags:") and int(line.split()[1], 8) & os.O_ACCMODE in (os.O_WRONLY, os.O_RDWR):
+                                how = WRITES_FILE
+                except (OSError, ValueError):
+                    pass
+                found.append((target.removesuffix(DELETED_SUFFIX), pid, how))
         try:
             with open(os.path.join(entry.path, "maps"), encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     parts = line.rstrip("\n").split(maxsplit=5)
                     if len(parts) == 6 and parts[5].startswith(prefix):
-                        found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, "maps a file in it"))
+                        found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, MAPS_FILE))
         except OSError:
             continue
     return ProcessUsesKnown(found, tuple(unreadable))
@@ -559,7 +570,7 @@ def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesU
 
 
 def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
-    """Each path under prefix in `lsof -F pfn` output, with its pid and how the process uses it."""
+    """Read each process path and its access from `lsof -F pfan` output."""
     found: list[tuple[str, int, str]] = []
     pid = 0
     how = ""
@@ -568,8 +579,9 @@ def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int,
         if field == "p" and value.isdigit():
             pid = int(value)
         elif field == "f":
-            how = ("works in it" if value == LSOF_CWD
-                   else "maps a file in it" if value in LSOF_MAPPED else "holds a file open in it")
+            how = WORKS_IN if value == LSOF_CWD else MAPS_FILE if value in LSOF_MAPPED else HOLDS_FILE
+        elif field == "a" and value in ("w", "u") and how == HOLDS_FILE:
+            how = WRITES_FILE
         elif field == "n" and pid and how and value.startswith(prefix):
             found.append((value, pid, how))
     return found
@@ -579,6 +591,8 @@ def entry_uses(paths: Sequence[tuple[str, int, str]], roots: Sequence[str]) -> d
     """For each entry a process uses, under any root, how the first such process uses it."""
     uses: dict[str, str] = {}
     for path, pid, how in paths:
+        if how == WRITES_FILE:
+            how = HOLDS_FILE
         for root in roots:
             if path.startswith(root + os.sep):
                 name = path[len(root) + 1:].split(os.sep, 1)[0]
@@ -643,7 +657,7 @@ def delete_tree(path: str) -> None:
 
 
 class RunKeepReason(Enum):
-    ACTIVE_MARKER = "an active run marker"
+    OPEN_RUN = "a staff run pointer"
     UNENDED_WORKER = "a worker has not ended"
     SESSION_WORKTREE = "a live or paused session uses its worktree"
     UNREADABLE_RECORD = "a run ownership record cannot be read"
@@ -674,31 +688,6 @@ def record_entries(directory: Path) -> list[Path]:
         if directory.is_symlink():
             raise ValueError(f"{directory}: broken record link") from None
         return []
-
-
-@dataclass(frozen=True)
-class RunMarkers:
-    paths: dict[str, str]
-    unreadable_sessions: frozenset[str]
-
-
-def marked_runs(roots: Roots) -> RunMarkers:
-    """Read valid run paths and the session names of bad markers."""
-    marked: dict[str, str] = {}
-    unreadable: set[str] = set()
-    for root in roots.runs:
-        for marker in record_entries(Path(root) / RUN_MARKERS):
-            try:
-                if marker.is_file(follow_symlinks=False):
-                    with marker.open(encoding="utf-8") as handle:
-                        run = handle.readline().strip()
-                    if os.path.isabs(run):
-                        marked[os.path.realpath(run)] = marker.name
-                        continue
-            except (OSError, UnicodeError, ValueError):
-                pass
-            unreadable.add(marker.name)
-    return RunMarkers(marked, frozenset(unreadable))
 
 
 @dataclass(frozen=True)
@@ -791,12 +780,13 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
     from scripts.production import staff
 
     folders = [entry.path for root in roots.runs for entry in listing(root)
-               if entry.name != RUN_MARKERS and entry.is_dir(follow_symlinks=False)]
+               if entry.is_dir(follow_symlinks=False)]
     try:
         if live is None:
             raise ValueError("session registry unreadable")
         use = session_run_use(live)
-        markers = marked_runs(roots)
+        opened = {os.path.realpath(row.run.path) for row in workers.record.rows
+                  if isinstance(row.run, staff.OpenRun)}
     except (OSError, UnicodeError, ValueError):
         return dict.fromkeys(folders, RunKeepReason.UNREADABLE_RECORD)
     kept: dict[str, RunKeepReason] = {}
@@ -817,13 +807,11 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                     raise ValueError("run worktree unreadable")
                 if working and os.path.realpath(working) in use.worktrees:
                     kept[folder] = RunKeepReason.SESSION_WORKTREE
-            if os.path.realpath(folder) in markers.paths:
-                kept[folder] = RunKeepReason.ACTIVE_MARKER
+            if os.path.realpath(folder) in opened:
+                kept[folder] = RunKeepReason.OPEN_RUN
             if folder not in kept:
                 director = unit_runs.director(Path(folder), record=workers.record)
-                if director in markers.unreadable_sessions:
-                    kept[folder] = RunKeepReason.UNREADABLE_RECORD
-                elif director in live:
+                if director in live:
                     kept[folder] = RunKeepReason.DIRECTOR
             if not isinstance(state, MissingRecord) and state.get("history_file"):
                 history = state["history_file"]
@@ -969,9 +957,9 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
     record: staff.StaffSnapshot | PaneRunsUnreadable,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str | None:
-    """Why an entry stays whatever its age: it is a root or run-marker folder, or a running session
+    """Why an entry stays whatever its age: it is a root, or a running session
     owns it by the entry's own record."""
-    if entry.path in roots.all() or (root in roots.runs and entry.name == RUN_MARKERS):
+    if entry.path in roots.all():
         return ROOT
     if root in roots.scratch:
         task = scratch.task_of(Path(entry.path), scratch_settings=scratch_settings)
@@ -1067,7 +1055,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
         print(f"tmp sweep: {error}", file=sys.stderr)
         pane_use = PaneRunsUnreadable(str(error))
         guarded = {entry.path: RunKeepReason.UNREADABLE_RECORD for root in roots.runs
-                   for entry in listing(root) if entry.name != RUN_MARKERS}
+                   for entry in listing(root)}
         workers = WorkerUse(frozenset(), frozenset(), (str(staff.record_path()),))
     for path in workers.unreadable_records:
         print(f"tmp sweep: {path}: {UNREADABLE}; keeping scratch and top-level /tmp/claude entries", file=sys.stderr)

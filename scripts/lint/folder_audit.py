@@ -62,6 +62,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from typing import Protocol, cast
 
 from scripts.lint import sweep, tmp_sweep
@@ -83,7 +84,7 @@ UNIX_SOCKETS = "/proc/net/unix"
 STATE_ENV = "FOLDER_SWEEP_STATE_DIR"
 ARMED_NAME = "armed"
 REMOVED_LOG = "removed.jsonl"
-# Ripgrep selects possible commands. The shared parser must prove each creation target.
+# The shared parser must prove each creation target.
 COMMAND_START = r'"command"\s*:\s*"(?:[^"\\]|\\.)*?'
 COMMAND_REST = r'(?:[^"\\]|\\.)*"'
 TRANSCRIPT_TIME = re.compile(rb'"timestamp"\s*:\s*"([^"]+)"')
@@ -519,7 +520,7 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
 def transcripts() -> list[Path]:
     """Every session transcript once; the account homes link the same projects folder."""
     folders = dict.fromkeys(folder.resolve() for folder in sorted(Path.home().glob(".claude*/projects")))
-    return [path for folder in folders for path in folder.glob("*/*.jsonl")]
+    return [path for folder in folders for path in transcript_paths(folder, "*/*.jsonl")]
 
 
 class CreationTarget(Protocol):
@@ -563,7 +564,7 @@ def makers(paths: list[Path], files: list[Path], *,
 ) -> dict[Path, str]:
     """Find the earliest-started session whose own command makes each folder.
 
-    Ripgrep selects possible rows by folder name. The scratch guard's parser proves
+    The folder names select possible rows. The scratch guard's parser proves
     each target against that row's cwd. A row without a cwd proves no target.
     """
     if isinstance(lint_settings, UseConfiguredValue):
@@ -571,44 +572,43 @@ def makers(paths: list[Path], files: list[Path], *,
     if not paths or not files:
         return {}
     alternatives = "|".join(re.escape(name) for name in sorted({path.name for path in paths}, key=len, reverse=True))
-    pattern = (COMMAND_START + "(?:" + alternatives + ")" + COMMAND_REST + "\n").encode()
+    pattern = re.compile((COMMAND_START + "(?:" + alternatives + ")" + COMMAND_REST).encode())
     earliest: dict[Path, tuple[float, str]] = {}
     started: dict[str, float] = {}
-    files_per_call = lint_settings.whole("folder_rg_files_per_call")
     start_lines = lint_settings.whole("folder_start_lines")
     start_bytes = lint_settings.whole("folder_start_bytes")
-    for start in range(0, len(files), files_per_call):
-        chunk = [str(file) for file in files[start:start + files_per_call]]
-        result = subprocess.run(["rg", "--with-filename", "--null", "--no-line-number",
-                                 "--no-messages", "--no-config", "--file", "-", "--", *chunk],
-                                input=pattern, capture_output=True, check=False)
-        for line in result.stdout.decode(errors="replace").splitlines():
-            file, _, raw = line.partition("\0")
-            try:
-                value = cast(object, json.loads(raw))
-            except ValueError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            row = cast(dict[str, object], value)
-            cwd = row.get("cwd")
-            if not isinstance(cwd, str) or not Path(cwd).is_absolute():
-                continue
-            targets = [target.path for command in transcript_commands(row) for target in SCRATCH_COMMANDS.creation_targets(command, Path(cwd))]
-            for path in paths:
-                if path not in targets:
+    for file in files:
+        with open_transcript(file) as source:
+            for raw in source:
+                if pattern.search(raw) is None:
                     continue
-                if file not in started:
-                    started[file] = _started(Path(file), start_lines, start_bytes)
-                if started[file] < earliest.get(path, (float("inf"), ""))[0]:
-                    earliest[path] = (started[file], Path(file).stem)
+                try:
+                    value = cast(object, json.loads(raw))
+                except ValueError:
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                row = cast(dict[str, object], value)
+                cwd = row.get("cwd")
+                if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                    continue
+                targets = [target.path for command in transcript_commands(row)
+                           for target in SCRATCH_COMMANDS.creation_targets(command, Path(cwd))]
+                for path in paths:
+                    if path not in targets:
+                        continue
+                    key = str(uncompressed_path(file))
+                    if key not in started:
+                        started[key] = _started(file, start_lines, start_bytes)
+                    if started[key] < earliest.get(path, (float("inf"), ""))[0]:
+                        earliest[path] = (started[key], uncompressed_path(file).stem)
     return {path: earliest[path][1] for path in paths if path in earliest}
 
 
 def _started(path: Path, start_lines: int, start_bytes: int) -> float:
     """The first timestamp in a transcript's opening lines, else its file time."""
     try:
-        with path.open("rb") as handle:
+        with open_transcript(path) as handle:
             for _ in range(start_lines):
                 found = TRANSCRIPT_TIME.search(handle.readline(start_bytes))
                 if found:

@@ -10,12 +10,13 @@ from typing import override
 import unittest
 from unittest import mock
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import mac_test
+from scripts.mac_test import mac_test, claim_state
 
 from scripts.lib import process_start as process_identity
 
@@ -78,6 +79,7 @@ class SshReservationTests(unittest.TestCase):
         args = build_targets.CliArguments()
         args.repo_root, args.package, args.kind = str(self.fixture.root), "linux-part", "test"
         args.pid, args.reservation_file = pid, str(path)
+        args.claim_identity_file = str(path.with_suffix(".identity"))
         return build_targets.command_reserve(args), path
 
     def test_retry_recovers_its_claim_when_the_reservation_file_was_not_published(self) -> None:
@@ -102,11 +104,12 @@ class SshReservationTests(unittest.TestCase):
         self.assertEqual(self.reserve(71)[0], 0)
         state = mac_test.state_paths("aws")
         claim, = mac_test.read_claims(state)
+        identity = claim_state.claim_identity(claim.record)
         with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("reused-start")):
-            self.assertEqual(build_targets.command_release_wait(71), 0)
+            self.assertEqual(build_targets.command_release_wait(71, identity=identity, session=NoOwningSession()), 0)
         self.assertTrue(claim.path.exists())
         self.assertEqual(mac_test.read_claims(state)[0].record, claim.record)
-        self.assertEqual(build_targets.command_release_wait(71), 0)
+        self.assertEqual(build_targets.command_release_wait(71, identity=identity, session=NoOwningSession()), 0)
         self.assertFalse(claim.path.exists())
 
     def test_reservation_race_keeps_the_loser_queued_without_an_answer(self) -> None:
@@ -125,9 +128,11 @@ class SshReservationTests(unittest.TestCase):
         self.assertEqual(self.reserve(71)[0], 0)
         paths = mac_test.state_paths("aws")
         original, = mac_test.read_claims(paths)
+        identity = claim_state.claim_identity(original.record)
         args = mac_test.CliArguments()
         args.target, args.worktree, args.what = "aws", str(self.fixture.root), "check hana"
         args.pid, args.from_pid, args.remote = 91, 71, "fake-aws"
+        args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
         unlink = Path.unlink
 
         def prevent_gap(path: Path, missing_ok: bool = False) -> None:
@@ -135,20 +140,22 @@ class SshReservationTests(unittest.TestCase):
             unlink(path, missing_ok=missing_ok)
 
         with mock.patch.object(Path, "unlink", autospec=True, side_effect=prevent_gap), redirect_stdout(io.StringIO()):
-            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 0)
+            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, session=NoOwningSession()), 0)
         transferred, = mac_test.read_claims(paths)
         self.assertEqual(transferred.path, original.path)
         self.assertEqual(transferred.scope, original.scope)
         self.assertEqual(transferred.record["pid"], 91)
         self.assertEqual(transferred.record.get("remote_host"), "fake-aws")
-        self.assertEqual(build_targets.command_release_wait(71), 0)
-        self.assertEqual(build_targets.command_release_wait(91), 0)
+        self.assertEqual(build_targets.command_release_wait(71, identity=identity, session=NoOwningSession()), 0)
+        self.assertEqual(build_targets.command_release_wait(91, identity=identity, session=NoOwningSession()), 0)
         self.assertTrue(original.path.exists())
         self.assertEqual(self.reserve(72)[0], 1)
 
     def test_exit_releases_only_an_untransferred_local_reservation(self) -> None:
         self.assertEqual(self.reserve(71)[0], 0)
-        self.assertEqual(build_targets.command_release_wait(71), 0)
+        claim, = mac_test.read_claims(mac_test.state_paths("aws"))
+        self.assertEqual(build_targets.command_release_wait(71,
+            identity=claim_state.claim_identity(claim.record), session=NoOwningSession()), 0)
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("aws")), ())
         self.assertEqual(self.reserve(72)[0], 0)
 
@@ -216,6 +223,7 @@ if words[0] == "eligible":
     print("aws\teligible\t-\t" + settings + "\tlinux")
 elif words[0] == "reserve":
     Path(words[words.index("--reservation-file") + 1]).write_text("aws\t" + settings + "\n")
+    Path(words[words.index("--claim-identity-file") + 1]).write_text("doc-claim\tdoc-episode\tdoc-attempt\t\n")
 elif words[0] in ("register-local", "check-local") and os.environ.get("TEST_PINNED_DOC") == "1":
     raise AssertionError("pinned doc requested local admission")
 elif words[0] not in ("release-wait", "register-local", "check-local"):

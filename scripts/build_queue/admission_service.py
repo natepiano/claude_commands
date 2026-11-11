@@ -10,6 +10,7 @@ from collections.abc import Generator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
 import errno
+import hashlib
 import json
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
@@ -22,15 +23,18 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from types import MappingProxyType
 from typing import Callable, Protocol, cast
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib import conf, inotify
 from scripts.lib.boot_identity import boot_identity
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
+from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
@@ -347,6 +351,9 @@ class ServiceState:
     run_places: dict[str, wire.RunPlace] = field(default_factory=dict)
     caller_versions: dict[str, str] = field(default_factory=dict)
     lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
+    placement_requests: dict[str, wire.PlacementRequest] = field(default_factory=dict)
+    assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
+    current_assignments: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -647,6 +654,45 @@ class OperatingSystemReader:
         self.thread.join()
 
 
+class HostEvidenceReader:
+    """A blocked provider cannot hold the service loop or another provider reader."""
+
+    def __init__(self, key: placement.HostEvidenceKey,
+                 probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence],
+                 clock: Clock, wake: int, interval: float, timeout: float) -> None:
+        self.key: placement.HostEvidenceKey = key
+        self.probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = probe
+        self.clock: Clock = clock
+        self.wake: int = wake
+        self.interval: float = interval
+        self.timeout: float = timeout
+        self.latest: placement.HostEvidence = placement.HostEvidenceUnavailable(key, clock.now(), "not read")
+        self.stopped: threading.Event = threading.Event()
+        self.thread: threading.Thread = threading.Thread(target=self._read, name="placement-evidence", daemon=True)
+        self.thread.start()
+
+    def _read(self) -> None:
+        while not self.stopped.is_set():
+            try:
+                evidence = self.probe(self.key)
+                if evidence.key != self.key:
+                    raise ValueError("provider evidence has a different policy key")
+            except Exception as error:
+                evidence = placement.HostEvidenceUnavailable(self.key, self.clock.now(), str(error))
+            self.latest = evidence
+            if self.stopped.is_set():
+                return
+            try:
+                os.eventfd_write(self.wake, 1)
+            except OSError:
+                return
+            if self.stopped.wait(self.interval):
+                return
+
+    def close(self) -> None:
+        self.stopped.set()
+
+
 @dataclass(frozen=True)
 class DurableRecordEncoding:
     value: object
@@ -882,7 +928,8 @@ def process_uid(pid: int, proc: Path) -> int | OwnerProcessGone:
 class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
-                 capture_root: Path = CARGO_CAPTURE_ROOT) -> None:
+                 capture_root: Path = CARGO_CAPTURE_ROOT,
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
         self.state_dir: Path = state_dir
         self.clock: Clock = clock
         self.readings: Readings = readings
@@ -896,6 +943,15 @@ class AdmissionServer:
         self.run_places: dict[str, wire.RunPlace] = {}
         self.build_history_generation: int = 0
         self.ledger: dict[str, ReplayEntry] = {}
+        self.placement_requests: dict[str, wire.PlacementRequest] = {}
+        self.assignments: dict[str, records.SavedPlacementAssignment] = {}
+        self.current_assignments: dict[str, str] = {}
+        self.execution_evidence: dict[str, placement.ExecutionEvidence] = {}
+        self.host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = (
+            host_probe if host_probe is not None else self._read_host_evidence)
+        self.host_readers: dict[placement.HostEvidenceKey, HostEvidenceReader] = {}
+        self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
+        self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
         self.spacing: records.StartSpacing = records.ReadyToStart()
         self.override: records.HeadAdmissionOverride | records.NoHeadAdmissionOverride = records.NoHeadAdmissionOverride()
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
@@ -986,6 +1042,9 @@ class AdmissionServer:
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
+            self.placement_requests = state.placement_requests
+            self.assignments = state.assignments
+            self.current_assignments = state.current_assignments
             self._persisted = wire.encode_record(state)
             if not isinstance(self.override, records.NoHeadAdmissionOverride):
                 self.override_reconnect_until = ReconnectAwaitingListener()
@@ -997,6 +1056,9 @@ class AdmissionServer:
                 self._watch_scope(lifetime, episode)
         self._prune_places()
         self._finish_priority()
+        for request in self.placement_requests.values():
+            if request.owner.host == self.host and self._live(wire.Owner(request.owner.pid, request.owner.start_time)):
+                self._watch_owner(request.owner)
 
     def _end_if_finished(self, episode: str, record: ReservationRecord) -> bool:
         lifetime = self._lifetime(record)
@@ -1025,17 +1087,22 @@ class AdmissionServer:
                 live_callers[key] = version
         self.caller_versions = live_callers
         live_reservations = self._live_reservation_ids()
+        live_dispatches = {"dispatch:" + key for key, saved in self.assignments.items()
+                           if isinstance(saved.state, placement.CurrentAssignment)}
         self.ledger = {key: replace(entry, ended_at=now)
                        if isinstance(entry.ended_at, LiveGrant)
                        and key not in self.reservations and entry.reservation not in live_reservations
+                       and key not in live_dispatches
                        else entry for key, entry in self.ledger.items()}
         if not isinstance(self.last_usable_configuration, NoPass):
             self.ledger = {key: entry for key, entry in self.ledger.items()
                            if isinstance(entry.ended_at, LiveGrant) or key in self.reservations
+                           or key in live_dispatches
                            or entry.reservation in live_reservations
                            or now - entry.ended_at < self.last_usable_configuration.replay_retention_seconds}
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
-            self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox)
+            self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
+            self.placement_requests, self.assignments, self.current_assignments)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
 
         def encoded_record(name: str, key: str, value: object) -> DurableRecordEncoding:
@@ -1072,7 +1139,11 @@ class AdmissionServer:
             pass
         os.close(descriptor)
 
-    def _watch_owner(self, owner: wire.Owner) -> None:
+    def _watch_owner(self, owner: wire.Owner | placement.SubmittingOwner) -> None:
+        if isinstance(owner, placement.SubmittingOwner):
+            if owner.host != self.host:
+                return
+            owner = wire.Owner(owner.pid, owner.start_time)
         if any(isinstance(watch, OwnerWatch) and watch.owner == owner for watch in self.watchers.values()):
             return
         try:
@@ -1112,6 +1183,8 @@ class AdmissionServer:
         owners.update(waiting.request.owner for waiting in self.waiters.values())
         owners.update(place.owner for place in self.places.values())
         owners.update(wire.Owner(place.run.pid, place.run.start_time) for place in self.run_places.values())
+        owners.update(wire.Owner(request.owner.pid, request.owner.start_time)
+                      for request in self.placement_requests.values() if request.owner.host == self.host)
         for descriptor, watch in list(self.watchers.items()):
             if (isinstance(watch, OwnerWatch) and watch.owner not in owners
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
@@ -1548,6 +1621,7 @@ class AdmissionServer:
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self._prune_runs()
         self.configuration = configuration
+        self._placement_pass()
         self.pass_stale = False
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
             self.reading_hold = NoReadingHold()
@@ -1885,7 +1959,241 @@ class AdmissionServer:
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
 
+    def host_evidence_key(self, request: wire.PlacementRequest,
+                          destination: placement.PlacementDestination) -> placement.HostEvidenceKey:
+        from scripts.build_targets import target_config
+
+        paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
+        for target in target_config.read_targets():
+            if isinstance(target, target_config.SshTarget) and target.name == destination.target:
+                paths.add(target.settings)
+        digest = hashlib.sha256()
+        for path in sorted(paths):
+            digest.update(str(path).encode())
+            try:
+                digest.update(path.read_bytes())
+            except FileNotFoundError:
+                digest.update(b"missing")
+        return placement.HostEvidenceKey(destination, request.constraints.session,
+            request.constraints.command, digest.hexdigest(), request.constraints.repository,
+            request.constraints.package, request.profile.step)
+
+    def _host_probe_timeout(self, destination: placement.PlacementDestination) -> float:
+        from scripts.build_targets import target_config
+
+        for target in target_config.read_targets():
+            if isinstance(target, target_config.SshTarget) and target.name == destination.target:
+                return conf.read(target.settings).number("probe_timeout_s")
+        return conf.read("mac_test").number("probe_timeout_s")
+
+    def publish_host_evidence(self, evidence: placement.HostEvidence) -> None:
+        self.host_observations[evidence.key] = evidence
+        reader = self.host_readers.get(evidence.key)
+        if reader is not None:
+            reader.latest = evidence
+        try:
+            os.eventfd_write(self.reading_events, 1)
+        except OSError:
+            pass
+
+    def host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        reader = self.host_readers.get(key)
+        evidence = (reader.latest if reader is not None else self.host_observations.get(key,
+                    placement.HostEvidenceUnavailable(key, self.clock.now(), "not read")))
+        if isinstance(evidence, placement.FreshHostEvidence):
+            interval = (self.last_usable_configuration.waiting_pass_seconds
+                        if isinstance(self.last_usable_configuration, records.MemoryConfig) else 0.0)
+            timeout = reader.timeout if reader is not None else self._host_probe_timeout(key.destination)
+            if self.clock.now() - evidence.observed_at > interval + timeout:
+                return placement.StaleHostEvidence(key, evidence.observed_at, "provider evidence expired")
+        return evidence
+
+    def _request_host_evidence(self, request: wire.PlacementRequest,
+                               destination: placement.PlacementDestination) -> placement.HostEvidence:
+        key = self.host_evidence_key(request, destination)
+        self.host_requests[key] = request
+        current = self.host_evidence(key)
+        if isinstance(current, placement.FreshHostEvidence):
+            return current
+        if key not in self.host_readers and isinstance(self.last_usable_configuration, records.MemoryConfig):
+            previous = self.host_observations.get(key)
+            reader = HostEvidenceReader(key, lambda current: self.host_probe(current), self.clock,
+                self.reading_events, self.last_usable_configuration.waiting_pass_seconds,
+                self._host_probe_timeout(destination))
+            self.host_readers[key] = reader
+            if previous is not None:
+                reader.latest = previous
+        return self.host_evidence(key)
+
+    def _read_host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        """Read provider policy and exact claims outside the service loop."""
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, offload
+
+        request = self.host_requests[key]
+        destination = key.destination
+        if destination.provider not in ("mac", "ssh"):
+            return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
+        target = next((target for target in target_config.read_targets() if target.name == destination.target), None)
+        if target is None:
+            return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
+        kind = offload.verb_kind(cast(offload.MacVerb, request.profile.step))
+        if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
+            return placement.HostEvidenceUnavailable(key, self.clock.now(), "command policy is unavailable")
+        if isinstance(target, target_config.SshTarget):
+            answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
+                request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session)
+        else:
+            answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
+                request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session)
+        eligibility: placement.HostEligibility = (placement.TemporaryExclusion(answer.reason)
+            if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
+        paths = claim_state.state_paths(destination.target)
+        adopted: list[placement.AdoptedProviderClaim] = []
+        with claim_state.locked(paths.lock):
+            held = claim_state.read_claims(paths)
+        generation = (offload.expected_instance_generation(target.name)
+                      if isinstance(target, target_config.SshTarget) and target_config.is_aws_target(target) else "")
+        for claim in held:
+            record = claim.record
+            if "remote_host" not in record:
+                continue
+            reference = placement.ProviderClaimReference(destination.provider, destination.target, claim.scope,
+                record["claim_id"], record["episode"], record["attempt"])
+            session_id = record["submitting_session"]
+            session = OwningSession(session_id) if session_id else NoOwningSession()
+            adopted.append(placement.AdoptedProviderClaim(reference,
+                placement.SubmittingOwner(self.host, record["pid"], record["proc_start"]),
+                session, record["remote_host"], record.get("instance_generation", "")))
+        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted))
+
+    def _placement_owner_live(self, owner: placement.SubmittingOwner) -> bool:
+        return owner.host == self.host and self._live(wire.Owner(owner.pid, owner.start_time))
+
+    def _placement_status(self, assignment: placement.PlacementAssignment, reason: str = "") -> wire.DispatchStatus:
+        saved = self.assignments.get(placement.attempt_key(assignment.episode, assignment.attempt))
+        if saved is None:
+            return wire.DispatchStatus(placement.UnknownAssignment(assignment.episode, assignment.attempt),
+                placement.ClosedAssignment("unknown attempt"), placement.NoLaunchPermission("unknown attempt"), reason)
+        return wire.DispatchStatus(saved.assignment, saved.state, saved.permission, reason)
+
+    def _placement_reply(self, request: wire.PlacementRequest) -> wire.Assignment | wire.PlacementWait | wire.DispatchStatus:
+        current = self.current_assignments.get(request.episode, "")
+        saved = self.assignments.get(current)
+        if saved is not None:
+            if isinstance(saved.state, placement.CurrentAssignment):
+                return wire.Assignment(saved.assignment)
+            return self._placement_status(saved.assignment)
+        eligibility: list[placement.CandidateEligibility] = []
+        for candidate in request.constraints.candidates:
+            destination = candidate.destination
+            permitted: placement.HostEligibility = candidate.eligibility
+            selection = request.constraints.selection
+            if isinstance(selection, placement.PinnedHost) and selection.target != destination.target:
+                permitted = placement.FixedExclusion("another target is pinned")
+            if isinstance(permitted, placement.AllowedHost):
+                evidence = self._request_host_evidence(request, destination)
+                permitted = (evidence.eligibility if isinstance(evidence, placement.FreshHostEvidence)
+                             else placement.EvidenceNeeded(evidence.reason))
+            eligibility.append(placement.CandidateEligibility(destination, permitted))
+            if isinstance(permitted, placement.AllowedHost):
+                assignment = placement.PlacementAssignment(request.episode, uuid.uuid4().hex, destination,
+                    request.constraints.source_key, request.owner, request.constraints.session, request.since)
+                key = placement.attempt_key(request.episode, assignment.attempt)
+                self.assignments[key] = records.SavedPlacementAssignment(assignment)
+                self.current_assignments[request.episode] = key
+                self.persist()
+                return wire.Assignment(assignment)
+        ordered = sorted(self.placement_requests.values(), key=lambda item: (item.since, item.owner.pid, item.episode))
+        position = next(index for index, waiting in enumerate(ordered, 1) if waiting.episode == request.episode)
+        return wire.PlacementWait(request.episode, request.since, position, tuple(eligibility))
+
+    def _placement_pass(self) -> None:
+        changed = False
+        for request in sorted(self.placement_requests.values(), key=lambda item: (item.since, item.owner.pid, item.episode)):
+            current = self.current_assignments.get(request.episode, "")
+            saved = self.assignments.get(current)
+            if not self._placement_owner_live(request.owner):
+                if (saved is not None and isinstance(saved.state, placement.CurrentAssignment)
+                        and isinstance(saved.permission, placement.PermissionAvailable)):
+                    self.assignments[current] = replace(saved, state=placement.ClosedAssignment("owner ended"))
+                    changed = True
+                continue
+            if isinstance(self.configuration, gate.UsableAdmissionConfiguration):
+                _ = self._placement_reply(request)
+        if changed:
+            self.persist()
+
+    def _consume_permission(self, request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+        assignment = request.assignment
+        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        saved = self.assignments.get(key)
+        if (saved is None or saved.assignment != assignment
+                or self.current_assignments.get(assignment.episode) != key
+                or not isinstance(saved.state, placement.CurrentAssignment)
+                or isinstance(saved.permission, placement.PermissionConsumed)):
+            return self._placement_status(assignment)
+        submitted = self.placement_requests.get(assignment.episode)
+        if (submitted is None or submitted.constraints.source_key != assignment.source_key
+                or submitted.owner != assignment.owner or not self._placement_owner_live(assignment.owner)):
+            return self._placement_status(assignment, "assignment owner or source is no longer valid")
+        reference = request.claim
+        destination = assignment.destination
+        if (not reference.claim_id or reference.episode != assignment.episode or reference.attempt != assignment.attempt
+                or reference.provider != destination.provider or reference.target != destination.target
+                or reference.scope != destination.scope):
+            return self._placement_status(assignment, "claim does not match the assignment")
+        evidence = self._request_host_evidence(submitted, destination)
+        if not isinstance(evidence, placement.FreshHostEvidence):
+            return self._placement_status(assignment, "adoption evidence is unavailable or stale")
+        adopted = next((claim for claim in evidence.claims
+                        if claim.reference == reference and claim.owner == assignment.owner
+                        and claim.session == assignment.session and claim.host == destination.host
+                        and claim.generation == evidence.generation), None)
+        if adopted is None:
+            return self._placement_status(assignment, "the exact claim is not adopted")
+        saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference)
+        self.assignments[key] = saved
+        status = wire.DispatchStatus(assignment, saved.state, saved.permission)
+        self.ledger["dispatch:" + key] = ReplayEntry(status, LiveGrant())
+        self.persist()
+        return wire.FirstAuthorization(assignment, reference)
+
+    def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
+                          ) -> list[wire.Reply]:
+        if isinstance(request, wire.ConsumePermission):
+            return [self._consume_permission(request)]
+        if isinstance(request, wire.PlacementRequest):
+            if not self._placement_owner_live(request.owner):
+                return [wire.Refused("submitting owner is not live on the coordinator")]
+            previous = self.placement_requests.get(request.episode)
+            if previous is not None and previous != request:
+                return [wire.Refused("placement constraints changed within an episode")]
+            self.placement_requests[request.episode] = request
+            self._watch_owner(request.owner)
+            self.persist()
+            return [self._placement_reply(request)]
+        assignment = request.assignment
+        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        saved = self.assignments.get(key)
+        if saved is None or saved.assignment != assignment or self.current_assignments.get(assignment.episode) != key:
+            return [self._placement_status(assignment)]
+        if isinstance(request, wire.ClaimFailure):
+            if isinstance(saved.permission, placement.PermissionAvailable) and isinstance(saved.state, placement.CurrentAssignment):
+                self.assignments[key] = replace(saved, state=placement.ClosedAssignment(request.reason))
+                del self.current_assignments[assignment.episode]
+                self.persist()
+        elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim):
+            self.execution_evidence[key] = request.evidence
+        return [self._placement_status(assignment)]
+
     def _authorize(self, request: wire.Request, uid: int) -> str:
+        if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport)):
+            owner = request.owner if isinstance(request, wire.PlacementRequest) else request.assignment.owner
+            episode = request.episode if isinstance(request, wire.PlacementRequest) else request.assignment.episode
+            if uid != os.getuid() and (not episode.startswith(f"uid:{uid}:") or self._account(owner.pid) != uid):
+                return "placement belongs to another account"
+            return ""
         if uid == os.getuid():
             return ""
         if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest)):
@@ -1963,6 +2271,8 @@ class AdmissionServer:
             return [wire.Refused(refusal)]
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection)
+        if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport)):
+            return self._handle_placement(request)
         if isinstance(request, wire.ServiceEstimateRequest):
             replay = self.ledger.get(request.episode)
             if replay is not None:
@@ -2561,6 +2871,8 @@ class AdmissionServer:
             return
         self.closed = True
         self.stopped = True
+        for reader in self.host_readers.values():
+            reader.close()
         if not isinstance(self.system_reader, NoSystemReader):
             self.system_reader.close()
         os.close(self.reading_events)

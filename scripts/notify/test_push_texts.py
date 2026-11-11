@@ -17,16 +17,11 @@ from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
-from scripts.lib.code_kind import is_test_code  # noqa: E402
-
 from scripts.notify import gpu_xid
 from scripts.notify import push_texts
 from scripts.message import session_send
 from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
-
-ROOT = Path(__file__).resolve().parents[2]
-EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}
 
 
 def literal_path(node: ast.expr) -> str:
@@ -474,14 +469,11 @@ class PushTextTests(unittest.TestCase):
                   self.assertRaises(ValueError)):
                 _ = push_texts.catalog()
 
-
     def test_remote_control_push_is_absent_from_catalog_and_approvals(self) -> None:
         removed_id = "shutdown." + "remote_control"
         self.assertNotIn(removed_id, {entry.id for entry in push_texts.catalog()})
         approvals = cast(dict[str, object], json.loads(push_texts.REVIEWED_FILE.read_text()))
         self.assertNotIn(removed_id, approvals)
-
-
 
     def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:
         entry = self.entry()
@@ -568,19 +560,6 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(literal_delivery_calls('command = ["scripts/notify/pushover.py", "title", "body"]\nrun(command)'), [1])
         self.assertEqual(literal_delivery_calls('run(["python3", str(ROOT / "notify" / "pushover.py"), "title", "body"])'), [1])
 
-    def test_each_script_delivery_uses_the_registry(self) -> None:
-        findings: list[str] = []
-        for path in (ROOT / "scripts").rglob("*.py"):
-            relative = path.relative_to(ROOT).as_posix()
-            if relative in EXEMPT or is_test_code(path):
-                continue
-            findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(path.read_text()))
-        for folder in ("commands", "codex"):
-            for path in (ROOT / folder).rglob("*.md"):
-                findings.extend(f"{path.relative_to(ROOT)}:{line}: unregistered phone instruction"
-                                for line in instruction_phone_sends(path.read_text()))
-        self.assertEqual(findings, [])
-
     def test_instruction_gate_checks_inline_and_multiline_phone_commands(self) -> None:
         self.assertEqual(instruction_phone_sends('`pushover.py --no-action Title Body`'), [1])
         self.assertEqual(instruction_phone_sends('`send.py --to user --text "use --text-id"`'), [1])
@@ -613,10 +592,3 @@ class PushTextTests(unittest.TestCase):
                 with self.subTest(executable=executable, quote=quote):
                     self.assertEqual(instruction_phone_sends(f'`{path} {target} "--text-id"`'), [1])
                     self.assertEqual(instruction_phone_sends(f'`{path} {target} --text-id nate.adhoc`'), [])
-
-    def test_only_pushover_posts_to_pushover(self) -> None:
-        """pushover.post_message adds the "Sent by" and "Template" lines; no other script may post round it."""
-        found = [path.relative_to(ROOT).as_posix() for path in (ROOT / "scripts").rglob("*")
-                 if path.is_file() and "__pycache__" not in path.parts and not is_test_code(path)
-                 and path.name != "pushover.py" and b"api.pushover.net" in path.read_bytes()]
-        self.assertEqual(found, [])

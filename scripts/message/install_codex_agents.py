@@ -70,7 +70,7 @@ def install_remote(host: str, text: bytes, arguments: list[str]) -> int:
                + " " + shlex.join(["--from-stdin", *arguments]))
     try:
         done = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+            ["ssh", "-o", "BatchMode=yes", host, command],
             input=text, capture_output=True, timeout=20, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:

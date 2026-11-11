@@ -22,7 +22,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff, unit_config, test_worker, worker
 from scripts.production.cli_fixture import invoke_cli
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
@@ -151,7 +151,7 @@ class AssignLauncherFixture(unittest.TestCase):
         self.registry = self.native.fixture.root / "conf/models.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "UNIT_HISTORY_DIR": str(self.history), "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
+            "UNIT_HISTORY_DIR": str(self.history), 
             "UNIT_RUN_ROOT": str(self.session_dir.parent), "ROSTER_RUN_ROOT": str(self.session_dir.parent),
             "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
             "PYTHONPATH": str(ROOT), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),

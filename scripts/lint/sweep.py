@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import record, store
+    from scripts.buildlog.repository import GIT_DIR, repo_name as repo_name
     from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                                               TargetFolderOverride, recorded_output_roots)
     from scripts.notify.push_texts import RenderedPush
@@ -212,6 +213,7 @@ else:
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import store
+    from scripts.buildlog.repository import GIT_DIR, repo_name as repo_name
     from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                                               TargetFolderOverride, recorded_output_roots)
 
@@ -226,10 +228,6 @@ MIB = 1 << 20
 DAY_SECONDS = 86_400
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
-GIT_DIR = ".git"
-GITDIR_PREFIX = "gitdir:"
-COMMONDIR_FILE = "commondir"
-ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
 DOC_LOCK_NAME = ".lock"
@@ -2766,6 +2764,11 @@ def shrink_floor(
                             break
                         if not group_unchanged(group):
                             continue
+                        if isinstance(policy, MacFloor) and not dry_run:
+                            current_claims = policy.claims_before_removal(paired_roots)
+                            if current_claims:
+                                busy.update(current_claims)
+                                break
                         attempted.append(group)
                         account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
                         if isinstance(account, ConfirmedDeletion) and account.removed:
@@ -3303,7 +3306,7 @@ def folder_choice(path: str, size: int) -> FolderChoice:
 
 def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: Sequence[tuple[str, int]], shortfall: int, *,
                    now: float, lint_settings: conf.ConfigRead, held_targets: Sequence[str] = ()) -> FolderChoices:
-    """Classify measured folders and exclude held output from recommendations."""
+    """Offer build output outside source checkouts and exclude held output from recommendations."""
     choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
                for path, size in protected if size > 0]
     if isinstance(measurement, CurrentMacFolders):
@@ -3316,11 +3319,17 @@ def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: 
             choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
                            if item.bytes > 0 and item.path not in protected_paths)
     held_paths = tuple(Path(path).expanduser().resolve() for path in held_targets)
-    for index, item in enumerate(choices):
+    output_roots = OUTPUT_ROOTS.get().output_owners
+    candidates: list[FolderChoice] = []
+    for item in choices:
         path = Path(item.label).expanduser().resolve()
+        if ((path / "Cargo.toml").exists() or (path / GIT_DIR).exists()
+                or (path not in output_roots and not is_cargo_target(str(path), lint_settings=lint_settings))):
+            continue
         if any(path.is_relative_to(held) or held.is_relative_to(path) for held in held_paths):
-            choices[index] = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
-    choices.sort(key=lambda item: (-item.bytes, item.label))
+            item = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
+        candidates.append(item)
+    choices = sorted(candidates, key=lambda item: (-item.bytes, item.label))
     if not choices:
         return UNAVAILABLE_FOLDER_CHOICES
     eligible = [item for item in choices if item.kind is not FolderChoiceKind.HELD_OUTPUT]
@@ -3363,15 +3372,20 @@ def folder_choice_lines(choices: FolderChoices, shortfall: int, *, folder_count:
                  "Delete nothing: the disk stays low and builds can fail."]
     else:
         shown: list[FolderChoice] = []
+        covered_paths: list[Path] = []
         covered = 0
         for item in choices.choices:
             if len(shown) >= folder_count or covered >= shortfall:
                 break
             if item.bytes <= 0:
                 continue
+            path = Path(item.label).expanduser().resolve()
+            if any(path.is_relative_to(previous) or previous.is_relative_to(path) for previous in covered_paths):
+                continue
             shown.append(item)
             if item.kind is not FolderChoiceKind.HELD_OUTPUT:
                 covered += item.bytes
+                covered_paths.append(path)
         if shown and not isinstance(choices, HeldOnlyFolderChoices):
             largest = next(item for item in choices.choices if item.kind is not FolderChoiceKind.HELD_OUTPUT)
             if largest not in shown:
@@ -3665,8 +3679,9 @@ class MacFloor:
     """Only marked output inside the three approved Mac roots can be removed."""
 
     roots: tuple[str, ...]
-    claims: floor_claims.LockedClaims
+    claims: floor_claims.ClaimSnapshot
     mirror: Path
+    busy_mirrors: frozenset[Path] = frozenset()
     leased_mirrors: frozenset[Path] = frozenset()
 
     def allows(self, target: str) -> bool:
@@ -3692,7 +3707,7 @@ class MacFloor:
         paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
         for root in targets:
             if (not self.allows(root) or self.claims.holds(root, self.mirror)
-                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)
+                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.busy_mirrors)
                     or isinstance(paths, tmp_sweep.ProcessUsesUnavailable)):
                 result[root] = LockHeld("Mac claim or process use is busy or unreadable")
             else:
@@ -3701,6 +3716,16 @@ class MacFloor:
                         result[root] = TargetUse(pid, how)
                         break
         return result
+
+    def claims_before_removal(self, targets: Sequence[str]) -> dict[str, LockHeld]:
+        """Read claims again for output outside the acquired mirror leases."""
+        uncovered = [target for target in targets if not any(
+            Path(target).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)]
+        if not uncovered:
+            return {}
+        claims = floor_claims.read_claims(conf.read("mac_test").number("probe_timeout_s"))
+        return {target: LockHeld("Mac claim is busy or unreadable") for target in uncovered
+                if claims.holds(target, self.mirror)}
 
 
 class NatedevFloor(Enum):
@@ -3739,9 +3764,9 @@ def mac_folder_reclaimable_bytes(directory: str) -> int:
     return total + sum(observed.st_blocks * 512 for key, observed in shared.items() if links[key] == observed.st_nlink)
 
 
-def mac_folder_measurement(policy: MacFloor) -> CurrentMacFolders:
-    """Measure each root's direct folder children without following directory symlinks."""
-    folders: set[str] = set()
+def mac_folder_measurement(policy: MacFloor, targets: Sequence[str]) -> CurrentMacFolders:
+    """Measure root children and discovered targets without following directory symlinks."""
+    folders = {target for target in targets if not os.path.islink(target) and os.path.isdir(target)}
     for root in policy.roots:
         try:
             with os.scandir(Path(root).expanduser().resolve()) as entries:
@@ -3795,6 +3820,15 @@ SweepFailureScope = FloorFailureScope | WorkspaceFailureScope | TemporarySweepFa
 
 
 @dataclass(frozen=True)
+class FloorTargetsNotSearched:
+    """This pass has no target search result."""
+
+
+class SearchedFloorTargets(tuple[str, ...]):
+    """The filtered target search result, including a completed search with no targets."""
+
+
+@dataclass(frozen=True)
 class FloorOutcome:
     assessment: tmp_sweep.SweepAssessment
     removed: int = 0
@@ -3803,6 +3837,7 @@ class FloorOutcome:
     busy: int = 0
     protected: tuple[tuple[str, int], ...] = ()
     held_targets: tuple[str, ...] = ()
+    targets: SearchedFloorTargets | FloorTargetsNotSearched = FloorTargetsNotSearched()
 
     @property
     def status(self) -> int:
@@ -3956,6 +3991,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
     after = outcome.after if isinstance(outcome, FloorOutcome) else 0
     protected = outcome.protected if isinstance(outcome, FloorOutcome) else ()
     held_targets = outcome.held_targets if isinstance(outcome, FloorOutcome) else ()
+    targets = outcome.targets if isinstance(outcome, FloorOutcome) else FloorTargetsNotSearched()
     removed = outcome.removed if isinstance(outcome, FloorOutcome) else 0
     filesystem = FLOOR_FILESYSTEM.get()
     root_scope = scope is FloorFailureScope.FILESYSTEM and (
@@ -4042,9 +4078,10 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             failure = NoFailure()
         current = replace(current, failure=failure)
         crossing = current.phone_crossing if root_scope else AbovePhoneFloor()
-        natedev_pending = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+        crossing_ready = isinstance(policy, NatedevFloor) or isinstance(targets, SearchedFloorTargets)
+        natedev_pending = (crossing_ready and free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
                            and crossing.natedev is CrossingReceipt.PENDING)
-        phone_due = (free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
+        phone_due = (crossing_ready and free < phone_floor and isinstance(crossing, OpenPhoneCrossing)
                      and crossing.phone is CrossingReceipt.PENDING and not assessment.status)
         phone_pending = phone_due and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE
         crossing_pending = natedev_pending or phone_pending
@@ -4054,7 +4091,11 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         shortfall = max(0, phone_floor - free)
         choices: FolderChoices = UNAVAILABLE_FOLDER_CHOICES
         if crossing_pending:
-            measurement = mac_folder_measurement(policy) if isinstance(policy, MacFloor) else read_disk_measurement()
+            if isinstance(policy, MacFloor):
+                assert isinstance(targets, SearchedFloorTargets)
+                measurement = mac_folder_measurement(policy, targets)
+            else:
+                measurement = read_disk_measurement()
             choices = folder_choices(measurement, protected, shortfall,
                                      now=time.time(), lint_settings=lint_settings, held_targets=held_targets)
 
@@ -4162,6 +4203,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
 
     guard: int | None = None
     outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
+    target_search: SearchedFloorTargets | FloorTargetsNotSearched = FloorTargetsNotSearched()
     protected: tuple[tuple[str, int], ...] = ()
     held_targets: set[str] = set()
     busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
@@ -4221,6 +4263,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             print(f"lint sweep: filesystem {filesystem.key} at {filesystem.probe_path}")
         if isinstance(policy, MacFloor):
             targets = [target for target in targets if policy.allows(target)]
+        target_search = SearchedFloorTargets(targets)
         owners = TargetOwnerIndex(targets)
         hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
                         if isinstance(policy, NatedevFloor) else {})
@@ -4433,7 +4476,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             except OSError as error:
                 print(f"lint sweep: cannot save floor accounting: {error}", file=sys.stderr)
         outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0 if isinstance(policy, MacFloor) else (1 if failures else 0)),
-                               0 if dry_run else max(0, total - left), free, after_free, len(busy), protected=protected)
+                               0 if dry_run else max(0, total - left), free, after_free, len(busy),
+                               protected=protected, targets=target_search)
         return outcome
     except (conf.Unusable, OSError) as error:
         if isinstance(policy, MacFloor):
@@ -4448,7 +4492,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                 held_targets.update(root for root, use in busy.items() if not isinstance(use, NoRecordedEvidence))
                 for root in tuple(held_targets):
                     held_targets.update(OUTPUT_ROOTS.get().roots_for(root))
-                notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets))),
+                notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets)),
+                                             targets=target_search),
                                      lint_settings=lint_settings, detail=detail,
                                      policy=policy)
         finally:
@@ -4466,93 +4511,6 @@ def size_bytes(raw: str, unit: int) -> int | None:
     except ValueError:
         return None
     return int(value * unit) if math.isfinite(value) and value >= 0 else None
-
-
-def repo_name(directory: str) -> str | None:
-    """Name of the directory holding the git common dir of the repo directory is
-    in: every worktree of a repo shares it, and a scratch clone takes the name of
-    the repo it was cloned from (source_git_dir). Read from the .git files rather
-    than from git, which a bare PATH may not reach."""
-    common = git_common_dir(directory)
-    if common is None:
-        return None
-    return os.path.basename(os.path.dirname(source_git_dir(common))) or None
-
-
-def git_common_dir(directory: str) -> str | None:
-    """The git dir every worktree of directory's repo shares."""
-    current = os.path.abspath(directory)
-    while not os.path.lexists(os.path.join(current, GIT_DIR)):
-        parent = os.path.dirname(current)
-        if parent == current:
-            return None
-        current = parent
-    common = os.path.join(current, GIT_DIR)
-    if os.path.isfile(common):
-        # A linked worktree: .git names its private git dir, whose commondir
-        # file leads back to the shared one.
-        try:
-            with open(common, encoding="utf-8") as handle:
-                pointer = handle.readline().strip()
-        except OSError:
-            return None
-        if not pointer.startswith(GITDIR_PREFIX):
-            return None
-        common = os.path.join(current, pointer[len(GITDIR_PREFIX) :].strip())
-        try:
-            with open(os.path.join(common, COMMONDIR_FILE), encoding="utf-8") as handle:
-                common = os.path.join(common, handle.readline().strip())
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return None
-    return os.path.normpath(common)
-
-
-def source_git_dir(common: str) -> str:
-    """The git dir a scratch clone came from, followed to its end: a
-    `git clone --shared` copy borrows its objects (alternates), and a plain local
-    clone names its source as a local origin. A merge check's clone of hana is
-    hana for the Mac mirror and the sweep budget. A git dir with neither is its
-    own answer."""
-    seen = {common}
-    while True:
-        source = borrowed_git_dir(common) or local_origin_git_dir(common)
-        if source is None or source in seen:
-            return common
-        seen.add(source)
-        common = source
-
-
-def borrowed_git_dir(common: str) -> str | None:
-    try:
-        with open(os.path.join(common, ALTERNATES_FILE), encoding="utf-8") as handle:
-            objects = handle.readline().strip()
-    except OSError:
-        return None
-    if not objects:
-        return None
-    return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
-
-
-def local_origin_git_dir(common: str) -> str | None:
-    """The shared git dir of origin when origin is a directory on this machine."""
-    try:
-        with open(os.path.join(common, "config"), encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
-    except OSError:
-        return None
-    in_origin = False
-    for line in lines:
-        text = line.strip()
-        if text.startswith("["):
-            in_origin = text == '[remote "origin"]'
-        elif in_origin and text.partition("=")[0].strip() == "url":
-            url = text.partition("=")[2].strip().removeprefix("file://")
-            if not os.path.isabs(url) or not os.path.isdir(url):
-                return None
-            return git_common_dir(url)
-    return None
 
 
 def budget_bytes(environ: dict[str, str], config: str | conf.ConfigRead, repo: str | None) -> tuple[int | None, str]:
@@ -4900,10 +4858,10 @@ def main(argv: list[str]) -> int:
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
-            with copies.mirror_sweep_leases(mirror_root.local_path()) as protected:
-                with floor_claims.locked_claims(timeout) as claims:
-                    return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                      policy=MacFloor(mac_roots, claims, mirror_root.local_path(), protected))
+            with copies.mirror_sweep_leases(mirror_root.local_path()) as leases:
+                claims = floor_claims.read_claims(timeout)
+                return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
+                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path(), leases.busy, leases.held))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2

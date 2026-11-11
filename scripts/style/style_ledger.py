@@ -50,6 +50,7 @@ from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingE
                            RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 from scripts.style import style_rules
+from scripts.style import style_config
 from scripts.style import approved_renames
 from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
@@ -2258,6 +2259,14 @@ MIGRATIONS = {
     """,
     # Assignment checks hold the write lock; batch tickets can share their showrunner.
     37: "DROP INDEX IF EXISTS tickets_one_assigned;",
+    38: """
+        ALTER TABLE ticket_predecessors RENAME TO ticket_predecessors_single;
+        CREATE TABLE ticket_predecessors (
+            ticket TEXT NOT NULL, predecessor TEXT NOT NULL, PRIMARY KEY(ticket, predecessor)
+        );
+        INSERT INTO ticket_predecessors SELECT ticket,predecessor FROM ticket_predecessors_single;
+        DROP TABLE ticket_predecessors_single;
+    """,
     33: """
         CREATE TABLE IF NOT EXISTS rename_outer_binding_blocks (
             finding_id TEXT PRIMARY KEY, name TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL
@@ -2356,7 +2365,7 @@ def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
     row = record.by_id(staff.StaffId(reference))
     if row is not None:
         return ticket_holder(reference, record)
-    from scripts.shutdown import remote
+    from scripts.agents import remote
 
     context = record.by_worktree(remote.local_machine(), ledger.repo)
     if context is None:
@@ -2844,7 +2853,7 @@ class Ledger:
     def bulk_holder(self) -> staff.StaffRow:
         """Resolve the style production's showrunner through the command's staff resolver."""
         from scripts.production.production_doc import Refusal, production_field
-        from scripts.shutdown import remote
+        from scripts.agents import remote
 
         resolver = self.staff_resolver()
         common = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -2944,7 +2953,7 @@ class Ledger:
             # These files belong to this ledger, rather than a guessed unit folder.
             paths.update((self.database.parent / "bulk_review").glob("*.json"))
             if not references:
-                from scripts.shutdown import remote
+                from scripts.agents import remote
                 from scripts.production import unit_config
 
                 for identity in sorted(set(owners.values())):
@@ -3461,13 +3470,13 @@ class Ledger:
             return self._ticket(id)["widened"]
 
     def _check_ticket_pipelines(self, unit: str = "") -> None:
-        """Reprove disjointness under the caller's write lock, including its pending writes.
-
-        Both assignment and footprint changes use this boundary. Ordinary tickets read no sources here.
-        """
+        """Check each peer pair with an open ticket under the caller's write lock."""
         pairs = cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT p.predecessor,p.ticket FROM ticket_predecessors p JOIN tickets t ON t.id=p.ticket "
-            + "WHERE t.state IN ('assigned','checkpointed') AND (?='' OR t.unit=?)", (unit, unit),
+            "SELECT p.predecessor,p.ticket FROM ticket_predecessors p "
+            + "JOIN tickets t ON t.id=p.ticket JOIN tickets peer ON peer.id=p.predecessor "
+            + "WHERE t.state<>'dropped' AND peer.state<>'dropped' "
+            + "AND (t.state IN ('assigned','checkpointed') OR peer.state IN ('assigned','checkpointed')) "
+            + "AND (?='' OR t.unit=?)", (unit, unit),
         ).fetchall())
         for predecessor, successor in pairs:
             self._check_ticket_pair(self._ticket(predecessor), self._ticket(successor))
@@ -3482,7 +3491,7 @@ class Ledger:
                 raise LedgerError(f"{id}: cannot resume or gate from {ticket['state']}")
             self._check_ticket_pipelines(ticket["unit"])
 
-    def _pipeline_footprint(self, ticket: TicketRecord, commits: frozenset[str]) -> frozenset[str]:
+    def pipeline_footprint(self, ticket: TicketRecord, commits: frozenset[str]) -> frozenset[str]:
         """Conservative edit paths at every relevant immutable tree, including current finding rows.
 
         Selection can parse exact module references. This mutation guard includes every mention of a module name
@@ -3523,7 +3532,15 @@ class Ledger:
         if not ticket["base"]:
             raise LedgerError(f"{ticket['id']}: changed paths require a ticket base")
         style_tip = self._style_branch_tip()[1]
-        revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
+        peers = cast(list[tuple[str]], self._connection.execute(
+            "SELECT peer.checkpoint FROM ticket_predecessors p JOIN tickets peer "
+            + "ON peer.id=CASE WHEN p.ticket=? THEN p.predecessor ELSE p.ticket END "
+            + "WHERE (p.ticket=? OR p.predecessor=?) AND peer.checkpoint<>''",
+            (ticket["id"], ticket["id"], ticket["id"]),
+        ).fetchall())
+        imported = {checkpoint for (checkpoint,) in peers if self._is_ancestor(checkpoint, end)}
+        revisions = (end, f"^{ticket['base']}", *(f"^{commit}" for commit in sorted(imported)),
+                     *((f"^{style_tip}",) if style_tip else ()))
         paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
                            "--format=", *revisions, "--").stdout
         if paths and not paths.endswith(b"\0"):
@@ -3533,26 +3550,38 @@ class Ledger:
     def _check_ticket_pair(self, predecessor: TicketRecord, successor: TicketRecord) -> None:
         """Reprove disjointness from fresh rows and resolved tips; any uncertainty refuses the transaction."""
         try:
-            if predecessor["state"] not in ("checkpointed", "merged") or not predecessor["checkpoint"]:
-                raise LedgerError("predecessor has no waiting or merged checkpoint")
             style_branch, style_tip = self._style_branch_tip()
-            live = {successor["branch"]: _git(self.repo, "rev-parse", "--verify", f"{successor['branch']}^{{commit}}")}
+            live = {ticket["branch"]: _git(self.repo, "rev-parse", "--verify", f"{ticket['branch']}^{{commit}}")
+                    for ticket in (predecessor, successor) if ticket["state"] == "assigned"}
             if style_branch:
                 live[style_branch] = style_tip
             commits = {self.synced_commit(), *live.values()}
             for ticket in (predecessor, successor):
-                if not ticket["base"] or (ticket["state"] == "checkpointed" and not ticket["checkpoint"]):
+                if not ticket["base"] or (ticket["state"] in ("checkpointed", "merged") and not ticket["checkpoint"]):
                     raise LedgerError(f"{ticket['id']}: footprint has no base or checkpoint")
                 commits.add(ticket["base"])
                 if ticket["checkpoint"]:
                     commits.add(ticket["checkpoint"])
-            trees = frozenset(commits)
+            ends: list[str] = []
+            for ticket in (predecessor, successor):
+                paths = self.pipeline_footprint(ticket, frozenset(commits))
+                end = ticket["checkpoint"] or live[ticket["branch"]]
+                if ticket["state"] == "assigned":
+                    from scripts.agents import remote
+
+                    location = self.unit_row(ticket["unit"]).worktree
+                    worktree = (location.path if isinstance(location, staff.PresentWorktree)
+                                and location.machine == remote.local_machine() else self.repo)
+                    if worktree.is_dir() and _git(worktree, "rev-parse", "--symbolic-full-name", "HEAD") == ticket["branch"]:
+                        end = style_footprint.worktree_commit(worktree, style_footprint.TicketSourcePaths(tuple(sorted(paths))))
+                ends.append(end)
+            trees = frozenset((*commits, *ends))
             crates = tuple(sorted({crate for commit in trees for crate in self._tip(commit).crate_dirs}, key=len, reverse=True))
             footprints: list[frozenset[str]] = []
-            for ticket in (predecessor, successor):
-                end = ticket["checkpoint"] or live[successor["branch"]]
+            for ticket, end in zip((predecessor, successor), ends, strict=True):
+                paths = self.pipeline_footprint(ticket, trees)
                 actual = self.ticket_changed_paths(ticket, end)
-                footprints.append(self._pipeline_footprint(ticket, trees) | actual)
+                footprints.append(paths | actual)
             waiting, selected = footprints
             overlap = ((waiting & protected_ticket_files(selected, crates))
                        | (selected & protected_ticket_files(waiting, crates)))
@@ -3658,6 +3687,29 @@ class Ledger:
              "blocked" if isinstance(block, OuterBindingBlocked) else "unproved", block.reason),
         )
 
+    def _record_build_checks(self, checks: tuple[tuple[str, BuiltEntryEvidence], ...]) -> tuple[FindingNotBuilt, ...]:
+        """Apply merge check outcomes inside the caller's transaction."""
+        now = _now()
+        not_built: list[FindingNotBuilt] = []
+        for finding_id, evidence in checks:
+            check = evidence.outcome
+            if isinstance(check, AppliedInCode):
+                _ = self._connection.execute("DELETE FROM rename_dispositions WHERE finding_id=?", (finding_id,))
+                # A new build clears the person's reading of the old build.
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?",
+                    (now, now, finding_id),
+                )
+                continue
+            if isinstance(check, OuterBindingBlocked | OuterBindingUnproved):
+                self._record_rename_block(finding_id, check)
+            if isinstance(check, RenameNotApplied | OuterBindingBlocked | OuterBindingUnproved):
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                )
+            not_built.append(FindingNotBuilt(finding_id, check))
+        return tuple(not_built)
+
     def record_rename_block(self, finding_id: str, block: OuterBindingBlocked | OuterBindingUnproved) -> None:
         """Record the shared proof's blocker without changing ticket membership or finding state."""
         with self._connection:
@@ -3697,19 +3749,43 @@ class Ledger:
             raise LedgerError(f"{ticket['id']}: cannot become {target} from {state}")
         if target == "assigned":
             active = self._assignment_predecessors(ticket)
-            if active and (len(active) != 1 or active[0]["state"] != "checkpointed"):
-                raise LedgerError(f"{ticket['id']}: unit {ticket['unit']} already has {active[0]['id']} in state {active[0]['state']}")
+            assigned = tuple(peer for peer in active if peer["state"] == "assigned")
+            waiting = sum(peer["state"] == "checkpointed" for peer in active)
+            # Zero assigned tickets fit every positive limit from the configuration contract.
+            if waiting >= 2 or (assigned and len(assigned) >= self._ticket_capacity(ticket["unit"])):
+                held = assigned[0] if assigned else active[0]
+                raise LedgerError(f"{ticket['id']}: unit {ticket['unit']} already has {held['id']} in state {held['state']}")
         if target == "merged":
-            rows = cast(list[tuple[str]], self._connection.execute(
-                "SELECT p.predecessor FROM ticket_predecessors p JOIN tickets t ON t.id=p.predecessor "
-                + "WHERE p.ticket=? AND t.state<>'merged'", (ticket["id"],),
-            ).fetchall())
-            if rows:
-                raise LedgerError(f"{ticket['id']}: waiting for predecessor {rows[0][0]} to merge")
+            waiting = self._ticket_merge_predecessors(ticket)
+            if waiting:
+                raise LedgerError(f"{ticket['id']}: waiting for predecessor {waiting[0]} to merge")
         return False
 
+    def _ticket_capacity(self, unit: str) -> int:
+        """Read the assigned-ticket limit from the unit's production document."""
+        row = self.unit_row(unit)
+        parent = self.staff_resolver().record.parent_of(row)
+        if parent is None or not isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            raise style_config.StyleConfigError(f"{row.name}: no parent production document")
+        return style_config.read_config(parent.doc.path).assignment(row.name).open_tickets
+
+    def _ticket_merge_predecessors(self, ticket: TicketRecord) -> tuple[str, ...]:
+        """Return waiting checkpoints that the ticket's checkpoint contains."""
+        if not ticket["checkpoint"] or self.unit_row(ticket["unit"]).kind == "showrunner":
+            return ()
+        peers = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT id,checkpoint FROM tickets WHERE unit=? AND id<>? AND state='checkpointed' ORDER BY length(id),id",
+            (ticket["unit"], ticket["id"]),
+        ).fetchall())
+        # Unchanged tickets can share one commit. Keep their existing assignment order.
+        older = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
+            "SELECT predecessor FROM ticket_predecessors WHERE ticket=?", (ticket["id"],),
+        ).fetchall())}
+        return tuple(id for id, checkpoint in peers if (id in older if checkpoint == ticket["checkpoint"]
+                     else self._is_ancestor(checkpoint, ticket["checkpoint"])))
+
     def _assignment_predecessors(self, ticket: TicketRecord) -> tuple[TicketRecord, ...]:
-        """Bulk tickets share a holder; ordinary tickets keep the unit's assignment order."""
+        """Return open peers for ordinary tickets; bulk tickets share their showrunner."""
         if (isinstance(self.ticket_batch_owner(ticket["id"]), BatchOwner)
                 and self.unit_row(ticket["unit"]).kind == "showrunner"):
             return ()
@@ -3762,7 +3838,7 @@ class Ledger:
                     except LedgerError as error:
                         raise LedgerError(f"{id}: cannot resolve branch {branch}; waiting for merge: "
                                           + f"{active[0]['id']} checkpointed at {active[0]['checkpoint']}; assignment refused") from error
-                    if assignment_tip != active[0]["checkpoint"] or not assignment_tip:
+                    if len(active) == 1 and active[0]["state"] == "checkpointed" and assignment_tip != active[0]["checkpoint"]:
                         raise LedgerError(f"{id}: branch must start at waiting checkpoint {active[0]['checkpoint']}")
             return False
 
@@ -3811,25 +3887,7 @@ class Ledger:
                          self._coordinate_commit(moved.finding), checkpoint, _now(), moved.finding.finding_id),
                     )
                 if building:
-                    now = _now()
-                    for finding_id, evidence in checks:
-                        check = evidence.outcome
-                        if isinstance(check, AppliedInCode):
-                            _ = self._connection.execute("DELETE FROM rename_dispositions WHERE finding_id=?", (finding_id,))
-                            # A person's reading was of the old build, so a new build clears it.
-                            _ = self._connection.execute(
-                                "UPDATE held_findings SET state='built',person_read_by='',built_at=CASE WHEN built_at='' THEN ? ELSE built_at END,updated_at=? WHERE finding_id=?", (now, now, finding_id),
-                            )
-                            continue
-                        if isinstance(check, OuterBindingBlocked | OuterBindingUnproved):
-                            self._record_rename_block(finding_id, check)
-                        if isinstance(check, RenameNotApplied | OuterBindingBlocked | OuterBindingUnproved):
-                            # The next refill takes the finding into a new ticket.
-                            _ = self._connection.execute(
-                                "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
-                            )
-                        # A finding with no check keeps the merged ticket, so refill skips it until a person marks it built.
-                        not_built.append(FindingNotBuilt(finding_id, check))
+                    not_built.extend(self._record_build_checks(checks))
                 if target == "dropped" and ticket["kind"] == "proposal":
                     _ = self._connection.execute(
                         "UPDATE held_findings SET build_ticket='',updated_at=? WHERE build_ticket=? AND state='filed'",
@@ -3838,8 +3896,14 @@ class Ledger:
                 if target == "assigned":
                     active = self._assignment_predecessors(ticket)
                     if active:
-                        _ = self._connection.execute("INSERT INTO ticket_predecessors VALUES (?,?)", (id, active[0]["id"]))
+                        _ = self._connection.executemany("INSERT INTO ticket_predecessors VALUES (?,?)",
+                                                         [(id, peer["id"]) for peer in active])
                         _ = self._connection.execute("UPDATE tickets SET base=? WHERE id=?", (assignment_tip, id))
+                        for peer in active:
+                            if peer["state"] == "assigned" and not peer["base"]:
+                                base = (assignment_tip if peer["branch"] == branch else
+                                        _git(self.repo, "rev-parse", "--verify", f"{peer['branch']}^{{commit}}"))
+                                _ = self._connection.execute("UPDATE tickets SET base=? WHERE id=?", (base, peer["id"]))
                 # Check before merge removes the successor from the open set, after any carried finding moves.
                 if target == "merged":
                     self._check_ticket_pipelines(ticket["unit"])
@@ -4002,6 +4066,18 @@ class Ledger:
             "SELECT finding_id FROM held_findings WHERE build_ticket=? AND state='filed' ORDER BY finding_id", (ticket_id,),
         ).fetchall())
         return tuple(self._held(finding_id) for (finding_id,) in rows)
+
+    def recheck_merged_findings(self) -> tuple[FindingNotBuilt, ...]:
+        """Apply current merge checks to filed findings with merged proposal tickets."""
+        with self.git_operation("held recheck-merged"), self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            rows = cast(list[tuple[str, str]], self._connection.execute(
+                "SELECT h.finding_id,t.checkpoint FROM held_findings h JOIN tickets t ON t.id=h.build_ticket "
+                + "WHERE h.state='filed' AND t.state='merged' AND t.kind='proposal' ORDER BY h.finding_id",
+            ).fetchall())
+            checks = tuple((finding_id, self._built_check(self._held(finding_id), checkpoint))
+                           for finding_id, checkpoint in rows)
+            return self._record_build_checks(checks)
 
     def checkpoint_restamps(self, ticket: TicketRecord, checkpoint: str) -> CheckpointRestamps | NoRestamps:
         """The verdicts of this ticket that carry across edits made only by this ticket."""
@@ -4941,7 +5017,7 @@ class Ledger:
         return self._superseded(definitions)
 
     def _obsolete_tickets(self, definitions: Mapping[str, Rule], withdrawal: Withdrawal) -> tuple[TicketRecord, ...]:
-        """Cancel unfinished stale pins and dependent successors; accepted checkpoints stop cancellation."""
+        """Cancel unfinished tickets with stale pins; peer rows do not create build dependencies."""
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT id FROM tickets WHERE state IN ('queued','assigned') ORDER BY id").fetchall())
         tickets = tuple(self._ticket(row[0]) for row in rows)
@@ -4953,11 +5029,6 @@ class Ledger:
         obsolete.update(item.finding.build_ticket.ticket for item in withdrawal.withdrawn
                         if isinstance(item.verdict, RuleBodyChanged) and isinstance(item.finding.build_ticket, BuildTicket)
                         and item.finding.build_ticket.ticket in cancellable)
-        dependencies = cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT ticket,predecessor FROM ticket_predecessors").fetchall())
-        while successors := {ticket for ticket, predecessor in dependencies
-                             if predecessor in obsolete and ticket in cancellable} - obsolete:
-            obsolete.update(successors)
         return tuple(ticket for ticket in tickets if ticket["id"] in obsolete)
 
     def _rule_generation_changes(self, definitions: Mapping[str, Rule]) -> tuple[RuleGenerationChange, ...]:
@@ -5002,7 +5073,7 @@ class Ledger:
                         or self._rule_generation_changes(definitions) != generations):
                     raise ChangedBeforeLock("the findings or tickets changed while they were withdrawn; rerun")
                 now = _now()
-                # Drop builds and their dependent tickets before withdrawing their findings, atomically.
+                # Drop obsolete tickets before withdrawing their findings in the same transaction.
                 _ = self._connection.executemany("UPDATE tickets SET state='dropped',updated_at=? WHERE id=?",
                                                  [(now, ticket["id"]) for ticket in cancelled])
                 _ = self._connection.executemany(
@@ -6548,6 +6619,28 @@ class Ledger:
 
         return retry_on_change(attempt)
 
+    def mark_unbuilt(self, names: tuple[str, ...], reading: ReadByPerson) -> tuple[str, ...]:
+        """Release filed findings from merged proposal tickets after a person finds their changes absent."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            findings = self.named_held(names)
+            for finding in findings:
+                if not isinstance(finding.state, Filed):
+                    raise LedgerError(f"{finding.finding_id}: cannot mark a {held_state_name(finding.state)} finding unbuilt")
+                if not isinstance(finding.build_ticket, BuildTicket):
+                    raise LedgerError(f"{finding.finding_id}: no merged build ticket")
+                ticket = self._ticket(finding.build_ticket.ticket)
+                if ticket["state"] not in FINAL_TICKET_STATES:
+                    raise LedgerError(f"{finding.finding_id}: build ticket {ticket['id']} still holds the finding")
+                if ticket["state"] != "merged" or ticket["kind"] != "proposal":
+                    raise LedgerError(f"{finding.finding_id}: no merged build ticket")
+            now = _now()
+            _ = self._connection.executemany(
+                "UPDATE held_findings SET build_ticket='',person_read_by=?,updated_at=? WHERE finding_id=?",
+                [(reading.by, now, finding.finding_id) for finding in findings],
+            )
+        return tuple(finding.finding_id for finding in findings)
+
     def mark_built_at_merge(self, names: tuple[str, ...], merge: str, reading: PersonReading) -> tuple[BuiltAtMerge, ...]:
         """Mark filed findings built after a plain merge put their change in the code, with no build ticket.
 
@@ -6813,9 +6906,10 @@ class Ledger:
                     changes.append(f"hand-off {checkpoint}: {handoff['state']} -> merged")
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute(
             "SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') "
-            + "ORDER BY EXISTS(SELECT 1 FROM ticket_predecessors p JOIN tickets prev ON prev.id=p.predecessor "
-            + "WHERE p.ticket=tickets.id AND prev.state='checkpointed'),state,unit,length(id),id",
+            + "ORDER BY state,unit,length(id),id",
         ).fetchall())
+        with self.git_operation(f"reconcile {style_branch}"):
+            tickets.sort(key=lambda row: len(self._ticket_merge_predecessors(self._ticket(row[0]))))
         for id, branch, state, checkpoint in tickets:
             with self.git_operation(f"ticket {id} reconcile"):
                 contained = state == "checkpointed" and self._is_ancestor(checkpoint, style_tip)
@@ -7594,6 +7688,18 @@ def record_split(repo: Path, unit: str, split: RecordedSplit, *,
         )
 
 
+def publication_path(repo: Path, name: str) -> Path:
+    return Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "style-" + name).strip())
+
+
+@contextmanager
+def publication_lock(repo: Path) -> Generator[None]:
+    """Serialize checkpoint publication and main merges in the unit worktree."""
+    with publication_path(repo, "publication.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 @contextmanager
 def refill_lock(repo: Path) -> Generator[None]:
     """Serialize refill selection for units that share a ledger."""
@@ -7668,6 +7774,7 @@ class LedgerArguments(argparse.Namespace):
     site: str = ""
     idea: str = ""
     # `held built` takes more than one --id only with --commit.
+    # `held unbuilt` always permits multiple ids.
     ids: list[str] = []
     merge: str | None = None
     session_dir: str = ""
@@ -7789,7 +7896,7 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "replace", "file", "waive", "built", "list")),
+        ("held", ("add", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -7842,11 +7949,12 @@ def main() -> None:
             elif action == "list":
                 _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built", "withdrawn"), default=None)
                 _ = command.add_argument("--json", action="store_true")
-            elif action == "built":
+            elif action in ("built", "unbuilt"):
                 _ = command.add_argument("--id", dest="ids", action="append", required=True)
-                _ = command.add_argument("--commit", dest="merge", default=None)
-                _ = command.add_argument("--by", default=None)
-            else:
+                if action == "built":
+                    _ = command.add_argument("--commit", dest="merge", default=None)
+                _ = command.add_argument("--by", required=action == "unbuilt", default=None)
+            elif action != "recheck-merged":
                 _ = command.add_argument("--id", required=True)
                 if action == "file":
                     _ = command.add_argument("--proposal", required=True)
@@ -7860,16 +7968,16 @@ def main() -> None:
     args = parser.parse_args(namespace=LedgerArguments())
     if not args.repo:
         parser.error("--repo is required")
-    if args.command == "held" and args.action == "built":
+    if args.command == "held" and args.action in ("built", "unbuilt"):
         # A blank name is a prefix of every finding.
         if any(not name.strip() for name in args.ids):
-            parser.error("held built --id requires a finding id")
-        if args.merge is None and len(args.ids) > 1:
+            parser.error(f"held {args.action} --id requires a finding id")
+        if args.action == "built" and args.merge is None and len(args.ids) > 1:
             parser.error("held built takes more than one --id only with --commit")
-        if args.merge is None and args.by is not None:
+        if args.action == "built" and args.merge is None and args.by is not None:
             parser.error("held built --by requires --commit")
         if args.by is not None and not args.by.strip():
-            parser.error("held built --by requires a name")
+            parser.error(f"held {args.action} --by requires a name")
     if args.command == "ticket" and args.action == "checkpoint" and bool(args.session_dir) != bool(args.phase):
         parser.error("ticket checkpoint takes --session-dir and --phase together")
     try:
@@ -8002,6 +8110,13 @@ def main() -> None:
                         reading: PersonReading = ReadByPerson(args.by.strip()) if args.by is not None else NotReadByPerson()
                         for item in ledger.mark_built_at_merge(tuple(args.ids), args.merge, reading):
                             print(built_at_merge_line(item))
+                elif args.action == "unbuilt":
+                    person_reading = ReadByPerson(cast(str, args.by).strip())
+                    for finding_id in ledger.mark_unbuilt(tuple(args.ids), person_reading):
+                        print(f"unbuilt {finding_id}, read by {person_reading.by}")
+                elif args.action == "recheck-merged":
+                    for item in ledger.recheck_merged_findings():
+                        print(not_built_line(ledger.repo, item))
                 else:
                     findings = ledger.held_findings(HeldFindingsInState(args.state) if args.state else AllHeldFindings())
                     if args.json:

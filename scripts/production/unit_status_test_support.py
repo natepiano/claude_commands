@@ -1,7 +1,7 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
@@ -105,15 +105,14 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/agents").mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "agents/worker_lifecycle.py", root / "scripts/agents/worker_lifecycle.py")
         (root / "scripts/herdr").mkdir()
-        for name in ("herdr.py", "place.py", "pane_launch.py"):
+        for name in ("herdr.py", "herdr_types.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
-        (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
-            _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
+            _ = shutil.copy2(SCRIPT.parents[1] / "agents" / name, root / "scripts/agents" / name)
         _ = shutil.copytree(SCRIPT.parents[1] / "lib", root / "scripts/lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
         _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
-        for name in ("active", "sessions"):
+        for name in ("sessions",):
             (root / name).mkdir()
         _ = (root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
         _ = shutil.copytree(root, cls.fixture_seed)
@@ -146,13 +145,11 @@ class UnitStatusFixture(unittest.TestCase):
     ) -> tuple[tuple[str, ...], str | None, str]:
         with self.case_directory() as root, isolated_staff_file(root / "staff.json", environment := dict(os.environ)):
             script = root / "scripts/production/unit_status.sh"
-            active_dir = root / "active"
             call_log = root / "notifier_calls"
             records = root / "sessions"
             responses_file = root / "herdr-responses.json"
             environment.update({
                 "HOME": str(root),
-                "UNIT_ACTIVE_DIR": str(active_dir),
                 "UNIT_HISTORY_DIR": str(root / "history"),
                 "NOTIFIER_STATE_DIR": str(root / "notifier"),
                 "NOTIFIER_NOW_EPOCH": "20100",
@@ -203,8 +200,8 @@ class UnitStatusFixture(unittest.TestCase):
                     else:
                         member = unit_membership("example", unit)
                     session_id = member.id
-                    if marker is not None:
-                        _ = (active_dir / session_id).write_text(marker, encoding="utf-8")
+                    if marker:
+                        _ = staff.set_run(member.id, staff.OpenRun(Path(marker.strip())))
                     pids[unit] = self.live_pid()
                     record = SessionRecord(pid=pids[unit], sessionId=session_id, name=f"claude-{unit}",
                         messagingSocketPath=str(address), updatedAt=1,

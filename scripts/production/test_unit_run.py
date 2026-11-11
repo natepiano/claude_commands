@@ -1,7 +1,7 @@
 """Find a unit's review history through the command with disposable local and Mac roots."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os

@@ -43,11 +43,11 @@ from scripts.whoami.quota_alert import (RefusedAt, _refusal_window, blocked_next
                          TargetAccountUnavailable as TargetAccountUnavailable)
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory as inventory_module
+    from scripts.agents import inventory as inventory_module
     from scripts.herdr import herdr
     from scripts.message import sessions
 else:
-    inventory_module = import_module("scripts.shutdown.inventory")
+    inventory_module = import_module("scripts.agents.inventory")
     sessions = import_module('scripts.message.sessions')
     herdr = import_module("scripts.herdr.herdr")
 
@@ -413,11 +413,11 @@ class NewestExchange:
 
 @dataclass(frozen=True)
 class NoExchange:
-    """No readable user or assistant entry is present in the transcript."""
+    """The transcript has no readable exchange or turn start."""
 
 
 def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchange:
-    """Read the newest user or assistant turn, ignoring trailing bookkeeping."""
+    """Read the newest exchange or turn start and ignore later bookkeeping."""
     try:
         with path.open("rb") as source:
             position = source.seek(0, os.SEEK_END)
@@ -440,8 +440,9 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                         payload = entry.get("payload")
                         if isinstance(payload, dict):
                             message = cast(dict[str, object], payload)
-                            if (entry.get("type") == "event_msg" and message.get("type") in (
-                                    "user_message", "agent_message", "error") or
+                            if (entry.get("type") == "event_msg" and (message.get("type") in (
+                                    "user_message", "agent_message", "error", "task_started")
+                                    or message.get("type") == "task_complete" and isinstance(message.get("error"), dict)) or
                                     entry.get("type") == "response_item" and message.get("type") == "message"
                                     and message.get("role") in ("user", "assistant")):
                                 return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
@@ -484,9 +485,13 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str
             if not isinstance(payload_value, dict):
                 return NoSessionRefusal()
             payload = cast(dict[str, object], payload_value)
-            if payload.get("type") != "error":
+            error = payload.get("error")
+            if payload.get("type") == "task_complete" and isinstance(error, dict):
+                text = str(cast(dict[str, object], error).get("message", ""))
+            elif payload.get("type") == "error":
+                text = str(payload.get("message", ""))
+            else:
                 return NoSessionRefusal()
-            text = str(payload.get("message", ""))
             entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
         else:
             if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
@@ -716,7 +721,7 @@ def _set_transition(state: WatchState, session_id: str, entry_id: str, transitio
 
 def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered | ContinuationNotDelivered:
     # Shutdown imports this watcher for its hold and cancellation; resolve its delivery boundary at use.
-    messenger = cast(LiveSessionMessenger, cast(object, import_module("scripts.shutdown.restart_support")))
+    messenger = cast(LiveSessionMessenger, cast(object, import_module("scripts.agents.restart_support")))
     try:
         delivery = messenger.send_message(f"session:{session_id}", "Quota wait ended", "Continue where you stopped.",
             key=f"quota-continue-{session_id}-{entry_id}")

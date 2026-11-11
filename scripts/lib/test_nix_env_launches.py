@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
 from scripts.herdr import herdr, herdr_sessions
+from scripts.herdr import herdr_types
 from scripts.production import add_unit, add_showrunner
 from scripts.notify import review
 from scripts.notify.user_action import NoActionRequired
@@ -27,7 +28,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.production_doc import Production
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -105,7 +106,7 @@ class HerdrLaunchTests(NixFixture):
     def test_choke_point_keeps_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),
               patch.object(herdr, "open_tab", return_value="new-pane"),
-              patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start refused")),
+              patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start refused")),
               patch.object(herdr, "close_agent") as close):
             result = herdr.launch_agent("host", "space", "title", str(self.work), {}, "codex", [],
                                         herdr.NoOpeningPrompt(), 100, agent="fixture")
@@ -254,7 +255,7 @@ class ShellLaunchTests(NixFixture):
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
         _ = (self.scripts / "agents/models_config.sh").write_text(
             (ROOT / "scripts/agents/models_config.sh").read_text()
-            + "\nagents_resolve() { AGENT_FAMILY=claude; }\n"
+            + "\nagents_resolve() { AGENT_FAMILY=claude; AGENT_MODEL=fixture; }\n"
             + "agents_claude_args() { echo '--model fixture'; }\n")
         registry = write_registry(self.root / "models.conf")
         self.env.update(MODELS_CONFIG_FILE=str(registry), MODELS_CONFIG_PUBLISH="0", MODELS_CONFIG_TIER_ONLY="1")

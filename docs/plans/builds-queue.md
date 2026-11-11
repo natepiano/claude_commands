@@ -400,7 +400,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 - `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate_suites_admission.py` — the rerun
 - `docs/as-built/build-memory-admission.md`, `docs/as-built/merge-gate-and-test-speed.md` — the rerun rule
 
-**Binds later work:** a module that names `session_send_argv` installs `forbid_real_sender` in `setUpModule`, because `scripts/message/test_session_send.py` requires it.
+**Binds later work:** a module that names `session_send_argv` installs `forbid_real_sender` in `setUpModule`, because `scripts/message/test_session_send_sources.py` requires it.
 
 **Gotchas:** the installed `merge_gate.py` runs for every `--checkout` gate, so `suites:2` records keep arriving until this phase is installed. Stored `suites:2` records stay until removed.
 
@@ -703,6 +703,44 @@ After Phase 30, `build_targets.py` eligible, reserve and release-wait still use 
 ### Phase 35 — Cloud gates are work rows on /build:queue and the build page  · status: moved to report (11-08)
 
 The user approved aws-unit's design on 2026-11-08. Builds moved it to report, which starts after Phase 36 lands, because both edit memory_feed.py and memory_live.html.
+
+### Phase 40 — The admission client starts with only the wire format  · status: done
+
+**Depends on:** none.
+
+1. **The measurement (builds and natest, 2026-11-09).** One whole gate starts `scripts/build_queue/admission_client.py` 910 times, at 142 ms of CPU per start and 129 CPU seconds in all. `admission_protocol` and `admission_records` take 58 ms of its 87 ms warm import. Report: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/rank113/whole_gate_report.md`.
+2. **Fix.** The client path that a `verify.sh` run takes imports only the wire format. The target is about 60 ms less per start. Code that needs the record types, such as reading the queue view, imports them when it runs.
+3. **Unchanged.** The command line, the bytes on the socket, exit codes and printed text.
+4. **Measure.** CPU (user + system, children counted) and wall per start, 15 interleaved runs before and after, warm, on the same command.
+5. **Proof.** A test that the client path starts without loading the record types, and fails without the fix. The existing tests of the changed modules pass.
+6. **The feed restarts itself (builds and natedev, 2026-11-09).** `installed_code_version` in `memory_feed.py` hashes only the admission sources, so an install that changes the feed's own modules leaves the old feed running. The fingerprint now also covers each Python module the feed loaded under the install root, and each other file it reads once at start. An install that changes one of those files makes the feed exit, and systemd starts the new code. A listed file with a modification time after the feed's import started also makes the feed exit. A row in the existing fingerprint test proves it and fails without the fix.
+
+**Workers:** 2 writers and testers, one for the client and one for the feed. **Gate:** targeted test, basedpyright 0/0/0, adversary review, the measured times.
+**Change-Review:** none — verify runs start faster, and nothing visible changes.
+
+### Phase 39 — The build page shows step names from the config  · status: done
+
+1. **The defect (builds, 2026-11-09; change review C1285 returned).** The build page shows `merge-gate`, not `merge gate`. `scripts/build_queue/memory_feed.py` passes `RECORDED_STEP_NAMES`, an empty map, at five places: `step_text` for swap holds, held rows, running rows and waiters, and `names=` on the `QueueModel`.
+2. **Fix.** The feed calls `read_step_names()` once for each reading and uses that value at all five places. `RECORDED_STEP_NAMES` leaves `memory_feed.py`.
+3. **Unchanged.** Comparisons of `step.step` with raw step names keep the raw name. `/build:queue` already reads the config.
+4. **Hover note.** `progressTip` in `memory_live.html` tested the row name for `merge-gate`. A row name is shown text and can hold a project, so the ordering note now tests `progress.unit === "modules"`.
+5. **Proof.** A row in the existing feed test: a `merge-gate` step shows as `merge gate` in running and waiting rows. The test fails without the fix. The existing expected values that use `RECORDED_STEP_NAMES` change to the config names. Rows in the existing hover test: a `modules` row has the ordering note, and a row with another unit has none.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review, page proof.
+**Change-Review:** The build page shows "merge gate" | On natedev, run /build:page and open the link while a merge gate runs or waits | The row says "merge gate", with a space and no hyphen. | after restart
+
+### Phase 38 — AWS rows on the build page show a progress bar  · status: done
+
+1. **The ask (user, 2026-11-09).** "the word \"running\" is superfluous on the aws rows - if they are there they are running - i would only want to see issues if they are \"not running\" when they should be." The module count "should be small text underneath a progress update bar - similar to the progress update bars on local rows."
+2. **Bar.** A cloud row with a module counter draws the same progress track and line as a local row, in the testing color, in the same layout pass. The feed gives the cloud row the `progress` field that local rows have: `RowProgress` with phase `testing` and unit `modules`, or `NoProgress` with the counter's reason. The cloud counter's phase is `modules`, so `row_progress` does not map it as it stands.
+3. **Text.** Small text in the row's `.amounts` line, under the bar: the module count, then the failed-module count when it is above zero, then "no update for <age>" in the cap color when the row is late. The word "running" never shows. Another state (`requesting`, `setup`, `uploading`, `progress missing`, `progress unreadable`) shows first, because the row is not running. "modules unknown" never shows.
+4. **Waiting rows.** A cloud row that waits for a slot draws no bar. Its reason stays as the same small text.
+5. **Hover.** The row tip keeps the machine and reservation sentence, and it adds the local rows' progress line. A row with no text shows no stray period.
+6. **Not in this phase.** The `/build:queue` terminal table keeps its text. The user named the page.
+7. **Proof.** A row in `test_cloud_rows_share_the_feed_without_memory_reservations` for each state and for a row with no counter. `memory_page_proof.mjs` checks the bar width, the text under the bar and the absence of "running", and it writes a shot.
+
+**Workers:** 1 writer and tester. **Gate:** targeted test, basedpyright 0/0/0, adversary review, page proof.
+**Change-Review:** AWS rows show a progress bar | On natedev, run /build:page and open the link while a cloud gate runs | Each AWS row has a progress line with small text such as "443 of 702 modules" under it, and the word "running" is gone.
 
 ### Phase 37 — Build folders delete themselves when their process ends  · status: done
 
@@ -1041,7 +1079,7 @@ The builds showrunner asked (2026-10-31): merge `origin/builds` (a546fe66, the v
 
 **Binds later work:** the merge gate's sizing is the one `sizing=` argument of `gate_reservation` (The merge gate holds its whole memory cap in the admission queue). `queue_place` calls `memory_admit.check` and `release` directly and moves to the service client with the other callers (Every build, view and command uses the queue service).
 
-**Gotchas:** snapshot ancestry cannot hold a program family without a scope: a `setsid()` descendant orphaned between two samples escapes `ProgramTree`. A place that replaces the caller's signal handlers breaks the merge gate's stop (exit 143). Process-group signals in scripts and tests go through `scripts.lib.process_group.send_process_group`; `scripts/lib/test_process_group.py` checks every file.
+**Gotchas:** snapshot ancestry cannot hold a program family without a scope: a `setsid()` descendant orphaned between two samples escapes `ProgramTree`. A place that replaces the caller's signal handlers breaks the merge gate's stop (exit 143). Process-group signals in scripts and tests go through `scripts.lib.process_group.send_process_group`; `scripts/lib/test_process_group_sources.py` checks every file.
 
 **Ruled out:** a `PR_SET_CHILD_SUBREAPER` reaper wrapper for the unscoped path (it needs an ECHILD-confirmed completion message and a new Popen contract).
 
@@ -1182,7 +1220,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - `InheritedTemporaryParent` reads `TMPDIR` at allocation. `ExplicitBuildParent` preserves the supplied parent. `SystemTemporaryParent` selects `/tmp`. `UnitRunParent` uses `unit_runs.run_roots()`. The merge gate requires `/dev/shm` without a disk fallback.
 - `FOLDER_PREFIXES` defines build names. `MKDTEMP_SUFFIX_PATTERN` defines eight-character allocator suffixes. `temporary_build_folder(request: UniqueBuildFolder) -> Generator[Path]` uses standard-library cleanup and permission repair. Callers retain ownership records and cleanup order.
 - The CLI prints one path. Forms are `unique --kind KIND [--owner TEXT] [--parent PATH | --system-temp]` and `unique --prefix TEXT [--parent PATH | --system-temp]`. Stable forms are `stable --name NAME (--parent PATH | --unit-root)`, `stable --path PATH`, and `stable --run-temp RUN`. `run-temp-path RUN` only names the path.
-- `scratch.new()` and `scratch.target()` retain registration and task naming. `copy_record.root()` and `copy_record.copies_root()` retain root authority. `unit_runs.RUN_TEMP_NAME` names run temporary folders. `unit_runs.activate()` maintains current and former markers.
+- `scratch.new()` and `scratch.target()` retain registration and task naming. `copy_record.root()` and `copy_record.copies_root()` retain root authority. `unit_runs.RUN_TEMP_NAME` names run temporary folders. `staff.set_run()` stores the open run in the director's staff row.
 - `memory_admit.is_fresh_test()` reads `tmp_sweep.state_dir()` at use. `tmp_sweep.TARGET_DELETES_NAME` names the shared deletion record. Private sweep roots select private copies folders. Admission state and snapshots remain outside temporary build folders.
 
 **Files:**
@@ -1319,7 +1357,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 ### Phase 23 — Detached Python runs have their own group and count in Other  · status: todo
 
-**Depends on:** Phase 18 of the herdr worker-panes plan on GitHub builds. That phase renames `scripts/agents/mesh_runs.py` and its config. Source: user, 2026-11-06.
+**Depends on:** none. The detached runs live in `scripts/agents/detached_runs.py` and `config/detached_runs.conf`. Source: user, 2026-11-06.
 
 #### Work Order
 
@@ -1328,14 +1366,14 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Spec:**
 
 1. **User rulings.** "i think the workers detached python tests will almost never be that heavyh weight so it's good that they don't count against the build queue". "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc."
-2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the line that is `mesh_runs.py:647` today. The limits of `builds.slice` still hold it.
+2. **The group.** The detached run starts in `builds-detached.slice`, a child of `builds.slice`, at the `--slice=builds.slice` argument in `detached_runs.py`. The limits of `builds.slice` still hold it.
 3. **Reader.** The scope reader in `memory_admit.py` (line 2648 today) treats the child group as part of the one builds total, and it makes no row for that group. A reserved cargo step inside it counts once, as a build.
 4. **Page.** `memory_feed.py` makes no row for the group (line 419 today in the session prototype; `scripts/build_page/` after the build page moves). Its memory reads as Other.
 5. **Trace rule.** Remove only the rule that shows a detached process group as a run because its processes trace to a live run. Keep the service's registered run identity (`admission_service.py:910`), the held-run rows (`queue_view.py:272`) and the card that a person selects by owner (`queue_card.py:217`).
 6. **Proof.** Tests: a Python process in the group reads as Other and has no row; a reserved cargo descendant counts once; a cargo and a lint step inside a detached `verify.sh` ask the queue; a held run keeps its row.
 
 **Files:**
-- `scripts/agents/mesh_runs.py` — renamed by the herdr phase; use the new name.
+- `scripts/agents/detached_runs.py`
 - `scripts/lint/memory_admit.py`
 - `scripts/lint/test_memory_admit.py`
 - `scripts/build_queue/test_queue_view.py`
@@ -1366,7 +1404,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 ### Phase 23 — Detached Python runs show under Other  · status: todo
 
-**Depends on:** herdr-unit Phase 18, which renames `config/mesh_runs.conf` to `config/detached_runs.conf` (user-approved, 2026-11-06).
+**Depends on:** none. The config is `config/detached_runs.conf` (user-approved, 2026-11-06).
 
 1. **The ask (user, 2026-11-06).** "yes detached python tests should show under other along with the memory taken by all the agent sessions, browsers, editors, etc." The user approved the group name `builds-detached.slice`.
 2. **Outline.** Detached Python test runs start in `builds-detached.slice`, not `builds.slice`. They do not ask the queue (10v does not land). The memory page shows their memory in the Other group; `/build:queue` does not show them.
@@ -1386,21 +1424,65 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
 
-### Phase 10g — The queue decides where every step runs  · status: todo
-**Depends on:** verify-unit's Phase 27 hotfix on builds (the Work Order follows it), 10z and 10x (it changes the admission request and the queue service).
-**Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
+### Phase 10g — The queue records each placement and gives one launch permission  · status: done
 
-**Outline (the Work Order follows at phase start, after verify's Phase 27 hotfix lands):**
-1. A step's admission request carries its eligible hosts (natedev, the Mac, SSH slots) and each host's exclusion reason.
-2. The queue service places each step on the first host that is free for it, and decides again on every pass while the step waits (Mac free, Mac disk over the floor, slot free).
-3. `verify.sh` and the offload path run the step where the queue says; they make no host choice.
-4. `build_targets.py` eligibility, slot reserve and the spending-guard exclusion move behind the queue decision.
-5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
-6. Runs beside 10f where the file sets are disjoint.
-7. **Slots per host (architect review, 2026-11-05).** A local 10z slot cannot stand for memory kept on the Mac or an SSH target. Define placement, reservation and departure states per host. Tests: a move to another host releases the local claim, and a local claim is never reused on a remote host.
-8. **Machine column (Phase 24).** `/build:queue` (`queue_view.py`, `queue_card.py`) and the memory page feed read one `scripts.buildlog.store.host_name()` for every running row. When a step runs on another host, the service reply carries that host on its row, and both views show it in the Machine column. Tests: a running row placed on the Mac shows the Mac's name in the view, the card and the page.
-9. **Host-scoped run identity (architect review of 18, 2026-11-06).** Two hosts can give the same pid and start time; `running_builds()` groups runs by `run_owner(pid, start_time)` today. One named run identity carries the host through placement, sampling, grouping and release. Test: a mixed-host fixture with the same pid and start time on two hosts keeps two runs, with separate accounting and the right Machine labels.
-10. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
+#### As-built
+
+- `scripts/build_queue/placement.py` holds the placement types: `SubmittingOwner`, `SubmittingSession`, `PlacementConstraints`, `HostSelection`, `PlacementAssignment`, `AssignmentState`, `LaunchPermission`, `ProviderClaimReference`, `ExecutionIdentity`, `ExecutionEvidence`, `HostEvidence`, `HostEligibility`.
+- The admission service saves one `PlacementAssignment` per episode and attempt before it replies. The first valid consumption moves `PermissionAvailable` to `PermissionConsumed` durably, and only its first response authorizes execution. A repeated, unknown or closed consumption returns `DispatchStatus` only; ledger pruning never makes a new permission.
+- Version 3 wire messages carry placement. Version 1 and 2 requests decode as before and keep their reply shapes. No caller changes its route: `route_test`, `_cloud_pass` and every existing client keep their behavior.
+- `HostEvidenceReader` reads host evidence in the background, in the pattern of `OperatingSystemReader`. Evidence goes stale on the existing poll interval; no network call or waiting lock runs in the service loop.
+- Each Mac and SSH claim record carries `claim_id`, `episode`, `attempt` and `submitting_session`. Release, release-wait and adoption match that exact identity under the target lock, never the pid alone. `submitting_session` names the current owner: `take_over_kept_claim(..., session=)` sets it with `pid` and `proc_start`, and `holder_session` keeps the original job evidence. `adopt_wait_claim` requires strict session equality, exact identity and a live process start.
+- Hold and claim policy take `SubmittingSession` explicitly; cached eligibility keys include it. `wait_claim_identity` recovers the identity for the session that owns the claim now. `verify.sh` and `offload.py` carry that identity to release and adoption; `mac_run.sh` releases by the exact claim; `/build:mac` prints a manual claim's identity and its release takes `--claim-id`, `--episode` and `--attempt`.
+- Claim records, run.json and admission state are decoded strictly.
+
+**Files:**
+- `scripts/build_queue/placement.py` — placement types and decision records.
+- `scripts/build_queue/admission_wire.py`, `admission_protocol.py`, `admission_client.py` — version 3 messages, decoding and client calls.
+- `scripts/build_queue/admission_service.py`, `admission_records.py`, `admission_code.py` — assignments, consumption, background evidence, restart; `placement.py` in the service code paths.
+- `scripts/mac_test/claim_state.py`, `scripts/mac_test/mac_test.py` — exact claim identity, takeover session, strict adoption and release.
+- `scripts/build_targets/build_targets.py` — explicit session, `wait_claim_identity`, `cleanup_refused_claims(..., session=)`.
+- `scripts/mac_test/offload.py`, `scripts/direct/verify.sh` — identity hand-off (verify-unit owns both).
+- `scripts/production/mac_run.sh`, `commands/build/mac.md` — exact manual claim and release.
+- `scripts/build_queue/test_placement.py` and rows in the admission, claim, target and verify tests; `docs/as-built/build-memory-admission.md` — messages and records.
+
+**Binds later work:** the verify, merge-gate and view cutovers build on `PlacementAssignment`, the single launch permission, `HostEvidenceReader` and the exact claim identity. `submitting_session` is the current claim owner; `wait_claim_identity` replaces `owns_wait_claim`.
+
+**Gotchas:** a merge that changes a strictly decoded record is a deploy. Stop `build-admission.service` and `.socket`, `build-memory-feed.service` and the claim writers; run the conversion program (outside the repository) on admission state, `~/.local/state/mac-test` and `~/.local/state/build-targets/aws`; merge; then start. Live services restart on main at once.
+
+**Ruled out:** a cleanup-pending bypass of the adoption session check, because it let an unrelated session adopt a live claim.
+
+### Phase 44 — Every verify step runs where the queue places it  · status: todo
+**Depends on:** 10g. Checkpoint 2 of section 8 in `docs/plans/builds-queue-placement.md`. This phase first fixes the 14:04 disk-decline defect. verify-unit has the function list. The Work Order follows at phase start.
+
+**Constraints from 10g (architect review of 10g, 2026-11-10).** The Work Order settles each item below before work is divided.
+1. **Queue policy.** `_read_host_evidence` excludes the local and scaler providers, and `_placement_pass` orders requests without the priority rank. Integrate local admission, priority, continuation release and retry deadlines through the existing planner. Tests: competing waiters; a priority change; a remote-to-local retry that charges local memory once.
+2. **Coordinator and claim holder.** `admission_service.py:2149` requires the adopted claim owner to equal the assignment owner. Adoption today moves ownership from the verify pid to the offload pid. Add a semantic claim-holder identity, separate from the coordinator. Test: a real verify-to-offload handoff that keeps the coordinator death check.
+3. **Completion and retry.** `_handle_placement` keeps execution evidence in memory only, ignores `ExecutionReport.outcome` and never closes a consumed assignment. Define terminal reports, a safe replacement attempt, and rebuild from provider evidence after a restart. Keep unstarted execution separate from unavailable evidence. Tests: lost response, restart, pending-launch barrier, safe replacement. Phase 45 reuses this contract.
+4. **Claim ownership.** `submitting_session` names the current claim owner. A takeover changes it with `pid` and `proc_start`; `holder_session` keeps the original job evidence. Use `wait_claim_identity`, not `owns_wait_claim`. Exact release and the offload identity hand-off already exist. Keep the interrupted-publication and unrelated-session refusal tests.
+5. **Deploy.** Claim records, run.json and admission state are decoded strictly. A phase that changes one of them names in its Work Order: the writers to stop (`build-admission.service` and `.socket`, `build-memory-feed.service`, the claim writers), how restart is prevented, the conversion roots (`~/.local/state/mac-test`, `~/.local/state/build-targets/aws`, admission state), the interrupted-conversion check, and the stop, convert, merge, start order. The showrunner holds the merge until the conversion runs.
+6. **Views.** Converted paths show correct host accounting and the Machine label of the host that runs the step.
+
+### Phase 45 — Merge gates take their route from the queue  · status: todo
+**Depends on:** 44 and aws-unit's repair of the uncertain cloud launch. Checkpoint 3 of section 8 in `docs/plans/builds-queue-placement.md`. `merge_gate --tests-only` takes the same queue route as a full gate and keeps its exit codes. Tell the sdlc showrunner when this phase is on main. The Work Order follows at phase start.
+
+**Constraints from 10g (architect review of 10g, 2026-11-10).** aws-unit's repair is commit `0ab15ffc4` (on builds and main): it keeps `GateLaunchPending` after an uncertain launch and adds reconciliation tests. Build on it and keep its tests through the scaler cutover. Reuse Phase 44's completion and retry contract and its claim ownership and deploy constraints (Phase 44 items 3 to 5).
+
+### Phase 46 — Every view names the machine a step runs on, and the old route code is gone  · status: todo
+**Depends on:** 45. Checkpoint 4 of section 8 in `docs/plans/builds-queue-placement.md`. The Work Order follows at phase start. It switches the remaining readers first and deletes the old selectors only after their last caller switches. Phase 44 item 4 (claim ownership) applies.
+
+### Phase 43a — A gate copy at a new path rebuilds what holds its manifest path  · status: done
+
+#### As-built
+
+`copies.standing` restores the saved file time of each tracked file with an unchanged blob, except a file whose content names `CARGO_MANIFEST_DIR`. `copies.manifest_path_files(tree)` finds those files with one `git grep --no-color -l -z -F` in the checkout. Those files keep their write time from the new checkout, so Cargo rebuilds their crates and the dependents. Every other unchanged file keeps its saved time, so a same-commit gate stays a cache hit for the other crates. `standing` is the only path in `copies.py` that restores saved times.
+
+**Files:**
+- `scripts/copies/copies.py` — `manifest_path_files` and the restore rule in `standing`.
+- `scripts/copies/test_copies.py` — rows in the repeated-gate test, with forced Git color.
+- `docs/as-built/gate-checkouts.md` — the rule and its limit.
+
+**Gotchas:** Cargo does not track `CARGO_MANIFEST_DIR`, because Cargo sets it for rustc. A dependency macro that reads the variable at expansion, in a caller without that text, stays outside this rule.
 
 ### Phase 10p — The snapshot client accepts records from an older or a newer admission service  · status: done
 

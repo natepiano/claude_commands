@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import io
@@ -15,6 +15,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from contextlib import redirect_stderr
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
 from unittest import mock
 
@@ -101,10 +102,8 @@ class NightlyReviewTests(unittest.TestCase):
         _ = shutil.copyfile(nightly_review.__file__, copied)
         library = copied.parents[1] / "lib"
         library.mkdir()
-        _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib/process_failure.py",
-                            library / "process_failure.py")
-        _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib/package_root.py",
-                            library / "package_root.py")
+        for name in ("process_failure.py", "package_root.py", "transcripts.py"):
+            _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib" / name, library / name)
         whoami = copied.parents[1] / "whoami"
         whoami.mkdir()
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")
@@ -139,6 +138,8 @@ class NightlyReviewTests(unittest.TestCase):
               mock.patch.object(showrunners, "production_of", side_effect=production_of),
               mock.patch.object(account, "process_config_dir", side_effect=AssertionError("recorded account lost"))):
             self.assertEqual(nightly_review.showrunner_transcripts(since), sorted(paths))
+            compressed = [compressed_copy(path) for path in paths]
+            self.assertEqual(nightly_review.showrunner_transcripts(since), sorted(compressed))
 
     def test_transcripts_keep_the_showrunners_earlier_native_session_in_the_window(self) -> None:
         registry = self.root / "sessions"
@@ -222,6 +223,9 @@ class NightlyReviewTests(unittest.TestCase):
         records.append(nightly_review.NightlyVerdictRecord(time=(since - timedelta(seconds=1)).isoformat(),
             verdict="rewrite", failed_rules=["reader-starts-cold"]))
         path = self.root / "review.jsonl"
+        _ = path.write_text(json.dumps(records[0]) + "\n")
+        self.assertEqual(nightly_review.live_message_counts(path, since),
+                         nightly_review.LiveMessageCounts(1, 0, 0, ()))
         _ = path.write_text("\n".join(json.dumps(record) for record in records) + '\n{"time":{},"verdict":"ask"}\n')
         self.assertEqual(nightly_review.live_message_counts(path, since),
                          nightly_review.LiveMessageCounts(4, 2, 1, (("reader-starts-cold", 2),)))

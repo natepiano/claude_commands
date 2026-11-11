@@ -39,7 +39,7 @@ from scripts.production.production_doc import Production, ProductionDocument, Re
 
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import merge_gate, production_doc, session_staff, staff, unit_config, unit_lookup, unit_names  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
@@ -65,6 +65,11 @@ class PushedTip(NamedTuple):
 
 class NotYetPushed(NamedTuple):
     pass
+
+
+class CheckpointOrigin(NamedTuple):
+    branch: str
+    already_merged: bool
 
 
 class PromotionAlreadyAtTip(NamedTuple):
@@ -390,7 +395,7 @@ def on_origin(request: MergeRequest) -> str | None:
     return None
 
 
-def ancestry(request: MergeRequest) -> bool:
+def ancestry(request: MergeRequest) -> CheckpointOrigin:
     checkout = request.production.checkout
     origin_branch = on_origin(request)
     if origin_branch is None:
@@ -409,7 +414,72 @@ def ancestry(request: MergeRequest) -> bool:
                        "wait for the phase code checkpoint to merge, then resend the shrink")
     checkpoint_gate.report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
            ("; already merged" if already else ""))
-    return already
+    return CheckpointOrigin(origin_branch.removeprefix("origin/"), already)
+
+
+def branch_is_landed(checkout: Path, tip: str, target: str) -> bool:
+    """Accept an ancestor or commits with equal patches on the target."""
+    ancestor = git(checkout, "merge-base", "--is-ancestor", tip, target)
+    if ancestor.returncode == 0:
+        return True
+    if ancestor.returncode != 1:
+        _ = good(ancestor, "branch")
+    patches = good(git(checkout, "cherry", target, tip), "branch")
+    return all(line.startswith("- ") for line in patches.splitlines())
+
+
+def branch_keep_reason(request: MergeRequest, branch: str) -> str:
+    """Keep main, production merge branches, and branches with a present owner."""
+    if branch == "main":
+        return "main is long-lived"
+    if branch == request.production.merge_branch:
+        return "the production merge branch is long-lived"
+    record = request.staff_record if request.staff_record is not None else staff.snapshot()
+    resolver = session_staff.RowResolver(record)
+    for row in record.rows:
+        if isinstance(row.worktree, staff.PresentWorktree):
+            owner_branch = resolver.unit_branch(row)
+            if not isinstance(owner_branch, session_staff.Branch):
+                return f"{row.name}: owner branch is unreadable"
+            if owner_branch.name == branch:
+                return f"{row.name} has a present worktree on this branch"
+        if row.kind == "showrunner" and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            doc = resolver.production_doc(row)
+            if not isinstance(doc, session_staff.ProductionDoc):
+                return f"{row.name}: {doc.reason}"
+            if production_field(doc.text.splitlines(), "Merge branch") == branch:
+                return f"{row.name} uses this production merge branch"
+    return ""
+
+
+def delete_landed_branch(request: MergeRequest, branch: str, tip: str) -> None:
+    """Delete only this request's unowned origin branch after main receives the merge."""
+    if isinstance(request.promotion, production_doc.NoPromotion):
+        return
+    try:
+        if reason := branch_keep_reason(request, branch):
+            checkpoint_gate.report("branch", "kept", f"origin/{branch}: {reason}")
+            return
+        checkout = request.production.checkout
+        ref = f"refs/remotes/origin/{branch}"
+        _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main",
+                     f"+refs/heads/{branch}:{ref}"), "branch")
+        if git(checkout, "merge-base", "--is-ancestor", tip, "origin/main").returncode:
+            checkpoint_gate.report("branch", "kept", f"origin/{branch}: this merge has not reached main")
+            return
+        branch_tip = good(git(checkout, "rev-parse", ref), "branch")
+        if not branch_is_landed(checkout, branch_tip, "origin/main"):
+            checkpoint_gate.report("branch", "kept", f"origin/{branch}: work has not reached main")
+            return
+        deleted = git(checkout, "push", f"--force-with-lease=refs/heads/{branch}:{branch_tip}",
+                      "origin", "--delete", branch)
+        if deleted.returncode:
+            checkpoint_gate.report("branch", "kept",
+                                   f"origin/{branch}: delete failed or branch moved; {failure_detail(deleted)}".replace("\n", "; "))
+        else:
+            checkpoint_gate.report("branch", "deleted", f"origin/{branch}")
+    except (checkpoint_gate.Stop, OSError, ValueError, Refusal, staff.StaffRefused) as error:
+        checkpoint_gate.report("branch", "kept", f"origin/{branch}: {error}".replace("\n", "; "))
 
 
 def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
@@ -1130,7 +1200,8 @@ def run(request: MergeRequest) -> int:
             raise checkpoint_gate.Stop("ancestry", "failed", f"commit {request.commit} is absent",
                        "push the checkpoint and send its hash again")
         request = request._replace(commit=checkpoint.stdout.strip())
-        already = ancestry(request)
+        origin = ancestry(request)
+        already = origin.already_merged
         tests_green = ("gate after push" if request.bump else
                        "merge tests" if isinstance(request.kind, CodeCheckpoint) else "no tests")
         pushed = pushed_state(request.production, request.commit) if already else NotYetPushed()
@@ -1224,6 +1295,7 @@ def run(request: MergeRequest) -> int:
                             start_gate(request, paths, merge_head, tip)
                         gate_lock.close()
                         promote(request, tip, local_only=True)
+                        delete_landed_branch(request, origin.branch, tip)
             finally:
                 if tip:
                     if request.bump:

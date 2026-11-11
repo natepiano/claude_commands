@@ -102,7 +102,7 @@ class UnitEffortTests(unittest.TestCase):
         ]
         identities = {unit.session: unit.marks["CODEX_THREAD_ID"] for unit in units
                       if "CODEX_THREAD_ID" in unit.marks}
-        notes = fixture_member("agent", name="notes", runtime_id=fixture_runtime_id("notes"))
+        notes = fixture_member("producer", name="notes", runtime_id=fixture_runtime_id("notes"))
         identities["notes"] = notes.current_session
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
@@ -166,13 +166,33 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(self.sent(), [])
 
     def test_every_productions_directors_get_effort_and_the_row_keeps_its_model(self) -> None:
-        code, out, _ = self.run_main("high")
-        self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[-1], "registry: production.director is now opus:high (was opus:xhigh)")
-        self.assertIn("widget: skipped — a draft is in its input line", out)
-        self.assertEqual(self.sent(), [["--session", "review", "agent", "prompt", "w1:p1", "/effort high"],
-                                       ["--session", "trunk", "agent", "prompt", "w3:p1", "/effort high"]])
-        self.assertEqual(self.director_row(), "director=opus:high")
+        config = self.root / "claude-config"
+        catalog = config / "cache/model-catalog/fixture-cc.json"
+        catalog.parent.mkdir(parents=True)
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        binary = binaries / "claude"
+        _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
+        binary.chmod(0o755)
+        for model in ("opus", "claude-opus-fixture"):
+            with self.subTest(model=model), mock.patch.dict(os.environ, {
+                "CLAUDE_CONFIG_DIR": str(config), "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+            }):
+                _ = write_registry(self.registry, {"production.claude": {"director": "opus:xhigh"}}, update=True)
+                if model != "opus":
+                    _ = catalog.write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+                        "provider_alias_targets": {"opus": {"default": model}},
+                        "models": [{"id": model, "min_claude_code_version": "2.1.319"}],
+                    }}}))
+                (self.root / "herdr.log").unlink(missing_ok=True)
+                code, out, _ = self.run_main("high")
+                self.assertEqual(code, 0)
+                self.assertEqual(out.splitlines()[-1],
+                                 "registry: production.director is now opus:high (was opus:xhigh)")
+                self.assertIn("widget: skipped — a draft is in its input line", out)
+                self.assertEqual(self.sent(), [["--session", "review", "agent", "prompt", "w1:p1", "/effort high"],
+                                               ["--session", "trunk", "agent", "prompt", "w3:p1", "/effort high"]])
+                self.assertEqual(self.director_row(), "director=opus:high")
 
     def test_a_level_the_model_does_not_take_is_refused_before_anything_happens(self) -> None:
         code, _, err = self.run_main("extreme")

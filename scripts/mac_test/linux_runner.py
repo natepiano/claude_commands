@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
 from types import FrameType
 import uuid
 
+from scripts.mac_test.abandoned_sessions import removal_script
+
 if TYPE_CHECKING:
     from scripts.copies import copies
     from scripts.lib import build_folders
@@ -801,6 +803,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         '  exit 75',
         'fi',
     ])
+    abandoned_sessions = (removal_script(shlex.quote(str(target)), int(values['abandoned_session_minutes'])) + '\n'
+                          if target == (mirror / 'target').resolve() else '')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
@@ -812,6 +816,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                     + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
                     + f'printf \'%s\' "${{RUSTUP_TOOLCHAIN-}}" > {shlex.quote(str(toolchain_environment))} || exit 75\n'
                     + '\n'.join(parity) + '\n'
+                    + abandoned_sessions
                     + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
                     + f'export {assignments}\n'
                     + f': > {shlex.quote(str(started))} || exit 75\n'

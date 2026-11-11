@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from typing import cast
 
 from scripts.buildlog import health
@@ -146,7 +147,7 @@ def launch_record(
             return LaunchOutcome.NO_RESULT
     except (ValueError, OverflowError):
         return LaunchOutcome.NO_RESULT
-    session = line.get("sessionId") or line.get("session_id") or transcript.stem
+    session = line.get("sessionId") or line.get("session_id") or uncompressed_path(transcript).stem
     if not isinstance(session, str):
         return LaunchOutcome.NO_RESULT
     location = path if isinstance(path, str) and path else directory
@@ -190,7 +191,7 @@ def save_launch(record_data: dict[str, object]) -> bool:
 def collect_file(
     path: Path, known: dict[str, object], recorded_ids: set[str], no_location_ids: set[str]
 ) -> tuple[dict[str, object], Counter[LaunchOutcome], int, int]:
-    with path.open("rb") as handle:
+    with open_transcript(path) as handle:
         size = os.fstat(handle.fileno()).st_size
         head = handle.read(min(size, MARK_BYTES)).hex()
         backfill = bool(known) and known.get("reread_complete") is not True
@@ -283,8 +284,8 @@ def collect() -> LaunchCounts:
         counts: Counter[LaunchOutcome] = Counter()
         recorded_ids: set[str] = set()
         no_location_ids: set[str] = set()
-        for path in sorted(transcripts_root().glob("*/*.jsonl")):
-            key = str(path)
+        for path in transcript_paths(transcripts_root(), "*/*.jsonl"):
+            key = str(uncompressed_path(path))
             prior = state.get(key)
             known = cast(dict[str, object], prior) if isinstance(prior, dict) else {}
             try:

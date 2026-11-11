@@ -6,10 +6,12 @@ import fcntl
 import json
 import os
 import subprocess
+import shutil
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import datetime, timedelta
+from typing import cast
 from unittest import mock
 
 from scripts.whoami import quota_alert_test_support as support
@@ -470,13 +472,15 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
 
     def test_old_workers_requests_share_one_role_read_per_pass(self) -> None:
         stamp = self.now.isoformat()
+        head = next_moves.add_next_move("workers", 1, "codex1")
         for index in range(3):
             moves.append_move(moves.RequestedMove(kind="requested", at=stamp, tool="codex", subject="workers",
                 move_id=f"old-{index}", cause="auto", why=f"auto: entry-{index}",
                 **{"from": "codex2", "to": "codex3"}, window="weekly"))
-        with mock.patch.object(role_map, "read_role_map", wraps=role_map.read_role_map) as read_role:
+        with mock.patch.object(accounts, "read_role_map", wraps=accounts.read_role_map) as read_role:
             _ = quota_alert.run_workers_next_moves(self.readings(self.now), self.now)
         self.assertEqual(read_role.call_count, 1)
+        self.assertEqual(next_moves.read_next_moves(), (head,))
 
     def test_stopped_claude_switch_recovers_fallback_and_journals_once(self) -> None:
         class Killed(BaseException):
@@ -572,33 +576,76 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
         class Killed(BaseException):
             pass
 
-        head = next_moves.add_next_move("workers", 1, "codex3")
-        readings = self.readings(self.now, left=1, spare_accounts=((3, 80, "0"),))
-        with mock.patch.object(accounts, "swap", side_effect=Killed()):
-            with self.assertRaises(Killed):
-                _ = quota_alert.run_workers_next_moves(readings, self.now)
-        requested = [row for row in moves.read_moves() if row["kind"] == "requested"]
-        self.assertEqual(len(requested), 1)
-        original_move_id = requested[0]["move_id"]
-        self.assertEqual(role_map.read_role_map().workers, "codex1")
-        self.assertEqual(next_moves.read_next_moves(), (head,))
+        for stopped_at in ("before role", "after role", "unit start", "historical target"):
+            with self.subTest(stopped_at=stopped_at):
+                role_map.write_role_map(role_map.RoleMapChange("workers", "codex1", "fixture reset", self.now.isoformat()))
+                head = next_moves.add_next_move("workers", 1, "codex3")
+                readings = self.readings(self.now, left=1, spare_accounts=((3, 80, "0"),))
+                report = Report("Codex", quotas=[Quota("Weekly", 20, self.now + timedelta(days=2))], credit_balance="0")
+                unit_can_start = stopped_at != "unit start"
+                commands: list[list[str]] = []
 
-        def swap_after_request(group: str, target: str, *, why: str, cause: str) -> list[str]:
-            self.assertEqual(next_moves.read_next_moves(), (head,))
-            self.assertEqual((group, target, why, cause), ("workers", "codex3", f"auto: {head.id}", "auto"))
-            accounts.set_role("workers", target)
-            return []
+                def start(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    self.assertIn(command[0], ("systemctl", "systemd-run"))
+                    commands.append(command)
+                    code = 1 if command[0] == "systemctl" or not unit_can_start else 0
+                    return subprocess.CompletedProcess(command, code, "", "fixture unit start failed" if code else "")
 
-        with mock.patch.object(accounts, "swap", side_effect=swap_after_request) as swap:
-            returned = quota_alert.run_workers_next_moves(readings, self.now + timedelta(seconds=1))
-        swap.assert_called_once()
-        self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex3", self.root / ".codex3"))
-        self.assertEqual(role_map.read_role_map().workers, "codex3")
-        self.assertEqual(next_moves.read_next_moves(), ())
-        requested = [row for row in moves.read_moves() if row["kind"] == "requested"]
-        self.assertEqual({row["move_id"] for row in requested}, {original_move_id})
-        with mock.patch.object(accounts, "swap", side_effect=AssertionError("finished move repeated")):
-            _ = quota_alert.run_workers_next_moves(returned, self.now + timedelta(seconds=2))
+                with (mock.patch.object(accounts, "swap", wraps=support.REAL_SWAP),
+                      mock.patch.object(accounts, "_codex_live", return_value=report),
+                      mock.patch.object(accounts, "_launch_worker_moves", wraps=support.REAL_LAUNCH_WORKER_MOVES) as launch,
+                      mock.patch.object(shutil, "which", return_value="/fixture/systemd-run"),
+                      mock.patch.object(subprocess, "run", side_effect=start),
+                      mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process"))):
+                    if stopped_at == "unit start":
+                        _ = quota_alert.run_workers_next_moves(readings, self.now)
+                        self.assertEqual([command[0] for command in commands], ["systemctl", "systemd-run"])
+                    else:
+                        boundary = "swap" if stopped_at == "before role" else "_launch_worker_moves"
+                        with mock.patch.object(accounts, boundary, side_effect=Killed()):
+                            with self.assertRaises(Killed):
+                                _ = quota_alert.run_workers_next_moves(readings, self.now)
+                    requested = [row for row in moves.read_moves() if row["kind"] == "requested"
+                                 and row["why"] == f"auto: {head.id}"]
+                    self.assertEqual(len(requested), 1)
+                    original_move_id = requested[0]["move_id"]
+                    if stopped_at == "historical target":
+                        configuration = accounts.accounts_config_file()
+                        saved = cast(dict[str, object], json.loads(configuration.read_text()))
+                        saved["home_cutovers"] = [{"at": (self.now + timedelta(days=1)).isoformat(),
+                                                   "label": "codex3", "login": "historical@example.invalid"}]
+                        _ = configuration.write_text(json.dumps(saved))
+                        path = moves.store_file()
+                        rows = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+                        for row in rows:
+                            if row["kind"] == "requested" and row["move_id"] == original_move_id:
+                                row["to"] = "~/.codex"
+                        _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                    self.assertEqual(role_map.read_role_map().workers, "codex1" if stopped_at == "before role" else "codex3")
+                    self.assertEqual(next_moves.read_next_moves(), (head,))
+                    self.assertEqual([row for row in moves.read_moves() if row["move_id"] == original_move_id], requested)
+                    unit_can_start = True
+                    commands.clear()
+                    launch.reset_mock()
+                    _ = quota_alert.run_workers_next_moves(readings, self.now + timedelta(seconds=1))
+                    launch.assert_called_once_with("codex3", f"auto: {head.id}")
+                    self.assertEqual([command[0] for command in commands], ["systemctl", "systemd-run"])
+                    self.assertEqual(role_map.read_role_map().workers, "codex3")
+                    self.assertEqual(next_moves.read_next_moves(), (head,))
+                    self.assertEqual([row for row in moves.read_moves() if row["move_id"] == original_move_id], requested)
+                    moved = accounts.move_workers("codex3", follow_role=True)
+                    self.assertIsInstance(moved, accounts.GroupMoveStarted)
+                    confirmed = [row for row in moves.read_moves() if row["kind"] == "confirmed"
+                                 and row["move_id"] == original_move_id]
+                    self.assertEqual(len(confirmed), 1)
+                    with mock.patch.object(accounts, "swap", side_effect=AssertionError("finished move repeated")):
+                        _ = quota_alert.run_workers_next_moves(readings, self.now + timedelta(seconds=2))
+                        _ = quota_alert.run_workers_next_moves(readings, self.now + timedelta(seconds=3))
+                    self.assertEqual(next_moves.read_next_moves(), ())
+                    requested = [row for row in moves.read_moves() if row["kind"] == "requested"
+                                 and row["why"] == f"auto: {head.id}"]
+                    self.assertEqual({row["move_id"] for row in requested}, {original_move_id})
 
 
 if __name__ == "__main__":

@@ -1,39 +1,32 @@
 ---
 description: Add and start a production unit.
-argument-hint: '<name> (--plan <path> | --brief "<goal>" | --standby | --permanent) [--port <n>] [--responsibility <name>]'
+argument-hint: "<name>"
 ---
 
-# Add unit
+**Usage:** `/showrunner:add_unit <name>`
 
-Run this in the showrunner session for a running production. Give exactly one
-of `--plan`, `--brief`, `--standby`, and `--permanent`. `--brief` is the user's goal in their own words; pass
-it without rewriting it. `--permanent` is a standby unit that wrap never retires (the
-nightly review).
-
-Run:
+Run this command from the parent showrunner:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_unit.py" --production <showrunner name> <arguments>
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_unit.py" --production <parent> <name>
 ```
 
-Show the script's output. If it exits nonzero, show its message and stop.
-New launches print `<unit> started: herdr session attach agents, workspace <space>, tab <name>`;
-restores print `<unit> restore launched: ` and the same place. Every unit is a tab of the one
-herdr session, `agents`.
-The unit uses its staff name without an added suffix.
-The launcher adopts an existing live staff row. It keeps the saved `.unit.toml` responsibilities and the port when omitted.
-A retired name stays reserved: resume the unit or remove it for good before reusing the name.
-Repeat `--responsibility <name>` for short duty names in a new configuration.
+Pass the current production name with `--production`.
+The plan comes from the unit's saved configuration or its row in the production document.
+A missing default reports its source paths.
+Optional `--plan`, `--brief`, `--standby`, or `--permanent` selects the launch mode.
+Pass brief text without rewriting it.
+A permanent unit remains after wrap.
+Hana units receive the lowest free BRP port in the configured unit range when no port is recorded.
+Optional `--port` overrides the default for a new configuration.
+Repeat `--responsibility <name>` for short duty names.
+The launcher preserves an existing configuration and refuses conflicting values.
+Every unit uses a tab in the shared `agents` session.
 Admission writes the worktree to the staff row.
-It writes the plan, port and responsibilities to untracked `.unit.toml`.
-`--resume` keeps that file.
-Add `--check` to run preflight without launching or writing anything.
-An untrusted session folder refuses before any stub, staff row, or worktree is
-written. Show the refusal's `Run:` command; the user runs it on the launch
-account (in the main checkout for a new worktree), accepts the trust prompt,
-types `/exit`, then retries this command.
-The unit director launch takes its model and effort from `/default_models production.director`.
-For a standby unit, send its work when assigned and set `plan` in its `.unit.toml`
-to the plan path. Nothing else marks the unit as working: it
-reads as running from the moment it starts its `/unit:direct` run, and the
-stall watch watches it from then.
+It writes the plan, port, and responsibilities to untracked `.unit.toml`.
+The director profile comes from `/default_models production.director`.
+Use `--resume` with `--cwd` to restore a stopped conversation.
+Use `--check` to inspect the request without writes or launch.
+For a trust refusal, show its `Run:` command.
+The user runs that command on the launch account before a retry.
+Show the script's output and any refusal.

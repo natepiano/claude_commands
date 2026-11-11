@@ -45,7 +45,7 @@ from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
 from scripts.production import change_routing, session_staff, showrunner_tree, staff, unit_config, unit_lookup
 from scripts.production.production_doc import Refusal, production_field
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
@@ -1052,16 +1052,6 @@ class PublicationChange:
     unit_name: str
 
 
-def producer_for(source: UnitSource, record: staff.StaffSnapshot, machine: str) -> staff.StaffId | UnknownProducer:
-    """Use the fixed producer from the shared member join on this machine."""
-    if isinstance(source.producer, UnknownProducer):
-        return UnknownProducer()
-    member = record.by_id(source.producer)
-    if member is None or member.kind != "unit" or isinstance(member.worktree, staff.WorktreeUnfilled):
-        return UnknownProducer()
-    return member.id if member.worktree.machine == machine else UnknownProducer()
-
-
 def producer_at(directory: Path, record: staff.StaffSnapshot) -> staff.StaffId | UnknownProducer:
     """Read the fixed id of the unit that owns the requested directory."""
     machine = remote.local_machine()
@@ -1094,7 +1084,9 @@ def checkpoint_producers(record: staff.StaffSnapshot) -> dict[str, tuple[staff.S
         if isinstance(owner, str) and owner:
             producer: staff.StaffId | UnknownProducer = staff.StaffId(owner)
         else:
-            unit = record.unit_by_worktree(remote.local_machine(), Path(str(event.get("working_dir", ""))))
+            owner_row = unit_runs.run_owner(event, record)
+            unit = (owner_row if isinstance(owner_row, staff.StaffRow) and owner_row.kind == "unit"
+                    else record.unit_by_worktree(remote.local_machine(), Path(str(event.get("working_dir", "")))))
             producer = unit.id if unit is not None else UNKNOWN_PRODUCER
         recorded[checkpoint] = producer, str(event.get("unit", ""))
     return recorded
@@ -1111,11 +1103,11 @@ def publication_changes(commits: list[Commit], production: Path, *,
     sources: dict[staff.StaffId, UnitSource] = {}
     for member in record.find(kind="unit"):
         tree = member.worktree
-        if isinstance(tree, staff.WorktreeUnfilled) or tree.machine != machine:
-            continue
         owner = record.parent_of(member)
-        doc = owner.doc.path if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else production
-        sources[member.id] = UnitSource(doc, tree.path if isinstance(tree, staff.PresentWorktree) else MissingUnitWorktree(),
+        doc = (owner.doc.path if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+               and owner.doc.machine == machine else production)
+        sources[member.id] = UnitSource(doc, tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
+                                       else MissingUnitWorktree(),
                                        member.name, member.id)
     changes: list[PublicationChange] = []
     for commit, item in _checkpoint_entries(commits):
@@ -1123,9 +1115,8 @@ def publication_changes(commits: list[Commit], production: Path, *,
         if isinstance(identity, UnknownProducer):
             identity = known_producer
         source = sources.get(identity) if isinstance(identity, str) else None
-        producer = producer_for(source, record, machine) if source is not None else UNKNOWN_PRODUCER
         name = source.name if source is not None else name
-        changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), producer, commit.sha, name))
+        changes.append(PublicationChange(item, source if source is not None else UnresolvedSource(), identity, commit.sha, name))
     return changes
 
 
@@ -1644,8 +1635,13 @@ def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list
             if _git(repo, "rev-parse", ref).strip() != merge:
                 excluded.add(ref)
             continue
-        descendants = {merge, *(commit[0] for commit in path)}
-        excluded.update(parent for commit in path for parent in commit[1:] if parent not in descendants)
+        ancestry = {commit[0]: commit[1:] for commit in path}
+        current = path[0][0]
+        while current in ancestry:
+            parent = ancestry[current][0]
+            if parent != merge and parent not in ancestry:
+                excluded.add(parent)
+            current = parent
     return sorted(excluded)
 
 
@@ -1717,6 +1713,17 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             for checkpoint in _git(repo, "rev-list", parents[1], f"^{parents[0]}", "--").splitlines():
                 if checkpoint not in producers or isinstance(producers[checkpoint][0], UnknownProducer):
                     producers[checkpoint] = inner_producer, ""
+        if isinstance(producer, UnknownProducer):
+            checkpoint = next(iter(ancestry), "")
+            checkpoint_owner: tuple[staff.StaffId | UnknownProducer, str] = (UNKNOWN_PRODUCER, "")
+            while checkpoint in ancestry:
+                owner = recorded.get(checkpoint, (UNKNOWN_PRODUCER, ""))
+                if not isinstance(owner[0], UnknownProducer):
+                    checkpoint_owner = owner
+                if checkpoint not in producers:
+                    producers[checkpoint] = checkpoint_owner
+                parents = ancestry[checkpoint]
+                checkpoint = parents[0] if parents else ""
         for change in publication_changes(commits, production, record=record, known_producer=producer,
                                           recorded_producers=producers):
             readiness = change.item.readiness

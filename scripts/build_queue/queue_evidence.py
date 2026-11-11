@@ -115,9 +115,8 @@ def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnav
         if missing:
             calculation += f": swap-backed use unavailable for {missing}"
         calculation += f"; free {gib(room.available)}"
-    ci = f" (CI keep-aside {gib(room.ci_keep_aside.bytes)})" if room.ci_keep_aside.bytes > 0 else ""
     text = (f"{calculation} "
-            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}{ci}; room {gib(room.room)}")
+            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}; room {gib(room.room)}")
     if room.shortfall:
         text += f"; shortfall {gib(room.shortfall)}"
     return text
@@ -220,9 +219,7 @@ def running_text(running: admission_records.ExplainedRunningStep, explanation: a
     memory = running.step.measured
     if isinstance(memory, admission_records.CompilerServiceMemory) or (
             isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
-        ci = explanation.room.ci_keep_aside.bytes if isinstance(explanation.room, admission_records.MemoryRoom) else 0
-        extra = f"; CI keep-aside {gib(ci)}" if ci and isinstance(memory, admission_records.UnownedSliceMemory) else ""
-        return service_text(memory, explanation.now) + extra
+        return service_text(memory, explanation.now)
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at
     started = ("admission time unknown" if isinstance(admitted, admission_records.AdmissionTimeNotRecorded) else

@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, Typed
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import operation_deadline
+from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -62,8 +62,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
-
-NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS, HerdrFailure, HerdrMissing
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
@@ -146,20 +145,8 @@ def _platform() -> str:
     return os.environ.get("HERDR_PLATFORM", _PLATFORM)
 
 
-class HerdrFailure(Exception):
-    """An external command failure or malformed herdr response."""
-
-    def __init__(self, message: str, code: str = "") -> None:
-        super().__init__(message)
-        self.code: str = code
-
-
 class NativeRegistryUnavailable(ValueError):
     """The process has no native registry identity."""
-
-
-class HerdrMissing(HerdrFailure):
-    """No herdr binary is available."""
 
 
 class _DarwinProcessGone(HerdrFailure):
@@ -1648,6 +1635,25 @@ class Herdr:
                 return NewTab(space["name"], title)
         return NewTab(fallback_workspace, title)
 
+    def producer_row_tab(self, row_id: str, title: str, workspace: str) -> NewTab | ExistingPane:
+        """Reuse a producer's shell only in its own tab in the configured workspace."""
+        destination = self.saved_row_tab(row_id, title, workspace)
+        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, title, workspace):
+            return destination
+        return NewTab(workspace, title)
+
+    def producer_pane(self, pane_id: str, title: str, workspace: str) -> bool:
+        """Check that the producer has one shell in its named tab and configured workspace."""
+        panes = self.listed("pane")
+        own = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
+        if own is None or not isinstance(self.pane_activity(pane_id), PaneAtShell):
+            return False
+        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == own.get("tab_id")), None)
+        return (tab is not None and tab.get("label") == title
+                and sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) == 1
+                and any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
+                        for space in self.listed("workspace")))
+
     def _retitle(self, row: dict[str, object], title: str, *, tab: bool) -> bool:
         changed = row.get("label") != title
         if changed:
@@ -1977,6 +1983,37 @@ class Herdr:
                 except HerdrFailure as error:
                     print(f"herdr {self.session}: workspace {candidate.workspace_id} retained: {error}", file=sys.stderr)
 
+    def producer_admission_launch(self, pane: str, kind: Literal["claude", "codex"]) -> pane_launch.PaneLaunch:
+        """Read the native identity and launch evidence before producer admission."""
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
+                           "producer process info")
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane):
+            raise HerdrFailure("producer pane is unavailable")
+        observed = pane_native_process(info, kind, row)
+        processes = [json_object(value, "producer process")
+                     for value in json_items(info.get("foreground_processes"), "producer processes")
+                     if _is_agent_process(_foreground_arguments(json_object(value, "producer process")), kind)]
+        if len(processes) != 1:
+            raise HerdrFailure("producer has no unique foreground process")
+        process = processes[0]
+        pid = process.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise HerdrFailure("producer has no process id")
+        folder = json_text(process.get("cwd"), "producer folder")
+        if (not Path(folder).is_absolute() or observed.environment.get("HERDR_PANE_ID") != pane
+                or observed.environment.get("HERDR_SESSION", "default") != self.session):
+            raise HerdrFailure("producer process does not match its pane")
+        entry = pane_launch.launch(pane, observed.current_identity, folder, observed.environment,
+                                   _foreground_arguments(process), kind=kind)
+        entry["config_dir"] = observed.environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR") or str(
+            Path.home() / (".codex" if kind == "codex" else ".claude"))
+        entry.update(pid=pid, proc_start=observed.started)
+        current = self.native_pane_process(pane, kind, PROGRAM_TIMEOUT_SECONDS, pane_row=row)
+        if current != observed:
+            raise HerdrFailure("producer process changed before admission")
+        return entry
+
     def codex_launch(self, pane: str, arguments: Sequence[str] = ()) -> pane_launch.PaneLaunch:
         """Read one Codex launch from its exact foreground process."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
@@ -2048,7 +2085,8 @@ class Herdr:
             try:
                 entry = self.codex_launch(pane, agent_arguments)
                 entry["name"] = name
-                pane_launch.write(pane_launch.record_directory() / f"{self.session}.json", entry)
+                directory = pane_launch.record_directory()
+                pane_launch.write(directory / f"{self.session}.json", entry, sources=tuple(directory.glob("*.json")))
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues", file=sys.stderr)
         if isinstance(opening, OpeningPrompt):
@@ -2474,7 +2512,8 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str, *, target: str,
-               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED,
+               on_submission: Callable[[], object] = lambda: None) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
@@ -2482,6 +2521,7 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        _ = on_submission()
         self._prompt(pane, text, proof=proof)
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
@@ -2669,7 +2709,7 @@ def pane_native_process(info: dict[str, object], kind: str,
             observed = NativeAgentProcess(UnreportedResume(observed.identity.id), observed.started, observed.environment)
         processes.append(observed)
     if len(processes) != 1:
-        raise HerdrFailure("native registry identity is unavailable or ambiguous")
+        raise HerdrFailure(f"expected one foreground {kind} process, found {len(processes)}")
     return processes[0]
 
 
@@ -3221,7 +3261,9 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
 
 
 def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
-    """Use the showrunner workspace, then the supplied name, then the shared session."""
+    """Select the configured producer workspace or the owner's workspace."""
+    if isinstance(row, staff.StaffRow) and row.kind == "producer":
+        return conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
     while isinstance(row, staff.StaffRow):
         if row.kind == "showrunner":
             return row.name
@@ -5088,6 +5130,11 @@ class CodexLaunchRead(Enum):
     CURRENT = "read Codex at launch"
 
 
+def agent_alias_script(kind: str) -> str:
+    """Clear the agent alias before the shell starts the agent."""
+    return f"unalias {kind} 2>/dev/null; "
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
@@ -5096,6 +5143,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
+        agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
         try:
             trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
         except HerdrFailure as error:
@@ -5139,7 +5187,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
-        script = f"unalias {kind} 2>/dev/null; "
+        script = agent_alias_script(kind)
         if isinstance(destination, ExistingPane):
             # Set the environment in the existing shell before the agent starts.
             environment = _pane_environment(prepared.env)

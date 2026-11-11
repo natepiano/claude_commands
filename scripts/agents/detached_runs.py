@@ -13,7 +13,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 
 import argparse
 import contextlib
@@ -21,6 +21,7 @@ import fcntl
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -61,12 +62,11 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR as DETACHED_RUNS_DIR, DETACHED_RUN_START_GRACE_SECS
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-# On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
-# places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
-# Worker cargo builds ran at the panes' weight in herdr-agents.service (2026-10-20). The scope
-# writes the marker just before the command starts; a marker missing after the scope exits proves
-# the scope never ran it (no user manager, a systemd that rejects an option), so the command runs
-# plainly. BUILDLOG_SCOPE=0 turns the scope off, as it does for invoke.sh.
+# On natedev the command runs in builds-detached.slice, a child of builds.slice.
+# The parent slice's memory limit and CPU weight also apply to the detached command.
+# The scope writes the marker before the command starts.
+# A missing marker after the scope exits proves that the command did not start there.
+# The command then runs without a scope. BUILDLOG_SCOPE=0 disables the scope, as it does for invoke.sh.
 SCOPE_SCRIPT = ': > "$0" || exit 125; exec "$@"'
 
 
@@ -91,6 +91,7 @@ class RunRecord(TypedDict):
     # Set when the run ended without its supervisor: "supervisor gone".
     completion_pending: NotRequired[bool]
     ended: NotRequired[str]
+    stop_reason: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -148,8 +149,27 @@ def _runs_dir(session_dir: str) -> Path:
     return Path(session_dir) / DETACHED_RUNS_DIR
 
 
-def _write_record(path: Path, record: RunRecord) -> None:
-    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+@contextlib.contextmanager
+def record_lock(path: Path) -> Generator[None]:
+    """Serialize supervisor updates and drain stop reasons for one record."""
+    with path.with_suffix(".record.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _write_record(path: Path, record: RunRecord) -> RunRecord:
+    with record_lock(path):
+        current = worker_lifecycle.read_json_object(path)
+        fields: dict[str, object] = {**current, **record}
+        if current.get("status") == "finished" and record["status"] == "running":
+            fields.update(current)
+        if current:
+            if "stop_reason" in current:
+                fields["stop_reason"] = current["stop_reason"]
+            else:
+                _ = fields.pop("stop_reason", "")
+        write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
+        return cast(RunRecord, cast(object, fields))
 
 
 def _read_record(path: Path) -> RunRecord:
@@ -157,6 +177,26 @@ def _read_record(path: Path) -> RunRecord:
     if not raw.get("run_id") or not isinstance(raw.get("command"), list):
         raise SystemExit(f"detached_runs: {path} is not a run record")
     return cast(RunRecord, cast(object, raw))
+
+
+def stop_with_reason(
+    path: Path, reason: str, *, still_current: Callable[[], bool], signal_run: Callable[[], None],
+) -> bool:
+    """Save the reason and complete the stop decision under one record lock."""
+    with record_lock(path):
+        record = worker_lifecycle.read_json_object(path)
+        record["stop_reason"] = reason
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+        sent = False
+        try:
+            if still_current():
+                signal_run()
+                sent = True
+            return sent
+        finally:
+            if not sent:
+                del record["stop_reason"]
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
 def seat_name(session_dir: str, name: str) -> str:
@@ -263,14 +303,14 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
 def _finish_record(path: Path, record: RunRecord) -> None:
     """Keep a failed completion event available without blocking other records."""
     record["completion_pending"] = True
-    _write_record(path, record)
+    record = _write_record(path, record)
     try:
         _complete_worker_dispatch(record)
     except Exception as error:
         print(f"anomaly: {record['run_id']}: completion event failed: {error}", file=sys.stderr)
     else:
         record["completion_pending"] = False
-        _write_record(path, record)
+        _ = _write_record(path, record)
 
 
 def _complete_worker_dispatch(record: RunRecord) -> None:
@@ -324,6 +364,18 @@ def live_runs(runs: Path, worker: str) -> list[RunRecord]:
     return found
 
 
+def resume_context(runs: Path, worker: str) -> str:
+    """Name live runs and their persistent result files for a resumed worker."""
+    lines: list[str] = []
+    for record in live_runs(runs, worker):
+        result = runs / f"{record['run_id']}.json"
+        command = shlex.join(["cat", "--", str(result), record["log"]])
+        lines.append(f"Detached run {record['run_id']} remains live. "
+                     + f"Result: {result}; log: {record['log']}. Read it with: `{command}`. "
+                     + "Its result follows this worker after the move.")
+    return "\n".join(lines)
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
@@ -347,10 +399,11 @@ def command_start(args: argparse.Namespace) -> int:
         if not session_dir:
             return NOT_A_DETACHED_WORKER
         name = seat_name(session_dir, name)
+    session_dir = str(Path(session_dir).resolve())
     label = str(getattr(args, "label", "") or "") or " ".join(command)
     done_file = str(getattr(args, "done_message_file", "") or "")
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
-    runs = _runs_dir(session_dir)
+    runs = _runs_dir(session_dir).resolve()
     runs.mkdir(parents=True, exist_ok=True)
     cwd = os.getcwd()
     tree_key = treekey.tree_key(cwd) or ""
@@ -384,7 +437,7 @@ def command_start(args: argparse.Namespace) -> int:
             "log": str(log_path), "started_at": time.time(), "pid": 0,
             "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
         }
-        _write_record(record_path, record)
+        _ = _write_record(record_path, record)
         with log_path.open("ab") as log:
             supervisor = subprocess.Popen(
                 [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
@@ -392,7 +445,7 @@ def command_start(args: argparse.Namespace) -> int:
                 start_new_session=True, cwd=cwd,
             )
         record["pid"] = supervisor.pid
-        _write_record(record_path, record)
+        _ = _write_record(record_path, record)
     print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
           + "its result arrives as your next message")
     return 0
@@ -461,6 +514,9 @@ def result_text(record: RunRecord, result: CommandResult) -> str:
                else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS else f"FAIL (exit {exit_code})")
     heading = "Run ended with no result" if isinstance(exit_code, SupervisorLost) else "Run finished"
     lines = [f"{heading}: ", f"Result: {verdict}", f"Log: {record['log']}"]
+    stop_reason = record.get("stop_reason", "")
+    if stop_reason:
+        lines.append(f"Stop reason: {stop_reason}")
     cancellation = ""
     if exit_code == TREE_CHANGED_STATUS:
         # Keep the cancellation instruction when cleanup moves it outside the tail.
@@ -503,9 +559,9 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
     """Deliver the command result to its current worker."""
     exit_code = result.code if isinstance(result, CompletedCommand) else result
     done_file = record["done_message_file"]
-    if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS):
+    if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS) and not record.get("stop_reason"):
         return f"nothing delivered: {_exit_words(result)} with a done message"
-    if done_file and exit_code == 0:
+    if done_file and exit_code == 0 and not record.get("stop_reason"):
         try:
             text = Path(done_file).read_text(encoding="utf-8")
         except OSError as exc:
@@ -540,13 +596,13 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
 
 
 def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
-    """The argv that runs a command in a builds.slice scope, or nothing where no scope is possible."""
+    """Start the command in builds-detached.slice when a scope is available."""
     runtime = environment.get("XDG_RUNTIME_DIR", "")
     if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-            "--slice=builds.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+            "--slice=builds-detached.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
@@ -576,24 +632,27 @@ def command_supervise(args: argparse.Namespace) -> int:
         record = _read_record(record_path)
         if record["pid"] == 0:
             record["pid"] = os.getpid()
-            _write_record(record_path, record)
+            record = _write_record(record_path, record)
     environment = dict(os.environ)
     environment.update({
         "UNIT_DETACHED_RUN": "1",
         "UNIT_RUN_DIR": record["session_dir"],
         "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
+        "UNIT_DETACHED_RECORD": str(record_path.resolve()),
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
     prefix = scope_prefix(marker, environment)
     exit_code = _run(prefix + record["command"], environment, log)
-    if prefix and not marker.exists():
+    record = _read_record(record_path)
+    if prefix and not marker.exists() and not record.get("stop_reason"):
         exit_code = _run(record["command"], environment, log)
+        record = _read_record(record_path)
     marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
     record["exit_code"] = exit_code
-    _write_record(record_path, record)
+    record = _write_record(record_path, record)
     try:
         delivery = deliver(record, CompletedCommand(exit_code))
     except RunDeliveryFailed as error:

@@ -97,16 +97,21 @@ def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[s
 
 def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
                    workers: ResumeWorkers = NO_WORKERS, context: str = "",
-                   own_pass: BusyPass | NoOwnPass = NO_OWN_PASS) -> str:
+                   own_pass: BusyPass | NoOwnPass = NO_OWN_PASS, detached: str = "") -> str:
     moved = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
     if isinstance(own_pass, BusyPass):
         opening = context or f"You were stopped and resumed because {why}.{moved}"
-        return script_prompt(f"{opening}\nContinue pass {own_pass.dispatch_id} in this conversation. Keep the same pass id.")
+        return script_prompt(f"{opening}\nContinue pass {own_pass.dispatch_id} in this conversation. Keep the same pass id."
+                             + ("\n" + detached if detached else ""))
     lines: list[str] = []
     if why or context:
         opening = context or f"You were stopped and resumed because {why}.{moved} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
-                     + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
+                     + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting. "
+                     + ("Background commands that you started before the restart ended with no result. Run them again."
+                        if not detached else ""))
+    if detached:
+        lines.append(detached)
     for pane in workers.panes:
         if isinstance(pane.turn, UnsubmittedAssignment):
             lines.append(launcher_prompt(pane.staff_id, pane.turn.dispatch_id, pane.turn.command))
@@ -128,7 +133,7 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
                     lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
                                  + f"Your next dispatch with --to {seat['seat']} resumes it.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
-    text = ("\n" if workers.results or workers.panes else " ").join(lines)
+    text = ("\n" if workers.results or workers.panes or detached else " ").join(lines)
     return script_prompt(text)
 
 

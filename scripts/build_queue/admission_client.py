@@ -19,20 +19,17 @@ import socket
 import shlex
 import subprocess
 import sys
-from typing import Callable, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
-from scripts.build_queue import admission_code, queue_lines
-from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_code
+if TYPE_CHECKING:
+    from scripts.build_queue import admission_protocol as wire, admission_records as records
+else:
+    from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.system_clock import SystemClock
-from scripts.build_queue.admission_records import reason_phrase
-from scripts.message import send_budget, send_result
-from scripts.message.session_send import session_send_argv
-from scripts.lib.user_zone import user_zone
-from scripts.build_queue import admission_records as records
 
-from scripts.lib import build_steps, conf
-from scripts.buildlog import store
+from scripts.lib import conf
 
 BUILDS_SESSION = "builds"
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
@@ -96,7 +93,9 @@ def _line(connection: socket.socket, pending: bytearray, deadline: float) -> byt
     return line
 
 
-def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -> wire.Reply:
+def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
+           | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport) -> wire.Reply:
+    from scripts.build_queue import admission_protocol as wire, admission_records as records
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     timeout = records.read_memory_config().query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
@@ -119,6 +118,36 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -
         raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
 
 
+def request_placement(request: wire.PlacementRequest) -> wire.Assignment | wire.PlacementWait | wire.DispatchStatus:
+    """Request a durable destination without selecting a fallback in the caller."""
+    reply = _query(request)
+    if isinstance(reply, (wire.Assignment, wire.PlacementWait, wire.DispatchStatus)):
+        return reply
+    raise wire.AdmissionUnavailable("invalid placement answer")
+
+
+def claim_failure(request: wire.ClaimFailure) -> wire.DispatchStatus:
+    reply = _query(request)
+    if isinstance(reply, wire.DispatchStatus):
+        return reply
+    raise wire.AdmissionUnavailable("invalid claim failure answer")
+
+
+def consume_permission(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+    """A repeated call can return status but cannot restore a lost authorization."""
+    reply = _query(request)
+    if isinstance(reply, (wire.FirstAuthorization, wire.DispatchStatus)):
+        return reply
+    raise wire.AdmissionUnavailable("invalid permission answer")
+
+
+def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
+    reply = _query(request)
+    if isinstance(reply, wire.DispatchStatus):
+        return reply
+    raise wire.AdmissionUnavailable("invalid execution report answer")
+
+
 @dataclass
 class EstimateConnection:
     connection: socket.socket
@@ -138,6 +167,7 @@ READ_CONFIGURATION_AT_USE = ReadConfigurationAtUse()
 
 def build_history_generation(configuration: records.MemoryConfig | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> records.BuildHistoryGeneration:
     """Read the generation before reading build history."""
+    from scripts.build_queue import admission_records as records
     reply = _call(wire.BuildHistoryRequest(), lambda _wait: None, channel=_ESTIMATE_CONNECTION.get(),
                   configuration=configuration)
     if isinstance(reply, LeftQueue):
@@ -150,6 +180,7 @@ def build_history_generation(configuration: records.MemoryConfig | ReadConfigura
 
 
 def view() -> records.QueueRead | wire.CloudQueueRead:
+    from scripts.build_queue import admission_protocol as wire, admission_records as records
     reply = _query(wire.ViewRequest())
     if not isinstance(reply, wire.ViewReply):
         raise wire.AdmissionUnavailable("invalid view answer")
@@ -158,6 +189,7 @@ def view() -> records.QueueRead | wire.CloudQueueRead:
 
 
 def explain() -> records.QueueExplanation:
+    from scripts.build_queue import admission_protocol as wire, admission_records as records
     reply = _query(wire.ExplainRequest())
     if not isinstance(reply, wire.ExplainReply):
         raise wire.AdmissionUnavailable("invalid explanation answer")
@@ -166,6 +198,7 @@ def explain() -> records.QueueExplanation:
 
 
 def mine(session_id: str) -> records.QueueRead | wire.CloudQueueRead:
+    from scripts.build_queue import admission_protocol as wire, admission_records as records
     reply = _query(wire.MineRequest(session_id))
     if not isinstance(reply, wire.MineReply):
         raise wire.AdmissionUnavailable("invalid step answer")
@@ -271,11 +304,16 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                  launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
-        resolved = records.read_memory_config(report=False) if isinstance(configuration, ReadConfigurationAtUse) else configuration
+        if isinstance(configuration, ReadConfigurationAtUse):
+            from scripts.build_queue import admission_records as records
+            resolved = records.read_memory_config(report=False)
+        else:
+            resolved = configuration
         request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
         reply = _acquire(request, on_wait, refresh, attempt=attempt, channel=channel, retry=retry,
                          configuration=resolved)
-        if not isinstance(reply, wire.Refused) and isinstance(resolved, records.MemoryConfig):
+        if not isinstance(reply, wire.Refused) and not isinstance(resolved, (wire.AcquisitionTiming, wire.CleanupTiming)):
+            from scripts.build_queue import admission_records as records
             records.warn_configuration_diagnostics(resolved.diagnostics)
         return reply
     except _QueueLeft:
@@ -296,7 +334,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming
              ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     first = request
-    leave_interval = (configuration.running_pass_seconds if isinstance(configuration, records.MemoryConfig)
+    leave_interval = (configuration.running_pass_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming))
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
     # The caller can hold a lease before the service accepts a connection.
@@ -314,7 +352,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         retry.unreachable_deadline = last_valid + configuration.unreachable_limit_seconds
 
     def check_unreachable() -> None:
-        if (isinstance(configuration, (records.MemoryConfig, wire.AcquisitionTiming))
+        if (not isinstance(configuration, wire.CleanupTiming)
                 and CLOCK.monotonic() >= retry.unreachable_deadline):
             duration = _unreachable_duration(configuration.unreachable_limit_seconds)
             reason = f"build queue unreachable for {duration}; step stopped; cargo token given back"
@@ -406,6 +444,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         return reply
                     if not isinstance(reply, wire.Wait):
                         raise CheckerFailure("invalid admission answer")
+                    from scripts.build_queue import admission_records as records
                     cause = reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus) else reply.reason
                     if isinstance(cause, records.ReadingUnavailable):
                         raise CheckerFailure(cause.reason)
@@ -470,7 +509,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
             restart_error = isinstance(error, TransportUnavailable) or error.errno in (errno.ECONNRESET, errno.EPIPE)
             if (isinstance(first, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
-                    and isinstance(configuration, (records.MemoryConfig, wire.AcquisitionTiming))
+                    and not isinstance(configuration, wire.CleanupTiming)
                     and (restart_error or isinstance(error, (FileNotFoundError, ConnectionRefusedError)))
                     and retry.unreachable_deadline == float("inf")):
                 retry.unreachable_deadline = CLOCK.monotonic() + configuration.unreachable_limit_seconds
@@ -481,7 +520,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     print("admission service restarted; waiting again", file=sys.stderr)
                     restarted = True
                 continue
-            if CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if isinstance(configuration, records.MemoryConfig) else configuration.silence_seconds):
+            if CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming)) else configuration.silence_seconds):
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused" if isinstance(error, ConnectionRefusedError) else str(error)
                 print(f"admission service unavailable: {reason}; waiting again", file=sys.stderr)
                 retry.last_outage_line = CLOCK.monotonic()
@@ -504,6 +543,7 @@ def launch(request: wire.LaunchRequest, on_wait: Callable[[wire.Wait], None],
 
 
 def _silence_notice(last_valid: float) -> None:
+    from scripts.lib.user_zone import user_zone
     since = datetime.fromtimestamp(CLOCK.now() - (CLOCK.monotonic() - last_valid), user_zone()).strftime("%H:%M")
     print(f"admission service not answering since {since}", file=sys.stderr)
 
@@ -555,6 +595,7 @@ def token_wait(reservation: str, configuration: records.MemoryConfig | wire.Clea
 
 def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
     """Describe why admission holds, without treating changing samples as a new reason."""
+    from scripts.build_queue import admission_records as records
     cause = result.head_reason.cause if isinstance(result.head_reason, records.HeadAdmissionStatus) else result.head_reason
     if isinstance(cause, records.MemoryPressure) and cause.condition == "swap":
         return ("swap memory pressure",)
@@ -562,7 +603,12 @@ def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
         return (f"queue head {cause.head_name}",)
     if isinstance(cause, records.ReadyForAdmission):
         return ("admission refresh",)
-    return (reason_phrase(cause, ()),)
+    return (records.reason_phrase(cause, ()),)
+
+
+@dataclass(frozen=True)
+class UnseenWaitHolder:
+    pass
 
 
 @dataclass
@@ -574,17 +620,21 @@ class WaitOutput:
     last_reasons: tuple[str, ...] = ()
     last_need: int = 0
     last_position: int = 0
-    last_holder: records.WaitHolder = field(default_factory=records.NoHolder)
+    last_holder: records.WaitHolder | UnseenWaitHolder = field(default_factory=UnseenWaitHolder)
     on_event: Callable[[str], None] = field(default=lambda _event: None)
     configuration: records.MemoryConfig | wire.AcquisitionTiming | ReadConfigurationAtUse = field(
         default=READ_CONFIGURATION_AT_USE, kw_only=True)
 
     def reply_seconds(self) -> float:
+        from scripts.build_queue import admission_records as records
         configuration = (records.read_memory_config(report=False)
             if isinstance(self.configuration, ReadConfigurationAtUse) else self.configuration)
         return configuration.wait_reply_seconds
 
     def __call__(self, reply: wire.Wait) -> None:
+        from scripts.build_queue import admission_records as records, queue_lines
+        from scripts.lib import build_steps
+        from scripts.lib.user_zone import user_zone
         now = CLOCK.monotonic()
         first = not self.held
         if isinstance(reply.reason, wire.CloudSlotWait):
@@ -675,12 +725,23 @@ def parse_run_identity(value: str) -> wire.RunIdentity | wire.NoRun:
     return wire.NO_RUN
 
 
+@dataclass(frozen=True)
+class InferProfileAtUse:
+    pass
+
+
+INFER_PROFILE_AT_USE = InferProfileAtUse()
+
+
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
-                 episode: str, profile: records.InferFromArgv | wire.Profile = records.INFER_FROM_ARGV,
+                 episode: str, profile: records.InferFromArgv | wire.Profile | InferProfileAtUse = INFER_PROFILE_AT_USE,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                  ) -> wire.AdmitRequest:
-    from scripts.build_queue import step_estimator
+    from scripts.build_queue import step_estimator, admission_records as records
+    from scripts.buildlog import store
 
+    if isinstance(profile, InferProfileAtUse):
+        profile = records.INFER_FROM_ARGV
     config = records.read_memory_config()
     estimate = step_estimator.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
                                   store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
@@ -711,6 +772,9 @@ def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, el
 
 def down_alert() -> int:
     from scripts.accounts import outage_alerts
+    from scripts.build_queue import admission_records as records
+    from scripts.message import send_budget, send_result
+    from scripts.message.session_send import session_send_argv
     configuration = records.read_memory_config()
     started = CLOCK.monotonic()
     while True:
@@ -833,6 +897,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "down-alert":
             return down_alert()
         if args.command in ("admit", "launch"):
+            from scripts.build_queue import admission_records as records
             owner_start = records.process_start_time(args.pid)
             if owner_start is None:
                 raise CheckerFailure("owner no longer exists")
@@ -871,13 +936,17 @@ def main(argv: list[str] | None = None) -> int:
             if not args.wait_events:
                 print(wire.encode_reply(grant), end="")
             return 0
+        def command_actor() -> str:
+            from scripts.build_queue import admission_records as records
+            return records.queue_command_actor()
+
         result = (view() if args.command == "view" else explain() if args.command == "explain" else
                   mine(args.session_id) if args.command == "mine" else release(args.reservation, args.value, _saved_cleanup_timing())
                   if args.command == "release" else width(args.reservation, args.value)
                   if args.command == "width" else token_wait(args.reservation, _saved_cleanup_timing()) if args.command == "token-wait" else
-                  priority_set(args.unit, args.why, records.queue_command_actor()) if args.command == "priority-set" else
-                  priority_clear(records.queue_command_actor()) if args.command == "priority-clear" else
-                  admit_head(args.why, records.queue_command_actor()))
+                  priority_set(args.unit, args.why, command_actor()) if args.command == "priority-set" else
+                  priority_clear(command_actor()) if args.command == "priority-clear" else
+                  admit_head(args.why, command_actor()))
         if isinstance(result, wire.Refused):
             return 2
         print(wire.encode_record(result))

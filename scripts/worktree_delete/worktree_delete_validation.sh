@@ -43,6 +43,13 @@ if [[ "$CURRENT_DIR" == "$SELECTED_ABSOLUTE" ]]; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLEANUP=false
+if CLEANUP_REASON=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" cleanup "$SELECTED_WORKTREE" 2>&1); then
+    CLEANUP=true
+fi
+CLEANUP_REASON_JSON=$("$SCRIPT_DIR/../lib/py" -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$CLEANUP_REASON")
+
 # Check for uncommitted changes
 UNCOMMITTED=$(git -C "$SELECTED_WORKTREE" status --porcelain)
 HAS_UNCOMMITTED=false
@@ -58,7 +65,6 @@ HAS_REMOTE_BRANCH=false
 HAS_REMOTE_ONLY=false
 REMOTE_ONLY_COUNT=0
 if git -C "$SELECTED_WORKTREE" remote get-url origin >/dev/null 2>&1; then
-    git -C "$SELECTED_WORKTREE" fetch --prune origin >/dev/null 2>&1
     if git -C "$SELECTED_WORKTREE" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
         UNPUSHED_COUNT=$(git -C "$SELECTED_WORKTREE" rev-list '@{upstream}..HEAD' --count 2>/dev/null || echo "0")
     else
@@ -88,5 +94,7 @@ echo "{
   \"unpushed_count\": $UNPUSHED_COUNT,
   \"has_remote_branch\": $HAS_REMOTE_BRANCH,
   \"has_remote_only\": $HAS_REMOTE_ONLY,
-  \"remote_only_count\": $REMOTE_ONLY_COUNT
+  \"remote_only_count\": $REMOTE_ONLY_COUNT,
+  \"cleanup\": $CLEANUP,
+  \"cleanup_reason\": $CLEANUP_REASON_JSON
 }"

@@ -11,6 +11,7 @@ Omit the package for the whole workspace. Give at most one positional word after
 | package or workspace tests | `bash ~/.claude/scripts/direct/verify.sh test [<package>]` |
 | one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --test <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --filter <name> [--filter <name> …]` |
+| only ignored tests, with optional name filters | `bash ~/.claude/scripts/direct/verify.sh test [<package>] [--filter <name> …] --run-ignored only` |
 | a test that cannot pass on macOS | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --local "<why it cannot pass on macOS>"` |
 | phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]` |
 | staged workspace rustdoc | `bash ~/.claude/scripts/direct/verify.sh doc [<package>]` |
@@ -18,6 +19,10 @@ Omit the package for the whole workspace. Give at most one positional word after
 | build a binary or example | `bash ~/.claude/scripts/direct/verify.sh build [<package>] [--bin <name> \| --example <name>]` |
 | final gate | `bash ~/.claude/scripts/direct/verify.sh final [<package>]` |
 | read a saved workspace gate pass | `bash ~/.claude/scripts/direct/verify.sh final --saved [--tree <tree>]` |
+
+`--run-ignored only` runs only ignored tests. It accepts `--filter` and `--features`, but refuses `--test`.
+The call must match a test. It never supplies a full package pass.
+Omit the package to select named tests across two packages in one call.
 
 `check` and `build` keep Cargo's workspace selection, also with a named package.
 A named package owns feature names without a slash. Without a package, feature

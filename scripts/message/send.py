@@ -141,6 +141,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 from scripts.herdr.place import HerdrPlace
+from scripts.herdr import herdr_types
 from scripts.lib import process_group
 from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start
@@ -680,6 +681,14 @@ class RecipientLookupFailed:
     reason: str
 
 
+class RecipientNameMissing(SystemExit):
+    """The recipient name has no staff row or live session."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(2)
+        self.reason: str = reason
+
+
 @dataclass(frozen=True)
 class NoStaffRecipient:
     """The target keeps its transport resolution because no staff row matches."""
@@ -1161,7 +1170,7 @@ def retire_record(record: Emergency) -> tuple[int, str]:
     # This host holds the key's window (remote() sends --repeat-minutes 0); the posting host holds the keys.
     forget_sent(record["key"], USER)
     forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", record["machine"], f"{REMOTE} {forwarded}"]
+    command = ["ssh", "-o", "BatchMode=yes", record["machine"], f"{REMOTE} {forwarded}"]
     code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
     last = (out.strip().splitlines() or [""])[-1]
     if code == 0:
@@ -2125,7 +2134,15 @@ def resolve_staff_recipient(
     target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
     observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
 ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
-    """Select one staff identity before any transport lookup."""
+    """Select a staff recipient, including its unit form."""
+    return _staff_recipient_match(target, membership, records=records, observed=observed, allow_unit_form=True)
+
+
+def _staff_recipient_match(
+    target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
+    observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (), allow_unit_form: bool = False,
+) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
+    """Match exact staff names unless the caller permits the unit form."""
     from scripts.message import roster
 
     reference = target
@@ -2165,10 +2182,7 @@ def resolve_staff_recipient(
         except unit_names.BadName:
             return value.casefold()
 
-    normalized = "/".join(normalized_name(part) for part in reference.split("/"))
-    matches: dict[staff.StaffId, staff.StaffRow] = {}
-    paths: dict[staff.StaffId, str] = {}
-    for candidate in membership.find():
+    def name_chain(candidate: staff.StaffRow) -> list[str]:
         chain = [candidate.name]
         parent = candidate
         visited = {candidate.id}
@@ -2179,6 +2193,13 @@ def resolve_staff_recipient(
             visited.add(ancestor.id)
             chain.insert(0, ancestor.name)
             parent = ancestor
+        return chain
+
+    normalized = "/".join(normalized_name(part) for part in reference.split("/"))
+    matches: dict[staff.StaffId, staff.StaffRow] = {}
+    paths: dict[staff.StaffId, str] = {}
+    for candidate in membership.find():
+        chain = name_chain(candidate)
         path = "/".join(chain)
         canonical = "/".join(normalized_name(part) for part in chain)
         short = normalized_name(candidate.name)
@@ -2189,6 +2210,20 @@ def resolve_staff_recipient(
             if row is not None:
                 matches[row.id] = row
                 paths[row.id] = path
+    if allow_unit_form and not matches and not _sender_label_matches(target, list(observed)):
+        from scripts.copies import copies
+
+        for candidate in membership.find(kind="unit"):
+            short = normalized_name(copies.unit_owner(candidate.name))
+            if short != normalized.rsplit("/", 1)[-1]:
+                continue
+            chain = name_chain(candidate)
+            path = "/".join(chain)
+            chain[-1] = short
+            canonical = "/".join(normalized_name(part) for part in chain)
+            if normalized == canonical or ("/" not in normalized and normalized == short):
+                matches[candidate.id] = candidate
+                paths[candidate.id] = path
     foreign_workers_only = False
     if "/" not in normalized and matches and all(row.kind == "worker" for row in matches.values()):
         sender = _sender_staff_row(membership)
@@ -2252,7 +2287,7 @@ def matching_recipients(
     from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
-    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    member = _staff_recipient_match(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
     if isinstance(member, staff.StaffRow):
@@ -2268,7 +2303,7 @@ def matching_recipients(
         return LocalRosterIncomplete(observed.diagnostics)
     peer = roster.peer_roster(os.environ)
     problems = [*observed.diagnostics, *peer.diagnostics]
-    member = resolve_staff_recipient(to, membership, observed=[*observed.entries, *peer.entries])
+    member = _staff_recipient_match(to, membership, observed=[*observed.entries, *peer.entries])
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [*problems, member.reason])
     if isinstance(member, staff.StaffRow):
@@ -2296,7 +2331,7 @@ def resolve_recipient(
     def lookup() -> DeliveryRoute:
         nonlocal problems
         socket_records = (sessions.live_sessions() if records is None else records) if to.startswith("uds:") else []
-        member = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
+        member = _staff_recipient_match(to, membership, observed=observed.entries, records=socket_records)
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
         if (not isinstance(scope, NamedMachine)
@@ -2321,6 +2356,14 @@ def resolve_recipient(
                 usage_error("codex: needs a thread id")
         result = matching_recipients(to, scope, observed, membership=membership)
         problems = result.problems
+        if isinstance(result, RecipientMatches) and result.entries:
+            return _matched_recipient(to, result.entries, result.destination)
+        if isinstance(member, NoStaffRecipient):
+            fallback = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
+            if isinstance(fallback, RecipientLookupFailed):
+                usage_error(fallback.reason)
+            if isinstance(fallback, staff.StaffRow):
+                return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         if isinstance(result, LocalRosterIncomplete):
             usage_error(f"absence of {to} here is not proven; use an address or --machine")
         if isinstance(result, RecipientSearchFailed):
@@ -2329,8 +2372,6 @@ def resolve_recipient(
                       if any(problem in result.reason for problem in problems if problem not in related)
                       else result.reason)
             return RecipientLookupFailed(reason)
-        if result.entries:
-            return _matched_recipient(to, result.entries, result.destination)
         if to.startswith("worker:"):
             usage_error(f"no roster session has address {to}")
         if to.startswith("codex:"):
@@ -2346,7 +2387,9 @@ def resolve_recipient(
             return QueuedStaffRecipient(address, member.name, str(member.current_session))
         if to.startswith("session:"):
             return ClaudeRecipient(to)
-        usage_error(f"no staff row or live session for {to!r}")
+        reason = f"no staff row or live session for {to!r}"
+        print(f"send.py: {reason}", file=sys.stderr)
+        raise RecipientNameMissing(reason)
 
     failed = True
     try:
@@ -2469,11 +2512,6 @@ def relay(message: Message, timeout: float) -> Result:
     if claude is None:
         return Result("queued", "no claude binary found")
     tools = "SendMessage" if message.to.startswith("uds:") else "SendMessage,ListAgents"
-    command = [claude, "-p", "--model", MODEL, "--permission-mode", PERMISSION_MODE, "--permission-prompts", "none",
-               "--tools", tools, "--allowedTools", tools,
-               "--setting-sources", "user", "--settings", json.dumps({"disableAllHooks": True}),
-               "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
-               "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
@@ -2487,6 +2525,12 @@ def relay(message: Message, timeout: float) -> Result:
         return Result("queued", str(error))
     if not isinstance(selected, accounts.LegacyHomeLaunch):
         env.update(named_account_environment(selected.dir))
+    model = models_registry.claude_model(MODEL, env)
+    command = [claude, "-p", "--model", model, "--permission-mode", PERMISSION_MODE, "--permission-prompts", "none",
+               "--tools", tools, "--allowedTools", tools,
+               "--setting-sources", "user", "--settings", json.dumps({"disableAllHooks": True}),
+               "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
+               "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
     # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
     token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"
@@ -2740,7 +2784,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
     elif message.to == USER and options.need == "blocked" and message.key is not None:
         # This host's claim holds the emergency's lifetime window; the run on host must not apply it again.
         forwarded += ["--repeat-minutes", "0"]
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
+    command = ["ssh", "-o", "BatchMode=yes", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
     failure: FailureText = NO_FAILED_PUSH
@@ -3283,7 +3327,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 _prompt_pane(HerdrPlace(herdr.shared_session(), state.pane), text,
                              target=str(worker.current_session), timeout=timeout)
                 return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-            except (herdr.HerdrFailure, OSError) as error:
+            except (herdr_types.HerdrFailure, OSError) as error:
                 reason = str(error)
         elif state is None:
             reason = "worker observation is unavailable"
@@ -3332,13 +3376,19 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
                  else UserDelivery())
     else:
-        route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
+        try:
+            route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
+        except RecipientNameMissing as error:
+            from scripts.message import failed_lookup
+
+            failed_lookup.report(options.sender or default_sender(), options.to, f"send.py: {error.reason}")
+            raise
     destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
-    member = resolve_staff_recipient(options.to, membership, records=records, observed=observed.entries)
+    member = _staff_recipient_match(options.to, membership, records=records, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
     if isinstance(member, NoStaffRecipient) and destination != options.to:
-        member = resolve_staff_recipient(destination, membership, records=records, observed=observed.entries)
+        member = _staff_recipient_match(destination, membership, records=records, observed=observed.entries)
     registered = sessions.addressed(destination, records)
     stable = StableRecipient(options.recipient_identity.name if isinstance(options.recipient_identity, LogicalRecipientIdentity)
                              else f"staff:{member.id}" if isinstance(member, staff.StaffRow)
@@ -3409,6 +3459,9 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     elif guarded.held:
         result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif isinstance(route, RecipientLookupFailed):
+        from scripts.message import failed_lookup
+
+        failed_lookup.report(sender, options.to, f"FAILED: {route.reason}")
         result = Result("failed", route.reason)
     elif isinstance(route, RemoteDelivery):
         result = remote(message, route.host, options)
@@ -3421,12 +3474,10 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
     elif isinstance(route, CodexPaneRecipient):
-        from scripts.herdr import herdr
-
         try:
             _prompt_pane(route.place, agent_text(message), target=route.thread_id, timeout=options.timeout)
             result = Result("sent", f"{route.address} at {route.place.session}:{route.place.pane}")
-        except (herdr.HerdrFailure, OSError) as error:
+        except (herdr_types.HerdrFailure, OSError) as error:
             result = Result("failed", str(error))
     elif isinstance(route, QueuedStaffRecipient):
         result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
@@ -3549,7 +3600,7 @@ def repeat_notice_owner(sender: str) -> str:
     """Follow staff parents to the sender's showrunner."""
     membership = staff.snapshot()
     member = resolve_staff_recipient(sender, membership)
-    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "agent":
+    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "producer":
         return rca.owner_address("")
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)

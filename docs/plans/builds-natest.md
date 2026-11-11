@@ -46,7 +46,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
   - `scripts/buildlog/index.py` — `SCHEMA_VERSION = 34`, with `step`, `dirty_paths` and `dirty_path_count` (was 42); column lists such as `TEST_COLUMNS` (141) and `CALL_COLUMNS`; `TABLES` (452, with the gate tables); `create_schema` (574, adds a `<table>_src` index for each table); `insert`, `pick`; `add_step` (763, the pattern for a nested list that becomes child rows); `ADDERS` (950, `gate_run` maps to `add_gate_run`); `forget` (954, loops `TABLES`); `update()` (1012); `read_only()` (1051)
   - `scripts/test_times/gate_record.py` — the `gate_run` record types (`ModuleTimes`, `ModuleRun`, `SuiteRun`, `GateRun`, `NoModuleTimes`), `TYPE_CHECK_JOB` (38), `read_module_times` (131), `kept_tests` (153), `slow_test_s` (162), `write_gate_run` (166) Since Phase 2: `Execution` (106), `module_runs` (185), `report_not_written` (213), `write_gate_run` (219).
   - `scripts/buildlog/cli.py` — runs `index.update()` before each report (140)
-  - `scripts/lib/conf.py` — `read(file).number(key)`; a config file puts a `# range: 0..` or `# whole: 1..` line directly above each `KEY=value` (see `config/mesh_runs.conf`)
+  - `scripts/lib/conf.py` — `read(file).number(key)`; a config file puts a `# range: 0..` or `# whole: 1..` line directly above each `KEY=value` (see `config/detached_runs.conf`)
   - `config/README.md` — one entry for each config file
   - `scripts/lib/user_zone.py` — `user_zone()`; `scripts/lib/test_user_zone.py` scans every script and fails an `astimezone()` with no zone
   - `scripts/lib/terminal_cells.py` — terminal cell widths for aligned tables
@@ -73,7 +73,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
   - Each dispatch names one worker that runs the changed modules and their callers after the last edit. With a writer and a tester, the writer runs the chain (Phase 22: each left it to the other).
 
 - **Speed method** (every speed phase; CPU first, 2026-11-06):
-  0. Targets: at dispatch, the director takes the top live rows of `show.py top`, ranked by median CPU per gate, that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal. `agents/test_codex_mesh.py` is excluded: it retires.
+  0. Targets: at dispatch, the director takes the top live rows of `show.py top`, ranked by median CPU per gate, that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal.
   1. Baseline: before the edit, run `python3 scripts/test_times/module_cost.py --tree <tree> <folder>/<file>` for CPU s, processes, execs and wall s. Run the module with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` for each test's time. Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
   2. Find the cost: the process starts per test, what starts them, and the CPU per test (`module_cost.py --tests 10`). A process count does not rank CPU: Phase 61's SSH files lost 52% of their processes and no CPU, because a Python start and a live server cost far more than a Bash start. Add up CPU by command (`module_cost.py --commands 10`) before a move. CPU in a production command that the tests need goes to its owner: no test edit removes it (Phase 66). Name each real end-to-end run and what only it proves. Do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
   3. Cut it, in this order:
@@ -1038,7 +1038,7 @@ Each `copies.py` use does less Git work, with the same trees, remote refs and ex
 
 #### As-built
 
-- `scripts/lib/inotify.py` is the one binding outside `codex_mesh.py`. It holds `IN_MODIFY` and `read_events(descriptor)`, which does one read; `events` loops on it.
+- `scripts/lib/inotify.py` is the one inotify binding. It holds `IN_MODIFY` and `read_events(descriptor)`, which does one read; `events` loops on it.
 - `LocalReleaseEvents` and `local_release_waiter` take `mask`. The default `RELEASE_CHANGES` equals `0xFC8`, written with named constants. `LocalReleaseEvents.wait` uses `read_events` and returns when something changed or the deadline passes.
 - `wait_until(..., watch_writes=False)` is the one wait that can watch writes. `VerifyTokenWaitFixture.wait_for_output` is one `wait_until(..., watch_writes=True)` call, then the `assertIn`. The raw-mask patches are gone.
 - `verify_hold_wait_test_support.py` catches only `FileNotFoundError` around `add_watch`.
@@ -1054,7 +1054,7 @@ Each `copies.py` use does less Git work, with the same trees, remote refs and ex
 
 **Gotchas:** `add_watch` raises `FileNotFoundError` for a directory that goes away. The deadline test allows `deadline + 5` s, so load gives no false red.
 
-**Ruled out:** A write watch on by default wakes on each write in a busy directory, and predicates can read half-written files. `codex_mesh.py` keeps its own copy, because it goes.
+**Ruled out:** A write watch on by default wakes on each write in a busy directory, and predicates can read half-written files.
 
 ### Phase 51 — `direct/test_simplify_lens.py` runs in less time  · status: done
 
@@ -1423,7 +1423,7 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 
 The four assign launcher test files use 37% less CPU, with every checked behavior kept. Three same-time pairs on `/tmp`: 482.4 to 303.6 CPU s. `test_assign_launcher.py` 286.6 to 214.8, `_reuse` 89.8 to 36.1, `_identity` 59.1 to 21.2, `_review` 46.9 to 31.5.
 
-- `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process. It calls the recorder, `workers.py` and `codex_mesh` in process, and patches `require_live_director` and `Dispatch.follow`. Forty tests use it.
+- `invoke_assignment` in `assign_launcher_test_support.py` runs the real coordinator in process. It patches `require_live_director`. Forty tests use it.
 - `snapshot_files` and `changed_files` hold the first-dispatch snapshot. `FirstDispatchFixture.first_assignment` and `AssignClaudeLauncherFixture.first_worker_launch` both use them, and each keeps its own restoration.
 - The process tests that stay real cover the ancestor check, launcher ownership, worker failure and concurrent review stages.
 
@@ -1433,7 +1433,7 @@ The four assign launcher test files use 37% less CPU, with every checked behavio
 - `scripts/direct/test_assign_launcher.py`, `test_assign_launcher_reuse.py`, `test_assign_launcher_identity.py`, `test_assign_launcher_review.py` — the four test files.
 
 **Gotchas:**
-- `AssignLauncherFixture` inherits `MeshCommandFixture` and sets the child `TMPDIR` to `/tmp`, so `/dev/shm` pairs do not reach it. Pairs run on `/tmp` at the same time.
+- `AssignLauncherFixture` inherits `unittest.TestCase` and does not set the child `TMPDIR`.
 - The remaining cost is the process tests in `test_assign_launcher.py` and the recorder and resolver children (58.6 CPU s in the command profile).
 
 ### Phase 69 — The remote copies review test uses half its CPU  · status: done
@@ -1638,12 +1638,12 @@ The verify hold and token wait fixtures keep every run root inside the test root
 
 - A test reads the mirrors that the claim reply carries.
 - `test_claim_server_keeps_a_second_admission_waiting_until_release` shows that a second admission waits while the lock is held.
-- `RemoteEntryTests.setUp` sets `UNIT_ACTIVE_DIR` inside the test root before `warm_claim_servers()`, so admission reads no live active marker.
+- `RemoteEntryTests.setUp` sets a private `STAFF_FILE` inside the test root before `warm_claim_servers()`, so admission reads no live run pointer.
 
 **Files:**
 - `scripts/copies/test_review_remote_copies.py` — the module
 
-**Gotchas:** an inherited `UNIT_RUN_DIR` moves the active folder outside the test root unless `UNIT_ACTIVE_DIR` is set.
+**Gotchas:** without a private `STAFF_FILE`, admission reads the live staff record and its run pointers.
 
 **Ruled out:** a CPU claim; the before and after samples ran under different loads.
 
@@ -1732,9 +1732,9 @@ The style ledger ticket and finding tests use 49% less CPU, with all tests kept.
 #### As-built
 
 - Two reports sort every test module under `scripts/` into Retired, Trivial, Repeat, Cross-module repeat, Table and Wording candidates. They change no test.
-- Report A covers `production`, `direct`, `agents`, `lint`, `message`, `hooks` and `lib`: 433 modules and 8,320 test methods. It has no safe deletion, 309 Table candidates in 127 groups, 3 Wording candidates and 736 conditional Retired candidates (`agents/test_codex_mesh.py`).
+- Report A covers `production`, `direct`, `agents`, `lint`, `message`, `hooks` and `lib`: 433 modules and 8,320 test methods. It has no safe deletion, 309 Table candidates in 127 groups, 3 Wording candidates and 736 conditional Retired candidates in a module that a later hierarchies phase deleted.
 - Report B covers every other folder: 300 modules and 10,453 test methods. Its Table merges remove an estimated 307 methods and keep every input case.
-- Both reports credit CPU savings only to the codex_mesh retirement. Every Table merge credits 0 CPU s per gate.
+- Both reports credit CPU savings only to the deletion of that retired module. Every Table merge credits 0 CPU s per gate.
 - Each report ends with growth patterns and one proposed rule for each. The user approved rules 1 and 2 on 2026-11-07.
 
 **Files:**
@@ -1939,7 +1939,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Gotchas:**
 - A syntax error in a non-test source does not raise. Only an invalid test module raises `SyntaxError`.
-- `config/postmaster.conf` selects 574 of 738 modules: 572 reach `send_budget.py` and 570 reach `codex_mesh.py` (for example `test_add_unit.py` -> `accounts.py` -> `codex_mesh.py` -> `send_budget.py`). Only the targeted test widens; merge gates run all modules.
+- At Phase 96, `config/postmaster.conf` selected 574 of 738 modules: 572 reached `send_budget.py`, most through a module that a later hierarchies phase deleted. Only the targeted test widens; merge gates run all modules.
 
 **Ruled out:**
 - A narrower closure: the wide selection follows the approved design.
@@ -2180,3 +2180,665 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 
 **Ruled out:**
 - A guard for a test that runs a second in-process `unittest` runner: no test does this, and module cleanups are process-wide in `unittest`.
+
+### Phase 110 — The nightly type check is a footnote under the slowest modules list  · status: done
+
+#### As-built
+
+- `show.py top` in the `~/.claude` repository ranks test modules only. `types/basedpyright` takes no rank, no `--limit` slot and no share of the `sum of median CPU` line.
+- After the sum line, one footnote gives the type check's latest passed run: `types/basedpyright runs nightly, so it is not ranked: last run <cpu> CPU s, <wall> s`. With no qualifying run, no footnote prints.
+- The footnote reads the same history query as a module: host, configured checkout, age limit, status 0, no restart, not aborted.
+- The `module`, `suites` and nextest views are unchanged, and the gate still records the type check.
+
+**Files:**
+- `scripts/test_times/show.py` — ranked rows and the footnote
+- `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
+- `commands/test_times.md` — the `top` description
+
+
+### Phase 111 — A targeted test runs only what the unit's own change can reach  · status: done
+
+#### As-built
+
+- `select_affected` in `scripts/production/affected_modules.py` builds its base candidates from the certified base, when one exists, and `git merge-base HEAD refs/remotes/origin/<branch>` for each branch of `landing_branches` in `config/merge_gate.conf`. A missing ref or a branch with no common ancestor gives no candidate.
+- It compares each distinct commit once and takes the candidate with the fewest changed paths. On a tie the certified base comes first, then the config order. With no candidate the result is `FullSuite("no certified base")`.
+- A landing candidate is a `CertifiedBase` with its committer time, so `report_selection` prints it unchanged. Each landing passed a merge gate that runs all modules, so landed work is not this unit's change.
+- `SuiteMode.MERGE_GATE` still runs all modules. Dirty paths, removed-file facts, the module rules and the fact cache are unchanged, and `merge_gate.py` and `cloud_gate.py` take no edit.
+- Replay of 19 landings on `builds`: the old rule selects a median 692 of 743 modules and 5193 CPU s, and the new rule a median 6 modules and 78 CPU s (mean 72 modules, 642 CPU s).
+
+**Files:**
+- `scripts/production/affected_modules.py` — the base choice
+- `config/merge_gate.conf` — `landing_branches`
+- `docs/as-built/merge-gate-and-test-speed.md` — the base rule, its reason and the fallback
+- `scripts/production/test_affected_modules.py` — landing bases, a merge with a landing branch, a dirty file at the tip, and candidate priority
+- `scripts/production/test_targeted_test.py` — the fixture sets a private branch list
+
+**Gotchas:**
+- An edit of `config/merge_gate.conf` alone selects 429 modules through the approved transitive config rule.
+- A missing `landing_branches` key gives a full suite through the graph-error result.
+
+**Ruled out:**
+- The import closure in place of the same-folder rule: replay selects more modules (596 against 426 on one 39-file run).
+
+
+### Phase 112 — A targeted test skips folder neighbors that do not name the changed file  · status: done
+
+#### As-built
+
+- In `select_affected` in `scripts/production/affected_modules.py`, a changed non-test Python file selects a test module of its folder only when that module's text holds the file's stem as a whole word. Imports, strings and comments each count. Removed files count.
+- The selector reads the text only for a module in such a folder that no earlier rule selected. A read or decode error gives the existing graph-error result.
+- The other module rules, the base choice and the fact cache are unchanged.
+- Replay of 19 landings on `builds`: mean 91 to 68 modules, mean 768 to 590 CPU s, median 77 to 64 CPU s. With no folder rule at all the mean is 67 modules and 581 CPU s.
+
+**Files:**
+- `scripts/production/affected_modules.py` — the folder rule
+- `scripts/production/test_affected_modules.py` — the changed rows and the new rows
+- `scripts/production/test_targeted_test.py` — the fixture's folder neighbor names the changed file
+- `docs/as-built/merge-gate-and-test-speed.md` — the fourth rule
+
+**Gotchas:**
+- A test that reaches a changed sibling only through a helper, and does not name it, is not selected. The merge gate still runs it.
+- The transitive config rule now holds most of the targeted cost: two `config/lint.conf` edits ran 580 modules each, 86% of the replay's CPU. A question to the user about it is open.
+
+**Ruled out:**
+- A measured per-module file map: the name check keeps nearly the same gain with much less work.
+- Config selection by changed key: replay gain is small (590 to 569 CPU s), because `scripts/lint/sweep.py` alone reaches 477 test modules by imports.
+
+
+### Phase 113 — A private admission server costs less to start and to keep running  · status: done
+
+#### As-built
+
+- `ObservedAdmissionServer` in `scripts/build_queue/admission_test_support.py` keeps one class-level record of source paths, keyed by the count of `sys.modules`. A fixture start with an unchanged count stamps the kept paths and resolves none.
+- `SERVING_POLL_SECONDS` is 0.05. `serve()` marks its thread with `serves_loop`, and `serving()` wakes the loop at stop through `wake_loop`.
+- `loop_turn` takes `turn_gate` at depth 0, wakes the loop when the caller is not the loop thread, then takes `loop_access`. A nested call skips `turn_gate`.
+- `wake_loop` and `close` both hold `wake_lock`, so a wake cannot write a descriptor that a restart closed.
+- Same-load measurement, three rounds: setup plus close 13.4-13.7 ms to 6.0-6.3 ms, idle loop 1.8-3.3 ms/s to 1.1-1.7 ms/s, median turn wait 7.04 ms to 0.02-0.03 ms. Gate estimate: about 27 of 3,056 CPU s.
+
+**Files:**
+- `scripts/build_queue/admission_test_support.py` — the poll value, the path record, the turn gate and the wakes
+
+**Gotchas:**
+- Shared fixtures are a small part of a gate. Python child processes are 57% of gate CPU, and the helper chain per `verify.sh` call is about 18%.
+
+**Ruled out:**
+- Rewriting the process scans with `os` calls: it saves 23%, because the kernel read of each process environment is 77% of a scan.
+
+### Phase 114 — A test that starts Python for one function stops loading what the function does not use  · status: done
+
+#### As-built
+
+- `test_each_module_uses_a_temporary_log` in `scripts/buildlog/test_index.py` runs one `lib/py -c` parent. The parent imports each production module named on its command line, with no `try`, then forks one child per test module. Each child imports its test module and prints `store.root()`. The production list comes from the folder listing, without `test_*.py`, `*_test_support.py` and `__init__.py`. Children run one at a time, so wall time rises from 7.1 s to 16.0 s and CPU falls.
+- `CliWork`, `MeasuredCliRun`, `probe_cli` and `measure_cli_work` live in `scripts/buildlog/cli_probe_test_support.py`. `test_report.py` and `test_mac_report.py` import them. The host is read in the parent under `mock.patch.dict(os.environ, environment, clear=True)`.
+- `configured_host_cli` in `test_memory_window.py` receives `configured_local_host()!r` from the parent, and its bootstrap imports only `store`.
+- The fake child in `scripts/mac_test/test_linux_runner.py` matches `argv[1] == "-c"` with `sweep.sweep_workspace` in `argv[2]`, and yields to `use_real_sweep`. Four tests keep `use_real_sweep = True`.
+- Same-load pairs, three rounds, median CPU s: `test_index` 30.7 to 12.0, `test_linux_runner` 27.3 to 13.3, `test_report` 24.8 to 23.1, `test_mac_report` 15.7 to 12.8, `test_memory_window` 7.6 to 7.5; total 106.1 to 68.7. The test names and assertions are the same.
+
+**Files:**
+- `scripts/buildlog/test_index.py` — the preloaded parent and its forked children
+- `scripts/buildlog/cli_probe_test_support.py` — the shared CLI probe helpers
+- `scripts/buildlog/test_report.py`, `scripts/buildlog/test_mac_report.py` — use the shared helpers
+- `scripts/buildlog/test_memory_window.py` — the small CLI bootstrap
+- `scripts/mac_test/test_linux_runner.py` — the fake child match
+
+**Gotchas:**
+- Index isolation must keep a separate test-module import in each child. Sharing that import removes what the test proves.
+- Floors per site, by the largest import: `scripts.buildlog.report` 0.41 s, `scripts.buildlog.memory` 0.19 s, style `queue_place` 0.146 s, statusline `update_registration` 0.30 s, `scripts.accounts.accounts` 0.12 s. Each lower cost needs a production import change.
+- Blanket no-op helpers in `verify.sh` make every test red. Per helper, `record.py` and `progress_history.py` stay green at 171 CPU s per gate, `tree_watch` fails four lint scope tests, and `step_record` is required.
+
+**Ruled out:**
+- A style CLI helper split: 206-249 ms per start against 225-247 ms, because the fake must import `queue_place`.
+- Bytecode work: compiling the whole tree costs 3.4 CPU s, and main-script compile across all starts costs 67.3 CPU s.
+- A preloaded Python start server: tests inspect real process trees, signals and process groups.
+- A test-only path in `verify.sh`: it breaks the one-way rule.
+
+### Phase 115 — Measurements show how much CPU each cheaper Python start saves, and which tests each breaks  · status: done
+
+#### As-built
+
+- This phase is research. No repository file changed for it, and no prototype landed.
+- Each start variant has an estimate: the paired per-start CPU difference of the top 20 commands, multiplied by the start counts of the baseline survey. The estimates cover startup, imports and compile for those 20 commands only.
+
+| Variant | CPU s saved per gate | At cloud factor 1.62 | New failures |
+| --- | ---: | ---: | --- |
+| Preloaded parent | 474.5 | 768.7 | 36 entries, 7 modules missing |
+| `-S` | not established | not established | 49, and two 1,800 s timeouts |
+| `-I` | 7.5 | 12.1 | 130 entries, 16 modules missing |
+| `-I -S` | 26.4 | 42.7 | 139 entries, 15 modules missing |
+| Warm bytecode | 19.1 (14.8 net) | 31.0 | 0 |
+| Thin entry scripts | 80.3 | 130.1 | 136 entries, 2 modules missing |
+| Delayed shared imports | 186.7 | 302.4 | 0, and 1 module incomplete |
+
+- A native survey of 740 of 744 modules records 4,975 CPU s. The interpreter alone costs 13.6 ms per start, 8.6 with `-S`, 12.6 with `-I` and 7.95 with both.
+- The routes that start Python: `lib/py` 22,281 execs, an absolute path, `sys.executable` or a shebang 11,885, Python on `PATH` 2,791, and other absolute paths 1,160.
+- One `progress_history.py` start costs 40 ms for standard-library imports, 140 ms for repository imports and 50.6 ms for main-script compile. Its large dependencies are `plan_history`, `session_staff` and `phase_reservation`.
+- The delayed-imports pilot used the standard-library `LazyLoader` over 309 production modules. It saved 100.5 CPU s across 58 matched passing modules, 1,610.1 to 1,509.6.
+
+**Files:**
+- `docs/plans/builds-natest.md` — this record
+
+**Binds later work:**
+- Delayed shared imports is the only variant that keeps tested behavior and has a large saving. It lands in the small form, with one start path for tests and real use.
+- `scripts/direct/test_review_launcher.py` timed out under the pilot, and its cause is not known.
+- The typing and thread behavior of the pilot's `LazyLoader` are not verified.
+
+**Gotchas:**
+- One whole-gate pair takes 45 minutes and about 10,000 CPU s.
+- The whole-gate confirmation of the preloaded parent stopped with SIGTERM twice, at 94 of 744 modules. The sender is not known.
+- `-S` runs need the startup hook. Without it, a pair shows hook failures, so its raw difference of 131 CPU s is not a saving.
+- One failure entry can be a module import failure and not one test.
+- A process name can hold invalid UTF-8 bytes, so a measurement tool must decode with replacement.
+
+**Ruled out:**
+- A preloaded parent: it breaks process ancestry, PID ownership, signals, process groups, startup hooks and pipe ownership.
+- `-S`, `-I`, `-I -S` and thin entry scripts: 49 to 139 new failures for 7 to 80 CPU s.
+- Warm bytecode: 14.8 CPU s net, which is too small to justify a preparation step.
+
+### Phase 116 — A targeted test run selects every test that reads a changed file as text  · status: done
+
+#### As-built
+
+`names_changed_file(graph, path, changed, folder_names)` in `scripts/production/affected_modules.py` decides whether a test names a changed file as text. A source names the file when one of its tokens equals the whole path, or when a token equals the base name and the source sits in the file's folder or holds a token equal to the folder name. The sources of a test are the test module and each `*_test_support.py` module it reaches through test-support imports; production modules are not followed. `select_affected` builds `folder_names` from the changed paths, so a file at the repository root matches by whole path only. The rule uses the existing tokens and imports: the extractor, `CACHE_FORMAT_VERSION` and `EXTRACTOR_VERSION` are unchanged, and the selector adds no parse and no Git process.
+
+Replay over the last 20 first-parent merges on `origin/builds`, one graph from the current tree: a mean of 16.45 added modules per landing and a maximum of 107 (73 to 180, and 20 to 127). No merge loses a module. The changed set `{scripts/direct/verify.sh}` selects 147 modules, 4 before, and includes `direct/test_verify_lint_output.py`.
+
+**Files:**
+- `scripts/production/affected_modules.py` — `names_changed_file` and its call in `select_affected`
+- `scripts/production/test_affected_modules.py` — rows in `test_complete_path_tokens_select_only_the_test_that_names_the_path`
+- `docs/as-built/merge-gate-and-test-speed.md` — selection rule 3 and the summary
+
+**Gotchas:** A name used only by a fake command also selects the test; the largest additions come from `build_targets.py` and `targets.py` names in verify test-support modules. A folder scan does not name a file: 26 direct test modules scan repository folders, and `targeted_test.py --full` is the full-coverage check for those changes.
+
+**Ruled out:** following production modules for names, because `test_indirect_path.py` must stay unselected; a new source fact or cache version.
+
+### Phase 117 — Scripts and tests start faster because the heaviest shared imports load only when used  · status: done
+
+#### As-built
+
+Four shared imports load at the function that uses them: `unit_lookup` in `read_production` of `scripts/direct/phase_table.py`, `findings` in `_review_trial` of `scripts/direct/progress_history.py`, and `offload` and `buildlog.sync` in each function of `scripts/mac_test/mac_test.py` that uses them. `mac_test.py` keeps `offload` under `TYPE_CHECKING` for its annotations. A whole-gate pair at the same load, phase base against the change, measured 5161.3 to 5122.7 CPU s: 38.7 CPU s saved per gate, above a modeled noise of 26.6 s. Both sides ran 746 modules and 18,556 tests with no missing result and no signal stop.
+
+**Files:**
+- `scripts/direct/phase_table.py` — delayed `unit_lookup` import
+- `scripts/direct/progress_history.py` — delayed `findings` import
+- `scripts/mac_test/mac_test.py` — delayed `offload` and `buildlog.sync` imports
+- `scripts/copies/test_review_remote_copies.py` — patches `scripts.mac_test.offload`, the package import target
+
+**Gotchas:** A test that patches a delayed import patches the package attribute, not the old module-level name. Shared import costs overlap, so a ranking by single-import CPU overstates the saving by about half. Readiness-deadline tests can error under whole-gate load on either side of a pair. The SIGTERM that stopped earlier whole-gate runs came from the user systemd manager, through the preloaded design's scope cleanup.
+
+**Ruled out:** a repair for the `test_review_launcher.py` timeout, because it did not reproduce; deferral of imports below 5 CPU s per gate.
+
+### Phase 118 — The test_times report tests pass on every date  · status: done
+
+#### As-built
+
+`REPORT_PROCESS` in `scripts/test_times/test_show.py` replaces the report module's `datetime` with a subclass whose `now` returns the time in `TEST_REPORT_EPOCH`. `report_process` sets `TEST_REPORT_EPOCH` to `EPOCH + 300`, the time the in-process `ReportTime` returns. The report child and the in-process tests use the same fixed clock, so the module passes 33 of 33 tests on every date. The first-report test expects the same-day stamp `rows as of 09:30 EST`; the module-report stamp test keeps the other-day stamp.
+
+**Files:**
+- `scripts/test_times/test_show.py` — the report child's fixed clock
+
+**Gotchas:** A patch of `show.datetime` in the parent does not reach a child process; every child report needs `TEST_REPORT_EPOCH`. A fixed fixture date with the seven-day `TOP_MAX_AGE_DAYS` window fails seven days after that date when the clock is real.
+
+**Ruled out:** fast track for this file, because it refuses Python files that import `scripts/production/staff.py`.
+
+### Phase 119 — A targeted test with no selected module ends at once and starts no cloud box  · status: done
+
+#### As-built
+
+A targeted test with no selected module ends at once and starts no cloud box. With requested type checks, it runs them locally.
+
+- `select_targeted_modules(repo, tested_tree, modules, *, source="tests-only")` in `merge_gate.py` is the one targeted selection. It returns the selection and its `PassedTreeLedger`.
+- `TreeSelection(paths, tree)` holds the selected paths and the Git tree that the selection read. `AllModules` asks for every discovered module.
+- `run_gate_suites` selects before `cloud.route`. An empty selection reuses or records its ledger pass, records the gate run, and returns a certified `GateRun` with no modules.
+- `cloud_gate.prepare` takes `selected: AllModules | TreeSelection`, and raises `GateRefused` before any request or bundle when its snapshot differs from `selected.tree`. `run_cloud` includes the modules and the selection tree in its identity.
+- A local fallback calls `run_suites` without `selected`, so it selects again against its own tree.
+
+**Files:**
+- `scripts/production/merge_gate.py` — selection, `TreeSelection`, `CloudGateRoute`, the empty return.
+- `scripts/aws_target/cloud_gate.py` — the tree check and the selected paths.
+- `scripts/production/test_merge_gate_suites.py`, `scripts/aws_target/test_cloud_gate.py` — empty selection, tree change during reservation, and fallback rows.
+
+**Binds later work:** a queue merge-gate step merges builds first, keeps selection before `cloud.route`, and keeps the empty return, requested local type checks and fallback selection.
+
+**Gotchas:** the cloud reservation can wait, so a fact computed before it must carry its tree. The targeted test runs main's gate code, so a real cloud run of the empty path is unproved until this code is on main.
+
+**Ruled out:** passing the old selected paths to the local fallback.
+
+### Phase 120 — Test fixtures stop starting Python to check the version  · status: done
+
+#### As-built
+
+A whole gate starts 997 interpreter version checks instead of 3,351. At a paired cost of 20.83 ms per check, this removes about 49 CPU s per gate on natedev and about 78 on a cloud box.
+
+- `scripts/lib/py` runs its version check (`new_enough`) when the interpreter cache file is absent or `CLAUDE_PYTHON` is set. A set `CLAUDE_PYTHON` skips the cache.
+- `interpreter_cache_environment(cache_home)` in `scripts/lib/py_floor_test_support.py` seeds the cache with `seed_interpreter_cache` and returns `{"XDG_CACHE_HOME": ...}` for a fixture's environment.
+- Fixtures that start scripts through the launcher in a temporary home seed the cache. Fixtures that set `CLAUDE_PYTHON` only to find Python drop it, and pop an inherited value inside their `patch.dict`.
+- These fixtures keep their interpreter setting because their tests check it: the hold family (its shell reads `PY=$CLAUDE_PYTHON`), observer and stub interpreters, the floor, root and shim fixtures, cold-cache and too-old tests, and the explicit interpreters of the override-guard, settings and merge-checkpoint fixtures.
+
+**Files:**
+- `scripts/lib/py_floor_test_support.py` — `seed_interpreter_cache`, `interpreter_cache_environment`.
+- Test modules and support files in `scripts/` agents, build_hold, build_queue, build_targets, direct, hana_shot, hooks, lib, lint, mac_test, message, production, review_links, settings, style, test_times, usage, whoami and worktree — seed or drop per fixture.
+
+**Binds later work:** the approved `scripts/style/style_sync.py` ledger change (one `style_ledger.open_ledger` around the `lint` record loop, `RuleValidationError` and `sqlite3.Error` in the `except`, no `LEDGER` constant or `diagnostic_file` write) is not in this phase.
+
+**Gotchas:** an inherited `CLAUDE_PYTHON` makes a seeded cache useless; pop it inside the fixture's `patch.dict` so cleanup restores it.
+
+**Ruled out:** a test-only start path in `scripts/lib/py`; a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
+
+### Phase 121 — Board helpers and the style lint record stop starting Python  · status: done
+
+#### As-built
+
+`flatten()`, `lock_guard()` and the `style_sync.py lint` record loop start no Python process. The estimated saving is about 42 CPU s per gate on natedev: 28.4 from the two board helpers (paired per-call cost times the Phase 115 whole-gate call counts) and 13.5 from `style/test_style_sync.py` (median 44.0 to 29.5 CPU s in `module_cost.py` pairs).
+
+- `flatten()` in `scripts/direct/board.sh` uses bash parameter expansion. It replaces newline, CR and tab with a space, removes each character outside `[[:print:]]`, and cuts to `MAX_MESSAGE_CHARS` characters. It pins a UTF-8 locale in a `local LC_ALL` (C.UTF-8, then en_US.UTF-8, then UTF-8), so text keeps its non-ASCII characters in a C or empty caller locale.
+- `lock_guard()` opens descriptor 9 in the shell and takes `flock(LOCK_EX|LOCK_NB)` with one perl call; perl exits 75 when the lock is busy. The shell keeps the lock after perl exits. The return codes do not change. It finds perl on PATH, then at `/run/current-system/sw/bin/perl` and `/usr/bin/perl`, as `scripts/lib/py` does for python3, so a caller with a cut PATH (`test_verify_lint_tool_failures`) still gets the guard.
+- `style_sync.py lint` opens `style_ledger.open_ledger(repo)` once, only when records exist, and calls `ledger.lint_record` per record. `main` also catches `rule_catalog.RuleValidationError` and `sqlite3.Error`. The `LEDGER` constant and the diagnostic file are gone; `style_ledger.py lint-record` stays.
+
+**Files:**
+- `scripts/direct/board.sh` — `flatten`, `lock_guard` (owner sdlc).
+- `scripts/direct/test_board_text.py` — Unicode and limit rows in the inherited, C and no-locale cases.
+- `scripts/style/style_sync.py`, `scripts/style/test_style_sync.py` — in-process lint records (owner style unit).
+- `docs/as-built/build-memory-admission.md` — the perl guard line.
+
+**Gotchas:** bash `[[:print:]]` and `${#text}` follow the locale; a launchd job or an `env -i` child has none. perl resolves from the `verify.sh` PATH: `/run/current-system/sw/bin/perl` on natedev, `/usr/bin/perl` on the Mac. The locale rows did not run on the Mac (SSH timed out).
+
+**Ruled out:** a whole-gate paired timing for this gain, because its noise is about 27 CPU s.
+
+### Phase 122 — Progress records start faster because the staff and plan imports load only when used  · status: done (declined)
+
+#### As-built
+
+Declined by the builds showrunner on 2026-11-10: the gain is under the 30 CPU s per gate bar. Checkpoint `8c9858589` was reverted by `25ec7c5ef`; the code is unchanged.
+
+- Change measured: `progress_history.py` and `plan_history.py` imported the staff, plan, reservation and worker modules inside the functions that use them, with type-only imports under `TYPE_CHECKING`.
+- `import scripts.direct.progress_history` went from about 87 ms to about 45 ms.
+- Paired CPU per start, minimum of 30 pairs on natedev under load: `start-wait` 132.5 to 106.2 ms, `finish-wait` 136.1 to 108.3, `start-activity` 132.7 to 108.3, `finish-activity` 133.7 to 105.0, `review-trial` 137.0 to 115.6. The saving is 21-29 ms per start, about 20 CPU s per gate at 772 starts.
+- The probe estimate (about 47 ms per start) was too high: every state read still loads `staff` (about 17 ms) for the run owner, and `models_registry` (about 14 ms) loads for a module constant.
+
+**Ruled out:** a recorder import phase while every state read needs `staff`; a larger gain needs a recorder that does not resolve the owner through staff on each start.
+
+### Phase 123 — A changed shell script selects the tests of the scripts that call it  · status: done
+
+#### As-built
+
+A changed shell script now selects the tests of every script that calls it, directly or through other scripts. A `board.sh` change selects `test_verify_lint_tool_failures`, the test the Phase 121 repair missed.
+
+- `script_callers` in `scripts/production/affected_modules.py` seeds from the changed scripts (non-Python files under `scripts/` that end in `.sh` or have an execute bit, removed `.sh` files included). It adds each script that calls a member until no new caller is found.
+- `calls_script` counts a call by the test rule (`names_path`: the full path, or the name with its folder), by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the caller's own folder (`"$SCRIPT_DIR/board.sh"`).
+- Tests select by the unchanged test rule against the changed files plus the closure. Python files are not callers. Script text is read only when a changed script exists; the fact cache does not change. The closure costs 40-50 ms per selection.
+- Selection, before and after, of 745 modules (recorded median CPU, full suite 5,075 s): `board.sh` 117 to 264 modules and 1,358 to 2,905 CPU s; `lint` 152 to 264; `build_hold/cargo` 115 to 267; a Python-only change 5 to 5. About 260 tests run `verify.sh`, which sources `board.sh`.
+
+**Files:**
+- `scripts/production/affected_modules.py` — `path_tokens`, `folder_names_of`, `names_path`, `is_script`, `calls_script`, `script_callers`.
+- `scripts/production/test_affected_modules.py` — the call-chain test, with sibling, full-path, executable, fragment, other-folder and Python rows.
+- `docs/as-built/merge-gate-and-test-speed.md` — the targeted selection lines.
+
+**Gotchas:** `~/.claude/scripts/lib/py -m` imports main's code from a worktree; run local tests with the worktree's `scripts/lib/py`.
+
+**Ruled out:** Python files as callers (a `board.sh` change would select 521-575 modules). A changed Python file that a shell script runs still selects only its importers and the tests that name it.
+
+### Phase 124 — Test modules start faster because three test-support files load their heavy imports only when used  · status: done
+
+#### As-built
+
+Three test-support files load their heavy imports at the function that uses them, in the phase 117 form. `memory_test_support.py` imports `read_memory_config` in `admission_configuration_fixture`. `queue_fixture.py` imports `roster` and `UnitLabels` in `QueueFixture.__init__`, and `head_facts` and `queue_view` in `model`; it keeps `queue_view` and `UnitLabels` under `TYPE_CHECKING`. `admission_test_support.py` imports `step_estimator` in `history`. A paired import scan of 745 gate test modules, phase base against the change, measured 149.8 to 117.0 and 143.2 to 115.2 CPU s: about 30 CPU s saved per gate. 440 modules load less, and the classes built fell from 428,232 to 322,648. The targeted gate passed 109 of 109 modules.
+
+**Files:**
+- `scripts/lint/memory_test_support.py` — delayed `admission_records` import
+- `scripts/build_queue/queue_fixture.py` — delayed `roster`, `unit_labels`, `head_facts` and `queue_view` imports
+- `scripts/build_queue/admission_test_support.py` — delayed `step_estimator` import
+
+**Gotchas:** Dataclass creation is about two thirds of test-module import CPU, so a cut is worth the classes it skips. `-X importtime` names only the first loader of a module; use paired CPU scans to rank a cut.
+
+**Ruled out:** a dataclass code cache in the module runner, because it replaces a private stdlib name; a delayed `pane_record` import in `staff_test_support.py`, because its isolation patches `RECORD_DIR` only when that module is already loaded.
+
+### Phase 125 — Message sends and test modules start faster because roster, pane records and unit lookup load the herdr client only when they call it  · status: done
+
+#### As-built
+
+New `scripts/herdr/herdr_types.py` holds the one definition and the one import path of `HerdrFailure`, `HerdrMissing` and `NATIVE_ID_MARKS`. `herdr.py` imports them for its own use and does not re-export them; all 53 caller files, production code and tests, read them from `herdr_types`. `roster.py`, `pane_record.py` and `unit_lookup.py` take `HerdrPlace` from `place.py`, keep annotation-only names under `TYPE_CHECKING`, and import `herdr` in each function that calls the client. Importing any of the three loads no `scripts.herdr.herdr`. A paired import scan of 745 gate test modules found 201 modules that load less, and the classes built fell from 322,685 to 304,696. Those modules saved 8.3 and 5.8 CPU s, about 7 CPU s per gate. A roster read, which each `send.py` roster lookup pays, saved 31-41 ms of a 258-302 ms median at host load above 40.
+
+**Files:**
+- `scripts/herdr/herdr_types.py` — new; failure types and native ID marks
+- `scripts/herdr/herdr.py` — imports the moved names; no re-export
+- 53 caller files across `production`, `herdr`, `agents`, `message`, `accounts`, `hooks`, `direct`, `lib` and `hana_instances` — read the moved names from `herdr_types`
+- `scripts/message/roster.py`, `scripts/agents/pane_record.py`, `scripts/production/unit_lookup.py` — delayed `herdr` imports
+- `scripts/herdr/test_herdr.py`, `scripts/production/unit_status_test_support.py` — isolated-copy lists add `herdr_types.py`
+- `scripts/production/test_unit_lookup.py` — reads `unit_lookup.HerdrPlace`
+
+**Gotchas:** One owner switches all callers: a re-export kept for old callers is a forbidden shim (builds, 2026-11-10). `staff.py` loads `herdr_types` through its lazy `import_module` form. A test that copies `herdr.py` to an isolated folder must also copy `herdr_types.py`. `send.py` loads `roster` lazily, so its bare start does not change. The `-X importtime` self cost overstated the gain by about half, because other paths still load part of the same closure.
+
+**Ruled out:** a split of `admission_records.py` now, because alone it is under the bar and the queue unit has phases there; it is in the next items.
+
+### Phase 126 — A targeted test reads the same working tree each time, so its cloud snapshot check no longer fails at random  · status: done
+
+#### As-built
+
+A private copy of the git index now keeps the mtime of the bytes it copies, so git keeps its racy-entry check. Before, `cloud_gate.working_tree` used `shutil.copyfile`. The copy got a new mtime, and git skipped a same-size edit made in the clock tick of the last index write. This gave the flaky `test_merge_gate_suites` tree mismatch. In 3,300 local repeats, `copyfile` gave 6 stale trees, and a copy that keeps the mtime gave none. New `scripts/lib/git_index.private_copy(source, destination)` opens the index once, takes `fstat` of that file, copies its bytes, and sets the copy's mtime from the same `fstat`. All six Python private index copies call it. `validate_ci.sh` `worktree_tree` copies from one file descriptor and takes the time with `touch -r /dev/fd/3`.
+
+**Files:**
+- `scripts/lib/git_index.py` — new; `private_copy`
+- `scripts/aws_target/cloud_gate.py`, `scripts/hooks/checkpoint_gate.py` (two copies), `scripts/lib/models_registry.py`, `scripts/copies/copies.py` (`staged_tree`), `scripts/style/style_footprint.py` (`worktree_commit`) — call `private_copy`
+- `scripts/validate_and_push/validate_ci.sh` — descriptor copy; ShellCheck removed two unused bindings
+- `scripts/aws_target/test_cloud_gate.py`, `scripts/lib/test_git_index.py`, `scripts/validate_and_push/test_rerun.py` — one regression each; each fails with the old copy
+
+**Gotchas:** `shutil.copy2` is not enough. It stats the path again after the read, and git replaces the index by rename, so a rewrite between the two gives old bytes with a newer mtime. Do not copy a git index with `cp` or `shutil.copyfile`; use `git_index.private_copy`. The macOS run of the `validate_ci.sh` regression is not verified.
+
+### Phase 127 — A config edit selects only the tests that really read that config file  · status: done
+
+#### As-built
+
+Config reads are recorded at run time. When the environment has `CONF_READ_LOG`, each read through `conf.py` or `conf.sh` appends the config stem to that file with one append write; without the variable, the readers do no added work. `module_run.py` sets the log per module, so child processes inherit it, and writes the sorted stems to the module's times file as `config_reads`. The gate record and the build log index (schema 37, `gate_modules.config_reads`) carry them. A module with no times file has no record (NULL), which is different from an empty list.
+
+`affected_modules.select_affected` selects, for each changed `config/<name>.conf`:
+- the modules that recorded `<name>` in the newest full, non-aborted gate with at least one config record (`latest_config_reads`); a newer gate without records does not replace it;
+- the modules with no record in that gate;
+- the modules whose own text names the file (direct `SourceFacts.config_reads`).
+
+The transitive config closure is deleted. An index read error gives `FullSuite` with a reason. On 19 builds merges, the estimate is targeted CPU 17,861 to 10,042 CPU s (median 280 to 126 per merge); selection takes under 3 s.
+
+**Files:**
+- `scripts/lib/conf_reads.py` — new; the recorder (`record`, `read_text`), standard library only
+- `scripts/lib/conf.py`, `scripts/lib/conf.sh` — record each read
+- `scripts/test_times/module_run.py`, `scripts/test_times/gate_record.py`, `scripts/buildlog/index.py` — carry the records
+- `scripts/production/affected_modules.py` — `latest_config_reads`, `select_affected`
+- Nine direct config readers read through `conf_reads.read_text`
+
+**Gotchas:**
+- `conf_reads.py` binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not catch the record.
+- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`. The Mac context-economy payload ships both.
+- Nine raw readers do not record: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, the `models_registry.py` edit snapshots and `deploy.py`.
+- A new reader is missed until the next full gate records it.
+
+**Ruled out:** the transitive closure rule of Phase 96 — one `merge_gate.conf` edit selected 429 of 743 modules.
+
+### Phase 128 — Test runs start no background Git upkeep  · status: done
+**Depends on:** Phase 127
+
+#### As-built
+
+- No repository change. The trial gained 2.8 CPU s on the 21 most Git-heavy modules, far under the 30 CPU s bar, and did not land.
+- The trial: `module_run.py` appended `maintenance.auto=false` and `gc.auto=0` through `GIT_CONFIG_COUNT`, one fixture helper kept those settings, and nine per-fixture copies were removed. Review closed four findings, and the full gate passed (748 modules).
+- Measure: `module_cost.py --commands` on 21 Git-heavy modules, base and change side by side. Command CPU 451.3 to 448.5 CPU s, Git CPU 92.1 to 90.2 CPU s, Git starts 82,028 to 79,432 (3%). No measured row was a detached `gc` or `maintenance` task.
+- Floor: the per-fixture copies already turned off most upkeep. The Work Order estimate (about 50 CPU s on 12 modules) did not hold on this base.
+
+**Ruled out:** a runner-wide Git upkeep setting for speed. Keep the per-fixture copies; several of them are race guards for fixture removal.
+
+### Phase 129 — Every config reader records its read, so a config edit selects its tests  · status: done
+**Depends on:** Phase 128
+
+#### As-built
+
+- Nine config readers record each config file they read in the `config_reads` record that `module_run.py` writes per module. The targeted selector uses that record to pick the tests that read an edited config file.
+- Shell readers call `conf_record <stem>` from `scripts/lib/conf_record.sh`. It is POSIX, appends to `CONF_READ_LOG` with builtins only, and starts no process. `conf.sh` sources it, and `conf_value` calls it.
+- `statusline.sh` sources the recorder only when `CONF_READ_LOG` is set. It records `statusline` and the stem of the zone file it reads.
+- `lint_config.sh` and `verify.sh` `lint_code_key` record the stem of the lint file they read. `verify.sh` sources only `conf_record.sh` before `lint_code_key`; its `conf.sh` source stays before `TOKEN_HOLD_S`.
+- Python readers: `progress_history.py` (`direct`), `new_account.py` (`statusline`), `tune.py` (the source stem) and `models_registry.py` (`models`, once before its snapshot reads) call `conf_reads.record`. `zone.py` and `deploy.py` read through `conf_reads.read_text`.
+- Test rows prove the record in `test_conf_sh.py`, `test_statusline.py`, `test_new_account.py`, `test_progress_history.py`, `test_deploy.py`, `test_models_registry.py`, `test_invoke_scope.py` and `test_verify_lint_cache_versions.py`. The lint-cache row routes the log only around `lint_code_key` in its own harness script, so the Clippy reader cannot satisfy it.
+- Raw reads that still record nothing: `production/dailies_counts.py` `read_specs`, generic file hashing in `direct/tree_watch.py` and `direct/progress_history.py`, and fixture readers in `findings_test_support.py`, `assign_launcher_test_support.py`, `rename_unit_test_support.py`, `memory_test_support.py` and `offload_test_support.py`.
+
+**Files:**
+- `scripts/lib/conf_record.sh` — the shell recorder.
+
+**Gotchas:**
+- Seven fixtures copy shell helpers one by one, and each must also copy `conf_record.sh`: `assign_claude_test_support.py`, `review_launcher_test_support.py`, `test_board_start.py`, `test_verify_nix_shell.py`, `test_verify_run_place.py`, `test_process_group.py` and `test_settings_local_keys.py`.
+- `verify.sh` runs top-level code before the nix re-exec, and some fixtures copy `verify.sh` alone. Source only `conf_record.sh` there, never `conf.sh`.
+
+**Ruled out:** rows for `tune.py` and `zone.py`, because the parsed read in the same call records the same stem; a test-only read-log branch in `verify.sh`.
+
+### Phase 130 — A test that scans repository folders runs when a file in those folders changes  · status: done
+**Depends on:** Phase 129
+
+#### As-built
+
+- `module_run.py` installs the `RepositoryFolderScans` audit hook when a times file is requested. It records `os.scandir` and `os.listdir` listings inside the running checkout as repository-relative folders (`.` for the root), and skips listings made by the import system. A `git ls-files` child process (with or without `-C`) records each pathspec as a recursive prefix with a trailing `/`; no pathspec records `/`, the whole repository. The sorted set is `folder_scans` in the times JSON; `[]` means no scan.
+- `gate_record.py`: `ModuleReadRecord` holds `config_reads` (`RecordedConfigReads | NoConfigReadRecord`) and `folder_scans` (`RecordedFolderScans | NoFolderScanRecord`). `module_read_record` is the one reader of both stored fields.
+- `buildlog/index.py` schema 38 adds `gate_modules.folder_scans` (sorted JSON; NULL means no record).
+- `affected_modules.py`: `latest_module_reads` reads each field from its newest full, non-aborted gate that has it. A listed folder selects its lister only when an added or removed path has that folder as its parent (`changed_path_parents`; a path in a new folder uses its nearest ancestor that exists at the base). A recursive prefix or `/` selects its module for any changed path under it (`scans_changed_paths`). A module with a NULL folder record is selected; with no gate that has folder records the rule selects nothing.
+- Measured on the first cloud full gate: 327 of 748 modules scan folders (about 3,100 of 4,584 CPU s), 288 list `config/` through `scripts/lint/memory_test_support.py`, and only `agents/test_no_old_model_names.py` records `/`. Over the last 10 builds merges the selection grew from 1,321 to 1,380 modules (11,344 to 11,683 CPU s); each change under `scripts/`, `docs/` or `commands/` now selects `production/test_staff_accessors.py` and `production/test_roles_audit.py`.
+
+**Files:**
+- `scripts/test_times/module_run.py` — the folder audit hook.
+- `scripts/test_times/gate_record.py` — `ModuleReadRecord` and its reader.
+- `scripts/buildlog/index.py` — the `folder_scans` column.
+- `scripts/production/affected_modules.py` — the combined reader and the folder rule.
+
+**Binds later work:** the stored folder strings (`.` root, `/` whole repository, trailing `/` recursive) are the inputs that "A test that reads the files it finds in a folder runs when one of those files changes" decodes into named states.
+
+**Gotchas:**
+- Each targeted selection reads the module records (1.2-2.6 CPU s), and the first index update on a host after the schema change rebuilds the index (99 CPU s on natedev).
+- Listings in child processes and Git listing commands other than `ls-files` record nothing.
+- A test that patches `os.path.realpath` counted the hook's own calls until the hook bound its functions at install time.
+
+**Ruled out:** selecting a lister on a content change in its listed folder, because 288 modules list `config/` and the rule selected all of them for each config edit.
+
+### Phase 131 — A test that reads the files it finds in a folder runs when one of those files changes  · status: done
+**Depends on:** Phase 130
+
+#### As-built
+
+- `module_run.py`'s `RepositoryReadAudit` records each read-mode `open` of an existing regular file inside the checkout as a repository-relative path. It skips `config/`, `__pycache__/` and opens made by the import system. The sorted set is `content_reads` in the times JSON; `[]` means no read.
+- `gate_record.py`: `ModuleReadRecord` adds `content_reads` (`RecordedContentReads | NoContentReadRecord`). `module_read_record(configs, folders, contents)` decodes the stored folder strings into `ListedDirectory(path)`, `RecursiveDirectory(prefix)` and `WholeRepository()`; `folder_scan_strings` encodes them back to the same JSON.
+- `buildlog/index.py` schema 39 adds `gate_modules.content_reads` (sorted JSON; NULL means no record).
+- `affected_modules.py`: `latest_module_reads` reads `content_reads` from the newest full, non-aborted gate that has it. A module is selected when a changed non-config path is in its content reads, or when its content record is NULL. With no gate that has content records, the rule selects nothing. `scans_changed_paths` matches on the three folder states.
+- `module_cost.py`: `runner_command(tree, module)` builds the `module_run.py` command from the requested tree for the time, trace and `--commands` runs.
+- Measured on the first cloud full gate: all 748 modules have a content record, 487 read repository files, and the records add 907 KB of JSON per gate. Over the last 10 builds merges the targeted selection grew from 978 to 1,072 modules (8,368 to 9,214 CPU s). A warm selection costs 0.14 CPU s more.
+
+**Files:**
+- `scripts/test_times/module_run.py` — the read audit.
+- `scripts/test_times/gate_record.py` — the content record and the three folder states.
+- `scripts/buildlog/index.py` — the `content_reads` column.
+- `scripts/production/affected_modules.py` — the content rule.
+- `scripts/test_times/module_cost.py` — `runner_command`.
+
+**Gotchas:**
+- The audit `open` event carries no `dir_fd`, so a read through `os.open(name, dir_fd=fd)` records nothing. No repository test reads repository files that way.
+- Reads in child processes record nothing.
+- 19 modules read over 500 repository files (the largest about 1,700), so almost every change under `scripts/` selects them.
+
+**Ruled out:** a `dir_fd` fix, because no current reader needs it.
+
+### Phase 132 — A script change runs the scan checks that read it, not the slower tests beside them  · status: done
+**Depends on:** Phase 131
+
+#### As-built
+
+- Nine modules keep their repository scan tests in `test_<stem>_sources.py` in the same folder. Each original module now reads 0 to 9 repository files (before: 609 to 1,701), so a script change selects only the scan module.
+- A scan module imports its helpers by function name from the original module. Each helper is defined there, not re-exported. Each moved test body and assertion is unchanged.
+- `scripts/lib/test_nix_env_integration.py` is deleted. The gate runs the `lib/test_claude_launch_scan.py` tests once.
+- Measured: over the last 10 builds merges, the targeted selection went from 1,072 modules (9,210 CPU s) to 1,081 (9,008 CPU s). Seven merges are about 34 CPU s lower each. The full gate went from 4,636 to 4,618 CPU s. The scan modules keep most of the old cost (3 to 19 CPU s each).
+
+**Files:**
+- `scripts/copies/test_copy_guard_sources.py` — both repository copy-policy scans (shared cached scan).
+- `scripts/astra/test_design_roles_sources.py` — retired design role name scan.
+- `scripts/lib/test_process_group_sources.py` — group signal scan of every script.
+- `scripts/message/test_session_send_sources.py` — sender guard scan of test modules.
+- `scripts/direct/test_one_launch_path_sources.py` — worker launch command scan.
+- `scripts/accounts/test_launch_accounts_sources.py` — Python and shell launcher account scans.
+- `scripts/lib/test_claude_launch_scan_sources.py` — repository launch guard scan; the scanner stays in `test_claude_launch_scan.py`.
+- `scripts/lib/test_py_floor_sources.py` — interpreter-floor parse of every script.
+- `scripts/notify/test_push_texts_sources.py` — literal phone send and Pushover host scans.
+
+**Gotchas:**
+- A scan module must never import a `TestCase` class or the original module object. The loader then runs those tests twice.
+
+**Ruled out:**
+- Splitting `lib/test_one_hang_guard.py`, `lib/test_process_failure.py` and `agents/test_no_old_model_names.py`, because each is almost only its scan.
+- Splitting `production/test_staff_accessors.py` and `lib/test_user_zone.py`, because each costs under 1 CPU s.
+- Changing the four tree-copy modules (`production/test_update_registration_commands.py`, `build_queue/test_memory_feed.py`, `aws_target/test_control.py`, `mac_test/test_floor_sweep.py`), because their read records are a correct over-approximation of the child's imports.
+
+### Phase 133 — Find where the two slowest source scans spend their CPU  · status: done
+**Depends on:** Phase 132
+
+#### As-built
+
+- No code changed. The phase is a stage profile of the two largest source scan modules, `scripts/copies/test_copy_guard_sources.py` and `scripts/lib/test_process_group_sources.py`. Each stage ran as a separate process over 3 alternating paired rounds on natedev, 2026-11-11.
+- Median CPU s of each added stage:
+
+| Added work | copy guard sources | process group sources |
+| --- | ---: | ---: |
+| start and imports | 0.13 | 0.12 |
+| list and read | 0.10 | 0.38 |
+| parse | 2.55 | 8.43 |
+| one walk | 1.27 | 6.03 |
+| check (full minus one walk) | 22.49 | 5.62 |
+| full module | 26.6 | 21.5 |
+
+- Removing all of the parse and one walk in both modules saves 18.3 CPU s at most. No shared-parse or shared-walk design reaches the 30 CPU s bar, so builds dropped the source-scan speed work.
+- The copy guard check is 22.5 CPU s of non-parse work. It parses each file twice (1,012 parse calls for 506 files). This item is in the next-items file for verify-unit.
+
+**Files:**
+- `docs/plans/builds-natest-next.md` — the copy guard check item for verify-unit.
+
+**Gotchas:**
+- Each scan module runs in its own gate process. A parse that a shared helper caches does not cross modules.
+- Name a cost inside a check only from a measured stage difference, never from cProfile totals.
+
+**Ruled out:**
+- A shared helper that parses each file and builds a full parent and scope node index: paired runs showed no saving (process group sources 10.6 -> 14.4 CPU s) and about 20 MiB more peak memory in each scan module.
+- A one-process run that keeps every tree in memory: 31 to 36 CPU s slower, with a 3.5 GB peak.
+- Any shared-parse or shared-walk design across the scan modules: at most 18.3 CPU s.
+
+### Phase 134 — The next slowest test module uses at least 30 CPU s less  · status: done
+**Depends on:** Phase 133
+
+#### As-built
+
+- `run_style_command(root, case, command, ...)` in `scripts/style/style_plan_test_support.py` runs ledger, planner and nested `style_footprint.py` commands in process with real parsers, Git, ledger files, stdout, stderr and exit codes. `StylePlanFixture.run_command` delegates to it; `StandingCheckpointTests.cli` uses `partial(run_style_command, self.root, self)`. A case that `process_boundary_for_case` marks keeps its real child process.
+- `invoke_checkpoint` (`scripts/production/merge_checkpoint_test_support.py`) takes `scripts/lib/py` as the interpreter, so `progress_history.py` calls reach `invoke_recorder`.
+- aws paired trial, 3 rounds: `style/test_standing_checkpoint.py` 51.3 to 11.9 CPU s (15 tests); `production/test_merge_checkpoint.py` 37.8 to 16.5 CPU s (39 tests); 60.7 CPU s saved per gate.
+
+**Files:**
+- `scripts/style/style_plan_test_support.py` — `run_style_command`.
+- `scripts/style/test_standing_checkpoint.py` — `cli` through `run_style_command`.
+- `scripts/production/merge_checkpoint_test_support.py` — `invoke_checkpoint` interpreter rule.
+
+**Ruled out:** progress history parser reuse (6.9 CPU s, 1 pair); style sync Git seed (2.6 CPU s); bulk run Git seed (-1.5 CPU s).
+
+### Phase 135 — One cached command shows the daily trend of gate CPU, wall time and cost  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `show.py trend [--days N]` (default `TREND_DAYS`) prints one table for each place and selection (`full`, `affected`). Columns: day, runs, CPU mean, CPU p95, wall mean, wall p95, cost mean, cost p95, cost total. An `affected` table adds median modules run.
+- Rows use passing, non-aborted runs with at least one module, grouped by day in the user's zone. Run CPU is the sum of `gate_modules.cpu_s` over all attempts; run wall is `gate_runs.wall_s`. p95 is nearest-rank (`nearest_rank`: index ceil(0.95n)-1). Seconds print as whole numbers; USD has 3 decimals.
+- `gate_costs()` joins `gate_runs.id` to `"gate-" + GateReservation.attempt` from `CostLedger.read_snapshot()`. Cost is `rate.usd_per_hour` x the charged lifetime (reservation start to `GateTerminated.at`) + `allowance_usd`. A `not priced` rate or a reservation that is not terminated gives `CostNotRecorded`.
+- Place is `aws` for a run that joins a reservation or an EC2 host name; any other host is its own place and shows `—` for cost. Cost statistics use only costed runs; a note line `<N> of <M> runs have no cost record.` follows the table.
+- `gate-trend.json` beside the gate index (`TREND_CACHE_VERSION = 2`) holds the rows of done days. A day is done when the completed index refresh started at least `TREND_SETTLE_MINUTES` (default 60) after the day ended. Every read-change-write holds `file_lock.exclusive`; the refresh start keeps its maximum. Writes are atomic; a missing, unreadable or other-version cache is rebuilt.
+- A first run reads the whole gate index (about 9 s); a run from the cache takes about 0.4 s.
+
+**Files:**
+- `scripts/test_times/show.py` — `trend`, `trend_day`, `gate_costs`, `nearest_rank`, the cache readers and writers, `refresh_trend_index`.
+- `scripts/test_times/test_show.py` — trend grouping, p95, place, cost join, missing cost, settle and cache cases.
+- `config/test_times.conf` — `TREND_DAYS=8`, `TREND_SETTLE_MINUTES=60`.
+- `commands/test_times.md` — the `trend` usage and rules.
+
+**Gotchas:** The cost ledger re-prices every stored reservation with its newest AWS bill at each reserve and resolve, so a cost cached with a day goes stale.
+
+### Phase 136 — Trend costs always match the cost ledger  · status: done
+**Depends on:** Phase 135
+
+#### As-built
+
+- The trend cache (`TREND_CACHE_VERSION = 3`) keeps, for each done day and each place and selection group, a `TrendDay` with the cost-free cells (day, runs, CPU mean and p95, wall mean and p95, median modules run) and `run_ids`.
+- Each `trend` run reads the ledger once through `gate_costs()` and computes cost mean, p95, total and the missing-cost count over the run ids, for cached and open days alike. The gate index is queried only for open days.
+- A cached day keeps the place it was cached with.
+
+**Files:**
+- `scripts/test_times/show.py` — `TrendRun.run_id`, `TrendDay.run_ids`, cost cells at print time in `trend`.
+- `scripts/test_times/test_show.py` — the settled-day case re-prices the ledger and checks the cached day's new cost and note.
+- `commands/test_times.md` — the ledger and cache rules.
+
+### Phase 137 — Find where the slowest test module spends its CPU  · status: done
+
+#### As-built
+
+- Research only; no repository file changed. `direct/test_verify_wait_holder.py` measures 76.0 CPU s, 5,404 processes and 27 tests at `4900e5d38`.
+- Recorder starts cost 19.6 CPU s in 88 starts; `build_targets.py` target selection costs 8.9 CPU s in 50 starts. Most CPU is in real Python children, not fixtures.
+- One local pair each: deferred recorder and staff imports save 16.4 CPU s; the seeded interpreter cache (`verify_hold_wait_test_support.py`) saves 2.2 CPU s; routing synchronous holder calls through the existing verify helper saves 7.3 CPU s; all three together save 9.0 CPU s. The isolated savings overlap.
+- Importing `progress_history` costs about 133 ms; 57 test modules and `verify.sh` start the recorder.
+
+**Binds later work:** The recorder import change ("Recorder commands import only what they use") is sdlc's code; sdlc gave the go after its owner lands on the same files.
+
+**Ruled out:** another class seed or a shorter fixture sleep (the dominant cost is child starts); a preloaded fork server (process ownership).
+
+### Phase 138 — Recorder commands import only what they use  · status: todo
+**Depends on:** Phase 134
+**Blocked by:** three lands on the same files — sdlc phase 22 (`plan_history.py`, progress_history tests), hierarchies staff-copies section 9 (`session_staff` readers), and the builds verify worker wait fix (`progress_history.py`). sdlc gave the go on 2026-11-11 and names when both reach main; start after builds carries them.
+
+#### Work Order
+
+**Goal:** A recorder start costs less CPU, and the gate modules that start the recorder save at least 30 CPU s in sum, with the same tests.
+
+**Decision:** Director, 2026-11-11, from the Phase 137 research: deferred imports saved 16.4 CPU s in `direct/test_verify_wait_holder.py` alone. Savings may join across modules.
+
+**Spec:**
+1. In `scripts/direct/progress_history.py`, `scripts/direct/plan_history.py` and `scripts/production/session_staff.py`, move each top-level import that only a function uses into that function.
+2. Keep each import that a module expression, class base or argument default uses at the top level.
+3. Keep every supported module attribute at the top level: explicit exports (`OPEN_PHASES_KEY`, `STATE_FILENAME`), names that tests patch (`progress_history.subprocess`, patched at `scripts/direct/test_progress_history.py:491` and near line 7557), decorator and module-expression names, and `session_staff`'s runtime aliases for staff types, configuration types and `HerdrPlace` (`session_staff.py:113` and near line 668). Import names used only in annotations under `TYPE_CHECKING`.
+4. Change no recorder, staff or holder decision. Keep every process boundary.
+5. Change no test body or assertion.
+
+**Files:**
+- `scripts/direct/progress_history.py`
+- `scripts/direct/plan_history.py`
+- `scripts/production/session_staff.py`
+
+**Workers:** 1 writer; three small edits in one import chain.
+- impl: all three files.
+
+**Constraints from prior phases:**
+- Phase 122 rejected a smaller recorder-only import change because real commands still loaded `staff`. That cause remains: `_read_state` calls `staff.initial_snapshot()` (`progress_history.py:485`), and the module constant near line 217 needs `models_registry`. Measure real commands, not an import probe.
+- Phase 137 research report: `phases/137/research_report.md` in the unit session. Its 16.4 CPU s is one local pair before Phase 134; Phase 134 already removes recorder starts in `merge_checkpoint_test_support.py`, so that number is not acceptance evidence.
+- Phase 134 gives the aws paired trial command for acceptance.
+
+**State:** none.
+
+**Acceptance gate:**
+- basedpyright reports zero errors and zero warnings on the three files and their callers.
+- The direct and production suites pass.
+- An aws paired trial, 3 rounds, over the named modules with the most recorder starts gives a summed paired median saving of at least 30 CPU s, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
+
+### Phase 139 — Find where the fast-track test module spends its CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed. `production/test_fast_track.py` measures 45.7 CPU s, 8,618 processes and 52 tests at `bcda46a2e`. Git commands use 13.9 CPU s in 7,703 starts; repeated setup uses 1.0 CPU s.
+- The module is at its Git floor. devtools-unit owns the Git read path.
+
+**Gotchas:** One local pair on natedev can vary by more than 10 CPU s. Check process and exec counts before trusting a local saving.
+
+**Ruled out:** direct fixture calls (-2.6 CPU s alone); retained immutable Git reads (-4.9 CPU s alone); both together remove only 16 of 8,618 processes.
+
+### Phase 140 — Find where the style sync test module spends its CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A measured report names where `style/test_style_sync.py` (median 47.7 CPU s, 70 tests) spends its CPU, and which changes save CPU with the same tests.
+
+**Decision:** Director, 2026-11-11: the next module in the descending sort, beside the Phase 139 research. Research first, as in Phases 137 and 139.
+
+**Spec:**
+1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
+2. Name each fixed cost: interpreter starts, imports, real sleeps or wait intervals, subprocess trees, repeated setup.
+3. Measure one local pair for each candidate change in a scratch copy, and one pair for the candidates together. A test that proves a process boundary keeps its process.
+4. For each candidate in shared code, count the other test modules it reaches.
+5. Name the owning unit of each file a change would touch.
+6. Edit no repository file.
+
+**Files:**
+- `scripts/style/test_style_sync.py` — read only.
+
+**Workers:** 1 writer; research only.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 137: Phase 138 defers recorder and staff imports. Do not count that saving again here.
+- Phase 134: `run_style_command` in `scripts/style/style_plan_test_support.py` runs style plan commands in process; reuse it where it fits.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report at `phases/140/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.

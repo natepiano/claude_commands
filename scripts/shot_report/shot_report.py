@@ -54,6 +54,7 @@ MAC_SSH_TIMEOUT_SECONDS = MAC_READ_BUDGET_SECONDS + MAC_SSH_TIMEOUT_MARGIN_SECON
 # not yet received. Filter literals are filled from transcripts.py below.
 MAC_READER = r'''
 import base64, itertools, json, pathlib, re, sys, time, zlib
+exec(__TRANSCRIPTS_MODULE__)
 prior = json.load(sys.stdin)
 deadline = time.monotonic() + __BUDGET_SECONDS__
 claude_hints = tuple(term.encode() for term in __CLAUDE_HINTS__)
@@ -63,7 +64,7 @@ home = pathlib.Path.home()
 codex = home / '.codex/sessions'
 claude = home / '.claude/projects'
 roots = [('codex', codex)]
-claude_files = list(itertools.islice(claude.rglob('*.jsonl'), 101)) if claude.is_dir() else []
+claude_files = list(itertools.islice(transcript_paths(claude), 101)) if claude.is_dir() else []
 include_claude = len(claude_files) <= 100 and sum(p.stat().st_size for p in claude_files) <= 100_000_000
 print(json.dumps({'kind': 'claude_coverage', 'included': include_claude and bool(claude_files)}))
 if include_claude:
@@ -72,7 +73,7 @@ finished = True
 
 def candidate(path, source):
     hints = codex_hints if source == 'codex' else claude_hints
-    with path.open('rb') as stream:
+    with open_transcript(path) as stream:
         for line in stream:
             if any(hint in line for hint in hints) or source == 'codex' and related_write.search(line):
                 return True
@@ -83,14 +84,18 @@ def candidate(path, source):
 def transfer(path, key, source):
     old = prior.get(key, {})
     stat = path.stat()
-    same = old.get('inode') == stat.st_ino and old.get('size') == stat.st_size and old.get('mtime') == stat.st_mtime_ns
+    size = stat.st_size
+    if path.suffix == '.zst':
+        with open_transcript(path) as stream:
+            size = stream.seek(0, 2)
+    same = old.get('inode') == stat.st_ino and old.get('size') == size and old.get('mtime') == stat.st_mtime_ns
     if same and not old.get('matched'):
         matched = False
         start = 0
     elif (old.get('matched') and old.get('inode') == stat.st_ino
-          and stat.st_size >= old.get('cursor', 0)
+          and size >= old.get('cursor', 0)
           and (old.get('mtime') == stat.st_mtime_ns
-               or stat.st_size > old.get('size', stat.st_size))):
+               or size > old.get('size', size))):
         matched = True
         start = old.get('cursor', 0)
     else:
@@ -98,10 +103,10 @@ def transfer(path, key, source):
         if matched is None:
             return False
         start = 0
-    print(json.dumps({'kind': 'file', 'key': key, 'size': stat.st_size, 'inode': stat.st_ino,
+    print(json.dumps({'kind': 'file', 'key': key, 'size': size, 'inode': stat.st_ino,
                       'mtime': stat.st_mtime_ns, 'matched': matched, 'start': start}))
-    if matched and (not same or start < stat.st_size):
-        with path.open('rb') as stream:
+    if matched and (not same or start < size):
+        with open_transcript(path) as stream:
             stream.seek(start)
             while data := stream.read(65536):
                 print(json.dumps({'kind': 'chunk', 'key': key, 'encoding': 'zlib+base64',
@@ -113,13 +118,13 @@ def transfer(path, key, source):
 for source, root in roots:
     if not root.is_dir():
         continue
-    for path in sorted(root.rglob('*.jsonl')):
+    for path in transcript_paths(root):
         if time.monotonic() >= deadline:
             finished = False
             break
         if not path.is_file():
             continue
-        rel = str(path.relative_to(root))
+        rel = str(uncompressed_path(path).relative_to(root))
         key = source + '/' + rel
         if not transfer(path, key, source):
             finished = False
@@ -136,6 +141,7 @@ print(json.dumps({'kind': 'end', 'finished': finished}))
 
 def _mac_reader_source(budget_seconds: int = MAC_READ_BUDGET_SECONDS) -> str:
     return (MAC_READER.replace("__BUDGET_SECONDS__", str(budget_seconds))
+            .replace("__TRANSCRIPTS_MODULE__", repr((Path(__file__).resolve().parents[1] / "lib/transcripts.py").read_text()))
             .replace("__CLAUDE_HINTS__", repr(PREFILTER))
             .replace("__CODEX_HINTS__", repr(CODEX_PREFILTER))
             .replace("__RELATED_WRITE__", repr(RELATED_WRITE)))
@@ -235,7 +241,7 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
         with output_path.open("wb") as output:
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac", command],
+                    ["ssh", "-o", "BatchMode=yes", "mac", command],
                     input=json.dumps(prior).encode(), stdout=output, stderr=subprocess.PIPE,
                     timeout=MAC_SSH_TIMEOUT_SECONDS, check=False,
                 )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
+from scripts.herdr import herdr_types
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 
@@ -22,7 +23,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources, session_staff
 from scripts.production.production_doc import ProductionDocument
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 from scripts.herdr import herdr
 from scripts.production import showrunners
 from scripts.production.session_staff import MemberSources
@@ -407,7 +408,7 @@ class StaffSourcesTests(StaffTestCase):
                 with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}),
                       mock.patch.object(herdr, "process_environment", return_value=environment),
                       mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane"),
-                          side_effect=herdr.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
+                          side_effect=herdr_types.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
                       mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
                           "foreground_processes": [{"pid": 42402, "argv": ["codex"]}]}}),
                       mock.patch.object(process_table, "snapshot", return_value=table),
@@ -468,7 +469,7 @@ class StaffSourcesTests(StaffTestCase):
 
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         for failure in (FileNotFoundError("process exited"), PermissionError("permission denied"),
-                        herdr.HerdrFailure("process 42401: exited")):
+                        herdr_types.HerdrFailure("process 42401: exited")):
             with (self.subTest(failure=type(failure).__name__),
                   mock.patch.object(process_table, "snapshot", side_effect=[table, {}]),
                   mock.patch.object(herdr, "process_environment", side_effect=failure),

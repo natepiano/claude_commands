@@ -19,7 +19,10 @@ from types import MappingProxyType
 from typing import Literal, cast, override
 from unittest import mock
 
+from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer
+from scripts.agents import detached_runs
+from scripts.lib.atomic_file import write_text_atomic
 
 from scripts.build_hold.override_guard import require_checkout
 
@@ -58,9 +61,9 @@ class HoldEnforcerTests(unittest.TestCase):
             "BUILD_HOLD_CGROUP_ROOT": str(self.root / "cgroup"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
         }))
         self.write_holder()
@@ -115,6 +118,265 @@ class HoldEnforcerTests(unittest.TestCase):
             call_id, pid, step_record.process_start(pid), self.root, "check", step_record.WorkspacePackages(),
             step_record.AnyTarget(("mac", "natedev"), ("mac",)), state, "2026-10-28T12:00:00+00:00",
         ))
+
+    def test_drain_stops_waiting_run_waits_for_working_run_and_releases_owner_once(self) -> None:
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="waiting-owner")
+        _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="working-owner")
+        _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
+        signals: list[tuple[int, int]] = []
+        notices: list[str] = []
+        pauses: list[float] = []
+        stop = hold_enforcer.stop_waiting_run
+        drain = hold_enforcer.drain
+
+        def private_drain(holder: build_hold.Holder, proc_root: Path) -> int:
+            self.assertIn(build_hold.ProcessIdentity(20, "11000"), holder.keep)
+            self.assertNotIn(build_hold.ProcessIdentity(10, "11000"), holder.keep)
+            return drain(holder, proc_root, sleep=advance, clock=lambda: self.now)
+
+        def signal_process(pid: int, signum: int) -> None:
+            self.assertTrue(build_hold.natedev_holds(self.holders).in_force)
+            signals.append((pid, signum))
+
+        def private_stop(run: hold_enforcer.WaitingRun, holder: build_hold.Holder,
+                         processes: Mapping[int, build_hold.AuditProcess], proc_root: Path
+                         ) -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
+            return stop(run, holder, processes, proc_root, signal_process=signal_process,
+                        signal_group=lambda pid, signum: self.fail(f"unexpected group signal {pid} {signum}"))
+
+        def advance(seconds: float) -> None:
+            self.assertEqual(signals, [(10, signal.SIGTERM)])
+            pauses.append(seconds)
+            self.now += 60
+            if len(pauses) == 2:
+                shutil.rmtree(self.proc / "10")
+                shutil.rmtree(self.proc / "21")
+                shutil.rmtree(self.proc / "20")
+
+        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             mock.patch.object(hold_enforcer, "claimed_processes", return_value=frozenset()), \
+             mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=private_stop), \
+             mock.patch.object(hold_enforcer, "drain", side_effect=private_drain), \
+             mock.patch.object(hold_enforcer, "start"), \
+             redirect_stdout(io.StringIO()) as output:
+            status = build_hold.main(["hold", "--drain", "--holder", "holder", "--for", "timed test",
+                                      "--proc-root", str(self.proc)])
+        self.assertEqual(status, 0)
+        self.assertEqual(signals, [(10, signal.SIGTERM)])
+        self.assertGreaterEqual(len(pauses), 2)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[-1], "drained")
+        self.assertGreaterEqual(sum("working-owner" in line and "20" in line for line in lines), 2)
+        self.assertTrue(any("waiting-owner" in line and "10" in line and "age" in line for line in lines))
+        self.assertRegex(output.getvalue(), r"age|[0-9]+s|[0-9]+ min")
+        row, = [row for row in self.rows() if row["action"] == "stopped"]
+        self.assertEqual(row["stopped_run"], {"pid": 10, "proc_start": "11000"})
+        self.assertEqual(row["session"], "waiting-owner")
+
+        def notify(entry: build_hold.ReleaseEntry, socket: str, _notice: str) -> build_hold.ReleaseDelivered:
+            self.assertEqual(socket, "/private/socket")
+            notices.append(entry["session_id"])
+            return build_hold.ReleaseDelivered()
+
+        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/private/socket")), \
+             mock.patch.object(build_hold, "send_release", side_effect=notify):
+            _ = build_hold.release_cycle(self.holders, "holder")
+            _ = build_hold.release_cycle(self.holders, "holder")
+        self.assertEqual(notices, ["waiting-owner"])
+
+    def test_drain_classifies_gate_entry_points_and_work_evidence(self) -> None:
+        entries = (("bash", "verify.sh", "check"), ("python3", "merge_gate.py", "--tests-only"),
+                   ("python3", "targeted_test.py"))
+        for argv in entries:
+            with self.subTest(entry=argv):
+                _ = self.process(10, argv[0], argv=argv, session="gate-owner")
+                table = self.table()
+                identity = table[10].identity
+                for admitted, claimed, expected in (
+                    (frozenset[build_hold.ProcessIdentity](), frozenset[build_hold.ProcessIdentity](),
+                     hold_enforcer.WaitingRun),
+                    (frozenset({identity}), frozenset[build_hold.ProcessIdentity](), hold_enforcer.WorkingRun),
+                    (frozenset[build_hold.ProcessIdentity](), frozenset({identity}), hold_enforcer.WorkingRun),
+                ):
+                    with self.subTest(admitted=admitted, claimed=claimed):
+                        run, = hold_enforcer.classify_drain_runs(table, admitted, claimed)
+                        self.assertIsInstance(run, expected)
+                        self.assertEqual(run.owner, OwningSession("gate-owner"))
+                _ = self.process(20, argv[0], parent=10, start=11_001, argv=argv)
+                _ = self.process(21, "runner", parent=10, start=11_002)
+                _ = self.process(30, "cargo", parent=21, start=11_003, argv=("cargo", "test"))
+                try:
+                    runs = hold_enforcer.classify_drain_runs(self.table(), frozenset(), frozenset())
+                    self.assertEqual([run.process.identity.pid for run in runs], [10])
+                    self.assertTrue(all(isinstance(run, hold_enforcer.WorkingRun) for run in runs))
+                finally:
+                    for pid in (20, 21, 30):
+                        shutil.rmtree(self.proc / str(pid))
+
+    def test_drain_records_stop_and_owner_before_signalling_and_cancels_a_changed_identity(self) -> None:
+        record = self.root / "detached-run.json"
+        _ = self.process(100, "python3", start=10_000,
+                         argv=("python3", "detached_runs.py", "supervise", str(record)))
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        record_build = hold_enforcer.record_build
+        for outcome in ("record failure", "identity change", "stopped"):
+            with self.subTest(outcome=outcome):
+                _ = record.write_text(json.dumps({"pid": 100, "status": "running"}))
+                _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
+                table = self.table()
+                run, = hold_enforcer.classify_drain_runs(table, frozenset(), frozenset())
+                assert isinstance(run, hold_enforcer.WaitingRun)
+                events: list[str] = []
+                signals: list[tuple[int, int]] = []
+
+                def save_stop(build: build_hold.AuditedBuild, holder: build_hold.Holder, proc_root: Path,
+                              action: Literal["audit", "stopped"], *,
+                              stopped_run: build_hold.ProcessIdentity | hold_enforcer.NoStoppedRun) -> None:
+                    events.append("record")
+                    if outcome == "record failure":
+                        raise OSError("private stop record is full")
+                    record_build(build, holder, proc_root, action, stopped_run=stopped_run)
+
+                def save_reason(path: Path, text: str) -> None:
+                    write_text_atomic(path, text)
+                    if path == record and "stop_reason" in text and outcome == "identity change":
+                        _ = self.process(10, "editor", start=12_000)
+
+                def signal_group(pid: int, signum: int) -> None:
+                    signals.append((pid, signum))
+                    self.assertEqual(events, ["record"])
+                    self.assertEqual([row["stopped_run"] for row in self.rows() if row["action"] == "stopped"],
+                                     [{"pid": 10, "proc_start": "11000"}])
+                    cycle = build_hold.read_cycle()
+                    assert cycle is not None
+                    self.assertIn("gate-owner", cycle["recipients"])
+
+                with mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop), \
+                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=save_reason):
+                    if outcome == "record failure":
+                        with self.assertRaisesRegex(OSError, "private stop record is full"):
+                            _ = hold_enforcer.stop_waiting_run(
+                                run, holder, table, self.proc, signal_group=signal_group,
+                                signal_process=lambda pid, signum: self.fail(f"unexpected signal {pid} {signum}"),
+                                supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
+                            )
+                    else:
+                        result = hold_enforcer.stop_waiting_run(
+                            run, holder, table, self.proc, signal_group=signal_group,
+                            signal_process=lambda pid, signum: self.fail(f"unexpected signal {pid} {signum}"),
+                            supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
+                        )
+                        expected = hold_enforcer.RunIdentityChanged if outcome == "identity change" else hold_enforcer.StoppedRun
+                        self.assertIsInstance(result, expected)
+                if outcome == "stopped":
+                    self.assertEqual(signals, [(100, signal.SIGTERM)])
+                else:
+                    self.assertEqual(signals, [])
+                    self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertNotIn("stop_reason", saved)
+
+    def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
+        table = self.table()
+        run, = hold_enforcer.classify_drain_runs(table, frozenset(), frozenset())
+        assert isinstance(run, hold_enforcer.WaitingRun)
+        _ = self.process(10, "editor", start=12_000)
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        signals: list[tuple[int, int]] = []
+        result = hold_enforcer.stop_waiting_run(
+            run, holder, table, self.proc,
+            signal_process=lambda pid, signum: signals.append((pid, signum)),
+            signal_group=lambda pid, signum: signals.append((pid, signum)),
+        )
+        self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
+        self.assertEqual(signals, [])
+        self.assertEqual(self.rows(), [])
+
+    def test_drain_interrupt_keeps_the_hold(self) -> None:
+        _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="working-owner")
+        _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
+        holder, = build_hold.natedev_holds(self.holders).in_force
+
+        def interrupt(seconds: float) -> None:
+            self.assertGreater(seconds, 0)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             mock.patch.object(hold_enforcer, "claimed_processes", return_value=frozenset()), \
+             redirect_stdout(io.StringIO()) as output:
+            status = hold_enforcer.drain(holder, self.proc, sleep=interrupt, clock=lambda: self.now)
+        self.assertEqual(status, 130)
+        self.assertTrue(build_hold.natedev_holds(self.holders).in_force)
+        self.assertNotIn("drained", output.getvalue().splitlines())
+
+    def test_drain_checks_detached_supervisor_before_group_stop_and_records_reason(self) -> None:
+        record = self.root / "detached-run.json"
+        _ = self.process(100, "python3", start=10_000,
+                         argv=("python3", "detached_runs.py", "supervise", str(record)))
+        _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
+        table = self.table()
+        run, = hold_enforcer.classify_drain_runs(table, frozenset(), frozenset())
+        assert isinstance(run, hold_enforcer.WaitingRun)
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        read_supervisor_args = hold_enforcer.supervisor_args
+        for argument, current, prefix in ((str(record), False, ("python3",)), (str(record), True, ("python3",)),
+                                           (record.name, True, ("python3",)),
+                                           (str(record), False, ("python3", "unrelated.py"))):
+            with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix):
+                _ = self.process(100, "python3", start=10_000,
+                                 argv=("python3", "detached_runs.py", "supervise", argument))
+                table = self.table()
+                _ = record.write_text(json.dumps({"pid": 100, "status": "running"}))
+                signals: list[tuple[int, int]] = []
+                inspected: list[int] = []
+
+                def supervisor_args(pid: int, proc_root: Path) -> tuple[str, ...]:
+                    inspected.append(pid)
+                    self.assertEqual(proc_root, self.proc)
+                    argv = ((*prefix, "detached_runs.py", "supervise", argument)
+                            if current or len(prefix) == 2 else ("editor", "notes.txt"))
+                    _ = (proc_root / str(pid) / "cmdline").write_bytes(
+                        b"\0".join(value.encode() for value in argv) + b"\0")
+                    return read_supervisor_args(pid, proc_root)
+
+                def signal_group(pid: int, signum: int) -> None:
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
+                    signals.append((pid, signum))
+
+                result = hold_enforcer.stop_waiting_run(
+                    run, holder, table, self.proc, supervisor_args=supervisor_args,
+                    signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                    signal_group=signal_group,
+                )
+                self.assertIn(100, inspected)
+                if current:
+                    self.assertIsInstance(result, hold_enforcer.StoppedRun)
+                    self.assertEqual(signals, [(100, signal.SIGTERM)])
+                else:
+                    self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
+                    self.assertEqual(signals, [])
+
+    def test_only_confirmed_hold_stops_are_consumed(self) -> None:
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        consumed = self.root / "consumed-stops"
+        for pid, (status, expected) in enumerate((("requested", False), ("not_stopped", False),
+                                                 ("stopped", True), ("legacy", True)), 10):
+            with self.subTest(stop_status=status):
+                _ = self.process(pid, "cargo", session="gate-owner",
+                                 environment={"BUILDLOG_CALL_ID": "drain-call"})
+                process = self.table()[pid]
+                build = build_hold.AuditedBuild(process, OwningSession("gate-owner"), "other_session", ())
+                if status == "legacy":
+                    hold_enforcer.record_build(build, holder, self.proc, "stopped")
+                else:
+                    hold_enforcer.record_build(build, holder, self.proc, "stopped", stopped_run=process.identity)
+                    if status == "not_stopped":
+                        hold_enforcer.set_stop_status(holder, process.identity, "not_stopped")
+                    elif status == "stopped":
+                        hold_enforcer.set_stop_status(holder, process.identity, "stopped")
+                self.assertEqual(step_record.consume_stopped_build("drain-call", consumed), expected)
 
     def test_verify_controller_survives_every_live_state_while_local_compile_child_stops(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="other")
@@ -207,10 +469,11 @@ class HoldEnforcerTests(unittest.TestCase):
         self.write_step("holder-call", step_record.StepState.ON_NATEDEV, 90)
         decision, = self.decisions()
         self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
-        self.assertEqual(decision.owner, build_hold.OwningSession("holder"))
+        self.assertEqual(decision.owner, OwningSession("holder"))
 
     def test_stopped_run_writes_reason_and_log_registers_notice_then_terms_root_first_and_kills_survivor(self) -> None:
         root = self.process(30, "cargo", argv=("cargo", "check", "--workspace"), session="other")
+        _ = (root / "fd/2").write_text("TREE ok\nFMT ok\n")
         _ = self.process(20, "rustc", parent=30, start=11_001)
         _ = self.process(10, "linker", parent=20, start=11_002)
         decision = next(item for item in self.decisions() if item.process.identity.pid == 30)
@@ -219,7 +482,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
         def send(pid: int, signum: int) -> None:
             self.assertEqual((root / "fd/2").read_text(),
-                             "natedev builds and tests are held by builder for timed test; this run was stopped. "
+                             "TREE ok\nFMT ok\nnatedev builds and tests are held by builder for timed test; this run was stopped. "
                              + "You get a notice at the release; run it again then.\n")
             self.assertEqual(self.rows()[0]["action"], "stopped")
             cycle = build_hold.read_cycle()
@@ -256,9 +519,9 @@ class HoldEnforcerTests(unittest.TestCase):
         decisions = {item.process.identity.pid: item for item in self.decisions()}
         self.assertEqual(set(decisions), {20, 21, 31, 40})
         self.assertTrue(all(isinstance(item, hold_enforcer.WouldStopBuild) for item in decisions.values()))
-        self.assertEqual(decisions[21].owner, build_hold.OwningSession("codex-worker"))
+        self.assertEqual(decisions[21].owner, OwningSession("codex-worker"))
         self.assertEqual(decisions[21].process.cwd, "/dev/shm/mac-idle-suite-123/tmp456")
-        self.assertEqual(decisions[40].owner, build_hold.OwningSession("detached-session"))
+        self.assertEqual(decisions[40].owner, OwningSession("detached-session"))
 
     def test_waiting_merge_gate_and_verify_survive_while_their_build_children_stop(self) -> None:
         _ = self.process(30, "python3", argv=("python3", "merge_gate.py", "--checkout", "/tree", "--tests-only"), session="gate")
@@ -313,7 +576,7 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(20, "rust-analyzer", parent=10)
         decision, = self.decisions()
         self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
-        self.assertEqual(decision.owner, build_hold.OwningSession("rename"))
+        self.assertEqual(decision.owner, OwningSession("rename"))
         self.assertEqual(decision.process.identity.pid, 20)
 
     def test_holder_user_terminal_desktop_and_shared_server_pass_but_service_and_marked_terminal_stop(self) -> None:

@@ -10,15 +10,15 @@ import fcntl
 import json
 import os
 import re
-import shutil
 import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
+from scripts.lib import conf_reads, git_index
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -131,14 +131,52 @@ class LaunchSettings(NamedTuple):
     service_tier: str
 
 
+def claude_model(model: str, environment: Mapping[str, str]) -> str:
+    """Resolve a model with the selected launch account's catalog."""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1" && _agents_model_slug claude "$2"', "claude-model",
+             str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), model],
+            env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return model
+    return result.stdout.strip()
+
+
+def claude_arguments(arguments: Sequence[str], environment: Mapping[str, str]) -> list[str]:
+    """Resolve model options after the caller selects the launch account."""
+    resolved = list(arguments)
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if argument == "--model":
+            resolved[index + 1] = claude_model(arguments[index + 1], environment)
+        elif argument.startswith("--model="):
+            resolved[index] = "--model=" + claude_model(argument.partition("=")[2], environment)
+    return resolved
+
+
 def launch_settings(section: str, key: str) -> LaunchSettings:
     """Read launch settings through the existing shell resolver."""
     configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
+    resolver = 'agents_resolve "$2.$3"'
+    producer_arguments: list[str] = []
+    if section == "producers":
+        value = next((row.value for row in reversed(configuration.rows)
+                      if row.section == section and row.key == key), "")
+        match value.split(":"):
+            case ["claude" | "codex" as family, model, effort] if model and effort:
+                producer_arguments = [family, f"{model}:{effort}"]
+            case _:
+                raise ValueError(f"invalid producer settings for {key}; expected <family>:<model>:<effort>")
+        resolver = ('AGENT_FAMILY="$4"; _agents_validate_pair "$2.$3" "$4" "$5" && '
+                    '_agents_resolve_service_tier "$2.$3" "$4"')
     result = subprocess.run(
         ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
-         + 'agents_resolve "$2.$3" && '
+         + '{ ' + resolver + '; } && '
          + 'printf "%s\\n%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
-         "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key],
+         "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key,
+         *producer_arguments],
         input=configuration_shell(configuration), text=True, capture_output=True, check=False,
         env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
     values = result.stdout.splitlines()
@@ -179,7 +217,7 @@ def registry_path() -> Path:
 
 
 def registry_text(registry: Path | None = None) -> str:
-    return (registry or registry_path()).read_text(encoding="utf-8")
+    return conf_reads.read_text(registry or registry_path())
 
 
 def _records(text: str) -> list[RegistryRow]:
@@ -351,7 +389,7 @@ def _preflight_fast_forward(repo: Path, target: str, *, replace_registry: bool,
     index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     with tempfile.TemporaryDirectory(prefix="models-ff-index-") as directory:
         trial_index = Path(directory) / "index"
-        _ = shutil.copyfile(index, trial_index)
+        git_index.private_copy(index, trial_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(trial_index)}
         if replace_registry:
             registry_entry = _git(repo, "ls-tree", target, "--", REGISTRY_PATH) + "\n"
@@ -548,6 +586,7 @@ def main() -> int:
                 configuration = RegistryEditBase(*_snapshot({}, "", arguments.registry))
             print(configuration_shell(configuration), end="")
             return 0
+        conf_reads.record("models")
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":

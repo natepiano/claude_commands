@@ -1,7 +1,7 @@
 """Run the real CLI on a synthetic production with isolated state and external tools."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
