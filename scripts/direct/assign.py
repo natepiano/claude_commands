@@ -695,7 +695,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
     parent = worker_admission.parent(staff.snapshot(), run=run)
     target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
-    before = staff_worker.before_launch()
+    before = staff_worker.rows_before_launch()
     with ExitStack() as cleanup:
         current = launch(target, policy)
         staff_worker.arm_launch_cleanup(cleanup, before, current)

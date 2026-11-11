@@ -1091,10 +1091,13 @@ class WorkerPaneTests(StaffTestCase):
         first = self.start()
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
+        self.assertEqual(first.created_pane, worker_panes.CreatedWorkerPane(first.terminal))
         self.dispatch(first.row, "impl")
         before = self.staff_state()
         locations = {key: dict(value) for key, value in self.world.locations.items()}
         repeated = self.start()
+        assert isinstance(repeated, worker_panes.OpenWorker)
+        self.assertIsInstance(repeated.created_pane, worker_panes.NoCreatedWorkerPane)
         self.assertEqual(repeated, first)
         self.assertEqual(self.staff_state(), before)
         self.assertEqual(self.world.locations, locations)

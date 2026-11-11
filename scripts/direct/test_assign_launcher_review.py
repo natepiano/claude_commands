@@ -221,7 +221,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                         if failure == "incomplete":
                             assert isinstance(result, worker_panes.OpenWorker)
                             rows.append(result.row)
-                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST hold unavailable")
+                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST hold unavailable", result.created_pane)
                         return result
                     with (patch.object(astra_roles, "hold", side_effect=hold),
                           patch.object(assign, "launch", side_effect=launch)):

@@ -313,49 +313,21 @@ class DispatchSubmission(IntEnum):
     SUBMITTED = 0
 
 
-@dataclass(frozen=True)
-class LaunchBefore:
-    rows: frozenset[StaffId]
-    terminals: frozenset[str]
-
-
-@dataclass(frozen=True)
-class LaunchReadUnavailable:
-    """The launch cannot claim ownership of a new pane."""
-
-
 class LaunchRow(IntEnum):
     CREATED = 1
     RETAINED = 2
 
 
-def before_launch() -> LaunchBefore | LaunchReadUnavailable:
-    try:
-        return LaunchBefore(frozenset(row.id for row in staff.snapshot().rows),
-                            frozenset(pane.get("terminal_id", "") for pane in _client().panes()))
-    except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError):
-        return LaunchReadUnavailable()
+def rows_before_launch() -> frozenset[StaffId]:
+    return frozenset(row.id for row in staff.snapshot().rows)
 
 
-def arm_launch_cleanup(cleanup: ExitStack, before: LaunchBefore | LaunchReadUnavailable,
+def arm_launch_cleanup(cleanup: ExitStack, before: frozenset[StaffId],
                        result: worker_panes.WorkerStart) -> None:
-    if isinstance(before, LaunchReadUnavailable):
-        return
-    if isinstance(result, worker_panes.IncompleteStart):
-        try:
-            pane = _client().pane_row(result.pane)
-        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError):
-            return
-        if isinstance(pane, herdr.NoPane):
-            return
-        terminal = pane.get("terminal_id", "")
-    elif isinstance(result, (worker_panes.OpenWorker, worker_panes.ProcessUnknownWorker)):
-        terminal = result.terminal
-    else:
-        return
-    if terminal and terminal not in before.terminals:
-        row = LaunchRow.RETAINED if result.row.id in before.rows else LaunchRow.CREATED
-        _ = cleanup.callback(cleanup_failed_launch, result.row, result.pane, terminal, row)
+    if isinstance(result, (worker_panes.OpenWorker, worker_panes.ProcessUnknownWorker, worker_panes.IncompleteStart)):
+        if isinstance(result.created_pane, worker_panes.CreatedWorkerPane) and result.created_pane.terminal:
+            row = LaunchRow.RETAINED if result.row.id in before else LaunchRow.CREATED
+            _ = cleanup.callback(cleanup_failed_launch, result.row, result.pane, result.created_pane.terminal, row)
 
 
 def cleanup_failed_launch(row: staff.StaffRow, pane: str, terminal: str, ownership: LaunchRow) -> None:
@@ -412,7 +384,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                                    import_module("scripts.herdr.turn_end").finish_late_completion)
                 finish_late(row, owner, hold, completion_actions.held_role)
         if isinstance(started, StartAtDispatch):
-            before = before_launch()
+            before = rows_before_launch()
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
             arm_launch_cleanup(cleanup, before, current_start)
         else:
@@ -611,7 +583,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             for default_role in ("impl", "fix", "review", "test"):
                 if default_role in names:
                     continue
-                before = before_launch()
+                before = rows_before_launch()
                 with redirect_stderr(io.StringIO()) as diagnostics:
                     result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role)
                 if isinstance(result, worker_panes.OpenWorker):
@@ -862,7 +834,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     resume = _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
                         role = worker_panes.dispatch_role(state.row)
-                        before = before_launch()
+                        before = rows_before_launch()
                         result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role,
                             account=launch_account, lock=hold, runs=runs, codex=codex)
                         arm_launch_cleanup(cleanup, before, result)
@@ -873,8 +845,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if isinstance(started_panes, dict):
                             started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
                         opened = cast(worker_panes.OpenWorker, result)
-                        if (isinstance(before, LaunchBefore)
-                                and opened.terminal not in before.terminals):
+                        if isinstance(opened.created_pane, worker_panes.CreatedWorkerPane):
                             resume = partial(_resume_launcher, on_submission=cleanup.pop_all)
                         changed = True
                         row = opened.row

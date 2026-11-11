@@ -1555,7 +1555,7 @@ class WorkerCommandTests(unittest.TestCase):
                                 def incomplete(*arguments: object, **options: object) -> worker_panes.WorkerStart:
                                     result = start(*arguments, **options)
                                     assert isinstance(result, worker_panes.OpenWorker)
-                                    return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed")
+                                    return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed", result.created_pane)
                                 _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=incomplete))
                             elif failure == "target":
                                 check = cast(Callable[..., bool], herdr.check_target)
@@ -1659,36 +1659,30 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().count("anomaly:"), 1)
         self.assertIn("terminal identity changed", errors.getvalue())
 
-    def test_dispatch_continues_when_its_ownership_read_fails(self) -> None:
+    def test_dispatch_uses_saved_start_ownership_without_a_pane_read(self) -> None:
         for incomplete in (False, True):
             with self.subTest(incomplete=incomplete):
                 case = WorkerCommandTests("runTest")
                 case.setUp()
                 try:
-                    panes = case.fixture.world.panes
                     start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
-                    reads = 0
-                    def read() -> list[herdr.PaneIdentity]:
-                        nonlocal reads
-                        reads += 1
-                        if reads == 1:
-                            raise herdr_types.HerdrFailure("TEST pane list failed")
-                        return panes()
+                    arm = worker.arm_launch_cleanup
                     def launch(*arguments: object, **options: object) -> worker_panes.WorkerStart:
                         result = start(*arguments, **options)
                         if incomplete:
                             assert isinstance(result, worker_panes.OpenWorker)
-                            _ = patches.enter_context(patch.object(case.fixture.world, "pane_row",
-                                side_effect=herdr_types.HerdrFailure("TEST pane read failed")))
-                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed")
+                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST startup failed", result.created_pane)
                         return result
-                    with ExitStack() as patches, redirect_stderr(io.StringIO()) as errors:
-                        if not incomplete:
-                            _ = patches.enter_context(patch.object(case.fixture.world, "panes", side_effect=read))
-                        _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=launch))
+                    def arm_without_read(cleanup: ExitStack, before: frozenset[staff.StaffId],
+                                         result: worker_panes.WorkerStart) -> None:
+                        with patch.object(worker, "_client", side_effect=AssertionError("no ownership pane read")):
+                            arm(cleanup, before, result)
+                    with (patch.object(worker_panes, "start_or_resume", side_effect=launch),
+                          patch.object(worker, "arm_launch_cleanup", side_effect=arm_without_read),
+                          redirect_stderr(io.StringIO()) as errors):
                         case.assertEqual(case.dispatch(), worker.ExitCode.UNCERTAIN if incomplete else worker.DispatchSubmission.SUBMITTED)
                     case.assertEqual(len(case.agent.submitted), 0 if incomplete else 1)
-                    case.assertEqual(case.fixture.world.closed, [])
+                    case.assertEqual(len(case.fixture.world.closed), int(incomplete))
                     if incomplete:
                         case.assertIn("TEST startup failed", errors.getvalue())
                 finally:
@@ -1737,7 +1731,7 @@ class WorkerCommandTests(unittest.TestCase):
                         result = start(*arguments, **options)
                         if incomplete:
                             assert isinstance(result, worker_panes.OpenWorker)
-                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST resume read failed")
+                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST resume read failed", result.created_pane)
                         return result
                     check = cast(Callable[..., bool], herdr.check_target)
                     def target(*arguments: object, **options: object) -> bool:

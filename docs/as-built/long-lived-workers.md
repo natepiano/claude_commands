@@ -188,7 +188,8 @@ A resumed worker keeps its existing row after cleanup.
 An existing pane keeps its pane and staff row.
 A failed close prints `anomaly: <pane>: cleanup failed: <reason>` and preserves the original failure code.
 An incomplete start also closes its new pane.
-A failed pane read disables cleanup ownership without blocking dispatch.
+The start result identifies a new pane and its saved terminal.
+Dispatch reads staff rows before start and adds no pane scan for cleanup.
 A target refusal before prompt delivery runs cleanup.
 Cleanup stops only after target checks pass and the prompt can reach the agent.
 Restore cancels cleanup through the callback in `Herdr.prompt`.
