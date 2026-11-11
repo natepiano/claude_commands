@@ -53,7 +53,7 @@ class FailedLookupTests(unittest.TestCase):
                              current_session=staff.StaffId(fixture_runtime_id("queue-current")))
         worker = staff.StaffRow(staff.StaffId(fixture_runtime_id("test-id")), "worker", "test", staff.ReportsTo(unit.id),
                                current_session=staff.StaffId(fixture_runtime_id("test-current")))
-        agent = staff.StaffRow(staff.StaffId(fixture_runtime_id("agent-id")), "agent", "analyst", staff.StaffRoot(),
+        agent = staff.StaffRow(staff.StaffId(fixture_runtime_id("agent-id")), "producer", "analyst", staff.StaffRoot(),
                               current_session=staff.StaffId(fixture_runtime_id("agent-current")))
         other = staff.StaffRow(staff.StaffId(fixture_runtime_id("other-id")), "showrunner", "other", staff.StaffRoot(),
                               current_session=staff.StaffId(fixture_runtime_id("other-current")))
