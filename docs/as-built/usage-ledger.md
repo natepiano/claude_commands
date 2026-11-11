@@ -195,7 +195,18 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 `scripts/usage/context_economy.py` reads context measurements on demand.
 `scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_mac`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
 `/context_economy` (`commands/context_economy.md`) defaults to `report`, also when its first argument starts with `--`.
-The CLI has `report`, `save`, `compare`, `trend` and `hourly`; `report` takes `--role` and `--by settings|week`.
+The CLI has `report`, `save`, `compare`, `trend`, `hourly` and `changes`; `report` takes `--role` and `--by settings|week`.
+`report` shows the `--where` value in the settings column and omits rows with no samples.
+`changes [--since TIME] [--files] [--detail]` lists tracked settings changes, newest first, after one summary line of verdict counts.
+It compares `changes_window_hours` before and after each change, per machine, family and role.
+A Claude setting is judged only for Claude roles, and a Codex setting only for Codex roles; a tracked file counts for both.
+Each request is split by time and by the settings it ran with. A session counts only on the side with more matching requests.
+Each measure needs `changes_min_sessions` sessions on each side; a role is judged when at least one measure qualifies, and its line names the measures with too few samples.
+Lower is better for all four measures. A change under `changes_min_percent` is noise.
+The verdicts are better, worse, mixed (named measures moved both ways), no clear change, and too few sessions.
+Roles with too few sessions share one `not judged` line. Other settings, model and CLI changes in the window, and file edits grouped per file, share one `also changed` line.
+By default only settings changes are listed; `--files` adds tracked file edits. `--detail` prints every measure with its sample counts.
+The verdicts describe observed movement, not proven cause.
 `hourly` reads only the ledger, so it lags by up to one collection. It shows active unit directors and weighted cost for the last `hourly_recent_hours` complete hours. Its normal and busy rows are the median and p75 of the `hourly_baseline_days` before those hours.
 The default window covers the last seven days.
 Bounds use `scripts.lib.user_zone.user_zone`.

@@ -12,9 +12,12 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py <argume
 4. `compare NAME [--since TIME] [--until TIME]` shows both sample sizes and the confounds.
 5. `trend [--role ROLE]` shows saved results in time order.
 6. `hourly` shows active units and cost per unit per hour from the ledger, against the normal and busy hours.
+7. `changes [--since TIME] [--files] [--detail]` gives each settings change a verdict per role: better, worse, mixed, no clear change or too few sessions.
+   `--files` also lists tracked file edits as changes. `--detail` shows every measure and sample count.
 
 Use `--family claude` for every precompute experiment save, threshold read, and comparison.
 Use `--where KEY=JSON` on `report`, `save` or `compare`; repeat it for more settings.
+`report` shows the filtered value in the settings column and omits rows with no samples.
 
 Both machines cache parsed transcript events under `~/.cache/context_economy/`.
 Warm reads reuse unchanged files; appended files resume at the last complete line with their saved parser state.
