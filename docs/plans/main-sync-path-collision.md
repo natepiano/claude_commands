@@ -36,32 +36,9 @@ Finding 1, from the Astra review of the main sync blocked report: an untracked f
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** when an untracked path collides with a path that origin/main adds, `sync` returns `dirty` and the detail names the untracked path.
-
-**Spec:**
-
-1. A collision is an untracked path that is a parent directory path of a path origin/main adds, or a path origin/main adds that is a parent directory path of an untracked path. Example: untracked `dir` and incoming `dir/file`, or untracked `dir/file` and incoming `dir`.
-2. Compare whole path components. `dir` collides with `dir/file`, but `di` does not collide with `dir/file`, and `dir` does not collide with `dir2/file`.
-3. Each colliding untracked path blocks the update. `sync` returns `dirty`, and the detail names each colliding untracked path in the existing form `<checkout> has local changes that block the update (<paths>)`.
-4. A collision changes no file, and `sync` does not run the merge.
-5. An untracked path that equals an added path keeps its current proof in `_finish_interrupted_update`. Do not change that proof.
-6. Add one row to the existing test `test_each_blocked_case_leaves_the_checkout_alone`: an untracked file `dir` in the checkout and a commit at origin/main that adds `dir/file`. Assert that `sync` returns `dirty`, the detail names `dir`, HEAD does not move, and `dir` keeps its content.
-7. Keep each existing assertion. Add no other check.
-8. Update the module docstring if it describes the blocked cases.
-
-**Files:**
-- `scripts/lib/main_sync.py` — the collision check
-- `scripts/lib/test_main_sync.py` — the new row
-
-**Workers:** 1 writer — one small change in one module.
-- `impl` — the files above.
-
-**State:** none — no record, mark or file write changes.
-
-**Constraints from prior phases:** the interrupted-update proof and the blocked report from the earlier main sync runs stay as built.
-
-**Acceptance gate:**
-- The Test command above passes.
-- `basedpyright scripts/lib/main_sync.py scripts/lib/test_main_sync.py` gives `0 errors, 0 warnings, 0 notes`.
+- `_has_untracked_update` in `scripts/lib/main_sync.py` finds each untracked path that is a parent directory path of a path origin/main adds, or the reverse. It compares whole path components and adds each colliding untracked path to the blocking details.
+- `sync` runs that check on each run, also when the status shows tracked changes. A collision gives `dirty` with the detail `<checkout> has local changes that block the update (<paths>)`. No file changes, and the merge does not run.
+- An untracked path that equals an added path keeps the interrupted-update proof.
+- A row in `test_each_blocked_case_leaves_the_checkout_alone` covers an untracked file `dir` and an incoming `dir/file`.
