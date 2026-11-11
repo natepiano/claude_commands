@@ -2904,3 +2904,40 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Acceptance gate:**
 - The report at `phases/143/research_report.md` in the unit session gives the Git census, each candidate with its saving and reach, and the owners.
+
+### Phase 144 — /test_times trend says targeted tests and merge gates, and every table right-aligns its numbers  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `/test_times trend` names its tables "targeted tests" and "merge gates", and every `/test_times` table right-aligns each number column under its label.
+
+**Decision:** User, 2026-11-11, through builds: "the term we've been using is targeted tests and merge gates - can you make /test_times trend use this terminology? also right align numbers underneath their labels - costs, all of it." Builds: "aws affected" and "natedev affected" become targeted tests; "aws full" and "natedev full" become merge gates. Director call: the alignment goes in the shared `print_table`, so every `/test_times` table gets it, not only trend. Only test_times tools call that `print_table`.
+
+**Spec:**
+1. In `trend`, print each table heading as `<place> targeted tests` for selection `affected` and `<place> merge gates` for selection `full`. Keep the database values `affected` and `full`. Print the merge gates table of a place before its targeted tests table.
+2. In `scripts/lib/terminal_cells.py` `print_table`, right-align a column when each of its row cells is a number cell, and right-align its header over that column. A number cell is a number with an optional sign, `$` prefix, `%` suffix or `s` suffix, or the no-value mark `—`. A column with at least one other cell stays left-aligned.
+3. Keep one place for the number test; give it a name that says what it decides.
+4. Update the trend help text and `commands/test_times.md` where they name these tables. Update each test that reads table text.
+
+**Files:**
+- `scripts/test_times/show.py` — trend headings and order.
+- `scripts/lib/terminal_cells.py` — `print_table` number columns.
+- `scripts/test_times/test_show.py` — trend heading parse and rows.
+- `scripts/lib/test_terminal_cells.py` — alignment rows.
+- `commands/test_times.md` — only where it names the trend tables.
+
+**Workers:** 1 writer; the change is small and the files share one output contract.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 12 and Phase 4 built `print_table` for the test_times tools; `module_cost.py` and `coverage_overlap.py` also call it, so their tables change too. Their tests must still pass.
+
+**State:** none.
+
+**Acceptance gate:**
+- basedpyright reports 0 errors and 0 warnings on the changed Python files.
+- `scripts/test_times` and `scripts/lib/test_terminal_cells.py` modules pass.
+- `show.py trend` prints `aws merge gates`, `aws targeted tests`, `natedev merge gates` and `natedev targeted tests`, with each number and cost column right-aligned under its label.
+
+**Result:** Done. Trend prints merge gates before targeted tests for each place. `print_table` right-aligns each column whose cells are all number cells, so every `/test_times` table gets it. 316 tests pass; basedpyright 0/0; two blind reviews approved with no findings.
