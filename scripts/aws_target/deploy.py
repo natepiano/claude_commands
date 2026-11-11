@@ -90,6 +90,17 @@ class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
 
 
+def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
+    """Return the largest known count, or zero when all types have unknown counts."""
+    largest = 0
+    for name in instance_types:
+        size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', name)
+        if size:
+            count = 2 if size[1] == 'large' else 4 * int(size[2] or '1')
+            largest = max(largest, count)
+    return largest
+
+
 @dataclass(frozen=True)
 class PreparedDeployment:
     at: int
@@ -335,6 +346,31 @@ class Deployment:
 
     def _api(self, settings: DeploymentSettings) -> AwsCli:
         return AwsCli(settings.profile, settings.region, settings.timeout_s, self.admin.executor(self.execute))
+
+    def _print_spot_quota(self, api: AwsCli, largest: int) -> None:
+        """Show the regional gate quota without stopping deployment on a failed read."""
+        try:
+            reply = api.call('get-service-quota', '--service-code', 'ec2',
+                             '--quota-code', 'L-34B43A08', service='service-quotas')
+            quota = conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
+        except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            print(f'{api.region}: Spot vCPU quota unknown: {self.admin.redact(str(error))}')
+            return
+        print(f'{api.region}: Spot quota {quota:g} vCPUs')
+        if largest == 0:
+            print(f'{api.region}: gate vCPU count is unknown')
+        elif quota < largest:
+            print(f'{api.region}: cannot run one gate ({largest} vCPUs); ask AWS for a Spot vCPU quota increase in this region.')
+
+    def _price_stage(self) -> dict[str, str | int]:
+        """Save the builder price and show the gate quota in each region."""
+        result = self.price()
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        largest = largest_gate_vcpus(conf.read_or_repository('cloud_gate').words('instance_types'))
+        for region in gate_regions(settings.region):
+            self._print_spot_quota(api.in_region(region), largest)
+        return result
 
     def price(self) -> dict[str, str | int]:
         """Save the current public Spot price without requesting resources."""
@@ -983,7 +1019,7 @@ class Deployment:
         """Check each deployment stage and stop at the first refusal."""
         self._authorize(approve_resources)
         stages = (
-            UpStage('price', self._price_present, self.price, refresh=True),
+            UpStage('price', self._price_present, self._price_stage, refresh=True),
             UpStage('bootstrap', self._bootstrap_present, self.bootstrap),
             UpStage('stacks', self._stacks_present, self._apply_stacks),
             UpStage('scaler-key', self._scaler_stage_present, self._scaler_key),
@@ -1198,11 +1234,14 @@ class Deployment:
         settings = read_deployment_settings(self.settings_path, self.directory)
         api = self._api(settings)
         from scripts.aws_target import cloud_gate
-        sizes = tuple(dict.fromkeys([*cloud_gate.settings().words('instance_types'),
+        configured_types = cloud_gate.settings().words('instance_types')
+        largest = largest_gate_vcpus(configured_types)
+        sizes = tuple(dict.fromkeys([*configured_types,
                                     'r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge']))
         print('region type zone price')
         for region in gate_regions(settings.region):
             target = api.in_region(region)
+            self._print_spot_quota(target, largest)
             zones = [ledger.text(row, 'ZoneName') for row in ledger.rows(target.call('describe-availability-zones',
                 '--filters', 'Name=state,Values=available'), 'AvailabilityZones')]
             rows = ledger.rows(target.call('describe-spot-price-history', '--instance-types', *sizes,

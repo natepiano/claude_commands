@@ -25,7 +25,6 @@ from zoneinfo import ZoneInfo
 from scripts.production import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
-from scripts.production.merge_checkpoint import check_parallel
 
 from scripts.lib import main_publish, scratch
 
@@ -716,20 +715,6 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertIn("--review-trial", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
-    def test_code_checkpoint_requires_a_known_parallel_line(self) -> None:
-        sha = self.checkpoint()
-        for parallel, expected in (
-            (None, "requires --parallel"),
-            ("Parallel: unknown — Phase 5 has no **Depends on:** line; add one under each phase heading and rerun",
-             "adds a **Depends on:** line"),
-            ("Parallel: maybe later", "--parallel must read"),
-        ):
-            result = self.run_checkpoint(sha, parallel=parallel)
-            self.assertEqual(result.process.returncode, 1)
-            self.assert_stopped_before_merge(result, "failed", expected)
-        for parallel in ("Parallel: none — Phase 4 needs Phase 3 (running)", "Parallel: Phase 4, Phase 6 could start"):
-            with self.subTest(parallel=parallel):
-                check_parallel(parallel)
     def test_alternate_review_trial_is_refused_and_canonical_numbers_reach_record(self) -> None:
         sha = self.checkpoint()
         alternate = self.run_checkpoint(sha, trial="review trial: UX 2, code 3, review 14 min, UX check 4 min, UX repair 1 min")

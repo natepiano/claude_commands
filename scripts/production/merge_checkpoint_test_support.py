@@ -94,7 +94,6 @@ SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
                     "and `basedpyright scripts/buildlog` (status zero and a clean summary), run in the showrunner checkout")
 DELIVERS = "Delivers checkpoint merge behavior."
-PARALLEL = "Parallel: none — no phase is waiting"
 STUB = '''#!/usr/bin/env python3
 import json
 import os
@@ -437,7 +436,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     def run_checkpoint(self, sha: str, *extra: str, phase: str = "2",
                        review: bool = True, trial: str = TRIAL,
-                       delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
+                       delivers: str | None = DELIVERS) -> MergeResult:
         before = self.git("rev-parse", "HEAD")
         runs = self.root / "history/runs"
         fixture_records = runs / "fixture.jsonl"
@@ -453,8 +452,6 @@ class MergeCheckpointFixture(unittest.TestCase):
                      "--trailer", "Co-authored-by: Test <test@example.invalid>"]
         if review:
             arguments.extend(("--review-trial", trial))
-        if parallel is not None and "--shrink" not in extra and "--as-built" not in extra:
-            arguments.extend(("--parallel", parallel))
         if delivers is not None and "--shrink" not in extra and "--as-built" not in extra:
             arguments.extend(("--delivers", delivers))
         arguments.extend(extra)

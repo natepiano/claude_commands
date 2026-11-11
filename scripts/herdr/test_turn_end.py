@@ -118,6 +118,7 @@ class TurnEndTests(unittest.TestCase):
         cases.append(("codex", "closed", "trailing period"))
         cases.extend((family, "working", "current") for family in ("codex", "claude"))
         cases.append(("codex", "held-lock", "current"))
+        cases.append(("codex", "send-unlocked", "current"))
         for family, close, transcript in cases:
             with self.subTest(family=family, close=close, transcript=transcript):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
@@ -169,7 +170,17 @@ class TurnEndTests(unittest.TestCase):
                         self.assertEqual(pending.result(timeout=LauncherHangGuard("queued DONE hook").remaining()),
                                          turn_end.TurnOutcome.DONE)
                 else:
-                    self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
+                    with ExitStack() as sends:
+                        if close == "send-unlocked":
+                            send_notice = send.send
+
+                            def send_unlocked(options: send.Options) -> send.Result:
+                                with worker_panes.worker_lock(self.case.fixture.parent.id, staff.WorkerName.parse(name)) as acquired:
+                                    self.assertIsInstance(acquired, worker_panes.WorkerLockHold)
+                                return send_notice(options)
+
+                            _ = sends.enter_context(patch.object(send, "send", side_effect=send_unlocked))
+                        self.assertEqual(turn_end.handle(turn_end.hook_event(payload)), turn_end.TurnOutcome.DONE)
                     if transcript != "current":
                         self.assertNotIn((pane, "terminal-" + pane), self.case.fixture.world.closed)
                         self.assertIn(pane, self.case.fixture.world.locations)
@@ -407,6 +418,7 @@ class TurnEndTests(unittest.TestCase):
         cases = [(event, reply_state) for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED)
                  for reply_state in ("done", "waiting for delivery", "waiting for reply")]
         cases.append((turn_end.EventKind.RUN_FINISHED, "empty reply"))
+        cases.append((turn_end.EventKind.RUN_FINISHED, "active result turn"))
         for index, (event, reply_state) in enumerate(cases):
             with self.subTest(event=event, reply_state=reply_state):
                 name = f"impl{index + 2}"
@@ -417,7 +429,25 @@ class TurnEndTests(unittest.TestCase):
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
-                if reply_state == "done":
+                if reply_state == "empty reply":
+                    self.case.fixture.world.locations[pane]["agent_status"] = "idle"
+                if reply_state == "active result turn":
+                    path, record = self.case.detached_record(row, "active-result-check")
+                    record["delivery"] = f"sent: worker {row.name} at {pane}"
+                    atomic_file.write_text_atomic(path, json.dumps(record))
+                    self.case.agent.append(pane, "user", "Detached run: active-result-check\nRun finished: private verification")
+                    self.case.fixture.world.locations[pane]["agent_status"] = "working"
+                    before = len(self.case.agent.notices)
+                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.WAITING_ON_REPLY)
+                    self.assertEqual(len(self.case.agent.notices), before)
+                    self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
+                    self.case.agent.without_done = False
+                    self.case.agent.complete(pane)
+                    self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                    self.assertEqual(len(self.case.agent.notices), before + 1)
+                    self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir), progress_history.NoActiveDispatch)
+                    self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
+                elif reply_state == "done":
                     path, record = self.case.detached_record(row, "private-check")
                     record["delivery"] = f"sent: worker {row.name} at {pane}"
                     atomic_file.write_text_atomic(path, json.dumps(record))
