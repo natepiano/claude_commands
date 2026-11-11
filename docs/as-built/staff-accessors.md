@@ -96,7 +96,7 @@ The shared pane launch builder uses `set_home`.
 | `commands/plan/shrink.md` | read | runtime_id; unit_runs.open_run reads the run pointer |
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
 | `commands/showrunner/units.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
-| `docs/associate-producer/operations.md` | read | staff.json (shell) |
+| `docs/producer/morty-operations.md` | read | staff.json (shell) |
 | `docs/as-built/showrunner-automation.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
 | `docs/as-built/session-notifier.md` | write | staff.py clear-run (documented shell command) |
 | `docs/production_format.md` | read | staff.py get (shell) |
