@@ -957,9 +957,47 @@ class WorkerCommandTests(unittest.TestCase):
         path = self.run_dir / "progress_history_state.json"
         before = path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()
         reply = self.reply.read_bytes(), self.reply.stat().st_mtime_ns
-        for repeated in (1, 2):
-            with self.subTest(repeated=repeated):
-                self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        for repeated in (1, 2, 3, 4):
+            with self.subTest(repeated=repeated), ExitStack() as sends:
+                if repeated == 4:
+                    row = self.agent.row(pane)
+                    passed = worker_panes.worker_pass(row, self.run_dir)
+                    delivery = progress_history.dispatch_delivery(passed)
+                    status = self.run_dir / "shared-status"
+                    progress_history.save_dispatch_delivery(self.run_dir, str(passed["instance_id"]),
+                        replace(delivery, actions=replace(delivery.actions, status_file=str(status))))
+                    with ExitStack() as notices:
+                        self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.prompt,
+                            session_dir=self.run_dir, slot="impl", phase="8", kind="impl",
+                            launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)], reply=self.reply,
+                            notices=notices), worker.DispatchSubmission.SUBMITTED)
+                        self.agent.finish_after = 1
+                        self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse("next-pass"), "impl", self.prompt,
+                            session_dir=self.run_dir, slot="next-pass", phase="8", kind="impl", launcher_command=["next-assign"],
+                            reply=self.run_dir / "next-reply.md",
+                            completion_actions=progress_history.CompletionActions(status_file=str(status)),
+                            on_submission=lambda: atomic_file.write_text_atomic(status, "running\n")), worker.DispatchSubmission.SUBMITTED)
+                    self.assertEqual(status.read_text(), "running\n")
+                    continue
+                if repeated == 3:
+                    send_notice = send.send
+
+                    def send_unlocked(options: send.Options) -> send.Result:
+                        with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as acquired:
+                            self.assertIsInstance(acquired, worker_panes.WorkerLockHold)
+                        return send_notice(options)
+
+                    _ = sends.enter_context(patch.object(send, "send", side_effect=send_unlocked))
+                    with ExitStack() as notices, worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as hold:
+                        self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                        assert isinstance(hold, worker_panes.WorkerLockHold)
+                        result = worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.prompt,
+                            session_dir=self.run_dir, slot="impl", phase="8", kind="impl",
+                            launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)], reply=self.reply,
+                            lock=hold, notices=notices)
+                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                else:
+                    self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
                 self.assertEqual(self.agent.notices, [notice] * (repeated + 1))
                 self.assertEqual(len(self.agent.submitted), 1)
                 self.assertEqual(len(self.fixture.world.launches), 1)
@@ -967,7 +1005,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()), before)
                 self.assertEqual((self.reply.read_bytes(), self.reply.stat().st_mtime_ns), reply)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.IGNORED)
-        self.assertEqual(len(self.agent.notices), 3)
+        self.assertEqual(len(self.agent.notices), 5)
 
     def test_dispatch_rerun_before_prompt_records_one_submission(self) -> None:
         target = herdr.check_target
