@@ -2429,12 +2429,22 @@ class WorkerPaneTests(StaffTestCase):
         self.world.add(row, "w1:p1")
         self.world.locations["w1:p1"]["agent_status"] = "working"
         before = self.staff_state()
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
-            code, _, errors = self.command("close", row.name)
-        self.assertEqual((code, errors), (worker_panes.ExitCode.OK, ""))
-        self.assertEqual(self.staff_state(), before)
-        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
-        self.assertEqual((self.world.stops, self.prompts()), ([], []))
+        panes = deepcopy(self.world.locations)
+        for name, found in (("absent", False), (row.name, True)):
+            with self.subTest(name=name), patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
+                code, output, errors = self.command("close", name)
+                if not found:
+                    self.assertEqual((code, output, errors),
+                                     (worker_panes.ExitCode.REFUSED, "", f"no worker named {name}\n"))
+                    self.assertEqual(self.staff_state(), before)
+                    self.assertEqual(self.world.locations, panes)
+                    self.assertEqual(self.world.closed, [])
+                    self.assertEqual((self.world.stops, self.prompts()), ([], []))
+                    continue
+                self.assertEqual((code, errors), (worker_panes.ExitCode.OK, ""))
+                self.assertEqual(self.staff_state(), before)
+                self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
+                self.assertEqual((self.world.stops, self.prompts()), ([], []))
 
     def test_refused_pass_allows_a_stopped_close_and_a_role_change(self) -> None:
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}}, update=True)
