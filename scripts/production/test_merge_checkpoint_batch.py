@@ -116,14 +116,50 @@ raise SystemExit(1)
                     self.assertIn("beta phase 2", self.log.read_text())
 
     def test_conflicting_second_item_drops_before_the_remaining_items_retry(self) -> None:
-        for preexisting_merge in (False, True):
-            with self.subTest(preexisting_merge=preexisting_merge):
+        for preexisting_merge, held_case in ((False, ""), (True, ""), (False, "two holds"), (False, "later item")):
+            with self.subTest(preexisting_merge=preexisting_merge, held_case=held_case):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
                 self.promotions = str(self.promote)
                 self.production_doc()
                 start = self.git("rev-parse", "HEAD")
+                if held_case:
+                    if held_case == "two holds":
+                        first = self.checkpoint(content="alpha clean item\n")
+                        second = self.beta_checkpoint("src/beta.txt", "beta invalid shrink\n")
+                        third = self.checkpoint("docs/wrong.md", "alpha invalid shrink\n")
+                        lines = [self.batch_line("alpha", "2", first),
+                                 self.batch_line("beta", "2", second, "--shrink"),
+                                 self.batch_line("alpha", "3", third, "--shrink")]
+                        landed, retries = [first], 2
+                    else:
+                        first = self.checkpoint("docs/wrong.md", "alpha invalid shrink\n")
+                        second = self.checkpoint("src/later.txt", "alpha later item\n")
+                        third = self.beta_checkpoint("src/beta.txt", "beta clean item\n")
+                        lines = [self.batch_line("alpha", "2", first, "--shrink"),
+                                 self.batch_line("alpha", "3", second), self.batch_line("beta", "2", third)]
+                        landed, retries = [third], 1
+                    result = self.land_batch(lines)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    _ = self.assert_landed(start, landed)
+                    self.assertEqual(result.stdout.count("batch: retry"), retries)
+                    self.assertIn("scope: held", result.stdout)
+                    self.assertEqual(self.events("checkpoint-test"), [[]])
+                    self.assertNotIn("batch retry stopped", result.stdout)
+                    if held_case == "two holds":
+                        self.assertIn("send alpha: phase 2 merged", result.stdout)
+                        self.assertNotIn("send beta: phase 2 merged", result.stdout)
+                        self.assertNotIn("send alpha: phase 3 merged", result.stdout)
+                        self.assertEqual(result.stdout.count("scope: held"), 2)
+                    else:
+                        self.assertIn(f"later item follows alpha phase 2 ({first[:12]})", result.stdout)
+                        self.assertIn(f"send alpha: resolve alpha phase 2 ({first[:12]}), then resend this checkpoint",
+                                      result.stdout)
+                        self.assertIn("send beta: phase 2 merged", result.stdout)
+                        self.assertNotIn("send alpha: phase 3 merged", result.stdout)
+                        self.assertEqual(result.stdout.count("scope: held"), 2)
+                    continue
                 first = self.checkpoint(content="alpha batch side\n")
                 second = self.beta_checkpoint("src/alpha.txt", "beta conflicting side\n")
                 third = self.checkpoint("src/third.txt", "alpha third change\n")
@@ -196,16 +232,19 @@ raise SystemExit(1)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     self.assertIn("resume it alone with the single command", result.stdout)
                     if shrink:
-                        self.assertIn("send alpha: repair package alpha-proof", result.stdout)
+                        self.assertIn(f"send alpha: resolve alpha phase 2 ({first[:12]}), then resend this checkpoint",
+                                      result.stdout)
+                        self.assertNotIn("red: failed", result.stdout)
+                        self.assertEqual(result.stdout.count("batch: retry"), 0)
                     else:
                         self.assertIn("send beta: repair package alpha-proof", result.stdout)
-                    self.assertIn("red: failed", result.stdout)
-                    self.assertEqual(result.stdout.count("batch: retry"), 1)
+                        self.assertIn("red: failed", result.stdout)
+                        self.assertEqual(result.stdout.count("batch: retry"), 1)
                     self.assertEqual(self.git("rev-parse", "HEAD"), unpublished)
                     for branch in ("production", "main"):
                         self.assertEqual(self.git("rev-parse", branch, cwd=self.origin), start)
-                    self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]] * 3)
-                    self.assertEqual(self.events("checkpoint-test"), [[], []])
+                    self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]] * (1 if shrink else 3))
+                    self.assertEqual(self.events("checkpoint-test"), [[]] * (1 if shrink else 2))
                     self.assertEqual(self.receipts(), [])
                 elif probe_case == "main":
                     self.promotions = str(self.promote)
