@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import subprocess
 import sys
 import time
+from threading import Timer
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
@@ -1182,6 +1183,64 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
 
+        for exited in (False, True):
+            with self.subTest(exited=exited):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    config = case.fixture.root / "conf/direct.conf"
+                    atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
+                    opened = case.opened()
+                    def queued_without_delivery(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                        if arguments[0] == "/nonexistent/herdr" and arguments[4:6] == ["prompt", opened.pane]:
+                            if exited:
+                                pid, _, _ = case.fixture.world.foreground.pop(opened.pane)
+                                del case.fixture.world.processes[pid]
+                                case.fixture.world.locations[opened.pane]["agent_status"] = "exited"
+                            return subprocess.CompletedProcess(arguments, 0, "{}", "")
+                        return case.agent.run(arguments, **options)
+                    with (patch.object(subprocess, "run", side_effect=queued_without_delivery),
+                          redirect_stderr(io.StringIO()) as errors):
+                        code = worker.assign(case.fixture.parent.id, "impl", case.prompt, session_dir=case.run_dir,
+                            slot="impl", phase="8", kind="impl", name="impl", launcher_command=["assign.sh"], reply=case.reply)
+                    case.assertEqual(code, worker.ExitCode.UNCERTAIN)
+                    case.assertEqual(case.agent.submitted, [])
+                    case.assertIsInstance(case.receipt(), worker.DispatchNotSubmitted)
+                    case.assertEqual(errors.getvalue(),
+                        "anomaly: impl: dispatch prompt is not in the transcript; submission is unproved\n")
+                    if exited:
+                        case.assertIsInstance(worker_panes.observe_worker(case.fixture.parent.id, opened.row, staff.snapshot()),
+                                              worker_panes.StoppedWorker)
+                        case.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+                    case.assertIs(case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+                    case.assertEqual(len(case.agent.submitted), 1)
+                    case.assertEqual(case.agent.row(case.agent.submitted[-1][0]).current_session, opened.row.current_session)
+                finally:
+                    case.doCleanups()
+
+        with self.subTest(delivery="delayed transcript"):
+            case = WorkerCommandTests("runTest")
+            case.setUp()
+            opened = case.opened()
+            case.agent.defer_prompt_transcript = True
+            config = case.fixture.root / "conf/direct.conf"
+            atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
+            def record_prompt() -> None:
+                pane, line = case.agent.submitted[-1]
+                case.agent.append(pane, "user", line)
+            delivery = Timer(0.1, record_prompt)
+            case.agent.during_prompt = delivery.start
+            try:
+                with redirect_stderr(io.StringIO()) as errors:
+                    case.assertIs(case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+                case.assertEqual(errors.getvalue(), "")
+                case.assertEqual(len(case.agent.submitted), 1)
+                case.assertEqual(case.agent.submitted[0][0], opened.pane)
+                case.assertIsInstance(case.receipt(), worker.DispatchSubmitted)
+            finally:
+                delivery.join()
+                case.doCleanups()
+
     def test_blocked_dispatch_returns_blocked(self) -> None:
         opened = self.opened()
         question = "Which output format must I use?\nJSON or Markdown?\n"
@@ -1471,6 +1530,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIsNotNone(staff.by_id(opened.row.id))
 
     def test_transcript_failure_reports_whether_the_prompt_was_delivered(self) -> None:
+        config = self.fixture.root / "conf/direct.conf"
+        atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
         for delivered in (False, True):
             with self.subTest(delivered=delivered):
                 name = "impl2" if delivered else "impl"
@@ -1490,8 +1551,9 @@ class WorkerCommandTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()) as errors:
                     result = self.dispatch(name)
                 if delivered:
-                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
-                    self.assertEqual(errors.getvalue(), "")
+                    self.assertEqual(result, worker.ExitCode.UNCERTAIN)
+                    self.assertEqual(errors.getvalue(),
+                        f"anomaly: {name}: worker transcript has incomplete records; submission is unproved\n")
                 else:
                     self.assertEqual(result, worker.ExitCode.UNCERTAIN)
                     self.assertEqual(errors.getvalue(),
