@@ -198,7 +198,7 @@ Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
   A `status` post does not change the role field.
 
 Record decisions on the board. Keep the slot argument in every post.
-Read worker names and states with `worker.py list`.
+Read worker names and states with `worker.py list all`.
 Use `send.py --to worker:<unit>/<short name> --from "<sender>" --text "<text>"` under the sender's showrunner.
 Use `worker:<showrunner>/<unit>/<short name>` from outside that showrunner.
 The address resolves through staff and the shared pane observation.

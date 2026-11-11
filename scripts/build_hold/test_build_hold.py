@@ -119,6 +119,19 @@ class OwningSessionTests(IsolatedBuildHoldTest):
         }):
             self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
 
+    def test_run_resolution_names_the_owner_or_the_missing_run(self) -> None:
+        identity = fixture_runtime_id("run-owner")
+        self.owner(identity, self.unit_run)
+        missing = self.scratch / "missing-run"
+        cases: tuple[tuple[dict[str, str], build_hold.RunOwner | build_hold.NoRunNamed | build_hold.RunNotInStaff], ...] = (
+            ({"UNIT_RUN_DIR": str(self.unit_run)}, build_hold.RunOwner(identity)),
+            ({}, build_hold.NoRunNamed()),
+            ({"UNIT_RUN_DIR": str(missing)}, build_hold.RunNotInStaff(missing)),
+        )
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                self.assertEqual(build_hold.run_resolution(environment), expected)
+
     def test_no_run_uses_shell_session_without_staff_lookup(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):
@@ -1181,10 +1194,63 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
             with self.subTest(code=code):
                 result = subprocess.CompletedProcess([], code, "", "recipient refused")
                 with mock.patch.object(subprocess, "run", return_value=result):
-                    self.assertEqual(build_hold.send_release(entry, "/test/socket"), expected)
+                    self.assertEqual(build_hold.send_release(entry, "/test/socket", build_hold.RELEASE_NOTICE), expected)
         with mock.patch.object(subprocess, "run", side_effect=OSError("send unavailable")):
-            self.assertEqual(build_hold.send_release(entry, "/test/socket"),
+            self.assertEqual(build_hold.send_release(entry, "/test/socket", build_hold.RELEASE_NOTICE),
                              build_hold.ReleaseSendFailed("send unavailable"))
+
+        for record in ("current-cycle", "old-cycle", "multiple-holders", "recovered-cycle", "broadcast", "same-minute"):
+            with self.subTest(record=record), mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "TZ": "UTC"}):
+                texts: list[str] = []
+                starts = ((33, 0, "frame capture", "07:33:00"), (56, 0, "animation capture", "07:56:00"))
+                if record == "same-minute":
+                    starts = ((33, 0, "frame capture", "07:33:00"),
+                              (33, 20, "frame capture", "07:33:20"), (33, 40, "frame capture", "07:33:40"))
+                for minute, second, purpose, shown in starts:
+                    started = datetime(2026, 11, 11, 12, minute, second, tzinfo=timezone.utc)
+                    folder = self.scratch / "holders"
+                    _ = build_hold.start_hold(folder, build_hold.HolderIdentity("fps", "fps"), purpose,
+                                              build_hold.NoReleaseEta(), started)
+                    build_hold.record_recipients([("waiting session", "session-a")])
+                    cycle = build_hold.read_cycle()
+                    assert cycle is not None
+                    if record == "old-cycle":
+                        for holder in cycle["holders"].values():
+                            _ = holder.pop("purpose", None)
+                        build_hold.save_cycle(cycle)
+                    if record in ("multiple-holders", "recovered-cycle"):
+                        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("resources", "resources"),
+                                                  "render checks", build_hold.NoReleaseEta(), started + timedelta(minutes=1))
+                        _ = build_hold.release_cycle(folder, "fps")
+                    key = "resources" if record in ("multiple-holders", "recovered-cycle") else "fps"
+                    if record == "broadcast":
+                        (build_hold.release_directory() / "current").unlink()
+                    if record == "recovered-cycle":
+                        release = build_hold.release_hold
+
+                        def interrupt(directory: Path, holder: build_hold.Holder) -> str:
+                            _ = release(directory, holder)
+                            raise OSError("stopped after unlink")
+
+                        with mock.patch.object(build_hold, "release_hold", side_effect=interrupt), \
+                             self.assertRaisesRegex(OSError, "stopped after unlink"):
+                            _ = build_hold.release_cycle(folder, key)
+                        _ = (build_hold.release_directory() / cycle["id"] / "cycle.json").write_text("broken")
+                    with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
+                         mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as send:
+                        _ = build_hold.release_cycle(folder, key)
+                    send.assert_called_once()
+                    arguments = cast(list[str], send.call_args.args[0])
+                    notice = arguments[arguments.index("--all" if record == "broadcast" else "--text") + 1]
+                    texts.append(notice)
+                    if record == "old-cycle":
+                        self.assertIn(f"fps hold, from {shown} EST", notice)
+                    else:
+                        self.assertIn(f"fps hold for {purpose}, from {shown} EST", notice)
+                    if record in ("multiple-holders", "recovered-cycle"):
+                        self.assertIn(f"resources hold for render checks, from 07:{minute + 1}:00 EST", notice)
+                self.assertNotEqual(texts[0], texts[1])
+                self.assertEqual(len(set(texts)), len(texts))
 
 
     def test_empty_or_unavailable_socket_lookup_has_named_results(self) -> None:
@@ -1829,7 +1895,9 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         build_hold.record_recipients([("second waiter", "two")])
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            holder = "first" if entry["session_id"] == "one" else "second"
+            self.assertIn(f"{holder} hold for tests,", notice)
             sent.append(entry["session_id"])
             if sent == ["two", "one"]:
                 raise OSError("stopped while sending the earlier release")
@@ -1960,7 +2028,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         build_hold.record_recipients([("first", "one"), ("second", "two"), ("third", "three")])
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             sent.append(entry["session_id"])
             if sent == ["one", "two"]:
                 raise OSError("stopped after sending second notice")
@@ -2021,7 +2090,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             events.append("started" if cycle["release_started_at"] else "released")
             save(cycle)
 
-        def send(_entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(_entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders/holder").exists())
             self.assertIn("started", events)
             events.append("notice")
@@ -2071,7 +2141,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             self.assertIn("wait for release", build_hold.register_wait(session, session))
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders/holder").exists())
             sent.append(entry["session_id"])
             # Neither session acknowledges or reports that its turn ended.
@@ -2095,7 +2166,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         _ = build_hold.register_wait("two")
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders" / "holder").exists())
             self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
             sent.append(entry["session_id"])
@@ -2152,8 +2224,11 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertIn("new-holder", self.cycle()["holders"])
 
     def test_notice_says_builds_can_start_and_needs_no_answer(self) -> None:
-        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
-            _ = build_hold.send_release(build_hold.new_entry("one", "recipient"), "/test")
+        self.begin()
+        build_hold.record_recipients([("recipient", "one")])
+        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test")), \
+             mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            _ = build_hold.release_cycle(self.scratch / "holders", "holder")
         arguments = cast(list[str], run.call_args.args[0])
         notice = arguments[arguments.index("--text") + 1]
         self.assertIn("Start your builds", notice)

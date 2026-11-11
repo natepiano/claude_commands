@@ -473,11 +473,11 @@ class KqueueFileChanges:
 
 
 def finished_run_status(session_dir: str) -> str:
-    """Return the final run status, or an empty string for an unfinished run."""
+    """Return the recorded outcome when the run has a finish time."""
     state_file = cast(str, import_module("scripts.lib.unit_runs").STATE_FILE)
     state = read_json_object(Path(session_dir) / state_file)
     status = state.get("status")
-    return status if isinstance(status, str) and status != "active" and "finished_at" in state else ""
+    return status if isinstance(status, str) and status and "finished_at" in state else ""
 
 
 DETACHED_RUNS_DIR = "detached_runs"

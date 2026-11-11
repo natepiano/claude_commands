@@ -25,7 +25,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
@@ -97,6 +97,8 @@ class BroadcastReleaseNotice(TypedDict):
 class ReleaseIntent(TypedDict):
     holder_key: str
     holder_name: str
+    holder_purpose: NotRequired[str]
+    cycle_holders: NotRequired[dict[str, dict[str, str]]]
     holder_since: str
     holder_directory: str
     released_at: str
@@ -357,8 +359,23 @@ class Busy:
     reasons: tuple[str, ...]
 
 
-def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
-    """Find the session that owns this run before using the shell's session id."""
+@dataclass(frozen=True)
+class RunOwner:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoRunNamed:
+    pass
+
+
+@dataclass(frozen=True)
+class RunNotInStaff:
+    run: Path
+
+
+def run_resolution(environment: Mapping[str, str] = os.environ) -> RunOwner | NoRunNamed | RunNotInStaff:
+    """Find the staff session that owns the named run."""
     run = (environment.get("UNIT_RUN_DIR") or environment.get("PLAN_DELEGATE_BOARD_DIR")
            or environment.get("UNIT_SESSION_DIR") or environment.get("PLAN_DELEGATE_SESSION_DIR"))
     if run:
@@ -370,7 +387,16 @@ def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession
             rows = ()
         for row in rows:
             if isinstance(row.run, staff.OpenRun) and str(row.run.path) == run and row.current_session:
-                return OwningSession(row.current_session)
+                return RunOwner(row.current_session)
+        return RunNotInStaff(Path(run))
+    return NoRunNamed()
+
+
+def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
+    """Find the session that owns this run before using the shell's session id."""
+    resolution = run_resolution(environment)
+    if isinstance(resolution, RunOwner):
+        return OwningSession(resolution.session_id)
     session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
     return OwningSession(session_id) if session_id else NoOwningSession()
 
@@ -1309,6 +1335,9 @@ def finish_release_intent(intent: ReleaseIntent) -> str:
 def finish_recorded_notices(record: RecordedRelease) -> str:
     intent = record.intent
     directory = Path(intent["holder_directory"])
+    released_hold = {"name": intent["holder_name"], "purpose": intent.get("holder_purpose", ""),
+                     "since": intent["holder_since"], "released_at": intent["released_at"]}
+    released_holds = intent.get("cycle_holders", {intent["holder_key"]: released_hold})
     try:
         pending = release_notices(intent)
     except ReleaseNoticeReadError as error:
@@ -1321,12 +1350,12 @@ def finish_recorded_notices(record: RecordedRelease) -> str:
         notices = intent["notices"]
         assert notices["kind"] == "cycle"
         save_cycle({"id": notices["cycle_id"], "opened_at": intent["holder_since"],
-                    "holders": {intent["holder_key"]: {"since": intent["holder_since"], "released_at": intent["released_at"]}},
+                    "holders": released_holds,
                     "recipients": dict(notices["recipients"]), "entries": [], "release_started_at": intent["released_at"]})
         pending = release_notices(intent)
     if not isinstance(pending, CycleNoticesToSend):
         # The pending record is the broadcast entry. Keep it until the send returns.
-        send_release_broadcast()
+        send_release_broadcast(release_notice(released_holds))
         result = " No hold cycle: broadcast this release to every session."
     else:
         cycle = pending.cycle
@@ -1378,7 +1407,8 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
                 cycle["release_started_at"] = ""
                 for entry in cycle["entries"]:
                     entry["delivery"] = "NotAttempted"
-            cycle["holders"][identity.key] = {"since": now.isoformat(), "released_at": ""}
+            cycle["holders"][identity.key] = {"name": identity.name, "purpose": purpose,
+                                              "since": now.isoformat(), "released_at": ""}
             save_cycle(cycle)
         return notice
 
@@ -1442,9 +1472,22 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
     return RecipientLookupFailed(reason)
 
 
-def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+def release_notice(holders: Mapping[str, Mapping[str, str]]) -> str:
+    """Name each released hold in the user's time zone."""
+    descriptions: list[str] = []
+    zone = user_zone()
+    for key, holder in holders.items():
+        name = holder.get("name", key)
+        purpose = holder.get("purpose", "")
+        work = f" for {purpose}" if purpose else ""
+        started = aware_instant(holder["since"]).astimezone(zone).strftime("%H:%M:%S %Z")
+        descriptions.append(f"{name} hold{work}, from {started}")
+    return RELEASE_NOTICE + " Released holds: " + "; ".join(descriptions) + "."
+
+
+def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    notice = f"{RELEASE_NOTICE} Session {entry['session_id']}."
+    notice = f"{notice} Session {entry['session_id']}."
     try:
         result = subprocess.run(session_send.send_argv("--to", f"uds:{socket}", "--text", notice), capture_output=True, text=True)
     except OSError as error:
@@ -1456,9 +1499,9 @@ def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | Release
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
 
-def send_release_broadcast() -> None:
+def send_release_broadcast(notice: str) -> None:
     script = Path(__file__).resolve().parent.parent / "production" / "broadcast.py"
-    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "--from", "build-hold", "--all", notice],
                             capture_output=True, text=True)
     if result.returncode:
         raise OSError(f"release broadcast: {failure_detail(result)}")
@@ -1512,7 +1555,7 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         if isinstance(recipient, RecipientGone):
             entry["delivery"] = "RecipientGone"
         elif isinstance(recipient, RecipientLive):
-            result = send_release(entry, recipient.socket)
+            result = send_release(entry, recipient.socket, release_notice(cycle["holders"]))
             if isinstance(result, ReleaseDelivered):
                 entry["delivery"] = "Delivered"
             elif isinstance(result, ReleaseQueued):
@@ -1554,9 +1597,11 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             notices: CycleReleaseNotices | BroadcastReleaseNotice = {"kind": "broadcast"}
             if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 notices = {"kind": "cycle", "cycle_id": cycle["id"], "recipients": dict(cycle["recipients"])}
-            intent = {"holder_key": holder.key, "holder_name": holder.name,
+            intent = {"holder_key": holder.key, "holder_name": holder.name, "holder_purpose": holder.purpose,
                       "holder_since": holder.since.isoformat(), "holder_directory": str(directory.resolve()),
                       "released_at": clock().isoformat(), "notices": notices}
+            if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+                intent["cycle_holders"] = {key: dict(fields) for key, fields in cycle["holders"].items()}
             save_release_intent(intent)
         result = release_hold(directory, holder)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):

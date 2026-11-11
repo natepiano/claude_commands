@@ -4977,9 +4977,8 @@ class HerdrTests(unittest.TestCase):
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:
-                return (roster._every_labeled_session(), inventory._unit_sessions((  # pyright: ignore[reportPrivateUsage]
-                    inventory.ShowrunnerRegistration("runner", "production", str(self.root / "production.md")),
-                )), roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
+                return (roster._every_labeled_session(), inventory._unit_sessions(staff.snapshot()),  # pyright: ignore[reportPrivateUsage]
+                        roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
 
             expected = read_callers()
             self.assertEqual(scans.call_count, 3)

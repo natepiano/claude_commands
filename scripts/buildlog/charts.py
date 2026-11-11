@@ -1,29 +1,21 @@
-"""Read shared build-page data and open the shared page link."""
+"""Read data for the shared build page."""
 
 from __future__ import annotations
 
 import bisect
-import os
 import sqlite3
-import subprocess
-import sys
-import webbrowser
 from collections import defaultdict
-from collections.abc import Callable, Mapping
-from contextlib import closing, suppress
+from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
-from pathlib import Path
 from enum import StrEnum
 from zoneinfo import ZoneInfo
-from urllib.parse import urlsplit
 
 from scripts.lib import conf
 from scripts.buildlog import costs, index, moments
 from scripts.lib.user_zone import user_zone
 from scripts.buildlog.costs import CostUnavailable as CostUnavailable
-
-MEMORY_FEED = Path(__file__).resolve().parents[1] / "build_queue/memory_feed.py"
 
 
 @dataclass(frozen=True)
@@ -356,44 +348,3 @@ def chart_data(series: ChartSet) -> dict[str, object]:
     return {"start": series.start.timestamp()*1000, "end": series.end.timestamp()*1000,
             "zone": series.zone, "machines": series.machines, "causes": CAUSES, "buckets": buckets,
             "moments": live, "pending": pending}
-
-
-def local_display(environ: Mapping[str, str], platform: str) -> bool:
-    if "SSH_CONNECTION" in environ:
-        return False
-    return platform == "darwin" or bool(environ.get("DISPLAY") or environ.get("WAYLAND_DISPLAY"))
-
-
-def main(args: list[str]) -> int:
-    no_open = "--no-open" in args or os.environ.get("BUILDLOG_CHARTS_NO_OPEN") == "1"
-    words = [word for word in args if word != "--no-open"]
-    if words not in ([], ["--days", "7"], ["--days", "30"]):
-        print("usage: buildlog charts [--days 7|30] [--no-open]", file=sys.stderr)
-        return 2
-    try:
-        result = subprocess.run([sys.executable, str(MEMORY_FEED), "link"],
-                                capture_output=True, text=True, check=False)
-    except (OSError, UnicodeDecodeError) as error:
-        print(f"buildlog charts: {error}", file=sys.stderr)
-        return 1
-    if result.returncode:
-        reason = result.stderr.strip() or f"link command exited {result.returncode}"
-        print(f"buildlog charts: {reason}", file=sys.stderr)
-        return 1
-    url = result.stdout.strip()
-    try:
-        link = urlsplit(url)
-        _ = link.port
-        valid = (link.scheme in ("http", "https") and bool(link.hostname) and url.isprintable()
-                 and not any(char.isspace() for char in url))
-    except ValueError:
-        valid = False
-    if not valid:
-        reason = result.stderr.strip() or "link command did not return one http/https URL"
-        print(f"buildlog charts: {reason}", file=sys.stderr)
-        return 1
-    print(url)
-    if not no_open and local_display(os.environ, sys.platform):
-        with suppress(OSError, webbrowser.Error):
-            _ = webbrowser.open(url)
-    return 0
