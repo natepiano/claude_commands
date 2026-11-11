@@ -553,6 +553,16 @@ Launch state, launch logs, and reservations retain the box region.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
 Status, termination, and expired-launch searches use that region.
 The controller searches every configured region for an expired reservation without a recorded region.
+After a valid final result, the controller books the box end at the result receipt time.
+It still requests termination and requires AWS to confirm termination before it books that time.
+A box without a valid final result uses the termination confirmation time.
+Reconciliation and the expiry sweep retain their existing end times.
+Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
+Each timestamp is a UTC epoch time from the box.
+Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
+It omits `instance_running_at` when the cache is absent or invalid.
+The current source checkout occurs after `nix_ready_at`, so results omit `source_ready_at`.
 All regions use one spend ledger and the existing caps.
 Gate costs use bill rates for the recorded region and UTC day.
 A day with its own completed bill keeps that day's rate when newer bills arrive.
@@ -566,8 +576,41 @@ The minimum charge applies once per lifetime.
 The older builder and paired trials use the same daily rate rule.
 Reservations without a region use the highest configured regional rate.
 A region without a usable bill rate uses the configured rate ceiling.
+Completed gates also use bill rates for non-compute costs.
+Public IPv4 and gp3 root storage use regional rates over the gate's actual box hours.
+The root charge uses `root_gib` and the number of hours in the bill's month.
+S3 requests, storage, and outbound transfer use the bill day's totals divided by its gate launch count.
+The ledger charges the S3 share once per gate.
+The hourly charges use each UTC day's rate across midnight.
+These rates use the same bill day rule as compute rates.
+The ledger stores the selected cost and its bill source.
+Paired trials use this booked cost for completed gates.
+Open reservations retain `attempt_allowance_usd`.
+Admission includes these allowances when bills exist.
+An own-day bill corrects saved estimates that still include configured allowances.
+The bill remains the minimum cost for its reconciliation period.
+Missing cost rows contribute zero.
+The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
+The spending limits do not change.
 
 The prices command prints regional Spot prices without resource identities.
+The table header follows the administrator passphrase prompt.
+Whole quota values have no decimal suffix.
+`deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
+The reads use the encrypted administrator key through the admin executor.
+A region whose quota is below the largest configured type prints a request for a quota increase.
+The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
+A type with another size has no known count, and the check skips it.
+A failed read prints the quota as unknown with the redacted reason, and the command continues.
+The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
+`deploy.py quota-request` requests `spot_quota_request_vcpus` from `cloud_gate.conf` in each configured region.
+The default request is 128 vCPUs.
+The command uses the encrypted administrator key through the admin executor.
+It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
+It prints the region, desired value, and request status without request, case, or account identifiers.
+A failed call prints only the AWS error code or Python error class and does not stop other regions.
+Any regional failure makes the command exit with status 1.
+The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.

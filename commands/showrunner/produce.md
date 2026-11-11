@@ -14,6 +14,7 @@ A real `hit your usage limit` worker failure turns it on for the unit's current 
 Send no worker work to a unit in this mode; treat its direct work as normal phase work.
 The director writes the code, runs the tests, and does the reviews directly.
 Follow <NoWorkerMode/> in `commands/unit/direct.md` for the phase gates and the next-phase assign rule.
+Merge unit directors follow `commands/unit/merge.md`; they wait for workers when capacity is absent.
 
 The showrunner believes in the three gods (<ThreeGods/>, imported below) and
 serves them in every merge, design check, call and report.
@@ -631,11 +632,11 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** In the background, run
+4. **Run the checkpoint.** With a merge unit, give the order to it under `commands/unit/merge.md`.
+   Without a merge unit, run this command in the background:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
    <showrunner name> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
-   --parallel "<the notice's Parallel: line>"
    --delivers "<one line of what the phase delivers>"`.
    When several checkpoint notices wait, land them in one batch, in arrival order.
    Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
@@ -652,7 +653,7 @@ notice to the unit director before any merge command runs:
    <SCRATCH>` to keep its merge message and test log there. For a phase shrink
    notice, add `--shrink`; for a unit's closing as-built commit (its as-built
    docs and the plan's deletion, after its last phase merged), add
-   `--as-built`; with either, omit `--review-trial`, `--parallel` and `--delivers`. Add
+   `--as-built`; with either, omit `--review-trial` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
    watching its result or diagnosing a red run. Add `--bump` only for a user's
@@ -821,6 +822,7 @@ or helper working a camera out by hand gets pointed at it.
 ---
 
 <CIPoint>
+Merge unit directors dispatch this contract through workers under `commands/unit/merge.md`.
 Merge nothing during validation. Before the push, check for an older queued or
 running CI run on `MERGE_BRANCH`; add `--cancel-prior` when this push supersedes
 it and no CI point is watching its result or diagnosing a red run. With
@@ -855,6 +857,7 @@ when the test ends; a phase task must name a real phase.
 ---
 
 <PromoteMain>
+Merge unit directors dispatch smoke checks, pushes, and promotion through workers under `commands/unit/merge.md`.
 Promote the exact sha pushed by <CIPoint/> after these checks:
 
 1. The CIPoint's local validation passed.
@@ -1198,7 +1201,8 @@ condition: wrap neither waits on it nor retires its worktree or branch.
 
 - The showrunner writes no implementation code, tests or Work Orders in a unit's
   files.
-- Only the showrunner pushes the merge branch and main, never with force.
+- The showrunner authorizes pushes to the merge branch and main.
+  Merge workers execute authorized pushes under `commands/unit/merge.md`. Never force a push.
   Units push only their own branch except <FastTrack/> (`commands/unit/fast_track.md`).
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
@@ -1219,7 +1223,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
     depend on which and start every independent phase now: beside the current
     phase in the same unit, or as its own unit (`/showrunner:add_unit`) when
     its files can be fenced. Packaging is yours, never the user's. User,
-    2026-10-13. Each dailies build identifies independent work; start it.
+    2026-10-13.
   - A unit's later phase runs beside its current one, with its own workers, berth
     reservation and checkpoint. A checkpoint commits only its own phase's paths.
     Where files overlap, it claims after the earlier phase and builds on its tree.

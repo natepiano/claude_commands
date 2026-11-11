@@ -425,7 +425,6 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           pane_rows: dict[staff.StaffId, list[dict[str, object]]] | None = None,
           runs_reader: worker_runs.WorkerRuns | None = None) -> str:
     snapshot = staff.snapshot() if snapshot is None else snapshot
-    resolver = session_staff.RowResolver(snapshot)
     if now is None:
         now = runs_reader.now if runs_reader is not None else plan_history.now_epoch()
     zone = user_zone() if zone is None else zone
@@ -435,7 +434,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     def read_plan(path: Path) -> list[plan_history.PlanPhase]:
         if path not in plans:
             try:
-                plans[path] = plan_history.plan_phases(path, resolver=resolver)
+                plans[path] = plan_history.plan_phases(path)
             except (OSError, UnicodeError):
                 plans[path] = []
         return plans[path]

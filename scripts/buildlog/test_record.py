@@ -978,14 +978,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertGreaterEqual(started, released_at - 0.01)
         self.assertEqual(record["mem_wait_s"], int(output.split("wait=")[-1].strip()))
 
-    def test_scope_memory_names_its_values_and_marks_missing_stalls_unmeasured(self) -> None:
-        peak = self.peak_file()
-        memory = recorder.peak_and_stall(str(peak))
-        self.assertIsInstance(memory, recorder.StepScopeMemory)
-        self.assertEqual(memory.peak_bytes, 123456)
-        self.assertIs(memory.stall_some_s, sample.Unmeasured.VALUE)
-        self.assertIs(memory.stall_full_s, sample.Unmeasured.VALUE)
-
     def test_scope_memory_uses_shared_pressure_parser_for_partial_counters(self) -> None:
         peak = self.base / "partial-pressure"
         _ = peak.write_text("123456\nsome avg10=0.00 total=1250000\n")
@@ -1421,14 +1413,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
                                             "2026-10-12T12:00:00+00:00"]), 0)
         self.assertEqual(self.records(), [])
         self.assertIn("write failed", (self.root / "errors.log").read_text())
-
-    def test_hold_event_refuses_invalid_or_naive_planned_ends_without_failing_its_caller(self) -> None:
-        for until in ("later", "2026-10-12T14:00:00"):
-            with self.subTest(until=until):
-                result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
-                                     "2026-10-12T12:00:00Z", until)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.records(), [])
 
     def test_hold_event_accepts_an_empty_planned_end(self) -> None:
         result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",

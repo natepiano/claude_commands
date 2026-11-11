@@ -1,4 +1,4 @@
-"""The readings log and the weighted pace the dailies footer extends to 100% used."""
+"""The readings log and the weighted pace for account usage."""
 
 import json
 import math

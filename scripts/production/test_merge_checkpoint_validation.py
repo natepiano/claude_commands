@@ -21,7 +21,7 @@ from scripts.production.production_doc import read_new_production
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -247,7 +247,7 @@ with (state / "refreshed-test-locks").open("a") as output:
 
         arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
-                     "--review-trial", TRIAL, "--delivers", DELIVERS, "--parallel", PARALLEL]
+                     "--review-trial", TRIAL, "--delivers", DELIVERS]
         output = StringIO()
         with mock.patch.dict(os.environ, self.env), mock.patch.object(sys, "argv", arguments), mock.patch.object(
             merge_checkpoint, "notify_style", side_effect=malformed_notification,

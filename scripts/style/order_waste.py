@@ -352,6 +352,10 @@ def ended_findings(connection: sqlite3.Connection) -> EndedFindings:
         "SELECT finding_id,rule,path,ticket,state,proposal,duplicate_of,withdrawn_by,declaration_gone_at,followed_from,"
         + "waive_provenance,created_at,updated_at FROM held_findings WHERE state IN ('withdrawn','waived') ORDER BY finding_id",
     ).fetchall())
+    retained_kinds = dict(cast(list[tuple[str, str]], connection.execute(
+        "SELECT finding_id,kind FROM held_findings WHERE finding_id IN "
+        + "(SELECT duplicate_of FROM held_findings WHERE state='withdrawn' AND duplicate_of!='')",
+    ).fetchall()))
     counted: list[EndedFinding] = []
     not_counted: Counter[str] = Counter()
     for (finding_id, rule, path, ticket, state, proposal, duplicate_of, withdrawn_by, declaration_gone_at, followed_from,
@@ -376,7 +380,8 @@ def ended_findings(connection: sqlite3.Connection) -> EndedFindings:
                 counted.append(EndedFinding(finding_id, canonical_rule(rule), frozenset(filter(None, (path, followed_from))), ticket,
                                             _instant(created_at), ended_at, reason))
             case DuplicateOf():
-                not_counted["bare rename duplicate"] += 1
+                kind = "folded test file duplicate" if retained_kinds.get(reason.finding_id) == "restructure" else "bare rename duplicate"
+                not_counted[kind] += 1
             case ExceptionVerdict():
                 not_counted["exception under a newer rule text"] += 1
             case WaiveProvenance():

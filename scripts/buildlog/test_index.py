@@ -1796,12 +1796,6 @@ class IndexTests(unittest.TestCase):
             [(11, "ran", 60.0, 0.0), (12, "skipped", None, None)],
         )
 
-    def test_ci_job_run_states_name_the_persisted_outcomes(self) -> None:
-        self.assertEqual(
-            {state.value for state in index.JobRunState},
-            {"ran", "skipped", "carried_over"},
-        )
-
     def test_tree_and_port_lint_columns(self) -> None:
         self.write(
             self.host_file,

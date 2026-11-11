@@ -239,6 +239,12 @@ fi
 
 initialize_review_artifacts
 
+source "${SCRIPT_DIR}/../agents/claude_account.sh"
+claude_launch_environment workers
+if RESOLVED_MODEL="$(_agents_model_slug claude "${AGENT_MODEL}")"; then
+  AGENT_MODEL="${RESOLVED_MODEL}"
+fi
+
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
@@ -317,7 +323,7 @@ PY
   fi
 fi
 
-bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
+AGENT_EXEC_CLAUDE_MODEL="${AGENT_MODEL}" bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
   "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
 AGENT_PID=$!
 
