@@ -1105,12 +1105,22 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         checkpoint = self.commit("Rename one of two")
         ledger.set_tip(checkpoint, "main")
         ledger.ticket_checkpoint("1", checkpoint)
-        output = self.cli("ticket", "merge", "--id", "1").stdout
-        self.assertEqual(output, f"not built {ids[1]}: rename not applied in {self.sources[1]}\n")
-        built, unbuilt = self.ledger().proposal_findings(issue)
-        self.assertIsInstance(built.state, style_ledger.Built)
-        self.assertEqual(unbuilt.state, style_ledger.Filed(issue))
-        self.assertIsInstance(unbuilt.build_ticket, style_ledger.NoBuildTicket)
+        for action in ("merge", "recheck-merged"):
+            with self.subTest(action=action):
+                if action == "recheck-merged":
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.executemany(
+                            "UPDATE held_findings SET state='filed',build_ticket='1' WHERE finding_id=?",
+                            [(finding_id,) for finding_id in ids],
+                        )
+                output = (self.cli("ticket", "merge", "--id", "1") if action == "merge"
+                          else self.cli("held", "recheck-merged")).stdout
+                self.assertEqual(output, f"not built {ids[1]}: rename not applied in {self.sources[1]}\n")
+                built, unbuilt = self.ledger().proposal_findings(issue)
+                self.assertIsInstance(built.state, style_ledger.Built)
+                self.assertEqual(unbuilt.state, style_ledger.Filed(issue))
+                self.assertIsInstance(unbuilt.build_ticket, style_ledger.NoBuildTicket)
+        self.assertEqual(self.cli("held", "recheck-merged").stdout, "")
 
     def test_binding_merge_keeps_unapplied_and_unproved_findings_filed(self) -> None:
         source = "fn f() {\n    let old = input;\n    consume(old);\n    let second = input;\n    consume(second);\n}\n"
@@ -1123,8 +1133,11 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(by_old, {"old": NoAppliedCheck("rename"), "second": RenameNotApplied(self.sources[0])})
         ledger.set_tip(checkpoint, "main")
         ledger.ticket_checkpoint("1", checkpoint)
-        _ = ledger.ticket_merge("1")
+        not_built = ledger.ticket_merge("1")
         self.assertTrue(all(isinstance(f.state, style_ledger.Filed) for f in ledger.proposal_findings(issue)))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket='1' WHERE proposal=?", (str(issue),))
+        self.assertEqual(ledger.recheck_merged_findings(), not_built)
 
     def test_binding_check_needs_a_build_ticket_with_a_saved_base(self) -> None:
         source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
@@ -1197,13 +1210,15 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         ledger.ticket_assign("1", "main")
         ledger.set_tip(self.initial_tip, "main")
         ledger.ticket_checkpoint("1", self.initial_tip)
-        output = self.cli("ticket", "merge", "--id", "1").stdout
-        self.assertEqual(output, f"not built {finding.finding_id}: type has no applied check; mark it built with "
-                         + f"style_ledger.py held built --repo {ledger.repo} --id {finding.finding_id} after checking\n")
-        held = next(item for item in self.ledger().proposal_findings(issue) if item.finding_id == finding.finding_id)
-        self.assertEqual(held.state, style_ledger.Filed(issue))
-        # The finding keeps its merged ticket, so refill does not take it again.
-        self.assertEqual(held.build_ticket, style_ledger.BuildTicket("1"))
+        for action in ("merge", "recheck-merged"):
+            with self.subTest(action=action):
+                output = (self.cli("ticket", "merge", "--id", "1") if action == "merge"
+                          else self.cli("held", "recheck-merged")).stdout
+                self.assertEqual(output, f"not built {finding.finding_id}: type has no applied check; mark it built with "
+                                 + f"style_ledger.py held built --repo {ledger.repo} --id {finding.finding_id} after checking\n")
+                held = next(item for item in self.ledger().proposal_findings(issue) if item.finding_id == finding.finding_id)
+                self.assertEqual(held.state, style_ledger.Filed(issue))
+                self.assertEqual(held.build_ticket, style_ledger.BuildTicket("1"))
         _ = self.cli("held", "built", "--id", finding.finding_id)
         held = next(item for item in self.ledger().proposal_findings(issue) if item.finding_id == finding.finding_id)
         self.assertIsInstance(held.state, style_ledger.Built)

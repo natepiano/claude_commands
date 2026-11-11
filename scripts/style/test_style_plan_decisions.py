@@ -22,6 +22,8 @@ from scripts.style import rules
 from scripts.style import style_ledger
 
 from scripts.style.style_plan_test_support import StylePlanFixture
+from scripts.production import proposal_issue
+from scripts.production.staff_test_support import fixture_member
 
 
 @final
@@ -249,10 +251,18 @@ class StylePlanTests(StylePlanFixture):
         blob = next(rule_.blob for rule_ in rules.load_rules(self.repo) if rule_.rule_id == rule)
         second = ledger.hold(rule, self.sources[0], 1, "another value", "restructure", "42", "LIMIT", blob, "outside")
         ledger.file_held(second.finding_id, issue)
-        _ = self.refill_decisions()
-        ticket, = ledger.ticket_open(ticket_owner_id("names"))
-        self.assertEqual(ticket["files"], list(self.sources[:2]))
-        self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue)})
+        owner = ledger.unit_row(ticket_owner_id("names"))
+        retired = fixture_member("unit", name="retired-names", parent=owner.parent)
+        for approved_unit in (owner.id, retired.id):
+            with self.subTest(approved_unit=approved_unit):
+                text, _ = proposal_issue.set_fields(issue.read_text(), {"unit": approved_unit}, issue)
+                _ = issue.write_text(text)
+                _ = self.refill_decisions()
+                ticket, = ledger.ticket_open(ticket_owner_id("names"))
+                self.assertEqual(ticket["files"], list(self.sources[:2]))
+                self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue)})
+                ledger.ticket_drop(ticket["id"])
+                _ = self.plan.write_text(self.plan_header())
 
     def test_queued_and_new_decisions_share_unchanged_site_proof_and_followed_coordinates(self) -> None:
         _ = self.types_unit()

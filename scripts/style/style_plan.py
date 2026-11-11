@@ -54,10 +54,10 @@ from scripts.style.style_ledger import publication_lock, publication_path
 from scripts.style import approved_renames
 from scripts.style import style_footprint
 from scripts.style import style_proposals
-from scripts.production.issues import Issue, frontmatter
+from scripts.production.issues import Issue, frontmatter, open_issues
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
-from scripts.production.proposal_issue import ApprovedDecision, decision_answer, proposal_unit, require_generated_body
+from scripts.production.proposal_issue import ApprovedDecision, decision_answer, require_generated_body
 from scripts.style.unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
 from scripts.style.unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
                         parse_pilot_scope, unit_plan_path)
@@ -2708,6 +2708,10 @@ def _select_phase(
         decisions = tuple(issue for issue in style_proposals.approved_decisions(folder, ledger.unit_name(unit))
                           if (definition := definitions.get(issue.value("style_rule"))) is None
                           or definition.family in families)
+        decisions += tuple(issue for issue in open_issues(folder, "style")
+                           if style_proposals.is_decision(issue)
+                           and isinstance(decision_answer(issue), ApprovedDecision)
+                           and issue.value("style_rule") not in definitions)
     def decision_members(issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
         definition = definitions.get(frontmatter(issue).get("style_rule", [""])[0])
         if definition is None or definition.family not in families:
@@ -3471,8 +3475,7 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
                 decisions[path] = False
             else:
                 issue = Issue(path, frontmatter(path))
-                decisions[path] = (proposal_unit(issue) == name
-                                   and isinstance(decision_answer(issue), ApprovedDecision))
+                decisions[path] = isinstance(decision_answer(issue), ApprovedDecision)
         definition = definitions.get(finding.rule)
         if decisions[path] and definition is not None and definition.family in families:
             population.append((finding, path))
