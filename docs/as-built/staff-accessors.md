@@ -307,6 +307,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/style/unit_files.py` | read | snapshot |
 | `scripts/usage/agents_log.py` | read | local_snapshot, OpenRun |
 | `scripts/usage/outcomes.py` | read | snapshot |
+| `scripts/usage/transcript_retention.py` | read | local_snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |

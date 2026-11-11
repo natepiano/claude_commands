@@ -70,6 +70,60 @@ def unit_staff_id(name: str) -> str:
     return proposal_issue.staff_reference(name, "unit").id
 
 
+def run_style_command(root: Path, case: unittest.TestCase, command: list[str], *,
+                      capture_output: bool = False, text: bool = False,
+                      check: bool = False, cwd: Path | str | None = None, env: dict[str, str] | None = None,
+                      stdin: int | None = None, stdout: int | None = None, stderr: int | None = None,
+                      encoding: str | None = None, errors: str | None = None,
+                      input: str | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    """Run supported style commands directly and preserve required child processes."""
+    environment = dict(os.environ) if env is None else env
+    directory = Path.cwd() if cwd is None else Path(cwd)
+    module = None
+    arguments = command[2:]
+    if command[0] == str(Path(__file__).resolve().parents[1] / "lib/py") and len(command) > 1:
+        module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
+                       if Path(command[1]) == Path(item.__file__ or "")), None)
+    if module is style_plan and process_boundary_for_case(case):
+        command = style_cli_command(Path(command[1]), *arguments)
+        module = None
+    executable = Path(shutil.which(command[0], path=environment.get("PATH")) or command[0])
+    if executable.parent == root / "bin" and executable.name in fake_fmt.NAMES:
+        module = ModuleType("style_plan_formatter_fixture")
+        module.__file__ = str(executable)
+        arguments = command[1:]
+
+        def main() -> int:
+            exec(compile(executable.read_text(), str(executable), "exec"), {**vars(module), "__name__": "__main__"})
+            return 0
+    elif module is style_plan:
+        def main() -> int:
+            return style_plan.main(sys.argv[1:])
+    elif module is style_footprint:
+        def main() -> int:
+            return style_footprint.main()
+    elif module is style_ledger:
+        def main() -> int:
+            style_ledger.main()
+            return 0
+    elif module is proposal_issue:
+        def main() -> int:
+            return proposal_issue.main(sys.argv[1:])
+    else:
+        return REAL_RUN(command, capture_output=capture_output, text=text, check=check, cwd=cwd, env=env,
+                        stdin=stdin, stdout=stdout, stderr=stderr, encoding=encoding, errors=errors,
+                        input=input, timeout=timeout)
+    result = invoke_cli(cast(ModuleType, module), main, arguments, environment, directory)
+    if not capture_output:
+        if stdout != subprocess.DEVNULL:
+            print(result.stdout, end="")
+        if stderr != subprocess.DEVNULL:
+            print(result.stderr, end="", file=sys.stderr)
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+    return result
+
+
 class StylePlanFixture(unittest.TestCase):
     root: Path = Path()
 
@@ -178,51 +232,9 @@ class StylePlanFixture(unittest.TestCase):
                     stdin: int | None = None, stdout: int | None = None, stderr: int | None = None,
                     encoding: str | None = None, errors: str | None = None,
                     input: str | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
-        environment = dict(os.environ) if env is None else env
-        directory = Path.cwd() if cwd is None else Path(cwd)
-        module = None
-        arguments = command[2:]
-        if command[0] == str(Path(__file__).resolve().parents[1] / "lib/py") and len(command) > 1:
-            module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
-                           if Path(command[1]) == Path(item.__file__ or "")), None)
-        if module is style_plan and process_boundary_for_case(self):
-            command = style_cli_command(Path(command[1]), *arguments)
-            module = None
-        executable = Path(shutil.which(command[0], path=environment.get("PATH")) or command[0])
-        if executable.parent == self.root / "bin" and executable.name in fake_fmt.NAMES:
-            module = ModuleType("style_plan_formatter_fixture")
-            module.__file__ = str(executable)
-            arguments = command[1:]
-
-            def main() -> int:
-                exec(compile(executable.read_text(), str(executable), "exec"), {**vars(module), "__name__": "__main__"})
-                return 0
-        elif module is style_plan:
-            def main() -> int:
-                return style_plan.main(sys.argv[1:])
-        elif module is style_footprint:
-            def main() -> int:
-                return style_footprint.main()
-        elif module is style_ledger:
-            def main() -> int:
-                style_ledger.main()
-                return 0
-        elif module is proposal_issue:
-            def main() -> int:
-                return proposal_issue.main(sys.argv[1:])
-        else:
-            return REAL_RUN(command, capture_output=capture_output, text=text, check=check, cwd=cwd, env=env,
-                            stdin=stdin, stdout=stdout, stderr=stderr, encoding=encoding, errors=errors,
-                            input=input, timeout=timeout)
-        result = invoke_cli(cast(ModuleType, module), main, arguments, environment, directory)
-        if not capture_output:
-            if stdout != subprocess.DEVNULL:
-                print(result.stdout, end="")
-            if stderr != subprocess.DEVNULL:
-                print(result.stderr, end="", file=sys.stderr)
-        if check and result.returncode:
-            raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
-        return result
+        return run_style_command(self.root, self, command, capture_output=capture_output, text=text,
+                                 check=check, cwd=cwd, env=env, stdin=stdin, stdout=stdout, stderr=stderr,
+                                 encoding=encoding, errors=errors, input=input, timeout=timeout)
 
     def build_fixture(self) -> None:
         _ = shutil.copytree(self.template_repo, self.fixture_root / "sample", symlinks=True)

@@ -13,6 +13,8 @@ from pathlib import Path
 from time import monotonic
 from typing import TypedDict, cast
 
+from scripts.lib.transcript_test_support import compressed_copy
+
 from scripts.shot_report.episodes import (
     EpisodeTimeline, NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots,
     TimelineUnavailable, read_episodes, split_episodes, write_episodes,
@@ -369,6 +371,24 @@ class TranscriptTest(unittest.TestCase):
         self.assertIsInstance(timeline, EpisodeTimeline)
         assert isinstance(timeline, EpisodeTimeline)
         self.assertEqual([(gap.minutes, gap.category) for gap in timeline.gaps], [(0.5, "other_brp")])
+
+    def test_compressed_sources_keep_calls_and_cached_results_for_both_agents(self) -> None:
+        for agent in ("claude", "codex"):
+            with self.subTest(agent=agent), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / agent / "session.jsonl"
+                if agent == "claude":
+                    _claude_case(path, [("Bash", "python3 hana_shot.py shot", "saved /tmp/front.png")])
+                else:
+                    _codex_case(path, ["python3 hana_shot.py shot"])
+                expected = scan_calls(root / "claude", root / "codex")
+                _ = compressed_copy(path)
+                cache = PersistentScanCache(root / "cache.pickle")
+                for mode in (NO_SCAN_CACHE, cache, cache):
+                    with self.subTest(cache=type(mode).__name__):
+                        actual = scan_calls(root / "claude", root / "codex", cache=mode)
+                        self.assertEqual(list(actual), list(expected))
+                        self.assertEqual(actual.tool_events, expected.tool_events)
 
     def test_transcript_scan_copies_tool_events_from_any_iterable(self) -> None:
         event = TranscriptToolEvent(
