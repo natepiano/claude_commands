@@ -25,6 +25,8 @@ from scripts.buildlog import charts, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
 from scripts.build_queue.test_queue_view import cloud_reading
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.build_queue.queue_fixture import write_scope
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
@@ -722,6 +724,47 @@ class MemoryFeedTests(unittest.TestCase):
                 text = memory_feed.page_json(page)
                 for minutes in (45, 19 * 60, 2 * 24 * 60):
                     self.assertIn(queue_view.leftover_age(minutes), text)
+
+    def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
+        for cargo_use in (0, 2 * admission_records.GIB):
+            with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
+                python = fixture.fixture_owner(700001, "100")
+                process = fixture.proc.path / str(python.pid)
+                _ = process.joinpath("comm").write_text("python3\n")
+                _ = process.joinpath("cmdline").write_bytes(b"python3\0-m\0unittest\0")
+                python_use = 4 * admission_records.GIB
+                builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+                detached = builds / "builds-detached.slice"
+                write_scope(builds, current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                write_scope(detached, current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                write_scope(detached / "python.scope", members=(python.pid,),
+                    current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                if cargo_use:
+                    cargo = fixture.fixture_owner(700002, "200")
+                    sidecar = fixture.scope(cargo, folder="builds.slice/builds-detached.slice/python.scope/cargo.scope",
+                        current=cargo_use, anonymous=cargo_use)
+                    request = replace(fixture.request(owner=cargo, need=8 * admission_records.GIB), sidecar=str(sidecar))
+                    grant = only_admitted(fixture.server.handle_request(request))
+                    self.assertEqual(len(fixture.server.reservations), 1)
+                    self.assertIn(grant.reservation, [record.reservation_id for record in fixture.server.reservations.values()])
+                fixture.free(60 * admission_records.GIB - python_use - cargo_use)
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                reading = reply.reading
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                self.assertEqual(page["used"], cargo_use / admission_records.GIB)
+                self.assertEqual(page["other"], python_use / admission_records.GIB)
+                build_rows = [row for row in page["walk"] if not row.get("ci", False)]
+                self.assertEqual(len(build_rows), int(bool(cargo_use)))
+                self.assertEqual(page["leftovers"], [])
+                self.assertTrue(all(row.get("queued", False) for row in build_rows))
+                room = reading.explanation.room
+                assert isinstance(room, admission_records.MemoryRoom)
+                self.assertEqual(len(room.runs), int(bool(cargo_use)))
+                self.assertEqual(room.used, cargo_use)
+                self.assertEqual(room.used + room.kept, 8 * admission_records.GIB if cargo_use else 0)
 
     def test_the_leftover_list_uses_the_queue_rule_and_keeps_all_scope_members(self) -> None:
         ended = leftover_step(45)

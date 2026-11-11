@@ -1554,7 +1554,7 @@ def _update_codex(arguments: list[str], *, account_config: conf.ConfigRead | Rea
     machine = remote.other_machine()
     command = 'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'
     try:
-        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={account_config.whole("codex_update_connect_timeout_seconds")}", machine, command],
+        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=account_config.whole("codex_update_timeout_seconds"), check=False)
     except (subprocess.TimeoutExpired, OSError):
         print(f"{machine}: unreachable; run codex update there")
@@ -2749,7 +2749,17 @@ class SessionMoveRefused:
     returncode: int = 1
 
 
-SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
+@dataclass(frozen=True)
+class IdleWorkerPaneClose:
+    """An idle worker can keep its conversation without a pane."""
+
+
+@dataclass(frozen=True)
+class SessionIdlePaneClosed:
+    session_id: str
+
+
+SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused | SessionIdlePaneClosed
 
 
 class WorkerResumePreview(Protocol):
@@ -2766,7 +2776,7 @@ class PaneMoves(Protocol):
     def run_for_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> Path: ...
 
     def preview_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
-                       why: str, run: Path) -> WorkerResumePreview | SessionMoveRefused | stop_results.ClaudeUp: ...
+                       why: str, run: Path) -> WorkerResumePreview | IdleWorkerPaneClose | SessionMoveRefused | stop_results.ClaudeUp: ...
 
 
 class AccountWorkerActivity(Protocol):
@@ -2825,6 +2835,8 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
 
 
 def move_result_line(result: SessionMoveOutcome) -> str:
+    if isinstance(result, SessionIdlePaneClosed):
+        return f"{result.session_id}: idle pane closed; the next assign resumes its conversation"
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
     if isinstance(result, stop_results.ResumePending):
@@ -2933,8 +2945,11 @@ def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
         if isinstance(decision, stop_results.ClaudeUp) or isinstance(decision, SessionMoveRefused) and decision.returncode == 0:
             nothing += 1
             continue
-        preview = (f"not moved: {decision.reason}" if isinstance(decision, SessionMoveRefused) else
-                   f"would stop and resume the same conversation on {target} in its worker pane")
+        if isinstance(decision, IdleWorkerPaneClose):
+            preview = f"would close its idle pane; the next assign resumes it on {target}"
+        else:
+            preview = (f"not moved: {decision.reason}" if isinstance(decision, SessionMoveRefused) else
+                       f"would stop and resume the same conversation on {target} in its worker pane")
         lines.append(f"{row.name} ({row.id}): {preview}")
     if nothing:
         lines.append(f"{nothing} workers: nothing to move")

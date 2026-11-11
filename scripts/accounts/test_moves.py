@@ -767,7 +767,7 @@ class WorkerGroupPendingTests(StaffTestCase):
                     result = accounts.move_workers(target, dry_run=True)
                     assert isinstance(result, accounts.GroupMoveDryRun)
                     same_family = target.startswith(family)
-                    preview = f"would stop and resume the same conversation on {target} in its worker pane"
+                    preview = f"would close its idle pane; the next assign resumes it on {target}"
                     self.assertEqual(result.lines, (f"{row.name} ({row.id}): {preview}",) if same_family else ())
                     if same_family:
                         self.assertIn(str(row.id), "\n".join(result.lines))

@@ -821,19 +821,46 @@ class OffloadCommandTests(OffloadCommandFixture):
                                  template="mac_test")
         self.config["offload"] = "off"
         self.sync_config()
-        result = self.command(settings=alternate)
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assert_wire("passed", "")
-        ssh = self.events_for("ssh")
-        self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
-        self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
-        self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
-        remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
-        lint_index = remote_words.index("~/.claude/scripts/lint/lint")
-        self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
-        self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
-        self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
-        self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
+        linux_settings = self.root / "linux.conf"
+        _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", template="mac_test")
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text("targets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
+            + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n")
+        self.environment["BUILD_TARGETS_CONFIG"] = str(registry)
+        for target, settings in (("", alternate), ("mac", alternate), ("mac", Path(alternate.name)),
+                                 ("builder", alternate)):
+            with self.subTest(target=target, settings=settings):
+                self.clear_events()
+                options = ("--target", target) if target else ()
+                if target == "builder":
+                    with (
+                        mock.patch.object(offload, "mac_step_eligibility", return_value=HANA),
+                        mock.patch.object(offload, "trusted_linux_source", return_value=True),
+                        mock.patch.object(offload, "recorded_linux_version_mismatch", return_value=""),
+                        mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim()),
+                        mock.patch.object(offload, "expected_linux_parity", return_value={}),
+                        mock.patch.object(offload, "copy_tracked_scripts", return_value=False) as scripts_copy,
+                    ):
+                        result = self.command(settings=settings, runner_options=options, separate_stderr=True)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(str(alternate.resolve()), result.stderr)
+                    self.assertIn(str(linux_settings.resolve()), result.stderr)
+                    self.assertEqual(self.events_for("rsync"), [])
+                    scripts_copy.assert_not_called()
+                    continue
+                result = self.command(settings=settings, runner_options=options)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assert_wire("passed", "")
+                ssh = self.events_for("ssh")
+                self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
+                self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
+                self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
+                remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                lint_index = remote_words.index("~/.claude/scripts/lint/lint")
+                self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+                self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
+                self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
+                self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
 
     def test_low_disk_declines_after_probe(self) -> None:
         self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]

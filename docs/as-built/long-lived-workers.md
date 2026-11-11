@@ -179,6 +179,20 @@ A publication failure runs the caller's cleanup callback and reports the native 
 The Claude coordinator tries to stop an unpublished session.
 A failed stop reports `cleanup unproved`.
 A failed pane admission closes only the new pane that this call created.
+A reviewer hold failure or a failure before dispatch submission ends only the worker pane that this call created.
+The same cleanup applies when worker restore fails before it submits its resume prompt.
+Cleanup closes only the saved pane and terminal.
+The close target is the worker's current session for both Claude and Codex.
+It retires a staff row only if this launch created the row.
+A resumed worker keeps its existing row after cleanup.
+An existing pane keeps its pane and staff row.
+A failed close prints `anomaly: <pane>: cleanup failed: <reason>` and preserves the original failure code.
+An incomplete start also closes its new pane.
+The start result identifies a new pane and its saved terminal.
+Dispatch reads staff rows before start and adds no pane scan for cleanup.
+A target refusal before prompt delivery runs cleanup.
+Cleanup stops only after target checks pass and the prompt can reach the agent.
+Restore cancels cleanup through the callback in `Herdr.prompt`.
 For an existing pane, the launcher quits its own agent and keeps the shell.
 Both paths compare the current terminal and process with the identities saved after launch.
 A replacement process remains open. Cleanup prints one anomaly with the pane id.

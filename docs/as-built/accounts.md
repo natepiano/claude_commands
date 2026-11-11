@@ -172,7 +172,7 @@ It uses one process environment read for this check and the run check.
 An unreadable environment permits reuse only for a worker whose pass is active in the current run.
 A different account follows the existing close checks, stop, and resume in the same pane.
 Workers moves and previews omit workers of the other family.
-The preview shares the move decision and lists workers that would resume or receive a refusal, with each reason.
+The preview shares the move decision and lists idle panes that would close, workers that would resume, and refusals with each reason.
 One count line covers workers with nothing to move.
 These include closed workers without an active dispatch, workers without a current session, and workers already on the target.
 
@@ -232,9 +232,14 @@ The flag survives state reloads and suppresses repeated ON notices during the sa
 `config/agent_notes.toml` sets the quota and notes intervals to 120 seconds.
 Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
-Pane workers move through their dispatch lock, fresh pane evidence, `restart.stop_row`, and `worker_panes.start_or_resume`.
-They keep the same conversation and reuse a stopped pane.
-Only an open pass receives resume text through the shared target check.
+Pane workers move under their dispatch lock with fresh pane evidence.
+An idle worker without an active dispatch closes its pane through `worker_panes.close` and keeps its conversation.
+The move writes no journal row for that worker.
+The next assign resumes it on the group account.
+A busy worker uses `restart.stop_row` and `worker_panes.start_or_resume` to keep its conversation and pane.
+A stopped worker with an active dispatch resumes in the same pane.
+A closed worker without an active dispatch has nothing to move.
+Only an active or refused pass receives resume text through the shared target check.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
