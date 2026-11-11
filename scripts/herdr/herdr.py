@@ -2022,27 +2022,27 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
-        matches: list[pane_launch.PaneLaunch] = []
+        matches: list[dict[str, object]] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
             argv = _foreground_arguments(process)
-            if not is_codex_process(argv):
-                continue
-            pid = process.get("pid")
-            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-                raise ValueError("Codex launch has no process id")
-            observed = native_process(pid, "codex")
-            session_id, started, environment = observed.identity.id, observed.started, observed.environment
-            cwd = json_text(process.get("cwd"), "Codex launch cwd")
-            if not Path(cwd).is_absolute():
-                raise ValueError("Codex launch working folder is unavailable")
-            entry = pane_launch.launch(pane, session_id, cwd, legacy_identity.without_legacy_identity(environment),
-                                       ["codex", *arguments], kind="codex")
-            entry["pid"], entry["proc_start"] = pid, started
-            matches.append(entry)
+            if is_codex_process(argv):
+                matches.append(process)
         if len(matches) != 1:
             raise ValueError("Codex launch has no unique foreground process")
-        return matches[0]
+        process = matches[0]
+        pid = process.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError("Codex launch has no process id")
+        observed = native_process(pid, "codex")
+        session_id, started, environment = observed.identity.id, observed.started, observed.environment
+        cwd = json_text(process.get("cwd"), "Codex launch cwd")
+        if not Path(cwd).is_absolute():
+            raise ValueError("Codex launch working folder is unavailable")
+        entry = pane_launch.launch(pane, session_id, cwd, legacy_identity.without_legacy_identity(environment),
+                                   ["codex", *arguments], kind="codex")
+        entry["pid"], entry["proc_start"] = pid, started
+        return entry
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
@@ -2087,6 +2087,8 @@ class Herdr:
                 entry["name"] = name
                 directory = pane_launch.record_directory()
                 pane_launch.write(directory / f"{self.session}.json", entry, sources=tuple(directory.glob("*.json")))
+            except CodexSessionPending:
+                pass
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues", file=sys.stderr)
         if isinstance(opening, OpeningPrompt):
@@ -3501,6 +3503,10 @@ def _process_birth(pid: int) -> str:
     return started
 
 
+class CodexSessionPending(ValueError):
+    """A fresh Codex process has no session report yet."""
+
+
 def codex_resume_thread(pid: int) -> str:
     """Read the Codex thread from its resume arguments."""
     if _platform() == "darwin":
@@ -3523,9 +3529,10 @@ def codex_resume_thread(pid: int) -> str:
                 if option == "resume":
                     try:
                         return staff.native_id(next(options, ""))
-                    except staff.StaffRefused:
-                        pass
+                    except staff.StaffRefused as error:
+                        raise ValueError(f"pid {pid}: Codex launch identity is unavailable") from error
                 break
+        raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
     raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
 
 
@@ -3552,6 +3559,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
             try:
                 return pane_native_process(info, "codex", pane)
             except HerdrFailure as error:
+                if isinstance(error.__cause__, CodexSessionPending):
+                    raise error.__cause__
                 raise ValueError(str(error)) from error
     return native_process(pid, "codex", "")
 
