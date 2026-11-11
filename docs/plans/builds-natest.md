@@ -2957,7 +2957,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:** reviewers can disagree on a kept test. Check the callers: a guard no caller can reach goes; a guard on a value a report counts stays.
 
-### Phase 150 — Three production test modules keep only the tests that pay their way  · status: todo
+### Phase 150 — Three production test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
 #### Work Order
