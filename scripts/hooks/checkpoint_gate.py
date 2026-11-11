@@ -8,13 +8,14 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import cast
+
+from scripts.lib import git_index
 
 
 SUBJECT = re.compile(r"^checkpoint\([^)]*\):")
@@ -42,7 +43,7 @@ def commit_tree(directory: Path, every: bool) -> str:
             index = directory / index
         private_index = temporary / "index"
         if index.exists():
-            _ = shutil.copyfile(index, private_index)
+            git_index.private_copy(index, private_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
         if every:
             _ = git(directory, "add", "-u", "--", ".", environment=environment)
@@ -62,7 +63,7 @@ def path_commit_tree(directory: Path, paths: tuple[str, ...], include_staged: bo
             if not index.is_absolute():
                 index = directory / index
             if index.exists():
-                _ = shutil.copyfile(index, private_index)
+                git_index.private_copy(index, private_index)
         else:
             _ = git(directory, "read-tree", "HEAD", environment=environment)
         _ = git(directory, "add", "--", *paths, environment=environment)

@@ -5,12 +5,14 @@ from __future__ import annotations
 from scripts.production.staff_test_support import unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
 from scripts.lib import names
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
 
 import io
 import json
 import os
 import shlex
+import socket
 import shutil
 import subprocess
 import unittest
@@ -173,6 +175,59 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(prompts, ["/unit:direct docs/plans/given.md"])
         self.assert_staff_folder("alpha", self.root / "project-alpha")
         self.assertEqual(stub.read_bytes(), source)
+
+    def test_name_only_uses_the_recorded_plan_and_explicit_plan_wins(self) -> None:
+        write_text_atomic(self.doc, self.doc.read_text() +
+                          "\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| alpha | docs/plans/given.md |\n")
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "record unit plan")
+        for flags in ((), ("--plan", "docs/plans/given.md")):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--check", *flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.servers_started(), [])
+
+    def test_hana_unit_without_a_port_gets_an_unused_port(self) -> None:
+        write_text_atomic(self.checkout / "crates/hana/Cargo.toml", '[package]\nname = "hana"\n')
+        _ = self.git("add", "crates/hana/Cargo.toml")
+        _ = self.git("commit", "-m", "record the Hana application")
+        with socket.socket() as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            occupied = cast(tuple[str, int], held.getsockname())[1]
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+            saved = unit_config.read(self.root / "project-alpha")
+            assert isinstance(saved, unit_config.UnitConfig)
+            self.assertIsInstance(saved.port, unit_config.AppPort)
+            assert isinstance(saved.port, unit_config.AppPort)
+            self.assertNotEqual(saved.port.number, occupied)
+
+    def test_hana_saved_config_without_a_port_gets_a_port_from_the_range(self) -> None:
+        from scripts.lib import conf
+
+        write_text_atomic(self.checkout / "crates/hana/Cargo.toml", '[package]\nname = "hana"\n')
+        _ = self.git("add", "crates/hana/Cargo.toml")
+        _ = self.git("commit", "-m", "record the Hana application")
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
+        _ = unit_config.write(worktree, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        saved = unit_config.read(worktree)
+        assert isinstance(saved, unit_config.UnitConfig)
+        self.assertIsInstance(saved.port, unit_config.AppPort)
+        assert isinstance(saved.port, unit_config.AppPort)
+        settings = conf.read("production")
+        self.assertGreaterEqual(saved.port.number, settings.whole("unit_port_first"))
+        self.assertLessEqual(saved.port.number, settings.whole("unit_port_last"))
+
+    def test_name_only_without_a_plan_reports_one_refusal_line(self) -> None:
+        result = self.cli("alpha", "--check")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("plan", result.stderr)
+        self.assertIn(str(self.doc), result.stderr)
+        self.assertEqual(self.servers_started(), [])
 
     def test_adopting_an_existing_config_without_a_port_flag_keeps_its_recorded_port(self) -> None:
         worktree = self.root / "project-alpha"
@@ -820,10 +875,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_refuses_checkout_off_merge_branch(self) -> None:
         _ = self.git("checkout", "-b", "wrong-branch")
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertFalse((self.root / "project-alpha").exists())
-        self.assert_staff_units()
+        for flags in (("--check",), ()):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--plan", "docs/plans/given.md", *flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertFalse((self.root / "project-alpha").exists())
+                self.assert_staff_units()
 
     def test_new_work_records_no_scheduled_prompt(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")

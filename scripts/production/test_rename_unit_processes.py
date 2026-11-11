@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
 from unittest import mock
@@ -14,7 +15,7 @@ from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import fixture_worker
 
 
-from scripts.shutdown import shutdown
+from scripts.agents import remote, shutdown
 from scripts.production import unit_lookup
 from scripts.production import unit_move
 from scripts.production import staff_sources
@@ -22,9 +23,9 @@ from scripts.production.staff_test_support import (
     StaffTestCase, fixture_unit_location, recorded_showrunner,
 )
 from scripts.lib.conf import UseConfiguredValue
-from scripts.lib import conf
+from scripts.lib import conf, unit_runs
 from scripts.lint.memory_test_support import config_environment
-from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
+from scripts.agents.unit_staff_test_support import PARENTS, isolated_parents
 
 SLUG = "demo"
 
@@ -125,14 +126,24 @@ class RunProcessTests(StaffTestCase):
             del self.processes[pid]
 
     def test_run_ownership_passes_one_settings_read_to_process_arguments(self) -> None:
-        with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
-              mock.patch.object(shutdown, "retirement_command_line", wraps=self.arguments) as arguments):
-            found = shutdown.retirement_run_processes(self.unit_folder, [101, 102])
-        self.assertEqual(set(found), {101, 102})
-        reads.assert_called_once_with("production")
-        settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
-        self.assertTrue(settings)
-        self.assertTrue(all(value is settings[0] for value in settings))
+        record = staff.snapshot()
+        row = record.by_worktree(remote.local_machine(), self.unit_folder)
+        assert row is not None and isinstance(row.worktree, staff.PresentWorktree)
+        for machine, hostname in ((row.worktree.machine, remote.local_machine()), ("mac", "Nates-MacBook-Pro.local")):
+            with self.subTest(machine=machine, hostname=hostname):
+                owner = replace(row, worktree=staff.PresentWorktree(machine, row.worktree.path))
+                supplied = staff.StaffSnapshot(tuple(owner if member.id == owner.id else member for member in record.rows))
+                with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
+                      mock.patch.object(shutdown, "retirement_command_line", wraps=self.arguments) as arguments,
+                      mock.patch.object(shutdown, "local_machine", return_value=hostname),
+                      mock.patch.object(staff, "snapshot", side_effect=AssertionError("local staff is unavailable")),
+                      mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("local staff is unavailable"))):
+                    found = shutdown.retirement_run_processes(owner, [101, 102], record=supplied)
+                self.assertEqual(set(found), {101, 102})
+                reads.assert_called_once_with("production")
+                settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
+                self.assertTrue(settings)
+                self.assertTrue(all(value is settings[0] for value in settings))
 
 
 
@@ -148,8 +159,13 @@ class RunRecordLookupTests(StaffTestCase):
         alias = root / "alias"
         alias.symlink_to(tree, target_is_directory=True)
         parent = recorded_showrunner("lookup", root / "lookup-production.md")
+        _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", root / "unit"))
         for worktree, at in ((tree, 2), (alias, 1)):
             member = fixture_unit_location(parent, worktree.name, worktree)
+            folder = root / "unit" / worktree.name
+            folder.mkdir(parents=True)
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: member.id}))
+            _ = staff.set_run(member.id, staff.OpenRun(folder))
             events = [{"event_type": "run_started", "main_agent": {"session_id": member.current_session},
                        "run_started_at": at}]
             _ = (runs / f"{worktree.name}.jsonl").write_text(
@@ -165,5 +181,7 @@ class RunRecordLookupTests(StaffTestCase):
                         reads.assert_called_once_with()
             with (runs / "alias.jsonl").open("a", encoding="utf-8") as handle:
                 _ = handle.write('{"event_type": "run_finished"}\n')
+            self.assertEqual(unit_move.open_run(alias), runs / "alias.jsonl")
+            _ = staff.clear_run(member.id, folder)
             self.assertIsNone(unit_move.open_run(alias))
             self.assertEqual(unit_move.newest_run(alias), runs / "alias.jsonl")

@@ -38,6 +38,7 @@ class GateBoxTests(unittest.TestCase):
         self.assertIn('merge_gate.SelectedModules', gate_box.GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
+        self.assertIn("'fetch', str(root / 'source.bundle'), links['commit']", gate_box.GUEST)
 
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
         links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
@@ -73,12 +74,13 @@ class GateBoxTests(unittest.TestCase):
                  'log': 'https://fixture.invalid/artifacts/attempt/gate.log',
                  'result': 'https://fixture.invalid/artifacts/attempt/result.json'}
         script = gate_box.user_data(links, 'f' * 40, 20, 5, 1800)
+        self.assertIn('set -eu\numask 077\n', script)
         self.assertLess(len(base64.b64encode(script.encode())), 25600)
         self.assertNotIn('test_module_', script)
         self.assertNotIn('"modules"', script)
         self.assertNotIn(base64.b64encode(gate_box.GUEST.encode()).decode(), script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
-        downloads = session[session.index('curl --fail'):session.index('ln -sf')]
+        downloads = session[:session.index('ln -sf')]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _ = (root / 'source.py').write_text(gate_box.GUEST)
@@ -87,15 +89,16 @@ class GateBoxTests(unittest.TestCase):
             _ = curl.write_text('#!/bin/sh\ncase "$6" in *.guest.py) cp "$FIXTURE/source.py" "$8" ;;'
                                 + ' *.json) cp "$FIXTURE/manifest.json" "$8" ;; *) exit 1 ;; esac\n')
             curl.chmod(0o700)
-            result = subprocess.run(['sh', '-ec', downloads],
+            result = subprocess.run(['sh', '-ec', 'umask 077\n' + downloads + 'mkdir "$box_dir/session-directory"\n'],
                 env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'FIXTURE': str(root), 'box_dir': str(root)},
                 text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / 'session-directory').stat().st_mode & 0o777, 0o755)
             self.assertEqual((root / 'guest.py').read_text(), gate_box.GUEST)
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
-        stages = ['boot', 'tools ready', 'source ready', 'tests start']
+        stages = ['boot', 'tools ready', 'tools checked', 'source ready', 'tests start']
         for failure in ('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -119,7 +122,8 @@ class GateBoxTests(unittest.TestCase):
                     + 'def completion_record(*args): return {"kind": "gate_run"}\n')
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
                 _ = (root / 'request.json').write_text(json.dumps({
-                    'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': []}))
+                    'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
+                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, subprocess, sys
 root = pathlib.Path(os.environ['FIXTURE'])
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
@@ -159,7 +163,10 @@ elif name == 'useradd':
     (root / 'user').touch()
 elif name == 'git' and args[0] == 'clone':
     fail('source ready')
+    print('Cloning the fixture repository.')
     shutil.copytree(root / 'repo', args[-1])
+elif name == 'git' and 'fetch' in args:
+    event('fetch ' + args[-1])
 elif name == 'git' and 'rev-parse' in args:
     print('c' * 40)
 elif name in ('systemd-run', 'loginctl', 'mount', 'chown', 'ln', 'cp', 'shutdown', 'git'):
@@ -177,6 +184,7 @@ else:
                 links = {'production': 'true', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
                          'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
                          'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
+                         'source': 'https://fixture.invalid/source/snapshot.bundle',
                          'request': 'https://fixture.invalid/requests/attempt.json',
                          'log': 'https://fixture.invalid/artifacts/attempt/gate.log',
                          'result': 'https://fixture.invalid/artifacts/attempt/result.json',
@@ -201,11 +209,20 @@ else:
                     self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
                 if not failure:
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
+                    self.assertEqual(list(ledger.mapping(results[-1]['tools'])),
+                                     ['git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup',
+                                      'cargo-nextest', 'uv', 'sqlite3', 'python_sqlite'])
                     lines = [line for line in log.splitlines() if ' stage=' in line]
                     self.assertEqual([line.split(' stage=', 1)[1] for line in lines], stages)
                     for line in lines:
                         self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
                     trace = (root / 'trace').read_text().splitlines()
+                    self.assertIn('fetch ' + links['commit'], trace)
+                    record = ledger.mapping(results[-1]['record'])
+                    self.assertEqual(record['head'], 'e' * 40)
+                    self.assertTrue(record['dirty'])
+                    self.assertEqual(record['dirty_paths'], ['scripts/fixture/test_one.py'])
+                    self.assertEqual(record['dirty_path_count'], 1)
                     self.assertLess(trace.index('upload log'), trace.index('tools shell'))
                     print('Production boot stages: ' + ' -> '.join(stages))
 

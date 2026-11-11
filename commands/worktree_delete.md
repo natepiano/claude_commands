@@ -5,103 +5,71 @@ description: Delete a worktree and its branch.
 PROTECTED_BRANCHES = main
 DEFAULT_REMOTE = origin
 
-I'll discover available worktrees and help you safely delete a worktree and its branch.
-
-First, let me create a todo list to track our progress:
-
-Use TodoWrite tool with todos:
-1. content: "Discover and validate worktree options", activeForm: "Discovering and validating worktree options", status: "pending"
-2. content: "Get user selection and validate target", activeForm: "Getting user selection and validating target", status: "pending"
-3. content: "Check for uncommitted changes", activeForm: "Checking for uncommitted changes", status: "pending"
-4. content: "Check for unpushed commits", activeForm: "Checking for unpushed commits", status: "pending"
-5. content: "Get final confirmation", activeForm: "Getting final confirmation", status: "pending"
-6. content: "Perform worktree and branch deletion", activeForm: "Performing worktree and branch deletion", status: "pending"
-
-Update each todo status to "in_progress" when starting that step, and "completed" when finished.
+Track discovery, validation, change checks, confirmation, and deletion with TodoWrite.
+Set each step to `in_progress` before execution and `completed` after execution.
 
 <ExecutionSteps>
-    **EXECUTE THESE STEPS IN ORDER:**
-
-    **STEP 1:** Execute <DiscoverWorktrees/>
-    **STEP 2:** Execute <ValidateDeletionTarget/>
-    **STEP 3:** Execute <CheckUncommittedChanges/>
-    **STEP 4:** Execute <CheckUnpushedCommits/>
-    **STEP 5:** Execute <GetFinalConfirmation/>
-    **STEP 6:** Execute <PerformDeletion/>
+    1. Execute <DiscoverWorktrees/>.
+    2. Execute <ValidateDeletionTarget/>.
+    3. If `cleanup` is true, say: "This tree is cleanup; all work is on the target branch."
+       Skip <GetFinalConfirmation/>, execute <PerformDeletion/>, and stop.
+    4. Execute <CheckUncommittedChanges/>.
+    5. Execute <CheckUnpushedCommits/>.
+    6. Execute <GetFinalConfirmation/>.
+    7. Execute <PerformDeletion/>.
 </ExecutionSteps>
 
 <DiscoverWorktrees>
-    - Run `bash ~/.claude/scripts/worktree_delete/discover_worktrees.sh` to get current context and all worktrees
-    - Parse the output to identify deletable worktrees (excluding current one and ${PROTECTED_BRANCHES})
-    - Display current worktree and available worktrees for deletion
+    1. Run `bash ~/.claude/scripts/worktree_delete/discover_worktrees.sh`.
+    2. Exclude the current worktree and `${PROTECTED_BRANCHES}` from the deletion options.
+    3. Display the current worktree and the deletion options.
 
-    **If exactly one eligible worktree exists:** auto-select it, announce the selection (e.g. "Only one eligible worktree found: [PATH] — proceeding to confirmation"), and continue to <ValidateDeletionTarget/> without prompting.
-
-    **If zero eligible worktrees exist:** inform the user and STOP.
-
-    **If multiple eligible worktrees exist:**
-
-    ## Worktree Selection
-    - **select** - Choose a worktree to delete by entering its number
-    - **cancel** - Exit without deleting any worktrees
-
-    Please select one of the keywords above.
-
-    [STOP and wait for user response]
+    If one option exists, select it and announce its path without a question.
+    If no option exists, inform the user and stop.
+    If multiple options exist, ask the user to select a number or enter `cancel`.
+    Wait for the selection before validation.
 </DiscoverWorktrees>
 
 <ValidateDeletionTarget>
-    - Run validation script: `bash ~/.claude/scripts/worktree_delete/worktree_delete_validation.sh "$SELECTED_WORKTREE"`
-    - Parse JSON result to check validation status
-    - If status is "error", display the message and STOP
-    - Store validation results for later use
+    1. Run `bash ~/.claude/scripts/worktree_delete/worktree_delete_validation.sh "$SELECTED_WORKTREE"`.
+    2. Read the JSON status.
+    3. If the status is `error`, display the message and stop.
+    4. Store the validation fields, including `cleanup` and `cleanup_reason`.
 </ValidateDeletionTarget>
 
 <CheckUncommittedChanges>
-    - Check the validation results from <ValidateDeletionTarget/>
-    - If has_uncommitted is true, STOP and inform user they'll be lost
+    If `has_uncommitted` is true, stop and tell the user that deletion would lose the changes.
 </CheckUncommittedChanges>
 
 <CheckUnpushedCommits>
-    - Check the validation results from <ValidateDeletionTarget/>
-    - If has_unpushed is true with unpushed_count > 0, WARN user they'll be lost and ask for confirmation
-    - If has_remote_only is true, WARN the same way: origin/[BRANCH_NAME] holds remote_only_count commits no other branch on origin has, and deletion removes it
+    If `has_unpushed` is true and `unpushed_count` exceeds zero, warn that deletion would lose those commits and request confirmation.
+    If `has_remote_only` is true, warn that deletion removes `origin/[BRANCH_NAME]` and its `remote_only_count` commits.
+    Request confirmation for that loss.
 </CheckUnpushedCommits>
 
 <GetFinalConfirmation>
-    - Display summary of what will be deleted:
-      - Worktree path
-      - Branch name
-      - origin/[BRANCH_NAME], when has_remote_branch is true
-      - Whether it has unpushed commits, or commits only origin/[BRANCH_NAME] holds
+    Display these deletion details:
 
-    ## Confirm Deletion
-    - **confirm** - Proceed with deletion of [WORKTREE_PATH] and branch [BRANCH_NAME], plus origin/[BRANCH_NAME] when it exists
-    - **cancel** - Exit without deleting
+    1. The worktree path.
+    2. The local branch name.
+    3. `origin/[BRANCH_NAME]`, if `has_remote_branch` is true.
+    4. The unpushed commits and the commits that only `origin/[BRANCH_NAME]` holds.
 
-    Please select one of the keywords above.
-
-    [STOP and wait for user response]
-
-    **If the user selects confirm:** record the confirmation gate by running
-    `bash ~/.claude/scripts/worktree_delete/record_confirmation.sh "$SELECTED_WORKTREE" "$TARGET_BRANCH"`,
-    then proceed to <PerformDeletion/>. This nonce is what authorizes the deletion at execution time — without it `perform_deletion.sh` refuses.
-
-    **If the user selects cancel:** STOP without deleting.
+    Ask the user to enter `confirm` for deletion or `cancel` to stop.
+    Wait for the response.
+    If the user enters `cancel`, stop.
+    If the user enters `confirm`, run:
+    `bash ~/.claude/scripts/worktree_delete/record_confirmation.sh "$SELECTED_WORKTREE" "$TARGET_BRANCH"`.
+    Continue to <PerformDeletion/>.
 </GetFinalConfirmation>
 
 <PerformDeletion>
-    - **IMPORTANT**: Use `dangerouslyDisableSandbox: true` — `git worktree remove` deletes files outside the sandbox's allowed write paths
-    - Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh $SELECTED_WORKTREE $TARGET_BRANCH` to remove the worktree and delete the branch, locally and on origin. A non-zero exit after "Branch deleted." means only the origin deletion failed; report it
-    - The script requires the confirmation nonce from <GetFinalConfirmation/>; if it reports "no confirmation nonce", the confirm step was skipped — return to <GetFinalConfirmation/> rather than retrying
-    - Report success to user
-</PerformDeletion>
+    1. Use `dangerouslyDisableSandbox: true` when sandbox limits prevent deletion outside the permitted paths.
+    2. Run `bash ~/.claude/scripts/worktree_delete/perform_deletion.sh "$SELECTED_WORKTREE" "$TARGET_BRANCH"`.
+    3. Report the result.
 
-HAPPY PATH: If all validations pass and user confirms, proceed with deletion
-UNHAPPY PATH: Stop and ask user for guidance if:
-- Not in a git worktree
-- Trying to delete ${PROTECTED_BRANCHES} worktree or branch
-- Trying to delete current worktree
-- Target worktree has uncommitted changes (unless user acknowledges)
-- Target branch has unpushed commits, or commits only its origin branch holds (unless user acknowledges)
-- User doesn't explicitly confirm deletion
+    The script checks and consumes an existing nonce.
+    Without a nonce, it repeats the cleanup check before deletion.
+    If it reports "no confirmation nonce", repeat validation and the change checks before <GetFinalConfirmation/>.
+    If origin deletion fails, report that the worktree and local branch remain.
+</PerformDeletion>

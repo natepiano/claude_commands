@@ -1169,7 +1169,11 @@ class ProgressProfileServiceTests(unittest.TestCase):
                         progress.ProgressCounter("build:1", done, 100), need, fixture.clock.now())
                 fixture.server.progress_history.finish(f"previous-{index}", fixture.clock.now(), fixture.clock.now() - 1)
             progress.publish_counter(sidecar, progress.ProgressCounter("build:1", 50, 100))
-            _ = fixture.run_pass()
+            checked = gate.read_admission_configuration()
+            self.assertIsInstance(checked, gate.UsableAdmissionConfiguration)
+            write_memory_config(fixture.root / "build_admission.conf", peak_history_share_percent="70")
+            with mock.patch.object(gate, "read_admission_configuration", return_value=checked):
+                _ = fixture.run_pass()
             reply, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
             room = reply.reading.explanation.room
@@ -1422,11 +1426,62 @@ class ReadingAlertTests(unittest.TestCase):
                 self.assertIsInstance(fixture.server.reading_alert_delivery, service.NoReadingAlertDelivery)
 
 
+class PlacementRestartTests(unittest.TestCase):
+    def test_restart_preserves_old_waiters_and_both_placement_permission_states(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment
+
+        for version in (1, 2):
+            with self.subTest(version=version), PlacementFixture() as fixture:
+                fixture.configure(cloud_gate_slots=1)
+                fixture.free(0)
+                blocker = replace(fixture.request(), place=wire.CloudPlace("aws"))
+                _ = only_admitted(fixture.server.handle_request(blocker))
+                fixture.hold_starts()
+                local = fixture.request(since=fixture.clock.now() - 100)
+                cloud = replace(fixture.request(since=fixture.clock.now() - 50), place=wire.CloudPlace("aws"))
+                legacy_messages: list[str] = []
+                for request in (local, cloud):
+                    envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+                    envelope["v"] = version
+                    message = json.dumps(envelope) + "\n"
+                    legacy_messages.append(message)
+                    reply, = fixture.connect(message).replies()
+                    self.assertIsInstance(reply, wire.Wait)
+                pending = placement_request(fixture, since=fixture.clock.now() - 25)
+                consumed = placement_request(fixture, since=fixture.clock.now() - 10)
+                _ = publish_candidate(fixture, pending)
+                pending_assignment = assignment_for(fixture, pending)
+                consumed_assignment = assignment_for(fixture, consumed)
+                claim = adopt_assignment(fixture, consumed, consumed_assignment)
+                consume = wire.ConsumePermission("first-consumption", consumed_assignment, claim)
+                self.assertEqual(fixture.server.handle_request(consume),
+                                 [wire.FirstAuthorization(consumed_assignment, claim)])
+                positions = fixture.server.places.copy()
+                waiters = {episode: fixture.server.waiters[episode].request for episode in (local.episode, cloud.episode)}
+                fixture.restart()
+                self.assertEqual(fixture.server.places, positions)
+                for message in legacy_messages:
+                    reply, = fixture.connect(message).replies()
+                    self.assertIsInstance(reply, wire.Wait)
+                self.assertEqual({episode: fixture.server.waiters[episode].request for episode in waiters}, waiters)
+                self.assertEqual(assignment_for(fixture, pending), pending_assignment)
+                self.assertEqual(assignment_for(fixture, consumed), consumed_assignment)
+                status, = fixture.server.handle_request(consume)
+                self.assertIsInstance(status, wire.DispatchStatus)
+                assert isinstance(status, wire.DispatchStatus)
+                self.assertIsInstance(status.permission, placement.PermissionConsumed)
+                pending_claim = adopt_assignment(fixture, pending, pending_assignment)
+                self.assertEqual(fixture.server.handle_request(wire.ConsumePermission(
+                    "pending-consumption", pending_assignment, pending_claim)),
+                    [wire.FirstAuthorization(pending_assignment, pending_claim)])
+
+
 class CloudAdmissionTests(unittest.TestCase):
     def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
         from scripts.build_queue import cloud_progress
 
-        for key in ("cloud_gate_slots", "cloud_gate_stale_pushes", "safety_gib"):
+        for key in ("cloud_gate_slots", "cloud_gate_stale_pushes", "safety_gib", "peak_history_share_percent"):
             with self.subTest(key=key), AdmissionFixture() as fixture:
                 config_path = fixture.root / "build_admission.conf"
                 write_memory_config(config_path, cloud_gate_slots="1", cloud_gate_stale_pushes="3")
@@ -1437,6 +1492,21 @@ class CloudAdmissionTests(unittest.TestCase):
                 cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 32, 0, fixture.clock.now() - 15))
                 waiting = self.cloud_request(fixture)
                 self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+                local_requests: list[wire.AdmitRequest] = []
+                if key == "peak_history_share_percent":
+                    local = fixture.request()
+                    assert isinstance(local.profile, records.StepProfile)
+                    local = replace(local, profile=replace(local.profile,
+                        repository=records.RepositoryIdentity("fixture-repository", "fixture")))
+                    store.append_line(fixture.state_dir / "anon_peaks.jsonl", {
+                        "host": fixture.server.host, "repo_identity": "fixture-repository", "step": "nextest",
+                        "test_threads": 8, "test_phase_peak_bytes": 3 * GIB,
+                        "ended_at": store.utc_iso(fixture.clock.now() - 1)})
+                    fixture.hold_starts()
+                    self.assertIsInstance(fixture.server.handle_request(local)[0], wire.Wait)
+                    local_requests.append(local)
+                    write_pressure_reading(fixture.root / "pressure")
+                    fixture.allow_next_start()
                 read_configuration = gate.read_admission_configuration
 
                 def change_after_check() -> gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration:
@@ -1453,6 +1523,9 @@ class CloudAdmissionTests(unittest.TestCase):
                 self.assertEqual(reply.reading.cloud_slots, 1)
                 self.assertEqual(reply.reading.cloud_gate_stale_pushes, 3)
                 self.assertIn(waiting.episode, fixture.server.waiters)
+                for local in local_requests:
+                    self.assertEqual(fixture.server.reservations[local.episode].test_phase_need,
+                                     records.TestPhaseNeed(3 * GIB, 1, 8, 8, "same_width", margin=1.2))
                 model = queue_view.QueueModel(reply.reading, {}, records.NoWaiter(), head_facts.PaceUnavailable(),
                     ZoneInfo("UTC"), queue_view.HostLoadUnavailable(), records.NoWaiter())
                 with mock.patch.object(queue_view, "cloud_push_interval", return_value=queue_view.CloudPushInterval(5)):
@@ -1467,6 +1540,10 @@ class CloudAdmissionTests(unittest.TestCase):
                 self.assertIn(key, refused.reason)
                 self.assertIsInstance(fixture.connect(wire.BuildHistoryRequest()).replies()[0], wire.BuildHistoryReply)
                 fixture.release(grant)
+                for local in local_requests:
+                    local_grant = fixture.server.ledger[local.episode].reply
+                    assert isinstance(local_grant, wire.Admitted)
+                    fixture.release(local_grant)
                 self.assertFalse(fixture.server.reservations)
 
     def test_view_and_mine_keep_version_one_readings_plain_with_a_cloud_gate(self) -> None:
@@ -1497,9 +1574,13 @@ class CloudAdmissionTests(unittest.TestCase):
                                 assert isinstance(reply.reading, wire.CloudQueueRead)
                                 self.assertEqual(len(reply.reading.cloud), 1)
 
-    def test_bad_cloud_settings_hold_admission_and_keep_the_service_available(self) -> None:
-        for key in ("cloud_gate_slots", "cloud_gate_stale_pushes"):
-            for value in ("bad", "0"):
+    def test_bad_admission_settings_hold_admission_and_keep_the_service_available(self) -> None:
+        for key, invalid_values, repaired_value in (
+            ("cloud_gate_slots", ("bad", "0"), "9"),
+            ("cloud_gate_stale_pushes", ("bad", "0"), "3"),
+            ("peak_history_share_percent", ("bad", "70"), "10"),
+        ):
+            for value in invalid_values:
                 with self.subTest(key=key, value=value), AdmissionFixture() as fixture:
                     grant = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
                     config = fixture.root / "build_admission.conf"
@@ -1513,7 +1594,7 @@ class CloudAdmissionTests(unittest.TestCase):
                     self.assertIn(key, reply.reason)
                     fixture.release(grant)
                     self.assertFalse(fixture.server.reservations)
-                    write_memory_config(config, **{key: "9" if key == "cloud_gate_slots" else "3"})
+                    write_memory_config(config, **{key: repaired_value})
                     fixture.server.run_once(0)
                     self.assertIsInstance(fixture.server.configuration, gate.UsableAdmissionConfiguration)
                     self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
@@ -3365,6 +3446,27 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
             self.assertEqual(fixture.state_text(), state)
 
+            for process in ("current", "fresh"):
+                with self.subTest(process=process):
+                    if process == "current":
+                        fixture.restart()
+                        restored = wire.encode_record(fixture.server.ledger[release.request_id].reply)
+                    else:
+                        result = subprocess.run([sys.executable, "-c", "\n".join((
+                            "import sys",
+                            "from scripts.build_queue import admission_protocol as wire",
+                            "from scripts.build_queue.admission_test_support import AdmissionFixture",
+                            "with AdmissionFixture() as fixture:",
+                            "    (fixture.state_dir / 'state.json').write_text(sys.stdin.read())",
+                            "    fixture.restart()",
+                            "    print(wire.encode_record(fixture.server.ledger['release-once'].reply))",
+                        ))], input=state, capture_output=True, text=True,
+                            cwd=Path(__file__).resolve().parents[2],
+                            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        restored = result.stdout.strip()
+                    self.assertEqual(restored, wire.encode_record(wire.Ok()))
+
     def test_restart_thirty_waiters_keeps_places_and_order_fields(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -3537,8 +3639,8 @@ class ServiceTests(unittest.TestCase):
 
     def test_unknown_version_gets_explicit_refusal_and_socket_is_private(self) -> None:
         with AdmissionFixture() as fixture:
-            peer = fixture.connect('{"v":3,"type":"view","data":{}}\n')
-            self.assertEqual(peer.replies(), [wire.Refused("client version 3, service supports 1..2")])
+            peer = fixture.connect('{"v":4,"type":"view","data":{}}\n')
+            self.assertEqual(peer.replies(), [wire.Refused("client version 4, service supports 1..3")])
             self.assertEqual(stat.S_IMODE(fixture.socket_path.stat().st_mode), 0o600)
 
     def test_aged_launch_alone_does_not_create_a_reservation(self) -> None:
@@ -4164,7 +4266,7 @@ class CutoverServiceTests(unittest.TestCase):
             shape = build_shape(list(argv))
             profile = records.StepProfile("fixture", "build", str(fixture.root),
                 records.ExpectedPeak(12 * GIB, "shape", 9,
-                    records.ShapeP90(9, records.NoFloor(), records.ReleaseHeadroom(records.read_memory_config(report=False).release_headroom), records.UnderBudget())),
+                    records.ShapeRankedPeak(9, 10, records.NoFloor(), records.ReleaseHeadroom(records.read_memory_config(report=False).release_headroom), records.UnderBudget())),
                 repository, "full", fixture.clock.now())
             owner_request = fixture.request(need=12 * GIB, step="build")
             assert isinstance(owner_request.profile, records.StepProfile)
@@ -4240,7 +4342,7 @@ class CutoverServiceTests(unittest.TestCase):
         profile = replace(request.profile, worktree=str(fixture.root),
             repository=records.RepositoryIdentity("https://example.org/fixture", "fixture"),
             peak=records.ExpectedPeak(12 * GIB, "shape", 9,
-                records.ShapeP90(9, records.NoFloor(), records.ReleaseHeadroom(records.read_memory_config(report=False).release_headroom), records.UnderBudget())))
+                records.ShapeRankedPeak(9, 10, records.NoFloor(), records.ReleaseHeadroom(records.read_memory_config(report=False).release_headroom), records.UnderBudget())))
         return replace(request, argv=("cargo", "build", "--release", "--bin", "fixture"), profile=profile)
 
     def assert_unregistered_build_is_expired(self, *, restart: bool = False,
@@ -5651,7 +5753,11 @@ class AdmissionConfigurationTests(unittest.TestCase):
             request = replace(request, sidecar=str(fixture.scope(request.owner)))
             granted = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(granted, 7 * GIB)
-            write_memory_config(fixture.root / "build_admission.conf", replay_retention_seconds="invalid")
+            progress.publish_counter(Path(request.sidecar), progress.ProgressCounter("build:1", 50, 100))
+            _ = fixture.run_pass()
+            self.assertTrue(fixture.server.progress_history.merged)
+            write_memory_config(fixture.root / "build_admission.conf", replay_retention_seconds="invalid",
+                                peak_history_share_percent="70")
             with mock.patch.object(fixture.server, "_log_request_timing"), \
                     mock.patch.object(conf, "read", side_effect=AssertionError("release read config")):
                 self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("release-bad-config", granted.reservation, 137)), [wire.Ok()])

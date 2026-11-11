@@ -2,7 +2,7 @@
 """SessionEnd hook: mark this herdr pane's launch entry ended, so a restore leaves it closed.
 
 Only an end by a signal (reason `other`, as at a reboot or a crash) keeps the entry for a restore.
-See `scripts/shutdown/pane_record.py`.
+See `scripts/agents/pane_record.py`.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import os
 import sys
 from typing import TypedDict, cast
 
-from scripts.shutdown import pane_record  # noqa: E402
+from scripts.agents import pane_record  # noqa: E402
 
 
 class HookInput(TypedDict, total=False):

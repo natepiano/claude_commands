@@ -100,7 +100,7 @@ def release_hold(source: str, identity: str, machine: str, timeout: float, *,
     if machine:
         command = ('~/.claude/scripts/lib/py ~/.claude/scripts/notify/review.py release --identity '
                    + shlex.quote(identity) + ' -- ' + shlex.quote(source))
-        result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", machine, command],
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command],
                            capture_output=True, text=True, check=True, timeout=timeout)
         lines = result.stdout.strip().splitlines()
         return ReleaseOutcome(lines[-1] if lines else "")

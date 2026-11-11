@@ -57,11 +57,23 @@ A file that cannot be inspected or deleted is reported on stderr and skipped. Th
 
 ### Window lookup
 
-`find_window(substring) -> FoundWindow` uses `xprop` alone, since xwininfo, xdotool and wmctrl are not installed on natedev:
+`find_window(substring) -> FoundWindow` reads `xprop -root _NET_CLIENT_LIST` for window ids.
+It reads each title with `xprop -id <id> WM_NAME`.
+It accepts `STRING` and `UTF8_STRING` titles and decodes escaped quotes and backslashes.
+It skips a window without a title.
 
-- `xprop -root _NET_CLIENT_LIST` lists window ids (hex), then `xprop -id <id> WM_NAME` reads each title. `STRING` and `UTF8_STRING` titles are read; escaped quotes and backslashes are unescaped. A window without a title is skipped.
-- The whole lookup has 10 s. It polls every 25 ms, and each `xprop` call gets a subprocess timeout equal to the time left.
-- Exactly one match returns. Several matches fail at once with `<n> windows match '<s>': <titles>; pass a longer substring`. No match after 10 s fails with `no window title contains '<s>' after 10 s; titles seen: <titles>`. A failing `xprop -root` fails at once with its stderr.
+A missing property or empty list selects `xwininfo -root -tree`.
+`TREE_WINDOW` reads each window id and title from that output.
+Tree titles retain literal quotes and backslashes because xwininfo does not escape them.
+The title ends at the last `": (` on its line.
+This path alone requires xwininfo.
+A missing binary gives `screen_record: missing on PATH: xwininfo`.
+
+The lookup has a 10-second limit and polls every 25 milliseconds.
+Each command receives the remaining time as its timeout.
+Exactly one match returns.
+Several matches fail before ffmpeg starts and list the matching titles.
+No match at the limit reports the titles seen.
 
 ### Recording
 

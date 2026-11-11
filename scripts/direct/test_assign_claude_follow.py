@@ -7,8 +7,10 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone
+from dataclasses import replace
 from unittest.mock import patch
 from scripts.usage import agents_log
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, fixture_runtime_id, fixture_session, isolated_staff_file, stopped_worker_module, transcript_fixture
@@ -39,7 +41,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         opening = (self.root / "delivered_message.txt").read_text()
         assignment = self.prompt_file.read_text()
         self.assertLess(opening.index(str(extract)), opening.index(assignment))
-        self.assertEqual(self.recorded_worker(session_dir), row)
+        self.assertEqual(self.recorded_worker(session_dir), replace(row, role=staff.KnownWorkerRole("impl")))
         accepted = worker_admission.dispatch_record(allowed.run, allowed.name)
         self.assertEqual(accepted, worker_admission.DispatchRecord(request, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
 
@@ -74,7 +76,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual(result.stderr.splitlines(),
                          [f"anomaly: {row.name}: {record_path}: worker state unreadable: fixture dispatch read failed"])
         self.assertEqual(len(transcript.read_text().splitlines()), 2)
-        self.assertEqual(self.recorded_worker(run), row)
+        self.assertEqual(self.recorded_worker(run), replace(row, role=staff.KnownWorkerRole("impl")))
 
     def test_family_switch_continues_after_an_unknown_dispatch_state(self) -> None:
         run = self.start_phase("switch-unknown-record")
@@ -82,8 +84,8 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         old = self.recorded_worker(run)
         with isolated_staff_file(self.root / "staff.json", {}):
             identity = staff.native_id(fixture_runtime_id("Codex source with an unknown dispatch state"))
-            fixture_session(identity, staff.CodexBackend(self.root / ".codex"))
             row = staff.update_current_session(old.current_session, identity)
+            fixture_session(identity, staff.CodexBackend(self.root / ".codex"))
         source, evidence = transcript_fixture(row, staff.CodexBackend(self.root / ".codex"))
         _ = (run / "impl_worker_impl.json").write_text(json.dumps({"staff_id": row.id, "slot": "impl", "model": "gpt-6"}))
         record_path = worker_admission.switch_record_path(run, row.name)
@@ -135,9 +137,15 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         session_dir = self.start_phase("claude-short-turn")
         transcript = self.claude_worker(session_dir)
 
+        entry = self.assign_script.with_suffix(".py")
+        pid_file = self.root / "launcher-pid"
+        write_text_atomic(entry, entry.read_text().replace("code = assign_claude.run(",
+            "from scripts.lib.atomic_file import write_text_atomic\n"
+            + f"write_text_atomic(Path({str(pid_file)!r}), str(os.getpid()))\ncode = assign_claude.run(", 1))
         result = self.worker_launch(session_dir, to="fixture-impl", behavior="complete")
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.open_passes(session_dir)["fixture-impl"].get("launcher_pid"), int(pid_file.read_text()))
         self.assertEqual(len(transcript.read_text(encoding="utf-8").splitlines()), 2)
         self.assertEqual(self.open_passes(session_dir)["fixture-impl"]["status"], "completed")
         self.assertIn("impl_summary_fixture-impl.txt", (

@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.review_links import review_link, serve
 
 
@@ -134,7 +135,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.env = {
             **os.environ,
             "HOME": str(home),
-            "CLAUDE_PYTHON": sys.executable,
+            **interpreter_cache_environment(self.root / "cache"),
             "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
             "CLAUDE_CODE_SESSION_ID": "12345678-abcd-4321-abcd-123456789abc",
         }
@@ -191,6 +192,23 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertRegex(snapshot.parent.name, r"^[a-z0-9]{6}$")
         self.assertEqual(snapshot.name, source.name)
         self.assertEqual(snapshot.read_bytes(), source.read_bytes())
+
+    def test_snapshot_url_keeps_the_host_port_and_quoted_relative_path(self) -> None:
+        path = self.snapshots / "abcdef" / "notes #%.html"
+        with patch.dict(os.environ, {"REVIEW_LINKS_HOST": "custom.tail.example.ts.net."}):
+            self.assertEqual(review_link.snapshot_url(self.snapshots, path),
+                "http://custom.tail.example.ts.net:8765/abcdef/notes%20%23%25.html")
+        self.assertFalse(self.snapshots.exists())
+
+    def test_snapshot_publication_uses_the_shared_url_function(self) -> None:
+        source = self.source("notes #%.txt", "fixture")
+        with (patch.dict(os.environ, {"REVIEW_LINKS_HOST": "fixture.example"}),
+              patch.object(review_link, "snapshot_url", wraps=review_link.snapshot_url) as shared_url):
+            urls = review_link.snapshot_at(self.snapshots, [source])
+        self.assertEqual(len(urls), 1)
+        self.assertRegex(urls[0], r"^http://fixture\.example:8765/[a-z0-9]{6}/notes%20%23%25\.txt$")
+        shared_url.assert_called_once_with(self.snapshots, next(self.snapshots.glob("*/notes #%.txt")),
+                                           host="fixture.example", port=8765)
 
     def test_missing_session_id_still_uses_a_flat_id(self) -> None:
         _ = self.env.pop("CLAUDE_CODE_SESSION_ID")

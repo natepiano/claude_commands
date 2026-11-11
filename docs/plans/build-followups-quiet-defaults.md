@@ -87,7 +87,7 @@ Current maintenance: snapshot-removal replaces the historical snapshot-timer wir
 | `scripts/direct/phase_table.py` | model-study; read only, not changed | 2 |
 | `/etc/nixos/modules/linux/agent-sessions-snapshot.py` | the showrunner applies; the user rebuilds | 2 |
 
-No phase touches `scripts/shutdown/*`, so neither waits on shutdown-unit's phases 8-9.
+No phase touches `scripts/agents/*`, so neither waits on shutdown-unit's phases 8-9.
 
 ## Gate, every phase
 

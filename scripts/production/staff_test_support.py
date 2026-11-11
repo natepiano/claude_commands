@@ -30,12 +30,14 @@ from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
+from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
@@ -49,7 +51,7 @@ def foreign_hostname() -> Generator[None]:
         _ = startup.write_text('import os, socket\nsocket.gethostname = lambda: os.environ.get("GATE_TEST_HOST", "gate-fixture")\n')
         pythonpath = os.pathsep.join((directory, os.environ.get("PYTHONPATH", "")))
         from scripts.production import production_lifecycle, update_registration
-        from scripts.shutdown import shutdown
+        from scripts.agents import shutdown
 
         with (mock.patch.object(shutdown, "local_machine", side_effect=lambda: remote.local_machine()),
               mock.patch.object(production_lifecycle, "local_machine", side_effect=lambda: remote.local_machine()),
@@ -129,7 +131,15 @@ def fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBac
     path = _prepare_fixture_session(identity, backend)
     path.touch(exist_ok=True)
     if isinstance(backend, staff.CodexBackend):
-        os.environ["CODEX_HOME"] = str(fixture_account_home(backend.codex_home))
+        home = fixture_account_home(backend.codex_home)
+        os.environ["CODEX_HOME"] = str(home)
+        row = staff.initial_snapshot().by_current_session(identity)
+        if row is None:
+            entry = pane_launch.launch("fixture-" + identity, identity, str(home),
+                                       {"CODEX_HOME": str(home)}, ["codex"], kind="codex")
+            pane_launch.write(pane_launch.record_directory() / ("fixture-" + identity + ".json"), entry)
+        elif row.home != staff.SessionHome(home):
+            _ = staff.set_home(row.id, staff.SessionHome(home))
 
 
 def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
@@ -185,7 +195,7 @@ def stopped_worker_module(directory: Path) -> Path:
     _ = (directory / "sitecustomize.py").write_text('''import json, os
 from pathlib import Path
 from scripts.production import staff
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 def stop(reference, kind=""):
     row = staff.by_id(staff.StaffId(reference))
     if os.environ.get("FIXTURE_STOPPED"):
@@ -203,7 +213,7 @@ from pathlib import Path
 from unittest.mock import patch
 from scripts.production import staff, worker_admission as admission
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_session
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 args = sys.argv[1:]
 run = Path(args[args.index("--session-dir") + 1])
 allowed = admission.admit(args[args.index("--name") + 1], run)
@@ -237,8 +247,9 @@ def fixture_member(kind: staff.Kind, *, name: str,
     if kind == "worker":
         if parent_id is None:
             raise staff.StaffRefused("a fixture worker requires a parent")
+        row = staff.ensure_worker(staff.native_id(identity), name, parent_id)
         fixture_session(identity, backend)
-        return staff.ensure_worker(staff.native_id(identity), name, parent_id)
+        return staff.by_id(row.id) or row
     return staff.ensure(kind, name=name, parent=relationship,
                         worktree=worktree, doc=doc, runtime_id=identity)
 
@@ -246,11 +257,7 @@ def fixture_member(kind: staff.Kind, *, name: str,
 def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "",
                    backend: staff.ClaudeBackend | staff.CodexBackend = CLAUDE_BACKEND) -> staff.StaffRow:
     """Publish the fake worker backend's native identity through the real writer."""
-    existing = [row for row in staff.initial_snapshot().find(kind="worker", parent=parent)
-                if row.name == name and row.parent == staff.ReportsTo(parent)]
-    identity = runtime_id or (existing[0].current_session if len(existing) == 1 else fixture_runtime_id(f"worker:{parent}:{name}"))
-    fixture_session(identity, backend)
-    return staff.ensure_worker(staff.native_id(identity), name, parent)
+    return fixture_member("worker", name=name, parent=parent, runtime_id=runtime_id, backend=backend)
 
 
 def fixture_roster(entries: dict[str, object], parent: staff.StaffId,
@@ -380,7 +387,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             if module is not None:
                 for key in ("NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
                     _ = contexts.enter_context(mock.patch.object(module, key, Path(environment[key])))
-        for name in ("pane_record", "scripts.shutdown.pane_record"):
+        for name in ("pane_record", "scripts.agents.pane_record"):
             module = sys.modules.get(name)
             if module is not None:
                 _ = contexts.enter_context(mock.patch.object(
@@ -482,7 +489,7 @@ from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
 from scripts.production import staff_sources
-from scripts.shutdown import remote
+from scripts.agents import remote
 from unittest import mock
 sys.platform = os.environ.get('STAFF_TEST_PLATFORM', 'linux')
 script = sys.argv.pop(1)
@@ -539,7 +546,7 @@ def isolated_source_readers() -> Generator[None]:
             }),
             ("pane_record", {"RECORD_DIR": Path(os.environ["HERDR_PANE_RECORD_DIR"])}),
         ):
-            qualified = "scripts.production.showrunners" if module_name == "showrunners" else "scripts.shutdown.pane_record"
+            qualified = "scripts.production.showrunners" if module_name == "showrunners" else "scripts.agents.pane_record"
             for name in (module_name, qualified):
                 module = sys.modules.get(name)
                 if module is not None:
@@ -571,11 +578,9 @@ if os.environ.get('STAFF_TEST_SSH_FAIL'):
     if reason:
         print(reason, file=sys.stderr)
     raise SystemExit(int(os.environ.get('STAFF_TEST_SSH_EXIT', '255')))
-if (len(arguments) < 6 or arguments[:3] != ['-o', 'BatchMode=yes', '-o']
-        or not arguments[3].startswith('ConnectTimeout=') or arguments[4] != 'natedev'
-        or int(arguments[3].split('=', 1)[1]) <= 0):
+if len(arguments) < 4 or arguments[:3] != ['-o', 'BatchMode=yes', 'natedev']:
     raise SystemExit('unexpected SSH target or options')
-command = arguments[5:]
+command = arguments[3:]
 if len(command) == 1:
     command = shlex.split(command[0])
 if command[:2] != ['~/.claude/scripts/lib/py', '~/.claude/scripts/production/staff.py']:
@@ -662,8 +667,10 @@ import json
 import os
 import socket
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
 children = []
 with socket.socket() as listener:
     listener.bind(('127.0.0.1', 0))
@@ -766,7 +773,7 @@ class StaffTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
-            "CLAUDE_PYTHON": sys.executable,
+            **interpreter_cache_environment(self.root / "cache"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -781,6 +788,7 @@ class StaffTestCase(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
             "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
         })))
+        _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
 
@@ -808,7 +816,7 @@ class StaffTestCase(unittest.TestCase):
             ))
             _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
             _ = contexts.enter_context(mock.patch(
-                "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
+                "scripts.agents.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
             for module in {remote, sys.modules.get("remote", remote)}:
                 _ = contexts.enter_context(mock.patch.object(module, "local_machine", return_value=machine))
@@ -1035,9 +1043,9 @@ class StaffTestCase(unittest.TestCase):
         })
         write_text_atomic(run / "director", director + "\n")
         if director_run:
-            from scripts.lib import unit_runs
-
-            write_text_atomic(unit_runs.marker(director), str(run) + "\n")
+            owner = staff.local_snapshot().by_current_session(director)
+            assert owner is not None
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
         return run
 
     @contextmanager
@@ -1075,10 +1083,9 @@ class StaffTestCase(unittest.TestCase):
         commands: list[list[str]] = []
         for line in self.ssh_log.read_text().splitlines():
             arguments = cast(list[str], json.loads(line))
-            self.assertEqual(arguments[:3], ["-o", "BatchMode=yes", "-o"])
-            self.assertEqual(arguments[4], "natedev")
-            self.assertRegex(arguments[3], r"^ConnectTimeout=[1-9][0-9]*$")
-            command = shlex.split(arguments[5]) if len(arguments) == 6 else arguments[5:]
+            self.assertEqual(arguments[:2], ["-o", "BatchMode=yes"])
+            self.assertEqual(arguments[2], "natedev")
+            command = shlex.split(arguments[3]) if len(arguments) == 4 else arguments[3:]
             self.assertEqual(command[:2], ["~/.claude/scripts/lib/py", "~/.claude/scripts/production/staff.py"])
             self.assertIn("--json", command[2:])
             commands.append(command[2:])

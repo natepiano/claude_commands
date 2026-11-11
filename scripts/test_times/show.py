@@ -146,6 +146,7 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
     checkout_parameters = ", ".join(["?"] * len(checkouts))
     oldest = cutoff(config.whole("TOP_MAX_AGE_DAYS"))
     histories: list[list[ModuleAttempt]] = []
+    type_history: list[ModuleAttempt] = []
     for folder, filename in sorted(modules | {TYPE_CHECK_JOB}):
         history: list[ModuleAttempt] = []
         seen: set[str] = set()
@@ -162,7 +163,9 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
             history.append(attempt)
             if len(history) == count:
                 break
-        if history:
+        if (folder, filename) == TYPE_CHECK_JOB:
+            type_history = history
+        elif history:
             histories.append(history)
     unmeasured = [f"{folder}/{filename}"
                   for folder, filename in sorted(modules - {history[0].key for history in histories})]
@@ -173,9 +176,7 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
         last = history[0]
         tests_run = str(last.tests_run)
         slowest = ""
-        if last.key == TYPE_CHECK_JOB:
-            tests_run = ""
-        elif last.times_missing:
+        if last.times_missing:
             tests_run = slowest = "times missing"
         else:
             tests = kept_tests(connection, last)
@@ -188,6 +189,10 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
                  "slowest kept test", "runs counted"], output, "no modules recorded yet")
     if output:
         print(f"{len(output)} modules; sum of median CPU {seconds(sum(item[0] for item in ranked))} s")
+    if type_history:
+        last_type = type_history[0]
+        print(f"{last_type.name} runs nightly, so it is not ranked: "
+              + f"last run {seconds(last_type.cpu_s)} CPU s, {seconds(last_type.wall_s)} s")
     if unmeasured:
         print(f"unmeasured: {len(unmeasured)} live modules: {', '.join(unmeasured)}")
 

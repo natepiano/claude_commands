@@ -1,11 +1,11 @@
 """Commit a main-checkout change, push it, and send or queue the Mac pull."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import subprocess
@@ -30,11 +30,27 @@ class MissingFile:
 
 
 @dataclass(frozen=True)
+class MacPullSourceUnrecorded:
+    """An older queue record uses the checkout supplied to drain."""
+
+
+@dataclass(frozen=True)
+class MacCheckoutPull:
+    mac: PurePosixPath
+    source: Path | MacPullSourceUnrecorded
+
+
+DEFAULT_MAC_CHECKOUT = PurePosixPath("~/.claude")
+_LEGACY_MAC_PULL = (MacCheckoutPull(DEFAULT_MAC_CHECKOUT, MacPullSourceUnrecorded()),)
+
+
+@dataclass(frozen=True)
 class PendingMacPull:
     label: str
     text: str
     since: str
     reason: str
+    pulls: tuple[MacCheckoutPull, ...] = _LEGACY_MAC_PULL
 
 
 @dataclass(frozen=True)
@@ -173,7 +189,7 @@ def push(checkout: Path, *, time_limit: CommandTimeLimit | NoTimeLimit = UNLIMIT
 def ssh(remote: str, *, ssh_program: str, host: str = "mac",
         time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> subprocess.CompletedProcess[str] | str:
     """Run a remote command; a string describes why it could not run."""
-    command = [ssh_program, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote]
+    command = [ssh_program, "-o", "BatchMode=yes", host, remote]
     try:
         return subprocess.run(command, capture_output=True, text=True, timeout=time_limit.seconds, check=False)
     except subprocess.TimeoutExpired as error:
@@ -182,11 +198,28 @@ def ssh(remote: str, *, ssh_program: str, host: str = "mac",
         return str(error)
 
 
-def pull_mac(checkout: Path, *, ssh_program: str,
+def remote_path(path: PurePosixPath) -> str:
+    """Quote a Mac path and let the Mac expand its home directory."""
+    text = str(path)
+    if text == "~":
+        return '"$HOME"'
+    if text.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(text[2:])
+    return shlex.quote(text)
+
+
+def mac_pull_command(mac: PurePosixPath, source: Path) -> str:
+    """Fetch main without shared fetch state and merge its advertised tip."""
+    url = f"natedev:{shlex.quote(str(source))}"
+    return (f"cd {remote_path(mac)} && tip=$(git ls-remote {url} refs/heads/main | cut -f1) "
+            f"&& git fetch -q --no-write-fetch-head {url} main "
+            "&& git merge -q --ff-only \"$tip\"; printf 'rc=%s\\n' \"$?\"")
+
+
+def pull_mac(checkout: Path, *, ssh_program: str, mac: PurePosixPath = DEFAULT_MAC_CHECKOUT,
              time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> MacPulled | MacPullFailed:
     """Return the completed Mac pull or its failure reason."""
-    done = ssh(f'cd "$HOME"/.claude && git pull -q --ff-only natedev:{shlex.quote(str(checkout))} main; '
-               + "printf 'rc=%s\\n' \"$?\"", ssh_program=ssh_program, time_limit=time_limit)
+    done = ssh(mac_pull_command(mac, checkout), ssh_program=ssh_program, time_limit=time_limit)
     if isinstance(done, str):
         return MacPullFailed(done)
     match = re.search(r"(?:^|\n)rc=(\d+)", done.stdout)
@@ -211,28 +244,48 @@ def read_queue() -> PendingMacPull | NoPendingMacPull:
     fields = cast(dict[str, object], value)
     if not all(isinstance(fields.get(key), str) for key in ("zone", "text", "since", "reason")):
         return NoPendingMacPull()
-    return PendingMacPull(*(cast(str, fields[key]) for key in ("zone", "text", "since", "reason")))
+    pulls: list[MacCheckoutPull] = []
+    for value in cast(list[object], fields.get("pulls", [{"mac": str(DEFAULT_MAC_CHECKOUT), "source": ""}])):
+        row = cast(dict[str, object], value)
+        source = str(row["source"])
+        pulls.append(MacCheckoutPull(PurePosixPath(str(row["mac"])), Path(source) if source else MacPullSourceUnrecorded()))
+    return PendingMacPull(cast(str, fields["zone"]), cast(str, fields["text"]),
+                          cast(str, fields["since"]), cast(str, fields["reason"]), tuple(pulls))
 
 
 def queue(change: PendingMacPull) -> None:
     """Coalesce pulls while retaining an earlier zone notice that still needs delivery."""
     previous = read_queue()
-    if not change.text and isinstance(previous, PendingMacPull) and previous.text:
-        change = PendingMacPull(previous.label, previous.text, previous.since, change.reason)
+    if isinstance(previous, PendingMacPull):
+        pulls = {pull.mac: pull for pull in previous.pulls}
+        pulls.update((pull.mac, pull) for pull in change.pulls)
+        change = replace(change, pulls=tuple(pulls.values()))
+        if not change.text and previous.text:
+            change = replace(change, label=previous.label, text=previous.text, since=previous.since)
+    _write_queue(change)
+
+
+def _write_queue(change: PendingMacPull) -> None:
     path = queue_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Keep the original zone queue format so installed sync jobs can drain it.
     write_text_atomic(path, json.dumps(dict(zone=change.label, text=change.text,
-                                           since=change.since, reason=change.reason), indent=2) + "\n")
+                                           since=change.since, reason=change.reason,
+                                           pulls=[dict(mac=str(pull.mac), source=str(pull.source) if isinstance(pull.source, Path) else "")
+                                                  for pull in change.pulls]), indent=2) + "\n")
 
 
-def queue_pull_only(label: str, reason: str) -> None:
+def queue_pull_only(label: str, reason: str, *, pulls: tuple[MacCheckoutPull, ...] = _LEGACY_MAC_PULL) -> None:
     """Queue a pull and retain any waiting zone notice."""
-    queue(PendingMacPull(label, "", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), reason))
+    queue(PendingMacPull(label, "", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), reason, pulls))
 
 
-def clear_pull_only() -> None:
+def clear_pull_only(mac: PurePosixPath = DEFAULT_MAC_CHECKOUT, *, notice_delivered: bool = False) -> None:
     """Clear a completed pull and retain any waiting zone notice."""
     pending = read_queue()
-    if isinstance(pending, PendingMacPull) and not pending.text:
-        queue_path().unlink(missing_ok=True)
+    if isinstance(pending, PendingMacPull):
+        pending = replace(pending, pulls=tuple(pull for pull in pending.pulls if pull.mac != mac),
+                          text="" if notice_delivered else pending.text)
+        if pending.pulls or pending.text:
+            _write_queue(pending)
+        else:
+            queue_path().unlink(missing_ok=True)

@@ -13,7 +13,7 @@ from typing import NamedTuple, TypedDict, cast
 from scripts.production import staff
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
 
 
@@ -189,7 +189,7 @@ def _text(value: object) -> str:
 
 def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
     """Resolve the director's current folder without changing its stored record."""
-    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
+    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status"):
         return fields
     row = unit_runs.run_owner(fields, record)
     if isinstance(row, unit_runs.RunOwnerUnrecorded):
@@ -225,7 +225,7 @@ def plan_runs(plan_path: Path, *,
         return []
     starts = [(path, event) for path in paths if (event := run_started_event(path)) is not None]
     if record is None:
-        record = (staff.snapshot() if any(event.get("main_agent") or event.get("owner_session") for _, event in starts)
+        record = (staff.snapshot() if any(event.get(unit_runs.OWNER_FIELD) or event.get("main_agent") or event.get("owner_session") for _, event in starts)
                   else staff.StaffSnapshot(()))
     matches: list[tuple[float, str, Path]] = []
     for path, event in starts:

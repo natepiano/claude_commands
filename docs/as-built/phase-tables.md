@@ -31,6 +31,11 @@ progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earl
 
 ### The record
 
+`build` uses the owner's staff folder when no working directory is supplied.
+A failed staff read remains an error in the result.
+The reader never substitutes the caller's current directory.
+Phase notes store the unit's fixed staff id in `unit:`.
+
 ```python
 build_plan(plan_path: Path) -> PhaseRecord      # raises NoPlan
 build(session_dir: Path) -> PhaseRecord         # raises NoState, NoPlan
@@ -118,7 +123,7 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
               first_eta, moves, eta_trail: [[target, stated_at]], finished_at, delta_minutes, fix_rounds, findings}
 ```
 
-The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`; the Markdown shows it as `after G<k>`. The unit board reads `build_plan`'s record, not this JSON.
+The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`; the Markdown shows it as `after G<k>`. The Units table reads `build_plan` records for progress and ETA facts.
 
 `current.repair_rounds_since_first_stated_eta` is the `FirstStatedEtaTarget`'s count when a first stated target exists, else `null`, and is present even when `current.eta` is `null`. The Markdown shows no count.
 
@@ -129,6 +134,7 @@ The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`
 `refresh` finds the unit staff row through its plan.
 The parent showrunner row supplies the production name and `doc.path`.
 A plan outside a production writes no note.
+A run whose plan file was removed, as for ad hoc work after the as-built, writes no note and prints nothing.
 
 - **Path.** `<vault root>/<showrunner session name>/<file name>.md`. The folder is `showrunners.current_name(name)` (`scripts/production/showrunners.py`). While that answers empty, the note is rewritten in the folder of the unit's most recently modified owned note; with no owned note `refresh` refuses with `the showrunner of <showrunner name> is not running`.
 - **Name.** `unit_lookup.labeled_sessions(name)[unit].claude.name` when that is a `LiveClaude` with a name; in every other case the unit id. `/` and NUL become `-`, and leading `.` characters are dropped.
@@ -136,7 +142,10 @@ A plan outside a production writes no note.
 - **Publication.** The writer checks ownership under the folder lock. Identical content keeps the existing bytes, inode, and modification time. Changed content uses a temporary file with mode `0o644`. The writer replaces an owned target with `os.replace`. A first write uses `os.link` and refuses a target that appears during publication. A foreign target remains unchanged. The writer does not add a Git exclusion. Existing installations must remove the old `showrunners/` entry from the vault’s `info/exclude`. The existing `agent-notes` vault part includes live phase notes only when its own generated notes already need a content commit. Selection uses the writer’s `phase_note_ownership` parser. Deleted notes use their content from `HEAD` for this check. It includes only owned live-note deletions. It leaves unrelated changes alone. Phase notes alone cause no commit. The existing ten-minute `hanadocs-push` job pushes these commits. No new job or schedule is required.
 - **Archive.** `_archive_note(candidate, vault_root, name)` moves an owned note to `<vault>/archive/<showrunner folder>/<showrunner name>/<name>.md`. Here, `<vault>` is the parent of the live-note root. Live-note scans and commits do not include archive files. The move uses `os.link` then `unlink`. An existing target remains unchanged. A repeated archive uses `<stem>-2.md`, then `<stem>-3.md`. An operating system error raises `Refusal` with the path and cause. A failed unlink removes the new link first. The writer removes an empty source folder after the move.
 - **`archive`.** Archives every owned note whose `production` is the showrunner staff name, live or retired unit alike; hand-written notes and other productions' notes stay. It prints one archived path per line and exits 0 also when nothing moved; a vault root whose parent does not exist archives nothing. `production_lifecycle.py wrap` runs it.
-- **Moves and `prune`.** After the write, every other `*.md` under `<vault root>/*/` with the same ownership is removed, with its folder when that leaves it empty; a renamed unit session or showrunner moves the note by this rule. `prune` archives every owned note under `<vault root>/*/` whose `production` is the showrunner staff name and whose `unit` is not a live Units row, removing each folder it leaves empty.
+- **Moves and pruning.** After a write, the writer removes other notes with the same ownership.
+  It removes a folder when that removal leaves it empty.
+  `prune` resolves ownership through staff and archives notes whose unit is no longer live in that production.
+  Fixed unit ids preserve ownership through a rename.
 
 ### Recorder side
 
@@ -144,7 +153,7 @@ A plan outside a production writes no note.
 - **Hook.** `_refresh_phase_table(session_dir)` follows phase, progress, finish and ETA records.
   It skips a plan with no staff unit. Otherwise it runs `phase_table.py refresh`.
   A failure prints `phase table not written: <reason>` and keeps the recorder's result.
-- **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row and gate, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish, `after G<k>` under an untimed gate). `scripts/direct/board_json.py` builds the unit board from the same record ([unit board](unit-board.md)).
+- **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row and gate, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish, `after G<k>` under an untimed gate). `scripts/production/unit_phases.py` builds the Units table from the same record.
 - **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`, with `history_root`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME` and `PlanPhase`. Tests patch `plan_history.now_epoch` for the clock.
 - **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `<ProgressContract>` in `commands/unit/direct.md` records every ETA the unit director states before stating it (`--phase-id` for a phase other than the active one) and states the recorder's printed time. `docs/direct/phase_end.md` step 2 and `docs/production_format.md` item 3 record the next phase's ETA with `--phase-id <next> --basis checkpoint` before the checkpoint notice. `commands/unit/eta.md` records the ETA, range and `--basis eta-command` before the answer is sent, as `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command on every answer, with the bullets' last end time and no range.
 
@@ -212,7 +221,8 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - `show --production-doc` reads neither `--zone` nor `--json`. It turns only an unreadable plan into `unavailable`; an unreadable production doc fails the whole call.
 - An `eta` call reads a typed time in the user's zone setting, never the machine's zone or the process `TZ` (2026-10-12). `HH:MM` means today only; a later-day ETA needs the full date. `eta.md` and `eta_breakdown.md` call the recorder installed under `~/.claude`, so a recorder change reaches them only once it is on main.
 - `scripts/production/showrunners.py` reads its two directories once, at import. A test that runs `refresh` in a subprocess sets them in the child's environment; a test that calls `phase_table.main()` in process patches the module constants. `scripts/production/fake_showrunner.py` (`write_timer`, `write_session`) supplies the running showrunner a note needs.
-- `add_unit.py` imports its siblings by bare name, so `phase_table.py` puts `scripts/production` on `sys.path` before its `scripts.production` imports. The form type-checks with no ignore and runs from any working directory.
+- `phase_table.py` imports production helpers through their `scripts.production` package names.
+  Entry scripts use the [shared package bootstrap](merge-gate-and-test-speed.md#python-package-imports).
 - A vault on a file system without hard links refuses a note's first write with one line. A showrunner name of `.` or `..`, or one holding `/` or NUL, is refused.
 - `production_lifecycle.py wrap` archives every generated note owned by the production before marking its doc wrapped, so another production can reuse the session name and publish a fresh note.
 - The archive sits outside `showrunners/`. Live-note scans use `vault_root.glob("*/*.md")` and do not include archive files.
@@ -236,3 +246,42 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - **A projection writes its own `why`.** The renderer refuses an ETA move of 15 minutes or more with no reason. Refusing the build instead would bring back hand-typed reasons.
 - **The builder checks against the renderer's own parser.** The range and stated-moment rules live in the renderer, so the builder writes only what `parse_range_end` reads back. `RecordEtaRangeOmitted` stays reachable for an end more than a day from its ETA.
 - **Older `eta_seen.json` text is adopted, not parsed.** Adoption keeps `first_seen` and `requested`, so a held unit is not asked twice.
+
+
+## Recording ETAs and chained predictions
+
+`progress_history.py eta` records the promise before the director states it.
+Use `--time`, `--basis`, and an optional `--phase-id`.
+A range needs both `--earliest` and `--latest` and must contain the promise.
+Short times mean today in the user zone; later dates need `YYYY-MM-DDTHH:MM`.
+The command refuses past times and local times that the clock skips.
+It prints `ETA recorded: HH:MM <zone>`.
+
+The `eta_stated` event names the target through `eta_phase_id`.
+`phase_id` names the phase active when the director recorded the promise.
+The basis is `checkpoint`, `eta-command`, or `stated`.
+An ETA recorded before its phase starts still belongs to that phase.
+
+`build_plan` combines phase headings, durable run events, and stated promises.
+History follows each phase's title family across instances.
+It excludes retired work under a reused phase number.
+`eta_trail` holds actual promises; `schedule_end` holds the prediction used for later phases.
+A passed promise remains visible as late, while the schedule advances for future work.
+Typical completed-phase durations and gaps predict the remaining phases.
+The Units table only formats these facts.
+
+## The short report
+
+`progress_history.py progress` prints the clocks table, phase heading, ETA line, stage, and worker lines.
+`--tables` adds the round table and its earlier-work line.
+Verification gate lines appear in both report forms.
+The ETA line shows the latest promise, its first value, moves, repair rounds, and overdue time.
+It reports unavailable ETA facts explicitly.
+Worker lines use each worker's live window or newest finished window.
+The clocks table uses the predicted plan finish for Project ETA.
+The legacy layout keeps its existing form and adds the ETA line.
+
+`/unit:report [tables|on|off]` presents the report and copies the clocks table without changes.
+`tables` adds the round table after the clocks table.
+Delegation launch and result replies end with this short report.
+Use `/showrunner:units` for the production's Units table.

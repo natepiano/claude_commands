@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.message import repeat_guard
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -117,7 +117,7 @@ def main() -> int:
         command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/repeats.py"'
                    + " --here --snapshot --day " + shlex.quote(day))
         try:
-            result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", host, command],
                                     capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20, check=False)
             if result.returncode != 0:
                 raise ValueError(result.stderr.strip() or f"exit {result.returncode}")

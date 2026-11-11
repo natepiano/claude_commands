@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.aws_target import ledger, remote
 from scripts.build_queue import queue_snapshot
 from scripts.mac_test import mac_test
-from scripts.aws_target.ledger_test_support import CostFixture, instant
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings
 
@@ -68,7 +68,7 @@ class AwsReplies:
         elif "describe-spot-price-history" in words:
             document = {"SpotPriceHistory": [{"Timestamp": self.generation, "SpotPrice": "0.25"}]}
         elif "get-cost-and-usage" in words:
-            document = {"ResultsByTime": []}
+            document = account_reply(arguments)
         else:
             raise AssertionError(f"Unexpected AWS operation: {words}")
         return subprocess.CompletedProcess(words, 0, json.dumps(document), "")
@@ -111,6 +111,8 @@ class ControlFixture(CostFixture):
         path = mac_test.claim_path(paths, scope)
         path.parent.mkdir(parents=True, exist_ok=True)
         record: mac_test.RemoteJobClaim = {
+            "claim_id": f"claim-{slot}-{pid}-{at}", "episode": f"episode-{slot}",
+            "attempt": f"attempt-{pid}-{at}", "submitting_session": "",
             "pid": pid, "proc_start": "old-process", "what": "test hana", "worktree": str(self.root),
             "since": datetime.fromtimestamp(at or self.clock.now - 10, UTC).isoformat(),
             "repo_name": "hana", "repo_key": scope.key, "slot": slot,

@@ -23,19 +23,13 @@ BOARD = Path(__file__).with_name("board.sh")
 
 
 class BoardReclaimTests(unittest.TestCase):
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     lock: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.lock = self.root / "locks" / "cargo.d"
-
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def board(self, command: str, *arguments: str, epoch: int = 1000) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

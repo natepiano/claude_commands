@@ -19,16 +19,19 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
-from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
-from scripts.herdr.herdr import HerdrPlace  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
+from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.message.sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff, session_staff, unit_config  # noqa: E402
 from scripts.production.session_labels import StaffLabels
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib import unit_runs  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.herdr import herdr
 
 USAGE = "usage: unit_lookup.py list <production name> | pane <production name> <unit>"
 
@@ -223,11 +226,12 @@ class RunRecord(NamedTuple):
 
 
 class HeldRun(NamedTuple):
-    """A directed run and its recorded worktree and state."""
+    """A directed run with its history, worktree, state, and held folder."""
 
     path: Path
     worktree: Path
     state: UnitState
+    folder: Path
 
 
 @dataclass(frozen=True)
@@ -248,15 +252,18 @@ class HeldRunLookup:
 
     def __init__(self, *, record: staff.StaffSnapshot | None = None) -> None:
         self._record: staff.StaffSnapshot | None = record
-        self._folders: dict[str, list[str]] | None = None
         self._histories: dict[Path, HeldRun | HeldRunUnknown] = {}
 
     def unfinished_held_run(self, session_id: str) -> HeldRun | HeldRunUnknown | NoUnfinishedRun:
         if not session_id:
             return NoUnfinishedRun()
-        if self._folders is None:
-            self._folders = unit_runs.held_by_session()
-        for folder in unit_runs.held(session_id, scanned=self._folders):
+        if self._record is None:
+            self._record = staff.snapshot()
+        row = self._record.by_current_session(session_id)
+        folders = [row.run.path] if row is not None and isinstance(row.run, staff.OpenRun) else []
+        for folder in folders:
+            if unit_runs.director(folder, record=self._record) != session_id:
+                continue
             path = runs_dir() / (Path(folder).name + ".jsonl")
             if path not in self._histories:
                 try:
@@ -264,15 +271,11 @@ class HeldRunLookup:
                         first = _event(handle.readline().decode("utf-8"))
                     if first is None or first.get("event_type") != "run_started":
                         raise ValueError("history does not start with run_started")
-                    if self._record is None:
-                        self._record = staff.snapshot()
                     row = self._record.by_member_reference(session_id)
                     if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
                         raise ValueError(f"{session_id}: the staff worktree is unavailable")
-                    last = _last_event(path)
-                    state = (UnitState.RUN_FINISHED if last is not None
-                             and last.get("event_type") == "run_finished" else UnitState.RUNNING)
-                    self._histories[path] = HeldRun(path, row.worktree.path, state)
+                    state = UnitState.RUNNING if unit_runs.run_is_open(Path(folder)) else UnitState.RUN_FINISHED
+                    self._histories[path] = HeldRun(path, row.worktree.path, state, Path(folder))
                 except (OSError, UnicodeError, ValueError) as error:
                     self._histories[path] = HeldRunUnknown(path, str(error))
             run = self._histories[path]
@@ -302,49 +305,18 @@ def _event(line: str) -> dict[str, object] | None:
     return cast(dict[str, object], event) if isinstance(event, dict) else None
 
 
-def _last_event(path: Path) -> dict[str, object] | None:
-    """Read backwards to the last JSON object, retaining lines across block boundaries."""
-    with path.open("rb") as handle:
-        position = handle.seek(0, os.SEEK_END)
-        pending = b""
-        block_size = 64 * 1024
-        while position:
-            size = min(position, block_size)
-            position -= size
-            _ = handle.seek(position)
-            lines = (handle.read(size) + pending).split(b"\n")
-            pending = lines.pop(0) if position else b""
-            for line in reversed(lines):
-                if not line.strip():
-                    continue
-                event = _event(line.decode("utf-8"))
-                if event is not None:
-                    return event
-            block_size *= 2
-    return None
-
-
 def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
     """Join each run's director to its staff folder and read the newest run state."""
     directory = runs_dir()
-    if not directory.exists():
-        return RunStates({})
+    record = staff.snapshot() if record is None else record
     newest: dict[str, _StartedRun] = {}
-    for path in directory.iterdir():
-        if path.suffix != ".jsonl":
-            continue
+    for path in directory.glob("*.jsonl"):
         with path.open("rb") as handle:
             first = _event(handle.readline().decode("utf-8"))
         if first is None or first.get("event_type") != "run_started":
             continue
-        agent = first.get("main_agent")
-        identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
-        if not isinstance(identity, str):
-            continue
-        if record is None:
-            record = staff.snapshot()
-        row = record.by_member_reference(identity)
-        if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
+        row = unit_runs.run_owner(first, record)
+        if isinstance(row, unit_runs.RunOwnerUnrecorded) or isinstance(row.worktree, staff.WorktreeUnfilled):
             continue
         worktree = str(row.worktree.path)
         started = first.get("run_started_at")
@@ -353,9 +325,12 @@ def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
             newest[worktree] = _StartedRun(at, path)
     records: dict[str, RunRecord] = {}
     for worktree, run in newest.items():
-        last = _last_event(run.path)
-        state = UnitState.RUN_FINISHED if last is not None and last.get("event_type") == "run_finished" else UnitState.RUNNING
-        records[worktree] = RunRecord(run.path, state)
+        records[worktree] = RunRecord(run.path, UnitState.RUN_FINISHED)
+    for row in record.rows:
+        if isinstance(row.run, staff.OpenRun) and not isinstance(row.worktree, staff.WorktreeUnfilled):
+            if unit_runs.run_is_open(row.run.path):
+                path = directory / f"{row.run.path.name}.jsonl"
+                records[str(row.worktree.path)] = RunRecord(path, UnitState.RUNNING)
     return RunStates(records)
 
 
@@ -377,6 +352,8 @@ class RecordsPartlyUnread(NamedTuple):
 
 
 def _place_of(pid: int, places: dict[int, HerdrPlace]) -> HerdrPlace | None:
+    from scripts.herdr import herdr
+
     place = places.get(pid)
     if place is not None:
         return place
@@ -441,6 +418,8 @@ def _claudes(processes: list[herdr.HerdrProcess], *,
 def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
                   processes: list[herdr.HerdrProcess]) -> Iterable[LabeledSession]:
     """Join live Claude by PID, retaining stopped panes and unknown evidence."""
+    from scripts.herdr import herdr
+
     running = {session["name"] for session in herdr.live_sessions()}
     holders = {process.pid: (process.place, claudes[process.pid].session_id if process.pid in claudes else
                             process.marks.get("CODEX_THREAD_ID", "") or process.marks.get("CLAUDE_CODE_SESSION_ID", ""))
@@ -510,12 +489,14 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
 
 def observed_session_labels(*, record: staff.StaffSnapshot | None = None, running: Sequence[SessionRecord] | None = None) -> tuple[LabeledSession, ...]:
     """Read native process identities for stop and cleanup checks."""
+    from scripts.herdr import herdr
+
     try:
         record = record if record is not None else staff.snapshot()
         processes = herdr.herdr_processes(membership=StaffLabels(record))
         claudes, unread = _claudes(processes, running=running)
         return tuple(_herdr_labeled(claudes, unread, processes))
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         raise OSError(str(error)) from error
 
 

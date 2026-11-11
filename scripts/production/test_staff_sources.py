@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
+from scripts.herdr import herdr_types
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 
@@ -9,17 +10,20 @@ import io
 import os
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 
 
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources, session_staff
+from scripts.production.production_doc import ProductionDocument
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
-from scripts.shutdown import pane_record, remote
+from scripts.agents import pane_record, remote
 from scripts.herdr import herdr
 from scripts.production import showrunners
 from scripts.production.session_staff import MemberSources
@@ -43,6 +47,22 @@ class StaffSourcesTests(StaffTestCase):
         owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.source_root / "sdlc-production.md"))
         return owner, unit, worker
 
+
+    def test_showrunner_admission_completes_the_started_pane_home(self) -> None:
+        identity = staff.native_id(fixture_runtime_id("TEST-showrunner-admission"))
+        home = self.root / "TEST-showrunner-home"
+        entry = pane_record.launch("TEST-pane", identity, str(self.root), {"CLAUDE_CONFIG_DIR": str(home)}, ["claude"])
+        pane_record.write("TEST-showrunner", entry)
+        self.assertIsNone(staff.initial_snapshot().by_current_session(identity))
+        self.assertIn("config_dir", pane_record.read("TEST-showrunner")["TEST-pane"])
+        production = ProductionDocument(self.root / "TEST-production.md", "TEST-showrunner", "main",
+                                                     self.root, self.root / "TEST-log.md", ZoneInfo("UTC"))
+        row = staff_sources.ensure_staff_showrunner(production, runtime_id=identity)
+        self.assertEqual(row.home, staff.SessionHome(home))
+        self.assertEqual(staff.by_id(row.id), row)
+        saved = pane_record.read("TEST-showrunner")["TEST-pane"]
+        self.assertNotIn("config_dir", saved)
+        self.assertEqual(saved["session_id"], row.id)
 
     def test_live_pane_workers_keep_all_five_states_and_report_unknown_evidence(self) -> None:
         fixture = self.row_production()
@@ -388,7 +408,7 @@ class StaffSourcesTests(StaffTestCase):
                 with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}),
                       mock.patch.object(herdr, "process_environment", return_value=environment),
                       mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane"),
-                          side_effect=herdr.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
+                          side_effect=herdr_types.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
                       mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
                           "foreground_processes": [{"pid": 42402, "argv": ["codex"]}]}}),
                       mock.patch.object(process_table, "snapshot", return_value=table),
@@ -449,7 +469,7 @@ class StaffSourcesTests(StaffTestCase):
 
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         for failure in (FileNotFoundError("process exited"), PermissionError("permission denied"),
-                        herdr.HerdrFailure("process 42401: exited")):
+                        herdr_types.HerdrFailure("process 42401: exited")):
             with (self.subTest(failure=type(failure).__name__),
                   mock.patch.object(process_table, "snapshot", side_effect=[table, {}]),
                   mock.patch.object(herdr, "process_environment", side_effect=failure),
@@ -1018,6 +1038,7 @@ class StaffWorkerIdentityTests(StaffTestCase):
 
         runner, owner, worker = self.tree()
         launch = pane_record.launch("test:pane", owner.current_session, str(self.root), {}, [])
+        owner = replace(owner, home=staff.SessionHome(Path.home() / ".claude"))
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"}),

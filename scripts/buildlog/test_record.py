@@ -141,7 +141,7 @@ class RecordTests(unittest.TestCase):
         environment["BUILDLOG_DIR"] = str(self.root)
         environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
         environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
-        environment["UNIT_ACTIVE_DIR"] = str(self.base / "active")
+        environment["STAFF_FILE"] = str(self.base / "staff.json")
         environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
         environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
         environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
@@ -960,8 +960,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             self.assertIn("waiting for memory since ", first_message)
             self.assertFalse(marker.exists())
             _ = threading.Event().wait(1.1)
-            released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
+            released_at = meminfo.stat().st_mtime
             output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             errors = first_message + remaining_errors
         finally:

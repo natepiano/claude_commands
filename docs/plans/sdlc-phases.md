@@ -105,7 +105,12 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Binds later work:** `read_usage` in `phase_process.py` sums input and all cache classes into one number and drops the model, so weighted tokens need a different read. `phase_boundaries` selects phases by finish time, and `measure_director_tokens` stops at phase end. Phase boundaries and fix time come from `scripts/history/rounds.py`: an open phase is a named state; fix time is worker time, apart from wall-time shares; a mixed phase is reported apart. `direct.md` costs about 41k tokens as a Read. `phase_process.py` has director tokens per phase, but no compactions per phase and no context size after reload.
 
-**Gotchas:** closure reviews are not in rounds.py, so the closure pass row stays a review pass. A ledger-only round has zero fix time and adds to the round count only. A repair round with `cause == "merge"` counts under fix, not under the merge row. Inserted phases are about 2% of gaps.
+**Gotchas:** closure reviews remain review passes.
+A dispatch without an eligible fix pass adds no repair round.
+Started passes with one ledger batch count once across relaunches.
+Legacy passes without a ledger number group by overlap.
+A repair with `cause == "merge"` counts under fix, not under the merge row.
+The saved baseline reports inserted phases as about 2% of gaps.
 
 **Ruled out:** a retrospective before sample for cheap A — a phase's start time does not prove which contract it read; the full A targets (10% tokens, 10 s) — the measured cut does not reach them.
 
@@ -299,7 +304,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 #### As-built
 
-- `docs/plans/sdlc-run-cancel-design.md` holds each owner's answer to builds' part. The design defines no copy path. It points to the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, the folder name from `roster.UnitLabels.folder_name()` on labels from `roster.unit_labels_for`, owned by verify-unit's `docs/plans/verify-copies.md`), and the run-stop provenance goes in a file inside that folder. `board.sh` is natedev's file.
+- `docs/plans/sdlc-run-cancel-design.md` holds each owner's answer to builds' part. The design defines no copy path. It points to the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, the folder name from `roster.UnitLabels.folder_name()` on labels from `roster.unit_labels_for`, owned by verify-unit's `docs/as-built/gate-checkouts.md`), and the run-stop provenance goes in a file inside that folder. `board.sh` is natedev's file.
 - verify-unit agreed items 1, 3, 4 and 6: the launchers export the owner link before `verify.sh` refuses calls without it; one command id passes down in the environment; the TERM order builds on verify-unit's token fix (no reclaim from a live holder, token renewed with `--pid`); the Mac claim stays until the remote side is empty; one 15 s attempt deadline; only verify's own cancel path sets exit 77.
 - resources-unit agreed item 2: charges bind to the step's systemd scope cgroup; a dead wrapper's kept charge counts measured memory; a step with no scope keeps today's rule; hold waits cancel through `interrupt-local`; a stopped command leaves a tombstone.
 - Items still open stay under the doc's Open questions. No code changed.
@@ -432,7 +437,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/lib/process_start.py` — the shared reader and `OwnerCheck`; `scripts/lib/test_process_start.py`.
 - `scripts/lib/process_start_test_support.py` — the one fake stat helper for tests (`write_stat`, `process_start_probe`, `stored_start_probe`).
 - `scripts/direct/assign.py`, `findings.py`, `verify.sh`, `end_session.sh` — the five rerun fixes; tests in `test_assign_launcher.py`, `test_findings.py`, `test_verify_hold_lint.py`, `test_verify_hold_wait.py`, `test_end_session.py`.
-- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/agents/codex_mesh.py`, `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/shutdown/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
+- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/agents/codex_mesh.py`, `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/agents/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
 
 **Binds later work:**
 - Any code that reads a process start or decides a process is stale calls `scripts.lib.process_start` (`check_owner`, `check_group_leader`). Only GONE and REPLACED reclaim. Only ALIVE signals. UNKNOWN keeps the record.

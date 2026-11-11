@@ -26,9 +26,13 @@ The move limits come from `config/production.conf` at use.
 
 Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
 The command refuses an existing destination or a concurrent row operation.
+An open phase does not prevent a folder move.
+Staff remains the folder source for runs, panes, recovery, and resume.
+Claude transcripts and Codex threads retain their native ids and existing transcript locations.
+The shared restart path can resume a previously live unit without an older launch record.
 
 ## Tests
 
-`scripts/shutdown/test_shutdown_cli.py` covers row names, display repair, moves, and stopped-session recovery.
+`scripts/agents/test_shutdown_cli.py` covers row names, display repair, moves, and stopped-session recovery.
 The `test_unit_move.py` module covers interruption recovery across the folder and branch operations.
 Tests use private staff records and fake process and terminal evidence.

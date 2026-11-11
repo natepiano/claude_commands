@@ -4,13 +4,17 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast, overload
 from enum import Enum
+from importlib import import_module
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
@@ -32,7 +36,7 @@ class PaneLaunch(TypedDict):
     kind: NotRequired[Literal["claude", "codex"]]
     pane_id: str
     session_id: str
-    config_dir: str
+    config_dir: NotRequired[str]
     cwd: str
     name: str
     model: str
@@ -46,6 +50,99 @@ class PaneLaunch(TypedDict):
     written_at: str
     pid: NotRequired[int]
     proc_start: NotRequired[str]
+    producer_binding: NotRequired[bool]
+
+
+class CurrentProcessEvidence(Protocol):
+    """The current conversation, process generation, and environment for a producer publication."""
+
+    @property
+    def current_identity(self) -> str: ...
+    started: str
+    environment: dict[str, str]
+
+
+class NativeProcessReader(Protocol):
+    def native_process(self, pid: int, kind: str) -> CurrentProcessEvidence: ...
+
+
+@dataclass(frozen=True)
+class ProducerStartExpectation:
+    """The conversation, backend, folder, and account selected before a producer starts."""
+
+    member: staff.StaffId
+    session: staff.StaffId
+    kind: Literal["claude", "codex"]
+    folder: Path
+    home: Path
+
+    def expected_launch(self, entry: PaneLaunch) -> PaneLaunch:
+        expected = entry.copy()
+        expected.update(session_id=self.session, kind=self.kind, cwd=str(self.folder), config_dir=str(self.home))
+        return expected
+
+
+@contextmanager
+def producer_start(directory: Path, expected: ProducerStartExpectation) -> Generator[None]:
+    """Publish the selected start contract for the Claude hook or the Codex publisher."""
+    path = directory / f".producer-start-{expected.member}"
+    contract = json.dumps({"member": expected.member, "session": expected.session, "kind": expected.kind,
+                           "folder": str(expected.folder), "home": str(expected.home), "attempt": uuid4().hex})
+    with _publication_lock(directory):
+        atomic_file.write_text_atomic(path, contract)
+    try:
+        yield
+    finally:
+        with _publication_lock(directory):
+            if path.exists() and path.read_text(encoding="utf-8") == contract:
+                path.unlink()
+
+
+def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | None = None) -> staff.SessionHome | staff.HomeUnknown:
+    """Read a staffed session's home, or an unstaffed launch's config folder."""
+    if record is None:
+        try:
+            record = staff.local_snapshot()
+        except staff.StaffAbsent:
+            record = staff.StaffSnapshot(())
+        except staff.StaffUnreadable:
+            return staff.HomeUnknown()
+    reference = entry.get("session_id", "")
+    row = record.by_member_reference(reference) if isinstance(reference, str) else None
+    if row is not None:
+        return row.home
+    directory = entry.get("config_dir", "")
+    return staff.SessionHome(Path(directory)) if isinstance(directory, str) and directory else staff.HomeUnknown()
+
+
+def _record_home(entry: PaneLaunch) -> PaneLaunch:
+    """Publish the pane's home through the staff writer when membership exists."""
+    try:
+        row = staff.initial_snapshot().by_member_reference(entry["session_id"])
+        if row is None:
+            return entry
+        current = entry.copy()
+        directory = current.pop("config_dir", "")
+        if directory:
+            home = staff.SessionHome(Path(directory).absolute())
+            if row.home != home:
+                _ = staff.set_home(row.id, home)
+        return current
+    except (staff.StaffUnreadable, staff.StaffNotFound) as error:
+        print(f"anomaly: {entry['session_id']}: pane home is unavailable: {error}", file=sys.stderr)
+        return entry
+
+
+def staff_admitted(row: staff.StaffRow) -> staff.StaffRow:
+    """Complete pane publication after the first native identity admission."""
+    try:
+        publication = newest_publication(record_directory(), (row.current_session,))
+        if publication is not None and "config_dir" in publication.entry:
+            write(publication.path, _record_home(publication.entry), sources=tuple(publication.path.parent.glob("*.json")))
+            return staff.by_id(row.id) or row
+    except (OSError, ValueError, staff.StaffNotFound) as error:
+        print(f"anomaly: {row.id}: pane publication is unavailable: {error}", file=sys.stderr)
+    return row
 
 
 def record_directory() -> Path:
@@ -53,6 +150,13 @@ def record_directory() -> Path:
 
 
 def read_entries(path: Path) -> dict[str, object]:
+    if not path.parent.exists():
+        return {}
+    with _publication_lock(path.parent):
+        return _read_entries(path)
+
+
+def _read_entries(path: Path) -> dict[str, object]:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
@@ -82,7 +186,7 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
             continue
         if not isinstance(launch.get(field), str):
             raise ValueError(f"{location}: {field} must be a string")
-    for field in ("remote_control", "flags_read", "ended"):
+    for field in ("remote_control", "flags_read", "ended", "producer_binding"):
         if field not in launch:
             continue
         if not isinstance(launch.get(field), bool):
@@ -120,13 +224,20 @@ def read_strict(path: Path) -> dict[str, PaneLaunch]:
             for pane, value in read_entries(path).items()}
 
 
-def read_valid_entries(path: Path) -> dict[str, PaneLaunch]:
+def read_valid_entries(path: Path, *, record: staff.StaffSnapshot | None = None) -> dict[str, PaneLaunch]:
     """Keep usable evidence for a readout without losing a damaged entry's siblings."""
     valid: dict[str, PaneLaunch] = {}
-    required_strings = frozenset({"session_id", "written_at", "config_dir"})
+    required_strings = frozenset({"session_id", "written_at"})
+    if record is None:
+        try:
+            record = staff.local_snapshot()
+        except staff.StaffUnreadable:
+            record = staff.StaffSnapshot(())
     for pane, value in read_entries(path).items():
         try:
-            valid[pane] = _validated_launch(path, pane, value, required_strings=required_strings)
+            entry = _validated_launch(path, pane, value, required_strings=required_strings)
+            if "config_dir" in entry or record.by_member_reference(entry["session_id"]) is not None:
+                valid[pane] = entry
         except ValueError:
             continue
     return valid
@@ -171,10 +282,39 @@ class RecordedLabels:
 @contextmanager
 def locked(path: Path) -> Generator[None]:
     """Hold the lock for one retained launch file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.parent / f".{path.stem}.lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with _publication_lock(path.parent):
+        with open(path.parent / f".{path.stem}.lock", "w", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+
+_publication_directories: ContextVar[frozenset[Path]] = ContextVar("publication_directories", default=frozenset())
+
+
+@contextmanager
+def _publication_lock(directory: Path) -> Generator[None]:
+    """Serialize record access and complete an interrupted producer publication before access."""
+    directory = directory.absolute()
+    held = _publication_directories.get()
+    if directory in held:
         yield
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / ".publication.lock", "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        scope = _publication_directories.set(held | {directory})
+        try:
+            journal = directory / ".producer-publication"
+            if journal.exists():
+                pending = cast(dict[str, dict[str, PaneLaunch]], json.loads(journal.read_text(encoding="utf-8")))
+                for filename, entries in pending.items():
+                    if Path(filename).name != filename or not filename.endswith(".json"):
+                        raise ValueError("invalid producer publication recovery path")
+                    atomic_file.write_text_atomic(directory / filename, json.dumps(entries, indent=2, sort_keys=True) + "\n")
+                journal.unlink()
+            yield
+        finally:
+            _publication_directories.reset(scope)
 
 
 def without_staff_labels(entry: PaneLaunch) -> PaneLaunch:
@@ -188,24 +328,107 @@ def without_staff_labels(entry: PaneLaunch) -> PaneLaunch:
 
 def save(path: Path, entries: dict[str, PaneLaunch]) -> None:
     """Publish one retained launch file through the atomic writer."""
-    atomic_file.write_text_atomic(path, json.dumps(entries, indent=2, sort_keys=True) + "\n")
+    with _publication_lock(path.parent):
+        atomic_file.write_text_atomic(path, json.dumps(entries, indent=2, sort_keys=True) + "\n")
 
 
-def write(path: Path, launch: PaneLaunch) -> None:
+def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> None:
     """Persist pane observations with the fixed staff reference."""
     try:
-        owner = staff.initial_snapshot().by_current_session(launch["session_id"])
+        membership = staff.initial_snapshot()
+        owner = membership.by_member_reference(launch["session_id"])
     except (staff.StaffUnreadable, OSError, ValueError):
+        membership = staff.StaffSnapshot(())
         owner = None
-    if owner is not None and owner.id != launch["session_id"]:
+    if owner is not None:
         launch = launch.copy()
         launch["session_id"] = owner.id
+        _ = launch.pop("config_dir", None)
     with locked(path):
+        if owner is not None and owner.kind == "producer":
+            _publish_producer(path, launch, owner, membership, sources)
+            return
         entries = read(path)
         if entries.get(launch["pane_id"]) == launch:
             return
         entries[launch["pane_id"]] = launch
         save(path, entries)
+
+
+def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
+                      membership: staff.StaffSnapshot, sources: Sequence[Path]) -> None:
+    """Commit one proved producer binding and remove its other bindings without closing panes."""
+    paths = sorted({path.absolute(), *(source.absolute() for source in sources)})
+    if any(source.parent != path.absolute().parent for source in paths):
+        raise ValueError("producer publication paths must share the record directory")
+    records = {source: read_strict(source) for source in paths}
+    previous = [entry for entries in records.values() for entry in entries.values()
+                if membership.by_member_reference(entry["session_id"]) == owner]
+    newest = max(previous, key=lambda entry: entry["written_at"], default=None)
+    if newest is not None and newest.get("producer_binding", False):
+        if newest == launch or launch["written_at"] < newest["written_at"]:
+            return
+        if (newest["pane_id"] != launch["pane_id"] and launch["written_at"] == newest["written_at"]):
+            raise ValueError("producer publication is older than its current binding")
+    pid, generation = launch.get("pid"), launch.get("proc_start", "")
+    if not isinstance(pid, int) or isinstance(pid, bool) or not generation:
+        if previous:
+            current = records[path.absolute()].get(launch["pane_id"])
+            if current is None or current.get("producer_binding", False):
+                return
+            if membership.by_member_reference(current["session_id"]) != owner:
+                return
+        records[path.absolute()][launch["pane_id"]] = launch
+        save(path, records[path.absolute()])
+        return
+    from scripts.lib import models_registry
+
+    process_reader = cast(NativeProcessReader, cast(object, import_module("scripts.herdr.herdr")))
+    observed = process_reader.native_process(pid, agent_kind(launch))
+    if (observed.current_identity != owner.current_session or observed.started != generation
+            or observed.environment.get("HERDR_PANE_ID") != launch["pane_id"]
+            or observed.environment.get("HERDR_SESSION", "default") != path.stem):
+        raise ValueError("producer publication does not match the current process")
+    expected = launch.copy()
+    expected["session_id"] = owner.id
+    expected["kind"] = models_registry.launch_settings("producers", owner.name).kind
+    contract_path = path.parent / f".producer-start-{owner.id}"
+    if contract_path.exists():
+        contract = cast(dict[str, str], json.loads(contract_path.read_text(encoding="utf-8")))
+        if contract["member"] != owner.id or contract["session"] != owner.current_session:
+            raise ValueError("producer start expectation names another conversation")
+        expected["cwd"] = contract["folder"]
+        if contract["kind"] != agent_kind(launch):
+            raise ValueError("producer publication uses another backend")
+        variable = "CODEX_HOME" if agent_kind(launch) == "codex" else "CLAUDE_CONFIG_DIR"
+        process_home = Path(observed.environment.get(variable) or Path.home() / (".codex" if agent_kind(launch) == "codex" else ".claude"))
+        if process_home.resolve() != Path(contract["home"]).resolve():
+            raise ValueError("producer publication uses another account")
+    elif isinstance(owner.worktree, staff.PresentWorktree):
+        expected["cwd"] = str(owner.worktree.path)
+    elif newest is not None:
+        expected["cwd"] = newest["cwd"]
+    _usable_replacement(path, ResumeAttempt(launch["pane_id"], launch), launch,
+                        VerifiedResume(expected, frozenset({owner.id, owner.current_session})), same_pane=False)
+    current = process_reader.native_process(pid, agent_kind(launch))
+    if current.current_identity != observed.current_identity or current.started != generation:
+        raise ValueError("producer process changed before publication")
+    committed = launch.copy()
+    committed["producer_binding"] = True
+    updates = {source: {pane: entry for pane, entry in entries.items()
+                         if membership.by_member_reference(entry["session_id"]) != owner}
+               for source, entries in records.items()}
+    updates[path.absolute()][launch["pane_id"]] = committed
+    changed = {source: entries for source, entries in updates.items() if entries != records[source]}
+    if len(changed) > 1:
+        journal = path.parent / ".producer-publication"
+        atomic_file.write_text_atomic(journal, json.dumps({source.name: entries for source, entries in changed.items()}))
+        for source, entries in changed.items():
+            save(source, entries)
+        journal.unlink()
+    elif changed:
+        source, entries = next(iter(changed.items()))
+        save(source, entries)
 
 
 @dataclass(frozen=True)
@@ -214,6 +437,15 @@ class LaunchPublication:
 
     path: Path
     entry: PaneLaunch
+
+
+def newest_publication(directory: Path, references: Sequence[str]) -> LaunchPublication | None:
+    """Read the newest retained publication for the supplied session references."""
+    matches = [LaunchPublication(path, entry)
+               for path in sorted(directory.glob("*.json"))
+               for entry in read_strict(path).values()
+               if entry["session_id"] in references]
+    return max(matches, key=lambda publication: publication.entry["written_at"], default=None)
 
 
 @dataclass(frozen=True)
@@ -253,6 +485,10 @@ class PreparedAccountMove:
     account_environment: Mapping[str, str]
 
 
+class ResumeRecord(Enum):
+    SOURCE = "source record"
+
+
 def resume_attempt(path: Path, pane_id: str) -> ResumeAttempt:
     """Capture the exact publication before identity checks or cleanup."""
     entry = read_strict(path).get(pane_id)
@@ -261,12 +497,18 @@ def resume_attempt(path: Path, pane_id: str) -> ResumeAttempt:
 
 def _usable_replacement(path: Path, attempt: ResumeAttempt, entry: PaneLaunch,
                         proof: VerifiedResume, *, same_pane: bool) -> None:
-    required = frozenset({"pane_id", "session_id", "config_dir", "cwd", "name", "model", "written_at"})
+    required = frozenset({"pane_id", "session_id", "cwd", "name", "model", "written_at"})
     _ = _validated_launch(path, attempt.pane_id, entry, required_strings=required)
     expected = proof.expected
+    home, expected_home = config_home(entry), config_home(expected)
+    home_changed = False
+    if isinstance(home, staff.SessionHome) and isinstance(expected_home, staff.SessionHome):
+        home_changed = home.path.resolve() != expected_home.path.resolve()
+    else:
+        print(f"anomaly: {attempt.pane_id}: session home is unknown; keep the selected account", file=sys.stderr)
     if (entry["pane_id"] != attempt.pane_id or entry["session_id"] not in proof.references
             or agent_kind(entry) != agent_kind(expected)
-            or Path(entry["config_dir"]).resolve() != Path(expected["config_dir"]).resolve()
+            or home_changed
             or Path(entry["cwd"]).resolve() != Path(expected["cwd"]).resolve()
             or not entry.get("flags_read", False)
             or (not same_pane and entry.get("ended", False))):
@@ -292,23 +534,30 @@ def retire_launch(path: Path, pane_id: str, original: PaneLaunch, *,
 
 @overload
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
-                   outcome: PreparedAccountMove, *, close: Callable[[str], bool]) -> LaunchPublication: ...
+                   outcome: PreparedAccountMove, *, close: Callable[[str], bool],
+                   destination: Path | ResumeRecord = ResumeRecord.SOURCE,
+                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE) -> LaunchPublication: ...
 
 
 @overload
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
-                   outcome: VerifiedResume | FailedResume, *, close: Callable[[str], bool]) -> None: ...
+                   outcome: VerifiedResume | FailedResume, *, close: Callable[[str], bool],
+                   destination: Path | ResumeRecord = ResumeRecord.SOURCE,
+                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE) -> None: ...
 
 
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                    outcome: VerifiedResume | FailedResume | PreparedAccountMove, *,
-                   close: Callable[[str], bool]) -> LaunchPublication | None:
+                   close: Callable[[str], bool],
+                   destination: Path | ResumeRecord = ResumeRecord.SOURCE,
+                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE) -> LaunchPublication | None:
     """Keep one proved launch, or retire a failed attempt after confirmed closure.
 
     The close callback must confirm that the selected tab is closed.
     A same-pane resume keeps its pane on success and failure.
     """
-    same_pane = original["pane_id"] == attempt.pane_id
+    destination_path = destination if isinstance(destination, Path) else path
+    same_pane = path == destination_path and original["pane_id"] == attempt.pane_id
     if isinstance(outcome, PreparedAccountMove):
         if not same_pane:
             raise ValueError("an account move requires its original retained pane")
@@ -317,8 +566,9 @@ def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
             if entries.get(original["pane_id"]) != original or attempt.publication != original:
                 raise ValueError(f"{original['pane_id']}: retained launch changed before the account move")
             prepared = original.copy()
-            prepared["config_dir"] = str(outcome.config_dir)
-            prepared["environment"] = {**original["environment"], **outcome.account_environment}
+            if "config_dir" in original:
+                prepared["config_dir"] = str(outcome.config_dir)
+                prepared["environment"] = {**original["environment"], **outcome.account_environment}
             if prepared != original:
                 entries[original["pane_id"]] = prepared
                 save(path, entries)
@@ -326,33 +576,46 @@ def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
     if isinstance(outcome, FailedResume):
         if same_pane:
             return
+        committed = read(destination_path).get(attempt.pane_id)
+        if committed is not None and committed.get("producer_binding", False):
+            return
         if close(attempt.pane_id) is not True:
             return
         if not isinstance(attempt.publication, UnpublishedResume):
-            retire_launch(path, attempt.pane_id, attempt.publication,
+            retire_launch(destination_path, attempt.pane_id, attempt.publication,
                            replacement=ResumeAttempt(attempt.pane_id, UnpublishedResume()))
         return
     try:
-        with locked(path):
-            entries = read_strict(path)
+        with locked(destination_path):
+            entries = read_strict(destination_path)
             replacement = entries.get(attempt.pane_id)
             if replacement is None:
                 raise ValueError(f"{attempt.pane_id}: replacement launch was not published; would delete the only resume record")
-            _usable_replacement(path, attempt, replacement, outcome, same_pane=same_pane)
+            _usable_replacement(destination_path, attempt, replacement, outcome, same_pane=same_pane)
             if same_pane:
                 if replacement.get("ended", False):
                     replacement["ended"] = False
-                    save(path, entries)
+                    save(destination_path, entries)
                 return
-            if entries.get(original["pane_id"]) != original:
+            source = read_strict(path).get(original["pane_id"])
+            if source is None and replacement.get("producer_binding", False):
+                retained = ResumeAttempt(attempt.pane_id, replacement.copy())
+            elif source != original:
                 raise ValueError(f"{original['pane_id']}: retained launch changed before replacement")
-            retained = ResumeAttempt(attempt.pane_id, replacement.copy())
+            else:
+                retained = ResumeAttempt(attempt.pane_id, replacement.copy())
     except (OSError, ValueError):
-        finish_restore(path, original, attempt, FailedResume(), close=close)
+        committed = read(destination_path).get(attempt.pane_id)
+        if committed is None or not committed.get("producer_binding", False):
+            finish_restore(path, original, attempt, FailedResume(), close=close, destination=destination_path)
         raise
-    if close(original["pane_id"]) is not True:
+    source_close = close if isinstance(close_source, ResumeRecord) else close_source
+    if source_close(original["pane_id"]) is not True:
         return
-    retire_launch(path, original["pane_id"], original, replacement=retained)
+    if destination_path == path:
+        retire_launch(path, original["pane_id"], original, replacement=retained)
+    else:
+        retire_launch(path, original["pane_id"], original)
 
 
 @dataclass(frozen=True)
@@ -367,7 +630,7 @@ class ClaudeArguments:
 
 # Claude options used by launch commands; all consumers share this parse.
 CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--settings",
-    "--model", "--name", "-n", "--permission-mode", "--session-id", "--plugin-dir"})
+    "--model", "--name", "-n", "--effort", "--permission-mode", "--session-id", "--plugin-dir"})
 RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 
@@ -414,7 +677,7 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
                         if key in KEPT_NAMES},
         "flags_read": bool(arguments),
         "ended": False,
-        "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "written_at": datetime.now(timezone.utc).isoformat(),
     }
     if kind == "codex":
         policy: list[str] = []
@@ -428,4 +691,4 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
                 if option != "-c" or not value.startswith("projects="):
                     policy.extend((option, value))
         entry["codex_policy"] = policy
-    return entry
+    return _record_home(entry)

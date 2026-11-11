@@ -2,7 +2,7 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -98,14 +98,14 @@ class AddShowrunnerFixture(unittest.TestCase):
     def setUp(self) -> None:
         socket_for = showrunners.socket_for
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        self.staff.setUp()
         _ = self.enterContext(patch.object(showrunners, "socket_for", socket_for))
         # Account links, trust entries and timer records embed absolute paths.
         # Restore private files and symlinks at the seed's original path.
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.state = self.root / "stub"
         self.env = self.fixture_env.copy()
         self.env["STAFF_FILE"] = str(self.staff.staff_file)

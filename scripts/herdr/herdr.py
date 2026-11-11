@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, Typed
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import operation_deadline
+from scripts.lib import conf, operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -62,8 +62,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
-
-NATIVE_ID_MARKS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS, HerdrFailure, HerdrMissing
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
@@ -146,20 +145,8 @@ def _platform() -> str:
     return os.environ.get("HERDR_PLATFORM", _PLATFORM)
 
 
-class HerdrFailure(Exception):
-    """An external command failure or malformed herdr response."""
-
-    def __init__(self, message: str, code: str = "") -> None:
-        super().__init__(message)
-        self.code: str = code
-
-
 class NativeRegistryUnavailable(ValueError):
     """The process has no native registry identity."""
-
-
-class HerdrMissing(HerdrFailure):
-    """No herdr binary is available."""
 
 
 class _DarwinProcessGone(HerdrFailure):
@@ -1648,6 +1635,25 @@ class Herdr:
                 return NewTab(space["name"], title)
         return NewTab(fallback_workspace, title)
 
+    def producer_row_tab(self, row_id: str, title: str, workspace: str) -> NewTab | ExistingPane:
+        """Reuse a producer's shell only in its own tab in the configured workspace."""
+        destination = self.saved_row_tab(row_id, title, workspace)
+        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, title, workspace):
+            return destination
+        return NewTab(workspace, title)
+
+    def producer_pane(self, pane_id: str, title: str, workspace: str) -> bool:
+        """Check that the producer has one shell in its named tab and configured workspace."""
+        panes = self.listed("pane")
+        own = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
+        if own is None or not isinstance(self.pane_activity(pane_id), PaneAtShell):
+            return False
+        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == own.get("tab_id")), None)
+        return (tab is not None and tab.get("label") == title
+                and sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) == 1
+                and any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
+                        for space in self.listed("workspace")))
+
     def _retitle(self, row: dict[str, object], title: str, *, tab: bool) -> bool:
         changed = row.get("label") != title
         if changed:
@@ -1897,6 +1903,17 @@ class Herdr:
             return False
         return self._close_pane(pane) and self._pane_closed(pane, terminal)
 
+    def close_terminal_pane(self, pane: str, terminal: str) -> bool:
+        """Close the matching terminal and confirm its removal without a process check."""
+        if not terminal:
+            return False
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane):
+            return self._pane_closed(pane, terminal)
+        if row.get("terminal_id") != terminal:
+            return False
+        return self._close_pane(pane) and self._pane_closed(pane, terminal)
+
     def _pane_closed(self, pane: str, terminal: str) -> bool:
         if any(row["pane_id"] == pane or terminal and row.get("terminal_id") == terminal for row in self.panes()):
             print(f"herdr {self.session}:{pane}: closure is pending; record retained", file=sys.stderr)
@@ -1965,6 +1982,37 @@ class Herdr:
                         _ = self.run("workspace", "close", candidate.workspace_id)
                 except HerdrFailure as error:
                     print(f"herdr {self.session}: workspace {candidate.workspace_id} retained: {error}", file=sys.stderr)
+
+    def producer_admission_launch(self, pane: str, kind: Literal["claude", "codex"]) -> pane_launch.PaneLaunch:
+        """Read the native identity and launch evidence before producer admission."""
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
+                           "producer process info")
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane):
+            raise HerdrFailure("producer pane is unavailable")
+        observed = pane_native_process(info, kind, row)
+        processes = [json_object(value, "producer process")
+                     for value in json_items(info.get("foreground_processes"), "producer processes")
+                     if _is_agent_process(_foreground_arguments(json_object(value, "producer process")), kind)]
+        if len(processes) != 1:
+            raise HerdrFailure("producer has no unique foreground process")
+        process = processes[0]
+        pid = process.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise HerdrFailure("producer has no process id")
+        folder = json_text(process.get("cwd"), "producer folder")
+        if (not Path(folder).is_absolute() or observed.environment.get("HERDR_PANE_ID") != pane
+                or observed.environment.get("HERDR_SESSION", "default") != self.session):
+            raise HerdrFailure("producer process does not match its pane")
+        entry = pane_launch.launch(pane, observed.current_identity, folder, observed.environment,
+                                   _foreground_arguments(process), kind=kind)
+        entry["config_dir"] = observed.environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR") or str(
+            Path.home() / (".codex" if kind == "codex" else ".claude"))
+        entry.update(pid=pid, proc_start=observed.started)
+        current = self.native_pane_process(pane, kind, PROGRAM_TIMEOUT_SECONDS, pane_row=row)
+        if current != observed:
+            raise HerdrFailure("producer process changed before admission")
+        return entry
 
     def codex_launch(self, pane: str, arguments: Sequence[str] = ()) -> pane_launch.PaneLaunch:
         """Read one Codex launch from its exact foreground process."""
@@ -2037,7 +2085,8 @@ class Herdr:
             try:
                 entry = self.codex_launch(pane, agent_arguments)
                 entry["name"] = name
-                pane_launch.write(pane_launch.record_directory() / f"{self.session}.json", entry)
+                directory = pane_launch.record_directory()
+                pane_launch.write(directory / f"{self.session}.json", entry, sources=tuple(directory.glob("*.json")))
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues", file=sys.stderr)
         if isinstance(opening, OpeningPrompt):
@@ -2176,10 +2225,10 @@ class Herdr:
         """Return the sole foreground Codex PID, or zero for other foreground work."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
                            "pane process info")
-        if not codex_without_session(info):
+        foreground = _codex_foreground(info)
+        if len(foreground) != 1:
             return 0
-        foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-        pid = json_object(foreground[0], "native foreground process").get("pid")
+        pid = foreground[0].get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise HerdrFailure("native process pid is unavailable")
         return pid
@@ -2463,7 +2512,8 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str, *, target: str,
-               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
+               proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED,
+               on_submission: Callable[[], object] = lambda: None) -> None:
         """Send input only to the selected session."""
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
@@ -2471,6 +2521,7 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        _ = on_submission()
         self._prompt(pane, text, proof=proof)
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
@@ -2618,11 +2669,22 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
+def _codex_foreground(info: dict[str, object]) -> list[dict[str, object]]:
+    """Select a sole Codex process after excluding the turn-end hook."""
+    foreground: list[dict[str, object]] = []
+    for value in json_items(info.get("foreground_processes"), "native foreground processes"):
+        process = json_object(value, "native foreground process")
+        arguments = _foreground_arguments(process)
+        program = (arguments[1] if len(arguments) > 1 and Path(arguments[0]).name.startswith("python")
+                   else arguments[0] if arguments else "")
+        if Path(program).parts[-3:] != ("scripts", "herdr", "turn_end.py"):
+            foreground.append(process)
+    return foreground if len(foreground) == 1 and is_codex_process(_foreground_arguments(foreground[0])) else []
+
+
 def codex_without_session(info: dict[str, object]) -> bool:
     """Identify one foreground Codex that can supply a session report."""
-    foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-    return len(foreground) == 1 and is_codex_process(
-        _foreground_arguments(json_object(foreground[0], "native foreground process")))
+    return len(_codex_foreground(info)) == 1
 
 
 def pane_native_process(info: dict[str, object], kind: str,
@@ -2647,7 +2709,7 @@ def pane_native_process(info: dict[str, object], kind: str,
             observed = NativeAgentProcess(UnreportedResume(observed.identity.id), observed.started, observed.environment)
         processes.append(observed)
     if len(processes) != 1:
-        raise HerdrFailure("native registry identity is unavailable or ambiguous")
+        raise HerdrFailure(f"expected one foreground {kind} process, found {len(processes)}")
     return processes[0]
 
 
@@ -3199,7 +3261,9 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
 
 
 def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
-    """Use the showrunner workspace, then the supplied name, then the shared session."""
+    """Select the configured producer workspace or the owner's workspace."""
+    if isinstance(row, staff.StaffRow) and row.kind == "producer":
+        return conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
     while isinstance(row, staff.StaffRow):
         if row.kind == "showrunner":
             return row.name
@@ -3481,8 +3545,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
     client = Herdr(place.session)
     info = json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
                        "Codex pane process info")
-    foreground = json_items(info.get("foreground_processes"), "Codex foreground processes")
-    if codex_without_session(info) and json_object(foreground[0], "Codex foreground process").get("pid") == pid:
+    foreground = _codex_foreground(info)
+    if len(foreground) == 1 and foreground[0].get("pid") == pid:
         pane = client.pane_row(place.pane)
         if not isinstance(pane, NoPane):
             try:
@@ -4978,11 +5042,6 @@ class PreparedAgentEnvironment:
 
 
 @dataclass(frozen=True)
-class WorkerPaneEnvironment(PreparedAgentEnvironment):
-    """A worker shell ends when its agent command returns."""
-
-
-@dataclass(frozen=True)
 class NewTab:
     space: str
     title: str
@@ -5071,6 +5130,11 @@ class CodexLaunchRead(Enum):
     CURRENT = "read Codex at launch"
 
 
+def agent_alias_script(kind: str) -> str:
+    """Clear the agent alias before the shell starts the agent."""
+    return f"unalias {kind} 2>/dev/null; "
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
@@ -5122,7 +5186,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
-        script = f"unalias {kind} 2>/dev/null; "
+        script = agent_alias_script(kind)
         if isinstance(destination, ExistingPane):
             # Set the environment in the existing shell before the agent starts.
             environment = _pane_environment(prepared.env)
@@ -5136,12 +5200,6 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-        if isinstance(prepared, WorkerPaneEnvironment):
-            script += ("\nprecmd_functions=(${precmd_functions:#herdr_worker_exit}); "
-                       "preexec_functions=(${preexec_functions:#herdr_worker_start}); "
-                       "herdr_worker_exit() { exit $?; }; "
-                       "herdr_worker_start() { precmd_functions=(herdr_worker_exit $precmd_functions); }; "
-                       "preexec_functions+=(herdr_worker_start)")
         client.run_in_pane(pane, ["eval", script],
                            terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
         server_name = agent_name if isinstance(agent_name, str) else agent

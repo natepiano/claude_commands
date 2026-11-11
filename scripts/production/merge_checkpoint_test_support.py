@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.production import checkpoint_gate
+
+from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
@@ -27,6 +30,7 @@ from pathlib import Path
 from typing import IO, ClassVar, NamedTuple, cast, override
 
 from scripts.lib import process_group
+from scripts.lib.git_test_support import write_fixture_git_config
 
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
@@ -38,7 +42,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host, staff
 from scripts.message import sessions
-from scripts.herdr.herdr import NATIVE_ID_MARKS
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, production_membership, unit_membership
 
 
@@ -147,7 +151,7 @@ with open(Path(__TEST_REPOSITORY__) / "scripts/lib/package_root.py") as package_
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
-from scripts.herdr.herdr import NATIVE_ID_MARKS
+from scripts.herdr.herdr_types import NATIVE_ID_MARKS
 
 def git(*arguments):
     return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
@@ -269,6 +273,11 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        def cleanup() -> None:
+            if self.fixture_root.exists():
+                shutil.rmtree(self.fixture_root)
+
+        self.addCleanup(cleanup)
         # Git's linked worktree metadata names absolute paths. Each case gets
         # private files, refs and origin restored at the seed's original path.
         if self._testMethodName == "runTest" and self.fixture_root.exists():
@@ -276,12 +285,6 @@ class MergeCheckpointFixture(unittest.TestCase):
             # outer fixture is unused; each matrix cell restores a fresh seed.
             shutil.rmtree(self.fixture_root)
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
-
-        def cleanup() -> None:
-            if self.fixture_root.exists():
-                shutil.rmtree(self.fixture_root)
-
-        self.addCleanup(cleanup)
         self.bind_fixture(self.fixture_root)
         _ = self.enterContext(isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env))
 
@@ -297,7 +300,8 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.state = self.root / "stub-state"
         home = self.root / "home"
-        self.env = {**os.environ, "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+        self.env = {**os.environ, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+                    "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -318,9 +322,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.state.mkdir()
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("config", "maintenance.auto", "false", cwd=self.origin)
         _ = self.git("init", "-b", "main", cwd=self.checkout)
-        _ = self.git("config", "maintenance.auto", "false", cwd=self.checkout)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=self.checkout)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.checkout)
         _ = self.git("remote", "add", "origin", str(self.origin), cwd=self.checkout)
@@ -366,7 +368,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
-                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                                env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
@@ -423,7 +425,6 @@ class MergeCheckpointFixture(unittest.TestCase):
         """Push an independent main fix through the fixture's private origin."""
         writer = self.root / "main-fix-writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
-        _ = self.git("config", "maintenance.auto", "false", cwd=writer)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=writer)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
         self.write(writer, relative, content)
@@ -581,7 +582,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         return self.wait_bump_result_at(path)
 
     def wait_bump_result_at(self, path: Path) -> dict[str, object]:
-        wait_until(lambda: path.exists() and merge_checkpoint.read_record(path)["result"] in ("red", "green"), path.parent)
+        wait_until(lambda: path.exists() and checkpoint_gate.read_record(path)["result"] in ("red", "green"), path.parent)
         record = cast(dict[str, object], json.loads(path.read_text()))
         pid = cast(int, record["pid"])
         if pid:
@@ -716,7 +717,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.write(self.unit, "src/alpha.txt", message)
         _ = self.git("add", "src/alpha.txt", cwd=self.unit)
         _ = subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.unit, check=True,
-                           env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"}, timeout=TEST_HANG_GUARD_SECS)
+                           env={**self.env, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"}, timeout=TEST_HANG_GUARD_SECS)
         _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
         return self.git("rev-parse", "HEAD", cwd=self.unit)
 

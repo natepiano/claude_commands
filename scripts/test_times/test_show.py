@@ -60,6 +60,12 @@ import sys
 report = runpy.run_path(str(Path(sys.argv[1]) / 'scripts/test_times/show.py'))
 main = report['main']
 main.__globals__['TOOL_REPOSITORY'] = Path(sys.argv[2])
+report_datetime = report['datetime']
+class ReportTime(report_datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls.fromtimestamp(float(os.environ['TEST_REPORT_EPOCH']), tz)
+main.__globals__['datetime'] = ReportTime
 index = report['index']
 if sys.argv[3]:
     table = sys.argv[3]
@@ -218,8 +224,8 @@ class TestTimesTests(unittest.TestCase):
             [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
              str(self.repo), changed_table, str(child_event.fileno()),
              *(arguments or ("top", "--repo", str(self.repo)))],
-            cwd=self.root, env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            pass_fds=(child_event.fileno(),),
+            cwd=self.root, env={**os.environ, "TEST_REPORT_EPOCH": str(EPOCH + 300)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(child_event.fileno(),),
         )
         child_event.close()
         try:
@@ -256,7 +262,7 @@ class TestTimesTests(unittest.TestCase):
             errors = self.report_pipe(cast(BinaryIO, process.stderr))
             self.assertIn("tools/test_alpha.py", first)
             self.assertNotIn("tools/test_beta.py", first.split("unmeasured:")[0])
-            self.assertEqual(errors, "rows as of 11-03 09:30 EST\n")
+            self.assertEqual(errors, "rows as of 09:30 EST\n")
             self.assertIsNone(process.poll(), "The supervisor must still wait for its refresh child")
             event.sendall(b"F")
         with self.report_process() as (process, event):
@@ -516,7 +522,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
 
     def test_top_ranks_live_local_modules_by_the_first_completed_attempt_and_recent_median(self) -> None:
         for offset, wall in enumerate((100.0, 8.0, 4.0)):
-            self.write_run([module_run("test_alpha.py", wall)], epoch=EPOCH + offset * 60)
+            self.write_run([module_run("test_alpha.py", wall), type_job(wall + 10)], epoch=EPOCH + offset * 60)
         slow: TestTime = {"test": "Alpha.test_slow", "s": 1.25, "status": "pass"}
         types = type_job(3.0)
         beta_run = module_run("test_beta.py", 1.0)
@@ -527,7 +533,20 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             module_run("test_alpha.py", 0.01, attempt=3),
             beta_run, module_run("test_removed.py", 999.0), types,
         ], epoch=EPOCH + 180)
-        self.write_run([module_run("test_alpha.py", 9999.0)], host="other-host", epoch=EPOCH + 240)
+        self.write_run([module_run("test_alpha.py", 9999.0), type_job(9999.0)],
+                       host="other-host", epoch=EPOCH + 240)
+        failed_type = type_job(900.0)
+        failed_type["status"] = 1
+        restarted_type = type_job(800.0)
+        restarted_type["restart"] = "hold"
+        for type_run, epoch, aborted, checkout in (
+            (failed_type, EPOCH + 240, False, str(self.repo)),
+            (restarted_type, EPOCH + 240, False, str(self.repo)),
+            (type_job(700.0), EPOCH + 240, True, str(self.repo)),
+            (type_job(600.0), EPOCH + 300 - 7 * 86400 - 1, False, str(self.repo)),
+            (type_job(500.0), EPOCH + 240, False, str(self.root / "other")),
+        ):
+            self.write_run([type_run], epoch=epoch, aborted=aborted, checkout=checkout)
 
         output = self.report("top", "--repo", str(self.repo))
         beta = self.line(output, "tools/test_beta.py")
@@ -535,19 +554,24 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         type_line = self.line(output, "types/basedpyright")
         self.assertLess(output.index(beta), output.index(alpha))
         self.assertLess(output.index(alpha), output.index(type_line))
+        self.assertEqual(type_line, "types/basedpyright runs nightly, so it is not ranked: last run 1.500 CPU s, 3.000 s")
+        self.assertNotRegex(output, r"(?m)^\s*\d+\s+types/basedpyright\b")
         self.assertNotIn("test_removed.py", output)
         self.assertNotIn("9999", output)
         self.assertIn("Alpha.test_slow", alpha)
         numbers = [float(match.group()) for match in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", alpha)]
         self.assertEqual(numbers, [2, 2, 4, 2, 13, 1.25, 3], alpha)
-        self.assertRegex(self.line(output, "sum of median CPU"), r"3 modules; sum of median CPU 7(?:\.0+)? s")
+        self.assertRegex(self.line(output, "sum of median CPU"), r"2 modules; sum of median CPU 5\.5(?:0+)? s")
+        self.assertLess(output.index("sum of median CPU"), output.index(type_line))
+        self.assertLess(output.index(type_line), output.index("unmeasured:"))
         self.assertEqual(self.report(), output)
         limited = self.report("top", "--limit", "1", "--repo", str(self.repo))
         self.assertIn("tools/test_beta.py", limited)
         self.assertNotIn("tools/test_alpha.py", limited)
+        self.assertIn(type_line, limited)
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
         changed = self.report("top", "--repo", str(self.repo))
-        self.assertLess(changed.index("types/basedpyright"), changed.index("tools/test_alpha.py"))
+        self.assertLess(changed.index("tools/test_alpha.py"), changed.index("types/basedpyright"))
 
     def test_top_ranks_only_the_working_repository_on_the_current_host_within_the_age_limit(self) -> None:
         hana = self.repository("hana")
@@ -724,10 +748,16 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([module_run("test_alpha.py", 4.0), module_run("test_beta.py", 6.0),
                         module_run("nested/test_deep.py", 10.0, status=1)])
         output = self.report("top", "--limit", "1", "--repo", str(self.repo))
+        self.assertNotIn("types/basedpyright", output)
         self.assertEqual(self.line(output, "unmeasured:"),
                          "unmeasured: 2 live modules: tools/nested/test_deep.py, tools/test_missing.py")
-        self.write_run([module_run("nested/test_deep.py", 3.0), module_run("test_missing.py", 2.0)])
-        self.assertNotIn("unmeasured:", self.report("top", "--limit", "1", "--repo", str(self.repo)))
+        self.write_run([module_run("nested/test_deep.py", 3.0), module_run("test_missing.py", 2.0), type_job(100.0)])
+        measured = self.report("top", "--limit", "1", "--repo", str(self.repo))
+        self.assertNotIn("unmeasured:", measured)
+        self.assertEqual(self.line(measured, "types/basedpyright"),
+                         "types/basedpyright runs nightly, so it is not ranked: last run 50.000 CPU s, 100.000 s")
+        self.assertRegex(self.line(measured, "tools/test_beta.py"), r"^1\s+tools/test_beta\.py\b")
+        self.assertRegex(self.line(measured, "sum of median CPU"), r"1 modules; sum of median CPU 3(?:\.0+)? s")
 
     def test_missing_times_and_type_jobs_do_not_show_test_measurements(self) -> None:
         types = type_job(37.0)
@@ -738,8 +768,8 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertEqual(missing_line.count("times missing"), 2, missing_line)
         type_line = self.line(output, "types/basedpyright")
         self.assertNotIn("times missing", type_line)
-        self.assertEqual(self.cell(output, type_line, "tests run"), "")
-        self.assertEqual(self.cell(output, type_line, "slowest kept test"), "")
+        self.assertEqual(type_line,
+                         "types/basedpyright runs nightly, so it is not ranked: last run 18.500 CPU s, 37.000 s")
         output = self.report("module", "tools/test_missing.py")
         self.assertIn("times missing: runner ended early", output)
         type_history = self.report("module", "types/basedpyright")

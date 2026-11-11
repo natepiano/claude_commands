@@ -122,14 +122,16 @@ retry_git() {
     output=$(g "$@" 2>&1)
     result=$?
     [ "$result" != 0 ] || return 0
-    printf '%s\\n' "$output" >&2
     case "$output" in
       *"index.lock"*"File exists"*|*"File exists"*"index.lock"*)
-        [ "$retries_left" -gt 0 ] || outcome locked
+        if [ "$retries_left" -le 0 ]; then
+          printf '%s\\n' "$output" >&2
+          outcome locked
+        fi
         retries_left=$((retries_left - 1))
         sleep "$vault_lock_retry_delay_s" || outcome failed
         ;;
-      *) return "$result" ;;
+      *) printf '%s\\n' "$output" >&2; return "$result" ;;
     esac
   done
 }
@@ -187,7 +189,7 @@ def git_ok(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed:
 
 
 def mac_git(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed | MacUnreachable:
-    transport = ["-c", "core.sshCommand=" + shlex.join(["ssh", *sync.ssh_options()])]
+    transport = ["-c", "core.sshCommand=" + shlex.join(["ssh", *sync.ssh_options(sync.peer_name())])]
     result = git(*transport, *args)
     if isinstance(result, VaultCommandFailed):
         return MacUnreachable()
@@ -276,7 +278,7 @@ def pull() -> PullOutcome:
     settings = conf.read("build_targets")
     remote = (f"vault_lock_retries={settings.whole('vault.lock_retries')}\n"
               + f"vault_lock_retry_delay_s={settings.number('vault.lock_retry_delay_s')}\n" + REMOTE_PULL)
-    result = run(["ssh", *sync.ssh_options(), peer, remote], COMMAND_TIMEOUT_S)
+    result = run(["ssh", *sync.ssh_options(peer), peer, remote], COMMAND_TIMEOUT_S)
     if result is None:
         return MacUnreachable()
     outcome = remote_outcome(result)
@@ -418,7 +420,7 @@ def _vault_locked() -> int:
         outage = replace(previous, cause=cause, detail=reason) if isinstance(previous, OpenOutage) else OpenOutage(cause, now, False, reason)
         last_good = state.last_good.at if isinstance(state.last_good, LastGoodPull) else outage.since
         sleeping = isinstance(outcome, MacUnreachable) and now - last_good < UNREACHABLE_GRACE_S
-        if not outage.asked and not sleeping:
+        if isinstance(previous, OpenOutage) and not outage.asked and not sleeping:
             outage = replace(outage, asked=True)
             write_state(replace(state, outage=outage))
             if not ask_question(reason, choices, outage.since):
@@ -428,4 +430,5 @@ def _vault_locked() -> int:
             write_state(replace(state, outage=outage))
         description = "Mac unreachable; the next hour retries" if sleeping else " ".join(reason.splitlines())
         print("buildlog vault: stopped: " + description)
-        return 0 if sleeping or (outage.asked and not isinstance(outcome, VaultCommandFailed)) else 1
+        return 0 if sleeping or (not isinstance(outcome, VaultCommandFailed)
+                                 and (outage.asked or isinstance(previous, NoOutage))) else 1

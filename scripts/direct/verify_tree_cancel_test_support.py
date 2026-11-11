@@ -156,7 +156,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             "PACKAGE_ROOT": str(self.workspace), "TEST_METADATA": json.dumps(metadata),
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
-            "UNIT_TEAM_ROLE": "test", "CLAUDE_PYTHON": sys.executable,
+            "UNIT_TEAM_ROLE": "test",
             "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",
             "PYTHONDONTWRITEBYTECODE": "1", "NEXTEST_TEST_THREADS": "4",
         })

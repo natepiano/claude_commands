@@ -12,9 +12,10 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import ledger
-from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, git_only, instant
+from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, charge_readings, git_only, instant
 
 from scripts.buildlog import index, store
+from scripts.lib import conf
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
 
 
@@ -78,6 +79,12 @@ class MeasurementFixture(CostFixture):
 
     def book(self) -> ledger.CostLedger:
         return ledger.CostLedger(self.state)
+
+    def charge_fetch(self, usd: Decimal) -> mock.Mock:
+        def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
+            fee = conf.decimal(conf.read(self.settings).text('cost_explorer_read_usd'))
+            return charge_readings(start, end, usd, fee)
+        return mock.Mock(side_effect=fetch)
 
     def seed_cost(self, *, hours: int = 2, price: str = "1") -> None:
         book = self.book()

@@ -2,7 +2,7 @@
 description: Direct phases, reviews, and checkpoints.
 ---
 
-Run every worker through `bash ~/.claude/scripts/direct/assign.sh` as a background shell of the director session.
+Run every worker through `bash ~/.claude/scripts/direct/assign.sh` from the director session.
 This rule covers all roles and both Claude and Codex.
 Direct calls to worker launchers refuse with one line that names `assign.sh`.
 
@@ -98,6 +98,7 @@ it:
 | <PhaseReservationContract/>, <RetainPhaseReservation/>, <CoordinatePhaseReservation/> | `docs/direct/phase_reservation.md` | — |
 | <VerificationContract/>, <VerificationNarration/> | `docs/direct/verification.md` | — |
 | <UXReview/>, <RunApplicationSmokeTest/> | `docs/direct/ux_review.md` | — |
+| <NoWorkerMode/> | `docs/direct/no_worker_mode.md` | — |
 | <WorkerLaunchFailure/> | `docs/direct/launch_failure.md` | — |
 | <AuthorizationContract/> | `docs/direct/authorization.md` | — |
 | <HeldAstraRoles/> | `docs/direct/held_astra_roles.md` | — |
@@ -120,48 +121,44 @@ the director neither prepares style inputs nor pastes a style assignment.
 <LongLivedWorkers>
 Dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
+Use `worker.py list all` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
-The launcher closes the worker's pane when its pass completes.
-The close keeps the native conversation and staff row.
-The next assign resumes that conversation in a new pane.
-The worker command selects idle workers and resumes stopped workers in new panes.
-Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
+The worker command selects idle workers and resumes a stopped worker in its same pane.
+Use the short name from `worker.py list all` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
-The transcript records prompt submission and the matching `DONE <dispatch id>` reply.
-Only exit 0 completes a pass.
-Exit 2 means refused.
-Exit 3 means no DONE reply. Exit 5 means stalled.
-Exit 4 means the worker asks a question or is blocked.
-Read `question: <worker> pane <pane>` and the question text.
-Run `worker.py answer <name> --text "<answer>"`, then rerun the worker's saved launcher command.
+Successful prompt delivery returns the launcher.
+The transcript prevents replay and proves completion with the matching `DONE <dispatch id>` reply.
+Exit 0 means submitted. The pass stays active until the turn hook proves completion.
+The launcher returns at once. End the director turn after the assigned synchronous review.
+The hook message names the worker, phase, outcome, and reply path.
+Read that reply before the next workflow step.
+A completed pass closes its pane and keeps its staff row and native conversation.
+A live detached run keeps the pass active. Its completion uses the same receipt rule.
+A finished run with an absent transcript result permits DONE completion and adds one anomaly line.
+A pending friend reply keeps the same pass and saved launcher arguments.
+Send no recovery prompt while either result remains pending.
+For `no DONE`, request a complete result with the saved dispatch id. The next turn hook records it.
+Exit 2 means refused. Exit 4 reports a Codex question and its visible pane lines.
+Answer with `worker.py answer <name> --text "<answer>"`. Keep the same pass.
+An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 Exit 6 means busy before submission. Exit 7 means retained. Exit 8 means uncertain.
-After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
-A rerun never types a prompt that the transcript records. It reads the transcript and waits for the worker.
-So when a turn ended with no DONE line, a rerun alone returns exit 3 (`NO_DONE`) again. Recover in this order:
-1. Tell the worker to write its complete result and to end with `DONE <dispatch id>` alone on the last line.
-   Use `send.py --from <holder> --to worker:<holder>/<worker> --text "<request>"`. The launcher's prompt line in the pane holds the id.
-2. Read the worker's reply in the pane. Check the result and the DONE line.
-3. Rerun the saved launcher command with its original arguments. The command is the worker's `launcher_command` in `<run>/progress_history_state.json`.
-A worker that waits on a friend's reply also ends its turn with no DONE, so the launcher exits 3.
-When the pane shows the worker's DONE line, rerun the saved launcher command. Do not send a message.
-After all repair workers complete successfully, run `findings.py landed` if the launcher does not run it.
-Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
+A failed delivery command returns an error even when the transcript contains the prompt.
+A repeated launcher reads the receipt and returns without another prompt.
 Read-only pane reviewers post no board lines and run no suites.
 The director or a writer handles required board posts and suites.
 A pane worker has no in-turn compaction option.
 Codex keeps its own full-window limit.
 
-A worker pane closes when its agent command returns. Shutdown retains the worker's row and native conversation.
+The completion hook closes a worker pane after DONE. Shutdown retains the worker's row and native conversation.
 Restore resumes only conversations with active dispatches through `worker.py restore`. Idle workers stay closed until their next assign.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
-Account moves resume only workers with active dispatches; each move closes an idle worker's pane.
+An account move resumes an open or stopped worker on the new account in its same pane and closes no pane.
 An idle worker's next assign opens its conversation on the current role account.
-Assign, restore, and account moves resume a stopped worker in a new pane.
+A closed worker with no active dispatch has nothing to move. A worker that changes family opens a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
@@ -179,8 +176,8 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   removes each worktree it made when that work ends. In the home worktree, the
   only branch the run may create is the remote branch <PushCheckpoint/> pushes;
   never switch to an existing branch.
-- The unit director does not write implementation code unless the user explicitly
-  asks, except <FastTrack/>. Exceptions: agreed doc-only/trivial post-review fixes.
+- The unit director does not write implementation code unless the user explicitly asks.
+  Exceptions: <FastTrack/>, <NoWorkerMode/>, and agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
   <CheckpointCommit/> and one <ShrinkCommit/> per completed phase, plus the one
   <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
@@ -199,6 +196,15 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   settled by the plan. Do not expose sandbox flags, scripts, status files,
   ledger ids, or other tooling mechanics in user-facing reports.
 </CoreContract>
+
+<NoWorkerMode>
+A no-capacity broadcast turns this mode on until the workers-back notice arrives.
+A real worker launch or turn failure containing `hit your usage limit` also turns this mode on.
+That self-on mode lasts through the current phase; try a normal assign at the next phase start.
+A broadcast-on mode keeps its longer lifetime if both triggers occur.
+Send no assign while this mode is on.
+Read `~/.claude/docs/direct/no_worker_mode.md` in full when this mode turns on.
+</NoWorkerMode>
 
 <ProductionUnit>
 Your staff row identifies your unit and its parent showrunner.
@@ -287,11 +293,9 @@ Run every command under `~/.claude/scripts/direct/` with
 calls run in the foreground. Unqualified worker script names below resolve
 under that directory. This avoids half-applied durable-state writes.
 
-- Claude: launchers and `verify.sh final` use `run_in_background: true`; retain
-  the returned task handle.
-- Codex: launch the same command in a managed unified-exec terminal with
-  `tty: true` and a short initial yield; retain its returned `session_id`. Do not
-  shell-background the launcher: it waits for its worker and remains attached.
+- Run pane assignments in the foreground. They return after submission.
+- Run `verify.sh final` through its detached verification path.
+- Each folder or file you make on another machine (the Mac) needs automatic removal. Use a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`.
 - Saved run output (traces, captures, logs) stays under a few GB: read each run
   and delete it before the next. A disk-floor sweeper keeps 300 GiB free on `/`
   by deleting only the shortfall, least recently used build output first, never
@@ -302,19 +306,19 @@ under that directory. This avoids half-applied durable-state writes.
 </ToolingContract>
 
 <DispatchContract>
-Applies to every implementation, test, fix, and review launcher.
+Applies to implementation, test, fix, and review assignments.
 
-1. Launch under <ToolingContract/> and save `${DISPATCH_HANDLE}`.
-2. Tell the user in one line what is running and what happens on completion.
-3. Perform only synchronous work assigned by the call site: the main half of
-   <DualReview/> or the shrink assigned by <PhaseEnd/>. Do not inspect launcher
-   output as a substitute for that review.
-4. Claude: after assigned synchronous work, end the turn under <TurnEndGate/>,
-   naming what is running in the `— holding: waiting on <what is running>`
-   line, never its handle. A task message resumes the workflow.
-5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
-   active; its terminal result drives the next workflow step.
-6. Recover an incomplete pass under <LongLivedWorkers/> before another role's dispatch.
+1. Submit each assignment through `assign.sh` under <ToolingContract/>.
+2. Report the running work and the expected hook message.
+3. Complete the synchronous review assigned by the call site.
+4. End the director turn after submission and that review.
+5. Read the hook message and its reply file when the message resumes the director.
+6. Resolve `question` or `no DONE` under <LongLivedWorkers/> before changing the worker's role.
+
+Submission does not finish a pass or release a held role.
+The hook records completion and runs the saved completion actions.
+It receives the Codex `Stop` event from `hooks.json` and the Claude `Stop` event from the launch line.
+No launcher shell waits for a worker.
 </DispatchContract>
 
 <WorkerRuns>
@@ -549,9 +553,8 @@ phase's gates pass. Follow its order through the next turn boundary.
 <PrepareSession>
 Run `bash ~/.claude/scripts/direct/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
-creates the run-active marker; every exit must
-eventually run `end_session.sh`
-through <RunSummary/> or single-mode completion.
+records the open run in the director's staff row.
+Run `end_session.sh` through <RunSummary/> or single-mode completion for every exit.
 
 When the plan header carries a `> **Issues:**` line, mark each issue it names
 as being built:

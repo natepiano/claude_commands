@@ -34,6 +34,7 @@ from scripts.style import style_ledger
 from scripts.production import style_units
 
 from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
+from scripts.style.style_config import StyleUnitAssignment
 
 
 @final
@@ -45,6 +46,28 @@ class StylePlanTests(StylePlanFixture):
         _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
         _ = recorded_unit("sample-style", "names", self.unit, self.doc,
                           plan="docs/style-production/units/names-unit.md")
+
+    def test_combined_unit_classifies_findings_with_each_rules_family(self) -> None:
+        self.style_units((StyleUnitAssignment("names", ("names", "types")),
+                          StyleUnitAssignment("values", ("values",)),
+                          StyleUnitAssignment("modules", ("modules",))))
+        names = self.rule("split-names")
+        types = self.rule("split-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        values = self.rule("split-values", "tier: C\nfamily: values\ninput_scope: file\n")
+        self.sync()
+        _ = self.approved_decision(names, self.sources[:1], "type", name="names")
+        _ = self.approved_decision(types, self.sources[2:3], "type", name="types")
+        _ = self.approved_decision(values, self.sources[1:2], "type", name="values")
+        ledger = self.ledger()
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
+        with (mock.patch.object(style_proposals.RankedWork, "waits", return_value={}) as waits,
+              mock.patch.object(style_proposals, "ranked_below_unit", return_value=False)):
+            result = style_plan.classify_split(ledger, "names", self.doc, self.base(), unit_plans.AllCrates(),
+                                               style_plan.BusyFiles(self.board(), frozenset()), definitions,
+                                               style_ledger.GitReadCache(self.repo), "2026-10-28T12:00:00+00:00")
+
+        self.assertEqual((result.ready, result.changed, result.structure, result.other), (2, 0, 0, 0))
+        self.assertEqual({call.args[0] for call in waits.call_args_list}, {"names", "types"})
 
     def test_split_partitions_the_table_left_total_including_ticketed_and_unselected_findings(self) -> None:
         rule = self.rule("split-population")
@@ -71,16 +94,23 @@ class StylePlanTests(StylePlanFixture):
         for index, excluded in enumerate(("declined", "unanswered", "types", "waived", "unfiled", "built"), 2):
             decision = issue.with_name(excluded + ".md")
             text = issue.read_text()
+            finding_rule, finding_blob = rule, findings[0].rule_blob
             if excluded == "declined":
                 text = text.replace("plan: approved", "plan: approved\nstyle_answer: declined")
             elif excluded == "unanswered":
                 text = re.sub(r"unit: [^\n]*\n", "", text)
             elif excluded == "types":
                 _ = fixture_member("unit", name="types", parent=recorded_showrunner("sample-style", self.doc).id)
+                finding_rule = self.rule("excluded-types", "tier: C\nfamily: types\ninput_scope: file\n")
+                finding_blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == finding_rule)
                 text = text.replace(f"unit: {unit_staff_id('names')}", f"unit: {unit_staff_id('types')}")
+                text = text.replace(rule, finding_rule).replace(findings[0].rule_blob, finding_blob)
+                ledger.ticket_add("6001", ticket_owner_id("types"), "read", "types", "crates/alpha",
+                                  [paths["free"]], [finding_rule])
+                ledger.ticket_drop("6001")
             _ = decision.write_text(text)
-            finding = ledger.hold(rule, paths["free"], index, excluded, "type", "before", "after",
-                                  findings[0].rule_blob, "outside")
+            finding = ledger.hold(finding_rule, paths["free"], index, excluded, "type", "before", "after",
+                                  finding_blob, "outside")
             if excluded != "unfiled":
                 ledger.file_held(finding.finding_id, decision)
             if excluded in ("waived", "built"):
@@ -147,7 +177,8 @@ class StylePlanTests(StylePlanFixture):
     def test_relative_proposals_use_the_table_population_and_refills_exact_stored_key(self) -> None:
         rule = self.rule("split-relative-proposal")
         self.sync()
-        original = self.approved_decision(rule, self.sources[:2], "type")
+        original, _ = self.judged_findings(rule, tuple((path, 1, "pub fn value() {}") for path in self.sources[:2]))
+        self.finish_judging()
         ledger = self.ledger()
         folder = self.repo / "decisions"
         folder.mkdir()
@@ -226,7 +257,8 @@ class StylePlanTests(StylePlanFixture):
     def test_split_changes_only_refill_results_and_keeps_the_plan_and_decisions(self) -> None:
         rule = self.rule("read-only-split")
         self.sync()
-        issue = self.approved_decision(rule, self.sources[:1], "type")
+        issue, _ = self.judged_findings(rule, ((self.sources[0], 1, "pub fn value() {}"),))
+        self.finish_judging()
         ledger = self.ledger()
         findings = ledger.proposal_findings(issue)
         before_plan, before_issue = self.plan.read_bytes(), issue.read_bytes()
@@ -262,7 +294,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((self.plan.read_bytes(), issue.read_bytes()), (before_plan, before_issue))
         rendered = style_units.table([live_units.LiveUnit("names", None)], {}, doc=self.doc, now=measured_at, zone=UTC,
                                      ledger_paths={"names": ledger.database})
-        self.assertIn("| names | active | idle | idle | — | 0 | 0 | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
+        self.assertIn("| names | exited | idle | idle | — | 0 | 0 | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
 
     def test_a_scan_error_or_time_limit_keeps_the_last_split_and_reports_the_cause(self) -> None:
         _ = self.rule("failed-split")

@@ -15,9 +15,11 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, current_thread
 from types import SimpleNamespace
 from typing import Literal, cast, override
 from unittest.mock import MagicMock, patch
@@ -26,15 +28,17 @@ from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import detached_run_process, detached_runs
 from scripts.buildlog import treekey
+from scripts.build_hold import build_hold, hold_enforcer
 from scripts.direct import progress_history
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr import turn_end
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
-from scripts.production import staff, session_staff, worker_admission
+from scripts.production import staff, session_staff, test_worker, worker_admission
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
 WORKER = "unit-impl"
@@ -243,6 +247,20 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(record["command"], ["bash", "verify.sh", "check"])
         self.assertNotIn("port", record)
         self.assertIn("next message", output.getvalue())
+        records[0].unlink()
+        with contextlib.chdir(self.root), \
+             patch.object(detached_runs, "caller_from_environment", return_value=detached_runs.NotDetachedWorker()), \
+             patch.object(subprocess, "Popen", popen), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(detached_runs.main([
+                "start", "--session-dir", str(self.session.relative_to(self.root)), "--to", WORKER,
+                "--", "bash", "verify.sh", "check",
+            ]), 0)
+        arguments = cast(list[str], popen.call_args.args[0])
+        path = Path(arguments[-1])
+        self.assertTrue(path.is_absolute())
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(record["session_dir"], str(self.session))
+        self.assertTrue(Path(cast(str, record["log"])).is_absolute())
 
     def test_run_uses_the_start_folder_instead_of_the_staff_worktree(self) -> None:
         start_folder = self.root / "repair-checkout"
@@ -554,6 +572,34 @@ sys.exit(1)
         _ = another.write_text(path.read_text())
         self.assertFalse(detached_run_process.supervises(original["pid"], another))
         self.assertFalse(detached_run_process.supervises(os.getpid(), path))
+        alias = self.root / "record-alias.json"
+        alias.symlink_to(path)
+        for recorded in (alias, Path(os.path.relpath(path))):
+            with self.subTest(recorded=recorded):
+                with patch.object(detached_run_process, "process_args",
+                                  return_value=["python", "detached_runs.py", "supervise", str(recorded)]):
+                    self.assertTrue(detached_run_process.supervises(4321, path))
+        command = ["assign.py", "impl", "prompt with spaces"]
+        for arguments, matches in ((["python", "/fixture/assign.py", *command[1:]], True),
+                                   ([], False),
+                                   (["python", "/fixture/other.py", *command[1:]], False),
+                                   (["python", "/fixture/assign.py", "review", command[2]], False)):
+            with self.subTest(arguments=arguments):
+                with patch.object(detached_run_process, "process_args", return_value=arguments):
+                    self.assertEqual(detached_run_process.runs_command(4321, command), matches)
+        for argument in ("prompt with spaces", "prompt  with  spaces"):
+            with self.subTest(argument=argument):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python /fixture/assign.py impl {argument}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
+        record = self.root / "run folder/r1.json"
+        for tail, matches in (("", True), (" backup.json", False)):
+            with self.subTest(tail=tail):
+                output = subprocess.CompletedProcess(["ps"], 0, f"python detached_runs.py supervise {record}{tail}\n", "")
+                with (patch.object(Path, "exists", return_value=False),
+                      patch.object(subprocess, "run", return_value=output)):
+                    self.assertEqual(detached_run_process.supervises(4321, record), matches)
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])
@@ -584,7 +630,7 @@ sys.exit(1)
                 prefix = detached_runs.scope_prefix(marker, on)
                 self.assertEqual(detached_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
         self.assertEqual(prefix[:2], ["systemd-run", "--user"])
-        self.assertIn("--slice=builds.slice", prefix)
+        self.assertIn("--slice=builds-detached.slice", prefix)
         self.assertEqual(prefix[-4:], ["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(marker)])
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
@@ -612,12 +658,176 @@ sys.exit(1)
         self.assertEqual(record.get("exit_code"), 4)
         done = self.root / "done.txt"
         _ = done.write_text("Stage 2: go", encoding="utf-8")
+        reason = "stopped for service deploy; run again after the release"
+        (session_staff.inbox_path(self.worker_id)).unlink()
+        path = self.record([
+            sys.executable, "-c",
+            "import json, sys; from pathlib import Path; path = Path(sys.argv[1]); "
+            + "record = json.loads(path.read_text()); record['stop_reason'] = sys.argv[2]; "
+            + "path.write_text(json.dumps(record)); raise SystemExit(143)",
+            str(self.session / detached_runs.DETACHED_RUNS_DIR / "r1.json"), reason,
+        ], done=str(done))
+        record = self.supervise(path)
+        message, = cast(list[str], self.pending()["messages"])
+        self.assertIn("Result: FAIL (exit 143)", message)
+        self.assertIn(reason, message)
+        self.assertEqual(record.get("stop_reason"), reason)
         (session_staff.inbox_path(self.worker_id)).unlink()
         record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(1)"], done=str(done)))
         self.assertEqual(self.pending(), {})
         self.assertIn("nothing delivered", record.get("delivery", ""))
         _ = self.supervise(self.record([sys.executable, "-c", "pass"], done=str(done)))
         self.assertEqual(self.pending()["messages"], ["Stage 2: go"])
+
+    def test_stop_reason_after_supervisor_completion_preserves_the_saved_result(self) -> None:
+        path = self.record([sys.executable, "-c", "raise SystemExit(4)"])
+        writer_progress, writer_finished = Event(), Event()
+        guard = LauncherHangGuard("stop reason after supervisor completion")
+        reason = "stopped for service deploy; run again after the release"
+        flock = fcntl.flock
+        completed = cast(dict[str, object], json.loads(path.read_text()))
+        completed.update(status="finished", exit_code=4, finished_at="2026-11-10T21:00:00+00:00", delivery="fixture")
+
+        def observe_lock(descriptor: int, operation: int) -> None:
+            if current_thread().name.startswith("stop-reason"):
+                writer_progress.set()
+            flock(descriptor, operation)
+
+        def save_reason() -> None:
+            try:
+                self.assertTrue(detached_runs.stop_with_reason(
+                    path, reason, still_current=lambda: True, signal_run=lambda: None))
+            finally:
+                writer_finished.set()
+                writer_progress.set()
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stop-reason") as executor:
+            with detached_runs.record_lock(path), patch.object(fcntl, "flock", side_effect=observe_lock):
+                writer = executor.submit(save_reason)
+                self.assertTrue(writer_progress.wait(timeout=guard.remaining()))
+                self.assertFalse(writer_finished.is_set())
+                self.assertFalse(writer.done())
+                write_text_atomic(path, json.dumps(completed))
+                self.assertFalse(writer_finished.is_set())
+            writer.result(timeout=guard.remaining())
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(saved["status"], "finished")
+        self.assertEqual(saved["stop_reason"], reason)
+        for field in ("exit_code", "finished_at", "delivery"):
+            with self.subTest(field=field):
+                self.assertEqual(saved[field], completed[field])
+
+    def test_cancelled_stop_reason_is_absent_from_the_delivered_result(self) -> None:
+        reason = "stopped for service deploy; run again after the release"
+        record_lock = detached_runs.record_lock
+        for timing in ("before publication", "during recheck"):
+            with self.subTest(cancellation=timing):
+                session_staff.inbox_path(self.worker_id).unlink(missing_ok=True)
+                path = self.record([sys.executable, "-c", "pass"])
+                cancelled = Event()
+                if timing == "before publication":
+                    self.assertTrue(detached_runs.stop_with_reason(
+                        path, reason, still_current=lambda: True, signal_run=lambda: None))
+
+                    @contextlib.contextmanager
+                    def cancel_before_save(path: Path) -> Generator[None]:
+                        if not cancelled.is_set():
+                            cancelled.set()
+                            self.assertFalse(detached_runs.stop_with_reason(
+                                path, reason, still_current=lambda: False,
+                                signal_run=lambda: self.fail("a cancelled stop must not signal")))
+                        with record_lock(path):
+                            yield
+
+                    with patch.object(detached_runs, "record_lock", side_effect=cancel_before_save):
+                        record = self.supervise(path)
+                else:
+                    done = self.root / "done.txt"
+                    _ = done.write_text("Result: PASS (exit 0)\nStage 2: go")
+                    self.update_record(path, done_message_file=str(done))
+                    proc = self.root / "proc"
+                    for pid, parent, start in ((100, 1, "1000"), (10, 100, "2000")):
+                        directory = proc / str(pid)
+                        directory.mkdir(parents=True)
+                        _ = (directory / "stat").write_text(
+                            f"{pid} (gate) S {parent} " + "0 " * 17 + start)
+                    supervisor = build_hold.AuditProcess(
+                        build_hold.ProcessIdentity(100, "1000"), 1, "python3",
+                        ("python3", "detached_runs.py", "supervise", str(path)), str(self.root), {}, False)
+                    gate = build_hold.AuditProcess(
+                        build_hold.ProcessIdentity(10, "2000"), 100, "bash",
+                        ("bash", "verify.sh", "check"), str(self.root), {}, False)
+                    holder = build_hold.Holder("holder", datetime.now(timezone.utc), "service deploy",
+                                               build_hold.UnknownReleaseEta(), "holder")
+                    run = hold_enforcer.WaitingRun(gate, build_hold.NoOwningSession())
+                    guard = LauncherHangGuard("cancelled stop blocks supervisor publication")
+                    rechecking, supervisor_record_section = Event(), Event()
+                    write_attempted, supervisor_blocked = Event(), Event()
+                    flock = fcntl.flock
+                    read_start = build_hold.process_start_time
+                    checks = 0
+
+                    @contextlib.contextmanager
+                    def observe_record_lock(path: Path) -> Generator[None]:
+                        if current_thread().name.startswith("supervisor-race"):
+                            supervisor_record_section.set()
+                        with record_lock(path):
+                            yield
+
+                    def observe_flock(descriptor: int, operation: int) -> None:
+                        if (current_thread().name.startswith("supervisor-race")
+                                and supervisor_record_section.is_set()):
+                            try:
+                                flock(descriptor, operation | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                supervisor_blocked.set()
+                                write_attempted.set()
+                                flock(descriptor, operation)
+                            else:
+                                write_attempted.set()
+                        else:
+                            flock(descriptor, operation)
+
+                    def reuse_at_recheck(pid: int, proc_root: Path = build_hold.PROC_ROOT) -> str:
+                        nonlocal checks
+                        if pid == 10:
+                            checks += 1
+                            if checks == 2:
+                                rechecking.set()
+                                self.assertTrue(write_attempted.wait(timeout=guard.remaining()))
+                                self.assertTrue(supervisor_blocked.is_set(), "the drain must hold the record lock")
+                                _ = (proc / "10/stat").write_text("10 (reused) S 100 " + "0 " * 17 + "3000")
+                                cancelled.set()
+                        return read_start(pid, proc_root)
+
+                    def supervise_at_recheck() -> detached_runs.RunRecord:
+                        self.assertTrue(rechecking.wait(timeout=guard.remaining()))
+                        return self.supervise(path)
+
+                    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="supervisor-race") as executor, \
+                         patch.object(detached_runs, "record_lock", side_effect=observe_record_lock), \
+                         patch.object(fcntl, "flock", side_effect=observe_flock), \
+                         patch.object(build_hold, "process_start_time", side_effect=reuse_at_recheck), \
+                         patch.object(hold_enforcer, "record_build"), patch.object(hold_enforcer, "set_stop_status"), \
+                         patch.object(detached_runs, "_run", return_value=0):
+                        publication = executor.submit(supervise_at_recheck)
+                        try:
+                            result = hold_enforcer.stop_waiting_run(
+                                run, holder, {10: gate, 100: supervisor}, proc,
+                                supervisor_args=lambda pid, proc_root: supervisor.argv,
+                                signal_process=lambda pid, signum: self.fail("a cancelled stop must not signal"),
+                                signal_group=lambda pid, signum: self.fail("a cancelled stop must not signal"))
+                            self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
+                        finally:
+                            rechecking.set()
+                        record = publication.result(timeout=guard.remaining())
+                message, = cast(list[str], self.pending()["messages"])
+                self.assertTrue(cancelled.is_set())
+                self.assertIn("Result: PASS (exit 0)", message)
+                self.assertNotIn(reason, message)
+                self.assertNotIn("stop_reason", record)
+                if timing == "during recheck":
+                    self.assertIn("Stage 2: go", message)
 
     def test_a_superseded_run_delivers_a_result_that_is_not_a_failure(self) -> None:
         done = self.root / "done.txt"
@@ -729,9 +939,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                              for line in path.read_text().splitlines()) + "\n")
         self.run_dir.mkdir()
         write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
-        marker = unit_runs.marker(self.fixture.parent.current_session)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(marker, str(self.run_dir) + "\n")
+        _ = staff.set_run(self.fixture.parent.id, staff.OpenRun(self.run_dir))
         server_run = self.fixture.world.run
 
         def input_line(*arguments: str, deadline: float = math.inf) -> str:
@@ -815,8 +1023,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         other_run = self.fixture.root / "other-run"
         other_run.mkdir()
         write_text_atomic(other_run / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": self.fixture.parent.id}))
-        # The run root's marker names the parent's current run among its two runs.
-        write_text_atomic(unit_runs.marker(self.fixture.parent.current_session, self.fixture.root / "active"), str(self.run_dir) + "\n")
+        # The staff row names the current run.
+        _ = staff.set_run(self.fixture.parent.id, staff.OpenRun(self.run_dir))
         runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         for requested_run in (self.run_dir, other_run):
             with self.subTest(session_dir=requested_run):
@@ -842,9 +1050,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
         _ = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
                                 director_run=True)
         self.fixture.world.add(self.fixture.worker("test", family="codex"), "w1:p3", family="codex")
-        cases = (("detached-command-owner", "w1:p1", False), ("test2", "w1:p2", False),
-                 ("implicit-command-owner", "w1:p4", True))
-        for name, pane, implicit in cases:
+        cases = (("detached-command-owner", "w1:p1", False, False), ("test2", "w1:p2", False, False),
+                 ("implicit-command-owner", "w1:p4", True, False), ("completed-owner", "w1:p5", False, True))
+        for name, pane, implicit, completed in cases:
             with self.subTest(name=name, implicit=implicit):
                 row = self.fixture.worker(name, family="codex")
                 self.fixture.world.add(row, pane, family="codex")
@@ -887,6 +1095,24 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
                 self.assertEqual(active.instance_id, dispatch_id)
+                if completed:
+                    agent = test_worker.DispatchAgent(self.fixture)
+                    agent.pane_commands(self)
+                    line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
+                    reply = self.fixture.root / "finished-reply.txt"
+                    progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
+                        progress_history.DispatchDelivery(line, dispatch_id, str(reply)))
+                    agent.append(pane, "user", line)
+                    agent.append(pane, "assistant", "The command is complete.\nDONE " + dispatch_id)
+                    self.fixture.world.locations[pane]["agent_status"] = "done"
+                    with patch.object(subprocess, "run", side_effect=agent.run), patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
+                        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+                    self.assertTrue(reply.read_text().endswith(f"DONE {dispatch_id}\n"))
+                    self.assertEqual(len(agent.notices), 1)
+                    self.assertIn("phase 40: done", agent.notices[0])
+                    self.assertIn(f"; pass {dispatch_id}", agent.notices[0])
+                    self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_native_caller_ignores_inherited_session_and_run(self) -> None:
         row = self.fixture.worker(family="claude")
@@ -928,6 +1154,41 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.notices), 1)
         self.assertIn("FAIL (exit 9)", self.notices[0][1])
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+
+    def test_a_failed_completion_event_keeps_other_orphans_and_retries_next_pass(self) -> None:
+        row = self.fixture.worker(family="codex")
+        records = [self.record(row, name) for name in ("first-result", "second-result")]
+        for record in records:
+            record["pid"] = DEAD_PID
+            record["command"] = ["echo", record["run_id"]]
+            write_text_atomic(Path(record["log"]).with_suffix(".json"), json.dumps(record))
+        complete = turn_end.run_finished
+        calls: list[str] = []
+
+        def fail_once(thread: str) -> None:
+            calls.append(thread)
+            if len(calls) == 1:
+                raise ValueError("director unavailable")
+            complete(thread)
+
+        with patch.object(turn_end, "run_finished", side_effect=fail_once), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), ["first-result", "second-result"])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(errors.getvalue().count("anomaly:"), 1)
+            self.assertIn("director unavailable", errors.getvalue())
+            with patch.object(detached_run_process, "supervises", return_value=True) as supervises:
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                self.assertEqual(len(calls), 2)
+                supervises.assert_called_once_with(DEAD_PID, Path(records[0]["log"]).with_suffix(".json"))
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertEqual(len(calls), 3)
+        self.assertEqual(len(self.notices), 2)
+        for record in records:
+            finished = cast(dict[str, object], json.loads(Path(record["log"]).with_suffix(".json").read_text()))
+            self.assertEqual(finished["status"], "finished")
+            self.assertFalse(finished["completion_pending"])
 
     def test_delayed_transcript_publication_retypes_without_a_receipt(self) -> None:
         row = self.fixture.worker(family="codex")

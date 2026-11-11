@@ -35,8 +35,8 @@ class VerifyVerbTests(VerifyLintCacheFixture):
         ])
         self.assertEqual([line.split()[0] for line in flags.splitlines()], [
             "--test", "--name", "--check", "--saved", "--tree",
-            "--filter", "--features", "--no-cache", "--target", "--mac",
-            "--local", "--session-dir",
+            "--filter", "--run-ignored", "--features", "--no-cache",
+            "--target", "--mac", "--local", "--session-dir",
         ])
 
     def test_each_command_has_separate_help(self) -> None:

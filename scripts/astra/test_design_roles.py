@@ -11,7 +11,6 @@ from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
 
-import ast
 import io
 import json
 import os
@@ -29,8 +28,8 @@ from unittest.mock import patch
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.lib.code_kind import is_test_code  # noqa: E402
-from scripts.astra import astra_work, design_roles  # noqa: E402
+from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
+from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
@@ -53,37 +52,6 @@ def setUpModule() -> None:
     install_signal_pid_guard()
 
 
-class LiveDesignRoleNamesTests(unittest.TestCase):
-    def test_live_modules_do_not_import_the_retired_package_or_read_its_environment(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        violations: list[str] = []
-        for path in sorted((root / "scripts").rglob("*")):
-            if not path.is_file() or is_test_code(path) or path.suffix not in (".py", ".sh"):
-                continue
-            relative = path.relative_to(root).as_posix()
-            text = path.read_text(encoding="utf-8")
-            if path.suffix == ".sh":
-                violations.extend(f"{relative}:{number}: {line.strip()}"
-                                  for number, line in enumerate(text.splitlines(), 1)
-                                  if "GUILD_" in line or "scripts.guilds" in line)
-                continue
-            for node in ast.walk(ast.parse(text, filename=relative)):
-                imports: tuple[str, ...] = ()
-                if isinstance(node, ast.Import):
-                    imports = tuple(alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom):
-                    imports = (node.module or "",)
-                    if node.module == "scripts":
-                        imports += tuple("scripts." + alias.name for alias in node.names)
-                if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                        name == "scripts.guilds" or name.startswith("scripts.guilds.") for name in imports):
-                    violations.append(f"{relative}:{node.lineno}: retired package import")
-                if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    if "GUILD_" in node.value or "scripts.guilds" in node.value:
-                        violations.append(f"{relative}:{node.lineno}: retired name in a runtime string")
-        self.assertEqual(violations, [], "\n".join(violations))
-
-
 @final
 class HeldRolePaneTests(HeldRolePaneCase):
 
@@ -99,6 +67,30 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(len(self.panes.world.launches), 1)
         self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
         self.assertEqual(self.panes.world.launch_directories, [worktree])
+
+    def test_submitted_held_review_keeps_the_phase_open_until_the_hook_completes(self) -> None:
+        design = self.panes.open("reviewer", bound=False)
+        directory = design_roles.design_directory(design.placement.design_id)
+        self.panes.command_case.agent.finish_after = 1
+        submitted = design_roles.resume(design.placement.design_id + "/reviewer", self.panes.command_case.prompt)
+        self.assertIsInstance(submitted, design_roles.SubmittedRoleTurn)
+        self.assertEqual(submitted.run, directory)
+        self.assertFalse(submitted.reply.exists())
+        self.assertFalse(progress_history.reply_completed(submitted.run, submitted.reply))
+        self.assertEqual(recorder_state.read_open_phase_ids(directory), ["astra-review"])
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(astra_review.read_review(submitted.reply, submitted.run), 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("not completed", errors.getvalue())
+        pane = self.panes.command_case.agent.submitted[-1][0]
+        self.panes.command_case.agent.complete(pane)
+        self.panes.finish(design, "reviewer")
+        self.assertEqual(recorder_state.read_open_phase_ids(directory), [], self.panes.command_case.agent.notices)
+        self.assertTrue(progress_history.reply_completed(submitted.run, submitted.reply))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(astra_review.read_review(submitted.reply, submitted.run), 0)
+        self.assertIn("The work is complete.", output.getvalue())
+        self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
 
     def test_rebind_without_context_does_not_report_unrelated_hold_damage(self) -> None:
         design = self.panes.open("designer")
@@ -134,10 +126,40 @@ class HeldRolePaneTests(HeldRolePaneCase):
                     reply = self.panes.resume(reopened, role)
                     self.assertIn("The work is complete.", reply.read_text())
                     ended = design_roles.end(design.placement.design_id + "/" + role)
+                    if bound:
+                        self.assertEqual(self.panes.recorder_commands, [])
                 self.assertIsInstance(next(item for item in ended.roles if item.role == role).lifecycle,
                                       design_roles.RoleEnded)
                 self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
                 self.assertEqual(staff.snapshot().find(kind="worker"), [])
+
+    def test_durable_dispatch_records_both_astra_policies_through_the_recorder(self) -> None:
+        from scripts.direct import progress_history
+
+        for role in ("designer", "reviewer"):
+            with self.subTest(role=role):
+                design = self.panes.open(role)
+                instance = next(item for item in design.roles if item.role == role)
+                assert isinstance(instance.lifecycle, design_roles.RoleOpen)
+                row = staff.by_id(instance.lifecycle.staff_id)
+                assert row is not None
+                member_id = row.id
+                command = self.panes.assign
+
+                def assigned(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+                    self.assertEqual(staff.by_id(member_id), row)
+                    return command(arguments)
+
+                with (patch.object(design_roles, "_assign_command", side_effect=assigned),
+                      patch.object(progress_history, "begin_dispatch", wraps=progress_history.begin_dispatch) as dispatch,
+                      patch.object(staff, "set_worker_role", wraps=staff.set_worker_role) as writer):
+                    _ = self.panes.resume(design, role)
+                dispatch.assert_called_once()
+                self.assertEqual(dispatch.call_args.kwargs["role"], "astra-" + role)
+                writer.assert_not_called()
+                saved = staff.by_id(row.id)
+                assert saved is not None
+                self.assertEqual(saved.role, staff.KnownWorkerRole(cast(staff.WorkerRole, "astra-" + role)))
 
     def test_held_designer_dispatches_through_worker_and_keeps_one_identity(self) -> None:
         design = self.panes.open("designer")
@@ -146,13 +168,12 @@ class HeldRolePaneTests(HeldRolePaneCase):
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
             self.fail("designer did not publish its worker")
         before = staff.by_id(instance.lifecycle.staff_id)
+        assert before is not None
         first = self.panes.resume(design, "designer")
         second = self.panes.resume(design, "designer")
         self.assertIn("The work is complete.", first.read_text())
         self.assertIn("The work is complete.", second.read_text())
-        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), before)
-        if before is None:
-            self.fail("designer row is unavailable")
+        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), replace(before, role=staff.KnownWorkerRole("astra-designer")))
         self.assertEqual(self.panes.world.requests[-1][1][:2], ["resume", str(before.current_session)])
         first_pane, second_pane = [submission[0] for submission in self.panes.command_case.agent.submitted]
         self.assertNotEqual(first_pane, second_pane)
@@ -180,10 +201,25 @@ class HeldRolePaneTests(HeldRolePaneCase):
                 patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": str(parent.current_session)}):
             self.panes.world.add(parent, "w1:p-showrunner")
             design = self.panes.open("reviewer", bound=False)
+            directory = design_roles.design_directory(design.placement.design_id)
+            open_during_turn: list[list[str]] = []
+            self.panes.command_case.agent.during_prompt = lambda: open_during_turn.append(
+                recorder_state.read_open_phase_ids(directory))
             reply = self.panes.resume(design, "reviewer")
             first_row = self.panes.command_case.agent.row(self.panes.command_case.agent.submitted[-1][0])
+            self.assertEqual(recorder_state.read_open_phase_ids(directory), [])
             second_reply = self.panes.resume(design, "reviewer")
-        self.assertEqual([command[0] for command in self.panes.recorder_commands], ["start-run", "start-phase"])
+            self.assertEqual(recorder_state.read_open_phase_ids(directory), [])
+        self.assertEqual(open_during_turn, [["astra-review"], ["astra-review"]])
+        self.assertEqual([command[0] for command in self.panes.recorder_commands],
+                         ["start-run", "start-phase", "finish-phase", "start-phase", "finish-phase"])
+        state = worker_lifecycle.read_worker_state(directory / "progress_history_state.json")
+        history = Path(cast(str, state["history_file"]))
+        events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([event["status"] for event in events if event["event_type"] == "phase_finished"],
+                         ["completed", "completed"])
+        self.assertEqual(sum(event["event_type"] == "run_started" for event in events), 1)
+        self.assertNotIn("status", state)
         self.assertIn("The work is complete.", second_reply.read_text())
         instance = design.roles[1]
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
@@ -206,10 +242,39 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(self.panes.command_case.agent.row(first_pane), row)
         self.assertEqual(self.panes.command_case.agent.row(second_pane), row)
         self.assertEqual(len(self.panes.world.launches), 2)
+        with stop_once(design_roles, "_recorder_command", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.end(design.placement.design_id + "/reviewer")
+        self.assertNotIn("status", worker_lifecycle.read_worker_state(directory / "progress_history_state.json"))
         ended = design_roles.end(design.placement.design_id + "/reviewer")
         self.assertIsInstance(ended.roles[1].lifecycle, design_roles.RoleEnded)
         self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
         self.assertEqual(len(self.panes.world.closed), 2)
+        finished = worker_lifecycle.read_worker_state(directory / "progress_history_state.json")
+        self.assertEqual(finished["status"], "completed")
+        events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([event["status"] for event in events if event["event_type"] == "run_finished"],
+                         ["completed"])
+        saved_history = history.read_bytes()
+        _ = design_roles.end(design.placement.design_id + "/reviewer")
+        self.assertEqual(history.read_bytes(), saved_history)
+        self.assertEqual(worker_lifecycle.read_worker_state(directory / "progress_history_state.json"), finished)
+
+    def test_refused_unbound_review_closes_its_phase_without_a_hook(self) -> None:
+        design = self.panes.open("reviewer", bound=False)
+        directory = design_roles.design_directory(design.placement.design_id)
+        refusal = subprocess.CompletedProcess(["assign.sh"], 2, "", "fixture refuses before submission")
+        with patch.object(design_roles, "_assign_command", return_value=refusal), \
+                self.assertRaisesRegex(design_roles.RoleRefused, "fixture refuses before submission"):
+            _ = self.panes.resume(design, "reviewer")
+        self.assertEqual(self.panes.command_case.agent.submitted, [])
+        self.assertEqual(recorder_state.read_open_phase_ids(directory), [])
+        state = worker_lifecycle.read_worker_state(directory / "progress_history_state.json")
+        self.assertNotIn("status", state)
+        history = Path(cast(str, state["history_file"]))
+        events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([event["status"] for event in events if event["event_type"] == "phase_finished"], ["error"])
+        self.assertEqual([command[0] for command in self.panes.recorder_commands],
+                         ["start-run", "start-phase", "finish-phase"])
 
     def test_astra_open_rerun_after_split_reuses_the_same_terminal(self) -> None:
         self.panes.world.interrupt = "split"
@@ -272,6 +337,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
             self.fail("designer did not publish its worker")
         row = staff.by_id(instance.lifecycle.staff_id)
+        assert row is not None
         self.panes.world.reads.clear()
         launches = len(self.panes.world.launches)
         before_prompt: list[tuple[str, ...]] = []
@@ -285,8 +351,9 @@ class HeldRolePaneTests(HeldRolePaneCase):
             "--cwd", str(self.panes.root),
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.panes.finish(design, "designer")
         self.assertIn("The work is complete.", reply.read_text())
-        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), row)
+        self.assertEqual(staff.by_id(instance.lifecycle.staff_id), replace(row, role=staff.KnownWorkerRole("astra-designer")))
         self.assertEqual(len(self.panes.world.launches), launches)
         self.assertEqual(sum(request[:2] == ("agent", "list") for request in before_prompt), 1)
         inventory = next(index for index, request in enumerate(before_prompt) if request[:2] == ("agent", "list"))
@@ -510,7 +577,7 @@ class DurableRolesTests(HeldRolePaneCase):
                 raise TimeoutError("creation acknowledgement lost")
         return result
 
-    def dispatch(self, design: design_roles.HeldDesign, role: Role, prompt: Path, reply: Path) -> None:
+    def dispatch(self, design: design_roles.HeldDesign, role: Role, prompt: Path, reply: Path) -> design_roles.SubmittedRoleTurn:
         lifecycle = self.instance(design, role).lifecycle
         self.assertIsInstance(lifecycle, (design_roles.RoleOpen, design_roles.RolePausedForMove))
         thread = cast(design_roles.RoleOpen, lifecycle).thread_id
@@ -518,6 +585,8 @@ class DurableRolesTests(HeldRolePaneCase):
         if self.fail_dispatch:
             raise design_roles.RoleRefused("turn acceptance unknown")
         write_text_atomic(reply, "Saved reply from " + thread)
+        run = Path(design.binding.run_directory) if isinstance(design.binding, design_roles.DesignBoundToPhase) else design_roles.design_directory(design.placement.design_id)
+        return design_roles.SubmittedRoleTurn(reply, run)
 
     def open_designer(self, *, document: str = "design.md", request_id: str = "open-one") -> design_roles.HeldDesign:
         return design_roles.open_role("fixture-repo", document, "designer", "design", binding=self.binding(self.run_a), request_id=request_id)
@@ -525,7 +594,7 @@ class DurableRolesTests(HeldRolePaneCase):
     def resume(self, design: design_roles.HeldDesign, role: Role, text: str = "Revise with cited evidence.") -> Path:
         prompt = self.root / "assignment.md"
         _ = prompt.write_text(text)
-        return design_roles.resume(design.placement.design_id + "/" + role, prompt)
+        return design_roles.resume(design.placement.design_id + "/" + role, prompt).reply
 
     def pane_start(self) -> PaneWorld:
         return self.panes.world
@@ -638,7 +707,7 @@ class DurableRolesTests(HeldRolePaneCase):
         row = worker_admission.find_worker(staff.snapshot(), parent.id, self.instance(saved, "designer").name)
         assert row is not None
         _ = world.foreground.pop("w1:p1")
-        with patch.object(world, "close_tab_confirmed", return_value=False):
+        with patch.object(world, "close_terminal_pane", return_value=False):
             with self.assertRaisesRegex(design_roles.RoleRefused, "pane close is incomplete"):
                 _ = design_roles.end(path.parent.name + "/designer")
         self.assertEqual(design_roles.read_design(path.parent.name), saved)
@@ -683,7 +752,7 @@ class DurableRolesTests(HeldRolePaneCase):
         transition = design_roles.design_directory(identifier) / "transition.json"
         lifecycle = self.instance(design, "designer").lifecycle
         assert isinstance(lifecycle, design_roles.RoleOpen)
-        with patch.object(world, "close_tab_confirmed", return_value=False):
+        with patch.object(world, "close_terminal_pane", return_value=False):
             with self.assertRaisesRegex(design_roles.RoleRefused, "pane close is incomplete"):
                 _ = design_roles.end(identifier + "/designer")
         self.assertTrue(transition.exists())
@@ -1429,9 +1498,9 @@ class DurableRolesTests(HeldRolePaneCase):
         during_turn: list[design_roles.PendingMessage] = []
 
         def dispatch_with_message(current: design_roles.HeldDesign, role: Role, prompt: Path,
-                                  reply: Path) -> None:
+                                  reply: Path) -> design_roles.SubmittedRoleTurn:
             during_turn.append(design_roles.queue_message(design.placement.design_id, role, "peer", "Later evidence."))
-            self.dispatch(current, role, prompt, reply)
+            return self.dispatch(current, role, prompt, reply)
 
         with patch.object(design_roles, "dispatch_turn", side_effect=dispatch_with_message):
             _ = self.resume(design, "designer")
@@ -1849,19 +1918,16 @@ class DurableRolesTests(HeldRolePaneCase):
                                                  "host": "natedev"}), authority_before)
 
 
-    def test_end_retry_requires_proof_that_the_original_turn_is_no_longer_live(self) -> None:
+    def test_end_closes_the_worker_while_its_agent_status_is_working(self) -> None:
         design = self.open_designer()
         instance_id = design.placement.design_id + "/designer"
         self.panes.world.locations["w1:p1"]["agent_status"] = "working"
-        with self.assertRaisesRegex(design_roles.RoleRefused, "agent state is working"):
-            _ = design_roles.end(instance_id)
-        self.assertEqual(design_roles.read_design(design.placement.design_id), design)
-        self.assertTrue((self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").exists())
-        _ = self.panes.world.foreground.pop("w1:p1")
         ended = design_roles.end(instance_id)
         self.assertEqual(self.instance(ended, "designer").lifecycle,
                          design_roles.RoleEnded(staff.StaffId("9309c903-5894-501a-8aa7-f33ea912e074")))
         self.assertFalse((self.root / "holds/9309c903-5894-501a-8aa7-f33ea912e074.json").exists())
+        self.assertEqual(self.panes.world.closed, [("w1:p1", "terminal-w1:p1")])
+        self.assertEqual(design_roles.end(instance_id), ended)
 
 
     def test_showrunner_notifier_target_requires_a_live_local_session(self) -> None:

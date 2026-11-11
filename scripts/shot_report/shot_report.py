@@ -235,7 +235,7 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
         with output_path.open("wb") as output:
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac", command],
+                    ["ssh", "-o", "BatchMode=yes", "mac", command],
                     input=json.dumps(prior).encode(), stdout=output, stderr=subprocess.PIPE,
                     timeout=MAC_SSH_TIMEOUT_SECONDS, check=False,
                 )

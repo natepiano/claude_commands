@@ -56,7 +56,6 @@ from scripts.build_queue.admission_records import (
     BasisNotRecorded,
     BehindHead,
     BetweenStepsSlot,
-    CIKeepAside,
     CallerRun,
     CapNotRecorded,
     CapUnavailable,
@@ -148,7 +147,7 @@ from scripts.build_queue.admission_records import (
     SettledPriority,
     ShapeFallback,
     ShapeLargest,
-    ShapeP90,
+    ShapeRankedPeak,
     StartBasis,
     StartSpacing,
     StartSpacingWait,
@@ -460,9 +459,6 @@ def head_override_event(action: Literal["set", "admitted", "lapsed"], override: 
                           reserve, override["why"], override["set_by"], at)
 
 
-NO_CI_KEEP_ASIDE = CIKeepAside()
-
-
 def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
     return (not waiter.get("build_history_current", True) or now - waiter.get("estimated_at", now) >= (policy.timing.fresh_test_seconds
                  if waiter.get("fresh_test", False) else policy.timing.estimate_refresh_seconds))
@@ -593,6 +589,7 @@ class UsableAdmissionConfiguration:
     cloud_gate_slots: int
     cloud_gate_stale_pushes: int
     progress_profile_rank: int
+    peak_history_share_percent: int
 
 
 @dataclass(frozen=True)
@@ -608,17 +605,17 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             cloud_gate_slots = settings.whole("cloud_gate_slots")
             cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
             progress_profile_rank = settings.whole("progress_profile_rank")
+            peak_history_share_percent = settings.whole("peak_history_share_percent")
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
-            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank)
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
 
 def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory],
                 policy: AdmissionPolicy, *,
-                ci_keep_aside: CIKeepAside = NO_CI_KEEP_ASIDE,
                 ci_use: int = 0) -> MemoryRoom | ReadingUnavailable:
     """Calculate room once from swap-backed use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
@@ -628,20 +625,13 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
                   max(0, run.need - run.use.bytes) + run.held
                   if isinstance(run.use, AnonymousRunUse) else run.need + run.held) for run in runs)
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
-    kept = sum(run.bytes for run in holds) + ci_keep_aside.bytes
+    kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
                                  else max(0, used + ci_use + host.available - safety))
     return MemoryRoom(host.available, safety, used, kept,
                       host.available - safety - kept, cap, holds, total=host.total,
-                      ci_keep_aside=ci_keep_aside, ci_use=ci_use)
-
-
-def ci_keep_aside(readings: Iterable[StepMemory], margin: int) -> CIKeepAside:
-    """Keep one margin for a CI job with readable slice evidence."""
-    running = any(isinstance(reading, UnownedSliceMemory)
-                  and isinstance(reading.job_state, RunningServiceJob) for reading in readings)
-    return CIKeepAside(margin if running else 0)
+                      ci_use=ci_use)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -678,9 +668,10 @@ def _need_record(basis: NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPha
             if isinstance(basis.factor, DevSizeHeadroom):
                 factor["margin_bytes"] = basis.factor.margin_bytes
             break
-    kind = "shape_p90" if isinstance(basis, ShapeP90) else "shape_largest"
-    return {"kind": kind, "runs": basis.runs,
-            "floor": floor, "factor": factor, "cap": cap}
+    if isinstance(basis, ShapeRankedPeak):
+        return {"kind": "shape_ranked_peak", "runs": basis.runs, "share_percent": basis.share_percent,
+                "floor": floor, "factor": factor, "cap": cap}
+    return {"kind": "shape_largest", "runs": basis.runs, "floor": floor, "factor": factor, "cap": cap}
 
 
 def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPhaseNeed:
@@ -689,6 +680,10 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     row = cast(dict[str, object], raw)
     kind = row.get("kind")
+    if kind == "shape_p90":
+        # Phase 33: older shape estimates always used a ten-percent share.
+        row = {**row, "kind": "shape_ranked_peak", "share_percent": 10}
+        kind = "shape_ranked_peak"
     if kind == "no_test_phase_need" and row.get("reason") in ("no_width", "no_history", "not_recorded"):
         return NoTestPhaseNeed(cast(Literal["no_width", "no_history", "not_recorded"], row["reason"]))
     if kind == "test_phase_need":
@@ -704,7 +699,7 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     if kind in ("measured", "buildlog", "pooled", "fallback"):
         return kind
-    if kind not in ("shape_p90", "shape_largest", "shape_fallback"):
+    if kind not in ("shape_ranked_peak", "shape_largest", "shape_fallback"):
         return BasisNotRecorded()
     try:
         cap_row = cast(dict[str, object], row["cap"])
@@ -762,8 +757,10 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         runs = row["runs"]
         if not isinstance(runs, int) or runs < 0:
             return BasisNotRecorded()
-        if kind == "shape_p90" and runs >= 10:
-            return ShapeP90(runs, floor, factor, cap)
+        if kind == "shape_ranked_peak" and runs >= 10:
+            share_percent = row["share_percent"]
+            if type(share_percent) is int and 0 <= share_percent <= 50:
+                return ShapeRankedPeak(runs, share_percent, floor, factor, cap)
         if kind == "shape_largest" and 1 <= runs < 10:
             return ShapeLargest(runs, floor, factor, cap)
     except (KeyError, TypeError, ValueError):
@@ -790,8 +787,10 @@ def read_test_phase_need(raw: object) -> TestPhaseNeed | NoTestPhaseNeed:
 
 
 def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
-                             row: Mapping[str, object], host: str, now: datetime, margin: float) -> TestPhaseNeed | NoTestPhaseNeed:
-    """Choose narrow-family history at the closest usable width; read no external state."""
+                             row: Mapping[str, object], host: str, now: datetime, margin: float, *,
+                             share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE
+                             ) -> TestPhaseNeed | NoTestPhaseNeed:
+    """Choose narrow-family history at the closest usable width."""
     recorded = row.get("test_threads")
     width = recorded.threads if isinstance(recorded, RequestedTestWidth) else recorded
     if type(width) is not int or width <= 0:
@@ -828,7 +827,7 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
     else:
         recorded_width, form = max(by_width), "scaled_up"
     peaks = by_width[recorded_width]
-    need = step_estimator.percentile(peaks)
+    need = progress.ranked_peak(peaks, 1, share_percent=share_percent)
     if form == "scaled_up":
         need = (need * width + recorded_width - 1) // recorded_width
     return TestPhaseNeed(max(FILTERED_FLOOR, need), len(peaks), width, recorded_width, form, margin)
@@ -836,12 +835,14 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
 
 def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path, *,
                     history_path: Path | None = None,
-                    config: MemoryConfig
+                    config: MemoryConfig,
+                    share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE
                     ) -> TestPhaseNeed | NoTestPhaseNeed:
     """Freeze the history need and margin when the reservation need is written."""
     try:
         path = history_path if history_path is not None else root / "admission/anon_peaks.jsonl"
-        return test_phase_need_from_rows(step_estimator.anonymous_history_rows(path), row, host, now, config.test_phase_margin)
+        return test_phase_need_from_rows(step_estimator.anonymous_history_rows(path), row, host, now, config.test_phase_margin,
+                                         share_percent=share_percent)
     except OSError:
         return NoTestPhaseNeed("no_history")
 
@@ -1831,7 +1832,7 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
     need = full_need
     if isinstance(window, progress.WindowPeak):
         basis = read_need_basis(row.get("queue_waiter", {}).get("need_basis"))
-        need = step_estimator.shape_headroom_bytes(window.bytes, basis.factor) if isinstance(basis, (ShapeP90, ShapeLargest)) else window.bytes
+        need = step_estimator.shape_headroom_bytes(window.bytes, basis.factor) if isinstance(basis, (ShapeRankedPeak, ShapeLargest)) else window.bytes
         if row["step"] == "nextest" and isinstance(reading.peak_history, TestPhaseStarted):
             phase = reading.peak_history
             if isinstance(counter, progress.ProgressCounter) and counter.phase == "test:1":
@@ -1865,8 +1866,7 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     ci_use = sum(reading.bytes for reading in readings
                  if isinstance(reading, UnownedSliceMemory)
                  and not isinstance(reading.job_state, NotServiceSlice))
-    return memory_room(inputs.host, run_memories(inputs), policy,
-        ci_keep_aside=ci_keep_aside(readings, policy.ci_memory_margin_bytes), ci_use=ci_use)
+    return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
@@ -2603,6 +2603,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
         result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), owner=ci_memory_slice, diagnostic=ci_group.reason))
     children.extend(group for group in ci_groups if group not in children)
     for child in children:
+        if child.name == "builds-detached.slice":
+            continue
         required = child in ci_groups
         if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue

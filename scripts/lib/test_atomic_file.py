@@ -247,19 +247,29 @@ class AtomicFileTests(unittest.TestCase):
             self.assertEqual(list(path.parent.glob(".note.txt.*")), [])
 
     def test_new_file_after_interrupted_publish_uses_the_default_permissions(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "report"
-            previous = os.umask(0o027)
-            try:
-                with patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("stopped")):
-                    with self.assertRaises(OSError):
+        for binary in (False, True):
+            with self.subTest(binary=binary), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "report"
+
+                def publish() -> None:
+                    if binary:
+                        atomic_file.write_bytes_atomic(path, b"complete report")
+                    else:
                         write_text_atomic(path, "complete report")
-                self.assertFalse(path.exists())
-                write_text_atomic(path, "complete report")
-                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
-                self.assertEqual(path.read_text(), "complete report")
-            finally:
-                _ = os.umask(previous)
+
+                previous = os.umask(0o027)
+                try:
+                    with patch.object(os, "umask", wraps=os.umask) as umask:
+                        with patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("stopped")):
+                            with self.assertRaises(OSError):
+                                publish()
+                        self.assertFalse(path.exists())
+                        publish()
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+                        self.assertEqual(path.read_text(), "complete report")
+                        umask.assert_not_called()
+                finally:
+                    _ = os.umask(previous)
 
     def test_replacing_a_file_keeps_its_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

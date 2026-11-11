@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.production import session_staff, staff
 from scripts.usage import collect, outcomes, weights
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib.user_zone import user_zone_name
 from scripts.usage.rollouts import parse_timestamp
 

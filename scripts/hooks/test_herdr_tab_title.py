@@ -13,11 +13,12 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.lib import names
+from scripts.herdr import herdr_types
 from scripts.lib.test_names import fixture_names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.hooks import herdr_tab_title  # noqa: E402
@@ -62,7 +63,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertTrue(tab)
         self.retitled.append((pane, title))
         if self.fault:
-            raise herdr.HerdrFailure("server gone")
+            raise herdr_types.HerdrFailure("server gone")
         return True
 
     def record(self, pid: int, session_id: str, name: str, entrypoint: str = "cli", *, proc_start: str = "") -> None:

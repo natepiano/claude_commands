@@ -50,12 +50,11 @@ while IFS= read -r worker; do
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_reply"*
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_agent"*.log
   )
-done < <("${SCRIPT_DIR}/../lib/py" - "${SESSION_DIR}" "${SCRIPT_DIR}/../.." <<'PYTHON'
+done < <("${SCRIPT_DIR}/../lib/py" - "${SESSION_DIR}" <<'PYTHON'
 import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(sys.argv[2]).resolve()))
 from scripts.direct import progress_history
 from scripts.production import staff, worker_admission
 

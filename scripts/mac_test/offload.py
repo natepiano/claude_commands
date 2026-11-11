@@ -10,7 +10,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 import fcntl
 import json
@@ -26,19 +26,26 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from types import FrameType
-from typing import Literal, NewType, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
-from scripts.mac_test import cargo_manifest
+from scripts.mac_test import cargo_manifest, claim_state
+from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
-from scripts.copies import copies
+from scripts.lib import copy_record
+
+if TYPE_CHECKING:
+    from scripts.copies import copies
 from scripts.direct import result_environment
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import repository, store
+from scripts.buildlog import sync as buildlog_sync
 from scripts.build_targets import target_config
 from scripts.lib import build_folders
 
@@ -297,6 +304,8 @@ class MacClaimFromWait:
     """A live local process owns the reservation for transfer."""
 
     owner_pid: int
+    identity: claim_state.ClaimIdentity
+    submitting_session: claim_state.SubmittingSession
 
 
 @dataclass(frozen=True)
@@ -313,6 +322,7 @@ class AttemptEvidence:
     cleanup: Literal["confirmed", "unconfirmed"] = "unconfirmed"
     unresolved_count: int | UnresolvedLeftoverCount = UnresolvedLeftoverCount()
     evidence_at: float = 0.0
+    traffic: buildlog_sync.TransferLedger = field(default_factory=buildlog_sync.TransferLedger)
 
 
 MacOffloadResult = (
@@ -396,6 +406,14 @@ class OffloadConfig:
         return float(self.values["fetch_limit_mib"])
 
     @property
+    def abandoned_session_minutes(self) -> int:
+        return int(self.values["abandoned_session_minutes"])
+
+    @property
+    def mirror_busy_backoff_s(self) -> float:
+        return float(self.values["mirror_busy_backoff_s"])
+
+    @property
     def fetch_retention_days(self) -> float:
         return float(self.values["fetch_retention_days"])
 
@@ -436,7 +454,7 @@ class OffloadRequest:
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
     environment: tuple[tuple[str, str], ...] = ()
     fetch: FetchFolder | NoFetch = NO_FETCH
-    repository_scope: copies.RepositoryScope = copies.ALL_REPOSITORIES
+    repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
 
     @property
@@ -555,7 +573,7 @@ class IdleProcess:
 class RunningProcess:
     """The child process currently owned by the runner."""
 
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[str] | subprocess.Popen[bytes]
 
 
 class NoClaimInterrupt:
@@ -649,6 +667,11 @@ class MissingMacStatus:
 
 
 @dataclass(frozen=True)
+class MirrorUseBusy:
+    """The mirror lease refused the command before the runner started."""
+
+
+@dataclass(frozen=True)
 class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
@@ -658,7 +681,7 @@ class InterruptedTargetStatus:
     generation: str
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch
+RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch | MirrorUseBusy
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -730,6 +753,10 @@ class CliArguments(argparse.Namespace):
         self.verb: MacVerb = "nextest"
         self.kind: str = ""
         self.claim_owner_pid: int = 0
+        self.claim_id: str = ""
+        self.episode: str = ""
+        self.attempt: str = ""
+        self.claim_session: str = ""
         self.environment: list[str] = []
         self.fetch: str | None = None
 
@@ -741,6 +768,7 @@ class ProcessController:
         self.active: ActiveProcess = IDLE_PROCESS
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
         self.copy_failure_detail: str = ""
+        self.claim_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
 
     def stop(self) -> None:
         active = self.active
@@ -781,7 +809,10 @@ class ProcessController:
                 attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
             else:
                 stdout, stderr = process.communicate()
-                attempt.answer = read_claim_answer(CommandOutput(process.returncode, stdout, stderr))
+                answer = CommandOutput(process.returncode, stdout, stderr)
+                attempt.answer = read_claim_answer(answer)
+                if answer.status in (0, 13):
+                    self.claim_identity = claim_state.reply_claim_identity(stdout)
         finally:
             self.active = IDLE_PROCESS
 
@@ -790,12 +821,13 @@ class ProcessController:
         arguments: Sequence[str],
         deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
     ) -> CapturedCommandResult:
+        if arguments[0] == "rsync":
+            arguments = [*arguments[:2], "--stats", *arguments[2:]]
         try:
             process = subprocess.Popen(
                 arguments,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
             )
         except OSError:
             return COMMAND_COULD_NOT_START
@@ -810,11 +842,30 @@ class ProcessController:
                 stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
-                _, _ = process.communicate()
+                stdout, stderr = process.communicate()
+                self.observe_command(arguments, stdout, stderr)
+                if arguments[0] in ("ssh", "rsync"):
+                    self.attempt_evidence.traffic.transfers[-1]["complete"] = False
                 return COMMAND_TIMED_OUT
-            return CommandOutput(process.returncode, stdout, stderr)
+            self.observe_command(arguments, stdout, stderr)
+            return CommandOutput(process.returncode,
+                stdout.decode().replace("\r\n", "\n").replace("\r", "\n"),
+                stderr.decode().replace("\r\n", "\n").replace("\r", "\n"))
         finally:
             self.active = IDLE_PROCESS
+
+    def observe_command(self, arguments: Sequence[str], stdout: bytes, stderr: bytes) -> None:
+        if arguments[0] not in ("ssh", "rsync"):
+            return
+        if arguments[0] == "ssh":
+            operation = "ssh_control"
+        elif any(word.startswith("--files-from=") for word in arguments):
+            operation = "rsync_scripts"
+        elif ":" in arguments[-2]:
+            operation = "rsync_fetch"
+        else:
+            operation = "rsync_source"
+        self.attempt_evidence.traffic.observe_bytes(operation, list(arguments), stdout, stderr)
 
     def capture_copy(
         self, arguments: Sequence[str], deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
@@ -836,8 +887,6 @@ class ProcessController:
                 arguments,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
             )
         except OSError:
             return MISSING_MAC_STATUS
@@ -846,16 +895,28 @@ class ProcessController:
             process.kill()
             _ = process.wait()
             return MISSING_MAC_STATUS
-        output = cast(TextIO, raw_output)
+        output = cast(BinaryIO | TextIO, raw_output)
         self.active = RunningProcess(process)
         status: RemoteRunStatus = MISSING_MAC_STATUS
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         mismatch = ""
+        mirror_refused = False
         build_target_directory = ""
+        received_bytes = 0
+        finished_output = False
         try:
-            for line in output:
+            for raw_line in output:
+                if isinstance(raw_line, bytes):
+                    received_bytes += len(raw_line)
+                    line = raw_line.decode()
+                else:
+                    received_bytes += len(raw_line.encode("utf-8"))
+                    line = raw_line
+                line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                if mirror_busy_refusal(marker):
+                    mirror_refused = True
                 if marker.startswith("build_target_directory="):
                     build_target_directory = marker.removeprefix("build_target_directory=")
                     continue
@@ -889,6 +950,9 @@ class ProcessController:
                         print(line, end="", flush=True)
                     cleanup = CleanupUnconfirmed()
                     continue
+                if marker.startswith("mac_trim="):
+                    print(line, end="", flush=True)
+                    continue
                 if marker.startswith("mac_cleanup="):
                     cleanup = parse_cleanup(marker.removeprefix("mac_cleanup="))
                     continue
@@ -898,14 +962,21 @@ class ProcessController:
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
+            finished_output = True
             exit_status = process.wait()
         finally:
             self.active = IDLE_PROCESS
             output.close()
+            if arguments[0] == "ssh":
+                self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
+                    "sent_bytes": len(arguments[-1].encode("utf-8")),
+                    "received_bytes": received_bytes, "complete": finished_output})
         if mismatch and not isinstance(status, (ReportedMacStatus, InterruptedTargetStatus)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
+        if mirror_refused:
+            return MirrorUseBusy()
         if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
@@ -982,6 +1053,8 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
     config = conf.read(settings)
     values = config.values()
+    values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
+    values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
         enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
                  else config.text("offload") == "on"),
@@ -996,13 +1069,11 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
 
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
-    from scripts.lint import sweep
-
-    name = sweep.repo_name(str(repo_root))
-    common = sweep.git_common_dir(str(repo_root))
+    name = repository.repo_name(str(repo_root))
+    common = repository.git_common_dir(str(repo_root))
     if name is None or common is None:
         return UNKNOWN_REPOSITORY
-    source = Path(sweep.source_git_dir(common))
+    source = Path(repository.source_git_dir(common))
     if not (source / "config").is_file():
         return KnownRepository(name)
     key = repository.repository_key(str(source.parent))
@@ -1108,6 +1179,29 @@ def backoff_path(target: str = "mac") -> Path:
     return state_directory(target) / "unreachable_until"
 
 
+def mirror_busy_path(repository: str, target: str = "mac") -> Path:
+    """Keep one refusal time for each target and repository."""
+    return state_directory(target) / f"mirror-busy-{quote(repository, safe='')}.until"
+
+
+def read_mirror_busy(now: float, repository: str, target: str = "mac") -> BackoffState:
+    try:
+        until = float(mirror_busy_path(repository, target).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return NO_BACKOFF
+    return ACTIVE_BACKOFF if math.isfinite(until) and until > now else NO_BACKOFF
+
+
+def write_mirror_busy(config: OffloadConfig, repository: str, target: str) -> None:
+    path = mirror_busy_path(repository, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, f"{time.time() + config.mirror_busy_backoff_s:.6f}\n")
+
+
+def mirror_busy_refusal(detail: str) -> bool:
+    return re.search(r"\bcopies: [^\n]+: busy; held by session ", detail) is not None
+
+
 @dataclass(frozen=True)
 class FailedProbe:
     """The target's last completed probe failed."""
@@ -1201,6 +1295,8 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    from scripts.copies import copies
+
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
@@ -1234,6 +1330,11 @@ def parse_probe(output: str) -> ProbeResult:
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
+    identity = (claim_state.ClaimIdentity(uuid.uuid4().hex, request.call_id, uuid.uuid4().hex)
+                if isinstance(request.admission, UnclaimedMacRun) else request.admission.identity)
+    session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
+               else claim_state.session_id(request.admission.submitting_session))
+    identity_words = ["--claim-id", identity.claim_id, "--episode", identity.episode, "--attempt", identity.attempt]
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
                if isinstance(request.admission, MacClaimFromWait) else [])
@@ -1250,6 +1351,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--remote",
         config.host,
         *copy_words,
+        *identity_words,
+        "--identity", "--session", session,
         *selection,
         *handoff,
         *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
@@ -1257,16 +1360,29 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
 
 
 def release_claim(controller: ProcessController, target: str = "") -> None:
-    _ = controller.capture(
+    identity = controller.claim_identity
+    if isinstance(identity, claim_state.NoClaimIdentity):
+        return
+    result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
             str(Path(__file__).with_name("mac_test.py")),
             "release",
             "--pid",
             str(os.getpid()),
+            "--claim-id", identity.claim_id,
+            "--episode", identity.episode,
+            "--attempt", identity.attempt,
             *(["--target", target] if target else []),
         ]
     )
+    if isinstance(result, CommandOutput):
+        if result.status == 0:
+            controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
+        for line in result.stdout.splitlines():
+            if line.startswith("copy_bytes="):
+                transfers = cast(list[buildlog_sync.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
+                controller.attempt_evidence.traffic.transfers.extend(transfers)
 
 
 def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
@@ -1276,6 +1392,8 @@ def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
     if slots and (len(slots) != 1 or not slots[0].isascii() or not slots[0].isdecimal() or int(slots[0]) < 1):
         return MacClaimNotConfirmed("state", result.stdout, result.stderr)
     slot = int(slots[0]) if slots else 1
+    if result.status in (0, 13) and isinstance(claim_state.reply_claim_identity(result.stdout), claim_state.NoClaimIdentity):
+        return MacClaimNotConfirmed("state", result.stdout, result.stderr)
     if result.status == 0:
         return FreshMacClaim(slot)
     if result.status == 13:
@@ -1393,6 +1511,8 @@ def linux_version_declined_recently(target: str, repository_name: str, hold_s: f
 
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     root = Path(__file__).resolve().parents[2]
     listing = controller.capture_copy(["git", "-C", str(root), "ls-files", "-z", "scripts", "config"])
@@ -1419,7 +1539,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
-        result = controller.capture_copy(["rsync", "-rlpc", f"--files-from={manifest.name}",
+        result = controller.capture_copy(["rsync", copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", f"--files-from={manifest.name}",
                                      "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
@@ -1627,6 +1747,8 @@ def copy_tree(
     request: OffloadRequest,
     repository: KnownRepository,
 ) -> bool:
+    from scripts.copies import copies
+
     controller.copy_failure_detail = ""
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
@@ -1687,6 +1809,46 @@ def expected_instance_generation(target: str) -> str:
     return instance_generation(state_directory(target))
 
 
+def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
+    """Trim the mirror budget before the run releases its lease."""
+    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
+        return "echo mac_cleanup=skipped"
+    budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    program = (
+        'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
+        'config = conf.read("lint"); '
+        'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
+        'config.number(sweep.RECENT_KEY)))'
+    )
+    floor = shlex.quote(f"{config.free_floor_gib:g}")
+    return (
+        f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
+        + 'trim_started=$(date +%s); '
+        + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
+        + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
+        + 'trim_status=0; else trim_status=$?; fi; '
+        + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
+        + f'if trim_size=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + 'trim_size=${trim_size%%[[:space:]]*}; '
+        + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
+        + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
+        + 'else over_budget=unknown; fi; '
+        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
+        + '"$trim_status" "$trim_elapsed" "$over_budget"; '
+        + 'if free_gib=$(df -g "$HOME"); then '
+        + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
+        + 'else free_gib=; fi; '
+        + f'if awk -v free="$free_gib" -v floor={floor} '
+        + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
+        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
+        + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+        + f'if rm -rf -- "$HOME"/{target}; then '
+        + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
+        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+    )
+
+
 def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
@@ -1717,32 +1879,22 @@ def remote_test_command(
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
     repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
+    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
-    elif any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
-        cleanup_command = "echo mac_cleanup=skipped"
     else:
-        target = shlex.quote(mirror_target(repository, request.target, request.slot))
-        floor = shlex.quote(f"{config.free_floor_gib:g}")
-        cleanup_command = (
-            'if free_gib=$(df -g "$HOME"); then '
-            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-            + 'else free_gib=; fi; '
-            + f'if awk -v free="$free_gib" -v floor={floor} '
-            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
-            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + f'if rm -rf -- "$HOME"/{target}; then '
-            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
-        )
+        cleanup_command = remote_cleanup_command(config, request, repository)
+    abandoned_sessions = ""
+    if not custom_target:
+        abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     clear_environment = clear_environment + " && " if clear_environment else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -1846,7 +1998,7 @@ def fetch_folder(
         landing = partial / folder.value
         landing.mkdir(parents=True)
         copied = controller.capture([
-            "rsync", "-rlp", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
+            "rsync", "-rlp", "--compress", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
             f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/{folder.value}/", f"{landing}/",
         ])
         if not isinstance(copied, CommandOutput) or copied.status != 0:
@@ -1948,8 +2100,9 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownR
                    target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
     """End and count one mirror's work without exposing the check to a second signal."""
     try:
+        arguments = ["ssh", *ssh_options(config), host, leftover_check_script(repository, target, slot)]
         result = subprocess.run(
-            ["ssh", *ssh_options(config), host, leftover_check_script(repository, target, slot)],
+            arguments,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1961,6 +2114,9 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownR
         return LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s")
     except OSError:
         return LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)")
+    ledger = buildlog_sync.active_transfers.get()
+    if isinstance(ledger, buildlog_sync.TransferLedger):
+        ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
         if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
             from scripts.mac_test import linux_runner
@@ -2045,6 +2201,8 @@ def claimed_run(
     repository: KnownRepository,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     release_allowed = True
     sync_after_release = False
     evidence = controller.attempt_evidence
@@ -2113,6 +2271,7 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        mirror_busy_path(repository.name, request.target).unlink(missing_ok=True)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
             if request.copy
@@ -2130,6 +2289,10 @@ def claimed_run(
                                           remote_test_command(config, request, repository, copied.tree_key)),
             ]
         )
+        if isinstance(remote_status, MirrorUseBusy):
+            release_allowed = True
+            write_mirror_busy(config, repository.name, request.target)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
             remote_status = MISSING_MAC_STATUS
         if not isinstance(remote_status, ReportedMacStatus):
@@ -2150,6 +2313,14 @@ def claimed_run(
         if not linux:
             linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
+        if not linux and isinstance(request.fetch, FetchFolder):
+            cleanup = controller.stream_mac_run([
+                *ssh_prefix(config),
+                copies.remote_use_command(request_mirror(config, request, repository),
+                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
+            ])
+            remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
+                                                          else CleanupUnconfirmed()))
         seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
@@ -2185,8 +2356,8 @@ def claimed_run(
         if release_allowed:
             release_claim(controller, request.target)
             if sync_after_release:
-                from scripts.buildlog import sync as buildlog_sync
-                buildlog_sync.sync_target(request.target)
+                with buildlog_sync.measure_transfers(evidence.traffic):
+                    buildlog_sync.sync_target(request.target)
 
 
 @dataclass(frozen=True)
@@ -2301,6 +2472,8 @@ def run_offload(
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
+    from scripts.copies import copies
+
     eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
     if isinstance(eligibility, IneligibleMacStep):
         return declined(eligibility.reason, started)
@@ -2334,12 +2507,17 @@ def run_offload(
                 except copies.BusyRemoteMirror:
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
-            return leased_offload(controller, config, request, repository, started, linux, leases)
+            result = leased_offload(controller, config, request, repository, started, linux, leases)
+            if isinstance(result, DeclinedMacRun) and result.reason == "copy" and mirror_busy_refusal(result.detail):
+                write_mirror_busy(config, repository.name, request.target)
+            return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
 
 
 def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> copies.RemoteMirror:
+    from scripts.copies import copies
+
     scope = request.repository_scope
     if isinstance(scope, copies.AllRepositories):
         scope = copies.SelectedRepository(repository.name)
@@ -2352,6 +2530,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                    repository: KnownRepository, started: float, linux: bool,
                    leases: dict[int, ExitStack]) -> MacOffloadResult:
     if not leases:
+        write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     claim = claim_for_run(controller, config, request, repository, tuple(leases))
     # A transferred reservation can be adopted only once.
@@ -2437,6 +2616,8 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--filter-run", action="store_true")
     _ = run.add_argument("--copy", action="store_true")
     _ = run.add_argument("--claim-owner-pid", type=int, default=0)
+    for field in ("claim-id", "episode", "attempt", "claim-session"):
+        _ = run.add_argument("--" + field, default="")
     _ = run.add_argument("--result")
     _ = run.add_argument("--env", dest="environment", action="append", default=[])
     _ = run.add_argument("--fetch")
@@ -2455,6 +2636,9 @@ def holder_session() -> str:
 
 
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
+    from scripts.build_hold.build_hold import NoOwningSession, OwningSession
+    from scripts.copies import copies
+
     words = arguments.nextest_words
     if words[:1] == ["--"]:
         words = words[1:]
@@ -2479,7 +2663,11 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         target=arguments.target,
         environment=tuple((name, os.environ[name]) for name in arguments.environment),
         fetch=FetchFolder(arguments.fetch.removesuffix("/")) if arguments.fetch is not None else NO_FETCH,
-        admission=MacClaimFromWait(arguments.claim_owner_pid) if arguments.claim_owner_pid else UnclaimedMacRun(),
+        admission=MacClaimFromWait(
+            arguments.claim_owner_pid,
+            claim_state.ClaimIdentity(arguments.claim_id, arguments.episode, arguments.attempt),
+            OwningSession(arguments.claim_session) if arguments.claim_session else NoOwningSession(),
+        ) if arguments.claim_owner_pid else UnclaimedMacRun(),
     )
 
 
@@ -2496,6 +2684,11 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     """Append each attempt independently of the final verify call target."""
     from scripts.buildlog import record
 
+    class MeasuredSshAttempt(record.SshAttempt):
+        transfers: list[buildlog_sync.TransferBytes]
+        sent_bytes: int
+        received_bytes: int
+
     if not request.target:
         return
     repository = repository_identity(request.repo_root)
@@ -2507,7 +2700,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                if isinstance(result, (FailedOnMac, FailedOnTarget)) else "lost"
                if isinstance(result, (LostMacRun, InterruptedTargetRun)) else "no_tests"
                if isinstance(result, NoTestMatchedOnMac) else "declined")
-    attempt: record.SshAttempt = {
+    attempt: MeasuredSshAttempt = {
         "call_id": request.call_id, "target": request.target,
         "repo_identity": (repository.key if isinstance(repository, KnownRepository) and repository.key
                           else store.UNKNOWN_IDENTITY),
@@ -2516,6 +2709,9 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         "outcome": outcome, "completion": evidence.completion, "cleanup": evidence.cleanup,
         "unresolved_count": evidence.unresolved_count if isinstance(evidence.unresolved_count, int) else None,
         "evidence_at": evidence.evidence_at or time.time(),
+        "transfers": evidence.traffic.transfers,
+        "sent_bytes": sum(transfer["sent_bytes"] for transfer in evidence.traffic.transfers),
+        "received_bytes": sum(transfer["received_bytes"] for transfer in evidence.traffic.transfers),
     }
     if isinstance(result, LostMacRun):
         attempt["reason"] = result.detail
@@ -2546,22 +2742,24 @@ def main() -> int:
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
     settings = arguments.settings
-    if not settings and arguments.target:
-        settings = str(configured_ssh_target(arguments.target).settings)
+    if arguments.target:
+        target_settings = configured_ssh_target(arguments.target).settings.expanduser().resolve()
+        if settings and Path(settings).expanduser().resolve() != target_settings:
+            cli.error(f"--settings {Path(settings).expanduser().resolve()} differs from "
+                      + f"--target {arguments.target} settings {target_settings}")
+        settings = str(target_settings)
     config = read_config(Path(settings)) if settings else read_config()
     controller = ProcessController()
     started = time.monotonic()
+    result: MacOffloadResult = LostMacRun(0, "runner did not complete")
     try:
-        with interrupt_handlers(controller):
+        with interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
             result = run_offload(controller, config, request, started)
         status = write_result(result, request.result, request.last_decline, request.verb, request.target,
                               controller.attempt_evidence, request.fetch)
-        try:
-            persist_attempt(request, result, controller.attempt_evidence, started)
-        except (OSError, ValueError) as error:
-            print(f"offload: cannot record the attempt: {error}", file=sys.stderr)
         return status
     except OffloadInterrupted as interrupted:
+        result = LostMacRun(elapsed_seconds(started), f"interrupted by signal {interrupted.signal_number}")
         return 128 + interrupted.signal_number
     except Exception:
         traceback.print_exc()
@@ -2571,6 +2769,11 @@ def main() -> int:
             except OSError:
                 pass
         return 75
+    finally:
+        try:
+            persist_attempt(request, result, controller.attempt_evidence, started)
+        except (OSError, ValueError) as error:
+            print(f"offload: cannot record the attempt: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":

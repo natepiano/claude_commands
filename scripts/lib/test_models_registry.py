@@ -164,20 +164,29 @@ class LaunchSettingsTests(unittest.TestCase):
         from scripts.lib import models_registry
 
         for family in ("codex", "claude"):
-            for section, keys in (("direct", ("impl", "test", "fix", "review")),
-                                  ("design_roles", ("designer", "reviewer"))):
+            for section, keys, reference_section in (
+                ("direct", ("impl", "test", "fix", "review"), "direct"),
+                ("design_roles", ("designer", "reviewer"), "design_roles"),
+                ("producers", ("morty", "brain", "dwight"), "producers"),
+                ("producers", ("producer_only",), "direct"),
+            ):
                 for key in keys:
+                    reference_key = key if reference_section == section else "impl"
                     for tier in ("", "fast", "flex", "default", "pace"):
                         with self.subTest(family=family, section=section, key=key, tier=tier):
                             _ = write_registry(self.path, {
-                                "assignments": {section: family},
-                                f"{section}.{family}": {key: "gpt-test:medium" if family == "codex" else "sonnet:max"},
-                                f"{section}.options": {"codex_service_tier": "flex",
-                                                         f"codex_service_tier.{key}": tier or None},
+                                "assignments": {reference_section: family},
+                                f"{reference_section}.{family}": {
+                                    reference_key: "gpt-test:medium" if family == "codex" else "sonnet:max"},
+                                "producers": {key: f"{family}:gpt-test:medium" if family == "codex"
+                                               else f"{family}:sonnet:max"},
+                                **{f"{role}.options": {"codex_service_tier": "flex",
+                                                      f"codex_service_tier.{role_key}": tier or None}
+                                   for role, role_key in ((section, key), (reference_section, reference_key))},
                             })
                             settings = models_registry.launch_settings(section, key)
                             self.assertEqual((settings.kind, settings.model, settings.effort, settings.service_tier),
-                                             self.shell_settings(section, key))
+                                             self.shell_settings(reference_section, reference_key))
 
     def test_registry_changes_affect_the_next_launch_without_changing_caller_context(self) -> None:
         from scripts.lib import models_registry
@@ -194,21 +203,56 @@ class LaunchSettingsTests(unittest.TestCase):
             self.assertEqual(os.environ["AGENTS_CALLER_FAMILY"], "claude")
             self.assertEqual(os.environ["AGENTS_CALLER_ASSIGNMENT"], "caller")
 
+            configuration = models_registry.launch_configuration(os.environ)
+            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+            for inherited, expected in ((False, first), (True, second)):
+                environment = configuration.environment(os.environ) if inherited else dict(os.environ)
+                with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
+                    self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
+
+    def test_launch_settings_starts_no_python_registry_process(self) -> None:
+        from scripts.lib import models_registry
+
+        _ = write_registry(self.path)
+        text = self.path.read_text()
+        log = self.root / "python-processes"
+        probe = self.root / "process-probe"
+        probe.mkdir()
+        _ = (probe / "sitecustomize.py").write_text(
+            "import sys\n"
+            + f"with open({str(log)!r}, 'a') as output: output.write(sys.argv[0] + '\\n')\n")
+        for comment_length in (0, 70_000):
+            with self.subTest(comment_length=comment_length):
+                _ = self.path.write_text("#" + "x" * comment_length + "\n" + text)
+                _ = log.write_text("")
+                with patch.dict(os.environ, {"PYTHONPATH": str(probe) + os.pathsep + os.environ.get("PYTHONPATH", "")}):
+                    settings = models_registry.launch_settings("direct", "impl")
+                self.assertEqual(tuple(settings), self.shell_settings("direct", "impl"))
+                self.assertEqual(log.read_text(), "")
+
     def test_invalid_launch_rows_fail_before_a_launcher_can_use_them(self) -> None:
         from scripts.lib import models_registry
 
-        cases: tuple[RegistryOverrides, ...] = (
-            {"direct.codex": {"impl": "missing-agent:high"}},
-            {"direct.codex": {"impl": "gpt-test:invalid-effort"}},
-            {"direct.codex": {"impl": None}},
-            {"assignments": {"direct": "unknown-family"}},
-            {"direct.options": {"codex_service_tier": "unknown-tier"}},
+        cases: tuple[tuple[str, str, RegistryOverrides], ...] = (
+            ("direct", "impl", {"direct.codex": {"impl": "missing-agent:high"}}),
+            ("direct", "impl", {"direct.codex": {"impl": "gpt-test:invalid-effort"}}),
+            ("direct", "impl", {"direct.codex": {"impl": None}}),
+            ("direct", "impl", {"assignments": {"direct": "unknown-family"}}),
+            ("direct", "impl", {"direct.options": {"codex_service_tier": "unknown-tier"}}),
+            ("producers", "morty", {"producers": {"morty": "codex:missing-agent:high"}}),
+            ("producers", "morty", {"producers": {"morty": "codex:gpt-test:invalid-effort"}}),
+            ("producers", "morty", {"producers": {"morty": None}}),
+            ("producers", "morty", {"producers": {"morty": "unknown-family:gpt-test:high"}}),
+            ("producers", "morty", {"producers": {"morty": "codex:gpt-test"}}),
+            ("producers", "morty", {"producers": {"morty": "codex:gpt-test:"}}),
+            ("producers", "morty", {"producers": {"morty": "codex::high"}}),
+            ("producers", "morty", {"producers": {"morty": "codex:gpt-test:high:extra"}}),
         )
-        for rows in cases:
-            with self.subTest(rows=rows):
+        for section, key, rows in cases:
+            with self.subTest(section=section, key=key, rows=rows):
                 _ = write_registry(self.path, rows)
                 with self.assertRaises(ValueError):
-                    _ = models_registry.launch_settings("direct", "impl")
+                    _ = models_registry.launch_settings(section, key)
 
 
 @final

@@ -1520,7 +1520,7 @@ class WorkspaceRunTests(CargoProjectTests):
                                        ("bash", verify, "final", "--saved", "--tree", str(report["tested_tree"]))])
         self.assertTrue(all(folder == self.runner.test_checkout for folder, args in self.runner.calls if args[0] == "bash"))
         self.assertNotEqual(self.runner.test_checkout, self.repo)
-        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
+        self.assertFalse(self.runner.test_checkout.exists())
         self.assertEqual(self.runner.test_tree, report["tested_tree"])
         self.assertEqual(self.git("rev-list", "--count", f"{self.base}..HEAD"), "1")
         self.assertIn(f"Tested-Tree: {report['tested_tree']}", self.git("log", "-1", "--format=%B"))
@@ -2094,7 +2094,7 @@ class WorkspaceRunTests(CargoProjectTests):
                 self.runner.mutate_stage = stage
                 with self.assertRaisesRegex(bulk.BulkRenameError, "clean checkout"):
                     _ = run.test_tree(self.repo, self.base, self.tree, self.runner, {})
-                self.assertTrue((self.runner.test_checkout / ".git").is_dir())
+                self.assertFalse(self.runner.test_checkout.exists())
                 self.assertEqual("final --saved" if self.runner.calls[-1][1][2:4] == ("final", "--saved") else self.runner.calls[-1][1][2], stage)
 
     def test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit(self) -> None:
@@ -2118,7 +2118,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
         self.assertEqual([("final --saved" if args[2:4] == ("final", "--saved") else args[2]) for _, args in self.runner.calls if args[0] == "bash"], ["final"])
-        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
+        self.assertFalse(self.runner.test_checkout.exists())
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets()
                                if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket)

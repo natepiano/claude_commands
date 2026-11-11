@@ -10,6 +10,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import staff, staff_move, staff_sources
+from scripts.herdr import herdr_types
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.herdr import herdr
 
@@ -81,7 +82,7 @@ class StaffMoveTests(StaffTestCase):
             assert row is not None
             parents.append(row.parent)
             if len(parents) == 1:
-                raise herdr.HerdrFailure("move refused")
+                raise herdr_types.HerdrFailure("move refused")
             return True
         self.place.side_effect = place
         with self.assertRaisesRegex(staff.StaffUnreadable, "tab was not moved"):

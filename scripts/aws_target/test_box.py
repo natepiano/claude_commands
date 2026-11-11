@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from base64 import b64encode
+from collections.abc import Mapping, Sequence
 from contextlib import redirect_stdout
 from email.message import Message
 from io import BytesIO, StringIO
@@ -14,16 +15,18 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import ModuleType, SimpleNamespace
 from typing import cast, final, override
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
-from scripts.aws_target import admin_secrets, box, deploy, routing_proof
+from scripts.aws_target import admin_secrets, aws_target, box, deploy, routing_proof
 from scripts.aws_target.ledger import mapping
 from scripts.aws_target.aws_target import AwsUnavailable
 from scripts.build_targets import target_config
 from scripts.mac_test import mac_test, offload
 from scripts.lib import conf, copy_record, process_start, scratch
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 SYSTEM = '/nix/store/' + 'a' * 32 + '-nixos-system-aws-build'
 IMAGE_TAGS = [{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}]
@@ -33,6 +36,8 @@ def write_aws_claim(directory: Path, *, kept: bool, remote: bool = True) -> Path
     owner = process_start.process_start(os.getpid())
     assert isinstance(owner, process_start.Started)
     record: mac_test.ProcessBoundClaim = {
+        'claim_id': 'fixture-claim', 'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
+        'submitting_session': '',
         'pid': os.getpid(), 'proc_start': 'ended-owner' if kept else owner.start,
         'what': 'fixture tests', 'worktree': str(directory), 'since': '2026-11-06T09:00:00+00:00',
         'repo_name': 'fixture', 'repo_key': 'fixture',
@@ -206,6 +211,7 @@ elif name == 'ssh':
     else: raise AssertionError(command)
 else: raise AssertionError(name)
 '''
+FAKE_CODE = compile(FAKE, '<box fake>', 'exec')
 
 
 @final
@@ -343,6 +349,31 @@ class BoxTests(unittest.TestCase):
         self.starts = 0
         self.monotonic = FakeMonotonicClock()
         self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet, monotonic=self.monotonic, pause=self.monotonic.advance)
+        if not process_boundary_for_case(self):
+            processes = SimpleNamespace(**{**cast(Mapping[str, object], vars(subprocess)),
+                                           'run': self.run_tool})
+            _ = self.enterContext(mock.patch.object(aws_target, 'subprocess', processes))
+
+    def run_tool(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
+                 timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ) if env is None else env
+        found = shutil.which(arguments[0], path=environment.get('PATH'))
+        path = Path(found) if found else Path(arguments[0])
+        if path.parent != self.root / 'bin':
+            return subprocess.run(arguments, capture_output=capture_output, text=text,
+                                  timeout=timeout, check=check, env=env)
+        tool = ModuleType('box_fake')
+        tool.__file__ = str(path)
+
+        def main() -> int:
+            exec(FAKE_CODE, {'__name__': '__main__', '__file__': str(path)})
+            return 0
+
+        result = invoke_cli(tool, main, list(arguments[1:]), environment, Path.cwd())
+        result.args = list(arguments)
+        if check:
+            result.check_returncode()
+        return result
 
     def start(self) -> str:
         self.starts += 1
@@ -399,7 +430,9 @@ class BoxTests(unittest.TestCase):
             output = StringIO()
             with redirect_stdout(output):
                 self.assertTrue(subject.up(approve_resources=True))
-            self.assertTrue(all(line.endswith(': present') for line in output.getvalue().splitlines()))
+            stage_lines = [line for line in output.getvalue().splitlines() if not line.startswith('up: ')]
+            self.assertEqual(len(stage_lines), 12)
+            self.assertTrue(all(line.endswith(': present') for line in stage_lines))
             later = self.commands()[commands:]
             self.assertFalse(any('systemd-run' in c[-1] or c[0] == 'nix' and 'copy' in c for c in later))
             results = box.json_record((self.directory / 'up.json').read_text())
@@ -685,6 +718,7 @@ class BoxTests(unittest.TestCase):
             self.subject.policy()
         self.assertTrue(self.subject.policy_present())
 
+    @process_boundary
     def test_join_sends_one_short_lived_key_only_through_ssm_stdin(self) -> None:
         self.assertFalse(self.subject.join_present())
         self.change(online=False)
@@ -737,6 +771,7 @@ class BoxTests(unittest.TestCase):
         self.assertTrue(self.subject.join_present())
         self.assertEqual(known_hosts.read_text(), 'unrelated entry\n')
 
+    @process_boundary
     def test_box_command_refusal_reports_the_last_stderr_line(self) -> None:
         for stderr, detail in (('earlier error\n  Host key verification failed. \n\n', ': Host key verification failed.'),
                                (' earlier \n\tlast  ' + 'x' * 400 + '\n', ': ' + ('last ' + 'x' * 400)[:300]),

@@ -24,17 +24,19 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, Protocol, cast
 
 from scripts.accounts import outage_alerts, role_map
+from scripts.herdr import herdr_types
 from scripts.production import showrunners, staff
 from scripts.whoami import account
-from scripts.shutdown import stop_results
+from scripts.agents import stop_results
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 
+from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.production import live_units, unit_lookup
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.message import sessions
 from scripts.lib.user_zone import user_zone
 
@@ -156,13 +158,18 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
         production = parent.name if parent is not None else ""
         try:
             entry = pane_record.launch_for_session(member.current_session)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             report_failure(f"watchdog: {production}/{member.name} session {member.current_session}: {error}")
             continue
         if entry is None or entry.get("ended", False):
             sources[(production, member.name)] = NoRecovery(member.current_session)
             continue
-        label = accounts.claude_config_label(Path(entry["config_dir"]))
+        home = pane_launch.config_home(entry, record=record)
+        if isinstance(home, staff.HomeUnknown):
+            print(f"anomaly: {member.name}: session home is unknown; select the normal account", file=sys.stderr)
+            label = accounts.role_account("unit").label
+        else:
+            label = accounts.claude_config_label(home.path)
         owner = RecoverableUnit(session_id=member.current_session, name=member.name,
             cwd=str(member.worktree.path), unit=member.name, production=production)
         sources[(production, member.name)] = RecoverySource(owner, label, member.id)
@@ -186,14 +193,14 @@ def _restart(label: str, identity: str, source: str) -> str:
             return live.reason
         if isinstance(live, sessions.LiveSessionProcess):
             return ""  # Another recovery already brought this conversation back.
-        resume = cast(ResumeUnit, import_module("scripts.shutdown.stop_resume").resume)
+        resume = cast(ResumeUnit, import_module("scripts.agents.stop_resume").resume)
         result = resume(identity, why="unit watchdog recovery", to=label)
         if isinstance(result, stop_results.ClaudeUp):
             return ""
         return (result.reason
                 if isinstance(result, stop_results.ResumeFailed)
                 else f"{identity}: no pane launch")
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         return str(error)
 
 
@@ -394,11 +401,11 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         # Save ownership before detaching; a later pass never starts a second copy.
                         _write_state({**state, **retained})
                         _start_recovery(source, job, min(limits.dispatch_seconds, remaining))
-                    except (OSError, ValueError, herdr.HerdrFailure) as error:
+                    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                         # Preserve incomplete observations, then continue with the next unit.
                         retained.update({key: value for key, value in state.items() if key not in retained})
                         lines.append(f"watchdog: {runner['name']}/{unit}: {error}")
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 # Keep pending recovery evidence when discovery is incomplete.
                 retained.update({key: value for key, value in state.items() if key not in retained})
                 lines.append(f"watchdog: {runner['name']}: {error}")

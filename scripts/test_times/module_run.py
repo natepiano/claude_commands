@@ -14,17 +14,20 @@ __unittest = True
 
 import json
 import os
-from collections.abc import Callable, Generator
+import fcntl
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
+from inspect import currentframe
 from pathlib import Path
 import resource
 import signal
+import stat
 import sys
 import tempfile
-from types import MethodType, TracebackType
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, override
+from types import FrameType, MethodType, TracebackType
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, final, override
 import unittest
 import unittest.case as unittest_case
 
@@ -51,8 +54,157 @@ class NoOpenTest:
 
 
 @dataclass(frozen=True)
+class NoConfigReadLog:
+    """The isolated project has no config reader to record its reads."""
+
+
+@final
+class RepositoryReadAudit:
+    """Record repository listings and file reads in this process."""
+
+    def __init__(self, root: Path, folders: set[str], contents: set[str]) -> None:
+        self.roots = tuple(dict.fromkeys((os.path.realpath(root), os.path.abspath(root))))
+        self.folders = folders
+        self.contents = contents
+        self.process_id = os.getpid()
+        self.current_process = os.getpid
+        self.decode = os.fsdecode
+        self.current_directory = os.getcwd
+        self.normalize = os.path.normpath
+        self.read_link = os.readlink
+        self.get_descriptor_path = fcntl.fcntl
+        self.descriptor_path_command = cast(int, getattr(fcntl, "F_GETPATH", 50))
+        self.platform = sys.platform
+        self.current_frame = currentframe
+        self.file_status = os.stat
+        self.is_regular = stat.S_ISREG
+        self.write_flags = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC | os.O_EXCL
+
+    def absolute_path(self, path: str, cwd: str) -> str:
+        return self.normalize(path if path.startswith("/") else cwd + "/" + path)
+
+    def listed_folder(self, value: object, cwd: str) -> set[str]:
+        if value is None:
+            value = cwd
+        if isinstance(value, int):
+            try:
+                if self.platform == "darwin":
+                    value = self.get_descriptor_path(value, self.descriptor_path_command, bytes(1024)).split(b"\0", 1)[0]
+                else:
+                    value = self.read_link(f"/proc/self/fd/{value}")
+            except (OSError, ValueError):
+                return {"/"}
+        if not isinstance(value, (str, bytes, os.PathLike)):
+            return set()
+        absolute = self.absolute_path(self.decode(value), cwd)
+        for root in self.roots:
+            if absolute == root:
+                return {"."}
+            if absolute.startswith(root + "/"):
+                return {absolute[len(root) + 1:]}
+        return set()
+
+    def git_folders(self, arguments: tuple[object, ...]) -> set[str]:
+        command = arguments[1]
+        if not isinstance(command, (list, tuple)):
+            return set()
+        values = cast(Sequence[object], command)
+        if not values or not all(isinstance(value, (str, bytes, os.PathLike)) for value in values):
+            return set()
+        argv = [self.decode(cast(str | bytes | os.PathLike[str] | os.PathLike[bytes], value)) for value in values]
+        if argv[0].rsplit("/", 1)[-1] != "git":
+            return set()
+        current_directory = self.current_directory()
+        cwd = current_directory if arguments[2] is None else self.decode(
+            cast(str | bytes | os.PathLike[str] | os.PathLike[bytes], arguments[2]))
+        cwd = self.absolute_path(cwd, current_directory)
+        index = 1
+        while index < len(argv):
+            option = argv[index]
+            if option == "-C" and index + 1 < len(argv):
+                cwd = self.absolute_path(argv[index + 1], cwd)
+                index += 2
+            elif option.startswith("-C"):
+                cwd = self.absolute_path(option[2:], cwd)
+                index += 1
+            elif option in {"-c", "--git-dir", "--work-tree", "--namespace"}:
+                index += 2
+            elif option.startswith("-"):
+                index += 1
+            else:
+                break
+        if index == len(argv) or argv[index] != "ls-files" or not self.listed_folder(cwd, current_directory):
+            return set()
+        pathspecs: list[str] = []
+        index += 1
+        while index < len(argv):
+            option = argv[index]
+            if option == "--":
+                pathspecs.extend(argv[index + 1:])
+                break
+            if option in {"-x", "--exclude", "-X", "--exclude-from", "--exclude-per-directory", "--format"}:
+                index += 2
+                continue
+            if not option.startswith("-"):
+                pathspecs.append(option)
+            index += 1
+        if not pathspecs:
+            return {"/"}
+        folders: set[str] = set()
+        for pathspec in pathspecs:
+            # Complex Git pathspecs conservatively cover the repository.
+            if pathspec.startswith(":") or any(mark in pathspec for mark in ("*", "?", "[")):
+                folders.add("/")
+                continue
+            for folder in self.listed_folder(pathspec, cwd):
+                folders.add("/" if folder == "." else folder.rstrip("/") + "/")
+        return folders
+
+    def __call__(self, event: str, arguments: tuple[object, ...]) -> None:
+        if event not in {"os.scandir", "os.listdir", "subprocess.Popen", "open"}:
+            return
+        if self.current_process() != self.process_id:
+            return
+        try:
+            target = self.folders
+            if event == "open":
+                mode, flags = arguments[1:3]
+                if (not isinstance(flags, int) or flags & self.write_flags
+                        or isinstance(mode, str) and (not mode.startswith("r") or "+" in mode)):
+                    return
+                paths = self.listed_folder(arguments[0], self.current_directory())
+                paths = {path for path in paths if path not in {".", "/"}
+                         and not path.startswith("config/") and "__pycache__" not in path.split("/")}
+                if not paths:
+                    return
+                # Use the original spelling for the existing-file check.
+                if not self.is_regular(self.file_status(cast(str | bytes | os.PathLike[str] | os.PathLike[bytes] | int,
+                                                            arguments[0])).st_mode):
+                    return
+                target = self.contents
+            else:
+                paths = (self.git_folders(arguments) if event == "subprocess.Popen"
+                         else self.listed_folder(arguments[0], self.current_directory()))
+            if not paths:
+                return
+            frame: FrameType | None = self.current_frame()
+            try:
+                while frame is not None:
+                    if frame.f_code.co_filename == "<frozen importlib._bootstrap_external>":
+                        return
+                    frame = frame.f_back
+            finally:
+                del frame
+            target.update(paths)
+        except (OSError, ValueError):
+            # Observation cannot change a test's result.
+            return
+
+
+@dataclass(frozen=True)
 class TimesOutput:
     path: Path
+    config_log: Path | NoConfigReadLog
 
 
 @dataclass(frozen=True)
@@ -296,7 +448,7 @@ def fixture_label(label: str) -> str:
 
 
 def write_times(path: Path, result: TimedResult, wall_s: float,
-                fixtures: list[FixtureMeasure]) -> None:
+                fixtures: list[FixtureMeasure], config_reads: Sequence[str] | NoConfigReadLog) -> None:
     """Replace the output file without changing the test result on failure."""
     temporary = ""
     try:
@@ -320,6 +472,10 @@ def write_times(path: Path, result: TimedResult, wall_s: float,
             "tests": tests,
             "fixtures": fixtures,
         }
+        if not isinstance(config_reads, NoConfigReadLog):
+            times["config_reads"] = sorted(set(config_reads))
+        times["folder_scans"] = sorted(TimedRunner.scanned_folders)
+        times["content_reads"] = sorted(TimedRunner.read_contents)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=f".{path.name}.", delete=False) as handle:
             temporary = handle.name
@@ -340,6 +496,8 @@ def write_times(path: Path, result: TimedResult, wall_s: float,
 class TimedRunner(unittest.TextTestRunner):
     resultclass: Callable[[TestOutput, bool, int], TimedResult] = TimedResult
     destination: ClassVar[TimesOutput | NoTimesOutput] = NoTimesOutput()
+    scanned_folders: ClassVar[set[str]] = set()
+    read_contents: ClassVar[set[str]] = set()
 
     @override
     def run(self, test: unittest.TestSuite | unittest.TestCase) -> unittest.TextTestResult:
@@ -347,17 +505,37 @@ class TimedRunner(unittest.TextTestRunner):
             result = super().run(test)
         wall_s = time.perf_counter() - _STARTED_AT
         if isinstance(self.destination, TimesOutput):
-            write_times(self.destination.path, cast(TimedResult, result), wall_s, fixtures)
+            log = self.destination.config_log
+            reads = log.read_text(encoding="utf-8").splitlines() if isinstance(log, Path) else log
+            write_times(self.destination.path, cast(TimedResult, result), wall_s, fixtures, reads)
         return result
 
 
 def main() -> None:
+    try:
+        from scripts.lib import conf_reads
+    except ImportError:
+        from importlib.util import find_spec
+
+        if find_spec("scripts.lib.conf_reads") is not None:
+            raise
+        run_module(NoConfigReadLog())
+        return
+
+    with tempfile.TemporaryDirectory(prefix="config-reads-") as temporary:
+        log = Path(temporary) / "reads"
+        log.touch()
+        with conf_reads.record_reads(log):
+            run_module(log)
+
+
+def run_module(config_log: Path | NoConfigReadLog) -> None:
     if len(sys.argv) != 3:
         print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
         sys.exit(2)
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
-    TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output))
+    TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
     try:
         names: list[str] = []
         for path in sorted(Path(start_dir).resolve().glob(pattern)):
@@ -369,6 +547,11 @@ def main() -> None:
                     if all(part.isidentifier() for part in parts):
                         candidates.append(parts)
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
+        if isinstance(TimedRunner.destination, TimesOutput):
+            TimedRunner.scanned_folders = set()
+            TimedRunner.read_contents = set()
+            sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
+                                                TimedRunner.read_contents))
         suite = unittest.defaultTestLoader.loadTestsFromNames(names)
         result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
         sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
@@ -376,8 +559,7 @@ def main() -> None:
         if "scripts.message.session_send_test_support" in sys.modules:
             from scripts.message import session_send_test_support
 
-            marker = session_send_test_support.refusal_marker
-            if isinstance(marker, session_send_test_support.SenderRefusalMarker) and marker.path.is_file():
+            if session_send_test_support.real_sender_was_started():
                 print(f"{pattern}: started the real scripts/message/send.py", file=sys.stderr)
                 sys.exit(1)
         raise

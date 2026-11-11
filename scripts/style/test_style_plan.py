@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, ticket_owner_id, write_style_units
+from scripts.style.style_config import StyleUnitAssignment
 
 import fcntl
 import io
@@ -56,10 +57,12 @@ class StylePlanTests(StylePlanFixture):
 
     def test_family_plans_use_each_units_config_plan_for_old_and_full_ids(self) -> None:
         expected: dict[rules.Family, str] = {}
+        assignments: list[StyleUnitAssignment] = []
         owner = recorded_showrunner("sample-style", self.doc)
         families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
         for index, family in enumerate(families):
             unit = f"sample-style-{family}" if index % 2 else family
+            assignments.append(StyleUnitAssignment(unit, (family,)))
             worktree = self.root / f"plan-{family}"
             relative = f"docs/style-production/units/retained-{family}.md"
             plan = worktree / relative
@@ -70,7 +73,47 @@ class StylePlanTests(StylePlanFixture):
             _ = recorded_unit("sample-style", unit, worktree, self.doc, plan=relative)
         _ = fixture_unit_location(owner, "feature", self.root / "feature")
 
+        write_style_units(self.doc, tuple(assignments))
         self.assertEqual(dict(unit_plans.family_plan_texts(self.doc)), expected)
+
+    def test_combined_unit_reads_its_standing_plan_once(self) -> None:
+        families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
+        self.style_units((StyleUnitAssignment("names", families),))
+        read_text = Path.read_text
+        reads: list[Path] = []
+
+        def read(path: Path, **_kwargs: object) -> str:
+            reads.append(path)
+            return read_text(path)
+
+        with mock.patch.object(Path, "read_text", side_effect=read, autospec=True):
+            texts = unit_plans.family_plan_texts(self.doc)
+
+        self.assertEqual(set(texts), set(families))
+        self.assertEqual(reads.count(self.plan), 1)
+        self.assertTrue(all(text == self.plan.read_text() for text in texts.values()))
+
+    def test_arbitrary_unit_name_selects_configured_work_on_both_routes(self) -> None:
+        _ = self.rule("configured-names")
+        member = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "names", self.unit)
+        _ = staff.rename(member.id, "maintenance")
+        self.style_units((StyleUnitAssignment("maintenance", ("names", "types", "values", "modules")),))
+        self.sync()
+        for direct in (False, True):
+            with self.subTest(direct=direct):
+                if direct:
+                    _ = self.doc.write_text(self.doc.read_text().replace("**Kind:** style", "**Kind:** product")
+                                            .replace("**Merge branch:** style/main", "**Merge branch:** main")
+                                            .replace(str(self.style), str(self.repo)))
+                    self.ledger().set_tip(self.tip, "main")
+                with mock.patch.object(style_plan, "main_changes", wraps=style_plan.main_changes) as changes:
+                    result = style_plan.next_phase("maintenance", self.plan, self.repo)
+                self.assertIsInstance(result, style_plan.PhaseWritten)
+                self.assertEqual(changes.call_args.args[1], "main")
+                ticket, = self.ledger().ticket_open(ticket_owner_id("maintenance"))
+                self.assertEqual(ticket["family"], "names")
+                self.assertEqual(style_plan.style_document(self.repo, "maintenance"), self.doc)
+                self.ledger().ticket_drop(ticket["id"])
 
     def test_next_phase_keeps_the_declared_plan_path_for_old_and_full_ids(self) -> None:
         _ = self.rule("read")
@@ -82,6 +125,8 @@ class StylePlanTests(StylePlanFixture):
         for number, unit in enumerate(("names", "sample-style-names"), 1):
             with self.subTest(unit=unit):
                 member = staff.rename(member.id, unit_names.name(unit))
+                write_style_units(self.doc, tuple(StyleUnitAssignment(unit, row.families) if row.families == ("names",)
+                                                 else row for row in DEFAULT_STYLE_ASSIGNMENTS))
                 _ = retained.write_text(self.plan_header().replace("`names`", f"`{unit}`"))
                 result = style_plan.next_phase(unit, retained, self.repo)
                 self.assertEqual(result, style_plan.PhaseWritten(str(number)))
@@ -221,6 +266,8 @@ class StylePlanTests(StylePlanFixture):
         unit = "sample-style-names"
         member = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "names", self.unit)
         _ = staff.rename(member.id, unit_names.name(unit))
+        write_style_units(self.doc, tuple(StyleUnitAssignment(unit, row.families) if row.families == ("names",)
+                                         else row for row in DEFAULT_STYLE_ASSIGNMENTS))
         retained = self.plan.with_name("retained-names-plan.md")
         _ = self.plan.rename(retained)
         first = self.sources[-1]
@@ -284,6 +331,17 @@ class StylePlanTests(StylePlanFixture):
         ledger = self.ledger()
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         held = ledger.hold(rule, self.sources[0], 1, "Split this module", "restructure", "before", "after", blob, "outside")
+        approved_findings: list[style_ledger.HeldFinding] = []
+        issues: list[Path] = []
+        for line, name in ((4, "approved"), (5, "other-approved")):
+            issue = self.root / f"{name}.md"
+            _ = issue.write_text('---\nstatus: open\ntags: [proposal, style]\n'
+                                 + f'unit: {unit_staff_id("modules")}\nplan: approved\nstyle_rule: {rule}\n'
+                                 + f'style_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+            finding = ledger.hold(rule, self.sources[0], line, name, "restructure", "before", "after", blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+            approved_findings.append(finding)
+            issues.append(issue)
         waived = ledger.hold(rule, self.sources[0], 2, "Already waived", "restructure", "before", "after", blob, "outside")
         _ = ledger.decline_findings((waived.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[waived.finding_id]
         outside = ledger.hold(rule, self.sources[2], 1, "Different batch", "restructure", "before", "after", blob, "outside")
@@ -300,12 +358,32 @@ class StylePlanTests(StylePlanFixture):
         heading = "Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."
         self.assertIn(heading, text)
         held_section, _, waived_section = text.partition(heading)
+        for finding in approved_findings:
+            self.assertIn(f"{finding.finding_id} · {rule} · {finding.path}:{finding.line} · {finding.text}", held_section)
+            self.assertEqual(text.count(finding.finding_id), 1)
         self.assertNotIn(waived.finding_id, held_section)
         self.assertIn(waived.finding_id, waived_section)
         self.assertNotIn(other.finding_id, text)
         self.assertIn(f"{waived.finding_id} · {rule} · {self.sources[0]}:2 · Already waived", text)
         self.assertNotIn(outside.finding_id, text)
         self.assertIn("Judge these 2 files of `crates/alpha`", text)
+
+        ledger.ticket_drop(ledger.ticket_open(ticket_owner_id("modules"))[0]["id"])
+        ledger.ticket_add("7001", ticket_owner_id("modules"), "proposal", "modules", "crates/alpha",
+                          [self.sources[0]], [rule], proposal=str(issues[0]), proposals=(issues[1],),
+                          finding_ids=tuple(finding.finding_id for finding in approved_findings))
+        ledger.ticket_assign("7001", "demo-style-modules")
+        style_plan.write_phase(ledger, ledger.ticket_get("7001"), plan, self.plan_header())
+        for kind, work_order, build_line in (
+            ("structure", text, ""),
+            ("proposal", plan.read_text(), f"Also build the approved findings selected from: `{issues[1]}`"),
+        ):
+            with self.subTest(kind=kind):
+                if build_line:
+                    self.assertIn(build_line, work_order)
+                    self.assertNotIn("Already-held findings:", work_order)
+                else:
+                    self.assertNotIn("Also build", work_order)
 
     def test_structure_resume_keeps_waived_findings_after_the_pinned_rule_leaves_the_catalog(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: manifest\n")

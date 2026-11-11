@@ -13,6 +13,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.direct import step_record
+from scripts.direct.step_selection import Pinned
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS
 from scripts.direct.verify_mac_offload_test_support import VERIFY
 from scripts.lib.shell_test_support import shell_functions
@@ -35,7 +36,7 @@ def read_step_row(call_id: str) -> dict[str, object]:
             location = {"kind": "natedev_only", "reason": reason}
     return dict(kind=record.kind, state=record.state.value, selected_target=record.selected_target,
                 updated=record.updated, runs_on=location, eligible_targets=list(record.eligible_targets),
-                pinned_target=record.selection.target if isinstance(record.selection, step_record.Pinned) else "",
+                pinned_target=record.selection.target if isinstance(record.selection, Pinned) else "",
                 package=step_record.package_name(record.package))
 
 
@@ -137,6 +138,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.fixture.environment.update({
             "BASH_ENV": str(shell), "TEST_STATE_OBSERVER": str(observer),
             "TEST_PYTHON_STARTS": str(starts),
+            "VERIFY_PY_TRACE": str(root / "python-trace"),
             "TEST_REAL_PYTHON": sys.executable, "CLAUDE_PYTHON": str(self.fixture.bin_directory / "python3"),
         })
         return starts
@@ -145,7 +147,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self, body: str, *, kind: str, package: str = "sample", pinned: str = "",
     ) -> subprocess.CompletedProcess[str]:
         functions = shell_functions(
-            VERIFY, "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
+            VERIFY, "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
             "run", "run_step", "finish_step_token", "route_compiling_step",
             "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
@@ -177,6 +179,9 @@ initialize_step_record
 
     def verbs(self, starts: Path) -> list[str]:
         words = [cast(list[str], json.loads(line)) for line in starts.read_text().splitlines()]
+        calls = Path(self.fixture.environment["VERIFY_PY_TRACE"] + ".calls")
+        if calls.exists():
+            words.extend(line.split("\t") for line in calls.read_text().splitlines())
         return [row[1] for row in words if len(row) > 1 and Path(row[0]).name == "step_record.py"]
 
     def observations(self) -> list[dict[str, object]]:

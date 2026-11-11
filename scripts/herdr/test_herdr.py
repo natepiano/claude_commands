@@ -22,6 +22,7 @@ import time
 import unittest
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
+from scripts.herdr import herdr_types
 from types import SimpleNamespace
 from typing import BinaryIO, Literal, cast, final, override
 from unittest.mock import Mock, call, patch
@@ -36,6 +37,7 @@ from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
+from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
 from scripts.message import sessions
 from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
@@ -168,13 +170,13 @@ class NativePaneSessionTests(StaffTestCase):
                       patch.object(world, "result", side_effect=read_process_info),
                       patch.object(world, "native_pane_process", side_effect=AssertionError("no native identity"))):
                     if exited:
-                        with self.assertRaisesRegex(herdr.HerdrFailure, f"w1:p1: process {pid}: exited"):
+                        with self.assertRaisesRegex(herdr_types.HerdrFailure, f"w1:p1: process {pid}: exited"):
                             _ = world.pane_agent_process("w1:p1", "friend-terminal")
                     else:
                         self.assertEqual(world.pane_agent_process("w1:p1", "friend-terminal"), herdr.AgentProcessIdentity(pid, 1))
                 self.assertEqual(world.process_reads, ["w1:p1"])
         del world.foreground["w1:p1"]
-        with self.assertRaisesRegex(herdr.HerdrFailure, "expected one foreground agent"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "expected one foreground agent"):
             _ = world.pane_agent_process("w1:p1", "friend-terminal")
 
     def test_prompt_terminal_sends_only_to_the_selected_terminal(self) -> None:
@@ -186,11 +188,32 @@ class NativePaneSessionTests(StaffTestCase):
         with patch.object(world, "native_session", side_effect=AssertionError("no native identity")):
             world.prompt_terminal("w1:p1", "friend-terminal", "Explain the result.")
             world.locations["w1:p1"]["terminal_id"] = "replacement-terminal"
-            with self.assertRaisesRegex(herdr.HerdrFailure, "terminal changed"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "terminal changed"):
                 world.prompt_terminal("w1:p1", "friend-terminal", "Do not deliver this text.")
         self.assertEqual(len(world.commands), 1)
         self.assertEqual(world.commands[0][:3], ("agent", "prompt", "w1:p1"))
         self.assertIn("Explain the result.", world.commands[0][3])
+
+        for allowed in (True, False):
+            with self.subTest(target_allowed=allowed):
+                events: list[str] = []
+                def check(*_arguments: object, **_options: object) -> bool:
+                    events.append("check")
+                    return allowed
+                def send(*_arguments: object, **_options: object) -> str:
+                    self.assertEqual(events, ["check", "callback"])
+                    events.append("send")
+                    return ""
+                with (patch.object(herdr, "check_target", side_effect=check),
+                      patch.object(world, "run", side_effect=send)):
+                    if allowed:
+                        world.prompt("w1:p1", "Continue the work.", target="TEST-session",
+                                     on_submission=lambda: events.append("callback"))
+                    else:
+                        with self.assertRaisesRegex(herdr_types.HerdrFailure, "unproved target"):
+                            world.prompt("w1:p1", "Continue the work.", target="TEST-session",
+                                         on_submission=lambda: events.append("callback"))
+                self.assertEqual(events, ["check", "callback", "send"] if allowed else ["check"])
 
     def test_codex_native_process_refuses_an_unheld_thread_from_environment(self) -> None:
         identity = fixture_runtime_id("unheld-thread")
@@ -245,7 +268,7 @@ class NativePaneSessionTests(StaffTestCase):
                 _ = client.codex_launch("w1:p1", arguments)
 
     def test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread(self) -> None:
-        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "agent", "bare-client",
+        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "producer", "bare-client",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("bare-client-thread")))
         client = herdr.Herdr("agents")
         with (codex_launch_evidence(self.root, ["codex"]) as info,
@@ -293,6 +316,27 @@ class NativePaneSessionTests(StaffTestCase):
             launch = client.codex_launch("w1:p1")
             self.assertEqual(launch["session_id"], identity)
         self.assertEqual(native.call_args_list, [call(998075, "codex", ""), call(998075, "codex")])
+
+    def test_codex_report_ignores_the_hook_process_in_the_foreground_group(self) -> None:
+        identity = fixture_runtime_id("codex-with-hook")
+        row = {"pane_id": "w1:p1", "session_id": identity}
+        info: dict[str, object] = {"foreground_processes": [
+            {"pid": 998076, "argv": ["python3", str(Path(herdr.__file__).with_name("turn_end.py"))]},
+            {"pid": 998075, "argv": ["codex"]}]}
+        observation = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "same-start", {})
+        result = subprocess.CompletedProcess[str]([], 0, json.dumps({"result": {"process_info": info}}), "")
+        client = herdr.Herdr("agents")
+        with patch.object(herdr, "run_program", return_value=result), \
+                patch.object(herdr, "native_process", return_value=observation) as native, \
+                patch.object(client, "result", return_value={"process_info": info}), \
+                patch.object(client, "pane_row", return_value=row), \
+                patch.object(herdr, "Herdr", return_value=client):
+            self.assertEqual(client.native_pane_process("w1:p1", "codex", 1, pane_row=row), observation)
+            self.assertEqual(client.pane_codex_pid("w1:p1"), 998075)
+            self.assertEqual(herdr.codex_pane_process(998075, herdr.HerdrPlace("agents", "w1:p1")), observation)
+        self.assertEqual(native.call_args_list, [call(998075, "codex", identity)] * 2)
+        self.assertFalse(herdr.codex_without_session({"foreground_processes": [
+            {"pid": 998075, "argv": ["codex"]}, {"pid": 998077, "argv": ["codex"]}]}))
 
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
@@ -378,7 +422,7 @@ class NativePaneSessionTests(StaffTestCase):
               patch.object(herdr, "process_environment", return_value=environment),
               patch.object(herdr, "run_program", return_value=completed)):
             observed = herdr.native_process(998076, "codex")
-            with self.assertRaisesRegex(herdr.HerdrFailure, "launch argument does not prove"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "launch argument does not prove"):
                 _ = herdr.Herdr("agents").native_session("w1:p1", "codex", 1)
         self.assertEqual(observed.identity, herdr.LaunchArgument(launch))
         self.assertEqual(observed.started, "same-process")
@@ -403,7 +447,7 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertEqual(herdr.Herdr("agents").native_session("w1:p1", "claude", 1), identity)
             observation["procStart"] = "reused-process-id"
             self.write_json(registry, observation)
-            with self.assertRaisesRegex(herdr.HerdrFailure, "native registry identity is unavailable"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "native registry identity is unavailable"):
                 _ = herdr.Herdr("agents").native_session("w1:p1", "claude", 1)
 
     def test_codex_native_process_refuses_a_changed_process_after_proving_its_thread(self) -> None:
@@ -503,7 +547,7 @@ class CodexAnomalyNameTests(StaffTestCase):
                               {"tab_id": "w1:t1", "label": "morty", "workspace_id": "w1"}]},
                     {"workspaces": [{"workspace_id": "w1", "label": "agents"}]}]
             else:
-                placement.side_effect = herdr.HerdrFailure("placement is unavailable")
+                placement.side_effect = herdr_types.HerdrFailure("placement is unavailable")
             if source == "pid":
                 registry.side_effect = OSError("registry is unavailable")
             with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
@@ -532,6 +576,9 @@ class CodexAnomalyNameTests(StaffTestCase):
 
 class StartupClock:
     elapsed: float = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.elapsed += seconds
 
 
 class WaitingAgentCLI:
@@ -1581,14 +1628,13 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
-    def test_launch_exits_the_shell_only_for_worker_panes(self) -> None:
+    def test_every_launch_keeps_the_shell_after_the_agent_returns(self) -> None:
         for kind in ("claude", "codex"):
             for purpose in ("worker", "unit", "side"):
                 for setups in (1, 2):
                     with self.subTest(kind=kind, purpose=purpose, setups=setups):
                         environment = {"CLAUDE_CONFIG_DIR": str(self.root / "account"), "PATH": os.defpath}
-                        prepared = (herdr.WorkerPaneEnvironment(self.root, environment) if purpose == "worker" else
-                                    herdr.PreparedAgentEnvironment(self.root, environment))
+                        prepared = herdr.PreparedAgentEnvironment(self.root, environment)
                         destination = (herdr.NewTab("units", "unit") if purpose == "unit" else
                                        herdr.SplitPane("parent", "right", 0.5, purpose))
                         client = Mock(spec=herdr.Herdr)
@@ -1600,15 +1646,14 @@ class LaunchDestinationTests(StaffTestCase):
                                 herdr.NoOpeningPrompt(), 5000, agent=purpose)
                         self.assertEqual(launched.pane, "launched-pane")
                         script = cast(list[str], cast(Mock, client.run_in_pane).call_args.args[1])[1]
-                        command = shlex.join(["eval", script + '; print -r -- "worker-hooks:${#preexec_functions}"'])
+                        command = shlex.join(["eval", script])
                         setup = (command + "\n") * setups
                         shell = subprocess.run([shutil.which("zsh") or "/bin/zsh", "-dfi"],
                             input=f'{kind}() {{ print agent-returned; return 23; }}\n{setup}{kind}\nprint shell-retained\n',
                             cwd=self.root, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                         self.assertIn("agent-returned", shell.stdout)
-                        self.assertEqual(shell.stdout.splitlines().count("worker-hooks:1"), setups if purpose == "worker" else 0)
-                        self.assertEqual("shell-retained" in shell.stdout, purpose != "worker")
-                        self.assertEqual(shell.returncode, 23 if purpose == "worker" else 0, shell.stderr)
+                        self.assertIn("shell-retained", shell.stdout)
+                        self.assertEqual(shell.returncode, 0, shell.stderr)
 
     def test_quit_agent_accepts_a_shell_or_a_closed_worker_pane(self) -> None:
         from scripts.herdr import test_worker_panes, worker_panes
@@ -1620,14 +1665,14 @@ class LaunchDestinationTests(StaffTestCase):
                 self.addCleanup(case.doCleanups)
                 opened = case.start()
                 assert isinstance(opened, worker_panes.OpenWorker)
-                if closure != "before-row":
-                    case.world.exiting_panes.discard(opened.pane)
+                if closure == "before-row":
+                    case.world.exiting_panes.add(opened.pane)
                 activity = case.world.pane_activity
 
                 def read_activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
                     if closure == "before-activity":
                         case.world.remove_pane(pane)
-                        raise herdr.HerdrFailure("pane closed", "pane_not_found")
+                        raise herdr_types.HerdrFailure("pane closed", "pane_not_found")
                     return activity(pane)
 
                 with patch.object(case.world, "pane_activity", side_effect=read_activity):
@@ -1689,7 +1734,7 @@ class LaunchDestinationTests(StaffTestCase):
         def checked(*_args: object, **_kwargs: object) -> bool:
             self.assertFalse(run.called)
             if clock.elapsed < 0.2:
-                raise herdr.HerdrFailure("pane runs other work: direnv, bash", "wrong_target")
+                raise herdr_types.HerdrFailure("pane runs other work: direnv, bash", "wrong_target")
             return clock.elapsed >= 0.4
 
         with (patch.object(herdr, "check_target", side_effect=checked) as check,
@@ -1797,6 +1842,7 @@ class LaunchDestinationTests(StaffTestCase):
     def test_existing_pane_refuses_overwriting_proved_foreground_work(self) -> None:
         client = herdr.Herdr("agents")
         log = self.root / "occupied-pane.jsonl"
+        clock = StartupClock()
 
         def transport(*arguments: str, deadline: float = math.inf) -> str:
             del deadline
@@ -1812,9 +1858,10 @@ class LaunchDestinationTests(StaffTestCase):
             return "{}"
 
         with (patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=clock.advance)),
               patch.object(client, "run", side_effect=transport),
               patch.object(herdr, "start_agent") as started,
-              self.assertRaises(herdr.HerdrFailure)):
+              self.assertRaises(herdr_types.HerdrFailure)):
             _ = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
                 herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
                 herdr.NoOpeningPrompt(), 5000, agent="worker")
@@ -1831,7 +1878,7 @@ class LaunchDestinationTests(StaffTestCase):
         cast(Mock, client.startup_processes).return_value = herdr.PaneStartupObservation(
             herdr.PaneShell(123), herdr.PaneAtShell())
         with (patch.object(herdr, "Herdr", return_value=client),
-              patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed"))):
+              patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start failed"))):
             outcome = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
                 herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
                 herdr.NoOpeningPrompt(), 5000, agent="worker")
@@ -1882,7 +1929,7 @@ class LaunchDestinationTests(StaffTestCase):
                 if isinstance(fresh, FileNotFoundError):
                     self.assertFalse(herdr.check_target(identity, action="signal", shell=herdr.PaneShell(123)))
                 else:
-                    with self.assertRaisesRegex(herdr.HerdrFailure, "reused process"):
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, "reused process"):
                         _ = herdr.check_target(identity, action="signal", shell=herdr.PaneShell(123))
             signalled.assert_not_called()
             checked.assert_called_once_with(identity.pid)
@@ -1902,7 +1949,7 @@ class LaunchDestinationTests(StaffTestCase):
                 agent = herdr.AgentProcessIdentity(123, 789) if case == "shell" else identity
                 if case in ("shell", "reused"):
                     message = "agent identity matches the shell" if case == "shell" else "reused process"
-                    with self.assertRaisesRegex(herdr.HerdrFailure, message):
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, message):
                         _ = herdr.check_target(agent, action="signal", shell=herdr.PaneShell(123))
                 else:
                     self.assertEqual(herdr.check_target(agent, action="signal", shell=herdr.PaneShell(123)), case == "live")
@@ -1916,15 +1963,17 @@ class LaunchDestinationTests(StaffTestCase):
     def test_refused_environment_command_never_starts_an_agent(self) -> None:
         client = herdr.Herdr("agents")
         commands: list[tuple[str, ...]] = []
+        clock = StartupClock()
 
         def run(*arguments: str, deadline: float = math.inf) -> str:
             del deadline
             commands.append(arguments)
             if arguments == ("pane", "process-info", "--pane", "worker"):
-                raise herdr.HerdrFailure("private process facts are unavailable")
+                raise herdr_types.HerdrFailure("private process facts are unavailable")
             return "{}"
 
         with (patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=clock.advance)),
               patch.object(client, "panes", return_value=[{
                   "pane_id": "worker", "terminal_id": "terminal-one", "session_id": None}]),
               patch.object(client, "run", side_effect=run),
@@ -1942,6 +1991,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py")),
         })))
@@ -1966,6 +2017,32 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
 
                 self.assertEqual(closed, ["w1:p1" if verified else "w1:p2"])
                 self.assertEqual(pane_launch.read_strict(path), before)
+
+        for verified in (False, True):
+            with self.subTest(verified=verified, collision=True), self.retained() as (client, path, original):
+                del client
+                destination = path.with_name("agents.json")
+                replacement = original.copy()
+                replacement["written_at"] = "2026-11-03T12:00:00Z"
+                pane_launch.save(destination, {replacement["pane_id"]: replacement})
+                attempt = pane_launch.resume_attempt(destination, replacement["pane_id"])
+                panes = {path.stem: [original["pane_id"]], destination.stem: [replacement["pane_id"]]}
+                def close_source(pane: str) -> bool:
+                    panes[path.stem].remove(pane)
+                    return True
+                def close_destination(pane: str) -> bool:
+                    panes[destination.stem].remove(pane)
+                    return True
+                outcome = (pane_launch.VerifiedResume(replacement, frozenset({original["session_id"]}))
+                           if verified else pane_launch.FailedResume())
+                pane_launch.finish_restore(path, original, attempt, outcome, close=close_destination,
+                                           destination=destination, close_source=close_source)
+                self.assertEqual(panes, {path.stem: [] if verified else [original["pane_id"]],
+                                         destination.stem: [replacement["pane_id"]] if verified else []})
+                self.assertEqual(pane_launch.read_strict(destination),
+                                 {replacement["pane_id"]: replacement} if verified else {})
+                if not verified:
+                    self.assertEqual(pane_launch.read_strict(path)[original["pane_id"]], original)
 
     @contextmanager
     def retained(self) -> Generator[tuple[herdr.Herdr, Path, pane_launch.PaneLaunch]]:
@@ -2023,7 +2100,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                       patch.object(client, "_close_pane") as closed,
                       redirect_stderr(io.StringIO()) as errors):
                     if terminal:
-                        with self.assertRaisesRegex(herdr.HerdrFailure, "terminal identity changed"):
+                        with self.assertRaisesRegex(herdr_types.HerdrFailure, "terminal identity changed"):
                             _ = client.close_retained_pane("w1:p1")
                     else:
                         _ = client.close_retained_pane("w1:p1")
@@ -2049,7 +2126,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
         with self.retained() as (client, path, entry):
             with (patch.object(client, "pane_activity", return_value=herdr.PaneRunning(("editor",))),
                   patch.object(client, "_close_pane") as closed,
-                  self.assertRaisesRegex(herdr.HerdrFailure, "pane runs other work: editor")):
+                  self.assertRaisesRegex(herdr_types.HerdrFailure, "pane runs other work: editor")):
                 _ = client.close_retained_pane("w1:p1")
             closed.assert_not_called()
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
@@ -2115,10 +2192,10 @@ class PaneSelectionTests(StaffTestCase):
             {"pane_id": "w1:p2", "workspace_id": "w1", "session_id": row.current_session, "label": "stale-label"}]
         with patch.object(client, "panes", return_value=panes):
             self.assertEqual(client.pane_id(row.id), "w1:p2")
-            with self.assertRaisesRegex(herdr.HerdrFailure, "unavailable or ambiguous"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "unavailable or ambiguous"):
                 _ = client.pane_id("stale-label")
             panes[1]["session_id"] = fixture_runtime_id("replaced-session")
-            with self.assertRaisesRegex(herdr.HerdrFailure, "unavailable or ambiguous"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "unavailable or ambiguous"):
                 _ = client.pane_id(row.id)
 
 
@@ -2161,7 +2238,7 @@ class TargetCatastropheTests(StaffTestCase):
         cast(Mock, self.client.native_session).return_value = replacement
         for action in ("keys", "close"):
             with self.subTest(action=action):
-                with self.assertRaisesRegex(herdr.HerdrFailure, f"does not run session {self.row.id}") as refused:
+                with self.assertRaisesRegex(herdr_types.HerdrFailure, f"does not run session {self.row.id}") as refused:
                     _ = herdr.check_target(self.row.id, action=action,
                         place=herdr.HerdrPlace("fixture", "w1:p1"))
                 self.assertEqual(refused.exception.code, "wrong_target")
@@ -2171,7 +2248,7 @@ class TargetCatastropheTests(StaffTestCase):
     def test_target_check_refuses_input_or_closure_of_another_conversation(self) -> None:
         cast(Mock, self.client.native_session).return_value = fixture_runtime_id("another-conversation")
         for action in ("keys", "close"):
-            with self.subTest(action=action), self.assertRaisesRegex(herdr.HerdrFailure, "does not run session"):
+            with self.subTest(action=action), self.assertRaisesRegex(herdr_types.HerdrFailure, "does not run session"):
                 _ = herdr.check_target(self.row.id, action=action, place=herdr.HerdrPlace("fixture", "w1:p1"))
         cast(Mock, self.client.run).assert_not_called()
 
@@ -2181,7 +2258,7 @@ class TargetCatastropheTests(StaffTestCase):
         identity = Mock(return_value=herdr.AgentProcessIdentity(42, 101))
         reader.configure_mock(identity=identity)
         with (patch.object(herdr, "_startup_process_reader", return_value=reader),
-              self.assertRaisesRegex(herdr.HerdrFailure, "reused process")):
+              self.assertRaisesRegex(herdr_types.HerdrFailure, "reused process")):
             _ = herdr.check_target(original, action="signal")
 
     def test_target_check_allows_signalling_the_same_process_generation(self) -> None:
@@ -2194,17 +2271,17 @@ class TargetCatastropheTests(StaffTestCase):
         identity.assert_called_once_with(42)
 
     def test_target_check_refuses_signalling_the_shell(self) -> None:
-        with self.assertRaisesRegex(herdr.HerdrFailure, "signal the shell"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "signal the shell"):
             _ = herdr.check_target(herdr.AgentProcessIdentity(42, 100), action="signal", shell=herdr.PaneShell(42))
 
     def test_target_check_refuses_closing_another_terminal(self) -> None:
-        with self.assertRaisesRegex(herdr.HerdrFailure, "another terminal"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "another terminal"):
             _ = herdr.check_target(self.row.id, action="close", terminal="replaced-terminal",
                                place=herdr.HerdrPlace("fixture", "w1:p1"))
 
     def test_target_check_refuses_overwriting_unsaved_input(self) -> None:
         cast(Mock, self.client.run).return_value = "──────────\n❯ keep my draft\n──────────"
-        with self.assertRaisesRegex(herdr.HerdrFailure, "unsaved input"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "unsaved input"):
             _ = herdr.check_target(self.row.id, action="keys", text="replacement",
                                place=herdr.HerdrPlace("fixture", "w1:p1"))
 
@@ -2216,7 +2293,7 @@ class TargetCatastropheTests(StaffTestCase):
         cast(Mock, self.client.startup_processes).return_value = herdr.PaneStartupObservation(
             herdr.PaneShell(42), herdr.PaneAtShell())
         with (patch.object(herdr, "_startup_processes", return_value=herdr.PaneRunning(("editor",))),
-              self.assertRaisesRegex(herdr.HerdrFailure, "other live work")):
+              self.assertRaisesRegex(herdr_types.HerdrFailure, "other live work")):
             _ = herdr.check_target(self.row.id, action="close", place=herdr.HerdrPlace("fixture", "w1:p1"))
 
 class HerdrTests(unittest.TestCase):
@@ -2242,7 +2319,7 @@ class HerdrTests(unittest.TestCase):
             return result(*arguments, deadline=deadline)
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             if (pid, kind) != (998041, "claude"):
-                raise herdr.HerdrFailure("unexpected private process")
+                raise herdr_types.HerdrFailure("unexpected private process")
             return herdr.NativeAgentProcess(herdr.PaneSessionReport(session), "fixture-start", {})
         def composer(_pane: str) -> herdr.ComposerInput:
             return herdr.ComposerInput("")
@@ -2303,7 +2380,7 @@ class HerdrTests(unittest.TestCase):
                 return herdr.NativeAgentProcess(herdr.PaneSessionReport(current), "fixture-start", {})
 
             with patch.object(herdr, "native_process", side_effect=native):
-                with self.assertRaisesRegex(herdr.HerdrFailure, "does not run session"):
+                with self.assertRaisesRegex(herdr_types.HerdrFailure, "does not run session"):
                     client.answer_question(pane, text, target=session)
         self.assertEqual(commands, [("pane", "send-keys", pane, "shift+left"), ("pane", "send-text", pane, text)])
 
@@ -2323,7 +2400,7 @@ class HerdrTests(unittest.TestCase):
         from scripts.lib import script_prompts
 
         for error in (subprocess.TimeoutExpired("herdr", 10),
-                      herdr.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
+                      herdr_types.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
             client = self.herdr
             with (self.subTest(error=type(error).__name__),
                   self.prompt_target(client, "w1:p1", "fixture-submission"),
@@ -2343,7 +2420,7 @@ class HerdrTests(unittest.TestCase):
         from scripts.lib import script_prompts
 
         for error in (subprocess.TimeoutExpired("herdr", 10),
-                      herdr.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
+                      herdr_types.HerdrFailure("input can still arrive", "agent_prompt_stalled")):
             client = self.herdr
             with (self.subTest(error=type(error).__name__),
                   self.prompt_target(client, "w1:p1", "fixture-submission"),
@@ -2399,6 +2476,16 @@ class HerdrTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.configure([], "")
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": []}}))
+        if not process_boundary_for_case(self):
+            real_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+            def fixture_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                if command[0] != str(self.fake):
+                    return real_run(command, **options)
+                return self.run_fake(command, cast(float, options.get("timeout", herdr.PROGRAM_TIMEOUT_SECONDS)),
+                                     environment=cast(dict[str, str] | None, options.get("env")))
+
+            _ = self.enterContext(patch.object(subprocess, "run", fixture_command))
 
     def test_agent_status_decodes_all_server_states_and_future_states_as_unknown(self) -> None:
         for raw, state in [(value.value, value) for value in herdr.AgentStatus] + [("future-state", herdr.AgentStatus.UNKNOWN)]:
@@ -2442,16 +2529,17 @@ class HerdrTests(unittest.TestCase):
                 self.configure_herdr(["agent", "list"], json.dumps({"result": {"agents": [{
                     "pane_id": "worker", "agent": "codex", "agent_status": "idle", "agent_session": report,
                 }]}}))
-                with self.assertRaisesRegex(herdr.HerdrFailure, "herdr agent session"):
+                with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr agent session"):
                     _ = self.herdr.agents()
 
+    @process_boundary
     def test_label_pane_uses_a_persistent_pane_label(self) -> None:
         self.herdr.label_pane("worker", "dispatch-owner")
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "pane", "rename", "worker", "dispatch-owner"])
 
     def test_one_codex_foreground_process_uses_its_session_report_without_a_rollout(self) -> None:
         current = fixture_runtime_id("reported-current")
-        row = staff.StaffRow(staff.native_id(fixture_runtime_id("reported-fixed")), "agent", "probe",
+        row = staff.StaffRow(staff.native_id(fixture_runtime_id("reported-fixed")), "producer", "probe",
                              staff.StaffRoot(), current_session=staff.native_id(current))
         membership = staff.StaffSnapshot((row,))
         pane = {"pane_id": "w1:p1", "workspace_id": "w1", "terminal_id": "report-terminal",
@@ -2472,7 +2560,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_stale_report_cannot_claim_a_shell_a_claude_pane_or_two_foreground_processes(self) -> None:
         current = fixture_runtime_id("stale-pane-report")
-        row = staff.StaffRow(staff.native_id(fixture_runtime_id("stale-fixed")), "agent", "probe",
+        row = staff.StaffRow(staff.native_id(fixture_runtime_id("stale-fixed")), "producer", "probe",
                              staff.StaffRoot(), current_session=staff.native_id(current))
         membership = staff.StaffSnapshot((row,))
         pane: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "agent_session": {"value": current}}
@@ -2490,13 +2578,17 @@ class HerdrTests(unittest.TestCase):
                 with fake_unit_host.private_process_registry(), redirect_stderr(io.StringIO()):
                     scan = self.herdr.scan_row_panes(membership, [pane])
                 self.assertEqual(scan.found, {})
+                if arguments in ((["zsh"],), (["claude"],)):
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure,
+                                                "^expected one foreground codex process, found 0$"):
+                        _ = self.herdr.native_session("w1:p1", "codex", 1, pane_row=pane)
 
     def test_pane_report_and_resume_accept_an_empty_or_matching_identity(self) -> None:
         current = fixture_runtime_id("herdr-codex-launch")
         other = fixture_runtime_id("stale-report-loser")
 
         def configure(report: str, info: dict[str, object]) -> tuple[staff.StaffSnapshot, dict[str, object]]:
-            rows = tuple(staff.StaffRow(staff.native_id(fixture_runtime_id("fixed-" + value)), "agent", name,
+            rows = tuple(staff.StaffRow(staff.native_id(fixture_runtime_id("fixed-" + value)), "producer", name,
                                        staff.StaffRoot(), current_session=staff.native_id(value))
                          for name, value in (("native", current), ("reported", other)))
             pane: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "terminal_id": "terminal",
@@ -2521,7 +2613,7 @@ class HerdrTests(unittest.TestCase):
                             self.assertEqual(scan.found, {})
                             with patch.object(self.herdr, "pane_row", return_value={"pane_id": "w1:p1",
                                               "workspace_id": "w1", "terminal_id": "terminal", "session_id": report}):
-                                with self.assertRaises(herdr.HerdrFailure):
+                                with self.assertRaises(herdr_types.HerdrFailure):
                                     self.herdr.prompt("w1:p1", "Do not send this task.", target=current)
                             self.assertEqual([command for command in self.commands()
                                               if command[2:4] == ["agent", "prompt"]], [])
@@ -2836,7 +2928,7 @@ class HerdrTests(unittest.TestCase):
         with (native_process_commands(11, generations=(original, replacement)),
               patch.object(os, "kill") as signalled):
             self.assertTrue(herdr.check_target(original, action="signal", shell=herdr.PaneShell(10)))
-            with self.assertRaisesRegex(herdr.HerdrFailure, "reused process"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "reused process"):
                 _ = herdr.check_target(original, action="signal", shell=herdr.PaneShell(10))
         signalled.assert_not_called()
 
@@ -2862,7 +2954,7 @@ class HerdrTests(unittest.TestCase):
               patch.object(herdr, "Herdr", return_value=client),
               patch.object(os, "kill") as signalled,
               patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)),
-              patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start failed"))):
+              patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start failed"))):
             _ = herdr.launch_prepared_agent("fixture", herdr.SplitPane("parent", "right", 0.5, "worker"),
                 herdr.PreparedAgentEnvironment(self.root, {}), "claude", [],
                 herdr.NoOpeningPrompt(), 1000, agent="worker")
@@ -2921,7 +3013,8 @@ class HerdrTests(unittest.TestCase):
         """Replay the command fake in process while Popen models the server child."""
         self.assertGreater(timeout, 0)
         stdout, stderr = io.StringIO(), io.StringIO()
-        with patch.dict(os.environ, environment or {}), redirect_stdout(stdout), redirect_stderr(stderr):
+        with patch.dict(os.environ, environment if environment is not None else dict(os.environ), clear=True), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
             code = fake_herdr.main(argv[1:])
         return subprocess.CompletedProcess(argv, code, stdout.getvalue(), stderr.getvalue())
 
@@ -3007,7 +3100,7 @@ class HerdrTests(unittest.TestCase):
                    herdr.nix_env.HEAL_DIRECTORY_ENV: str(self.root), "IN_NIX_SHELL": "impure"}
         process = WaitingAgentCLI(StartupClock(), 0, lambda: None)
         with (patch.dict(os.environ, handoff),
-              patch.object(herdr.Herdr, "startup_processes", side_effect=herdr.HerdrFailure("fixture has no shell")),
+              patch.object(herdr.Herdr, "startup_processes", side_effect=herdr_types.HerdrFailure("fixture has no shell")),
               patch.object(subprocess, "Popen", return_value=process) as spawn):
             result = self.herdr.start_command(["agent-start"], "claude", "pane", 1.0)
         self.assertEqual(result.returncode, 0)
@@ -3023,12 +3116,13 @@ class HerdrTests(unittest.TestCase):
         isolated.mkdir(parents=True)
         _ = shutil.copy2(Path(herdr.__file__), isolated / "herdr.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("herdr_types.py"), isolated / "herdr_types.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
         message = isolated.parent / "message"
         copy_session_modules(message)
         _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "shutdown/remote.py"):
+        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "agents/remote.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
@@ -3057,7 +3151,7 @@ class HerdrTests(unittest.TestCase):
         self.responses["--session fixture status server"] = [
             {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
         _ = self.responses_path.write_text(json.dumps(self.responses))
-        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr server for fixture did not start"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr server for fixture did not start"):
             _ = herdr.start_server("fixture", 90_000)
         self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]] * 2 + [
             ["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"]])
@@ -3093,7 +3187,7 @@ class HerdrTests(unittest.TestCase):
 
         with (patch.object(time, "monotonic", side_effect=lambda: clock.elapsed),
               patch.object(time, "sleep", side_effect=advance),
-              self.assertRaisesRegex(herdr.HerdrFailure, "did not start")):
+              self.assertRaisesRegex(herdr_types.HerdrFailure, "did not start")):
             _ = herdr.start_server("fixture", 250)
         self.assertFalse(any(command[2:3] == ["workspace"] for command in self.commands()))
 
@@ -3115,11 +3209,12 @@ class HerdrTests(unittest.TestCase):
 
         with (patch.object(time, "monotonic", side_effect=lambda: clock.elapsed),
               patch.object(herdr, "run_program", side_effect=slow_probe),
-              self.assertRaisesRegex(herdr.HerdrFailure, "did not start")):
+              self.assertRaisesRegex(herdr_types.HerdrFailure, "did not start")):
             _ = herdr.start_server("fixture", 90_000)
         self.assertEqual(budgets, [10, 8, 6])
         self.assertEqual(clock.elapsed, 10)
 
+    @process_boundary
     def test_darwin_identity_preserves_registry_start_time_and_pins_locale_and_zone(self) -> None:
         self.darwin()
         started = "Thu Oct  1 12:00:00 2026"
@@ -3143,7 +3238,7 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-a", "-p", "42", "-Fn"], code=1)
         self.assertEqual(herdr.darwin_open_files(42), [])
         self.configure(["-a", "-p", "42", "-Fn"], code=1, stderr="permission denied")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "process 42 open files.*permission denied"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "process 42 open files.*permission denied"):
             _ = herdr.darwin_open_files(42)
 
     def test_darwin_environment_uses_only_the_suffix_after_unchanged_arguments(self) -> None:
@@ -3437,7 +3532,7 @@ class HerdrTests(unittest.TestCase):
     def test_binary_missing_and_override(self) -> None:
         self.assertEqual(herdr.herdr_binary(), str(self.fake))
         with patch.dict(os.environ, {"HERDR_BIN": ""}), patch.object(shutil, "which", return_value=None):
-            with self.assertRaisesRegex(herdr.HerdrMissing, "herdr is not installed"):
+            with self.assertRaisesRegex(herdr_types.HerdrMissing, "herdr is not installed"):
                 _ = herdr.herdr_binary()
         with patch.dict(os.environ, {"HERDR_BIN": ""}), patch.object(shutil, "which", return_value="/fixture/herdr"):
             self.assertEqual(herdr.herdr_binary(), "/fixture/herdr")
@@ -3445,13 +3540,13 @@ class HerdrTests(unittest.TestCase):
     def test_argv_and_refusal_preserve_code_and_message(self) -> None:
         self.assertEqual(self.herdr.argv("pane", "list"), [str(self.fake), "--session", "fixture", "pane", "list"])
         self.configure_herdr(["pane", "list"], code=1, stderr=json.dumps({"error": {"code": "not_found", "message": "missing pane"}}))
-        with self.assertRaisesRegex(herdr.HerdrFailure, "not_found: missing pane") as raised:
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "not_found: missing pane") as raised:
             _ = self.herdr.panes()
         self.assertEqual(raised.exception.code, "not_found")
 
     def test_invalid_json_is_a_library_failure(self) -> None:
         self.configure_herdr(["pane", "list"], "[]")
-        with self.assertRaises(herdr.HerdrFailure):
+        with self.assertRaises(herdr_types.HerdrFailure):
             _ = self.herdr.panes()
 
     def test_session_of_keeps_the_terminal_but_clears_the_conversation_after_claude_exits(self) -> None:
@@ -3511,7 +3606,7 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p2", "label": "alpha", "terminal_id": "terminal-alpha"}]}}))
         self.configure_herdr(start, code=1, stderr="agent failed to start")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "agent failed to start"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "agent failed to start"):
             _ = self.herdr.run(*start)
         self.assertEqual(self.herdr.panes(), [{"pane_id": "w1:p2", "label": "alpha",
                                                "workspace_id": "w1", "session_id": None,
@@ -3618,7 +3713,7 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["status", "server"], "status: stopped\n")
         creation = self.server_creation()
         self.configure(creation, code=1, stderr="fixture manager unavailable")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "fixture manager unavailable"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "fixture manager unavailable"):
             _ = herdr.start_server("fixture", 10_000)
         self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"], SCOPE_PROBE, creation])
 
@@ -3885,7 +3980,7 @@ class HerdrTests(unittest.TestCase):
         self.herdr.focus_workspace("w3")
         self.assertEqual(self.commands(), [["--session", "fixture", "workspace", "focus", "w3"]])
         self.configure_herdr(["workspace", "focus", "w3"], code=1, stderr="workspace no longer exists")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "workspace no longer exists"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "workspace no longer exists"):
             self.herdr.focus_workspace("w3")
 
     def test_startup_cleanup_closes_only_the_untouched_home_shell_and_preserves_the_restored_workspace(self) -> None:
@@ -4367,6 +4462,7 @@ class HerdrTests(unittest.TestCase):
         self.assertTrue(all(timeout <= 1 - called_at for called_at, timeout in calls))
         self.assertLess(calls[-1][1], 0.5)
 
+    @process_boundary
     def test_start_does_not_treat_an_unreadable_observation_as_an_exit(self) -> None:
         source = self.fake.read_text().replace(
             '    responses = cast(',
@@ -4546,7 +4642,7 @@ class HerdrTests(unittest.TestCase):
                 self.configure_herdr(["pane", "process-info", "--pane", "w1:p1"], json.dumps({
                     "result": {"process_info": info},
                 }))
-                with self.assertRaises(herdr.HerdrFailure):
+                with self.assertRaises(herdr_types.HerdrFailure):
                     _ = self.herdr.pane_activity("w1:p1")
 
     def test_prompt_refusal_raises_blocked_without_retry(self) -> None:
@@ -4632,7 +4728,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(self.herdr.agents(deadline=deadline), [])
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
             program.reset_mock()
-            with self.assertRaisesRegex(herdr.HerdrFailure, "deadline passed"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "deadline passed"):
                 _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=99.0)
             program.assert_not_called()
             _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
@@ -4854,12 +4950,12 @@ class HerdrTests(unittest.TestCase):
 
     def test_process_snapshot_serves_roster_units_inventory_and_codex_from_one_scan(self) -> None:
         from scripts.message import roster
-        from scripts.shutdown import inventory
+        from scripts.agents import inventory
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         unit = unit_membership("production", "unit")
-        codex = fixture_member("agent", name="codex-pane")
+        codex = fixture_member("producer", name="codex-pane")
 
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
@@ -4881,9 +4977,8 @@ class HerdrTests(unittest.TestCase):
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:
-                return (roster._every_labeled_session(), inventory._unit_sessions((  # pyright: ignore[reportPrivateUsage]
-                    inventory.ShowrunnerRegistration("runner", "production", str(self.root / "production.md")),
-                )), roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
+                return (roster._every_labeled_session(), inventory._unit_sessions(staff.snapshot()),  # pyright: ignore[reportPrivateUsage]
+                        roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
 
             expected = read_callers()
             self.assertEqual(scans.call_count, 3)
@@ -4926,9 +5021,9 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(herdr.herdr_processes()[0].marks["CODEX_THREAD_ID"], "second")
 
     def test_process_snapshot_does_not_change_scan_failure_or_retry(self) -> None:
-        with (patch.object(herdr, "_process_sessions", side_effect=[herdr.HerdrFailure("fixture scan failed"), {}]) as scans,
+        with (patch.object(herdr, "_process_sessions", side_effect=[herdr_types.HerdrFailure("fixture scan failed"), {}]) as scans,
               herdr.process_snapshot()):
-            with self.assertRaisesRegex(herdr.HerdrFailure, "fixture scan failed"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "fixture scan failed"):
                 _ = herdr.herdr_processes()
             self.assertEqual(herdr.herdr_processes(), [])
             self.assertEqual(herdr.herdr_processes(), [])
@@ -5231,7 +5326,7 @@ class HerdrTests(unittest.TestCase):
         log.parent.mkdir(parents=True)
         _ = log.write_text("server could not bind its socket\n")
         with patch.object(time, "sleep") as pause:
-            with self.assertRaises(herdr.HerdrFailure) as raised:
+            with self.assertRaises(herdr_types.HerdrFailure) as raised:
                 _ = herdr.start_server("fixture", 90_000)
             self.assertEqual(str(raised.exception), f"herdr server for fixture did not start; see {log}")
             pause.assert_not_called()
@@ -5244,7 +5339,7 @@ class HerdrTests(unittest.TestCase):
             {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
         self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"],
                        code=1, stderr="inspection denied")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr server for fixture did not start"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr server for fixture did not start"):
             _ = herdr.start_server("fixture", 90_000)
         self.assertFalse(any(command[2:3] == ["workspace"] for command in self.commands()))
 
@@ -5253,7 +5348,7 @@ class HerdrTests(unittest.TestCase):
         spawn, _ = self.detached_server()
         spawn.side_effect = OSError("cannot execute")
         self.configure_herdr(["status", "server"], "status: stopped\n")
-        with self.assertRaises(herdr.HerdrFailure) as raised:
+        with self.assertRaises(herdr_types.HerdrFailure) as raised:
             _ = herdr.start_server("fixture", 90_000)
         self.assertEqual(str(raised.exception), "herdr server for fixture did not start")
 
@@ -5262,7 +5357,7 @@ class HerdrTests(unittest.TestCase):
         self.darwin()
         herdr.stop_session("foo.service")
         self.configure(["--session", "foo.service", "server", "stop"], code=1, stderr="stop refused")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "stop refused"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "stop refused"):
             herdr.stop_session("foo.service")
         self.assertEqual(self.commands(), [["--session", "foo.service", "server", "stop"]] * 2)
 
@@ -5275,10 +5370,10 @@ class HerdrTests(unittest.TestCase):
         for output in ("", "Thu Oct 15 12:00:00 2026", "malformed ttys001",
                        "Thu Oct 15 12:00:00 2026 ttys001\nThu Oct 15 12:00:00 2026 ??"):
             self.configure(["-o", "lstart=,tty=", "-p", "42"], output)
-            with self.subTest(output=output), self.assertRaisesRegex(herdr.HerdrFailure, "process 42"):
+            with self.subTest(output=output), self.assertRaisesRegex(herdr_types.HerdrFailure, "process 42"):
                 _ = herdr.darwin_process_identity(42)
         self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="process vanished")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "process vanished"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "process vanished"):
             _ = herdr.darwin_process_identity(42)
 
 
@@ -5288,17 +5383,17 @@ class HerdrTests(unittest.TestCase):
         self.responses["-o command= -p 42"] = [
             {"stdout": "claude\n", "code": 0}, {"stdout": "claude HERDR_PANE_ID=forged\n", "code": 0}]
         _ = self.responses_path.write_text(json.dumps(self.responses))
-        with self.assertRaisesRegex(herdr.HerdrFailure, "stable command"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "stable command"):
             _ = herdr.darwin_process_environment(42)
         self.configure(["-o", "command=", "-p", "42"], code=1, stderr="vanished")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "vanished"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "vanished"):
             _ = herdr.darwin_process_environment(42)
 
 
     def test_darwin_unreadable_command_cannot_be_used_to_read_an_environment(self) -> None:
         self.darwin()
         self.darwin_environment(42, "(herdr)", "HERDR_SESSION=writing")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "arguments are unreadable"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "arguments are unreadable"):
             _ = herdr.darwin_process_environment(42)
         self.assertEqual(self.commands(), [["-o", "command=", "-p", "42"]])
 
@@ -5309,11 +5404,11 @@ class HerdrTests(unittest.TestCase):
         for sockets in ("", f"p70\nf3\nn{path}\np71\nf3\nn{path}\n"):
             with self.subTest(sockets=sockets):
                 self.darwin_sockets(sockets)
-                with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*listening socket holder"):
+                with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*listening socket holder"):
                     _ = herdr.server_environment("fixture")
         self.darwin_sockets(f"p70\nf3\nn{path}\n")
         self.configure(["-o", "command=", "-p", "70"], code=1, stderr="environment unavailable")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*environment unavailable"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*environment unavailable"):
             _ = herdr.server_environment("fixture")
 
 
@@ -5321,7 +5416,7 @@ class HerdrTests(unittest.TestCase):
         self.darwin()
         self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"],
                        code=1, stderr="socket inspection denied")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*socket inspection denied"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*socket inspection denied"):
             _ = herdr.server_environment("fixture")
         self.assertEqual(herdr.herdr_processes(), [])
 
@@ -5332,7 +5427,7 @@ class HerdrTests(unittest.TestCase):
         for workspace in workspaces:
             with self.subTest(workspace=workspace), patch.object(client, "result", return_value={"panes": [
                     {"pane_id": "w1:p1", "label": "alpha", "workspace_id": workspace}]}):
-                with self.assertRaisesRegex(herdr.HerdrFailure, "herdr pane workspace id: expected text"):
+                with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr pane workspace id: expected text"):
                     _ = client.panes()
 
 
@@ -5340,13 +5435,13 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": []}}))
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": 3}]}}))
-        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr workspace label: expected text"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr workspace label: expected text"):
             _ = self.herdr.tab_sessions()
 
 
     def test_stop_checks_unit_after_server_refusal(self) -> None:
         self.configure_herdr(["server", "stop"], code=1, stderr="server failed")
-        with self.assertRaises(herdr.HerdrFailure):
+        with self.assertRaises(herdr_types.HerdrFailure):
             herdr.stop_session("fixture")
         self.assertEqual(self.commands()[-1], ["--user", "stop", "herdr-fixture.service"])
 
@@ -5360,7 +5455,7 @@ class HerdrTests(unittest.TestCase):
                                            ["--session", "fixture", "workspace", "focus", "w2"],
                                            ["--session", "fixture", "tab", "focus", "w2:t2"]])
         self.log.unlink()
-        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr pane w9:p9 is not open in session fixture"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr pane w9:p9 is not open in session fixture"):
             self.herdr.focus_tab_of("w9:p9")
         self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
 
@@ -5368,7 +5463,7 @@ class HerdrTests(unittest.TestCase):
     def test_shared_session_is_never_stopped_and_close_agent_closes_only_the_tab(self) -> None:
         self.share()
         self.configure_startup_shell("w1:p2")
-        with self.assertRaisesRegex(herdr.HerdrFailure, "close one tab instead"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "close one tab instead"):
             herdr.stop_session("fixture")
         self.responses["--session fixture pane list"] = [
             {"stdout": json.dumps({"result": {"panes": [
@@ -5393,7 +5488,7 @@ class HerdrTests(unittest.TestCase):
         self.configure_startup_shell("w1:p2")
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
-        with self.assertRaisesRegex(herdr.HerdrFailure, "tab closure is not confirmed"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "tab closure is not confirmed"):
             herdr.close_agent("fixture", "w1:p2")
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "pane", "list"],
@@ -5552,7 +5647,7 @@ class HerdrTests(unittest.TestCase):
         self.unix_socket(self.root / "config/herdr/sessions/other/herdr.sock", 200)
         process = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
         self.socket_fd(process, 100)
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*listening socket, found 0"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*listening socket, found 0"):
             _ = herdr.server_environment("fixture")
 
 
@@ -5563,7 +5658,7 @@ class HerdrTests(unittest.TestCase):
         client = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "session", "attach", "fixture"], {})
         self.socket_fd(client, 101)
         _ = self.process(20, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*socket holder, found 0"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*socket holder, found 0"):
             _ = herdr.server_environment("fixture")
 
 
@@ -5573,7 +5668,7 @@ class HerdrTests(unittest.TestCase):
         second = self.process(20, 1, ["/fixture/herdr", "--handoff"], {"ACCOUNT": "second"})
         self.socket_fd(first, 100)
         self.socket_fd(second, 100)
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*socket holder, found 2"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*socket holder, found 2"):
             _ = herdr.server_environment("fixture")
 
 
@@ -5584,7 +5679,7 @@ class HerdrTests(unittest.TestCase):
         for pid, inode in ((10, 100), (20, 200)):
             process = self.process(pid, 1, ["/fixture/herdr", "server"], {})
             self.socket_fd(process, inode)
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*listening socket, found 2"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*listening socket, found 2"):
             _ = herdr.server_environment("fixture")
 
 
@@ -5594,23 +5689,23 @@ class HerdrTests(unittest.TestCase):
         self.socket_fd(process, 100)
         process.joinpath("environ").unlink()
         process.joinpath("environ").mkdir()
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*cannot read process environment"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*cannot read process environment"):
             _ = herdr.server_environment("fixture")
 
 
     def test_server_environment_reports_unreadable_socket_table(self) -> None:
         self.proc.joinpath("net", "unix").mkdir(parents=True)
-        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*cannot read listening sockets"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "session fixture.*cannot read listening sockets"):
             _ = herdr.server_environment("fixture")
 
 
     def test_plain_calls_and_session_listing_translate_timeouts(self) -> None:
         with patch.object(herdr, "run_program", side_effect=subprocess.TimeoutExpired("fake", 10)):
-            with self.assertRaisesRegex(herdr.HerdrFailure, "herdr pane list: no answer after 10 s"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr pane list: no answer after 10 s"):
                 _ = self.herdr.run("pane", "list")
-            with self.assertRaisesRegex(herdr.HerdrFailure, "herdr pane list: no answer after 10 s"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr pane list: no answer after 10 s"):
                 _ = self.herdr.result("pane", "list")
-            with self.assertRaisesRegex(herdr.HerdrFailure, "herdr session list: no answer after 10 s"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "herdr session list: no answer after 10 s"):
                 _ = herdr.live_sessions()
 
 
@@ -5715,7 +5810,7 @@ class LayoutHerdr(herdr.Herdr):
 
     def require_time(self, deadline: float) -> None:
         if time.monotonic() >= deadline:
-            raise herdr.HerdrFailure("fixture command deadline exhausted")
+            raise herdr_types.HerdrFailure("fixture command deadline exhausted")
 
     def new_id(self, kind: str) -> str:
         self.count += 1
@@ -5857,7 +5952,7 @@ class RowTabsHerdr(LayoutHerdr):
     @override
     def run(self, *arguments: str, deadline: float = math.inf) -> str:
         if arguments[:2] == ("pane", "focus"):
-            raise herdr.HerdrFailure("usage: herdr pane focus --direction left|right|up|down [--pane ID|--current]")
+            raise herdr_types.HerdrFailure("usage: herdr pane focus --direction left|right|up|down [--pane ID|--current]")
         result = super().run(*arguments, deadline=deadline)
         if arguments[:2] == ("tab", "focus"):
             members = [pane for pane in self.tabs if pane["tab_id"] == arguments[2]]
@@ -5892,7 +5987,7 @@ class RowTabsHerdr(LayoutHerdr):
         if arguments[:2] == ("pane", "process-info"):
             pane = next(row for row in self.tabs if row["pane_id"] == arguments[-1])
             if pane["pane_id"] in self.unknown:
-                raise herdr.HerdrFailure("private process facts are unavailable")
+                raise herdr_types.HerdrFailure("private process facts are unavailable")
             if "session_id" not in pane:
                 return {"process_info": {"shell_pid": 990042, "foreground_process_group_id": 990042,
                     "foreground_processes": [{"pid": 990042, "argv": ["zsh"], "name": "zsh"}]}}
@@ -5955,7 +6050,7 @@ class RowTabTests(StaffTestCase):
         original = self.client.run if method == "run" else self.client.result
         def refuse(*arguments: str, deadline: float = math.inf) -> str | dict[str, object]:
             if arguments[:len(prefix)] == prefix and (not option or option in arguments):
-                raise herdr.HerdrFailure(reason)
+                raise herdr_types.HerdrFailure(reason)
             return original(*arguments, deadline=deadline)
         with patch.object(self.client, method, side_effect=refuse), redirect_stderr(io.StringIO()) as errors:
             yield errors
@@ -5967,7 +6062,7 @@ class RowTabTests(StaffTestCase):
 
     def test_a_staff_root_has_no_parent_workspace(self) -> None:
         before = self.staff_file.read_bytes()
-        with self.assertRaisesRegex(herdr.HerdrFailure, "has no parent workspace"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "has no parent workspace"):
             _ = self.client.move_row_tabs(self.rows["parent"].id)
         self.assertEqual(self.client.commands, [])
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -6248,7 +6343,7 @@ class RowTabTests(StaffTestCase):
             self.client.require_time(deadline)
             if arguments == ("pane", "list"):
                 return {"panes": []}
-            raise herdr.HerdrFailure(f"unconfigured command: {arguments}")
+            raise herdr_types.HerdrFailure(f"unconfigured command: {arguments}")
 
         with patch.object(self.client, "result", side_effect=result):
             self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
@@ -6297,10 +6392,10 @@ class RowTabTests(StaffTestCase):
         def refuse(method: str, **params: object) -> dict[str, object]:
             if method == "tab.move":
                 self.client.focused_pane, self.client.focused_workspace = foreign, "w3"
-                raise herdr.HerdrFailure("private order failure")
+                raise herdr_types.HerdrFailure("private order failure")
             return request(method, **params)
 
-        with patch.object(self.client, "socket_request", side_effect=refuse), self.assertRaisesRegex(herdr.HerdrFailure, "private order failure"):
+        with patch.object(self.client, "socket_request", side_effect=refuse), self.assertRaisesRegex(herdr_types.HerdrFailure, "private order failure"):
             _ = self.client.move_row_tabs(self.rows["unit"].id)
         focused = next(pane for pane in self.client.tabs if pane["pane_id"] == self.client.focused_pane)
         selected_tab = next(pane["tab_id"] for pane in self.client.tabs if pane["pane_id"] == selected)
@@ -6444,6 +6539,27 @@ class SavedLayoutTests(unittest.TestCase):
 
     def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
         client = LayoutHerdr()
+        cases: tuple[tuple[staff.Kind, str, str], ...] = (
+            ("showrunner", "production", "production"),
+            ("producer", "first-producer", "producers"),
+            ("producer", "second-producer", "producers"))
+        configuration = self.root / "configuration"
+        configuration.mkdir()
+        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        for kind, name, workspace in cases:
+            with self.subTest(kind=kind, name=name):
+                row = staff.StaffRow(staff.StaffId("missing-row"), kind, name, staff.STAFF_ROOT,
+                                    current_session=staff.StaffId("missing-current"))
+                record = staff.StaffSnapshot((row,))
+                self.assertEqual(client.saved_row_tab(row.id, row.name, herdr.row_workspace(row, record, row.name)),
+                                 herdr.NewTab(workspace, name))
+        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=crew\n")
+        producer = staff.StaffRow(staff.StaffId("producer-row"), "producer", "custom-producer", staff.STAFF_ROOT,
+                                  current_session=staff.StaffId("producer-current"))
+        self.assertEqual(client.saved_row_tab(producer.id, producer.name,
+                         herdr.row_workspace(producer, staff.StaffSnapshot((producer,)), producer.name)),
+                         herdr.NewTab("crew", producer.name))
         self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
                          herdr.NewTab("production", "unit"))
 

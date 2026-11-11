@@ -12,6 +12,9 @@ import textwrap
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
 from typing import NamedTuple, cast, override
 from unittest.mock import patch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -160,13 +163,14 @@ class IsolatedHookTests(unittest.TestCase):
         # Start afresh: never inherit a director's active run, state, pane or log paths.
         self.environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
         self.environment.update({
-            "HOME": str(self.home), "TMPDIR": str(temp), "USER_ZONE": "UTC",
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home), "TMPDIR": str(temp), "USER_ZONE": "UTC",
             "XDG_STATE_HOME": str(self.home / ".local/state"),
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
             "CLAUDE_CONTEXT_HOOK_DEBUG": "0", "CLAUDE_CONTEXT_HOOK_MODE": "dynamic",
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause"),
             "FN_LENGTH_HOOK_STATE": str(self.root / "fn-length"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         })
@@ -297,13 +301,13 @@ class RealHookEquivalenceTests(IsolatedHookTests):
                     self.assertEqual(outcome.output, {})
 
     def test_dispatcher_allows_stop_during_an_active_run_near_compaction(self) -> None:
-        session_id = "dispatcher-active-director"
+        session_id = fixture_runtime_id("dispatcher-active-director")
         run = self.root / "unit-run"
         run.mkdir()
         _ = (run / "director").write_text(session_id + "\n", encoding="utf-8")
-        markers = Path(self.environment["UNIT_ACTIVE_DIR"])
-        markers.mkdir()
-        _ = (markers / session_id).write_text(str(run) + "\n", encoding="utf-8")
+        row = staff.StaffRow(staff.StaffId(session_id), "showrunner", "director", staff.StaffRoot(),
+                             current_session=staff.StaffId(session_id), run=staff.OpenRun(run))
+        _ = Path(self.environment["STAFF_FILE"]).write_text(json.dumps({"schema": 2, "rows": [row.to_json()]}))
         settings = self.home / ".claude/settings.json"
         settings.parent.mkdir(parents=True)
         _ = settings.write_text(json.dumps({"autoCompactWindow": 200_000}), encoding="utf-8")
@@ -761,6 +765,29 @@ class DispatcherRepairTests(IsolatedHookTests):
 
 
 class CopyGuardDispatchTests(IsolatedHookTests):
+    def dispatch_cases(self, commands: Sequence[str | list[str]], cwd: str) -> list[subprocess.CompletedProcess[str]]:
+        """Run each real dispatcher entry in one isolated main-thread driver."""
+        driver = (
+            "import json, os, sys\n"
+            + "from io import StringIO\n"
+            + "from pathlib import Path\n"
+            + "from unittest.mock import patch\n"
+            + "from scripts.hooks import hook_dispatch as dispatch\n"
+            + "from scripts.production.cli_fixture import invoke_cli\n"
+            + "payloads = json.load(sys.stdin)['payloads']\nresults = []\n"
+            + "for payload in payloads:\n"
+            + "    with patch.object(sys, 'stdin', StringIO(json.dumps(payload))):\n"
+            + "        result = invoke_cli(dispatch, dispatch.main, ['pre_tool_use'], dict(os.environ), Path.cwd())\n"
+            + "    results.append((result.returncode, result.stdout, result.stderr))\n"
+            + "print(json.dumps(results))\n"
+        )
+        payloads = [{"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd} for command in commands]
+        result = self.run_python(["-c", driver], {"payloads": payloads})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = cast(list[tuple[int, str, str]], json.loads(result.stdout))
+        return [subprocess.CompletedProcess([str(DISPATCH), "pre_tool_use"], code, stdout, stderr)
+                for code, stdout, stderr in outcomes]
+
     def test_copy_guard_failure_preserves_a_later_hooks_refusal(self) -> None:
         later = self.root / "later-guard.py"
         marker = self.root / "later-ran"
@@ -808,10 +835,10 @@ class CopyGuardDispatchTests(IsolatedHookTests):
         self.assertTrue(later.exists())
 
     def test_registered_dispatch_distinguishes_literal_and_executable_substitutions(self) -> None:
-        for case in shell_policy_cases():
+        cases = shell_policy_cases()
+        results = self.dispatch_cases([case.command for case in cases], "/")
+        for case, result in zip(cases, results, strict=True):
             with self.subTest(command=case.command):
-                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
-                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": "/"})
                 self.assertEqual(result.returncode, 2 if case.operation else 0, result.stderr)
                 if case.operation:
                     self.assertTrue(result.stderr.startswith(case.operation + ":"), result.stderr)
@@ -829,24 +856,26 @@ class CopyGuardDispatchTests(IsolatedHookTests):
         self.assertEqual(result.stdout, "")
 
     def test_interpreter_vectors_and_unresolved_programs_reach_the_dispatcher_policy(self) -> None:
-        for command, operation in argv_policy_cases():
+        vectors = argv_policy_cases()
+        results = self.dispatch_cases([case[0] for case in vectors], str(self.root))
+        for (command, operation), result in zip(vectors, results, strict=True):
             with self.subTest(command=command):
-                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
-                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)})
                 self.assertEqual(result.returncode, 2 if operation else 0, result.stderr)
                 self.assertEqual(result.stderr.split(":", 1)[0] if result.stderr else "", operation)
-        for command, reason in unresolved_policy_cases():
+        unresolved = unresolved_policy_cases()
+        results = [self.run_python([str(DISPATCH), "pre_tool_use"], {
+            "tool_name": "Bash", "tool_input": {"command": unresolved[0][0]}, "cwd": str(self.root)})]
+        results.extend(self.dispatch_cases([case[0] for case in unresolved[1:]], str(self.root)))
+        for (command, reason), result in zip(unresolved, results, strict=True):
             with self.subTest(command=command):
-                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
-                    "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)})
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertTrue(result.stderr.startswith("unresolved relevant operation: " + reason + ":"), result.stderr)
 
     def test_recorded_commands_and_interpreter_descriptor_context_matrix(self) -> None:
-        for case in repair_policy_cases():
+        cases = repair_policy_cases()
+        results = self.dispatch_cases([case.command for case in cases], str(self.root))
+        for case, result in zip(cases, results, strict=True):
             with self.subTest(case=case.name, provenance=case.provenance):
-                result = self.run_python([str(DISPATCH), "pre_tool_use"], {
-                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
                 self.assertEqual(result.returncode, 2 if case.expected else 0, result.stderr)
                 if case.expected:
                     self.assertTrue(result.stderr.startswith(case.expected + ":"), result.stderr)

@@ -28,7 +28,7 @@ from pathlib import Path
 from subprocess import Popen
 from typing import Literal, cast
 
-from scripts.lib import process_group
+from scripts.lib import conf_reads, process_group
 from scripts.lib.atomic_file import write_text_atomic
 
 CONFIG = Path(__file__).resolve().parents[2] / "config/send_repeat_guard.conf"
@@ -67,7 +67,7 @@ def configuration() -> Limits | GuardUnavailable:
     path = Path(os.environ.get("SEND_REPEAT_CONFIG", str(CONFIG)))
     try:
         values: dict[str, int] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in conf_reads.read_text(path).splitlines():
             line = line.split("#", 1)[0].strip()
             if not line:
                 continue

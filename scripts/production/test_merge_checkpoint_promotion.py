@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 import argparse
 import fcntl
 from collections.abc import Generator
@@ -17,10 +19,10 @@ import threading
 import time
 import unittest
 from unittest import mock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import final
 from scripts.production.cli_fixture import production_paths
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from zoneinfo import ZoneInfo
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -168,19 +170,19 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.production_doc()
         checkpoint = self.checkpoint()
         with self.refuse_bump_gate_launch(), mock.patch.object(merge_checkpoint, "promote", side_effect=(
-                merge_checkpoint.Stop("promote", "failed", "fixture promotion failed", "retry"))):
+                checkpoint_gate.Stop("promote", "failed", "fixture promotion failed", "retry"))):
             failed = self.run_checkpoint(checkpoint, "--bump")
         self.assertEqual(failed.process.returncode, 1, failed.process.stdout + failed.process.stderr)
         merge_head = self.git("rev-parse", "HEAD")
         path = merge_checkpoint.checkpoint_step_record(self.checkout, merge_head, "bump-gate")
-        record = merge_checkpoint.read_record(path)
+        record = checkpoint_gate.read_record(path)
         record["delivered_to"] = []
-        merge_checkpoint.save_record(path, record)
+        checkpoint_gate.save_record(path, record)
         fix = self.push_main_change("fast-fix.txt", "new main tip\n")
         (self.state / "slow-delivery").touch()
         command = (
             "import sys\nfrom pathlib import Path\n"
-            'with open(Path(sys.argv[1]).parents[1] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})\nfrom scripts.production import merge_checkpoint as checkpoint\n'
+            'with open(Path(sys.argv[1]).parents[1] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})\nfrom scripts.production import checkpoint_gate as checkpoint\n'
             "path = Path(sys.argv[2])\ncheckpoint.send_result(path, checkpoint.read_record(path))\n"
         )
         output = self.enterContext((self.state / "slow-delivery.log").open("w"))
@@ -196,7 +198,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         retry_waits = threading.Event()
         failures: list[BaseException] = []
-        original_lock = merge_checkpoint.record_lock
+        original_lock = checkpoint_gate.record_lock
 
         @contextmanager
         def observe_lock(record_path: Path) -> Generator[None]:
@@ -218,7 +220,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         probe = threading.Thread(target=probe_push_lock)
         probe.start()
         try:
-            with mock.patch.object(merge_checkpoint, "record_lock", side_effect=observe_lock):
+            with mock.patch.object(checkpoint_gate, "record_lock", side_effect=observe_lock):
                 retried = self.run_checkpoint(checkpoint, "--bump")
         finally:
             probe.join(timeout=TEST_HANG_GUARD_SECS)
@@ -318,7 +320,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.promotions = str(self.promote)
         self.production_doc()
         checkpoint = self.checkpoint()
-        records: list[merge_checkpoint.BumpGateRecord] = []
+        records: list[checkpoint_gate.BumpGateRecord] = []
         original_promote = merge_checkpoint.promote
 
         def promote_after_gate(request: merge_checkpoint.MergeRequest, tip: str, *, local_only: bool = False) -> None:
@@ -327,7 +329,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             merge_head = self.git("rev-parse", "HEAD")
             path = merge_checkpoint.checkpoint_step_record(self.checkout, merge_head, "bump-gate")
             self.assertTrue(path.exists(), "the gate must be recorded before promotion starts")
-            record = merge_checkpoint.read_record(path)
+            record = checkpoint_gate.read_record(path)
             self.assertEqual(record["tip"], tip)
             self.assertEqual(record["result"], "pending")
             self.assertGreater(record["pid"], 0)
@@ -371,7 +373,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             marker.unlink()
         original_start = merge_checkpoint.start_gate
         original_promote = merge_checkpoint.promote
-        original_send = merge_checkpoint.send_result
+        original_send = checkpoint_gate.send_result
         delivered: list[str] = []
 
         def start(request: merge_checkpoint.MergeRequest, paths: tuple[str, ...], merge_head: str, tip: str) -> None:
@@ -384,12 +386,12 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         def local(request: merge_checkpoint.MergeRequest, tip: str, *, local_only: bool = False) -> None:
             self.assertTrue(local_only)
             path = merge_checkpoint.checkpoint_step_record(self.checkout, self.git("rev-parse", "HEAD"), "bump-gate")
-            self.assertEqual(merge_checkpoint.read_record(path)["result"], "red")
+            self.assertEqual(checkpoint_gate.read_record(path)["result"], "red")
             self.assertEqual(len(self.bump_notices()), 0 if launch_failure else 1,
                              "completed gate notices must wait until after local promotion")
             original_promote(request, tip, local_only=local_only)
 
-        def send(path: Path, record: merge_checkpoint.BumpGateRecord) -> None:
+        def send(path: Path, record: checkpoint_gate.BumpGateRecord) -> None:
             self.assert_main_push_lock_available()
             self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), record["tip"])
             delivered.append(record["tip"])
@@ -397,12 +399,12 @@ class MergeCheckpointTests(MergeCheckpointFixture):
 
         with mock.patch.object(merge_checkpoint, "start_gate", side_effect=start), \
                 mock.patch.object(merge_checkpoint, "promote", side_effect=local), \
-                mock.patch.object(merge_checkpoint, "send_result", side_effect=send):
+                mock.patch.object(checkpoint_gate, "send_result", side_effect=send):
             result = self.run_checkpoint(checkpoint, "--bump")
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(delivered, [self.git("rev-parse", "HEAD")])
         gate_path = merge_checkpoint.checkpoint_step_record(self.checkout, self.git("rev-parse", "HEAD"), "bump-gate")
-        gate_record = merge_checkpoint.read_record(gate_path)
+        gate_record = checkpoint_gate.read_record(gate_path)
         self.assertEqual(len(self.bump_notices()), 2, Path(gate_record["log"]).read_text())
         self.assertEqual(len(self.bump_gate_runs()), 0 if launch_failure else 1)
 
@@ -458,7 +460,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             self.assertEqual(source, self.promote)
             check_lock("mac")
 
-        def zone() -> None:
+        def zone(mac: PurePosixPath) -> None:
+            self.assertEqual(mac, self.root / "mac-installed")
             check_lock("zone")
 
         with mock.patch.object(merge_checkpoint, "into", side_effect=announce), \
@@ -483,7 +486,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         if handoff:
             _ = self.child_production()
         checkpoint = self.checkpoint()
-        with mock.patch.object(merge_checkpoint, "promote", side_effect=merge_checkpoint.Stop(
+        with mock.patch.object(merge_checkpoint, "promote", side_effect=checkpoint_gate.Stop(
                 "promote", "failed", "interrupted promotion", "retry")):
             failed = self.run_handoff(checkpoint) if handoff else self.run_checkpoint(checkpoint).process
         self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
@@ -499,7 +502,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
         self.assertEqual(self.git("show", "main:fast-fix.txt", cwd=self.origin), "keep this fast fix")
-        self.assertEqual(self.events("checkpoint-test"), test_events)
+        self.assertEqual(self.events("checkpoint-test"), [*test_events, []])
 
     def test_checkpoint_retry_integrates_main_fix_before_finishing_promotion(self) -> None:
         self.assert_interrupted_promotion_keeps_new_main_fix(handoff=False)

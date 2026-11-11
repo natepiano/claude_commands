@@ -26,7 +26,7 @@ from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_
 from scripts.lint.memory_test_support import config_environment
 from scripts.buildlog.test_holds import hold_event, timed_hold_events, write_mac_block
 from scripts.buildlog.test_index import Record, call, encode, point_root_at, step
-from scripts.buildlog.test_report import MeasuredCliRun, measure_cli_work
+from scripts.buildlog.cli_probe_test_support import MeasuredCliRun, measure_cli_work
 from scripts.buildlog.test_memory_window import configured_local_host
 from scripts.lib.user_zone import user_zone
 from scripts.lib import test_hang_guard

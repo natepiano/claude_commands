@@ -24,14 +24,19 @@ from scripts.build_queue.queue_fixture import (
     ci_step,
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
-from scripts.build_queue.queue_lines import json_form, plain, wrap
+from scripts.build_queue.queue_lines import QueueLines, json_form, plain, wrap
 from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
-from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config, write_process
+
+
+def queue_json_text(data: QueueLines) -> str:
+    """Read the text cells from the queue pane's JSON lines."""
+    return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
 
 
 class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
@@ -49,6 +54,24 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
             yield record
 
 
+def cloud_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
+    """Add running and waiting cloud work to a private queue reading."""
+    now = reading.explanation.now
+    rows = (
+        wire.CloudRow(wire.Owner(700001, "100"),
+            wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
+            wire.CloudPlace("aws"), now - 245, now - 240,
+            cloud_progress.CloudProgress("running", 32, 1, now - 120),
+            progress_profile.ProgressCounter("modules", 7, 12), admission_records.ReadyForAdmission()),
+        wire.CloudRow(wire.Owner(700002, "200"),
+            wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
+            wire.CloudPlace("aws"), now - 60, 0,
+            cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
+    )
+    return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
+        reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)
+
+
 class CloudQueueViewTests(unittest.TestCase):
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
@@ -57,22 +80,9 @@ class CloudQueueViewTests(unittest.TestCase):
         _ = (fixture.root / "cloud_gate.conf").write_text(
             "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
         model = fixture.model()
-        rows = (
-            wire.CloudRow(wire.Owner(700001, "100"),
-                wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
-                wire.CloudPlace("aws"), NOW - 245, NOW - 240,
-                cloud_progress.CloudProgress("running", 32, 1, NOW - 120),
-                progress_profile.ProgressCounter("modules", 7, 12), admission_records.ReadyForAdmission()),
-            wire.CloudRow(wire.Owner(700002, "200"),
-                wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
-                wire.CloudPlace("aws"), NOW - 60, 0,
-                cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
-        )
-        reading = model.reading
-        return replace(model, reading=wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
-            reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)), fixture
+        return replace(model, reading=cloud_reading(model.reading)), fixture
 
-    def test_cloud_group_shows_slots_progress_size_elapsed_and_wait(self) -> None:
+    def test_cloud_rows_share_the_table_with_slots_progress_size_elapsed_and_wait(self) -> None:
         model, _fixture = self.cloud_model()
         names = read_step_names()
         reading = model.reading
@@ -80,21 +90,76 @@ class CloudQueueViewTests(unittest.TestCase):
         row = reading.cloud[0]
         assert isinstance(row.progress, cloud_progress.CloudProgress)
         expected = (GOLDEN / "cloud_view.txt").read_text()
-        for failures, failure_text in ((1, "1 failed module"), (2, "2 failed modules")):
-            with self.subTest(failures=failures):
-                current = replace(row, progress=replace(row.progress, failed_modules=failures))
+        cases: tuple[tuple[cloud_progress.CloudState, int, str, float, str], ...] = (
+            ("running", 1, "1 failed module", NOW - 120, "2 min"),
+            ("running", 2, "2 failed modules", NOW - 120, "2 min"),
+            ("requesting", 0, "", NOW - 120, "2 min"),
+            ("setup", 1, "1 failed module", NOW - 120, "2 min"),
+            ("uploading", 2, "2 failed modules", NOW - 120, "2 min"),
+            ("running", 1, "1 failed module", NOW - 45, "45 s"),
+            ("running", 1, "1 failed module", NOW - 10800, "3 h"),
+            ("running", 1, "1 failed module", NOW - 172800, "2 d"),
+            ("running", 1, "1 failed module", 0.0, "20756 d"),
+        )
+        for state, failures, failure_text, updated_at, late_age in cases:
+            with self.subTest(state=state, failures=failures, updated_at=updated_at):
+                current = replace(row, progress=replace(row.progress, state=state,
+                    failed_modules=failures, updated_at=updated_at))
                 model = replace(model, reading=replace(reading, cloud=(current, *reading.cloud[1:])))
                 text = plain(queue_view.render_view(model, 140))
-                self.assertIn("Cloud", text)
+                self.assertNotIn("Cloud ·", text)
                 self.assertIn("1 of 1 slots", text)
-                for value in ("cloud-unit", names.shown("merge-gate"), "running", "waiting-unit",
-                              names.shown("targeted-test"), "32", "vCPUs"):
+                for value in ("cloud-unit", names.shown("merge-gate"), state, "waiting-unit",
+                              names.shown("targeted-test"), "32", "vCPU"):
                     self.assertIn(value, text)
                 self.assertRegex(text, r"7(?: of |/)12")
-                self.assertIn("4 min", text)
-                self.assertIn("no update for 2 min", text)
-                self.assertIn("waits for a cloud slot: 1 of 1 in use", text)
-                self.assertEqual(text + "\n", expected.replace("1 failed module", failure_text))
+                header, = [line for line in text.splitlines() if line.lstrip().startswith("# ")]
+                running, = [line for line in text.splitlines() if line.lstrip().startswith("run ")]
+                waiting, = [line for line in text.splitlines() if line.startswith("cloud")]
+                self.assertLess(header.index("machine"), header.index("vCPU"))
+                self.assertLess(header.index("vCPU"), header.index("pid"))
+                self.assertEqual(running[header.index("min"):header.index("machine")].strip(), "4")
+                self.assertEqual(running[header.index("machine"):header.index("vCPU")].strip(), "aws")
+                self.assertEqual(running[header.index("vCPU"):header.index("pid")].strip(), "32")
+                self.assertIn("pid 700001", running)
+                self.assertIn("pid 700002", waiting)
+                self.assertEqual(waiting[header.index("machine"):header.index("pid")].strip(), "")
+                self.assertNotRegex(running, r"[█░▒]")
+                self.assertNotRegex(waiting, r"[█░▒]")
+                error_text = " ".join(span.text.strip() for line in queue_view.render_view(model, 140)
+                    for span in line if span.tone == "error")
+                self.assertIn(f"no update for {late_age}", error_text)
+                head, = [line for line in text.splitlines() if line.startswith("Head:")]
+                self.assertIn("cloud 1 of 1 slots", head)
+                row_text = " ".join(line.removeprefix("· ").strip() for line in text.splitlines())
+                self.assertIn(f"no update for {late_age}", row_text)
+                self.assertIn("waits for a cloud slot: 1 of 1 in use", row_text)
+                if state == "running" and updated_at == NOW - 120:
+                    self.assertEqual(text + "\n", expected.replace("1 failed module", failure_text))
+                elif failures:
+                    self.assertIn(failure_text, text)
+                else:
+                    self.assertNotIn("failed module", text)
+
+    def test_cloud_rows_sort_with_local_steps_and_keep_the_local_memory_bars(self) -> None:
+        model, fixture = self.cloud_model()
+        fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+        _ = fixture.write_waiter({"pid": 123, "start_time": "123", "need": 9 * admission_records.GIB,
+            "since": NOW - 30, "session_id": "local-waiter", "session_name": "local",
+            "step": "check", "folder": "/private/local"})
+        model = replace(model, reading=cloud_reading(fixture.read()))
+        with mock.patch.object(os, "cpu_count", return_value=17):
+            text = plain(queue_view.render_view(model, 140))
+        rows = [line for line in text.splitlines()
+            if "pid " in line and line.split("pid ", 1)[1].split()[0].isdigit()]
+        self.assertEqual([line.split("pid ", 1)[1].split()[0] for line in rows],
+            ["700001", "900", "700002", "123"])
+        header, = [line for line in text.splitlines() if line.lstrip().startswith("# ")]
+        self.assertEqual(rows[1][header.index("vCPU"):header.index("pid")].strip(), "17")
+        self.assertEqual(rows[3][header.index("machine"):header.index("pid")].strip(), "")
+        self.assertIn("2.0 / 1.0", rows[1])
+        self.assertRegex(rows[1], r"[█░▒]")
+        self.assertRegex(rows[3], r"[█░▒]")
 
     def test_missing_cloud_progress_has_a_named_display_state(self) -> None:
         model, _fixture = self.cloud_model()
@@ -173,7 +238,14 @@ class CloudQueueViewTests(unittest.TestCase):
                 self.assertNotIn("no update for", text)
 
 
-class QueueViewTests(QueueFixtureTests):
+class QueueViewFixtureTests(QueueFixtureTests):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
+
+
+class QueueViewTests(QueueViewFixtureTests):
 
     def test_targeted_test_step_uses_its_shown_name(self) -> None:
         model = self.fixture.model()
@@ -197,12 +269,17 @@ class QueueViewTests(QueueFixtureTests):
                 header, = [row for row in text.splitlines() if row.lstrip().startswith("# ")]
                 rows = [row for row in text.splitlines() if row.startswith("run")]
                 self.assertTrue(rows)
+                for row in rows:
+                    self.assertRegex(row, r"[█░▒]")
                 if columns >= 100:
                     self.assertLess(header.index("min"), header.index("machine"))
-                    self.assertLess(header.index("machine"), header.index("pid"))
+                    self.assertIn("vCPU", header)
+                    self.assertLess(header.index("machine"), header.index("vCPU"))
+                    self.assertLess(header.index("vCPU"), header.index("pid"))
                     for row in rows:
                         self.assertEqual(row.index("fixture-host"), header.index("machine"))
                         self.assertEqual(row.index("pid "), header.index("pid"))
+                        self.assertEqual(row[header.index("vCPU"):header.index("pid")].strip(), "17")
                     for row in waiting_rows(queue_view.render_view(model, columns)):
                         self.assertEqual(row[header.index("machine"):header.index("pid")].strip(), "")
                 else:
@@ -377,41 +454,42 @@ class QueueViewTests(QueueFixtureTests):
                        facts=head_facts.read_head_facts(reply.reading))
 
     def test_running_waiting_and_held_rows_show_run_pids_at_every_width(self) -> None:
-        with AdmissionFixture() as fixture:
-            owner = fixture.fixture_owner(7000001, "100")
-            child = fixture.fixture_owner(7000002, "200")
-            run = wire.RunIdentity(owner.pid, owner.start_time)
-            _ = (fixture.proc.path / str(child.pid) / "environ").write_bytes(
-                f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
-            request = replace(fixture.request(owner=child, run=run), sidecar=str(fixture.scope(child)))
-            grant = only_admitted(fixture.server.handle_request(request))
-            waiter = fixture.request(owner=fixture.fixture_owner(7000003, "300"),
-                run=wire.RunIdentity(7000004, "400"), need=60 * admission_records.GIB)
-            _ = fixture.fixture_owner(7000004, "400")
-            _ = fixture.server.handle_request(waiter)
-            for held in (False, True):
-                if held:
-                    _ = fixture.server.handle_request(wire.ReleaseRequest("held", grant.reservation, 0))
-                model = self.service_model(fixture)
-                for columns in (60, 80, 100, 140):
-                    with self.subTest(held=held, columns=columns):
-                        lines = queue_view.render_view(model, columns)
-                        running, = [plain([line]) for line in lines
-                                    if plain([line]).startswith("run") and "pid 7000001" in plain([line])]
-                        queued, = waiting_rows(lines)
-                        self.assertIn("pid 7000001", running)
-                        self.assertIn("pid 7000004", queued)
-                        self.assertNotIn("pid 7000002", running)
-                        self.assertNotIn("pid 7000003", queued)
-                        self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
-                        card = queue_card.render_selection(model, "1", columns)
-                        self.assertIn("pid 7000004", plain(card))
-                        self.assertTrue(all(terminal_width(plain([line])) <= columns for line in card))
-                if held:
-                    self.assertFalse(fixture.server.reservations)
-                    room = model.reading.explanation.room
-                    assert isinstance(room, admission_records.MemoryRoom)
-                    self.assertGreater(sum(hold.memory.held for hold in room.runs), 0)
+        for folder in ("", "builds.slice/builds-detached.slice/verify.scope"):
+            with self.subTest(scope=folder), AdmissionFixture() as fixture:
+                owner = fixture.fixture_owner(7000001, "100")
+                child = fixture.fixture_owner(7000002, "200")
+                run = wire.RunIdentity(owner.pid, owner.start_time)
+                _ = (fixture.proc.path / str(child.pid) / "environ").write_bytes(
+                    f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
+                request = replace(fixture.request(owner=child, run=run), sidecar=str(fixture.scope(child, folder=folder)))
+                grant = only_admitted(fixture.server.handle_request(request))
+                waiter = fixture.request(owner=fixture.fixture_owner(7000003, "300"),
+                    run=wire.RunIdentity(7000004, "400"), need=60 * admission_records.GIB)
+                _ = fixture.fixture_owner(7000004, "400")
+                _ = fixture.server.handle_request(waiter)
+                for held in (False, True):
+                    if held:
+                        _ = fixture.server.handle_request(wire.ReleaseRequest("held", grant.reservation, 0))
+                    model = self.service_model(fixture)
+                    for columns in (60, 80, 100, 140):
+                        with self.subTest(held=held, columns=columns):
+                            lines = queue_view.render_view(model, columns)
+                            running, = [plain([line]) for line in lines
+                                        if plain([line]).startswith("run") and "pid 7000001" in plain([line])]
+                            queued, = waiting_rows(lines)
+                            self.assertIn("pid 7000001", running)
+                            self.assertIn("pid 7000004", queued)
+                            self.assertNotIn("pid 7000002", running)
+                            self.assertNotIn("pid 7000003", queued)
+                            self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+                            card = queue_card.render_selection(model, "1", columns)
+                            self.assertIn("pid 7000004", plain(card))
+                            self.assertTrue(all(terminal_width(plain([line])) <= columns for line in card))
+                    if held:
+                        self.assertFalse(fixture.server.reservations)
+                        room = model.reading.explanation.room
+                        assert isinstance(room, admission_records.MemoryRoom)
+                        self.assertGreater(sum(hold.memory.held for hold in room.runs), 0)
 
     def test_service_without_a_recorded_process_shows_pid_absence(self) -> None:
         model = self.fixture.model()
@@ -528,13 +606,13 @@ class QueueViewTests(QueueFixtureTests):
                     for hidden in ("idle", "2880", "2 days", "Runner.Listener"):
                         self.assertNotIn(hidden, row)
 
-    def test_running_ci_names_its_keep_aside_in_the_view_and_card(self) -> None:
+    def test_running_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
             model = self.ci_service_model(fixture, active=True)
             for source, lines in (("view", queue_view.render_view(model, 400)),
                                   ("card", queue_card.render_card(model, [], 400))):
                 with self.subTest(source=source):
-                    self.assertIn("CI keep-aside 7.0 GiB", plain(lines))
+                    self.assertNotIn("CI keep-aside", plain(lines))
 
     def test_idle_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
@@ -625,6 +703,27 @@ class QueueViewTests(QueueFixtureTests):
             assert isinstance(activity.run, LiveBuildRun)
             self.assertEqual((activity.run.pid, activity.run.start_time), (owner.pid, owner.start_time))
             self.assertNotIn("Still running after their build ended", plain(queue_view.render_view(model, 140)))
+
+    def test_a_detached_supervisor_does_not_make_a_python_scope_a_live_build(self) -> None:
+        with AdmissionFixture() as fixture:
+            supervisor = fixture.fixture_owner(700001, "100")
+            child = fixture.fixture_owner(700002, "200")
+            write_process(fixture.proc.path, child.pid, admission_records.GIB, parent=supervisor.pid, start=child.start_time)
+            parent = fixture.proc.path / str(supervisor.pid)
+            _ = (parent / "cmdline").write_bytes(b"python3\0detached_runs.py\0supervise\0private.json\0")
+            process = fixture.proc.path / str(child.pid)
+            _ = (process / "cmdline").write_bytes(b"python3\0-m\0unittest\0")
+            scope = Path(fixture.scope(child, folder="builds.slice/python.scope").read_text())
+            _ = fixture.run_pass()
+            model = self.service_model(fixture)
+            step, = [step for step in model.reading.view.running
+                if isinstance(step.measured, admission_records.UnownedSliceMemory) and step.measured.cgroup == str(scope)]
+            assert isinstance(step.measured, admission_records.UnownedSliceMemory)
+            activity = step.measured.activity
+            assert isinstance(activity, ScopeProcesses)
+            self.assertIsInstance(activity.run, NoLiveBuildRun)
+            self.assertEqual(queue_view.running_builds(model), [])
+            self.assertEqual(queue_view.leftover_processes(model.reading.view.running), [(step, step.measured, activity)])
 
     def test_ended_processes_use_session_labels_and_exclude_the_ci_slice(self) -> None:
         model = self.fixture.model()
@@ -1222,7 +1321,7 @@ class QueueViewTests(QueueFixtureTests):
         self.assertNotIn("budget", text.lower())
 
 
-class CapViewTests(QueueFixtureTests):
+class CapViewTests(QueueViewFixtureTests):
     def cap_model(self, *, available: int = 20, need: int = 10, used: int = 5) -> queue_view.QueueModel:
         model = self.fixture.cap_model()
         room = gate.memory_room(admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB), [admission_records.RunMemory("run", need * admission_records.GIB, admission_records.AnonymousRunUse(used * admission_records.GIB))], admission_policy_fixture())
@@ -1289,7 +1388,7 @@ class CapViewTests(QueueFixtureTests):
         bar = queue_view.cap_bar(room, 60, colour=True)
         self.assertEqual(plain([bar[:9]]), "█" * 9)
         self.assertEqual([span.tone for span in bar],
-            ["suggestion"] * 9 + ["warning"] * 12 + ["success"] * 5 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
+            ["suggestion"] * 9 + ["warning"] * 5 + ["success"] * 12 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
 
     def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)
