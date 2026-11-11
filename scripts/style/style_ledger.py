@@ -4974,7 +4974,16 @@ class Ledger:
         before = f"The whole test file {first.path} is a separate sibling module."
         after = (text + " Replace its external module declaration. "
                  + "Keep all items, imports, attributes and comments. Remove the sibling file.")
-        identity = _finding_id((first.rule, first.path, "test-file-move", destination.path, destination.module, first.rule_blob))
+        anchor, = cast(tuple[str], self._connection.execute(
+            "SELECT anchor_commit FROM held_findings WHERE finding_id=?", (first.finding_id,),
+        ).fetchone())
+        anchor = anchor or self._tip("HEAD").commit
+        identity = _finding_id((first.rule, first.path, "test-file-move", destination.path, destination.module, first.rule_blob, anchor))
+        existing = cast(list[tuple[str]], self._connection.execute(
+            "SELECT state FROM held_findings WHERE finding_id=?", (identity,),
+        ).fetchall())
+        if existing and existing[0][0] not in ("unfiled", "filed"):
+            return ()
         if len(findings) == 1 and first.finding_id == identity:
             return ()
         now = _now()
@@ -4982,9 +4991,9 @@ class Ledger:
         _ = self._connection.execute(
             "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,"
             + "proposal,created_at,updated_at,anchor_commit) "
-            + "SELECT ?,rule,path,1,?,'restructure',?,?,rule_blob,ticket,?,?,?, ?,anchor_commit "
+            + "SELECT ?,rule,path,1,?,'restructure',?,?,rule_blob,ticket,?,?,?, ?,? "
             + "FROM held_findings WHERE finding_id=? ON CONFLICT(finding_id) DO NOTHING",
-            (identity, text, before, after, held_state_name(first.state), proposal, now, now, first.finding_id),
+            (identity, text, before, after, held_state_name(first.state), proposal, now, now, anchor, first.finding_id),
         )
         _ = self._connection.executemany(
             "UPDATE held_findings SET state='withdrawn',duplicate_of=?,built_at='',updated_at=? WHERE finding_id=?",

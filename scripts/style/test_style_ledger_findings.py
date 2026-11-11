@@ -1337,6 +1337,48 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 for path in paths[3:]:
                     self.assertEqual(sum(finding.path == path for finding in live), 3)
 
+    def test_a_new_test_file_anchor_gets_a_new_aggregate_after_the_old_one_is_built(self) -> None:
+        rule = self.rule("test-move-anchors", "tier: D\nfamily: modules\ninput_scope: file\n")
+        path = "crates/alpha/src/anchor/widget_tests.rs"
+        self.write("crates/alpha/src/anchor/mod.rs", "mod widget_tests;\n")
+        ledger = self.ledger()
+        aggregates: list[str] = []
+        anchor = ""
+        for generation in range(3):
+            with self.subTest(generation=generation):
+                if generation < 2:
+                    self.write(path, f"fn item_{generation}() {{}}\n")
+                    anchor = self.commit("Change the sibling test file")
+                items = tuple(ledger.hold(rule, path, generation * 2 + line, f"item_{generation}_{line}",
+                                          "restructure", f"Separate item {generation}_{line}.", "Inline the whole test file.",
+                                          self.blob(rule), "outside") for line in (1, 2))
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.executemany("UPDATE held_findings SET anchor_commit=? WHERE finding_id=?",
+                                               [(anchor, item.finding_id) for item in items])
+                result = ledger.fold_test_files()
+                live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
+                if generation == 2:
+                    self.assertEqual(result, ())
+                    self.assertEqual({finding.finding_id for finding in live}, {item.finding_id for item in items})
+                    for item in items:
+                        retained, = ledger.named_held((item.finding_id,))
+                        self.assertIsInstance(retained.state, style_ledger.Unfiled)
+                else:
+                    group, = result
+                    aggregate, = live
+                    self.assertEqual(group.finding_id, aggregate.finding_id)
+                    self.assertNotIn(aggregate.finding_id, aggregates)
+                    aggregates.append(aggregate.finding_id)
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        stored_anchor, = cast(tuple[str], connection.execute(
+                            "SELECT anchor_commit FROM held_findings WHERE finding_id=?", (aggregate.finding_id,)).fetchone())
+                        self.assertEqual(stored_anchor, anchor)
+                        _ = connection.execute("UPDATE held_findings SET state='built',built_at='read' WHERE finding_id=?",
+                                               (aggregate.finding_id,))
+                for identity in aggregates:
+                    previous, = ledger.named_held((identity,))
+                    self.assertIsInstance(previous.state, style_ledger.Built)
+
     def test_hold_of_a_different_change_at_a_held_site_gets_its_own_row(self) -> None:
         rule = self.rule("change-ids")
         self.set_tip(self.initial_tip)
