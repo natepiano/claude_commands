@@ -30,6 +30,7 @@ from scripts.lib import unit_runs
 from scripts.message import sessions
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.transcript_test_support import compressed_copy
 
 
 MISSING_ID = staff.StaffId("s00000000000")
@@ -210,12 +211,17 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
             with self.subTest(home=label):
                 native = staff.native_id(fixture_runtime_id(label))
                 row = staff.ensure_worker(native, label, unit.id)
-                (shared / f"{native}.jsonl").touch()
+                transcript = shared / f"{native}.jsonl"
+                transcript.touch()
                 if isinstance(home, staff.SessionHome):
                     row = staff.set_home(row.id, home)
                 with mock.patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}):
-                    self.assertEqual(staff.backend(row), expected)
-                    self.assertEqual(staff.local_snapshot().backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
+                    for compressed in (False, True):
+                        with self.subTest(compressed=compressed):
+                            if compressed:
+                                _ = compressed_copy(transcript)
+                            self.assertEqual(staff.backend(row), expected)
+                            self.assertEqual(staff.local_snapshot().backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
 
     def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
         environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
