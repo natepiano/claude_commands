@@ -2,6 +2,7 @@
 
 The account tools separate provider identity from shared configuration and conversations.
 Claude groups and Codex workers select numbered accounts through one role map.
+Producers use the group account for their configured family.
 Both machines use that map, but each machine keeps its own sign-in state.
 Account moves preserve conversations and worker threads.
 Git filters keep machine-local settings outside promoted configuration.
@@ -33,7 +34,7 @@ Loading the same module under two names creates distinct runtime types and break
 The agent-notes job runs notes, quota alerts, pacing, refusal moves, and unit recovery as separate parts.
 `scripts/maintenance/agent_notes_job.py` owns that job.
 `config/agent_notes.toml` supplies its schedules and process limits.
-Herdr layout saves and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
+Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
 
 ## Account identity and storage
@@ -79,6 +80,9 @@ The [trust guide](../accounts.md#trusted-worktrees) describes configured project
 Natedev owns the role map for both machines.
 The map contains the Claude groups `units` and `showrunners`, the Codex `workers` account, and an optional timed Claude worker route.
 Both Claude groups may select the same account.
+Codex producers use the workers account.
+Claude producers use the showrunners account.
+`[producers]` in `config/models.conf` selects each producer's family, model, and effort.
 An absent selection stays unconfigured until an explicit move selects it.
 Status, launch, and preview reads never create a selection.
 
@@ -133,7 +137,7 @@ The [launch environment](nix-shell-launch.md) describes shared Nix setup and acc
 Account moves use the shared stop and resume API.
 Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 Each attempt has its own move ID and cause.
-A session already on the target writes nothing.
+A session proved live on the target writes nothing.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
@@ -177,7 +181,16 @@ One count line covers workers with nothing to move.
 These include closed workers without an active dispatch, workers without a current session, and workers already on the target.
 
 A group move validates the destination before changing the selection or stopping members.
-It selects the account for future launches and moves live off-target members.
+It selects the account for future launches and moves live members on other accounts.
+A workers swap also selects eligible Codex producers.
+A showrunners group move also selects eligible Claude producers.
+`eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
+`producer_settings` returns `LaunchSettings` or `InvalidProducerSettings`.
+One `settings_report_scope` limits each producer's invalid-settings warning to one per operation.
+A repeated move selects a stopped producer even when its home already names the target.
+Only proof that the producer runs on the target permits a skip.
+Unreadable live account evidence prevents the stop, start, and home change.
+The [producer launch contract](shutdown-and-restart.md#producer-launch-and-admission) defines the shared move and publication checks.
 An empty group can still select its account.
 Each member has an independent result.
 A single-session move refuses a grouped session and names the group operation.
@@ -291,6 +304,10 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, problems, and session input paths.
+Each account row exports `sessions` beside `role_counts`.
+Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
+The list reuses local count observations and reads no pane again.
+Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
 Status attributes a session to its account independently of the current role selection.
 This preserves visible off-target members during a move.
@@ -300,6 +317,8 @@ Local role counts read the registry, staff, pane launches, and worker records wi
 An exit record takes precedence over a pause record.
 A missing live session gives `exited`; live activity gives `busy` or `idle`.
 The workers role retains only `busy` and `idle`.
+Claude producers count under `showrunners` with the same hold and activity rules.
+Without a live session, they count on the selected showrunners account.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.
