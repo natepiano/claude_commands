@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.message import sessions
@@ -43,7 +44,7 @@ class SessionLookupTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
         })))
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()

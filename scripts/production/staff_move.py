@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass
 
 from scripts.production import staff, staff_sources  # noqa: E402
+from scripts.herdr import herdr_types  # noqa: E402
 from scripts.herdr import herdr  # noqa: E402
 
 
@@ -69,7 +70,7 @@ def move_unit(production_name: str, unit: str, new_showrunner: str, *, identity:
         try:
             current = staff.StaffSnapshot(tuple(row if member.id == row.id else member for member in record.rows))
             changed = _place_tab(row, current)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             raise staff.StaffUnreadable(f"{production_name}/{unit}: tab was not moved: {error}") from error
         return UnitMoveResult(row, found.row.parent != row.parent or changed, parent.row.name)
 

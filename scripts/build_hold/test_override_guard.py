@@ -14,8 +14,10 @@ from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_hold import override_guard
 from scripts.lib import test_hang_guard
 
@@ -52,7 +54,9 @@ class InstalledScript:
 
 
 def temporary_root(test: unittest.TestCase) -> Path:
-    return Path(test.enterContext(tempfile.TemporaryDirectory(prefix="override-guard-")))
+    root = Path(test.enterContext(tempfile.TemporaryDirectory(prefix="override-guard-")))
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, interpreter_cache_environment(root / "cache"))))
+    return root
 
 
 def installed_script(root: Path, relative: str) -> InstalledScript:
@@ -73,6 +77,7 @@ def script_links(root: Path, script: Path) -> tuple[Path, Path]:
 
 def child_environment(values: Mapping[str, str]) -> dict[str, str]:
     environment = {"PATH": os.defpath, "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"}
+    environment["XDG_CACHE_HOME"] = os.environ["XDG_CACHE_HOME"]
     environment.update(values)
     return environment
 

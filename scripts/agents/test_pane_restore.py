@@ -18,6 +18,7 @@ from typing import Literal, cast, final, override
 from unittest import mock
 
 from scripts.production.rename_test_support import FolderMoveBackend, FolderMoveFixture
+from scripts.herdr import herdr_types
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
@@ -72,7 +73,7 @@ class FakeClient(herdr.Herdr):
             "foreground_processes": [{"argv": ["zsh"], "name": "zsh", "pid": 998042}]}
         self.started: list[tuple[str, str, list[str]]] = []
         self.closed: list[str] = []
-        self.start_error: herdr.HerdrFailure | None = None
+        self.start_error: herdr_types.HerdrFailure | None = None
         self.native_ids: dict[str, str] = {}
         self.prompts: list[tuple[str, herdr.OpeningPrompt]] = []
         self.opened: list[tuple[str, str, str, str, dict[str, str]]] = []
@@ -161,7 +162,7 @@ class FakeClient(herdr.Herdr):
         if self.start_error is not None:
             raise self.start_error
         if pane not in self.native_ids:
-            raise herdr.HerdrFailure(f"{pane}: fixture has no native process observation")
+            raise herdr_types.HerdrFailure(f"{pane}: fixture has no native process observation")
         return self.native_ids[pane]
 
     @override
@@ -903,9 +904,9 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         path = pane_record.record_path("agents")
         attempt = pane_launch.resume_attempt(path, "w1:p3")
         proof = pane_launch.VerifiedResume(replacement, frozenset({self.owner.id, self.owner.current_session}))
-        with self.assertRaisesRegex(herdr.HerdrFailure, "forced close failure"):
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "forced close failure"):
             pane_launch.finish_restore(path, original, attempt, proof,
-                close=mock.Mock(side_effect=herdr.HerdrFailure("forced close failure")))
+                close=mock.Mock(side_effect=herdr_types.HerdrFailure("forced close failure")))
         return backend, client
 
     def finished_move_rerun(self) -> subprocess.CompletedProcess[str]:
@@ -975,7 +976,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
     def test_restore_rerun_closes_the_extra_shell_after_a_failed_close(self) -> None:
         backend, _transcript = self.moved_codex()
         with self.codex_restore(backend) as (client, _proof):
-            with (mock.patch.object(client, "close_tab_of", side_effect=herdr.HerdrFailure("forced close failure")),
+            with (mock.patch.object(client, "close_tab_of", side_effect=herdr_types.HerdrFailure("forced close failure")),
                   redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
                 self.assertEqual(pane_restore.restore("agents", dry_run=False), 0)
         self.assertIn("w1:p1", pane_record.read("agents"))

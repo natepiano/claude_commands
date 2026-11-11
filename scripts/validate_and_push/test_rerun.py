@@ -1,6 +1,7 @@
 """Validation and merged-branch recovery use only a local bare remote."""
 from __future__ import annotations
 
+import os
 import shutil
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
@@ -189,6 +190,31 @@ printf '%s\\n' "${GIT_INDEX_FILE:-real}" >> "$TEST_INDEX_HOOK_LOG"
         self.assertTrue(calls, "The real commit still runs repository hooks")
         self.assertFalse(any("validate-index." in call for call in calls), calls)
         self.assertEqual((self.repo / "seed.txt").read_text(), "formatted\n")
+
+    def test_autofix_proof_refuses_a_same_size_edit_at_the_index_mtime(self) -> None:
+        self.seed()
+        self.install_autofix()
+        _ = self.git("config", "core.trustctime", "false")
+        source = self.write(self.repo / "racy.txt", "before\n")
+        timestamp = 1_600_000_000_000_000_000
+        os.utime(source, ns=(timestamp, timestamp))
+        _ = self.git("add", "racy.txt")
+        _ = self.git("commit", "-qm", "Add the racy file")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        _ = self.write(self.repo / ".git/validate-autofix", f"{head} {tree}\n")
+        index = self.repo / ".git/index"
+        os.utime(index, ns=(timestamp, timestamp))
+        _ = source.write_text("edited\n")
+        os.utime(source, ns=(timestamp, timestamp))
+
+        result = self.script("validate_and_push/validate_ci.sh")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uncommitted changes outside the saved autofix output", result.stderr)
+        self.assertIn("racy.txt", result.stderr)
+        self.assertEqual(source.read_text(), "edited\n")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), head)
 
     def assert_user_edit_refused(self, before: str) -> None:
         index = (self.repo / ".git/index").read_bytes()

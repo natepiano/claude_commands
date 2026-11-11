@@ -264,6 +264,8 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
+`abandoned_session_minutes` sets the minimum age for removing abandoned compiler sessions before builds on Mac and Linux targets.
+
 The Mac floor sweep reads `sweep_floor_gib=150` from this file.
 The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
 `sweep_floor_roots` names `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
@@ -371,11 +373,9 @@ Unbilled days use the label `estimated from the newest bill` when a bill exists.
 Spot compute includes the older Spot builder when it uses the same instance type.
 The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
 Reports read local evidence without an AWS call or a coordination file.
-`go-live.json` records the first permitted running observation for the wait comparison.
 
 `### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
 Missing comparisons remain unavailable. Run time differences can remain negative.
-The daily wait comparison remains unmatched for load.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.

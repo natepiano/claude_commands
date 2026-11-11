@@ -70,7 +70,7 @@ class RemoteEntryTests(unittest.TestCase):
         self.enterContext(local_remote_transport(self.root))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
-        _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
+        _ = self.enterContext(mock.patch("scripts.mac_test.offload", offload))
         self.source = self.root / "checkout"
         self.source_seed.copy_to(self.source, self.root / "origin.git")
         self.mirror = self.root / "mirrors/repository"
@@ -579,7 +579,7 @@ from scripts.mac_test import linux_runner
 root, exports = Path(sys.argv[1]), Path(sys.argv[2])
 print('RUNNER', os.getpid(), flush=True)
 values = dict(kinds='test', devshell='default', shell_cache='cache', shell_timeout_s='1',
-              build_budget_gib='20', target_budget_gib='10', free_floor_gib='1')
+              build_budget_gib='20', target_budget_gib='10', free_floor_gib='1', abandoned_session_minutes='1')
 with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner.ShellEnvironment('key', exports, exports)),
       mock.patch.object(linux_runner, 'permission_refused', return_value=False),
       mock.patch.object(linux_runner, 'output_free_bytes', return_value=100 * 1024**3),

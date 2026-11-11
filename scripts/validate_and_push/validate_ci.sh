@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Single bottom layer for cargo invocations: scripts/lint owns every command's
 # flags (lint CLI over invoke.sh); this script only picks subcommands.
 # LINT_CONFIG_FORCE=1 is set on each step that must never be skipped by
@@ -74,7 +73,10 @@ worktree_tree() (
   }
   real_index="$(git rev-parse --git-path index)"
   if [[ -f "$real_index" ]]; then
-    cp "$real_index" "$temporary_index" || return
+    exec 3<"$real_index" || return
+    cat <&3 > "$temporary_index" || return
+    touch -r /dev/fd/3 "$temporary_index" || return
+    exec 3<&-
   else
     rm -f "$temporary_index"
     temporary_git read-tree HEAD || return
@@ -203,10 +205,11 @@ resolve_mend_self_package() {
   fi
   MEND_SELF_RESOLVED=1
 
-  local members name manifest
+  local members member name
   members="$(workspace_members)"
   if [ -n "$members" ]; then
-    while IFS="$TAB" read -r name manifest; do
+    while IFS= read -r member; do
+      name="${member%%"$TAB"*}"
       if [ "$name" = "cargo-mend" ]; then
         MEND_SELF_PACKAGE="$name"
         break

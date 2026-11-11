@@ -11,6 +11,7 @@ from typing import Literal, override
 from unittest.mock import patch
 
 from scripts.herdr import herdr, pane_launch, side_pane, worker_panes
+from scripts.herdr import herdr_types
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -203,7 +204,7 @@ class SidePaneTests(StaffTestCase):
 
         def fail_send(*arguments: str, deadline: float = math.inf) -> str:
             if arguments[:2] == ("agent", "prompt"):
-                raise herdr.HerdrFailure("question delivery failed")
+                raise herdr_types.HerdrFailure("question delivery failed")
             return run(*arguments, deadline=deadline)
 
         with patch.object(self.world, "run", side_effect=fail_send):
@@ -243,13 +244,13 @@ class SidePaneTests(StaffTestCase):
         def read_activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
             reads.append(pane)
             if pane in ("w1:p0", "w2:p9"):
-                raise herdr.HerdrFailure("process read is unavailable")
+                raise herdr_types.HerdrFailure("process read is unavailable")
             return activity(pane)
 
         def read_native(pane: str, kind: str, timeout: float) -> herdr.NativeAgentProcess:
             reads.append(pane)
             if pane in ("w1:p0", "w2:p9"):
-                raise herdr.HerdrFailure("native process read is unavailable")
+                raise herdr_types.HerdrFailure("native process read is unavailable")
             return native(pane, kind, timeout)
 
         with patch.object(self.world, "pane_activity", side_effect=read_activity), patch.object(
@@ -438,7 +439,7 @@ class SidePaneTests(StaffTestCase):
 
         def fail_close(*arguments: str, deadline: float = math.inf) -> str:
             if arguments[:2] == ("pane", "close"):
-                raise herdr.HerdrFailure("closure failed")
+                raise herdr_types.HerdrFailure("closure failed")
             return run(*arguments, deadline=deadline)
 
         with patch.object(self.world, "run", side_effect=fail_close):
