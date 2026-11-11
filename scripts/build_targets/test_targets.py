@@ -170,11 +170,10 @@ class ConfigurationTests(IsolatedTargetTest):
                 target = target_config.SshTarget(name, platform, self.root / filename)
                 self.assertEqual(target_config.is_aws_target(target), expected)
 
-    def test_shipped_config_reads_mac_then_natedev_then_aws(self) -> None:
+    def test_shipped_config_reads_mac_then_natedev(self) -> None:
         self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
             targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
             targets.LocalTarget("natedev", "linux"),
-            targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf")),
         ))
 
     def test_order_follows_targets_key(self) -> None:

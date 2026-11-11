@@ -23,6 +23,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
 
 from unittest import mock
@@ -392,6 +393,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
+        self.environment.update(interpreter_cache_environment(self.root / "cache"))
         self.children = []
         child_lifetime = self.root / "child-lifetime"
         child_lifetime.mkdir()
@@ -709,6 +711,9 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         return cast(str, values["variable"])
 
     def test_aws_block_uses_mac_idle_policy_without_target_idle_keys(self) -> None:
+        _ = write_config_fixture(self.root / "build_targets.conf", "\n".join((
+            "targets=mac,natedev,aws", "kind.aws=ssh", "platform.aws=linux", "settings.aws=aws_target.conf",
+        )))
         settings = self.root / "aws_target.conf"
         values = conf.read(settings).values()
         self.assertTrue(all(key not in values for key in (

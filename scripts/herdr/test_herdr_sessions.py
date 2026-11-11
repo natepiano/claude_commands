@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.herdr import herdr_types
 
 import io
 import json
@@ -123,7 +124,7 @@ class HerdrSessionsTests(unittest.TestCase):
         def native(pid: int, _kind: str) -> herdr.NativeAgentProcess:
             if pid == 108:
                 return herdr.NativeAgentProcess(herdr.LaunchArgument("TEST-old-thread"), "1", {})
-            raise herdr.HerdrFailure("fixture unknown")
+            raise herdr_types.HerdrFailure("fixture unknown")
 
         def display(pid: int) -> str:
             return f"TEST-pane-{pid}"
@@ -719,7 +720,7 @@ class StandaloneLaunchTests(unittest.TestCase):
 
     def test_launch_server_failure_prints_only_its_message(self) -> None:
         message = f"herdr server for agents did not start; see {self.root}/herdr-server.log"
-        with patch.object(herdr, "start_server", side_effect=herdr.HerdrFailure(message)):
+        with patch.object(herdr, "start_server", side_effect=herdr_types.HerdrFailure(message)):
             self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)),
                              (1, f"herdr_sessions: {message}\n"))
         self.assertEqual(self.attachments, [])

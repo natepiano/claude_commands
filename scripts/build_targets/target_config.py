@@ -119,7 +119,9 @@ def ssh_target_state_directory(target: str) -> Path:
     """Return the state path without requiring target registration."""
     require_target_name(target)
     if target != "mac":
-        return Path.home() / ".local/state/build-targets" / target
+        configured_root = os.environ.get("BUILD_TARGETS_STATE_DIR")
+        root = Path(configured_root).expanduser() if configured_root else Path.home() / ".local/state/build-targets"
+        return root / target
     configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
     return Path(configured).expanduser()
 

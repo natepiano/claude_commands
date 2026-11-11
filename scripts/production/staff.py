@@ -1053,6 +1053,8 @@ def _found_backends(rows: Sequence[StaffRow],
     if os.environ.get("CODEX_HOME"):
         homes.insert(0, Path(os.environ["CODEX_HOME"]))
     wanted = {row.current_session: row.id for row in rows if row.kind == "worker"}
+    recorded_homes = {row.id: row.home.path for row in rows if isinstance(row.home, SessionHome)}
+    codex_sessions: set[StaffId] = set()
     found: dict[StaffId, ClaudeBackend | CodexBackend] = {}
     for home in dict.fromkeys(homes):
         try:
@@ -1060,14 +1062,16 @@ def _found_backends(rows: Sequence[StaffRow],
                 for path in (home / folder).rglob("*.jsonl"):
                     identity = wanted.get(StaffId(path.stem[-36:]))
                     if identity is not None:
-                        _ = found.setdefault(identity, CodexBackend(home))
+                        codex_sessions.add(identity)
+                        if recorded_homes.get(identity) == home:
+                            found[identity] = CodexBackend(home)
         except OSError as error:
             print(f"anomaly: {home}: {error}", file=sys.stderr)
     if running is None:
         running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
-                   if any(identity not in found for identity in wanted.values()) else frozenset())
+                   if any(identity not in codex_sessions for identity in wanted.values()) else frozenset())
     for current, identity in wanted.items():
-        if identity not in found and (current in running or bool(sessions.transcript_locations(current))):
+        if identity not in codex_sessions and (current in running or bool(sessions.transcript_locations(current))):
             found[identity] = ClaudeBackend()
     return found
 
@@ -1620,9 +1624,10 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
         renamed = _transaction(edit)
     if renamed.kind == "worker":
         herdr = import_module("scripts.herdr.herdr")
+        herdr_types = import_module("scripts.herdr.herdr_types")
         client = cast(Callable[[str], object], herdr.Herdr)
         shared_session = cast(Callable[[], str], herdr.shared_session)
-        display_failure = cast(type[Exception], herdr.HerdrFailure)
+        display_failure = cast(type[Exception], herdr_types.HerdrFailure)
 
         try:
             retitle = cast(Callable[[str], bool], getattr(client(shared_session()), "retitle_row"))

@@ -11,7 +11,7 @@ import sys
 
 from scripts.herdr import herdr  # noqa: E402
 from scripts.herdr.herdr import AgentBlocked, Herdr  # noqa: E402
-from scripts.herdr.herdr import HerdrFailure as HerdrFailure  # noqa: E402
+from scripts.herdr.herdr_types import HerdrFailure as HerdrFailure  # noqa: E402
 from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
 from scripts.production.unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
 from scripts.lib.script_envelope import script_prompt  # noqa: E402

@@ -3306,7 +3306,7 @@ def folder_choice(path: str, size: int) -> FolderChoice:
 
 def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: Sequence[tuple[str, int]], shortfall: int, *,
                    now: float, lint_settings: conf.ConfigRead, held_targets: Sequence[str] = ()) -> FolderChoices:
-    """Classify measured folders and exclude held output from recommendations."""
+    """Offer build output outside source checkouts and exclude held output from recommendations."""
     choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
                for path, size in protected if size > 0]
     if isinstance(measurement, CurrentMacFolders):
@@ -3319,11 +3319,17 @@ def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: 
             choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
                            if item.bytes > 0 and item.path not in protected_paths)
     held_paths = tuple(Path(path).expanduser().resolve() for path in held_targets)
-    for index, item in enumerate(choices):
+    output_roots = OUTPUT_ROOTS.get().output_owners
+    candidates: list[FolderChoice] = []
+    for item in choices:
         path = Path(item.label).expanduser().resolve()
+        if ((path / "Cargo.toml").exists() or (path / GIT_DIR).exists()
+                or (path not in output_roots and not is_cargo_target(str(path), lint_settings=lint_settings))):
+            continue
         if any(path.is_relative_to(held) or held.is_relative_to(path) for held in held_paths):
-            choices[index] = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
-    choices.sort(key=lambda item: (-item.bytes, item.label))
+            item = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
+        candidates.append(item)
+    choices = sorted(candidates, key=lambda item: (-item.bytes, item.label))
     if not choices:
         return UNAVAILABLE_FOLDER_CHOICES
     eligible = [item for item in choices if item.kind is not FolderChoiceKind.HELD_OUTPUT]

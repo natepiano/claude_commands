@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
+from scripts.herdr import herdr_types
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -2043,7 +2044,7 @@ class RosterTests(unittest.TestCase):
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
         worker["cwd"] = str(self.home / "projects" / "unit-one")
         _ = worker_path.write_text(json.dumps(worker), encoding="utf-8")
-        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         director = next(entry for entry in found.entries if entry.name == "director")
         worker_entry = next(entry for entry in found.entries if entry.name == "claude-worker")
@@ -2193,8 +2194,12 @@ class RosterTests(unittest.TestCase):
 
     def test_pane_workers_keep_their_backend_accounts_across_a_selection_change(self) -> None:
         old, current = self.account_note(1), self.account_note(2)
+        shared = current / "sessions"
+        shared.mkdir(parents=True, exist_ok=True)
+        (old / "sessions").symlink_to(shared, target_is_directory=True)
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
-            "old-impl": {"thread_id": "old-thread", "status": "running", "role": "impl"}}, codex_home=old)
+            "old-impl": {"thread_id": "old-thread", "status": "running", "role": "impl"},
+            "shared-worker": {"thread_id": "shared-thread", "status": "done"}}, codex_home=old)
         self._publish_workers(self.director_run / unit_runs.STATE_FILE, {
             "new-test": {"thread_id": "new-thread", "status": "running", "role": "test"},
             "between-turns": {"thread_id": "waiting-thread", "status": "done"}}, codex_home=current)
@@ -2202,7 +2207,8 @@ class RosterTests(unittest.TestCase):
             before = self._entries()
         with mock.patch.object(agent_accounts, "workers_home", return_value=current):
             after = self._entries()
-        for name, label in (("old-impl", "codex1"), ("new-test", "codex2"), ("between-turns", "codex2")):
+        for name, label in (("old-impl", "codex1"), ("new-test", "codex2"),
+                            ("between-turns", "codex2"), ("shared-worker", "codex1")):
             with self.subTest(worker=name):
                 self.assertEqual(before[name].account, roster.AccountLabel(label))
                 self.assertEqual(after[name].account, roster.AccountLabel(label))
@@ -2479,7 +2485,7 @@ class RosterTests(unittest.TestCase):
         record = staff.snapshot()
         with (mock.patch.object(staff, "snapshot", return_value=record),
               mock.patch.object(sys, "platform", "darwin"),
-              mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")),
+              mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
             result = roster.roster(os.environ, roster.ThisMachine())
         director = next(row for row in result.entries if row.name == "director")
@@ -2496,7 +2502,7 @@ class PaneRosterTests(StaffTestCase):
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# Worker settings.\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
-             mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), \
+             mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), \
              mock.patch.object(account, "process_config_dir", return_value=None), \
              mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())

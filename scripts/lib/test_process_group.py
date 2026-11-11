@@ -21,6 +21,7 @@ import unittest
 from typing import cast, override
 from unittest.mock import MagicMock, patch
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
@@ -193,8 +194,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         home = self.root / "home"
         home.mkdir()
         self.environment = {**os.environ, **config_environment(self.root / "config"),
-                            "HOME": str(home), "CLAUDE_PYTHON": sys.executable,
-                            "XDG_CACHE_HOME": str(self.root / "cache"),
+                            "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
                             "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
 
     def release_child_group(self, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:

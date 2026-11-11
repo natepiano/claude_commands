@@ -4,16 +4,19 @@ from __future__ import annotations
 import json
 import io
 import os
+import shutil
 import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr
+from datetime import datetime
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.accounts import refusals
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
@@ -21,8 +24,9 @@ from scripts.lib import atomic_file, process_start, scratch
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
-from scripts.production import staff, test_worker, worker
+from scripts.production import staff, test_worker, worker, worker_admission
 from scripts.production.staff_test_support import fixture_worker
+from scripts.whoami import agent_accounts, note_file, quota_alert
 
 
 class NativeHookEntryTests(unittest.TestCase):
@@ -165,6 +169,57 @@ class TurnEndTests(unittest.TestCase):
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
                 self.assertEqual((entry["thread_id"], entry["worker_name"], entry["reason"]),
                     (row.current_session, name, "the hook completion is already finished"))
+
+    def test_a_codex_quota_refusal_is_reported_once_with_its_stopped_command(self) -> None:
+        for shared_sessions in (False, True):
+            with self.subTest(shared_sessions=shared_sessions):
+                _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
+                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                    self.case.fixture.root / "conf/accounts.conf")
+                self.case.agent.finish_after = 1
+                self.assertIs(self.case.dispatch("impl-shared" if shared_sessions else "impl"), worker.DispatchSubmission.SUBMITTED)
+                row = self.case.agent.row(self.case.agent.submitted[-1][0])
+                backend = staff.backend(row)
+                assert isinstance(backend, staff.CodexBackend)
+                account_home = backend.codex_home
+                if shared_sessions:
+                    shared = Path.home() / ".codex" / "sessions"
+                    shared.mkdir(parents=True, exist_ok=True)
+                    transcript = worker_admission.transcript_source(row, backend)
+                    if transcript.parent != shared:
+                        _ = shutil.copyfile(transcript, shared / transcript.name)
+                        transcript.unlink()
+                    account_home = Path.home() / ".codex1"
+                    account_home.mkdir(exist_ok=True)
+                    folder = account_home / "sessions"
+                    if folder.is_dir() and not folder.is_symlink():
+                        shutil.rmtree(folder)
+                    if not folder.is_symlink():
+                        folder.symlink_to(shared, target_is_directory=True)
+                    row = staff.set_home(row.id, staff.SessionHome(account_home))
+                    backend = staff.CodexBackend(account_home)
+                account = agent_accounts.KnownCodexAccount(account_home, "worker@example.com", "codex1")
+                refused_at = "2026-11-10T19:30:38.842000+00:00"
+                def account_at(home: Path) -> agent_accounts.KnownCodexAccount | agent_accounts.UnknownCodexAccount:
+                    return account if home == account_home else agent_accounts.UnknownCodexAccount(home, "fixture has no sign-in")
+
+                with (patch.object(quota_alert, "blocked", return_value=["workers moved"]) as blocked,
+                      patch.object(agent_accounts, "codex_account", side_effect=account_at),
+                      patch.dict(os.environ, {"CODEX_HOME": str(Path.home() / ".codex") if shared_sessions else str(account_home)}),
+                      patch.object(note_file, "read_notes", return_value=iter(()))):
+                    self.assertEqual(turn_end.report_quota_refusals(), [])
+                    # A later refusal in the same pass sends no second notice.
+                    for timestamp, expected in ((refused_at, ["workers moved"]), ("2026-11-10T19:35:00+00:00", [])):
+                        with worker_admission.transcript_source(row, backend).open("a", encoding="utf-8") as stream:
+                            _ = stream.write(json.dumps({"type": "event_msg", "timestamp": timestamp, "payload": {
+                                "type": "task_complete", "last_agent_message": None, "error": {
+                                    "message": "You’ve hit your usage limit. Try again at Nov 15th, 2026 1:34 PM.",
+                                    "codex_error_info": "usage_limit_exceeded"}}}) + "\n")
+                        self.assertEqual(turn_end.report_quota_refusals(), expected)
+                        self.assertEqual(turn_end.report_quota_refusals(), [])
+                blocked.assert_called_once_with([], account, window=refusals.UnknownWindow(),
+                    refused_at=quota_alert.RefusedAt(datetime.fromisoformat(refused_at)),
+                    stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
         opened = self.case.opened()

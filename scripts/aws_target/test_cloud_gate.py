@@ -1,9 +1,9 @@
 """Exercise durable cloud gates with private files and a fake AWS transport."""
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from decimal import Decimal
 from io import StringIO
 import base64
@@ -28,6 +28,7 @@ from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import merge_gate as gate
+from scripts.production.gate_modules import GateRefused
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -668,10 +669,14 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
 
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
-        with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)),
-              mock.patch.object(gate, 'run_suites') as local):
-            self.assertEqual(gate.run_gate_suites(self.root), remote)
-        local.assert_not_called()
+        for mode, full in ((gate.SuiteMode.MERGE_GATE, False), (gate.SuiteMode.TARGETED_TEST, True)):
+            with (self.subTest(mode=mode, full=full),
+                  mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
+                  mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
+                  mock.patch.object(gate, 'run_suites') as local):
+                self.assertEqual(gate.run_gate_suites(self.root, mode=mode, full=full), remote)
+            local.assert_not_called()
+            self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
 
     def test_allowed_fallback_calls_the_original_local_runner(self) -> None:
         with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.LocalFallback('AWS is down')),
@@ -708,7 +713,7 @@ class CloudRouteTests(CostFixture):
 
     def test_main_commit_needs_no_bundle(self) -> None:
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, False, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
         self.assertEqual(request['tree'], gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         self.assertEqual(request['commit'], gate.checked_git(self.repo, 'rev-parse', 'HEAD'))
         self.assertEqual(request['head'], request['commit'])
@@ -724,7 +729,7 @@ class CloudRouteTests(CostFixture):
         _ = gate.checked_git(self.repo, 'add', 'new-file')
         _ = gate.checked_git(self.repo, 'commit', '-qm', 'New commit')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, False, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
         bundle = folder / 'source.bundle'
         header = bundle.read_bytes().split(b'\n\n', 1)[0].decode()
         self.assertIn('-' + base + ' ', header)
@@ -756,7 +761,7 @@ class CloudRouteTests(CostFixture):
         head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
         refs = gate.checked_git(self.repo, 'for-each-ref')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, False, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
         commit = ledger.text(request, 'commit')
         self.assertNotEqual(commit, head)
         self.assertEqual(request['head'], head)
@@ -775,23 +780,81 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(gate.checked_git(clone, 'rev-parse', 'HEAD^{tree}'), request['tree'])
         self.assertEqual((clone / 'untracked').read_text(), 'untracked file\n')
 
+    def test_working_tree_reads_a_same_size_edit_at_the_index_mtime(self) -> None:
+        _ = gate.checked_git(self.repo, 'config', 'core.trustctime', 'false')
+        source = self.repo / 'racy'
+        _ = source.write_text('before\n')
+        timestamp = 1_600_000_000_000_000_000
+        os.utime(source, ns=(timestamp, timestamp))
+        _ = gate.checked_git(self.repo, 'add', 'racy')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Add the racy file')
+        index = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index'))
+        os.utime(index, ns=(timestamp, timestamp))
+        _ = source.write_text('edited\n')
+        index_mtime = index.stat().st_mtime_ns
+        os.utime(source, ns=(index_mtime, index_mtime))
+        environment = {**os.environ, 'GIT_INDEX_FILE': str(self.root / 'expected-index')}
+        for arguments in (('read-tree', 'HEAD'), ('add', '-A')):
+            _ = subprocess.run(['git', *arguments], cwd=self.repo, env=environment,
+                               check=True, capture_output=True)
+        expected = subprocess.run(['git', 'write-tree'], cwd=self.repo, env=environment,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(expected, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
+        tree, dirty = cloud_gate.working_tree(self.repo)
+        self.assertIn('racy', dirty)
+        self.assertEqual(tree, expected)
+
     def test_targeted_selection_runs_locally_and_sends_only_selected_paths(self) -> None:
-        selection = affected_modules.AffectedSelection(affected_modules.CertifiedBase('base', '2026-01-15T00:00:00+00:00'),
-                                            ('scripts/fixture/test_one.py',), (self.modules[0][1],))
-        for dirty in (False, True):
-            with self.subTest(dirty=dirty):
+        for dirty, paths, later in ((False, ('test_one.py',), ''), (True, ('test_one.py',), ''),
+                                    (False, ('test_two.py',), ''), (True, (), ''),
+                                    (False, ('test_one.py',), 'edit'), (False, ('test_one.py',), 'commit')):
+            selection = affected_modules.AffectedSelection(
+                affected_modules.CertifiedBase('base', '2026-01-15T00:00:00+00:00'),
+                ('scripts/fixture/test_one.py',), tuple(self.repo / 'scripts/fixture' / name for name in paths))
+            with self.subTest(dirty=dirty, paths=paths, later=later):
+                _ = gate.checked_git(self.repo, 'reset', '--hard', 'HEAD')
                 if dirty:
                     _ = self.modules[0][1].write_text('import os\n')
                 expected_tree = gate.clean_test_tree(self.repo)
                 with (mock.patch.object(gate.PassedTreeLedger, 'certified_base', autospec=True,
                                         return_value=selection.base) as certified,
-                      mock.patch.object(affected_modules, 'select_affected', return_value=selection) as select,
+                      mock.patch.object(gate, 'select_affected', return_value=selection) as select,
                       redirect_stdout(StringIO())):
-                    request = cloud_gate.prepare(self.repo, self.root / 'attempt', gate.SuiteMode.TARGETED_TEST, False, 1800)
+                    chosen, book = gate.select_targeted_modules(self.repo, expected_tree, self.modules)
+                    self.assertEqual(book.tree, expected_tree)
+                    self.assertIsInstance(chosen, affected_modules.AffectedSelection)
+                    assert isinstance(chosen, affected_modules.AffectedSelection)
+                    selected = gate.TreeSelection(tuple(str(path.relative_to(self.repo)) for path in chosen.modules),
+                                                  cloud_gate.working_tree(self.repo)[0])
+                    self.assertEqual(select.call_count, 1)
+                    if later:
+                        _ = self.modules[1][1].write_text('import sys\n')
+                        if later == 'commit':
+                            _ = gate.checked_git(self.repo, 'add', '.')
+                            _ = gate.checked_git(self.repo, 'commit', '-qm', 'Change the selected tree')
+                        folder = self.root / ('refused-' + later)
+                        with (mock.patch.object(cloud_gate, 'save') as save,
+                              mock.patch.object(gate, 'checked_git', wraps=gate.checked_git) as git):
+                            with self.assertRaisesRegex(GateRefused, 'The checkout changed after the test selection'):
+                                _ = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.TARGETED_TEST, 1800,
+                                                       selected=selected)
+                        save.assert_not_called()
+                        self.assertFalse((folder / 'request.json').exists())
+                        self.assertFalse(any('bundle' in call.args for call in git.call_args_list))
+                        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+                        with mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No service may start')) as service:
+                            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                                                     module_time_limit_s=1800, selected=selected)
+                        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
+                        service.assert_not_called()
+                        continue
+                    request = cloud_gate.prepare(self.repo, self.root / 'attempt', gate.SuiteMode.TARGETED_TEST, 1800,
+                                                selected=selected)
+                    self.assertEqual(select.call_count, 1)
                 self.assertEqual(select.call_args.args[0], self.repo)
                 self.assertEqual(select.call_args.args[3], affected_modules.dirty_paths(self.repo))
                 self.assertEqual(cast(gate.PassedTreeLedger, certified.call_args.args[0]).tree, expected_tree)
-                self.assertEqual(request['modules'], ['scripts/fixture/test_one.py'])
+                self.assertEqual(request['modules'], ['scripts/fixture/' + name for name in paths])
 
     def test_pending_attempt_reuses_only_the_same_working_tree(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
@@ -807,6 +870,35 @@ class CloudRouteTests(CostFixture):
                                module_time_limit_s=1800, service=service)
         self.assertEqual(folders[0], folders[1])
         self.assertNotEqual(folders[1], folders[2])
+        paths = ('scripts/fixture/test_one.py',)
+        tree, dirty = cloud_gate.working_tree(self.repo)
+        self.assertTrue(dirty)
+        selected = gate.TreeSelection(paths, tree)
+        _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                           module_time_limit_s=1800, service=service, selected=selected)
+        stale = gate.TreeSelection(paths, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
+        with self.subTest(selection='different tree with a saved request'):
+            count = len(folders)
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                                     module_time_limit_s=1800, service=service, selected=stale)
+            self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
+            self.assertEqual(len(folders), count)
+        reserve = cloud_gate.cloud_reservation
+
+        @contextmanager
+        def changed_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
+            with reserve(repo, sidecar, mode) as reservation:
+                _ = self.modules[1][1].write_text('import sys\n')
+                yield reservation
+
+        with (self.subTest(selection='tree changed during reservation'),
+              mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=changed_reservation),
+              mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No service may start')) as start):
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                                     module_time_limit_s=1800, service=service,
+                                     selected=gate.TreeSelection(('scripts/fixture/test_two.py',), tree))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
+        start.assert_not_called()
 
     def test_session_runs_only_scaler_service_and_imports_explicit_record(self) -> None:
         for dirty, later_edit, changed_head in ((False, False, False), (True, False, False),

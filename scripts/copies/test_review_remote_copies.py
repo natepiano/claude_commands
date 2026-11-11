@@ -70,7 +70,7 @@ class RemoteEntryTests(unittest.TestCase):
         self.enterContext(local_remote_transport(self.root))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
-        _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
+        _ = self.enterContext(mock.patch("scripts.mac_test.offload", offload))
         self.source = self.root / "checkout"
         self.source_seed.copy_to(self.source, self.root / "origin.git")
         self.mirror = self.root / "mirrors/repository"

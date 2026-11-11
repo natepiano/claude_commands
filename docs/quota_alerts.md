@@ -20,8 +20,10 @@ A pane worker's proved quota refusal marks its pass refused and keeps it open fo
 The move preserves its native conversation, pane, and terminal.
 The launcher reads the transcript before another submission.
 
-Its exited worker command tells the director the exact command to rerun on Claude.
-The launcher supplies `--stopped <session id> <worker> <command>` only after that command exits.
+The refusal sends one relay to the director of the stopped worker after the refusal is routed.
+The relay says that the pass stays open, names the outcome when it is known, and tells the director not to rerun the assign command.
+The outcome is one of these: workers moved to an account, workers wait for a reset time, or no-worker mode started.
+The caller supplies `--stopped <session id> <worker>`.
 Unknown directors receive no message; a waiting follow keeps its continuation.
 
 Zero, credits forecasts, Codex-to-Codex moves and unknown-account refusals write log lines without session delivery. Phone pushes, move journal rows and the natedev prompt notice remain. Restoration is recorded only in `moves.jsonl` as `routed back` or `routing not restored`; `/quota_refresh` tells nobody. Showrunners keep no held quota-alert list. The legacy configuration `repeat_minutes` is unused; `always` supplies recipients only for Claude five-hour and Claude no-room notices, alongside running showrunners.

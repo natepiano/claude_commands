@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.agents import remote
+from scripts.herdr import herdr_types
 
 import io
 import json
@@ -428,7 +429,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
                           mock.patch.object(herdr, "launch_prepared_agent", wraps=herdr.launch_prepared_agent) as launch,
                           mock.patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(self.source, {}))):
                         if isinstance(live, native_sessions.SessionNotLive):
-                            with self.assertRaisesRegex(herdr.HerdrFailure, "other live work"):
+                            with self.assertRaisesRegex(herdr_types.HerdrFailure, "other live work"):
                                 _ = restart.start_row(self.owner, staff.snapshot(), client)
                         else:
                             _ = restart.start_row(self.owner, staff.snapshot(), client)
@@ -555,9 +556,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(client, "saved_row_tab", return_value=target),
               mock.patch.object(client, "panes", return_value=[]),
               mock.patch.object(herdr, "prepare_session_environment", return_value=prepared),
-              mock.patch.object(herdr, "launch_prepared_agent", side_effect=herdr.HerdrFailure("target retained")) as guard,
+              mock.patch.object(herdr, "launch_prepared_agent", side_effect=herdr_types.HerdrFailure("target retained")) as guard,
               redirect_stderr(io.StringIO()) as output):
-            with self.assertRaisesRegex(herdr.HerdrFailure, "target retained"):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "target retained"):
                 _ = restart.start_row(self.owner, staff.snapshot(), client)
         guard.assert_called_once()
         self.assertEqual(guard.call_args.kwargs["reported_unknown"], unknown.reason)
