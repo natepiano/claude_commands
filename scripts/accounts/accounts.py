@@ -2388,7 +2388,7 @@ def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[st
 
 @settings_report_scope()
 def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple[staff.StaffRow, ...]]:
-    """Keep live accounts and include eligible stopped producers for an interrupted move."""
+    """Keep verified accounts and retain eligible members without account proof."""
     from scripts.production import staff
     from scripts.message import sessions
 
@@ -2397,15 +2397,16 @@ def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple
         membership = staff.local_snapshot()
     except staff.StaffUnreadable:
         return live, ()
-    producers = {row.id: row for row in membership.rows if row.kind == "producer"}
-    eligible = {row.id: row for row in eligible_producers(membership, "claude")}
-    live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
-            or owner.id not in producers or owner.id in eligible]
-    if group != "showrunners" or not eligible:
-        return live, ()
     running = {session["sessionId"] for session in sessions.running_sessions()}
     running.update(member.session_id for member in live)
-    return live, tuple(row for row in eligible.values() if row.current_session not in running)
+    kind = "unit" if group == "units" else "showrunner"
+    candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
+    if group == "showrunners":
+        candidates.update((row.id, row) for row in eligible_producers(membership, "claude"))
+    live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
+            or owner.kind != "producer" or owner.id in candidates]
+    verified = {member.session_id for member in live}
+    return live, tuple(row for row in candidates.values() if row.current_session not in verified)
 
 
 def session_account_label(session: ListedSession | LiveGroupMember) -> str:
@@ -3193,8 +3194,6 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
         return checked
     members, stopped = group_move_members(group)
     selected = [session for session in members if not session_on_account(session, target)]
-    stopped = tuple(row for row in stopped if not isinstance(row.home, staff.SessionHome)
-                    or row.home.path != claude_account_dir(target))
     ids = (*tuple(session.session_id for session in selected), *(row.current_session for row in stopped))
     reason = why or f"{group} moved by hand"
     notices = (f"{group}: no live session moves",) if not ids else ()

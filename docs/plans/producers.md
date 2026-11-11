@@ -80,40 +80,36 @@ dwight=claude:fable:high
 
 **Depends on:** Phase 1, Phase 2
 
-#### Work Order
+#### As-built
 
-**Goal:** `resume <producer>` starts the producer in its own tab of the `producers` workspace, on its family account, with its `[producers]` model and effort, in its same conversation; a group move moves its producers.
-
-**Spec:**
-
-1. A producer row reads its family, model and effort from `[producers]`.
-2. Account by family: a codex producer uses the workers account; a claude producer uses the showrunners account. An explicit `--to` still wins.
-3. The workspace name is a config value, `producers`. Each producer has its own tab, named for the producer. No code names a `morty` workspace; the test fixture at `scripts/agents/test_pane_record.py:246` uses `producers`.
-4. Resume keeps the same conversation (the row's `current_session`).
-5. A workers swap moves the codex producers with the workers. A showrunners group move moves the claude producers. Each move updates the row's `home`.
-6. Add rows to the existing tests the research lists (resume account, workspace, group move). Add no new test file unless no test covers the behavior.
+- `resume <producer>` starts the producer in its own tab of the `producers` workspace (`config/staff.conf` `PRODUCER_WORKSPACE`), on its family account, with its `[producers]` model and effort, in the row's `current_session`. An explicit `--to` still wins.
+- Account by family: a Codex producer uses the workers account, a Claude producer uses the showrunners account.
+- A workers swap moves the eligible Codex producers; a showrunners group move moves the eligible Claude producers. `accounts.eligible_producers` is the one selector (active, unpaused, local, family). Each move writes the row's `home`.
+- `accounts.producer_settings` reads one producer's `[producers]` line. A bad line leaves that producer out, with one warning per operation (`settings_report_scope`).
+- `pane_launch.write` owns the retained producer binding. `pane_launch.producer_start` is the one writer of the start contract, written before each retained-launch start, exec included.
+- Resume compares the source and destination pane locations before it lists panes, so a resume in its own pane makes no pane list call. `pane_launch.read_entries` returns no entries and makes no lock file when the record folder is absent.
 
 **Files:**
 - `scripts/agents/member_account.py` — account by family
-- `scripts/agents/restart.py` — model and effort from `[producers]`
-- `scripts/agents/stop_resume.py` — resume and move of a producer row
+- `scripts/agents/restart.py` — `producer_launch`, `producer_resume`
+- `scripts/agents/stop_resume.py` — producer resume and move
 - `scripts/herdr/herdr.py` — `row_workspace` for a producer
-- `scripts/accounts/accounts.py` — group moves and workers swaps take producers
+- `scripts/herdr/pane_launch.py` — producer binding, start contract, publication lock
+- `scripts/accounts/accounts.py` — `eligible_producers`, `producer_settings`, producer selection in swaps and group moves
 - `config/staff.conf` — `PRODUCER_WORKSPACE=producers`
-- `scripts/agents/test_restart.py` — rows
-- `scripts/agents/test_stop_resume.py` — rows
-- `scripts/agents/test_pane_record.py` — the `producers` fixture
-- `scripts/herdr/test_herdr.py` — rows
-- `scripts/accounts/test_accounts.py` — rows
-- `scripts/agents/test_account_move.py` — rows
 
-**Workers:** 1 writer.
+**Binds later work:** `home` records an account; it does not prove that a start finished. `pane_launch.write` owns retained producer bindings and `pane_launch.producer_start` owns start-contract writes. Automatic recovery uses `producer_settings` inside one `settings_report_scope`.
 
-**State:** none beyond the row `home` that a move writes now.
+**Gotchas:**
+- A move writes the target `home` before the start is confirmed.
+- Restore reads `[producers]` for every producer row; a test fixture row of kind `producer` needs a `[producers]` line.
+- The `.publication.lock` is shared by every pane record writer. Lock tests must find their target lock by file identity, not by the first exclusive lock.
+- The cloud gate runner's host name is not the selection machine; fixtures use the selection machine.
+- Run the full merge gate, not only the touched test modules: restore, watchdog and lock tests break outside them.
 
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** a producer-only resume, move or restart branch — producers use the shared path, with only family and model from `[producers]`.
 
-### Phase 3a — A group move rerun finishes a producer that exited early  · status: pending
+### Phase 3a — A group move rerun finishes a producer that exited early  · status: done
 
 **Depends on:** Phase 3
 
@@ -128,7 +124,7 @@ Moved out of phase 3 by the hard landing rule (repair rounds 6 and 7), with sdlc
 1. Today the move writes the target `home` before the move confirms the start. A producer that exits in that window keeps the target `home`, so a rerun skips it and reports success with zero sessions.
 2. A rerun selects each eligible stopped producer, also when its saved `home` already matches the target. It skips only a producer verified live on the target account. Unknown liveness is an explicit failure. Keep the pause and machine limits. `home` is account data, not proof that a move finished.
 3. Producers use the same selection code as units and showrunners. Only the family and model come from `[producers]`.
-4. The phase 3 F007 source-unavailable row in `scripts/agents/test_restart.py` (near line 2017) uses a destination-close mock that always returns False. Make the callback record and perform the fixture close, and assert that source unavailability makes no destination close call.
+4. Correct the `source unavailable` row in `RestartTests.test_saved_tab_reuses_only_the_targets_shell_and_splits_beside_a_sibling` (`scripts/agents/test_restart.py`). Its destination-close mock always returns False. Make the callback record and perform the fixture close. Require zero destination close calls when the source is unavailable.
 5. Add a row to the existing group move test in `scripts/agents/test_account_move.py`: the first move writes the target `home`, then start confirmation fails; a repeated move makes another start attempt. Keep the Codex swap row in `scripts/accounts/test_accounts.py` as a control. Each new row fails on the phase 3 code.
 6. Delete the producer-only branches that the shared path can carry (F017):
    - `stop_resume.py` move check (near line 1235): a unit or showrunner with no matching tab skips the target-account check and reaches `_stop`; only a producer gets the check. Use one rule for all rows.
@@ -136,27 +132,38 @@ Moved out of phase 3 by the hard landing rule (repair rounds 6 and 7), with sdlc
    - `stop_resume.py` (near line 921) keeps a producer-only `home` write condition.
    - `restart.py` `producer_resume` (near line 186) repeats the saved policy, remote-control and plugin handling of `pane_record.resume_arguments`.
    Only the family and model come from `[producers]`. Add rows to the existing tests for units and showrunners with no matching tab.
-7. The Codex own-pane exec test in `scripts/agents/test_stop_resume.py` (near line 1193) uses a fake `os.execvpe` that publishes a binding, and its `SystemExit` runs the contract cleanup. A real exec does neither. Make the fake match the real exec (F018).
+7. Correct the Codex row in `StopResumeTests.test_own_empty_pane_executes_the_saved_launch` (`scripts/agents/test_stop_resume.py`). Its fake `os.execvpe` publishes a binding, and its `SystemExit` runs the contract cleanup; a real exec does neither. Model a successful exec with no launch publication and no Python cleanup after the exec. Verify the next resume from the state that the real exec leaves (F018).
+
+**Constraints from prior phases:**
+- `home` records an account. It does not prove that a start finished.
+- `pane_launch.write` owns retained producer bindings.
+- `pane_launch.producer_start` owns start-contract writes.
+- Keep the source and destination session qualification during a pane close.
+- Keep a committed destination when the source inspection or close fails.
 
 **Files:**
 - `scripts/accounts/accounts.py` — rerun selection
 - `scripts/agents/stop_resume.py` — move start confirmation, `home` write order, the shared move check
 - `scripts/agents/member_account.py` — shared `repair_home`
 - `scripts/agents/restart.py` — shared resume arguments
+- `scripts/agents/pane_record.py` — shared `resume_arguments`
+- `scripts/herdr/pane_launch.py` — existing publication and start-contract ownership
 - `scripts/agents/test_stop_resume.py` — rows and the exec fixture
 - `scripts/agents/test_account_move.py` — rows
 - `scripts/accounts/test_accounts.py` — rows
 - `scripts/agents/test_restart.py` — the F007 row
+- `scripts/agents/test_pane_record.py` — retained argument rows
+- `scripts/herdr/test_pane_launch.py` — publication rows, when `pane_launch.py` changes
 
 **Workers:** 1 writer.
 
-**State:** the row `home`.
+**State:** the existing row `home`, the retained launch binding and the transient start contract. Add no new persistent state.
 
 **Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
 
 ### Phase 4 — A herdr restart and a reboot bring the producers back  · status: pending
 
-**Depends on:** Phase 3
+**Depends on:** Phase 3a
 
 #### Work Order
 
@@ -164,17 +171,38 @@ Moved out of phase 3 by the hard landing rule (repair rounds 6 and 7), with sdlc
 
 **Spec:**
 
-1. The herdr upkeep run starts each producer that is not live and not paused, through the same code as `resume <name>`.
-2. A paused producer stays down. The pause is the user's off switch.
-3. A start that fails is reported once and retried on the next upkeep run. One failed producer does not stop the others.
-4. If the upkeep timer does not run at boot on natedev, name the nixos change for the showrunner; do not push nixos.
-5. Add rows to the existing restore tests with a fake herdr.
+1. The herdr upkeep run first brings the shared herdr server back through the existing server restore, because resume needs pane access.
+2. It then selects the active, local, unpaused producer rows from staff and calls `stop_resume.resume(str(row.id))`, the same code as `resume <name>`.
+3. A paused producer stays down. The pause is the user's off switch.
+4. It reads settings with `accounts.producer_settings` inside one `settings_report_scope` per upkeep run. A bad `[producers]` line skips that producer with one warning; the others still start.
+5. A start that fails is reported once per upkeep run and retried on the next upkeep run. One failed producer does not stop the others.
+6. Starts use the existing operation deadlines and stay inside the upkeep worker budget in `config/herdr_upkeep.toml` (60 seconds today; one start can take 20 seconds).
+7. Keep the layout save and the detection-rule refresh.
+8. If the upkeep timer does not run at boot on natedev, name the nixos change for the showrunner; do not push nixos.
+9. Add rows to the existing upkeep tests with a fake herdr: an absent server, both families, a paused row, a remote row, a bad settings line, a failed start, and a repeated upkeep run.
+
+**Constraints from prior phases:**
+- Phase 3 gives the account choice, the `[producers]` launch settings, the same conversation and the producer tab. Phase 3a gives the one shared resume and move path. Add the automatic start through that path only.
+- Start admitted staff rows only. Phase 5 owns a first start.
+- Keep the difference between a stopped and an unknown liveness. Reuse the existing liveness evidence and launch functions.
+- Add no new checks and no stored failure record.
+- The nixos module starts `herdr-upkeep` from a graphical login. That alone does not prove a start before login.
+
+**Files:**
+- `scripts/maintenance/herdr_upkeep.py` — the automatic start and the existing upkeep operations
+- `scripts/maintenance/test_herdr_upkeep.py` — rows
+- `config/herdr_upkeep.toml` — the existing cadence and worker budget
+- `scripts/agents/stop_resume.py` — the shared `resume` entry and its result
+- `scripts/agents/test_stop_resume.py` — shared resume rows
+- `scripts/accounts/accounts.py` — `producer_settings` and `settings_report_scope`
+- `scripts/herdr/herdr.py` — the existing server restore
+- `scripts/herdr/test_herdr.py` — the existing server tests
 
 **Workers:** 1 writer.
 
 **State:** none.
 
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
+**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`. A test row proves that another eligible producer starts when one producer fails. A test row proves that a later upkeep run retries the failed producer and does not start a second copy of a running conversation.
 
 ### Phase 5 — dwight's first start  · status: pending
 
@@ -187,11 +215,32 @@ Moved out of phase 3 by the hard landing rule (repair rounds 6 and 7), with sdlc
 **Spec:**
 
 1. Create `~/rust/hanadocs/dwight/README.md` with the role name (strategist) and the management lines only.
-2. The first start of a producer with no conversation starts a new one, proves its identity, and admits its staff row through staff code. It uses the same start path after that.
-3. Start dwight. Report the model the conversation runs. The user expects Fable 5.2.
+2. The shared resume entry recognizes a configured producer that has no staff row. It starts a new conversation with no resume argument, with the `[producers]` family, model and effort, the account rule and the producer workspace.
+3. It proves the native identity through the existing herdr path, admits the row with `staff.ensure(..., runtime_id=<proved identity>)`, and completes the retained publication through `pane_launch.staff_admitted`. Later resumes use the row's `current_session`.
+4. Start dwight. Report the model the conversation runs. The user expects Fable 5.2.
+
+**Constraints from prior phases:**
+- `StaffRow.current_session` stays required (`scripts/production/staff.py:330`). A first-start request is its own type, separate from an admitted `StaffRow`; do not use an optional identity.
+- After an interrupted admission, reuse the existing native identity and launch evidence.
+- Keep the family and model choice apart from the shared launch code.
+- Run the tests with fixture staff and a fake herdr before the live dwight start.
+
+**Files:**
+- `scripts/agents/stop_resume.py` — first-start selection at the shared resume entry
+- `scripts/agents/restart.py` — shared launch arguments
+- `scripts/agents/member_account.py` — the existing account choice
+- `scripts/agents/shutdown.py` — command routing
+- `scripts/herdr/herdr.py` — the existing launch and native identity proof
+- `scripts/herdr/pane_launch.py` — `staff_admitted` publication
+- `scripts/production/staff.py` — the existing admission transaction
+- `scripts/production/add_showrunner.py` — read only: the existing admission pattern
+- `scripts/agents/test_stop_resume.py` — first start and the next resume
+- `scripts/agents/test_shutdown_cli.py` — `resume dwight` routing
+- `scripts/production/test_staff.py` — admission rows
+- `~/rust/hanadocs/dwight/README.md` — the role name and the management lines
 
 **Workers:** 1 writer.
 
 **State:** a new staff row for dwight.
 
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`; `resume dwight` reaches the live conversation.
+**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`. Fixture tests cover the first admission, a failed admission and the next resume of the same conversation. The live start reports the model identifier, and `resume dwight` reaches the same live conversation.

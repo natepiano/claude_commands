@@ -35,11 +35,9 @@ def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWith
 
 
 def repair_home(row: StaffRow, kind: str, pid: int) -> None:
-    """Repair a producer's home from its unchanged current process."""
+    """Repair the member's home from its unchanged current process."""
     from scripts.production import staff
 
-    if row.kind != "producer":
-        return
     try:
         reader = cast(pane_launch.NativeProcessReader, cast(object, import_module("scripts.herdr.herdr")))
         observed = reader.native_process(pid, kind)

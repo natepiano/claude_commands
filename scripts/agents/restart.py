@@ -186,20 +186,8 @@ def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], di
 def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch
                     ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Keep saved launch options with the producer's current model settings."""
-    kind, environment, arguments = producer_launch(row)
-    if kind == "codex":
-        policy = iter(entry.get("codex_policy", []))
-        for option in policy:
-            value = next(policy, "")
-            if option == "-c" and value.partition("=")[0].strip() in ("model_reasoning_effort", "service_tier"):
-                continue
-            arguments.extend((option, value))
-    else:
-        if entry["remote_control"]:
-            arguments.extend(("--remote-control", row.name))
-        for directory in entry.get("plugin_directories", []):
-            arguments.extend(("--plugin-dir", directory))
-    return kind, environment, arguments
+    settings = models_registry.launch_settings("producers", row.name)
+    return settings.kind, {}, pane_record.configured_resume_arguments(entry, str(row.current_session), row.name, settings)
 
 
 def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
