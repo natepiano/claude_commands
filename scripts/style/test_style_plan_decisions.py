@@ -20,6 +20,7 @@ from scripts.style import style_proposals
 
 from scripts.style import rules
 from scripts.style import style_ledger
+from scripts.style import unit_plans
 
 from scripts.style.style_plan_test_support import StylePlanFixture
 from scripts.production import proposal_issue
@@ -331,8 +332,8 @@ class StylePlanTests(StylePlanFixture):
     def test_decision_refill_skips_a_rule_that_left_the_catalog_and_coverage_goes_on(self) -> None:
         # Each row uses the original Git paths from the fixture snapshot.
         _ = self.doCleanups()
-        for suffix in ("", "#uncovered"):
-            with self.subTest(suffix=suffix):
+        for suffix, queued_busy in (("", False), ("#uncovered", False), ("#uncovered", True)):
+            with self.subTest(suffix=suffix, queued_busy=queued_busy):
                 case = StylePlanTests()
                 case.setUp()
                 try:
@@ -376,6 +377,32 @@ class StylePlanTests(StylePlanFixture):
                     ledger.ticket_drop(types_ticket["id"])
                     for path in case.sources:
                         case.record(types_rule, path, case.tip)
+                    definitions = {definition.rule_id: definition for definition in rules.load_rules(case.repo)}
+                    measured_at = "2026-11-10T22:00:00+00:00"
+                    for blocked, expected in (((), (1, 0, 0, 0)), ((case.sources[0],), (0, 0, 0, 1))):
+                        with self.subTest(blocked=blocked):
+                            split = style_plan.classify_split(
+                                ledger, "names", case.doc, case.base(), unit_plans.AllCrates(),
+                                style_plan.BusyFiles(case.board(*blocked), frozenset(blocked)), definitions,
+                                style_ledger.GitReadCache(case.repo), measured_at)
+                            self.assertEqual((split.ready, split.changed, split.structure, split.other), expected)
+                    if queued_busy:
+                        ledger.ticket_add("99", ticket_owner_id("names"), "proposal", "names", "crates/alpha",
+                                          [case.sources[0]], [rule + suffix], proposal=str(issue),
+                                          finding_ids=(finding.finding_id,))
+                        with (mock.patch.object(style_plan, "busy_files",
+                                                return_value=style_plan.BusyFiles(
+                                                    case.board(case.sources[0]), frozenset({case.sources[0]}))),
+                              mock.patch.object(style_proposals, "proposal_command")):
+                            code, output, errors = case.run_next()
+                        self.assertEqual(code, 0, errors)
+                        self.assertIn("dropped 99: files busy", output)
+                        self.assertIn(f"waiting {issue}: {case.sources[0]} busy", output)
+                        self.assertEqual(ledger.ticket_get("99")["state"], "dropped")
+                        self.assertFalse(any(ticket["kind"] == "proposal"
+                                             for ticket in ledger.ticket_open(ticket_owner_id("names"))))
+                        for ticket in ledger.ticket_open(ticket_owner_id("names")):
+                            ledger.ticket_drop(ticket["id"])
                     with mock.patch.object(style_plan, "fill_decision_batch",
                                            wraps=style_plan.fill_decision_batch) as batch:
                         output = case.refill_decisions()
