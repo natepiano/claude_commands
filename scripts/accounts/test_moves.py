@@ -84,6 +84,30 @@ class SingleSessionMoveNoticeTests(unittest.TestCase):
                 lines = self.move_lines("top-level", "claude3", dry_run=dry_run)
                 self.assertFalse(any("returns to" in line for line in lines))
 
+    def test_preview_reads_detached_context_only_for_listed_workers(self) -> None:
+        kinds: tuple[Literal["unit", "showrunner", "top-level", "worker"], ...] = (
+            "unit", "showrunner", "top-level", "worker")
+        for kind in kinds:
+            owner = inventory.ListedSession("session-alpha", 123, "fixture-start", "alpha", kind,
+                                           self.home / ".claude1", "", "fixture", "")
+            with (self.subTest(kind=kind),
+                  patch.object(accounts, "detached_move_context", return_value="fixture run context") as context):
+                line = accounts.move_preview_line(owner, "claude3")
+                self.assertEqual(line, "alpha: session-alpha · stop, then resume on claude3 (from claude1)"
+                                 + ("; fixture run context" if kind == "worker" else ""))
+                if kind == "worker":
+                    context.assert_called_once_with(owner.session_id)
+                else:
+                    context.assert_not_called()
+
+    def test_stopped_personal_session_preview_needs_no_staff_record(self) -> None:
+        checked = accounts.MoveTargetReady(accounts.NamedAccount("claude3", self.home / ".claude3"))
+        with (patch.object(inventory, "listing", return_value=[]),
+              patch.object(accounts, "check_move_target", return_value=checked)):
+            result = accounts.move("personal-session", "claude3", dry_run=True)
+        self.assertEqual(result, accounts.MoveDryRun("personal-session", (
+            "personal-session: would resume on claude3 if its saved tab is local",)))
+
 
 class MoveJournalTests(unittest.TestCase):
     home: Path = Path()
