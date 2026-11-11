@@ -30,10 +30,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
+from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold import override_guard
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-from scripts.buildlog import store
 from scripts.message import session_send
 
 
@@ -48,16 +48,6 @@ RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your bui
                   "their memory gate orders them. No answer is needed.")
 
 DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
-
-
-@dataclass(frozen=True)
-class OwningSession:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class NoOwningSession:
-    pass
 
 
 class ReleaseEntry(TypedDict):
@@ -392,13 +382,13 @@ def run_resolution(environment: Mapping[str, str] = os.environ) -> RunOwner | No
     return NoRunNamed()
 
 
-def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
+def owning_session(environment: Mapping[str, str] = os.environ) -> session_owner.OwningSession | session_owner.NoOwningSession:
     """Find the session that owns this run before using the shell's session id."""
     resolution = run_resolution(environment)
     if isinstance(resolution, RunOwner):
-        return OwningSession(resolution.session_id)
+        return session_owner.OwningSession(resolution.session_id)
     session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
-    return OwningSession(session_id) if session_id else NoOwningSession()
+    return session_owner.OwningSession(session_id) if session_id else session_owner.NoOwningSession()
 
 
 def process_start_time(pid: int, proc_root: Path = PROC_ROOT) -> str:
@@ -454,7 +444,7 @@ CARGO_COMMANDS = AUDIT_COMMANDS - {"rustc", "rustdoc"}
 @dataclass(frozen=True)
 class AuditedBuild:
     process: AuditProcess
-    owner: OwningSession | NoOwningSession
+    owner: session_owner.OwningSession | session_owner.NoOwningSession
     classification: BuildClass
     children: tuple[ProcessIdentity, ...]
 
@@ -559,44 +549,33 @@ def audit_command(process: AuditProcess) -> str:
     return executable if executable in AUDIT_COMMANDS | {"claude", "codex"} else process.command
 
 
-def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> OwningSession | NoOwningSession:
+def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> session_owner.OwningSession | session_owner.NoOwningSession:
     for item in (process, *ancestors):
         session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
         if session_id:
-            return OwningSession(session_id)
+            return session_owner.OwningSession(session_id)
         owner = owning_session(item.environment)
-        if isinstance(owner, OwningSession):
+        if isinstance(owner, session_owner.OwningSession):
             return owner
         if item.environment.get("CODEX_THREAD_ID"):
-            return OwningSession(item.environment["CODEX_THREAD_ID"])
+            return session_owner.OwningSession(item.environment["CODEX_THREAD_ID"])
     for parent in ancestors:
         if audit_command(parent) in {"claude", "codex"}:
             owner = owning_session(parent.environment)
-            if isinstance(owner, OwningSession):
+            if isinstance(owner, session_owner.OwningSession):
                 return owner
-            return OwningSession(parent.environment.get("CODEX_THREAD_ID")
+            return session_owner.OwningSession(parent.environment.get("CODEX_THREAD_ID")
                                  or f"{audit_command(parent)}:{parent.identity.pid}:{parent.identity.start_time}")
-    return NoOwningSession()
+    return session_owner.NoOwningSession()
 
 
-def admitted_processes() -> frozenset[ProcessIdentity]:
-    """Read durable grants, which precede replies and the next decision pass."""
-    from scripts.build_queue import admission_service
-
-    try:
-        state = admission_service.read_state(store.root() / "admission")
-    except (OSError, ValueError) as error:
-        raise OSError(f"admission state unavailable: {error}") from error
-    return frozenset(ProcessIdentity(record.owner.pid, record.owner.start_time)
-                     for record in state.reservations.values())
-
-
-def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequence[Holder]) -> bool:
-    return (isinstance(owner, OwningSession) and bool(holders)
+def owner_is_sole_holder(owner: session_owner.OwningSession | session_owner.NoOwningSession, holders: Sequence[Holder]) -> bool:
+    return (isinstance(owner, session_owner.OwningSession) and bool(holders)
             and all(holder.key == holder_path(Path(), owner.session_id).name for holder in holders))
 
 
 class HoldEnforcer(Protocol):
+    def admitted_processes(self) -> frozenset[ProcessIdentity]: ...
     def start(self) -> None: ...
     def drain(self, holder: Holder, proc_root: Path = PROC_ROOT) -> int: ...
     def working_drain_identities(self, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
@@ -613,7 +592,7 @@ def hold_enforcer() -> HoldEnforcer:
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
-    admitted = admitted_processes()
+    admitted = hold_enforcer().admitted_processes()
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -637,7 +616,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
             classification = "holder"
         elif process.in_build_scope or any(item.identity in admitted for item in (process, *ancestors)):
             classification = "admitted"
-        elif isinstance(owner, OwningSession):
+        elif isinstance(owner, session_owner.OwningSession):
             classification = "other_session"
         else:
             classification = "no_session"
@@ -654,7 +633,7 @@ def audit_lines(builds: Sequence[AuditedBuild], *, beginning: bool = False) -> l
     for build in builds:
         if build.classification == "no_session":
             continue
-        owner = build.owner.session_id if isinstance(build.owner, OwningSession) else ""
+        owner = build.owner.session_id if isinstance(build.owner, session_owner.OwningSession) else ""
         command = shlex.join(build.process.argv) or build.process.command
         lines.append(f"  {build.classification}: {owner}, pid {build.process.identity.pid}: {command}"
                      + (f" ({len(build.children)} build children)" if build.children else ""))

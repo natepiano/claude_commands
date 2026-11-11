@@ -48,6 +48,14 @@ class CheckpointTestStep(NamedTuple):
     folder: Path
 
 
+class RedCheckpointTests(Stop):
+    """The unresolved commands that prevent a checkpoint publication."""
+
+    def __init__(self, detail: str, message: str, steps: tuple[CheckpointTestStep, ...]) -> None:
+        super().__init__("red", "failed", detail, message)
+        self.steps: tuple[CheckpointTestStep, ...] = steps
+
+
 class CargoPackage(NamedTuple):
     folder: Path
     name: str
@@ -144,6 +152,7 @@ def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, 
             if not test_passed(result):
                 failed.append((step, failed_tests(result.stdout + result.stderr)))
     unresolved: list[str] = []
+    red_steps: list[CheckpointTestStep] = []
     for step, tests in failed:
         name, command, folder = step
         # Run only the known flaky tests when they cause the failure.
@@ -163,10 +172,12 @@ def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, 
         else:
             names = tests | failed_tests(result.stdout + result.stderr)
             unresolved.append(name + (f" ({', '.join(sorted(names))})" if names else ""))
+            red_steps.append(step)
     report("test", "ok", f"{len(steps)} commands ran; {len(failed)} red; log {log}")
     if unresolved:
-        raise Stop("red", "failed", f"{', '.join(unresolved)} failed; log {log}",
-                   f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}")
+        raise RedCheckpointTests(f"{', '.join(unresolved)} failed; log {log}",
+                                 f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}",
+                                 tuple(red_steps))
     report("red", "ok", "all commands green or known flakes green alone")
     return ", ".join(step.label for step in steps) if steps else "no tests"
 

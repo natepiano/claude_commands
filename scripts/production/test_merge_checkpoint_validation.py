@@ -21,7 +21,7 @@ from scripts.production.production_doc import read_new_production
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -81,6 +81,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def test_cancel_prior_reaches_validate_and_push_only_when_requested(self) -> None:
         self.push = "validate_and_push"
         self.production_doc()
+        self.executable(self.bin / "validate_and_push.sh", STUB + '''
+with (state / "validation-locks").open("a") as output:
+    output.write(os.environ.get("MAIN_PUSH_LOCK_HELD", "missing") + "\\n")
+''')
         first = self.checkpoint()
         first_result = self.run_checkpoint(first)
         self.assertEqual(first_result.process.returncode, 0, first_result.process.stderr + first_result.process.stdout)
@@ -92,6 +96,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(len(calls), 2)
         self.assertNotIn("--cancel-prior", calls[0])
         self.assertIn("--cancel-prior", calls[1])
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        self.assertEqual((self.state / "validation-locks").read_text().splitlines(),
+                         [str(common / "main-push.lock")] * len(calls))
     def test_cancel_prior_with_git_push_is_refused_before_merge(self) -> None:
         sha = self.checkpoint()
         result = self.run_checkpoint(sha, "--cancel-prior")
@@ -175,6 +182,24 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.events("review_regime.py"), [])
         self.assertEqual(self.events("style_sync.py"), [])
     def test_style_notification_observes_the_successfully_pushed_tip(self) -> None:
+        observer = STUB + '''
+import fcntl
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
+with (Path(common) / "main-push.lock").open("a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_state = "held"
+    else:
+        lock_state = "free"
+with (state / "refreshed-test-locks").open("a") as output:
+    output.write(lock_state + "\\n")
+(state / "refreshed-test-tip").write_text(tip)
+'''
+        for name in ("verify.sh", "checkpoint-test"):
+            self.executable(self.bin / name, observer)
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         tip = self.git("rev-parse", "HEAD")
@@ -182,23 +207,14 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             "notify", "--repo-dir", str(self.checkout), "--branch", "production", "--tip", tip,
         ]])
         self.assertEqual((self.state / "notified-tip").read_text(), tip)
+        self.assertEqual((self.state / "refreshed-test-locks").read_text().splitlines(), ["free"])
         with self.subTest(refresh="main moved"):
             main = self.push_main_change("crates/main-proof/Cargo.toml",
                                          '[package]\nname = "main-proof"\nversion = "0.1.0"\n')
-            observer = STUB + '''
-import fcntl
-import subprocess
-tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
-with (Path(common) / "main-push.lock").open("a") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-(state / "refreshed-test-tip").write_text(tip)
-'''
-            for name in ("verify.sh", "checkpoint-test"):
-                self.executable(self.bin / name, observer)
             production = read_new_production(self.doc, "example")
             with mock.patch.dict(os.environ, self.env):
                 refreshed = merge_checkpoint.refresh_pushed_tip(production, tip)
+            self.assertEqual((self.state / "refreshed-test-locks").read_text().splitlines(), ["free", "held", "held"])
             self.assertEqual(refreshed, (self.state / "refreshed-test-tip").read_text())
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), refreshed)
             self.assertEqual(self.git("merge-base", "--is-ancestor", main, refreshed), "")
@@ -231,7 +247,7 @@ with (Path(common) / "main-push.lock").open("a") as lock:
 
         arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
-                     "--review-trial", TRIAL, "--delivers", DELIVERS, "--parallel", PARALLEL]
+                     "--review-trial", TRIAL, "--delivers", DELIVERS]
         output = StringIO()
         with mock.patch.dict(os.environ, self.env), mock.patch.object(sys, "argv", arguments), mock.patch.object(
             merge_checkpoint, "notify_style", side_effect=malformed_notification,

@@ -10,8 +10,10 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 
 from scripts.usage import rollouts
+from scripts.lib.transcripts import open_transcript
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -81,16 +83,19 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(thread.edits, [])
 
     def test_rollout_builder_keeps_usage_opening_and_compaction_lifecycle(self) -> None:
-        builder = rollouts.ThreadRolloutBuilder()
-        for line in (session("2026-01-01T00:00:00Z"), tokens("2026-01-01T01:00:00Z", 100, 20, 10),
-                     record("compacted", "2026-01-01T02:00:00Z", {})):
-            value = rollouts.decode_rollout(line)
-            assert value is not None
-            builder.consume(value)
-        thread = builder
-        self.assertEqual(thread.opening, rollouts.KnownThreadOpening(datetime(2026, 1, 1, tzinfo=timezone.utc)))
-        self.assertEqual(thread.usage[0].usage, rollouts.TokenUsage(80, 20, 10))
-        self.assertEqual(thread.compactions, [datetime(2026, 1, 1, 2, tzinfo=timezone.utc)])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            _ = path.write_text("\n".join((session("2026-01-01T00:00:00Z"),
+                tokens("2026-01-01T01:00:00Z", 100, 20, 10),
+                record("compacted", "2026-01-01T02:00:00Z", {}))) + "\n")
+            for compressed in (False, True):
+                with self.subTest(compressed=compressed):
+                    source = compressed_copy(path) if compressed else path
+                    with open_transcript(source) as stream:
+                        thread = self.builder_from(tuple(line.decode() for _, line in rollouts.complete_lines(stream)))
+                    self.assertEqual(thread.opening, rollouts.KnownThreadOpening(datetime(2026, 1, 1, tzinfo=timezone.utc)))
+                    self.assertEqual(thread.usage[0].usage, rollouts.TokenUsage(80, 20, 10))
+                    self.assertEqual(thread.compactions, [datetime(2026, 1, 1, 2, tzinfo=timezone.utc)])
 
     def test_real_exec_apply_patch_call_marks_the_edit(self) -> None:
         thread = self.builder_from((

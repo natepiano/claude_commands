@@ -359,16 +359,45 @@ _agents_effort_allowed() {
     return 1
 }
 
-# Resolve visible model-family versions with known effort rows. Numeric ties
-# use slug order, independent of cache order; a full slug needs no cache.
+# Resolve a family through its provider catalog. Preserve a full model id.
 _agents_model_slug() {
     _models_registry_read _agents_model_slug_from_table "$@"
 }
 
 _agents_model_slug_from_table() {
-    local family="$1" word="$2" model cache_text
+    local family="$1" word="$2" model cache_text catalog minimum version
     if ! _models_registry_has_key "$family.families" "$word"; then
         printf '%s' "$word"
+        return 0
+    fi
+    if [[ "$family" == "claude" ]]; then
+        local -a catalogs=()
+        for catalog in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache/model-catalog/"*-cc.json; do
+            [[ ! -f "$catalog" ]] || catalogs+=("$catalog")
+        done
+        if [[ ${#catalogs[@]} -gt 0 ]] && cache_text="$(jq -ers --arg word "$word" '
+            max_by(.fetchedAt) | .catalog.config
+            | .provider_alias_targets[$word].default as $target
+            | select($target | type == "string" and length > 0)
+            | [$target, ([.models[]? | select(.id == $target)
+                | .min_claude_code_version][0] // "")] | @tsv
+        ' "${catalogs[@]}" 2>/dev/null)" \
+            && version="$(claude --version 2>/dev/null)"; then
+            IFS=$'\t' read -r model minimum <<< "$cache_text"
+            version="${version%%[[:space:]]*}"
+            if jq -en --arg installed "$version" --arg minimum "$minimum" '
+                def version: select(test("^[0-9]+(\\.[0-9]+)*$")) | split(".") | map(tonumber);
+                [($installed | version), (($minimum | select(length > 0)) // "0" | version)]
+                | select(length == 2)
+                | (map(length) | max) as $length
+                | map(. + [range(length; $length) | 0])
+                | .[0] >= .[1]
+            ' >/dev/null 2>&1; then
+                printf '%s' "$model"
+                return 0
+            fi
+        fi
+        _models_registry_get "$family.families" "$word"
         return 0
     fi
     if [[ "$family" != "codex" ]]; then
@@ -408,7 +437,11 @@ _agents_validate_pair_from_table() {
     local word model effort allowed_efforts allowed_agents
 
     word="${pair%%:*}"
-    model="$(_agents_model_slug "$family" "$word")" || return 1
+    if [[ "$family" == "claude" ]]; then
+        model="$word"
+    else
+        model="$(_agents_model_slug "$family" "$word")" || return 1
+    fi
     effort=""
     if [[ "$pair" == *:* ]]; then
         effort="${pair#*:}"

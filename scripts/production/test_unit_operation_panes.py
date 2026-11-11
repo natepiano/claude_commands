@@ -18,7 +18,7 @@ from scripts.production.fake_unit_host import PaneShellFixture
 from scripts.production import unit_move
 from scripts.herdr import herdr
 from scripts.production import unit_lookup
-from scripts.production.rename_state import RenameRefused
+from scripts.production.unit_move import RenameRefused
 
 
 @final

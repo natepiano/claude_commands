@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
 from scripts.build_hold.hold_applies import BUILDING_CARGO_VERBS, cargo_verb
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
@@ -34,16 +35,28 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
 
 
+def admitted_processes() -> frozenset[build_hold.ProcessIdentity]:
+    """Read durable grants, which precede replies and the next decision pass."""
+    from scripts.build_queue import admission_service
+
+    try:
+        state = admission_service.read_state(store.root() / "admission")
+    except (OSError, ValueError) as error:
+        raise OSError(f"admission state unavailable: {error}") from error
+    return frozenset(build_hold.ProcessIdentity(record.owner.pid, record.owner.start_time)
+                     for record in state.reservations.values())
+
+
 @dataclass(frozen=True)
 class WaitingRun:
     process: build_hold.AuditProcess
-    owner: build_hold.OwningSession | build_hold.NoOwningSession
+    owner: OwningSession | NoOwningSession
 
 
 @dataclass(frozen=True)
 class WorkingRun:
     process: build_hold.AuditProcess
-    owner: build_hold.OwningSession | build_hold.NoOwningSession
+    owner: OwningSession | NoOwningSession
     reason: str
 
 
@@ -126,7 +139,7 @@ def classify_drain_runs(
 def working_drain_identities(proc_root: Path) -> tuple[build_hold.ProcessIdentity, ...]:
     """Keep existing work through the enforcer when the drain hold starts."""
     runs = classify_drain_runs(build_hold.read_audit_processes(proc_root),
-                               build_hold.admitted_processes(), claimed_processes(proc_root))
+                               admitted_processes(), claimed_processes(proc_root))
     return tuple(run.process.identity for run in runs if isinstance(run, WorkingRun))
 
 
@@ -198,7 +211,7 @@ def stop_waiting_run(
         if (build_hold.process_start_time(supervisor.pid, proc_root) != supervisor.start_time
                 or not supervisor_matches(supervisor_args(supervisor.pid, proc_root), detached.path, detached.supervisor.cwd)):
             return RunIdentityChanged(run)
-    classification: build_hold.BuildClass = "other_session" if isinstance(run.owner, build_hold.OwningSession) else "no_session"
+    classification: build_hold.BuildClass = "other_session" if isinstance(run.owner, OwningSession) else "no_session"
     record_build(build_hold.AuditedBuild(process, run.owner, classification, ()), holder, proc_root, "stopped",
                  stopped_run=identity)
     reason = f"stopped for {holder.purpose}; run again after the release"
@@ -217,7 +230,7 @@ def stop_waiting_run(
             signal_process(identity.pid, signal.SIGTERM)
 
     try:
-        if isinstance(run.owner, build_hold.OwningSession):
+        if isinstance(run.owner, OwningSession):
             _ = build_hold.register_wait(run.owner.session_id)
         if isinstance(detached, DetachedRun):
             sent = detached_runs.stop_with_reason(detached.path, reason, still_current=still_current, signal_run=signal_run)
@@ -257,13 +270,13 @@ def drain(
     try:
         while True:
             processes = build_hold.read_audit_processes(proc_root)
-            runs = classify_drain_runs(processes, build_hold.admitted_processes(), claimed_processes(proc_root))
+            runs = classify_drain_runs(processes, admitted_processes(), claimed_processes(proc_root))
             if not runs:
                 print("drained", flush=True)
                 return 0
             report = clock() >= heartbeat
             for run in runs:
-                owner = run.owner.session_id if isinstance(run.owner, build_hold.OwningSession) else "no session"
+                owner = run.owner.session_id if isinstance(run.owner, OwningSession) else "no session"
                 if isinstance(run, WaitingRun) and run.process.identity not in attempted:
                     outcome = stop_waiting_run(run, holder, processes, proc_root)
                     label = "stopped" if isinstance(outcome, StoppedRun) else "skipped: identity changed"
@@ -297,14 +310,14 @@ def drain(
 @dataclass(frozen=True)
 class AllowedBuild:
     process: build_hold.AuditProcess
-    owner: build_hold.OwningSession | build_hold.NoOwningSession
+    owner: OwningSession | NoOwningSession
     reason: str
 
 
 @dataclass(frozen=True)
 class KeptBuild:
     process: build_hold.AuditProcess
-    owner: build_hold.OwningSession | build_hold.NoOwningSession
+    owner: OwningSession | NoOwningSession
     holder: build_hold.Holder
 
     @property
@@ -315,7 +328,7 @@ class KeptBuild:
 @dataclass(frozen=True)
 class WouldStopBuild:
     process: build_hold.AuditProcess
-    owner: build_hold.OwningSession | build_hold.NoOwningSession
+    owner: OwningSession | NoOwningSession
     reason: str
     holder: build_hold.Holder
     stop_root: build_hold.AuditProcess
@@ -469,7 +482,7 @@ def is_sccache_server(process: build_hold.AuditProcess) -> bool:
 
 def protected_reason(
     process: build_hold.AuditProcess, ancestors: Sequence[build_hold.AuditProcess],
-    owner: build_hold.OwningSession | build_hold.NoOwningSession,
+    owner: OwningSession | NoOwningSession,
     holders: Sequence[build_hold.Holder], enforcer_ancestors: frozenset[build_hold.ProcessIdentity],
 ) -> str:
     if process.identity in enforcer_ancestors:
@@ -526,7 +539,7 @@ def decide_builds(
         owner = build_hold.audit_owner(process, ancestors)
         names = {process.executable, Path(process.argv[0]).name if process.argv else process.command}
         if (not process.environment.get("BUILDLOG_CALL_ID") and "rust-analyzer" in names
-                and isinstance(owner, build_hold.NoOwningSession)):
+                and isinstance(owner, NoOwningSession)):
             continue
         reason = protected_reason(process, ancestors, owner, holders, protected)
         if reason or not holders:
@@ -536,7 +549,7 @@ def decide_builds(
         if isinstance(kept, build_hold.Holder):
             decisions.append(KeptBuild(process, owner, kept))
             continue
-        owner_key = build_hold.holder_path(Path(), owner.session_id).name if isinstance(owner, build_hold.OwningSession) else ""
+        owner_key = build_hold.holder_path(Path(), owner.session_id).name if isinstance(owner, OwningSession) else ""
         blocking = [holder for holder in holders if holder.key != owner_key] or list(holders)
         holder = min(blocking, key=lambda item: item.since)
         decisions.append(WouldStopBuild(process, owner, f"test or build outside {holder.name}'s hold for {holder.purpose}",
@@ -598,7 +611,7 @@ def record_build(
             "kind": "hold_build", "v": 1, "id": build_id, "at": store.utc_iso(time.time()), "host": host,
             "hold_key": holder.key, "hold_since": holder.since.isoformat(), "boot_id": boot,
             "pid": identity.pid, "proc_start": identity.start_time, "class": build.classification,
-            "session": build.owner.session_id if isinstance(build.owner, build_hold.OwningSession) else "",
+            "session": build.owner.session_id if isinstance(build.owner, OwningSession) else "",
             "command": shlex.join(build.process.argv) or build.process.command, "cwd": build.process.cwd,
             "action": action, "call_id": build.process.environment.get("BUILDLOG_CALL_ID", ""),
         }
@@ -658,7 +671,7 @@ class StopBuildsAndTests:
         for identity, deadline in tuple(self.terminating.items()):
             process = processes.get(identity.pid)
             ancestors = build_hold.audit_ancestors(process, processes) if process is not None else ()
-            owner = build_hold.audit_owner(process, ancestors) if process is not None else build_hold.NoOwningSession()
+            owner = build_hold.audit_owner(process, ancestors) if process is not None else NoOwningSession()
             # A route change cannot cancel termination of an old process.
             if (not holders or identity in protected or build_hold.owner_is_sole_holder(owner, holders)
                     or process is not None and isinstance(
@@ -682,9 +695,9 @@ class StopBuildsAndTests:
                for item in (build.process, *ancestors)):
             return
         write_refusal(self.proc_root, build)
-        classification: build_hold.BuildClass = "other_session" if isinstance(build.owner, build_hold.OwningSession) else "no_session"
+        classification: build_hold.BuildClass = "other_session" if isinstance(build.owner, OwningSession) else "no_session"
         self.record(build_hold.AuditedBuild(build.process, build.owner, classification, ()), build.holder, self.proc_root, "stopped")
-        if isinstance(build.owner, build_hold.OwningSession):
+        if isinstance(build.owner, OwningSession):
             _ = self.register(build.owner.session_id)
         # Include all descendants, not only compilers. Parents precede their children.
         children: dict[int, list[build_hold.AuditProcess]] = {}
@@ -775,7 +788,7 @@ def decision_lines(decisions: Sequence[BuildDecision]) -> list[str]:
     lines: list[str] = []
     for decision in decisions:
         label = "would stop" if isinstance(decision, WouldStopBuild) else "kept" if isinstance(decision, KeptBuild) else "allowed"
-        owner = decision.owner.session_id if isinstance(decision.owner, build_hold.OwningSession) else "no session"
+        owner = decision.owner.session_id if isinstance(decision.owner, OwningSession) else "no session"
         command = shlex.join(decision.process.argv) or decision.process.command
         keep = f"; --keep {decision.process.identity.pid}" if isinstance(decision, WouldStopBuild) else ""
         lines.append(f"{label}: {owner}, pid {decision.process.identity.pid}: {command}; {decision.reason}{keep}")

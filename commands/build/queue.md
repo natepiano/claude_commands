@@ -8,12 +8,15 @@ Use `/build:page` to see running steps, waiting steps, and memory use.
 A view request without `--json` prints `build queue: the queue view is on the build page; run /build:page` and exits 3.
 
 `bump <position|session|folder>` selects a waiting step with the pane card's selector resolver.
-It sets priority for that step's unit with the reason `the user's bump`.
-`clear` clears priority.
+It adds the step's unit to the end of the priority list with the reason `the user's bump`.
+A unit already in the list keeps its place. The output gives the unit's priority place.
+`clear` empties the priority list.
+`clear <unit>` removes that unit. An unknown unit receives a refusal.
 An unmatched selector exits 3 with `build queue: no waiting step matches <selector>`.
 `admit-head <why>` permits the current head to exceed the budget when free memory permits its start.
 These controls work from any session or a plain shell.
-Priority preserves order among steps with the same rank.
+The first unit's steps go first, then the second unit's steps, then all other steps.
+Each group keeps its normal order.
 The pane passes its session id to each control command.
 Unknown units use the same refusal protocol: exit 3 and a stdout line starting `build queue: `.
 Use `/build:status` for holds and target state.
