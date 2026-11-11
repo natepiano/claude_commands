@@ -220,16 +220,17 @@ class NativePaneSessionTests(StaffTestCase):
         proc = self.root / "unheld-proc"
         process = proc / "998079"
         (process / "fd").mkdir(parents=True)
-        for arguments in (["codex"], ["codex", "app-server", "--managed-daemon"],
-                          ["codex", "exec", "resume", identity],
-                          ["codex", "-c", "resume", identity]):
+        for arguments, refusal in ((["codex"], herdr.CodexPaneStarting),
+                          (["codex", "app-server", "--managed-daemon"], ValueError),
+                          (["codex", "exec", "resume", identity], ValueError),
+                          (["codex", "-c", "resume", identity], ValueError)):
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             with (self.subTest(arguments=arguments),
                   patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
                   patch.object(herdr, "_PLATFORM", "linux"),
                   patch.object(sessions, "process_start", return_value="same-process"),
                   patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": identity})):
-                with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+                with self.assertRaisesRegex(refusal, "Codex launch identity is unavailable"):
                     _ = herdr.native_process(998079, "codex")
 
     def test_codex_native_process_accepts_only_the_thread_in_its_resume_arguments(self) -> None:
@@ -279,7 +280,7 @@ class NativePaneSessionTests(StaffTestCase):
               patch.object(client, "result", return_value=info)):
             entry = client.codex_launch("w1:p1")
             herdr.json_object(info["pane"], "fixture pane")["session_id"] = None
-            with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+            with self.assertRaisesRegex(herdr.CodexPaneStarting, "Codex launch identity is unavailable"):
                 _ = client.codex_launch("w1:p1")
         self.assertEqual(entry["session_id"], fixture_runtime_id("herdr-codex-launch"))
         self.assertNotEqual(entry["session_id"], owner.current_session)
@@ -406,6 +407,57 @@ class NativePaneSessionTests(StaffTestCase):
                 self.assertEqual(observed, herdr.NativeAgentProcess(expected, "same-process", environment))
                 self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
 
+        pending_launches = (
+            (["codex"], True),
+            (["codex", "Explain this repository"], True),
+            (["codex", "--", "Explain this repository"], True),
+            (["codex", "--model", "test-model", "--no-alt-screen"], True),
+            (["codex", "--config=resume"], False),
+            (["codex", "-cresume"], False),
+            (["codex", '-cmodel="test-model"'], True),
+            (["node", "/opt/@openai/codex/bin/codex.js"], True),
+            (["codex", "resume", "--last"], False),
+            (["codex", "exec"], False),
+            (["codex", "--future-option"], False),
+            (["codex", "--model"], False),
+            (["codex", "--model", "--no-alt-screen"], False),
+        )
+        for arguments, starting in pending_launches:
+            with self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence:
+                pane = herdr.json_object(evidence["pane"], "fixture pane")
+                pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
+                info = herdr.json_object(evidence["process_info"], "fixture process info")
+                info.update(shell_pid=998069, foreground_process_group_id=998070)
+                identity = herdr.codex_launch_identity(998070, "")
+                if starting:
+                    self.assertIsInstance(identity, herdr.StartingCodexPane)
+                else:
+                    self.assertIsInstance(identity, herdr.CodexLaunchIdentityUnknown)
+                client = herdr.Herdr("agents")
+                with redirect_stderr(io.StringIO()) as notes:
+                    scan = client.scan_row_panes(staff.initial_snapshot(), [pane])
+                    for action in ("keys", "close", "signal"):
+                        self.assertFalse(herdr.check_target(
+                            current, action=action, place=herdr.HerdrPlace("agents", "w1:p1"),
+                            pane_info=client.pane_row("w1:p1"), client=client))
+                self.assertEqual(scan.found, {})
+                self.assertEqual([(item.pane, item.tab) for item in scan.unknown], [("w1:p1", "w1:t1")])
+                if starting:
+                    self.assertIn("starting", notes.getvalue())
+                    self.assertNotIn("unknown", notes.getvalue())
+                    self.assertNotIn("anomaly", notes.getvalue())
+                    with (patch.object(codex_daemon, "read_daemons", return_value=[]),
+                          patch.object(herdr, "herdr_places", return_value={998070: herdr.HerdrPlace("agents", "w1:p1")}),
+                          redirect_stderr(io.StringIO()) as conversations_notes):
+                        conversations = herdr.codex_conversations()
+                    self.assertEqual(conversations.live, {})
+                    self.assertEqual(conversations.unknown, ())
+                    self.assertIn("starting", conversations_notes.getvalue())
+                    self.assertNotIn("anomaly", conversations_notes.getvalue())
+                else:
+                    self.assertIn("unknown", notes.getvalue())
+                    self.assertNotIn("starting", notes.getvalue())
+
 
     def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")
@@ -457,7 +509,7 @@ class NativePaneSessionTests(StaffTestCase):
               patch.object(sessions, "process_start", side_effect=["first-process", "reused-pid"]),
               patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": launch}),
               patch.object(herdr, "herdr_place_of", return_value=herdr.NotInHerdr()),
-              patch.object(herdr, "codex_resume_thread", return_value=current)):
+              patch.object(herdr, "codex_launch_identity", return_value=herdr.PaneSessionReport(current))):
             with self.assertRaisesRegex(ValueError, "native process start changed"):
                 _ = herdr.native_process(998073, "codex", current)
 
@@ -550,7 +602,7 @@ class CodexAnomalyNameTests(StaffTestCase):
                 placement.side_effect = herdr_types.HerdrFailure("placement is unavailable")
             if source == "pid":
                 registry.side_effect = OSError("registry is unavailable")
-            with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+            with self.assertRaisesRegex(herdr.CodexPaneStarting, "Codex launch identity is unavailable"):
                 _ = herdr.native_process(pid, "codex", "")
             self.assertEqual(herdr.running_codex_threads(thread_host=lambda _argv: False), set())
             name = {"tab": "morty", "registry": "registry-name", "pid": f"pid {pid}"}[source]
@@ -4489,6 +4541,25 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "agent", "start", "worker", "--kind", "codex", "--pane", "pane-1", "--timeout", "10000", "--", "-m", "fixture-model"],
             ["--session", "fixture", "agent", "prompt", "pane-1", script_prompt("opening\nprompt")],
         ])
+
+        for index, opening in enumerate((herdr.NoOpeningPrompt(), herdr.OpeningPrompt("Explain this repository"))):
+            root = self.root / f"starting-{index}"
+            with self.subTest(opening=opening):
+                with (codex_launch_evidence(root, ["codex"], pane_id="pane-1") as evidence,
+                      redirect_stderr(io.StringIO()) as notes):
+                    herdr.json_object(evidence["pane"], "fixture pane")["session_id"] = None
+                    self.configure_herdr(["pane", "process-info", "--pane", "pane-1"],
+                                         json.dumps({"result": evidence}))
+                    outcome = self.herdr.start_agent("worker", "pane-1", "codex", [], opening, 10_000)
+                self.assertNotIn("anomaly", notes.getvalue())
+                self.assertIn("starting", notes.getvalue())
+                if isinstance(opening, herdr.NoOpeningPrompt):
+                    self.assertIsInstance(outcome, herdr.PromptSubmissionNotRequired)
+                else:
+                    self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+                self.assertEqual([command for command in self.start_commands() if command[2:4] == ["agent", "prompt"]], [
+                    ["--session", "fixture", "agent", "prompt", "pane-1", script_prompt("opening\nprompt")]])
+                self.assertEqual(list((root / "codex-launch-records").glob("*.json")), [])
 
     def test_claude_start_passes_only_extra_arguments_after_separator(self) -> None:
         _ = self.herdr.start_agent(
