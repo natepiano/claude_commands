@@ -59,89 +59,22 @@ dwight=claude:fable:high
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** staff knows kind `producer` and not kind `agent`; morty and brain become producer rows through a one-off conversion at deploy.
-
-**Spec:**
-
-1. Replace kind `agent` with `producer` in `staff.py` and in every caller, test and doc the research lists. Keep each rule as it is for the new kind: no parent, may hold a worktree and a doc, may be a root row, starts a staff path.
-2. Rename the words "agent row" and "freestanding agent" to "producer" in code, help text and docs where they name this kind.
-3. Write a conversion program outside the repository, at `/tmp/claude/unit/bd19678b-c7b1-4e24-be9e-133ecfe24c7a/convert_producers.py`. It uses staff code to change each `agent` row to `producer`, and gives brain `home` = the home of the current workers account. It prints each changed row and exits 0 when no `agent` row is left. A second run changes nothing.
-4. Test the conversion program against a fixture staff file in a temporary directory. Do not commit that test.
-5. Add no reader for the old `agent` kind in the main code.
-
-**Files:**
-- `scripts/production/staff.py` — the kind and its rules
-- `scripts/production/staff_sources.py` — active producers
-- `scripts/agents/restart.py` — pane search
-- `scripts/agents/shutdown_record.py` — location
-- `scripts/message/send.py` — repeat-notice owner
-- `scripts/production/test_staff.py` — fixtures and rows
-- `scripts/agents/test_restart.py` — fixtures
-- `scripts/agents/test_stop_resume.py` — fixtures
-- `scripts/agents/test_pane_record.py` — fixtures
-- `scripts/agents/test_pane_restore.py` — fixtures
-- `scripts/herdr/test_herdr.py` — fixtures
-- `scripts/herdr/test_pane_launch.py` — fixtures
-- `scripts/message/test_roster.py` — fixtures
-- `scripts/message/test_send.py` — fixtures
-- `scripts/hooks/test_codex_queue_drain.py` — fixtures
-- `scripts/production/test_worker.py` — fixtures
-- `scripts/production/test_unit_effort.py` — fixtures
-- `scripts/build_targets/test_working_set.py` — fixtures
-- `scripts/hana_shot/test_hana_shot.py` — fixtures
-- `scripts/direct/test_progress_history.py` — fixtures
-- `commands/agents.md` — the word for the kind
-- `docs/as-built/herdr-restore.md` — the word for the kind
-- `docs/as-built/shutdown-and-restart.md` — the word for the kind
-
-**Workers:** 1 writer.
-
-**State:** the staff row kind. The deploy runs the conversion once on natedev and on the Mac, right after the stack lands on main, then deletes it.
-
-**Acceptance gate:**
-- The Test command passes.
-- basedpyright gives `0 errors, 0 warnings, 0 notes` on the changed Python files.
-- The conversion program run against a copy of the live staff file in a temporary directory changes morty and brain and nothing else.
+- Staff kind `producer` replaces kind `agent` in `scripts/production/staff.py`, `staff_sources.py`, `agents/restart.py`, `agents/shutdown_record.py` and `message/send.py`. A producer row has no parent, may hold a worktree and a doc, may be a root row, and starts a staff path.
+- Tests, `commands/agents.md` and the herdr-restore and shutdown-and-restart as-builts use the word producer.
+- Deploy: `convert_producers.py`, outside the repository, changes morty and brain to `producer` through the staff transaction and gives brain the workers account home. A second run changes nothing. It runs once on natedev and the Mac right after the stack lands, then is deleted.
 
 ### Phase 2 — One command and one models line per producer  · status: done
 
 **Depends on:** none (runs beside Phase 1; no shared file)
 
-#### Work Order
+#### As-built
 
-**Goal:** /producer:morty, /producer:brain and /producer:dwight exist, the old name is gone, and `config/models.conf` holds the three producer lines.
-
-**Spec:**
-
-1. `git mv commands/associate-producer.md commands/producer/morty.md`. Its text calls morty nate's producer, and the user the executive producer.
-2. `git mv docs/associate-producer/operations.md docs/producer/morty-operations.md`. Fix every link to it.
-3. Write `commands/producer/brain.md` and `commands/producer/dwight.md`. Each holds the producer's name, its job name (dwight: strategist; brain: the job its current docs name, else only the name), and the management lines: how it starts (`resume <name>`), its family account, its workspace tab. Add no invented duties. Write no shared role doc.
-4. Rename every "associate producer" and "associate-producer" reference: `commands/showrunner/produce.md:126`, `docs/as-built/staff-accessors.md:99`, the command's own links, and `~/rust/hanadocs/morty/README.md` (git -C).
-5. Add to `config/models.conf` a `[producers]` section with the three lines from the Source, one line each, in the form `<name>=<family>:<model>:<effort>`. Extend `models_registry.py` to read and check that form, and add a row to its existing test.
-6. Name the code that syncs commands into the Codex skill list. If it maps a command folder to a `folder:name` skill, show that `commands/producer/morty.md` gives `producer:morty`. The director checks morty's live skill list after the stack lands.
-
-**Files:**
-- `commands/associate-producer.md` — moves to `commands/producer/morty.md`
-- `commands/producer/brain.md` — new
-- `commands/producer/dwight.md` — new
-- `docs/associate-producer/operations.md` — moves to `docs/producer/morty-operations.md`
-- `commands/showrunner/produce.md` — the reference
-- `docs/as-built/staff-accessors.md` — the reference
-- `config/models.conf` — the `[producers]` section
-- `scripts/lib/models_registry.py` — reads the producer lines
-- `scripts/lib/test_models_registry.py` — a row for the producer lines
-- `~/rust/hanadocs/morty/README.md` — the references
-
-**Workers:** 1 writer.
-
-**State:** none.
-
-**Acceptance gate:**
-- The Test command passes.
-- basedpyright gives `0 errors, 0 warnings, 0 notes` on the changed Python files.
-- `rg -i 'associate.producer'` in both repositories finds nothing.
+- `/associate-producer` is now `/producer:morty` (`commands/producer/morty.md`); its operations doc is `docs/producer/morty-operations.md`. `/producer:brain` and `/producer:dwight` hold the name, the job name and the management lines only.
+- The Codex sync names the folder command `producer-morty`.
+- `config/models.conf` `[producers]` holds `morty=codex:astra:high`, `brain=codex:astra:medium`, `dwight=claude:fable:high`. `models_registry.launch_settings("producers", name)` reads and checks them.
+- hanadocs `morty/README.md` and `morty/checkins.json` name the new paths, uncommitted in hanadocs.
 
 ### Phase 3 — One start path and account moves for producers  · status: pending
 
