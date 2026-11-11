@@ -77,8 +77,7 @@ def typed_record(plan: Path, *statuses: str) -> phase_table.PhaseRecord:
             rows.append(current)
         else:
             rows.append(phase_table.TodoPhase(str(index), f"Delivery {index}", phase_table.PhaseTimingNotPredicted()))
-    return phase_table.PhaseRecord(plan, now, current, rows, phase_table.UnknownFinish(),
-                                   phase_table.CouldStart(()))
+    return phase_table.PhaseRecord(plan, now, current, rows, phase_table.UnknownFinish())
 
 
 def open_record(plan: Path) -> phase_table.PhaseRecord:

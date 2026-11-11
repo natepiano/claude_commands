@@ -8438,91 +8438,11 @@ class PublicPhaseHelperTests(unittest.TestCase):
         self.assertEqual(
             plan_history.plan_phases(plan),
             [
-                {"id": "1", "title": "Archived delivery", "done": True, "depends_on": None},
-                {"id": "2", "title": "Finished delivery", "done": True, "depends_on": None},
-                {"id": "3", "title": "Live delivery", "done": False, "depends_on": None},
+                {"id": "1", "title": "Archived delivery", "done": True},
+                {"id": "2", "title": "Finished delivery", "done": True},
+                {"id": "3", "title": "Live delivery", "done": False},
             ],
         )
-
-    def test_plan_phases_read_each_phase_dependencies(self) -> None:
-        plan = self.root / "plan.md"
-        _ = plan.write_text(
-            "\n".join(
-                (
-                    "### Phase 1 — Base  · status: todo",
-                    "**Depends on:** none",
-                    "### Phase 2 — Report  · status: todo",
-                    "**Depends on:** Phase 1, Phase 4",
-                    "### Phase 3 — Docs  · status: todo",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
-
-        phases = plan_history.plan_phases(plan)
-
-        self.assertEqual(
-            [phase["depends_on"] for phase in phases],
-            [[], ["1", "4"], None],
-        )
-
-    def test_plan_dependencies_read_only_named_local_phase_spans(self) -> None:
-        cases: tuple[tuple[str, list[str]], ...] = (
-            (
-                "the checkpoints of Phases 3, 4 and 5, and the three review records: "
-                + "the Phase 3 and Phase 5 re-runs, which the unit director runs on "
-                + "2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on "
-                + "2026-10-29) and records in the design doc under Steps 1 and 4",
-                ["3", "4", "5"],
-            ),
-            (
-                "phases Phase 11 (the wait-holder field and the phase origin fields) "
-                + "merged into sdlc; sdlc said 2026-10-29 its ETA is 19:00 EDT.",
-                [],
-            ),
-            ("Phase 7; postmaster's reply record (main abc8344f)", ["7"]),
-            ("Phase 19 (numbering only)", ["19"]),
-            ("Phase 10b, Phase 11", ["10b", "11"]),
-            ("none", []),
-        )
-        plan = self.root / "dependencies.md"
-        for depends, expected in cases:
-            with self.subTest(depends=depends):
-                _ = plan.write_text(
-                    "### Phase 6 — Consumer  · status: todo\n"
-                    + f"**Depends on:** {depends}\n",
-                    encoding="utf-8",
-                )
-                self.assertEqual(plan_history.plan_phases(plan)[0]["depends_on"], expected)
-
-    def test_plan_dependencies_accept_either_case_and_keep_first_seen_order(self) -> None:
-        plan = self.root / "dependencies.md"
-        _ = plan.write_text(
-            "### Phase 6 — Consumer  · status: todo\n"
-            + "**Depends on:** phases 4, 3 AND 5; PHASE 10b; phase 4\n",
-            encoding="utf-8",
-        )
-        self.assertEqual(
-            plan_history.plan_phases(plan)[0]["depends_on"], ["4", "3", "5", "10b"]
-        )
-
-    def test_plan_dependencies_skip_other_unit_spans_but_keep_local_references(self) -> None:
-        plan = self.root / "dependencies.md"
-        for external in (
-            "phases Phase 11",
-            "models's phase 4",
-            "models’s Phases 4, 5 and 6",
-        ):
-            with self.subTest(external=external):
-                _ = plan.write_text(
-                    "### Phase 6 — Consumer  · status: todo\n"
-                    + f"**Depends on:** Phase 7; {external}; Phase 19\n",
-                    encoding="utf-8",
-                )
-                self.assertEqual(
-                    plan_history.plan_phases(plan)[0]["depends_on"], ["7", "19"]
-                )
 
     def test_plan_phases_preserves_descriptive_parentheticals(self) -> None:
         plan = self.root / "plan.md"
