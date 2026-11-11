@@ -21,7 +21,7 @@ from scripts.herdr import herdr_types
 from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import DEMOTED, Production, Refusal, read_new_production, read_production
 from scripts.agents import pane_record, remote, stop_resume
 from scripts.whoami.account import named_account_environment
 
@@ -36,6 +36,7 @@ class Step(IntEnum):
     DOCUMENTED = 6
     STARTED = 7
     PLACED = 8
+    CLEANED = 9
 
 
 @dataclass(frozen=True)
@@ -262,6 +263,24 @@ def restore(path: Path) -> int:
     return 0
 
 
+def finish_demotion(child: staff.StaffRow, doc: Path, parent: Production, plan: Path) -> None:
+    """Remove the completed production's schedule and commit its ended document."""
+    production = read_new_production(doc, child.name).for_owner(child)
+    lines = doc.read_text(encoding="utf-8").splitlines()
+    if not any(line.startswith("> **Status: ended") for line in lines):
+        status = DEMOTED.format(date=datetime.now(parent.zone).date().isoformat(), child=child.name,
+                                parent=parent.name, plan=plan.relative_to(production.checkout))
+        for index, line in enumerate(lines):
+            if line.startswith("> **Status:"):
+                lines[index] = status
+                break
+        else:
+            lines[1:1] = ["", status]
+        write_text_atomic(doc, "\n".join(lines) + "\n")
+    _ = add_unit.commit_paths(production, [doc], f"production({child.name}): record the completed demotion")
+    update_registration.remove_updates(child)
+
+
 def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
     completed = Step(int(str(fields["step"])))
     if completed < Step.DETACHED:
@@ -307,6 +326,9 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
         assert row is not None
         transfer_unit.place_unit(request.child.name, transfer_unit.UnitTransfer(row, request.parent.owner, request.parent, row.name))
         save(path, fields, Step.PLACED)
+    if completed < Step.CLEANED:
+        finish_demotion(request.child.owner, request.child.doc, request.parent, request.plan)
+        save(path, fields, Step.CLEANED)
     path.unlink()
     print(f"{request.child.name} is now a unit of {request.parent.name}")
     return 0
@@ -331,8 +353,11 @@ def _main(argv: list[str]) -> int:
         add_unit.require_merge_branch(parent)
         fields = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         if Step(int(str(fields["step"]))) == Step.PLACED:
-            path.unlink()
-            fields = {}
+            source = staff.StaffRow.from_json(fields["source"])
+            row = record.by_id(source.id)
+            if row is None or row.kind != "unit" or row.parent != staff.ReportsTo(parent.owner.id):
+                path.unlink()
+                fields = {}
     if fields:
         request = saved_request(parent, fields)
         if ((isinstance(plan, Path) and child_plan(request.child, plan) != request.plan)

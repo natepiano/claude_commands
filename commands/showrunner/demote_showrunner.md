@@ -17,3 +17,8 @@ Relative plan paths start at the child's checkout.
 Use `--check` to inspect the request without changes.
 Repeat the child name to continue a pending demotion.
 Show the script's output and any refusal.
+
+A pending demotion keeps the stopped showrunner notifier for restoration.
+A completed demotion removes that notifier, its generated prompt and its counts cache.
+The command keeps reminders and history records.
+It marks the old production document ended and commits only that document on the unit branch.

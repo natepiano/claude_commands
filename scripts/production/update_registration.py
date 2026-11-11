@@ -505,6 +505,14 @@ def notifier(arguments: list[str]) -> str:
     return command("notifier", ["zsh", str(script), *arguments])
 
 
+def remove_updates(owner: staff.StaffRow) -> None:
+    """Remove the generated schedule files and retain reminders and history."""
+    _ = notifier(["remove", f"showrunner-{owner.id}"])
+    root = _showrunner_state_root()
+    (root / owner.id / "prompt.txt").unlink(missing_ok=True)
+    (root / "counts" / owner.id).unlink(missing_ok=True)
+
+
 def instance(name: str) -> InstancePresent | InstanceAbsent:
     script = Path.home() / ".claude/scripts/message/notifier.sh"
     result = subprocess.run(["zsh", str(script), "status", name], capture_output=True, text=True, check=False)
