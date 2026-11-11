@@ -7,9 +7,10 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from typing import Literal
 
 from scripts.lib import conf
 from scripts.lib.atomic_file import sync_folder
@@ -31,6 +33,19 @@ class RetentionPolicy:
     delete_after: timedelta
     sample_files: int
     sample_bytes: int
+
+
+RetainedKind = Literal["showrunner", "producer", "unit"]
+
+
+@dataclass(frozen=True)
+class StaffKeepRule:
+    kind: RetainedKind
+
+
+@dataclass(frozen=True)
+class NoStaffKeep:
+    """The transcript follows the age rule."""
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,7 @@ class RetentionTotals:
     deleted: int = 0
     skipped: int = 0
     freed: int = 0
+    kept: Counter[RetainedKind] = field(default_factory=Counter, kw_only=True)
 
 
 def read_policy() -> RetentionPolicy:
@@ -73,30 +89,40 @@ def transcript_roots(home: Path) -> list[Path]:
                    for root in home.glob(pattern) if root.is_dir()})
 
 
-def retained_sessions() -> frozenset[str]:
+def retained_sessions() -> dict[str, StaffKeepRule]:
     """Read local staff membership without contacting its remote owner."""
-    return frozenset(str(row.current_session) for row in staff.local_snapshot().rows if row.current_session)
+    retained: dict[str, StaffKeepRule] = {}
+    for row in staff.local_snapshot().rows:
+        if row.kind not in ("showrunner", "producer", "unit") or not row.current_session:
+            continue
+        retained[row.current_session] = StaffKeepRule(row.kind)
+    return retained
 
 
-def staff_transcript(path: Path, retained: frozenset[str]) -> bool:
-    """Match session folders, plain session names, and rollout name suffixes."""
+def staff_transcript(path: Path, retained: Mapping[str, StaffKeepRule]) -> StaffKeepRule | NoStaffKeep:
+    """Keep main transcripts while their eligible staff rows remain in the record."""
     logical = uncompressed_path(path)
     stem = logical.stem
-    return (any(part in retained for part in logical.parts) or stem in retained
-            or any(stem[index + 1:] in retained for index, char in enumerate(stem) if char == "-"))
+    rule = retained.get(stem)
+    if rule is None and stem.startswith("rollout-"):
+        rule = next((retained[stem[index + 1:]] for index, char in enumerate(stem)
+                     if char == "-" and stem[index + 1:] in retained), None)
+    return rule if rule is not None else NoStaffKeep()
 
 
-def retention_candidates(root: Path, policy: RetentionPolicy, retained: frozenset[str], now: datetime,
+def retention_candidates(root: Path, policy: RetentionPolicy, retained: Mapping[str, StaffKeepRule], now: datetime,
                          totals: RetentionTotals) -> list[DeletionCandidate | CompressionCandidate]:
     candidates: list[DeletionCandidate | CompressionCandidate] = []
     for path in sorted(root.rglob("*.jsonl*")):
         if not path.name.endswith((".jsonl", ".jsonl.zst")) or not path.is_file():
             continue
-        if staff_transcript(path, retained):
-            totals.skipped += 1
-            continue
         saved = path.stat()
         age = now.timestamp() - saved.st_mtime
+        kept = staff_transcript(path, retained)
+        if isinstance(kept, StaffKeepRule):
+            totals.skipped += 1
+            totals.kept[kept.kind] += 1
+            continue
         if age >= policy.delete_after.total_seconds():
             candidates.append(DeletionCandidate(path, saved))
         elif age >= policy.compress_after.total_seconds() and path.suffix != ".zst":
@@ -131,7 +157,7 @@ def compression_ratio(candidates: Sequence[CompressionCandidate], policy: Retent
     return compressed / original if original else 1.0
 
 
-def retain_root(root: Path, policy: RetentionPolicy, retained: frozenset[str], now: datetime, *,
+def retain_root(root: Path, policy: RetentionPolicy, retained: Mapping[str, StaffKeepRule], now: datetime, *,
                 dry_run: bool, finalize: Callable[[Path], None], files: bool = False) -> RetentionTotals:
     totals = RetentionTotals(root)
     candidates = retention_candidates(root, policy, retained, now, totals)
@@ -227,6 +253,8 @@ def run(*, dry_run: bool, files: bool = False) -> list[RetentionTotals]:
                                sum(item.deleted for item in totals), sum(item.skipped for item in totals),
                                sum(item.freed for item in totals))
     print(summary_line(combined, dry_run=dry_run))
+    kept = sum((item.kept for item in totals), Counter[RetainedKind]())
+    print(f"kept plain: {kept['showrunner']} showrunner, {kept['producer']} producer, {kept['unit']} unit")
     return totals
 
 
