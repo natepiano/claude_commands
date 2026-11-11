@@ -2210,33 +2210,59 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Gotchas:** the `local_hold_environment` patch reaches only an in-process wait. A wait that `verify.sh` starts as a child process runs the real `tell_wait_holder`, inside the fixture `HOME` and `XDG_STATE_HOME`.
 
-### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: todo
+### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: done
 
-**Depends on:** Phase 103 (it changes `scripts/build_hold/build_hold.py`); done.
+#### As-built
 
-**Source:** builds 2026-11-11, from natedev. fps took and released three holds from 12:33 to 12:56 UTC. Each release sent the same text, `/build:hold: the build hold has been released …`, to session dea51c3e. The send-repeat guard held the later copies, so a stopped session can miss its release.
-
-#### Work Order
-
-**Goal:** Each release notice is a distinct message: it names the hold's purpose and its start time.
-
-**Spec:**
-
-1. **The text.** `send_release` (`scripts/build_hold/build_hold.py:1469`) and `send_release_broadcast` (:1483) add the released hold to `RELEASE_NOTICE`: `<holder> hold for <purpose>, from <HH:MM zone>`. The time is in the user zone (`scripts/lib/user_zone.py`). A cycle with more than one holder names each one.
-2. **The record.** The hold cycle keeps each holder's purpose beside `since` (`HoldCycle.holders`, :69; written at :1405 and in the recovery at :1348), because the holder file is gone at release. A cycle saved before this change has no purpose: the notice then names the holder and its start time only.
-3. **Proof.** Add rows to the existing release notice tests in `scripts/build_hold/test_build_hold.py` (:1197): two releases of two holds in one session give two different texts; each text names the purpose and start time; an old cycle with no purpose still sends.
-4. **Docs.** `docs/as-built/build-targets.md`: the release notice text names the hold, its purpose and its start time.
-
-**Constraints from prior phases:** Phase 103 added `run_resolution` and the `hold_sender_timeout_seconds` key; release sends keep their own path and do not use that key.
+- `release_notice(holders)` adds `Released holds: <name> hold for <purpose>, from <HH:MM:SS zone>; …` to `RELEASE_NOTICE`, one entry for each holder, with the time in the user zone. A holder with no purpose reads `<name> hold, from <time>`. Seconds keep the texts of holds in one minute different.
+- `send_release(entry, socket, notice)` and `send_release_broadcast(notice)` send that text. `send_cycle_notices` makes it from `cycle["holders"]`.
+- `start_hold` writes `{"name", "purpose", "since", "released_at"}` into the cycle holders, because the holder file is gone at release.
+- `ReleaseIntent` has `holder_purpose` and `cycle_holders` (both `NotRequired`). `finish_recorded_notices` uses `cycle_holders` for the recovered cycle and the broadcast. An old intent falls back to its one holder.
 
 **Files:**
-- `scripts/build_hold/build_hold.py`
-- `scripts/build_hold/test_build_hold.py`
-- `docs/as-built/build-targets.md`
+- `scripts/build_hold/build_hold.py` — release notice text, cycle holder record, release intent.
+- `scripts/build_hold/test_build_hold.py` — `ReleaseDeliveryTests` rows: current-cycle, old-cycle, multiple-holders, recovered-cycle, broadcast, same-minute.
+- `scripts/build_hold/test_hold_enforcer.py` — the drain test's `send_release` fake takes the notice.
+- `docs/as-built/build-targets.md` — the release notice text.
 
-**Workers:** `1 writer`
-- `impl` owns all three files; step 4 of the Spec names the as-built change.
+**Gotchas:** a `side_effect` fake of `send_release` must take three arguments.
 
-**Gate:** the targeted test; `scripts/build_hold/test_build_hold.py` passes; `basedpyright` 0 warnings on the changed files (the import cycles go in their own phase).
+**Ruled out:** a start time with minutes only — three holds in one minute give equal texts.
 
-**Change-Review:** Two hold releases in a row both reach a waiting session | Take and release two natedev holds with different purposes while a session waits | The session gets two release notices, each naming its hold's purpose and start time
+### Phase 105 — The Mac floor alert lists the build output inside each Mac test copy  · status: done
+
+#### As-built
+
+- When the Mac disk falls below the alert line, the alert lists each Mac cargo target with its size in GiB, marks held ones, and recommends the largest target that is not held.
+- `mac_folder_measurement(policy: MacFloor, targets: Sequence[str])` measures each root's direct children and each target in `targets` with `mac_folder_reclaimable_bytes`. It skips targets that no longer exist and symlinked targets. It does not scan the roots again.
+- `FloorOutcome.targets` holds `SearchedFloorTargets` (the target list `_hold_floor_pass` found, filtered by `policy.allows`; a search with no targets gives an empty one) or `FloorTargetsNotSearched`.
+- A Mac crossing alert sends only after a pass that searched for targets. Failure alerts and natedev alerts do not wait for a search.
+- `folder_choice_lines` lists no choice that is inside, or holds, an earlier listed choice.
+- `folder_choices` keeps the Phase 99 rule: a folder with a `Cargo.toml` or `.git` is not a choice.
+
+**Files:**
+- `scripts/lint/sweep.py` — the Mac measurement, `SearchedFloorTargets`, `FloorTargetsNotSearched`, the crossing gate and the choice overlap rule.
+- `scripts/lint/test_sweep.py` — rows for nested, held nested and symlinked targets, overlapping targets, and passes that end before the search.
+- `docs/as-built/build-memory-admission.md` — the Mac measurement paragraph.
+
+**Gotchas:** when the Mac `sweep_floor_gib` falls below `sweep_phone_floor_gib`, a pass with free space between the two values returns before the search, so the Mac crossing alert never sends. Both values are 150 today.
+
+**Ruled out:** a second root scan in the alert path.
+
+### Phase 106 — The hold module has no import cycle  · status: done
+
+#### As-built
+
+- `scripts/build_hold/owning_session.py` owns `OwningSession(session_id: str)` and `NoOwningSession`. It imports no repository module. Every caller imports the types from it; `build_hold` keeps no re-export.
+- `placement.SubmittingSession` and `claim_state.SubmittingSession` are `OwningSession | NoOwningSession`, imported at run time. `placement.py` has no deferred import class.
+- `hold_enforcer.admitted_processes() -> frozenset[ProcessIdentity]` reads the durable grants. It imports `admission_service` inside the function. `build_hold.audit_builds` reads it through `hold_enforcer()`, and the `HoldEnforcer` protocol names it.
+- `build_hold` does not import `admission_service`. `basedpyright` reports no import cycle over the hold, queue, target and Mac test modules.
+
+**Files:**
+- `scripts/build_hold/owning_session.py` — the two session types.
+- `scripts/build_hold/build_hold.py` — imports the types as `session_owner` because its own function is named `owning_session`.
+- `scripts/build_hold/hold_enforcer.py` — `admitted_processes`.
+- `scripts/build_queue/placement.py`, `scripts/build_queue/admission_service.py`, `scripts/build_targets/build_targets.py`, `scripts/mac_test/claim_state.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — import the types from the new module.
+- `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md` — the type owner and the grant reader.
+
+**Gotchas:** tests patch `hold_enforcer.admitted_processes`, not `build_hold.admitted_processes`. `basedpyright` counts an import inside a function as a cycle edge, so an import of `admission_service` anywhere in `build_hold` makes the cycles again.

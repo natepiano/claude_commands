@@ -31,7 +31,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import send, sessions
 from scripts.usage import agents_log
@@ -2116,6 +2116,36 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
         self.assertIn(self.agent.final, self.reply.read_text())
+
+    def test_cli_model_override_uses_the_selected_account_catalog(self) -> None:
+        _ = write_registry(self.fixture.root / "conf/models.conf", {
+            "assignments": {"direct": "claude"}, "direct.claude": {"impl": "sonnet:high"},
+        })
+        environment = claude_catalog_environment(self.fixture.root / "caller-account", {
+            "opus": "claude-opus-caller-fixture", "sonnet": "claude-sonnet-caller-fixture",
+        })
+        selected = self.fixture.root / "override-account"
+        _ = claude_catalog_environment(selected, {
+            "opus": "claude-opus-override-fixture", "sonnet": "claude-sonnet-role-fixture",
+        })
+        for index, (model, expected) in enumerate((
+            ("opus", "claude-opus-override-fixture"),
+            ("claude-opus-saved-fixture", "claude-opus-saved-fixture"),
+        )):
+            name = f"override-{index}"
+            with (self.subTest(model=model), patch.dict(os.environ, environment),
+                  patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.NamedAccount("claude2", selected)),
+                  patch.object(herdr, "launch_prepared_agent", side_effect=self.fixture.world.launch_through_herdr)):
+                code, output, errors = self.command("assign", "impl", str(self.prompt),
+                    "--session-dir", str(self.run_dir), "--slot", "impl", "--phase", "8", "--kind", "impl",
+                    "--name", name, "--reply", str(self.reply), "--model", model,
+                    "--launcher-command", json.dumps(["assign.sh", "--model", model]))
+                self.assertEqual((code, output), (0, "submitted\n"), errors)
+                pane = self.agent.submitted[-1][0]
+                self.assertEqual(self.agent.row(pane).name, name)
+                arguments = self.fixture.world.foreground[pane][2]
+                self.assertEqual(arguments[arguments.index("--model") + 1], expected)
+                self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
 
     def test_early_review_uses_one_pass_and_two_transcript_receipts(self) -> None:
         ready = self.run_dir / "final.ready"

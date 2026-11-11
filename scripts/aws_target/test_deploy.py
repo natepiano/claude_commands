@@ -715,7 +715,7 @@ sys.exit(7)
         self.assertEqual(self.previous_output(output.getvalue(), 'secrets'), '')
 
     def test_gate_trial_command_prints_progress_around_the_trial(self) -> None:
-        arguments = ['deploy.py', 'gate-trial', '--step', 'size', '--repo', str(self.root), '--approve-resources']
+        arguments = ['deploy.py', 'gate-trial', '--base', 'base', '--changed', 'changed', '--modules', 'fixture/test_ok.py']
         with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(gate_trial, 'main', return_value=0) as trial,
               redirect_stdout(StringIO()) as output):
             self.assertEqual(deploy.main(), 0)

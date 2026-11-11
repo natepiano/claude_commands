@@ -7,6 +7,7 @@ from scripts.production.staff_test_support import unit_membership, fixture_membe
 from scripts.lib import names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_names import fixture_names
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 
 import io
 import json
@@ -19,7 +20,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, tzinfo
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -53,6 +54,14 @@ from scripts.production import staff, unit_config
 from scripts.production.production_doc import Production, read_production
 
 class NativeClaudeUnitTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        registry = write_registry(Path.home() / ".claude/config/models.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+        })))
+
     def test_resume_uses_the_renamed_native_owner_for_arguments_and_tab(self) -> None:
         document = self.production("demo")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
@@ -70,16 +79,33 @@ class NativeClaudeUnitTests(StaffTestCase):
             identity=add_unit.UnitIdentity("saved-name", "saved-name"))
         from scripts.accounts.accounts import NamedAccount
 
-        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", return_value=
-              herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(LAUNCHED_AT))) as launch):
-            _ = add_unit.launch_session(request, add_unit.DirectorAgent("fixture", add_unit.DefaultEffort()),
-                "resume", NamedAccount("claude1", self.root))
-        arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
-        self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
-        self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
-        self.assertEqual(launch.call_args.args[2], "row-name")
-        self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
-        self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in cast(dict[str, str], launch.call_args.args[4])))
+        caller = claude_catalog_environment(self.root / "caller-account", {"fable": "claude-fable-caller-fixture"})
+        selected = self.root / "selected-account"
+        _ = claude_catalog_environment(selected, {"fable": "claude-fable-selected-fixture"})
+        for director_model, saved_model, expected in (
+            ("fixture", "", "fixture"),
+            ("fable", "", "claude-fable-selected-fixture"),
+            ("fixture", "fable", "claude-fable-selected-fixture"),
+            ("fixture", "claude-fable-saved-fixture", "claude-fable-saved-fixture"),
+        ):
+            with (self.subTest(director=director_model, saved=saved_model), patch.dict(os.environ, caller),
+                  patch.object(herdr, "start_server"), patch.object(herdr, "open_tab", return_value="w1:p1"),
+                  patch.object(herdr.Herdr, "run_in_pane"),
+                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmitted(LAUNCHED_AT)) as start,
+                  patch.object(herdr, "launch_agent", wraps=herdr.launch_agent) as launch):
+                _ = add_unit.launch_session(request, add_unit.DirectorAgent(director_model, add_unit.DefaultEffort()),
+                    "resume", NamedAccount("claude1", selected), model=saved_model)
+            arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
+            started = cast(list[str], start.call_args.args[3])
+            self.assertEqual(started[started.index("--model") + 1], expected)
+            self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
+            self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
+            self.assertEqual(launch.call_args.args[2], "row-name")
+            environment = cast(dict[str, str], launch.call_args.args[4])
+            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(selected))
+            self.assertNotIn("STAFF_ID", environment)
+            self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in environment))
 
     def test_fresh_unit_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
         document = self.production("demo")

@@ -27,6 +27,7 @@ import uuid
 from types import MappingProxyType
 from typing import Callable, Protocol, cast
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib import conf, inotify
 from scripts.lib.boot_identity import boot_identity
@@ -2028,7 +2029,6 @@ class AdmissionServer:
         """Read provider policy and exact claims outside the service loop."""
         from scripts.build_targets import build_targets, target_config
         from scripts.mac_test import claim_state, offload
-        from scripts.build_hold import build_hold
 
         request = self.host_requests[key]
         destination = key.destination
@@ -2061,7 +2061,7 @@ class AdmissionServer:
             reference = placement.ProviderClaimReference(destination.provider, destination.target, claim.scope,
                 record["claim_id"], record["episode"], record["attempt"])
             session_id = record["submitting_session"]
-            session = build_hold.OwningSession(session_id) if session_id else build_hold.NoOwningSession()
+            session = OwningSession(session_id) if session_id else NoOwningSession()
             adopted.append(placement.AdoptedProviderClaim(reference,
                 placement.SubmittingOwner(self.host, record["pid"], record["proc_start"]),
                 session, record["remote_host"], record.get("instance_generation", "")))

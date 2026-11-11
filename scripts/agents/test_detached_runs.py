@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Literal, cast, override
 from unittest.mock import MagicMock, patch
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import detached_run_process, detached_runs
@@ -773,7 +774,7 @@ sys.exit(1)
                         ("bash", "verify.sh", "check"), str(self.root), {}, False)
                     holder = build_hold.Holder("holder", datetime.now(timezone.utc), "service deploy",
                                                build_hold.UnknownReleaseEta(), "holder")
-                    run = hold_enforcer.WaitingRun(gate, build_hold.NoOwningSession())
+                    run = hold_enforcer.WaitingRun(gate, NoOwningSession())
                     guard = LauncherHangGuard("cancelled stop blocks supervisor publication")
                     rechecking, supervisor_record_section = Event(), Event()
                     write_attempted, supervisor_blocked = Event(), Event()

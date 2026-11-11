@@ -1701,6 +1701,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
             os.execvpe(str(SCRIPTS / "lib" / "py"), [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
                                       "run", "--", program, *arguments], models_registry.agent_environment(environment))
         else:
+            arguments = models_registry.claude_arguments(arguments, environment)
             os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error

@@ -18,6 +18,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.aws_target import ledger
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
@@ -25,7 +26,6 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import mac_test, offload, claim_state
-from scripts.build_hold.build_hold import NoOwningSession
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 
 VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"

@@ -45,7 +45,7 @@ from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.agents.test_pane_restore import FakeClient
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
@@ -236,9 +236,16 @@ class WorkerResumeTests(unittest.TestCase):
 @final
 class StopResumeTests(unittest.TestCase):
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
-        cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (("claude", False), ("codex", False), ("claude", True))
-        for kind, existing in cases:
-            with self.subTest(kind=kind, existing=existing), producer_first_fixture(kind) as world:
+        cases: tuple[tuple[Literal["claude", "codex"], bool, str], ...] = (
+            ("claude", False, "opus"), ("codex", False, "gpt-test"), ("claude", True, "opus"),
+            ("claude", False, "claude-opus-producer-fixture"))
+        for kind, existing, expected_model in cases:
+            with self.subTest(kind=kind, existing=existing, model=expected_model), producer_first_fixture(kind) as world:
+                if expected_model == "claude-opus-producer-fixture":
+                    environment = claude_catalog_environment(world.case.root / "caller-claude",
+                        {"opus": "claude-opus-caller-fixture"})
+                    _ = claude_catalog_environment(world.home, {"opus": expected_model})
+                    _ = cast(object, world.case.enterContext(patch.dict(os.environ, environment)))
                 if existing:
                     world.case.client.rows[0]["label"] = "dwight"
                     world.case.tab_titles["w1:t9"] = "dwight"
@@ -256,7 +263,7 @@ class StopResumeTests(unittest.TestCase):
                 self.assertNotIn("--resume", world.arguments[0])
                 self.assertNotIn("resume", world.arguments[0])
                 self.assertEqual(world.arguments[0][world.arguments[0].index("--model") + 1],
-                                 "opus" if kind == "claude" else "gpt-test")
+                                 expected_model)
                 self.assertIn("high" if kind == "claude" else 'model_reasoning_effort="high"', world.arguments[0])
                 publication = pane_record.read("agents")["w1:p3"]
                 self.assertEqual(publication["session_id"], row.id)

@@ -866,6 +866,9 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
         if same_permissions and same_role:
             hook_arguments = _turn_end_arguments(policy.settings.kind)
             return not hook_arguments or hook_arguments in pairs
+        if policy.settings.kind == "claude" and ["--model", policy.settings.model] not in pairs:
+            launched = herdr.pane_native_process(info, "claude", {})
+            expected = models_registry.claude_arguments(expected, launched.environment)
         return all(expected[index:index + 2] in [actual[pos:pos + 2] for pos in range(len(actual) - 1)]
                    for index in range(0, len(expected), 2))
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
