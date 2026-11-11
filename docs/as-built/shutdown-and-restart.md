@@ -303,10 +303,17 @@ The pane and terminal match also applies when no retained launch entry exists.
 The cleanup record path is `<pane record directory>/.producer-cleanup-<name>-<session>`.
 The record holds the name, session ID, process IDs, process start times, agent kinds, and herdr session.
 It also holds the pane IDs, tab IDs, terminal IDs, admission match, admission content, and transcript paths.
-`ProducerCleanupStep` identifies the first incomplete step.
+`ProducerCleanupStep` stores a progress hint.
+Each command checks every saved target, regardless of that hint.
+A process stop is complete when the saved PID is absent or has a different process start time.
+An absent saved pane needs no closure.
+The saved tab and terminal IDs protect other targets when the pane still exists.
+An absent admission record or transcript needs no deletion.
 Each completed step atomically saves its progress before the next step starts.
 A repeated command reads the saved targets without native identity discovery.
 Each step permits repetition after a failure between its action and its progress write.
+A lost stop progress write cannot require a removed registry entry or absent pane metadata.
+Cleanup also completes when only the saved transcripts remain.
 A failed pane closure retains the terminal target even without herdr session metadata or a retained launch entry.
 A failed transcript deletion retains the transcript targets.
 

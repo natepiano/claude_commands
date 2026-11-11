@@ -15,6 +15,7 @@ from unittest.mock import call, patch
 
 from scripts.agents import pane_record, shutdown, test_stop_resume
 from scripts.herdr import herdr
+from scripts.lib import atomic_file
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
@@ -91,7 +92,8 @@ class ProducerCommandsTests(unittest.TestCase):
     def test_remove_stray_preserves_the_real_producer_and_completes_a_rerun(self) -> None:
         for target, failure_step in (("stray", ""), ("current", ""), ("split", ""), ("pane-admission", ""),
                 ("other-admission", ""), ("no-row", ""), ("unrelated-unproved", ""), ("unretained-admission", ""),
-                ("transcript-failure", "transcript"), ("pane-failure", "pane")):
+                ("transcript-failure", "transcript"), ("pane-failure", "pane"),
+                ("stop-progress-failure", "stop-progress"), ("transcripts-only", "")):
             with self.subTest(target=target):
                 case = self.world()
                 identity = self.register(case)
@@ -107,7 +109,7 @@ class ProducerCommandsTests(unittest.TestCase):
                 receipt = case.root / "panes/.producer-admission-alpha"
                 if target == "unretained-admission" or failure_step:
                     pane_record.save("agents", {})
-                if failure_step == "pane":
+                if failure_step in ("pane", "stop-progress"):
                     _ = case.client.rows[0].pop("agent_session")
                 saved = ({"pane": "w1:p2", "terminal": "w1:p2-terminal"}
                          if target == "unretained-admission" or failure_step else
@@ -122,6 +124,13 @@ class ProducerCommandsTests(unittest.TestCase):
                     path = folder / f"{identity}.jsonl"
                     _ = path.write_text("retained transcript\n")
                     transcripts.append(path)
+                if target == "transcripts-only":
+                    (case.root / "sessions/123.json").unlink()
+                    case.live.return_value = sessions.SessionNotLive()
+                    case.process.return_value = sessions.SessionNotLive()
+                    case.client.rows.clear()
+                    pane_record.save("agents", {})
+                    receipt.unlink()
                 output = io.StringIO()
                 with patch.object(herdr, "native_process", NATIVE_PROCESS), redirect_stdout(output):
                     if failure_step:
@@ -132,9 +141,16 @@ class ProducerCommandsTests(unittest.TestCase):
                                 raise OSError("fixture transcript deletion failure")
                             unlink(path, missing_ok=missing_ok)
 
+                        def fail_stop_progress(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+                            if path.name == f".producer-cleanup-alpha-{identity}" and json.loads(text)["step"] == "admission":
+                                raise OSError("fixture stop progress failure")
+                            atomic_file.write_text_atomic(path, text, new_file_mode=new_file_mode)
+
                         with ExitStack() as failure:
                             if failure_step == "transcript":
                                 _ = failure.enter_context(patch.object(Path, "unlink", new=fail_transcript))
+                            elif failure_step == "stop-progress":
+                                _ = failure.enter_context(patch.object(shutdown, "write_text_atomic", new=fail_stop_progress))
                             else:
                                 _ = failure.enter_context(patch.object(case.client, "close_retained_pane", return_value=False))
                             failed = shutdown.main(["remove-stray", "alpha", identity])
@@ -158,6 +174,13 @@ class ProducerCommandsTests(unittest.TestCase):
                     self.assertEqual(case.client.closed, [])
                     self.assertEqual([path.read_text() for path in transcripts], ["retained transcript\n"] * 2)
                     self.assertEqual(json.loads(receipt.read_text())["session_id"], identity)
+                elif target == "transcripts-only":
+                    self.assertEqual(status, 0, output.getvalue())
+                    self.assertEqual(case.kill.call_args_list, [])
+                    self.assertEqual(case.client.closed, [])
+                    self.assertEqual(sessions.transcript_locations(identity), [])
+                    self.assertIn(f"{identity}: removed stray", output.getvalue())
+                    self.assertIn(f"{identity}: unchanged", output.getvalue())
                 else:
                     self.assertEqual(status, 0, output.getvalue())
                     self.assertEqual(case.kill.call_args_list, [call(123, signal.SIGTERM)])
