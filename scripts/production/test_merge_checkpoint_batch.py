@@ -164,8 +164,10 @@ raise SystemExit(1)
                     self.assertEqual(absent.returncode, 1, absent.stdout + absent.stderr)
 
     def test_red_package_drops_only_the_item_that_selects_its_command(self) -> None:
-        for interrupted, shrink in ((False, False), (True, False), (True, True)):
-            with self.subTest(interrupted=interrupted, shrink=shrink):
+        for interrupted, shrink, shared_red, probe_case in ((False, False, False, ""), (True, False, False, ""),
+                                                           (True, True, False, ""), (False, False, True, ""),
+                                                           (False, False, False, "main"), (False, False, False, "rename")):
+            with self.subTest(interrupted=interrupted, shrink=shrink, shared_red=shared_red, probe_case=probe_case):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
@@ -205,6 +207,129 @@ raise SystemExit(1)
                     self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]] * 3)
                     self.assertEqual(self.events("checkpoint-test"), [[], []])
                     self.assertEqual(self.receipts(), [])
+                elif probe_case == "main":
+                    self.promotions = str(self.promote)
+                    self.production_doc()
+                    start = self.git("rev-parse", "HEAD")
+                    first = self.beta_checkpoint("src/main-sensitive.txt", "fails with new main\n")
+                    second = self.checkpoint(content="alpha batch side\n")
+                    third = self.checkpoint("src/third.txt", "alpha third change\n")
+                    writer = self.root / "main-writer"
+                    _ = self.git("clone", "-b", "main", str(self.origin), str(writer))
+                    _ = self.git("config", "user.name", "Checkpoint Test", cwd=writer)
+                    _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
+                    self.write(writer, "main-ready.txt", "main dependency\n")
+                    _ = self.git("add", "main-ready.txt", cwd=writer)
+                    _ = self.git("commit", "-m", "new main dependency", cwd=writer)
+                    main_commit = self.git("rev-parse", "HEAD", cwd=writer)
+                    self.executable(self.checkout / ".git/hooks/post-merge", f'''#!/usr/bin/env python3
+import subprocess
+parent = subprocess.run(["git", "rev-parse", "HEAD^2"], capture_output=True, text=True,
+                        check=True, timeout={TEST_HANG_GUARD_SECS}).stdout.strip()
+if parent == {third!r}:
+    subprocess.run(["git", "-C", {str(writer)!r}, "push", "origin", "main"],
+                   check=True, timeout={TEST_HANG_GUARD_SECS})
+''')
+                    self.executable(self.bin / "checkpoint-test", STUB + '''
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                     check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+with (state / "main-probe-tips").open("a") as output:
+    output.write(tip + "\\n")
+red = Path("main-ready.txt").is_file() and Path("src/main-sensitive.txt").is_file()
+print("main probe " + tip)
+raise SystemExit(1 if red else 0)
+''')
+                    result = self.land_batch([self.batch_line("beta", "2", first), self.batch_line("alpha", "2", second),
+                                              self.batch_line("alpha", "3", third)])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    tip = self.git("rev-parse", "HEAD")
+                    for branch in ("production", "main"):
+                        self.assertEqual(self.git("rev-parse", branch, cwd=self.origin), tip)
+                    merges = self.git("rev-list", "--reverse", "--first-parent", "--merges", start + ".." + tip).splitlines()
+                    self.assertEqual([self.git("rev-parse", merge + "^2") for merge in merges], [second, third, main_commit])
+                    repairs = [line.split(":", 1)[0] for line in result.stdout.splitlines()
+                               if line.startswith("send ") and ": repair " in line]
+                    self.assertEqual(repairs, ["send beta"])
+                    self.assertIn("send alpha: phase 2 merged", result.stdout)
+                    self.assertIn("send alpha: phase 3 merged", result.stdout)
+                    self.assertEqual(result.stdout.count("batch: retry"), 1)
+                    self.assertEqual(self.git("ls-tree", "HEAD", "--", "src/main-sensitive.txt"), "")
+                    tested = (self.state / "main-probe-tips").read_text().splitlines()
+                    self.assertEqual(len(tested), 7)
+                    for tested_tip in set(tested):
+                        self.assertEqual(self.git("merge-base", "--is-ancestor", main_commit, tested_tip), "")
+                elif probe_case == "rename":
+                    self.promotions = str(self.promote)
+                    self.production_doc()
+                    self.write(self.checkout, "crates/shared/Cargo.toml",
+                               '[package]\nname = "old-proof"\nversion = "0.1.0"\n')
+                    self.write(self.checkout, "crates/shared/src/lib.rs", "pub fn initial() {}\n")
+                    _ = self.git("add", "crates/shared")
+                    _ = self.git("commit", "-m", "initial package")
+                    _ = self.git("push", "origin", "HEAD:production", "HEAD:main")
+                    start = self.git("rev-parse", "HEAD")
+                    for worktree in (self.unit, self.other):
+                        _ = self.git("merge", "--ff-only", "production", cwd=worktree)
+                    first = self.checkpoint("crates/shared/src/lib.rs", "pub fn first() {}\n")
+                    second = self.beta_checkpoint("crates/shared/Cargo.toml",
+                                                  '[package]\nname = "new-proof"\nversion = "0.1.0"\n')
+                    third = self.checkpoint("src/third.txt", "alpha third change\n")
+                    (self.state / "fail-always-test-new-proof").touch()
+                    result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second),
+                                              self.batch_line("alpha", "3", third)])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    _ = self.assert_landed(start, [first, third])
+                    repairs = [line.split(":", 1)[0] for line in result.stdout.splitlines()
+                               if line.startswith("send ") and ": repair " in line]
+                    self.assertEqual(repairs, ["send beta"])
+                    self.assertEqual(self.events("verify.sh"), [["test", "new-proof"], ["test", "new-proof"],
+                                                                 ["test", "old-proof"]])
+                    self.assertEqual(self.events("checkpoint-test"), [[], []])
+                    self.assertEqual(result.stdout.count("bisect: green"), 1)
+                    self.assertEqual(result.stdout.count("batch: retry"), 1)
+                    self.assertEqual(self.git("show", "HEAD:crates/shared/Cargo.toml"),
+                                     '[package]\nname = "old-proof"\nversion = "0.1.0"')
+                elif shared_red:
+                    self.promotions = str(self.promote)
+                    self.production_doc()
+                    start = self.git("rev-parse", "HEAD")
+                    first = self.checkpoint(content="alpha batch side\n")
+                    second = self.beta_checkpoint("src/broken.txt", "broken shared test import\n")
+                    third = self.checkpoint("src/third.txt", "alpha third change\n")
+                    self.executable(self.bin / "checkpoint-test", STUB + '''
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                     text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+with (state / "checkpoint-tips").open("a") as output:
+    output.write(tip + "\\n")
+red = Path("src/broken.txt").is_file()
+print("checkpoint proof " + tip + (": red" if red else ": green"))
+raise SystemExit(1 if red else 0)
+''')
+                    result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second),
+                                              self.batch_line("alpha", "3", third)])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    _ = self.assert_landed(start, [first, third])
+                    self.assertEqual(result.stdout.count("batch: retry"), 1)
+                    repairs = [line.split(":", 1)[0] for line in result.stdout.splitlines()
+                               if line.startswith("send ") and ": repair " in line]
+                    self.assertEqual(repairs, ["send beta"])
+                    self.assertNotIn("send beta: phase 2 merged", result.stdout)
+                    self.assertIn("send alpha: phase 2 merged", result.stdout)
+                    self.assertIn("send alpha: phase 3 merged", result.stdout)
+                    tips = (self.state / "checkpoint-tips").read_text().splitlines()
+                    self.assertEqual(self.events("checkpoint-test"), [[]] * 6)
+                    self.assertEqual([self.git("rev-parse", tip + "^2") for tip in tips[2:-1]], [second, second, first])
+                    probes = [line for line in result.stdout.splitlines() if line.startswith("bisect:")]
+                    self.assertEqual([line.split(" — ", 1)[0] for line in probes], ["bisect: red", "bisect: green"])
+                    self.assertIn(f"beta phase 2 at {tips[2]}", probes[0])
+                    self.assertIn(f"alpha phase 2 at {tips[4]}", probes[1])
+                    log = (self.state / f"merge_{first[:7]}_test.log").read_text()
+                    for tip in set(tips[2:-1]):
+                        self.assertIn("checkpoint proof " + tip, log)
+                    self.assertEqual(self.events("verify.sh"), [])
+                    self.assertEqual(self.git("ls-tree", "HEAD", "--", "src/broken.txt"), "")
                 else:
                     self.promotions = str(self.promote)
                     self.production_doc()
