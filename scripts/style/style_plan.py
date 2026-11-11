@@ -2117,7 +2117,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         *(["Also build the approved findings selected from: " + ", ".join(f"`{issue}`" for issue in sorted({
             finding.state.proposal for finding in held_findings if isinstance(finding.state, style_ledger.Filed)
             and str(finding.state.proposal) != ticket["proposal"]}))]
-          if any(isinstance(finding.state, style_ledger.Filed) and str(finding.state.proposal) != ticket["proposal"]
+          if approved and any(isinstance(finding.state, style_ledger.Filed) and str(finding.state.proposal) != ticket["proposal"]
                  for finding in held_findings) else []),
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
         *([f"`{ticket['crate']}` is binary-only (no library target): none of its items, `pub` or not, is public outside the crate."]

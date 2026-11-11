@@ -583,8 +583,8 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
         messages = [entry for entry in entries if isinstance(entry, str) and entry]
         if (not isinstance(dispatch, str) or not dispatch or not messages
                 or not messages[-1].startswith("assistant:\n")
-                or messages[-1].rstrip().splitlines()[-1] not in
-                (f"DONE {dispatch}", f"DONE {stage_two_completion_id(dispatch)}")):
+                or not any(worker_admission.reply_ends_dispatch(messages[-1], identity)
+                           for identity in (dispatch, stage_two_completion_id(dispatch)))):
             return Kept("last turn does not end with the dispatch DONE line")
     except (OSError, ValueError) as error:
         return Kept(f"completion evidence is unavailable: {error}")
