@@ -495,6 +495,25 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         reason = " ".join(str(error).splitlines())
         print(f"{reason}; prompt delivered to pane {current.pane}", file=sys.stderr)
         return ExitCode.UNCERTAIN
+    if codex:
+        deadline = time.monotonic() + conf.read("direct").number("WORKER_SETTLE_SECONDS")
+        while True:
+            receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
+            if not isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                if isinstance(client.pane_activity(current.pane), herdr.PaneAtShell):
+                    break
+            except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired):
+                pass
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        if isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+            reason = receipt.reason if isinstance(receipt, DispatchEvidenceUnknown) else "dispatch prompt is not in the transcript"
+            print(f"anomaly: {current.row.name}: {' '.join(reason.splitlines())}; submission is unproved", file=sys.stderr)
+            return ExitCode.UNCERTAIN
     return DispatchSubmission.SUBMITTED
 
 

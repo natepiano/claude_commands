@@ -52,8 +52,11 @@ class GateRecordTests(unittest.TestCase):
         self.assertTrue(result.reason.strip(), "A missing result must explain the failure")
 
     def test_config_reads_preserve_empty_records_and_missing_records(self) -> None:
-        for field in ("config_reads", "folder_scans"):
-            for reads in (["z", "a", "z"], [], None):
+        for field in ("config_reads", "folder_scans", "content_reads"):
+            values = [["z", "a", "z"], [], None]
+            if field == "folder_scans":
+                values.append([".", "/", "scripts/", "docs", "scripts/"])
+            for reads in values:
                 with self.subTest(field=field, reads=reads):
                     value: dict[str, object] = dict(module_times())
                     if reads is not None:

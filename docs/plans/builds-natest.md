@@ -2589,47 +2589,51 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 130 — A test that scans repository folders runs when a file in those folders changes  · status: done
 **Depends on:** Phase 129
 
-#### Work Order
+#### As-built
 
-**Goal:** A full gate records the repository folders each test module lists, and the targeted selector picks each module whose recorded folders hold a changed, added or removed path.
-
-**Decision:** Builds showrunner, 2026-11-11: go. Put the folder record in the same gate record as the config reads, with one reader. Keep the child-process gap as a named item in `docs/plans/builds-natest-next.md`.
-
-**Spec:**
-1. `scripts/test_times/module_run.py`: when a times file is requested, install one `sys.addaudithook` before the tests load. Record only paths inside the repository root of the running checkout, as repository-relative POSIX paths:
-   - `os.scandir` and `os.listdir` events record the listed folder. Skip listings made by the import system: walk the frames and skip the event when one has `co_filename` `<frozen importlib._bootstrap_external>`.
-   - A `subprocess.Popen` event whose arguments run `git ls-files` (with or without `-C`) inside the repository records each pathspec as a recursive prefix with a trailing `/`. No pathspec records `/`, the whole repository.
-   - Write the sorted set as `folder_scans` in the times JSON beside `config_reads`. An empty list means the module scanned nothing.
-2. `scripts/test_times/gate_record.py`: carry `folder_scans` through `ModuleTimes` and `ModuleRun` as `config_reads` is carried. Use one record type for both fields per module, so a reader gets one value per module with the config stems and the folders. NULL or absent means no record.
-3. `scripts/buildlog/index.py`: add the `gate_modules.folder_scans` column (sorted JSON; `[]` records no scans; NULL means no record) and bump `SCHEMA_VERSION`.
-4. `scripts/production/affected_modules.py`: replace `latest_config_reads` with one reader that returns both records per module from the newest full, non-aborted gate that has the record. Select a module when an added or removed path has a recorded listed folder as its parent, or when a changed, added or removed path lies under a recorded recursive prefix. A listing shows names only, so a content change in a listed folder does not select its lister; content reads stay with the config rule and the import graph. Director decision 2026-11-11: the first cloud full gate showed 288 modules that list `config/` through `memory_test_support.config_environment`, so the content form selected 288 modules for every config edit and undid the Phase 127 config rule. For a path in a new folder, use its nearest ancestor that exists at the base revision as its parent. With no gate that has folder records, the folder rule selects nothing. A module with a NULL folder record in that gate is selected.
-5. Do not record scans in child processes. Name in the reply the git listing commands other than `ls-files` that tests run. The director records this gap in `docs/plans/builds-natest-next.md`.
-6. Measure and report. The director measures the first two from the cloud full gate's records; the worker reports the third:
-   - the number of modules that record folders in one full gate, the most common folders, and those modules' summed CPU;
-   - the selected-module count, before and after, for the changed paths of the last 10 builds merges;
-   - for each of the three failures that Phase 127's targeted run missed (`aws_target/test_admin_secrets.py`, `whoami/test_profile_notes_pass.py`, `usage/test_context_economy_read.py`), why it was not selected and whether this rule selects it.
+- `module_run.py` installs the `RepositoryFolderScans` audit hook when a times file is requested. It records `os.scandir` and `os.listdir` listings inside the running checkout as repository-relative folders (`.` for the root), and skips listings made by the import system. A `git ls-files` child process (with or without `-C`) records each pathspec as a recursive prefix with a trailing `/`; no pathspec records `/`, the whole repository. The sorted set is `folder_scans` in the times JSON; `[]` means no scan.
+- `gate_record.py`: `ModuleReadRecord` holds `config_reads` (`RecordedConfigReads | NoConfigReadRecord`) and `folder_scans` (`RecordedFolderScans | NoFolderScanRecord`). `module_read_record` is the one reader of both stored fields.
+- `buildlog/index.py` schema 38 adds `gate_modules.folder_scans` (sorted JSON; NULL means no record).
+- `affected_modules.py`: `latest_module_reads` reads each field from its newest full, non-aborted gate that has it. A listed folder selects its lister only when an added or removed path has that folder as its parent (`changed_path_parents`; a path in a new folder uses its nearest ancestor that exists at the base). A recursive prefix or `/` selects its module for any changed path under it (`scans_changed_paths`). A module with a NULL folder record is selected; with no gate that has folder records the rule selects nothing.
+- Measured on the first cloud full gate: 327 of 748 modules scan folders (about 3,100 of 4,584 CPU s), 288 list `config/` through `scripts/lint/memory_test_support.py`, and only `agents/test_no_old_model_names.py` records `/`. Over the last 10 builds merges the selection grew from 1,321 to 1,380 modules (11,344 to 11,683 CPU s); each change under `scripts/`, `docs/` or `commands/` now selects `production/test_staff_accessors.py` and `production/test_roles_audit.py`.
 
 **Files:**
-- `scripts/test_times/module_run.py` — the audit hook and the `folder_scans` field
-- `scripts/test_times/gate_record.py` — the combined record
-- `scripts/buildlog/index.py` — the column and the schema version
-- `scripts/production/affected_modules.py` — the one reader and the folder rule
-- `scripts/test_times/test_module_run.py`, `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_index.py`, `scripts/production/test_affected_modules.py` — rows in existing tests
-- `docs/plans/builds-natest-next.md` — the child-process gap item
+- `scripts/test_times/module_run.py` — the folder audit hook.
+- `scripts/test_times/gate_record.py` — `ModuleReadRecord` and its reader.
+- `scripts/buildlog/index.py` — the `folder_scans` column.
+- `scripts/production/affected_modules.py` — the combined reader and the folder rule.
 
-**Workers:** 1 writer. The record passes through four files in one chain, and each test row follows one link, so the work does not split.
-- impl: all files.
+**Binds later work:** the stored folder strings (`.` root, `/` whole repository, trailing `/` recursive) are the inputs that "A test that reads the files it finds in a folder runs when one of those files changes" decodes into named states.
 
-**Goes:** builds showrunner, 2026-11-11, for all files.
+**Gotchas:**
+- Each targeted selection reads the module records (1.2-2.6 CPU s), and the first index update on a host after the schema change rebuilds the index (99 CPU s on natedev).
+- Listings in child processes and Git listing commands other than `ls-files` record nothing.
+- A test that patches `os.path.realpath` counted the hook's own calls until the hook bound its functions at install time.
 
-**Acceptance gate:**
-- `scripts/production/test_affected_modules.py` rows, each failing on the old code:
-  1. A new file that imports staff selects `production/test_staff_accessors.py` when its record holds the `git ls-files` prefixes.
-  2. A removed file selects the module that listed its folder.
-  3. A change in a folder that no module lists selects no scanner.
-  4. A module with a NULL folder record is selected.
-  5. A listing by the import system records nothing (`test_module_run.py`).
-  6. A content change in a listed folder selects no lister, and a content change under a recursive prefix selects its scanner.
-- Every changed module passes through `module_run.py`; basedpyright 0/0/0 on the changed files.
-- A full gate on a cloud box records `folder_scans`, and `production/test_staff_accessors.py` records `scripts/`, `commands/` and `docs/`.
-- The phase is a selection fix, not a speed phase; it reports the measured selection change from Spec item 6.
+**Ruled out:** selecting a lister on a content change in its listed folder, because 288 modules list `config/` and the rule selected all of them for each config edit.
+
+### Phase 131 — A test that reads the files it finds in a folder runs when one of those files changes  · status: done
+**Depends on:** Phase 130
+
+#### As-built
+
+- `module_run.py`'s `RepositoryReadAudit` records each read-mode `open` of an existing regular file inside the checkout as a repository-relative path. It skips `config/`, `__pycache__/` and opens made by the import system. The sorted set is `content_reads` in the times JSON; `[]` means no read.
+- `gate_record.py`: `ModuleReadRecord` adds `content_reads` (`RecordedContentReads | NoContentReadRecord`). `module_read_record(configs, folders, contents)` decodes the stored folder strings into `ListedDirectory(path)`, `RecursiveDirectory(prefix)` and `WholeRepository()`; `folder_scan_strings` encodes them back to the same JSON.
+- `buildlog/index.py` schema 39 adds `gate_modules.content_reads` (sorted JSON; NULL means no record).
+- `affected_modules.py`: `latest_module_reads` reads `content_reads` from the newest full, non-aborted gate that has it. A module is selected when a changed non-config path is in its content reads, or when its content record is NULL. With no gate that has content records, the rule selects nothing. `scans_changed_paths` matches on the three folder states.
+- `module_cost.py`: `runner_command(tree, module)` builds the `module_run.py` command from the requested tree for the time, trace and `--commands` runs.
+- Measured on the first cloud full gate: all 748 modules have a content record, 487 read repository files, and the records add 907 KB of JSON per gate. Over the last 10 builds merges the targeted selection grew from 978 to 1,072 modules (8,368 to 9,214 CPU s). A warm selection costs 0.14 CPU s more.
+
+**Files:**
+- `scripts/test_times/module_run.py` — the read audit.
+- `scripts/test_times/gate_record.py` — the content record and the three folder states.
+- `scripts/buildlog/index.py` — the `content_reads` column.
+- `scripts/production/affected_modules.py` — the content rule.
+- `scripts/test_times/module_cost.py` — `runner_command`.
+
+**Gotchas:**
+- The audit `open` event carries no `dir_fd`, so a read through `os.open(name, dir_fd=fd)` records nothing. No repository test reads repository files that way.
+- Reads in child processes record nothing.
+- 19 modules read over 500 repository files (the largest about 1,700), so almost every change under `scripts/` selects them.
+
+**Ruled out:** a `dir_fd` fix, because no current reader needs it.

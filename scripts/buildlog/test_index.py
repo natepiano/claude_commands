@@ -207,7 +207,7 @@ def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]
         records = cast(list[sqlite3.Row],
                        connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
         return [{name: cast(object, row[name]) for name in row.keys()
-                 if not (table == "gate_modules" and name in {"config_reads", "folder_scans"} and row[name] is None)}
+                 if not (table == "gate_modules" and name in {"config_reads", "folder_scans", "content_reads"} and row[name] is None)}
                 for row in records]
 
 
@@ -304,10 +304,11 @@ class IndexTests(unittest.TestCase):
     def test_gate_config_reads_store_sorted_empty_and_missing_records(self) -> None:
         template = gate_run()["modules"][0]
         run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "config-reads", "host": "mac",
-                       "modules": [{**template, "module": "test_empty.py", "config_reads": [], "folder_scans": []},
+                       "modules": [{**template, "module": "test_empty.py", "config_reads": [], "folder_scans": [], "content_reads": []},
                                    {**template, "module": "test_missing.py"},
                                    {**template, "module": "test_read.py", "config_reads": ["z", "a", "z"],
-                                    "folder_scans": ["scripts/", "docs", "scripts/"]}]}
+                                    "folder_scans": ["scripts/", "docs", "scripts/"],
+                                    "content_reads": ["scripts/z.py", "scripts/a.py", "scripts/z.py"]}]}
         self.write(self.host_file, run)
         _ = index.update()
         self.assertIn("config_reads", [row[1] for row in self.rows("PRAGMA table_info(gate_modules)")])
@@ -316,6 +317,9 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT module, folder_scans FROM gate_modules ORDER BY module"),
                          [("test_empty.py", "[]"), ("test_missing.py", None),
                           ("test_read.py", '["docs", "scripts/"]')])
+        self.assertEqual(self.rows("SELECT module, content_reads FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["scripts/a.py", "scripts/z.py"]')])
 
     def test_update_enables_the_configured_spill_threshold(self) -> None:
         spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
