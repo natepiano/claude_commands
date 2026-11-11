@@ -2,24 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test.claim_state import ClaimScope
 
-if TYPE_CHECKING:
-    from scripts.build_hold.build_hold import NoOwningSession, OwningSession
-
-    SubmittingSession = OwningSession | NoOwningSession
-else:
-    class _DeferredBuildHold:
-        """Resolve existing session types only when a placement record needs them."""
-
-        def __getattr__(self, name: str) -> object:
-            from scripts.build_hold import build_hold
-            return cast(object, getattr(build_hold, name))
-
-    build_hold = _DeferredBuildHold()
-    SubmittingSession = "build_hold.OwningSession | build_hold.NoOwningSession"
+SubmittingSession = OwningSession | NoOwningSession
 
 
 @dataclass(frozen=True)
