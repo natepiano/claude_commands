@@ -1053,7 +1053,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
         for step in ("stop", "move", "publish"):
             with self.subTest(step=step), saved_fixture(self.root) as restore, ExitStack() as recovery:
                 _ = recovery.callback(restore)
-                worker = fixture_worker("stopped-worker", self.owner.id)
+                worker = fixture_worker("stopped", self.owner.id)
                 unit_move.prepare_move(self.owner, self.destination, "cargo-liner-destination", "destination")
                 _ = staff.rename(self.owner.id, "destination")
                 if step in ("move", "publish"):
