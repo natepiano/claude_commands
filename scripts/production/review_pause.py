@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
 
 from scripts.hooks import showrunner_footer as showrunner_footer
 
@@ -42,8 +42,8 @@ def notifier(action: str, instance: Path) -> str:
     return result.stdout.strip()
 
 
-def record_path(name: str) -> Path:
-    return showrunner_footer.review_pause_path(name)
+def record_path(owner_id: staff.StaffId) -> Path:
+    return showrunner_footer.review_pause_path(owner_id)
 
 
 def read_record(path: Path) -> ReviewPauseRecord:
@@ -96,8 +96,9 @@ def reconcile_attempted(instance: Path, path: Path, record: ReviewPauseRecord) -
 
 
 def pause(instance: Path) -> str:
-    name = showrunners.owner_for_timer(instance).name
-    path = record_path(name)
+    owner = showrunners.owner_for_timer(instance)
+    name = owner.name
+    path = record_path(owner.id)
     existing = path.exists()
     record = read_record(path) if existing else ReviewPauseRecord(dailies="untouched")
     if not existing:
@@ -118,8 +119,9 @@ def pause(instance: Path) -> str:
 
 
 def status(instance: Path) -> str:
-    name = showrunners.owner_for_timer(instance).name
-    path = record_path(name)
+    owner = showrunners.owner_for_timer(instance)
+    name = owner.name
+    path = record_path(owner.id)
     if not path.exists():
         return ""
     record = read_record(path)
@@ -128,8 +130,9 @@ def status(instance: Path) -> str:
 
 
 def resume(instance: Path, answer: str) -> str:
-    name = showrunners.owner_for_timer(instance).name
-    path = record_path(name)
+    owner = showrunners.owner_for_timer(instance)
+    name = owner.name
+    path = record_path(owner.id)
     if not path.exists():
         return ""
     record = read_record(path)

@@ -39,7 +39,7 @@
 
 **Ruled out:** a collector schema migration or `PRAGMA user_version` bump — old data changes once at deploy.
 
-### Phase 2 — Production records keep staff ids  · status: todo
+### Phase 2 — Production records keep staff ids  · status: done
 
 **Depends on:** none.
 

@@ -66,8 +66,8 @@ def state_root() -> Path:
     return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 
 
-def review_pause_path(name: str) -> Path:
-    return state_root() / "review-paused" / f"{name}.json"
+def review_pause_path(owner_id: staff.StaffId) -> Path:
+    return state_root() / "review-paused" / f"{owner_id}.json"
 
 
 def targeted_instances(session_id: str) -> list[Path]:

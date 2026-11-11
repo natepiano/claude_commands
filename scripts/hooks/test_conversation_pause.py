@@ -1813,9 +1813,14 @@ print("SENT: delivered")
         }
         review_root = self.showrunner_root / "review-paused"
         review_root.mkdir(parents=True)
-        review_paths = [review_root / f"{name}.json" for name in paths]
+        review_paths = [review_root / f"{instance.name.removeprefix('showrunner-')}.json"
+                        for instance in (asked_instance, quiet_instance, returned_instance)]
         for review_path in review_paths:
             _ = review_path.write_text("{}\n")
+        for instance in (asked_instance, quiet_instance, returned_instance):
+            owner = staff.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+            assert owner is not None
+            _ = staff.rename(owner.id, f"renamed-{owner.name}")
         before = {name: path.read_bytes() for name, path in paths.items()}
 
         held = self.run_cli("tick", now=1_000)
@@ -1851,7 +1856,8 @@ print("SENT: delivered")
             asked_read(100, 1),
             instances=("unit-abc",),
         )
-        review_path = self.showrunner_root / "review-paused/demo.json"
+        owner = fixture_member("showrunner", name="demo")
+        review_path = self.showrunner_root / "review-paused" / f"{owner.id}.json"
         review_path.parent.mkdir(parents=True)
         _ = review_path.write_text("{}\n")
 

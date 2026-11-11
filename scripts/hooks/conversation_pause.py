@@ -957,15 +957,15 @@ def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
     return words
 
 
-def _review_names(record: PauseRecord) -> frozenset[str]:
-    from scripts.production import showrunners, staff
+def _review_names(record: PauseRecord) -> frozenset[staff.StaffId]:
+    from scripts.production import showrunners
 
-    names: set[str] = set()
+    names: set[staff.StaffId] = set()
     for name in record.instances:
         if name.startswith("showrunner-"):
             owner = showrunners.owner_for_timer(notifier_root() / name)
             if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-                names.add(owner.name)
+                names.add(owner.id)
     return frozenset(names)
 
 
