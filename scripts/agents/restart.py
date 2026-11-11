@@ -168,19 +168,25 @@ def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str) -> tu
     return kind, environment, arguments
 
 
-def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
-    """Resume the producer's current conversation with its configured settings."""
-    settings = models_registry.launch_settings("producers", row.name)
+def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], list[str]]:
+    """Select the configured producer settings without a resume identity."""
+    settings = models_registry.launch_settings("producers", name)
     if settings.kind == "codex":
-        arguments = ["resume", str(row.current_session), "--model", settings.model,
+        arguments = ["--model", settings.model,
                      "-c", f'model_reasoning_effort="{settings.effort}"']
         if settings.service_tier:
             arguments.extend(("-c", f'service_tier="{settings.service_tier}"'))
     else:
-        arguments = ["--resume", str(row.current_session), "--name", row.name,
+        arguments = ["--name", name,
                      "--model", settings.model, "--effort", settings.effort,
                      "--settings", '{"disableAgentView": true}']
-    return settings.kind, {}, arguments
+    return settings.kind, arguments
+
+
+def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+    """Resume the producer's current conversation with its configured settings."""
+    kind, arguments = producer_first_arguments(row.name)
+    return kind, {}, ["resume" if kind == "codex" else "--resume", str(row.current_session), *arguments]
 
 
 def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch
