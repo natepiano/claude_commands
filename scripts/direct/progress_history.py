@@ -1500,6 +1500,21 @@ def _finish_activity(args: argparse.Namespace) -> None:
     )
 
 
+def _claim_run_pointer(owner: staff.StaffRow, session_dir: Path) -> None:
+    """Point the owner at this run, unless the owner holds another active run.
+
+    A helper run, such as an Astra review folder, then never moves its director's run.
+    """
+    if isinstance(owner.run, staff.OpenRun) and owner.run.path.resolve() != session_dir.resolve():
+        try:
+            held = _json_object(_state_path(owner.run.path).read_text(encoding="utf-8"))
+        except OSError:
+            held = None
+        if held is not None and held.get("status") == "active":
+            return
+    _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+
+
 def _start_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     existing = _state_path(session_dir)
@@ -1565,7 +1580,7 @@ def _start_run(args: argparse.Namespace) -> None:
     owner = unit_runs.run_owner(state, record)
     if isinstance(owner, staff.StaffRow):
         state[unit_runs.OWNER_FIELD] = owner.id
-        _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+        _claim_run_pointer(owner, session_dir)
     _write_state(session_dir, state)
     _append_event(state, _event(state, "run_started", now))
     print(history_file)
@@ -1644,7 +1659,7 @@ def _start_phase(args: argparse.Namespace) -> None:
         if director:
             row = staff.by_current_session(director)
             if row is not None:
-                _ = staff.set_run(row.id, staff.OpenRun(session_dir))
+                _claim_run_pointer(row, session_dir)
         previous_status = _string(state.get("status"))
         state["status"] = "active"
         _ = state.pop("finished_at", None)
