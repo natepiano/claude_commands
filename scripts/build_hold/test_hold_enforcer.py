@@ -472,6 +472,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
     def test_stopped_run_writes_reason_and_log_registers_notice_then_terms_root_first_and_kills_survivor(self) -> None:
         root = self.process(30, "cargo", argv=("cargo", "check", "--workspace"), session="other")
+        _ = (root / "fd/2").write_text("TREE ok\nFMT ok\n")
         _ = self.process(20, "rustc", parent=30, start=11_001)
         _ = self.process(10, "linker", parent=20, start=11_002)
         decision = next(item for item in self.decisions() if item.process.identity.pid == 30)
@@ -480,7 +481,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
         def send(pid: int, signum: int) -> None:
             self.assertEqual((root / "fd/2").read_text(),
-                             "natedev builds and tests are held by builder for timed test; this run was stopped. "
+                             "TREE ok\nFMT ok\nnatedev builds and tests are held by builder for timed test; this run was stopped. "
                              + "You get a notice at the release; run it again then.\n")
             self.assertEqual(self.rows()[0]["action"], "stopped")
             cycle = build_hold.read_cycle()

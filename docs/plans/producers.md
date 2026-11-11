@@ -76,32 +76,67 @@ dwight=claude:fable:high
 - `config/models.conf` `[producers]` holds `morty=codex:astra:high`, `brain=codex:astra:medium`, `dwight=claude:fable:high`. `models_registry.launch_settings("producers", name)` reads and checks them.
 - hanadocs `morty/README.md` and `morty/checkins.json` name the new paths, uncommitted in hanadocs.
 
-### Phase 3 — One start path and account moves for producers  · status: pending
+### Phase 3 — One start path and account moves for producers  · status: done
 
 **Depends on:** Phase 1, Phase 2
 
-#### Work Order
+#### As-built
 
-**Goal:** `resume <producer>` starts the producer in its own tab of the `producers` workspace, on its family account, with its `[producers]` model and effort, in its same conversation; a group move moves its producers.
+- `resume <producer>` starts the producer in its own tab of the `producers` workspace (`config/staff.conf` `PRODUCER_WORKSPACE`), on its family account, with its `[producers]` model and effort, in the row's `current_session`. An explicit `--to` still wins.
+- Account by family: a Codex producer uses the workers account, a Claude producer uses the showrunners account.
+- A workers swap moves the eligible Codex producers; a showrunners group move moves the eligible Claude producers. `accounts.eligible_producers` is the one selector (active, unpaused, local, family). Each move writes the row's `home`.
+- `accounts.producer_settings` reads one producer's `[producers]` line. A bad line leaves that producer out, with one warning per operation (`settings_report_scope`).
+- `pane_launch.write` owns the retained producer binding. `pane_launch.producer_start` is the one writer of the start contract, written before each retained-launch start, exec included.
+- Resume compares the source and destination pane locations before it lists panes, so a resume in its own pane makes no pane list call. `pane_launch.read_entries` returns no entries and makes no lock file when the record folder is absent.
 
-**Spec:**
+**Files:**
+- `scripts/agents/member_account.py` — account by family
+- `scripts/agents/restart.py` — `producer_launch`, `producer_resume`
+- `scripts/agents/stop_resume.py` — producer resume and move
+- `scripts/herdr/herdr.py` — `row_workspace` for a producer
+- `scripts/herdr/pane_launch.py` — producer binding, start contract, publication lock
+- `scripts/accounts/accounts.py` — `eligible_producers`, `producer_settings`, producer selection in swaps and group moves
+- `config/staff.conf` — `PRODUCER_WORKSPACE=producers`
 
-1. A producer row reads its family, model and effort from `[producers]`.
-2. Account by family: a codex producer uses the workers account; a claude producer uses the showrunners account. An explicit `--to` still wins.
-3. The workspace name is a config value, `producers`. Each producer has its own tab, named for the producer. No code names a `morty` workspace; the test fixture at `scripts/agents/test_pane_record.py:246` uses `producers`.
-4. Resume keeps the same conversation (the row's `current_session`).
-5. A workers swap moves the codex producers with the workers. A showrunners group move moves the claude producers. Each move updates the row's `home`.
-6. Add rows to the existing tests the research lists (resume account, workspace, group move). Add no new test file unless no test covers the behavior.
+**Binds later work:** `home` records an account; it does not prove that a start finished. `pane_launch.write` owns retained producer bindings and `pane_launch.producer_start` owns start-contract writes. Automatic recovery uses `producer_settings` inside one `settings_report_scope`.
 
-**Workers:** 1 writer.
+**Gotchas:**
+- A move writes the target `home` before the start is confirmed.
+- Restore reads `[producers]` for every producer row; a test fixture row of kind `producer` needs a `[producers]` line.
+- The `.publication.lock` is shared by every pane record writer. Lock tests must find their target lock by file identity, not by the first exclusive lock.
+- The cloud gate runner's host name is not the selection machine; fixtures use the selection machine.
+- Run the full merge gate, not only the touched test modules: restore, watchdog and lock tests break outside them.
 
-**State:** none beyond the row `home` that a move writes now.
+**Ruled out:** a producer-only resume, move or restart branch — producers use the shared path, with only family and model from `[producers]`.
 
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
+### Phase 3a — A group move rerun finishes a producer that exited early  · status: done
+
+**Depends on:** Phase 3
+
+#### As-built
+
+- A repeated group move or workers swap selects each eligible stopped producer, also when its `home` already names the target. It skips a member only when the member is verified live on the target account.
+- `stop_resume.LiveAccountUnproved` (a `ResumeFailed`) marks a live process whose account cannot be read. A move turns it into `StopFailed` ("live process account is unreadable") with no stop, no start and no `home` change.
+- Live units and showrunners keep their earlier group-move selection. `eligible_producers` limits only producers.
+- Producers, units and showrunners share one move check, one `member_account.repair_home` and one `home` write rule. `set_home` runs only when the home changes.
+- `restart.producer_resume` takes only the family and model from `[producers]` and builds the rest with `pane_record.configured_resume_arguments`. `pane_launch` reads `--effort` as an option with a value.
+
+**Files:**
+- `scripts/accounts/accounts.py` — `group_move_members` selection
+- `scripts/agents/stop_resume.py` — `LiveAccountUnproved`, the shared move check, `home` writes on change only
+- `scripts/agents/member_account.py` — `repair_home` for every row kind
+- `scripts/agents/restart.py`, `scripts/agents/pane_record.py` — shared resume arguments
+- `scripts/herdr/pane_launch.py` — `--effort` value flag
+
+**Binds later work:** `stop_resume.resume` returns `LiveAccountUnproved` for a live Codex producer whose process account cannot be read; that producer is live.
+
+**Gotchas:**
+- A test row for a live member needs process evidence in the fake herdr. A unit row needs a parent showrunner row.
+- A fake `os.execvpe` runs the exit callback only in the forked child; the parent fails on a second exec.
 
 ### Phase 4 — A herdr restart and a reboot bring the producers back  · status: pending
 
-**Depends on:** Phase 3
+**Depends on:** Phase 3a
 
 #### Work Order
 
@@ -109,17 +144,39 @@ dwight=claude:fable:high
 
 **Spec:**
 
-1. The herdr upkeep run starts each producer that is not live and not paused, through the same code as `resume <name>`.
-2. A paused producer stays down. The pause is the user's off switch.
-3. A start that fails is reported once and retried on the next upkeep run. One failed producer does not stop the others.
-4. If the upkeep timer does not run at boot on natedev, name the nixos change for the showrunner; do not push nixos.
-5. Add rows to the existing restore tests with a fake herdr.
+1. The herdr upkeep run first brings the shared herdr server back through the existing server restore, because resume needs pane access.
+2. It then selects the active, local, unpaused producer rows from staff and calls `stop_resume.resume(str(row.id))`, the same code as `resume <name>`.
+3. A paused producer stays down. The pause is the user's off switch.
+4. It reads settings with `accounts.producer_settings` inside one `settings_report_scope` per upkeep run. A bad `[producers]` line skips that producer with one warning; the others still start.
+5. A start that fails is reported once per upkeep run and retried on the next upkeep run. One failed producer does not stop the others.
+6. Starts use the existing operation deadlines and stay inside the upkeep worker budget in `config/herdr_upkeep.toml` (60 seconds today; one start can take 20 seconds).
+7. Keep the layout save and the detection-rule refresh.
+8. If the upkeep timer does not run at boot on natedev, name the nixos change for the showrunner; do not push nixos.
+9. Add rows to the existing upkeep tests with a fake herdr: an absent server, both families, a paused row, a remote row, a bad settings line, a failed start, and a repeated upkeep run.
+
+**Constraints from prior phases:**
+- Phase 3 gives the account choice, the `[producers]` launch settings, the same conversation and the producer tab. Phase 3a gives the one shared resume and move path. Add the automatic start through that path only.
+- `stop_resume.resume` returns `LiveAccountUnproved` (a `ResumeFailed`) for a live Codex producer whose process account cannot be read. The producer is live: report it and start nothing. A resume in the same pane on an unchanged account writes no staff `home`.
+- Start admitted staff rows only. Phase 5 owns a first start.
+- Keep the difference between a stopped and an unknown liveness. Reuse the existing liveness evidence and launch functions.
+- Add no new checks and no stored failure record.
+- The nixos module starts `herdr-upkeep` from a graphical login. That alone does not prove a start before login.
+
+**Files:**
+- `scripts/maintenance/herdr_upkeep.py` — the automatic start and the existing upkeep operations
+- `scripts/maintenance/test_herdr_upkeep.py` — rows
+- `config/herdr_upkeep.toml` — the existing cadence and worker budget
+- `scripts/agents/stop_resume.py` — the shared `resume` entry and its result
+- `scripts/agents/test_stop_resume.py` — shared resume rows
+- `scripts/accounts/accounts.py` — `producer_settings` and `settings_report_scope`
+- `scripts/herdr/herdr.py` — the existing server restore
+- `scripts/herdr/test_herdr.py` — the existing server tests
 
 **Workers:** 1 writer.
 
 **State:** none.
 
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
+**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`. A test row proves that another eligible producer starts when one producer fails. A test row proves that a later upkeep run retries the failed producer and does not start a second copy of a running conversation.
 
 ### Phase 5 — dwight's first start  · status: pending
 
@@ -132,11 +189,32 @@ dwight=claude:fable:high
 **Spec:**
 
 1. Create `~/rust/hanadocs/dwight/README.md` with the role name (strategist) and the management lines only.
-2. The first start of a producer with no conversation starts a new one, proves its identity, and admits its staff row through staff code. It uses the same start path after that.
-3. Start dwight. Report the model the conversation runs. The user expects Fable 5.2.
+2. The shared resume entry recognizes a configured producer that has no staff row. It starts a new conversation with no resume argument, with the `[producers]` family, model and effort, the account rule and the producer workspace.
+3. It proves the native identity through the existing herdr path, admits the row with `staff.ensure(..., runtime_id=<proved identity>)`, and completes the retained publication through `pane_launch.staff_admitted`. Later resumes use the row's `current_session`.
+4. Start dwight. Report the model the conversation runs. The user expects Fable 5.2.
+
+**Constraints from prior phases:**
+- `StaffRow.current_session` stays required (`scripts/production/staff.py:330`). A first-start request is its own type, separate from an admitted `StaffRow`; do not use an optional identity.
+- After an interrupted admission, reuse the existing native identity and launch evidence.
+- Keep the family and model choice apart from the shared launch code.
+- Run the tests with fixture staff and a fake herdr before the live dwight start.
+
+**Files:**
+- `scripts/agents/stop_resume.py` — first-start selection at the shared resume entry
+- `scripts/agents/restart.py` — shared launch arguments
+- `scripts/agents/member_account.py` — the existing account choice
+- `scripts/agents/shutdown.py` — command routing
+- `scripts/herdr/herdr.py` — the existing launch and native identity proof
+- `scripts/herdr/pane_launch.py` — `staff_admitted` publication
+- `scripts/production/staff.py` — the existing admission transaction
+- `scripts/production/add_showrunner.py` — read only: the existing admission pattern
+- `scripts/agents/test_stop_resume.py` — first start and the next resume
+- `scripts/agents/test_shutdown_cli.py` — `resume dwight` routing
+- `scripts/production/test_staff.py` — admission rows
+- `~/rust/hanadocs/dwight/README.md` — the role name and the management lines
 
 **Workers:** 1 writer.
 
 **State:** a new staff row for dwight.
 
-**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`; `resume dwight` reaches the live conversation.
+**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`. Fixture tests cover the first admission, a failed admission and the next resume of the same conversation. The live start reports the model identifier, and `resume dwight` reaches the same live conversation.

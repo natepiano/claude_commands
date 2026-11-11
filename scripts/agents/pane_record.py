@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 
 from scripts.herdr import herdr_types, pane_launch  # noqa: E402
-from scripts.lib import legacy_identity
+from scripts.lib import legacy_identity, models_registry
 from scripts.message import sessions
 from scripts.herdr.pane_launch import PaneLaunch as PaneLaunch
 from scripts.herdr.pane_launch import (
@@ -145,6 +145,28 @@ def resume_arguments(entry: PaneLaunch) -> list[str]:
     return arguments
 
 
+def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
+                                settings: models_registry.LaunchSettings) -> list[str]:
+    """Apply current model settings and retain the saved resume options."""
+    current = entry.copy()
+    current.update(kind=settings.kind, session_id=identity, name=name, model=settings.model)
+    if settings.kind == "codex":
+        policy = ["-c", f'model_reasoning_effort="{settings.effort}"']
+        if settings.service_tier:
+            policy.extend(("-c", f'service_tier="{settings.service_tier}"'))
+        saved = iter(entry.get("codex_policy", []))
+        for option in saved:
+            value = next(saved, "")
+            if option == "-c" and value.partition("=")[0].strip() in ("model_reasoning_effort", "service_tier"):
+                continue
+            policy.extend((option, value))
+        current["codex_policy"] = policy
+    arguments = resume_arguments(current)
+    if settings.kind == "claude":
+        arguments.extend(("--effort", settings.effort))
+    return arguments
+
+
 def locked(session: str) -> AbstractContextManager[None]:
     return pane_launch.locked(record_path(session))
 
@@ -162,7 +184,7 @@ def save(session: str, entries: dict[str, PaneLaunch]) -> None:
 
 def write(session: str, launch: PaneLaunch) -> None:
     """Delegate retained launch publication to the shared writer."""
-    pane_launch.write(record_path(session), without_legacy_identity(launch))
+    pane_launch.write(record_path(session), without_legacy_identity(launch), sources=tuple(record_directory().glob("*.json")))
 
 
 def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> dict[str, str]:
