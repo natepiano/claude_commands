@@ -207,9 +207,9 @@ class RowResolverTests(StaffTestCase):
 
         def transport(arguments: list[str], *, input: str, capture_output: bool,
                       text: bool, check: bool) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(arguments[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac"])
+            self.assertEqual(arguments[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
             transports.append(arguments)
-            command = shlex.split(arguments[6])
+            command = shlex.split(arguments[4])
             return real_run([sys.executable, *command[1:]], input=input, capture_output=capture_output,
                             text=text, check=check)
 
