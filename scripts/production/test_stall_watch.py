@@ -681,33 +681,6 @@ always=natedev
                          {f"stall-watch:{unit_session('unit-two')}:{START}:bump",
                           f"stall-watch:{unit_session('unit-two')}:{START}:tell"})
 
-    def test_one_director_read_per_folder_serves_multiple_units(self) -> None:
-        _ = self.unit("unit-two")
-        self.configure({"showrunner": ["unit-one", "unit-two"]})
-        with mock.patch.object(unit_runs, "director", wraps=unit_runs.director) as directors:
-            result = self.tick(START)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["inspected showrunner/unit-one: fresh",
-                                                     "inspected showrunner/unit-two: fresh"])
-        self.assertEqual(directors.call_count, 2)
-        self.assertEqual({call.args[0] for call in directors.call_args_list},
-                         {self.root / "held/unit-one", self.root / "held/unit-two"})
-
-    def test_bad_unheld_history_header_and_tail_do_not_affect_units(self) -> None:
-        scan = unit_runs.held_by_session
-
-        def damage() -> dict[str, list[str]]:
-            folders = scan()
-            _ = (self.root / "history/runs/unheld.jsonl").write_bytes(b"not JSON\n\xff\n")
-            return folders
-
-        with (mock.patch.object(unit_runs, "held_by_session", side_effect=damage),
-              mock.patch.object(unit_lookup, "read_run_states", side_effect=AssertionError("eager history read"))):
-            result = self.tick(START)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["inspected showrunner/unit-one: fresh"])
-        self.assertEqual(self.sent(), [])
-
     def test_inspection_deadline_prevents_later_history_reads_and_state_changes(self) -> None:
         _ = self.unit("unit-two")
         self.configure({"showrunner": ["unit-one", "unit-two"]})
@@ -737,14 +710,6 @@ always=natedev
         self.assertEqual({path: path.read_bytes() for path in saved}, saved)
         self.assertEqual(self.sent(), [])
 
-    def test_one_staff_snapshot_supplies_discovery_and_unit_membership(self) -> None:
-        with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshots,
-              mock.patch.object(showrunners, "registered_showrunners", wraps=showrunners.registered_showrunners) as discover):
-            result = self.tick(START)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        snapshots.assert_called_once_with()
-        self.assertIsInstance(cast(object, discover.call_args.kwargs["membership"]), staff.StaffSnapshot)
-
     def test_staff_unit_without_a_document_row_is_still_inspected(self) -> None:
         doc = self.root / "showrunner-production.md"
         _ = doc.write_text("\n".join(line for line in doc.read_text().splitlines() if "| unit-one |" not in line))
@@ -753,66 +718,6 @@ always=natedev
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("inspected showrunner/unit-one: idle bump requested", result.stdout)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
-
-    def test_inspection_log_names_each_unit_without_sending(self) -> None:
-        _ = self.unit("unit-two")
-        self.configure({"showrunner": ["unit-one", "unit-two"]})
-        with (mock.patch.object(stall_watch, "send_all") as sends,
-              mock.patch.object(stall_watch, "delivery") as delivery):
-            result = self.tick(START)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["inspected showrunner/unit-one: fresh",
-                                                     "inspected showrunner/unit-two: fresh"])
-        delivery.assert_not_called()
-        sends.assert_called_once_with([], START, deadline=mock.ANY,
-            limits=stall_watch.sender_limits(stall_watch.watch_config(packaged_only=True)))
-        self.assertEqual(self.sent(), [])
-
-    def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
-        from scripts.production import stall_watch
-        from scripts.production import showrunners
-        from scripts.production import unit_lookup as lookup
-        runners: list[showrunners.Showrunner] = []
-        marked: dict[str, dict[str, lookup.LabeledSession]] = {}
-        for production_name in ("first", "second"):
-            doc = self.root / f"{production_name}-production.md"
-            _ = doc.write_text(f"# Production\n- **Production name:** {production_name}\n")
-            runners.append(showrunners.Showrunner(session=production_name, socket="/fixture.sock",
-                            name=production_name, zone="UTC", doc=str(doc)))
-            marked[production_name] = {}
-            for name in ("alpha", "beta"):
-                row = unit_membership(production_name, name)
-                marked[production_name][name] = lookup.LabeledSession(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
-                                                     identity=lookup.LiveSession(row.current_session))
-
-        with (mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(stall_watch, "processes", return_value=[]),
-              mock.patch.object(stall_watch, "STATE_DIR", self.state),
-              mock.patch.object(showrunners, "load_settings", return_value={}),
-              mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery(runners)),
-              mock.patch.object(lookup, "every_labeled_session", return_value=lookup.LabeledProductions(marked)) as scans,
-              mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as reads,
-              mock.patch.object(stall_watch, "forget", return_value=None) as forget,
-              mock.patch.object(stall_watch, "send_all") as send):
-            _ = stall_watch.tick(START)
-            scans.assert_called_once_with(record=mock.ANY)
-            reads.assert_not_called()
-            self.assertEqual(forget.call_count, 4)
-            send.assert_called_once_with(
-                [], START, deadline=mock.ANY,
-                limits=stall_watch.sender_limits(stall_watch.watch_config(packaged_only=True)))
-
-    def test_a_failed_session_scan_ends_the_tick_and_the_next_tick_scans_again(self) -> None:
-        with (mock.patch.object(unit_lookup, "every_labeled_session", side_effect=OSError("fixture scan failed")) as scans,
-              mock.patch.object(showrunners, "registered_showrunners") as discovery):
-            first = self.tick(START)
-            second = self.tick(START + 60)
-        self.assertEqual(scans.call_count, 2)
-        discovery.assert_not_called()
-        for result in (first, second):
-            self.assertIn("fixture scan failed", result.stderr)
-            self.assertNotIn("inspected ", result.stdout)
-        self.assertEqual(self.sent(), [])
 
     def test_a_stalled_discovery_keeps_prompt_work_and_returns_by_the_pass_deadline(self) -> None:
         self.panes["unit-one"]["agent_status"] = "blocked"
@@ -1453,32 +1358,6 @@ always=natedev
             stall_watch.retire_session_prompt("unit")
             stall_watch.retire_session_prompt("unit")
             self.assertEqual(len(list(self.state.glob("*.prompt.cancel.json"))), 2)
-
-    def test_an_oversized_cancellation_timestamp_cannot_stop_other_requests_or_alerts(self) -> None:
-        self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
-        self.assertEqual(self.tick(START).returncode, 0)
-        # An old-schema oversized since and a current-schema oversized at must both be isolated.
-        bad_since = self.state / "aaa.prompt.cancel.json"
-        bad_at = self.state / "aab.prompt.cancel.json"
-        _ = bad_since.write_text(json.dumps({"key": PROMPT_KEY, "since": 10 ** 400}))
-        _ = bad_at.write_text(json.dumps({"session_id": "sid-old", "at": 10 ** 400}))
-        path = self.state / "old.prompt.json"
-        with mock.patch.object(stall_watch, "STATE_DIR", self.state):
-            stall_watch.save_prompt(path, stall_watch.PromptWait(session_id="sid-old", created=0,
-                key="stall-watch:prompt:old:unit", since=0, alerted=True, tool="old", retiring=False))
-            stall_watch.retire_session_prompt("sid-old")
-        result = self.tick(START + 60)
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stderr.count(str(bad_since)), 1)
-        self.assertEqual(result.stderr.count(str(bad_at)), 1)
-        self.assertIn("retained for retry", result.stderr)
-        self.assertTrue(bad_since.exists())
-        self.assertTrue(bad_at.exists())
-        self.assertFalse(path.exists())
-        self.assertIn({**RETIRE, "key": "stall-watch:prompt:old:unit"}, self.sent())
-        self.assertEqual([item["key"] for item in self.prompt_followups() if item.get("command") != "retire"],
-                         [PROMPT_KEY])
-        self.assertEqual(len(self.prompt_notices()), 1)
 
     def test_slow_inspection_does_not_move_the_prompts_escalation_deadline(self) -> None:
         _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=120\n")
@@ -2729,20 +2608,6 @@ always=natedev
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
 
-    def test_detached_processes_use_native_sessions_without_production_name_resolution(self) -> None:
-        from scripts.production import stall_watch
-        from scripts.production import showrunners
-
-        rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
-                stall_watch.Process(21, 1, "build")]
-        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(stall_watch, "process_session", return_value="native-unit-one"),
-              mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads):
-            self.assertFalse(stall_watch.work_running(10, rows, "unrelated"))
-            self.assertEqual(reads.call_count, 0)
-            self.assertTrue(stall_watch.work_running(10, rows, "native-unit-one"))
-            self.assertEqual(reads.call_count, 0)
-
     def test_recent_transcript_or_subagent_activity_prevents_a_bump(self) -> None:
         _ = self.tick(START)
         transcript = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
@@ -2784,14 +2649,6 @@ always=natedev
         retry = self.sent()[2:]
         self.assertEqual(len(retry), 1)
         self.assertEqual(retry[0]["key"], next(item["key"] for item in first if item["key"].endswith(":tell")))
-
-    def test_stale_worker_status_does_not_count_as_running_work(self) -> None:
-        status = self.root / "run" / "status"
-        status.parent.mkdir()
-        _ = status.write_text("implementing\n")
-        _ = self.tick(START)
-        _ = self.tick(START + 300)
-        self.assertEqual(len(self.sent()), 2)
 
     def test_defunct_worker_process_does_not_count_as_running_work(self) -> None:
         _ = self.tick(START)
@@ -2986,34 +2843,6 @@ always=natedev
             snapshot = stall_watch.processes(deadline=time.monotonic() + 1)
         self.assertIsInstance(snapshot, stall_watch.ProcessSnapshotFailure)
 
-    def test_failed_commands_report_both_output_streams(self) -> None:
-        script = self.root / "failed-command"
-        executable(script, "#!/usr/bin/env python3\nimport sys\n"
-                   + "print('output evidence')\nprint('error evidence', file=sys.stderr)\nsys.exit(7)\n")
-        with (mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(stall_watch, "PS", str(script))):
-            snapshot = stall_watch.processes(deadline=time.monotonic() + 5)
-        self.assertIsInstance(snapshot, stall_watch.ProcessSnapshotFailure)
-        if not isinstance(snapshot, stall_watch.ProcessSnapshotFailure):
-            self.fail("a failed command must not become process rows")
-        self.assertIn("ps exited 7:", snapshot.reason)
-        self.assertIn("stderr: error evidence", snapshot.reason)
-        self.assertIn("stdout: output evidence", snapshot.reason)
-        for kind in ("bump", "retire"):
-            with self.subTest(kind=kind):
-                state = self.root / "failed.prompt.json"
-                stall_watch.save_prompt(state, stall_watch.PromptWait(session_id="stopped", created=START,
-                    key="failed-alert", since=START, alerted=True, tool="", retiring=True))
-                saved = state.read_bytes()
-                errors = io.StringIO()
-                with (mock.patch.dict(os.environ, self.environment), redirect_stderr(errors),
-                      mock.patch.object(stall_watch, "STATE_DIR", self.root)):
-                    stall_watch.send_all([stall_watch.Delivery(state, kind, [str(script)])], START,
-                                         deadline=time.monotonic() + 5)
-                self.assertIn(f"stall-watch: {kind}: stderr: error evidence", errors.getvalue())
-                self.assertIn("stdout: output evidence", errors.getvalue())
-                self.assertEqual(state.read_bytes(), saved)
-
     def test_sender_timeout_kills_a_grandchild_holding_the_output_pipe(self) -> None:
         script = self.root / "relay.py"
         pid_file = self.root / "grandchild.pid"
@@ -3147,6 +2976,33 @@ always=natedev
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "", "every sender must complete the concurrency barrier")
         self.assertEqual(len(self.sent()), 6)
+
+    def test_bad_unheld_history_header_and_tail_do_not_affect_units(self) -> None:
+        scan = unit_runs.held_by_session
+
+        def damage() -> dict[str, list[str]]:
+            folders = scan()
+            _ = (self.root / "history/runs/unheld.jsonl").write_bytes(b"not JSON\n\xff\n")
+            return folders
+
+        with (mock.patch.object(unit_runs, "held_by_session", side_effect=damage),
+              mock.patch.object(unit_lookup, "read_run_states", side_effect=AssertionError("eager history read"))):
+            result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["inspected showrunner/unit-one: fresh"])
+        self.assertEqual(self.sent(), [])
+
+    def test_a_failed_session_scan_ends_the_tick_and_the_next_tick_scans_again(self) -> None:
+        with (mock.patch.object(unit_lookup, "every_labeled_session", side_effect=OSError("fixture scan failed")) as scans,
+              mock.patch.object(showrunners, "registered_showrunners") as discovery):
+            first = self.tick(START)
+            second = self.tick(START + 60)
+        self.assertEqual(scans.call_count, 2)
+        discovery.assert_not_called()
+        for result in (first, second):
+            self.assertIn("fixture scan failed", result.stderr)
+            self.assertNotIn("inspected ", result.stdout)
+        self.assertEqual(self.sent(), [])
 
 
 if __name__ == "__main__":

@@ -2892,7 +2892,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - User, 2026-11-11, through builds: `/test_times trend` names its tables `<place> merge gates` (selection `full`) and `<place> targeted tests` (selection `affected`), merge gates first. The database keeps `full` and `affected`.
 - `scripts/lib/terminal_cells.py` `is_number_cell` decides number cells (sign, `$`, `%` or `s` suffix, or `—`). `print_table` right-aligns each column whose cells are all number cells, header included; only test_times tools call it.
 
-### Phase 145 — The dailies tests are gone and the stall-watch tests keep only the tests that pay their way  · status: todo
+### Phase 145 — The dailies tests are gone and the stall-watch tests keep only the tests that pay their way  · status: done
 **Depends on:** none
 
 #### Work Order
