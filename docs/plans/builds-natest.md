@@ -2823,7 +2823,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Kept:** signal, lock, verifier, lint driver and workspace integration processes stay real.
 
-### Phase 141 — Find where the crate run test module spends its CPU  · status: todo
+### Phase 141 — Find where the crate run test module spends its CPU  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -2855,6 +2855,8 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Acceptance gate:**
 - The report at `phases/141/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
+
+**Result:** Profile 61.7 CPU s, 27,662 processes, 97 tests. Git uses about 30.8 CPU s in 26,573 starts, half the module; `rev-parse` alone runs 8,182 times. Batched checkout metadata saved 8.7 CPU s in one pair (queue-unit); batched ledger location lost 2.7 CPU s; both together lost 3.7 CPU s. No stable saving. Phase 143 asks which of these Git calls the tests need.
 
 ### Phase 142 — The wait holder and style sync test modules use less CPU  · status: todo
 **Depends on:** none
