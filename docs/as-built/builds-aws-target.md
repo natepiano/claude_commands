@@ -526,3 +526,50 @@ Uncertain launches retain their requests and reservations for reconciliation and
 The paired trial replaces the size/start trials.
 The twelve `gate_trial_*` settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
+
+## Cloud gate region fallback
+
+The controller uses the region order in `cloud_gate.conf`.
+The list must start with the home region and must not repeat a region.
+The default order is us-east-2, then us-west-2.
+The list can include other regions that the account policy permits.
+Within each region, it tries each configured type and each public zone.
+Capacity refusals and unsupported types select the next variant.
+A normal gate uses natedev after every regional variant refuses.
+Paired trials use the same regional launch and cleanup path.
+
+The home stack owns the artifact bucket and the global gate role and instance profile.
+Each fallback region has a separate gate stack in its default VPC.
+The deployment generates each regional template from the home template.
+The regional template contains network, launch, scaler policy, and expiry resources.
+The regional scaler policy keeps the home tag, type, Spot, and launch-template restrictions.
+The regional expiry function terminates expired boxes in that region.
+
+The deployment resolves the pinned image by Name and owner or copies it when no matching image exists.
+It records copies before it waits for image readiness.
+The deployment record stores ordered regional launch resources and keeps artifact resources at the top level.
+The reader migrates an old single-region record once.
+Launch state, launch logs, and reservations retain the box region.
+Recovery replays saved launch arguments in the saved region before it uses the current variants.
+Status, termination, and expired-launch searches use that region.
+The controller searches every configured region for an expired reservation without a recorded region.
+All regions use one spend ledger and the existing caps.
+Gate costs use bill rates for the recorded region and UTC day.
+A day with its own completed bill keeps that day's rate when newer bills arrive.
+An unbilled day uses the newest earlier bill until its own bill arrives.
+A day before every bill uses the oldest available bill.
+Reservations store the selected rates and bill days for each UTC day.
+Each pricing pass builds one bill index for each type and region.
+Reservations that start after the current time retain their full reserved compute cost.
+Intervals that cross UTC midnight use each day's rate for that part of the lifetime.
+The minimum charge applies once per lifetime.
+The older builder and paired trials use the same daily rate rule.
+Reservations without a region use the highest configured regional rate.
+A region without a usable bill rate uses the configured rate ceiling.
+
+The prices command prints regional Spot prices without resource identities.
+`down` searches configured regions and regions in the saved manifest and stack records.
+It terminates boxes before it deletes their regional stacks.
+Then it deletes copied images and their snapshots.
+`remove-images` changes the home image and keeps regional stacks and copied images.
+Copied image records permit cleanup after an interrupted deployment.

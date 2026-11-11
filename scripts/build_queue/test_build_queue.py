@@ -303,14 +303,58 @@ class QueueTests(NotificationGuardedTestCase):
             with self.subTest(actor=actor), \
                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}), \
                  mock.patch.object(memory_admit, "priority_labels", return_value=labels):
-                self.assertEqual(self.bump_output("2" if actor == "ordinary-session" else "1")[0], 0)
+                self.assertEqual(self.bump_output("2")[0], 0)
                 priority = admission.server.priority
                 self.assertNotIsInstance(priority, records.NoQueuePriority)
                 if not isinstance(priority, records.NoQueuePriority):
-                    self.assertEqual(priority["set_by"], actor)
+                    self.assertEqual(priority.entries[0]["set_by"], actor)
                 events = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
                           for line in path.read_text().splitlines() if '"queue_priority"' in line]
                 self.assertEqual(events[-1]["set_by"], actor)
+                self.assertEqual(admission_client.priority_clear(actor), wire.Ok())
+
+    def test_clear_one_unit_passes_the_unit_to_the_client(self) -> None:
+        with mock.patch.object(records, "queue_command_actor", return_value="actor"), mock.patch.object(
+                admission_client, "priority_clear", return_value=wire.Ok()) as clear, mock.patch(
+                "sys.argv", ["build_queue.py", "clear", "demo"]), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_queue.main(), 0)
+        clear.assert_called_once_with("actor", "demo")
+        self.assertEqual(output.getvalue(), "queue priority cleared\n")
+
+    def test_clear_unknown_unit_distinguishes_refusal_from_unavailable_service(self) -> None:
+        cases = (
+            (wire.Refused("unknown unit missing"), 3, "build queue: unknown unit missing\n", ""),
+            (wire.AdmissionUnavailable("no socket"), 2, "",
+             "build queue: admission service unavailable: no socket\n"),
+        )
+        for result, expected_status, expected_output, expected_errors in cases:
+            output, errors = io.StringIO(), io.StringIO()
+            with self.subTest(result=result), mock.patch.object(
+                    records, "queue_command_actor", return_value="actor"), mock.patch.object(
+                    admission_client, "priority_clear", side_effect=(
+                        result if isinstance(result, wire.AdmissionUnavailable) else None),
+                    return_value=result) as clear, mock.patch(
+                    "sys.argv", ["build_queue.py", "clear", "missing"]), \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(build_queue.main(), expected_status)
+            clear.assert_called_once_with("actor", "missing")
+            self.assertEqual(output.getvalue(), expected_output)
+            self.assertEqual(errors.getvalue(), expected_errors)
+
+    def test_repeat_bump_prints_the_same_priority_place(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        _ = self.fixture.waiter(200, "worker-id", "worker")
+        admission = self.private_mutation_service()
+        labels = {"head-id": UnitLabels("head", unit="demo"),
+                  "worker-id": UnitLabels("worker", unit="cables")}
+        self.labels_read.return_value = labels
+        with mock.patch.object(memory_admit, "priority_labels", return_value=labels):
+            self.assertIn("priority #1", self.bump_output("1")[1])
+            self.assertIn("priority #2", self.bump_output("2")[1])
+            self.assertIn("priority #1", self.bump_output("1")[1])
+        priority = admission.server.priority
+        assert isinstance(priority, records.QueuePriority)
+        self.assertEqual([entry["unit"] for entry in priority.entries], ["demo", "cables"])
 
     def test_bump_passes_a_dash_unit_as_one_argparse_value(self) -> None:
         with mock.patch.object(records, "queue_command_actor", return_value="showrunner"), \
@@ -327,12 +371,12 @@ class QueueTests(NotificationGuardedTestCase):
             self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="berth")}
             status, output, errors = self.bump_output("2")
             self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 100])
-        self.assertEqual((status, output, errors), (0, "queue priority set for berth (step #2): first step now #1\n", ""))
+        self.assertEqual((status, output, errors), (0, "queue priority set for berth (step #2): first step now #1; priority #1\n", ""))
         self.assertEqual((first.read_bytes(), second.read_bytes()), before)
         priority = admission.server.priority
         self.assertNotIsInstance(priority, records.NoQueuePriority)
         if not isinstance(priority, records.NoQueuePriority):
-            self.assertEqual((priority["unit"], priority["why"]), ("berth", "the user's bump"))
+            self.assertEqual((priority.entries[0]["unit"], priority.entries[0]["why"]), ("berth", "the user's bump"))
 
     def test_unmatched_bump_selector_refuses_without_writing_priority(self) -> None:
         admission = self.private_mutation_service()

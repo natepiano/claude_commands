@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import html
 import ipaddress
 import json
 import os
@@ -28,7 +29,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.lib import conf
 from scripts.production import change_routing
-from scripts.review_links import change_page, change_browser
+from scripts.review_links import branch_page, change_page, change_browser
 from scripts.review_links.review_link import private_name
 
 
@@ -111,6 +112,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     @override
     def send_head(self) -> BinaryIO | None:
         root = cast(ReviewLinksServer, self.server).root
+        try:
+            branches = branch_page.page_at(root, self.path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links branches: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>This branch page is not available.</p>"))
+            return None
+        else:
+            self.html_response(200, branch_page.render(branches))
+            return None
         try:
             browser = change_browser.page_at(root, self.path)
         except FileNotFoundError:
@@ -219,6 +231,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
         try:
+            branches = branch_page.page_at(server.root, self.path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links branches: {error}", file=sys.stderr)
+            self.html_response(404, change_page.document("<p>This branch page is not available.</p>"))
+            return
+        else:
+            self.delete_branches(branches)
+            return
+        try:
             browser = change_browser.page_at(server.root, self.path)
         except FileNotFoundError:
             pass
@@ -263,6 +286,25 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.deliver(delivery, server.delivery_status)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def delete_branches(self, page: branch_page.BranchPage) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("empty branch selection")
+            body = self.rfile.read(length).decode("utf-8")
+            results = branch_page.submit(page, body)
+        except ValueError as error:
+            self.html_response(400, change_page.document(f"<p>{html.escape(str(error))}</p>"))
+            return
+        except OSError as error:
+            print(f"review-links branch delete: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>The request could not be read. No branches were deleted.</p>"))
+            return
+        completed = {result.name for result in results if result.message == "deleted"}
+        selected = frozenset(result.name for result in results if result.message != "deleted")
+        remaining = branch_page.BranchPage(page.repository, tuple(row for row in page.rows if row.name not in completed), page.token)
+        self.html_response(200, branch_page.render(remaining, results, selected=selected))
 
     def browser_answer(self, browser: change_browser.ReviewBrowser) -> None:
         server = cast(ReviewLinksServer, self.server)

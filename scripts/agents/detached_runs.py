@@ -21,6 +21,7 @@ import fcntl
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -361,6 +362,18 @@ def live_runs(runs: Path, worker: str) -> list[RunRecord]:
                 and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             found.append(cast(RunRecord, cast(object, raw)))
     return found
+
+
+def resume_context(runs: Path, worker: str) -> str:
+    """Name live runs and their persistent result files for a resumed worker."""
+    lines: list[str] = []
+    for record in live_runs(runs, worker):
+        result = runs / f"{record['run_id']}.json"
+        command = shlex.join(["cat", "--", str(result), record["log"]])
+        lines.append(f"Detached run {record['run_id']} remains live. "
+                     + f"Result: {result}; log: {record['log']}. Read it with: `{command}`. "
+                     + "Its result follows this worker after the move.")
+    return "\n".join(lines)
 
 
 def command_start(args: argparse.Namespace) -> int:

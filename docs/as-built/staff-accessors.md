@@ -243,7 +243,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
 | `scripts/production/prune_phase_notes.py` | read | snapshot |
-| `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
@@ -276,6 +275,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/waiting.py` | read | snapshot |
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
+| `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
 | `scripts/review_links/change_page.py` | read | snapshot |
 | `scripts/agents/inventory.py` | read | local_snapshot |

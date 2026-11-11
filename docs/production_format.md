@@ -252,6 +252,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    notice after each final-gate and as-built commit. Timing:
    `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
+   When several small changes are coming, hold their notices and send them together.
+   The merge gate lands them in one batch run.
+
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
    `<HH:MM>` means today in the user's zone; an ETA on a later day takes

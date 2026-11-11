@@ -415,6 +415,49 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(searches.call_count, 0)
         self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
 
+    def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
+        self.assert_restore_live_run(active=False)
+
+    def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
+        self.assert_restore_live_run(active=True)
+
+    def assert_restore_live_run(self, *, active: bool) -> None:
+        from scripts.whoami import agent_accounts
+
+        opened = self.opened("active-run" if active else "idle-run")
+        dispatch_id = ""
+        if active:
+            dispatch_id = progress_history.begin_dispatch(self.run_dir, slot=opened.row.name, phase="8", role="impl",
+                worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                prompt=self.prompt, kind="impl", lens="")
+            self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch_id}.")
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        run = self.run_dir / "detached_runs" / opened.row.name
+        context = (f"Detached run {opened.row.name} remains live. "
+                   + f"Result: {run}.json; log: {run}.log. Read it with: `cat -- {run}.json {run}.log`. "
+                   + "Its result follows this worker after the move.")
+        target = self.fixture.root / ".codex2"
+        target.mkdir()
+        (target / "sessions").symlink_to(self.fixture.root / "codex/sessions", target_is_directory=True)
+        with (pane_fixtures.live_detached_run(self.run_dir, opened.row), redirect_stdout(io.StringIO()),
+              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
+                  "codex2", self.fixture.root / ".codex2", "fixture")),
+              patch.object(accounts, "account_directory_readiness", return_value=accounts.AccountDirectoryReady("fixture"))):
+            code = worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({opened.row.id}))
+        self.assertEqual(code, worker.ExitCode.OK)
+        self.assertEqual(self.fixture.world.requests[-1][2]["CODEX_HOME"], str(self.fixture.root / ".codex2"))
+        prompt = self.fixture.prompts()[-1]
+        self.assertEqual(prompt[2], opened.pane)
+        self.assertEqual(prompt[3], (
+            '<system-reminder source="script">\nYou were stopped and resumed because .\n'
+            + f"Continue pass {dispatch_id} in this conversation. Keep the same pass id.\n"
+            + context + "\n</system-reminder>" if active else
+            '<system-reminder source="script"> ' + context + " </system-reminder>"))
+        self.assertEqual(self.fixture.world.closed, [])
+        current = staff.snapshot().by_id(opened.row.id)
+        assert current is not None
+        self.assertEqual(current.current_session, opened.row.current_session)
+
     def test_restore_starts_only_the_worker_with_an_active_dispatch(self) -> None:
         idle = self.opened("review", "review")
         _ = self.fixture.world.stop(idle.row, self.fixture.world)
