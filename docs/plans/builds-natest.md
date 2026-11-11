@@ -2960,122 +2960,28 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 150 — Three production test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The add showrunner, fast track and roles audit test modules lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+- Rule 2 sweep, as in Phase 147. Removed 7 rare-case tests: `test_add_showrunner.py` 60 → 56, `test_fast_track.py` 52 → 50, `test_roles_audit.py` 52 → 51.
+- Fixed by review: `advance()` in `add_showrunner_test_support.py` no longer writes `polls.jsonl`; the removed interval test was its only reader.
 
-**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". The user approved the Rule 2 sweep with no CPU or money bar: fewer tests is the goal. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Folders go by test count, then their largest modules. Owners gave the go through sdlc on 2026-11-11.
-
-**Spec:**
-1. For each test in the listed modules, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
-2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
-3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
-4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in a listed support file may go only when `grep -rn <name> scripts` finds no other user. Do not change production code.
-5. Do not merge tests into table rows in this phase. Remove no test that a held speed phase changes.
-6. Write `phases/150/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case and the reason no user harm follows. Give the counts before and after for each module.
-7. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Keep a test whose code a live tool still calls.
-
-**Files:**
-- `scripts/production/test_add_showrunner.py` — 60 tests.
-- `scripts/production/test_fast_track.py` — 53 tests.
-- `scripts/production/test_roles_audit.py` — 52 tests.
-- `scripts/production/add_unit_test_support.py` — support; remove a helper only when nothing else uses it.
-- `scripts/production/add_showrunner_test_support.py` — support; remove a helper only when nothing else uses it.
-
-**Held (sdlc, 2026-11-11):** `test_unit_lookup.py`, `test_add_unit.py` and `test_unit_move.py` wait for owner branches to reach main.
-
-**Workers:** 1 writer; one reader keeps one standard across the modules.
-- impl: the three modules and the removal table.
-
-**Constraints from prior phases:**
-- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
-- Phase 87: Rule 2 removal saved no CPU in Git-heavy modules. CPU is not this phase's measure.
-- Phases 145-149: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom, and tests whose code a live tool still calls. Spec item 7 carries this.
-
-**State:** none.
-
-**Acceptance gate:**
-- Each listed test module passes; basedpyright reports 0 errors and 0 warnings on each edited file.
-- `phases/150/removed_tests.md` lists every removed test with its reason, and the counts.
-- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+**Gotchas:** a removed test can leave fixture writes with no reader. Check each fixture output the removed test read.
 
 ### Phase 151 — Four more style test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The bulk run, style ledger, crate run and approved renames test modules lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+- Rule 2 sweep, as in Phase 147. Removed 5 tests: `test_style_ledger.py` 100 → 98, `test_crate_run.py` 97 → 96, `test_approved_renames.py` 89 → 87. `test_bulk_run.py` keeps all 108. The removed tests checked internal call counts, query-plan shape or an import cycle.
+- Kept guard for the removed nested-`if` refusal test: `test_bulk_rename.py` `test_unread_enclosing_scopes_refuse_before_analyzer_rename` (no edit) and `test_style_ledger_findings.py` `test_unparsed_enclosing_condition_cannot_be_marked_built` (no built mark), with the same source.
 
-**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". The user approved the Rule 2 sweep with no CPU or money bar: fewer tests is the goal. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Folders go by test count, then their largest modules. Owners gave the go through sdlc on 2026-11-11.
-
-**Spec:**
-1. For each test in the listed modules, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
-2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
-3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
-4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in a listed support file may go only when `grep -rn <name> scripts` finds no other user. Do not change production code.
-5. Do not merge tests into table rows in this phase. Remove no test that a held speed phase changes.
-6. Write `phases/151/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case and the reason no user harm follows. Give the counts before and after for each module.
-7. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Keep a test whose code a live tool still calls.
-
-**Files:**
-- `scripts/style/test_bulk_run.py` — 109 tests.
-- `scripts/style/test_style_ledger.py` — 100 tests.
-- `scripts/style/test_crate_run.py` — 97 tests.
-- `scripts/style/test_approved_renames.py` — 89 tests.
-- `scripts/style/ledger_test_support.py` — support; remove a helper only when nothing else uses it.
-- `scripts/style/style_child_test_support.py` — support; remove a helper only when nothing else uses it.
-- `scripts/style/style_plan_test_support.py` — support; remove a helper only when nothing else uses it.
-
-**Workers:** 1 writer; one reader keeps one standard across the modules.
-- impl: the four modules and the removal table.
-
-**Constraints from prior phases:**
-- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
-- Phase 87: Rule 2 removal saved no CPU in Git-heavy modules. CPU is not this phase's measure.
-- Phases 145-149: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom, and tests whose code a live tool still calls. Spec item 7 carries this.
-
-**State:** none.
-
-**Acceptance gate:**
-- Each listed test module passes; basedpyright reports 0 errors and 0 warnings on each edited file.
-- `phases/151/removed_tests.md` lists every removed test with its reason, and the counts.
-- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+**Gotchas:** a removal table must cite a guard that uses the same input. A wrong citation made one reviewer ask to restore a covered test.
 
 ### Phase 152 — Two more production test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The broadcast and style units test modules lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+- Rule 2 sweep, as in Phase 147. Removed 1 test: `test_style_units.py` 46 → 45 (it only proved Python requires `ledger_paths`). `test_broadcast.py` keeps all 49: each guards a wrong delivery, a lost message or a main path.
 
-**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". The user approved the Rule 2 sweep with no CPU or money bar: fewer tests is the goal. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Folders go by test count, then their largest modules. Owners gave the go through sdlc on 2026-11-11.
-
-**Spec:**
-1. For each test in the listed modules, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
-2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
-3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
-4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in a listed support file may go only when `grep -rn <name> scripts` finds no other user. Do not change production code.
-5. Do not merge tests into table rows in this phase. Remove no test that a held speed phase changes.
-6. Write `phases/152/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case and the reason no user harm follows. Give the counts before and after for each module.
-7. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Keep a test whose code a live tool still calls.
-
-**Files:**
-- `scripts/production/test_broadcast.py` — 49 tests.
-- `scripts/production/test_style_units.py` — 46 tests.
-
-**Held (sdlc, 2026-11-11):** `test_proposal_issue.py`, `test_staff_sources.py` and `test_unit_config.py` wait for owner branches to reach main.
-
-**Workers:** 1 writer; one reader keeps one standard across the modules.
-- impl: the two modules and the removal table.
-
-**Constraints from prior phases:**
-- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
-- Phase 87: Rule 2 removal saved no CPU in Git-heavy modules. CPU is not this phase's measure.
-- Phases 145-149: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom, and tests whose code a live tool still calls. Spec item 7 carries this.
-
-**State:** none.
-
-**Acceptance gate:**
-- Each listed test module passes; basedpyright reports 0 errors and 0 warnings on each edited file.
-- `phases/152/removed_tests.md` lists every removed test with its reason, and the counts.
-- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+**Gotchas:** production modules near 50 tests now yield one to four tests each.
