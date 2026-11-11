@@ -2152,7 +2152,9 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
     def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
-        from scripts.agents.inventory import ListedSession
+        from scripts.agents.inventory import (
+            AttributedSessionConfiguration, ListedSession, ShowrunnerRegistration, ShowrunnerRegistrations,
+        )
 
         inventory = import_module("scripts.agents.inventory")
         owner = ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
@@ -2182,6 +2184,36 @@ class AccountsTests(unittest.TestCase):
                 listing.assert_called_once_with()
                 checked.assert_not_called()
                 moved.assert_not_called()
+
+        runner = fixture_member("showrunner", name="fixture-production",
+                                doc=staff.LiveDoc("natedev", self.root / "production.md"))
+        unit = fixture_member("unit", name="fixture-unit", parent=runner.id)
+        registrations = ShowrunnerRegistrations((ShowrunnerRegistration(
+            str(runner.current_session), runner.name, str(self.root / "production.md")),))
+        producer = fixture_member("producer", name="fixture-producer")
+        records = [sessions.SessionRecord(pid=998071 + index, sessionId=str(row.current_session),
+            name=runner.name, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], procStart="fixture")
+            for index, row in enumerate((runner, unit, producer))]
+        attributed = AttributedSessionConfiguration(
+            account.Account("claude", "move@example.invalid", "claude1"), self.home / ".claude1")
+        with (patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "private-sessions"),
+                                           "HERDR_PROC": str(self.root)}),
+              patch.object(sessions, "live_sessions", return_value=records),
+              patch.object(inventory, "showrunner_registrations", return_value=registrations) as timers,
+              patch("scripts.agents.inventory._record_matches_process", return_value=True),
+              patch("scripts.agents.inventory._configuration_for_session", return_value=attributed)):
+            for registered in (registrations, ShowrunnerRegistrations(())):
+                timers.return_value = registered
+                for member, reference in ((unit, unit.name), (unit, str(unit.current_session)),
+                                          (runner, runner.name), (producer, producer.name)):
+                    for dry_run in (False, True):
+                        with (self.subTest(registered=bool(registered.entries), reference=reference, dry_run=dry_run),
+                              patch.object(accounts, "check_move_target", wraps=accounts.check_move_target) as checked,
+                              patch.object(accounts, "move_sessions", return_value=()) as moved):
+                            result = self.run_cli("move", reference, "claude1", *(["--dry-run"] if dry_run else []))
+                            self.assertEqual(result, (0, f"{member.name}: already on claude1\n", ""))
+                            checked.assert_not_called()
+                            moved.assert_not_called()
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         from scripts.agents.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
@@ -7515,11 +7547,13 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def worker(self, name: str = "implementer", *, family: Literal["claude", "codex"] = "claude", live: bool = True) -> staff.StaffRow:
         from scripts.lib.test_models_registry import write_registry
+        from scripts.herdr.test_worker_panes import idle_transcript
 
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
         row = fixture_worker(name, self.owner.id, backend=staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / ".codex1"))
         pane = "w1:p" + str(len(self.world.locations))
         self.world.add(row, pane, family=family, live=live)
+        idle_transcript(row)
         return row
 
     def dispatch(self, row: staff.StaffRow, role: str = "impl", status: str = "active") -> None:
@@ -7735,7 +7769,15 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.stop.assert_not_called()
 
     def test_worker_move_preview_lists_actions_and_refusals_and_counts_empty_rows(self) -> None:
+        from scripts.accounts import pane_moves
+        from scripts.lib.test_models_registry import write_registry
+        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.herdr import worker_panes
+
         opened = self.worker("open", family="codex")
+        kept = self.worker("kept", family="codex")
+        kept = staff.set_worker_role(kept.id, staff.KnownWorkerRole("impl"))
+        locked = self.worker("locked", family="codex")
         stopped = self.worker("stopped", family="codex", live=False)
         unknown = self.worker("unassigned", family="codex", live=False)
         closed = fixture_worker("closed", self.owner.id, backend=staff.CodexBackend(self.root / ".codex1"))
@@ -7746,13 +7788,21 @@ class PaneWorkerMoveTests(unittest.TestCase):
         record = staff.local_snapshot()
         record = replace(record, rows=tuple(replace(row, current_session=staff.StaffId(""))
                                            if row.id == empty.id else row for row in record.rows))
-        before = self.fixture.staff_state()
         role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture selection", datetime.now(timezone.utc).isoformat()))
-        with patch.object(staff, "local_snapshot", return_value=record):
+        with (patch.object(staff, "local_snapshot", return_value=record), live_detached_run(self.run_dir, kept),
+              worker_panes.worker_lock(self.owner.id, staff.WorkerName.parse(locked.name)) as hold):
+            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+            before = self.fixture.staff_state()
             result = accounts.move_workers("codex2", dry_run=True)
+            refused = pane_moves.move_worker(locked, record, "codex2", "quota", self.run_dir)
+            self.assertEqual(refused, accounts.SessionMoveRefused(locked.id, "dispatch lock is held"))
+            self.assertEqual(self.fixture.staff_state(), before)
         assert isinstance(result, accounts.GroupMoveDryRun)
         self.assertEqual(sorted(result.lines), sorted((
             f"{opened.name} ({opened.id}): would close its idle pane; the next assign resumes it on codex2",
+            f"{kept.name} ({kept.id}): kept open: a detached run is live; "
+            + "would stop and resume the same conversation on codex2 in its worker pane",
+            f"{locked.name} ({locked.id}): not moved: dispatch lock is held",
             f"{stopped.name} ({stopped.id}): would close its idle pane; the next assign resumes it on codex2",
             f"{unknown.name} ({unknown.id}): would close its idle pane; the next assign resumes it on codex2",
             "2 workers: nothing to move",
@@ -7763,6 +7813,15 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(self.world.stops, [])
         self.assertEqual(self.world.launches, [])
         self.assertEqual(self.world.requests, [])
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "codex"}}, update=True)
+        pane = next(pane for pane, process in self.world.foreground.items()
+                    if self.world.processes[process[0]].current_identity == kept.current_session)
+        with live_detached_run(self.run_dir, kept):
+            moved = pane_moves.move_worker(kept, record, "codex2", "quota", self.run_dir)
+        self.assertIsInstance(moved, stop_results.ClaudeUp)
+        self.assertEqual(self.world.closed, [])
+        self.assertEqual(self.world.launches, [herdr.ExistingPane(pane, "terminal-" + pane)])
+        self.assertEqual(self.world.stops, [kept.current_session])
 
     def test_move_workers_catches_the_worker_panes_herdr_failure(self) -> None:
         from scripts.herdr import worker_panes

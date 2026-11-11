@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+from subprocess import run as run_fixture_zstd
 import tempfile
 import time
 import unittest
@@ -19,7 +20,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast, final, override
+from scripts.lib.transcript_test_support import compressed_copy
+from typing import BinaryIO, Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -533,6 +535,15 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIsNone(entry["sent"])
         self.assertFalse((self.root / "state/held").exists())
         self.assertFalse(pushover.LOG_FILE.exists())
+        since = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        expected = review.transcript_replies(path, since)
+
+        def codec(command: list[str], *, stdout: BinaryIO, stderr: int, check: bool) -> subprocess.CompletedProcess[bytes]:
+            self.assertEqual(command[0], "zstd")
+            return run_fixture_zstd(command, stdout=stdout, stderr=stderr, check=check)
+
+        with mock.patch.object(subprocess, "run", side_effect=codec):
+            self.assertEqual(review.transcript_replies(compressed_copy(path), since), expected)
 
     def test_sample_limit_selects_recent_non_question_replies_across_transcripts(self) -> None:
         paths = [self.transcript("one.jsonl", [

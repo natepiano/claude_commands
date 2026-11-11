@@ -96,9 +96,21 @@ Without a matching row, `target_platform` returns no answer and status 1.
   `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
   A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
   Without either session, `owning_session` returns `NoOwningSession`.
+  `scripts.build_hold.owning_session` defines both session types and imports no repository module.
+  All callers import the types from this module.
+  `placement.SubmittingSession` uses their union directly.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
-- After the last holder file is gone, each recipient gets one release notice. No answer or allocation is awaited. The result names failed or unconfirmed deliveries: `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
+- After the last holder file is gone, each recipient gets one release notice.
+  The notice names each hold, its purpose, and its start time in the user zone.
+  For example: `fps hold for frame capture, from 07:33:20 EST`.
+  An old cycle without a purpose still names the hold and its start time.
+  The cycle keeps each purpose after the holder file is gone.
+  The release intent keeps each cycle holder's name, purpose, and start time for broadcasts and cycle recovery.
+  An old release intent without cycle holders still names its one holder.
+  Release does not wait for an answer or an allocation.
+  The result names failed or unconfirmed deliveries:
+  `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
 
 ### Where a job runs: `scripts/direct/verify.sh`
@@ -207,7 +219,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:queue bump <selector>`, `clear`, `admit-head <why>` | `build_queue.py` | Changes unit priority or permits the head to exceed the budget when free memory permits. Use `/build:page` for the queue view. The unit-board pane retains its `--json` view and selected cards. Plain view requests exit 3 and name `/build:page`. |
-| Build page | `buildlog charts [--days 7\|30] [--no-open]` | Prints the shared build page link, the same link as `/build:page`. Use the `buildlog` CLI for detailed records. |
+| `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
 Each command shows its script's output unchanged; each script answers in about a second. There are no stubs at the old names `/builds`, `/build_hold` or `/mac_test`.

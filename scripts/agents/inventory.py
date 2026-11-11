@@ -14,9 +14,10 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from typing import Literal, TypedDict, cast
 
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
@@ -80,6 +81,7 @@ from scripts.agents.session_types import (
     ShowrunnerSession as ShowrunnerSession,
     UnitSession as UnitSession,
     WorkerSession as WorkerSession,
+    ProducerSession as ProducerSession,
     TopLevelSession as TopLevelSession,
     Session as Session,
     TimerRestore as TimerRestore,
@@ -112,10 +114,10 @@ class ListedSession:
     pid: int
     proc_start: str
     name: str
-    kind: Literal["showrunner", "unit", "worker", "top-level"]
+    kind: staff.Kind | Literal["top-level"]
     config_dir: Path
     login: str
-    # Empty for sessions outside a registered production.
+    # Empty for sessions without a showrunner staff parent.
     production: str
     doc: str
 
@@ -153,12 +155,6 @@ class SessionFile(TypedDict, total=False):
 
 
 @dataclass(frozen=True)
-class ProductionSession:
-    name: str
-    doc: str
-
-
-@dataclass(frozen=True)
 class ShowrunnerRegistration:
     session_id: str
     name: str
@@ -168,14 +164,11 @@ class ShowrunnerRegistration:
 @dataclass(frozen=True)
 class ShowrunnerRegistrations:
     entries: tuple[ShowrunnerRegistration, ...]
-    retired_sessions: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
 class UnitMarks:
-    production: str
     unit: str
-    doc: str
     session_name: str
     session_host: Literal["herdr"]
 
@@ -363,23 +356,17 @@ def showrunner_registrations() -> ShowrunnerRegistrations:
         except (OSError, UnicodeError):
             continue
         found.append(ShowrunnerRegistration(target[8:], owner.name, str(doc.path)))
-    retired = frozenset(str(identity) for row in record.rows if isinstance(row.worktree, staff.RemovedWorktree)
-                        for identity in (row.id, row.current_session))
-    return ShowrunnerRegistrations(tuple(found), retired)
+    return ShowrunnerRegistrations(tuple(found))
 
 
 def unregistered_showrunners(
     listed: Sequence[ListedSession] | Literal["read sessions"] = "read sessions", *,
     registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers",
 ) -> list[showrunners.Showrunner]:
-    """Each production whose update timer names a session that is not running.
-
-    A showrunner is known only by the session its timer names, so one running under another id
-    without registering reads as a plain session. Empty when the session records cannot be read.
-    """
+    """Return registrations whose target session is absent from the live inventory."""
     try:
         timers = showrunner_registrations() if isinstance(registrations, str) else registrations
-        entries = listing(registrations=timers) if isinstance(listed, str) else listed
+        entries = listing() if isinstance(listed, str) else listed
     except OSError:
         return []
     live_ids = {entry.session_id for entry in entries}
@@ -387,29 +374,20 @@ def unregistered_showrunners(
             for timer in timers.entries if timer.session_id not in live_ids]
 
 
-def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, UnitMarks]:
-    """Each running unit director of a registered production, by session id.
-
-    Read the native session labels once for all productions.
-    Omit productions that have no showrunner timer or have faulty session labels.
-    """
+def _unit_sessions(record: staff.StaffSnapshot) -> dict[str, UnitMarks]:
+    """Read live unit places from the staff membership and native session labels."""
     try:
-        every = unit_lookup.every_labeled_session()
+        every = unit_lookup.every_labeled_session(record=record)
     except OSError:
         return {}
-    docs = {runner.name: runner.doc for runner in runners}
     found: dict[str, UnitMarks] = {}
-    for name, units in every.units.items():
-        if name not in docs:
-            continue
+    for units in every.units.values():
         for unit_id, labeled_session in units.items():
             claude = labeled_session.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
                 continue
             found[claude.session_id] = UnitMarks(
-                production=name,
                 unit=unit_id,
-                doc=docs[name],
                 session_name=labeled_session.place.session,
                 session_host="herdr",
             )
@@ -655,7 +633,7 @@ def last_tool_call(config_dir: Path, session_id: str) -> str:
     if path is None:
         return ""
     try:
-        with path.open("rb") as transcript:
+        with open_transcript(path) as transcript:
             size = transcript.seek(0, os.SEEK_END)
             _ = transcript.seek(max(0, size - _LAST_STEP_BYTES))
             lines = transcript.read().decode("utf-8", errors="replace").splitlines()
@@ -691,7 +669,7 @@ def transcript_path(config_dir: Path, session_id: str) -> Path | None:
     newest: Path | None = None
     modified = float("-inf")
     try:
-        for path in (config_dir / "projects").glob(f"*/{session_id}.jsonl"):
+        for path in transcript_paths(config_dir / "projects", f"*/{session_id}.jsonl"):
             try:
                 at = path.stat().st_mtime
             except OSError:
@@ -706,7 +684,7 @@ def transcript_path(config_dir: Path, session_id: str) -> Path | None:
 def last_model(path: Path) -> str | None:
     """Read complete transcript lines newest first, stopping at a real model."""
     try:
-        with path.open("rb") as transcript:
+        with open_transcript(path) as transcript:
             position = transcript.seek(0, os.SEEK_END)
             pending = b""
             while position:
@@ -820,8 +798,7 @@ def _machine() -> str:
 
 def _listed_session(
     record: SessionFile,
-    productions: dict[str, ProductionSession],
-    units: dict[str, UnitMarks],
+    membership: staff.StaffSnapshot,
     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> ListedSession | UnattributedSession:
     pid = record.get("pid", 0)
@@ -832,17 +809,15 @@ def _listed_session(
     if isinstance(attributed, UnreadableSessionConfiguration):
         return {"pid": pid, "name": name, "reason": "account unreadable"}
     session_id = _string(record.get("sessionId"))
-    production = productions.get(session_id)
-    unit = units.get(session_id)
-    if production is not None:
-        kind: Literal["showrunner", "unit", "worker", "top-level"] = "showrunner"
-        name, doc = production.name, production.doc
-    elif unit is not None:
-        kind = "unit"
-        name, doc = unit.production, unit.doc
-    else:
-        kind = "worker" if record.get("kind") == "bg" else "top-level"
-        name, doc = "", ""
+    member = membership.by_current_session(session_id)
+    kind: staff.Kind | Literal["top-level"] = member.kind if member is not None else (
+        "worker" if record.get("kind") == "bg" else "top-level")
+    name = member.name if member is not None else ""
+    owner = member
+    while owner is not None and owner.kind != "showrunner":
+        owner = membership.parent_of(owner)
+    production = owner.name if owner is not None else ""
+    doc = str(owner.doc.path) if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""
     return ListedSession(
         session_id=session_id,
         pid=pid,
@@ -851,21 +826,18 @@ def _listed_session(
         kind=kind,
         config_dir=attributed.config_dir,
         login=attributed.account.login,
-        production=name,
+        production=production,
         doc=doc,
     )
 
 
-def listing(login: str | None = None, *,
-            registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[ListedSession]:
+def listing(login: str | None = None) -> list[ListedSession]:
     """List membership without inspecting transcripts, worktrees or host resources."""
     home_state = account.home_account_state()
-    timers = showrunner_registrations() if isinstance(registrations, str) else registrations
-    productions = {timer.session_id: ProductionSession(timer.name, timer.doc) for timer in timers.entries}
-    units = _unit_sessions(timers.entries)
+    membership = staff.snapshot()
     found: list[ListedSession] = []
     for record in sessions.live_sessions():
-        entry = _listed_session(_session_file(record), productions, units, home_state)
+        entry = _listed_session(_session_file(record), membership, home_state)
         if isinstance(entry, ListedSession) and (
             login is None or entry.login.casefold() == login.casefold()
         ):
@@ -894,9 +866,10 @@ def inventory(
     """Return account sessions in ``only`` and their workers, or all when empty."""
     home_state = account.home_account_state()
     records = [_session_file(record) for record in sessions.live_sessions()]
-    timers = showrunner_registrations()
-    productions = {timer.session_id: ProductionSession(timer.name, timer.doc) for timer in timers.entries}
-    units = _unit_sessions(timers.entries)
+    membership = staff.snapshot()
+    units = _unit_sessions(membership)
+    retired = frozenset(str(identity) for row in membership.rows if isinstance(row.worktree, staff.RemovedWorktree)
+                        for identity in (row.id, row.current_session))
     session_ids = {
         session_id
         for record in records
@@ -907,9 +880,9 @@ def inventory(
     worker_owners = _worker_owners(run_directories, session_ids)
     wanted_login = login.casefold()
     candidates = [
-        (record, _listed_session(record, productions, units, home_state))
+        (record, _listed_session(record, membership, home_state))
         for record in records
-        if _string(record.get("sessionId")) not in timers.retired_sessions
+        if _string(record.get("sessionId")) not in retired
         and (not only or _string(record.get("sessionId")) in only
              or worker_owners.get(_string(record.get("sessionId"))) in only)
     ]
@@ -953,7 +926,7 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         "model": _model(entry.session_id, entry.config_dir), "checkout": {"kind": "not a checkout"},
         "run_dirs": [str(directory) for directory in directories],
         "timers": timers, "host": host,
-        "kind": "top-level" if entry.kind == "unit" and host["kind"] == "unknown" else entry.kind,
+        "kind": entry.kind,
     }
     if entry.kind == "showrunner":
         common.update(production=entry.production, doc=entry.doc)

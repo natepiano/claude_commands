@@ -26,15 +26,16 @@ from datetime import datetime, timezone
 from enum import Enum
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import BinaryIO, Literal, cast, override
+from typing import Literal, cast, override
 
 from scripts.lib import unit_runs
+from scripts.lib.transcripts import open_transcript, uncompressed_path
 from scripts.usage.activity import (
     RequestActivity, RequestEvidence, Waiting, activity_name, claude_atoms, codex_atoms, decode_activity, wait_action,
 )
 from scripts.usage.agents_log import Assignment, Lens, Role, RoleLog, assignments, state_dir
 from scripts.usage.rollouts import (
-    KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
+    KnownThreadOpening, ThreadRolloutBuilder, complete_lines as complete_lines, decode_rollout, is_compaction,
     is_edit, parse_timestamp, token_usage,
 )
 
@@ -721,16 +722,8 @@ def cursor_at(db: sqlite3.Connection, machine: str, path: str) -> int:
     return cast(int, cast(sqlite3.Row, value)[0]) if value is not None else 0
 
 
-def complete_lines(source: BinaryIO) -> Iterator[tuple[int, bytes]]:
-    while True:
-        offset = source.tell()
-        line = source.readline()
-        if not line or not line.endswith(b"\n"):
-            return
-        yield offset, line
-
-
 def claude_identity(machine: str, path: Path) -> ClaudeSession | ClaudeSubagent:
+    path = uncompressed_path(path)
     if path.parent.name == "subagents":
         return ClaudeSubagent(machine, path.parent.parent.name, path.stem.removeprefix("agent-"))
     return ClaudeSession(machine, path.stem)
@@ -757,6 +750,8 @@ def read_file(machine: str, path: Path, family: Family,
     identity = [stat.st_dev, stat.st_ino]
     resumed = (held.get("parser") is True and held.get("identity") == identity and stat.st_size >= previous
                and stat.st_size >= cast(int, held.get("size", 0)))
+    if path.suffix == ".zst" and held.get("identity") == identity:
+        resumed = True
     if resumed and held.get("size") == stat.st_size:
         if held.get("mtime") == stat.st_mtime_ns and held.get("ctime") == stat.st_ctime_ns:
             return
@@ -765,7 +760,7 @@ def read_file(machine: str, path: Path, family: Family,
         previous = 0
     if not saved and previous == stat.st_size:
         return
-    context = CodexContext(machine, path.name)
+    context = CodexContext(machine, uncompressed_path(path).name)
     agent = claude_identity(machine, path)
     edit_seen = False
     # One Claude message spans a line per content block; user lines between them keep it open.
@@ -790,7 +785,7 @@ def read_file(machine: str, path: Path, family: Family,
         evidence = saved_evidence(held.get("evidence"))
         context.evidence = saved_evidence(held.get("codex_evidence"))
         completed = previous
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         if resumed:
             _ = source.seek(previous)
         for offset, line in complete_lines(source):
@@ -864,7 +859,7 @@ def collect_file(db: sqlite3.Connection, machine: str, path: str, local_path: Pa
 
 
 def known_sessions(db: sqlite3.Connection, machine: str, paths: Iterable[Path]) -> set[str]:
-    sessions = {path.stem for path in paths if path.parent.name != "subagents"}
+    sessions = {uncompressed_path(path).stem for path in paths if path.parent.name != "subagents"}
     rows = db.execute("SELECT DISTINCT agent_id FROM turns " +
                       "WHERE machine = ? AND family = 'claude' AND kind = 'session'", (machine,))
     sessions.update(cast(str, row[0]) for row in cast(Iterable[sqlite3.Row], rows))
@@ -1075,6 +1070,8 @@ def source_paths(root: Path, family: LogFamily) -> tuple[tuple[Path, ...], Sourc
         return (), SourceState.UNREADABLE
     patterns = {"claude": (("*", "*.jsonl"), ("*", "*", "subagents", "agent-*.jsonl")),
                 "codex": (("*", "*", "*", "*.jsonl"),), "history": (("*.jsonl",),)}[family]
+    if family != "history":
+        patterns = (*patterns, *(parts[:-1] + (parts[-1] + ".zst",) for parts in patterns))
     paths: set[Path] = set()
     state = SourceState.READY
 
@@ -1549,6 +1546,7 @@ def reader_payload(offsets: dict[str, int]) -> str:
         ("scripts.lib.unit_runs", "scripts/lib/unit_runs.py"),
         ("scripts.usage.activity", "scripts/usage/activity.py"),
         ("scripts.usage.agents_log", "scripts/usage/agents_log.py"),
+        ("scripts.lib.transcripts", "scripts/lib/transcripts.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.collect", "scripts/usage/collect.py"),
     )}

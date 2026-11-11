@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
+from scripts.build_hold.owning_session import OwningSession
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, targets
@@ -612,7 +613,7 @@ class ReservationTests(IsolatedTargetTest):
         identity_file = self.root / "reservation.identity"
         args.reservation_file, args.claim_identity_file = str(reservation), str(identity_file)
         paths = mac_test.StatePaths(self.mac_state)
-        session = build_hold.OwningSession("cleanup-session")
+        session = OwningSession("cleanup-session")
         write_atomic = atomic_file.write_text_atomic
 
         def process_start(pid: int) -> process_identity.ProcessStart:

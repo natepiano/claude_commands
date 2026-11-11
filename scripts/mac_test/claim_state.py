@@ -12,13 +12,15 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
     from scripts.buildlog import sync as buildlog_sync
-    from scripts.build_hold.build_hold import NoOwningSession, OwningSession
 
-    SubmittingSession = OwningSession | NoOwningSession
+
+SubmittingSession = OwningSession | NoOwningSession
+
 
 CiSwitch = Literal[
     "off_by_this_block",
@@ -185,9 +187,7 @@ def submitting_session(session: SubmittingSession | CallingSession) -> Submittin
 
 
 def session_id(session: SubmittingSession) -> str:
-    from scripts.build_hold import build_hold
-
-    return session.session_id if isinstance(session, build_hold.OwningSession) else ""
+    return session.session_id if isinstance(session, OwningSession) else ""
 
 
 def claim_identity(record: ClaimOwnerRecord) -> ClaimIdentity:

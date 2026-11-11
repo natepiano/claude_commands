@@ -2846,10 +2846,13 @@ SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_r
 
 
 class WorkerResumePreview(Protocol):
-    """The observed source account for a worker that can resume on the target."""
+    """The source account and pane reason for a worker that can resume."""
 
     @property
     def source(self) -> str: ...
+
+    @property
+    def kept_open_reason(self) -> str: ...
 
 
 class PaneMoves(Protocol):
@@ -3047,6 +3050,8 @@ def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
         else:
             preview = (f"not moved: {decision.reason}" if isinstance(decision, SessionMoveRefused) else
                        f"would stop and resume the same conversation on {target} in its worker pane")
+            if not isinstance(decision, SessionMoveRefused) and decision.kept_open_reason:
+                preview = f"kept open: {decision.kept_open_reason}; {preview}"
         lines.append(f"{row.name} ({row.id}): {preview}")
     if nothing:
         lines.append(f"{nothing} workers: nothing to move")

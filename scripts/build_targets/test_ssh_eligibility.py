@@ -17,6 +17,7 @@ import sys
 import tempfile
 from typing import cast, override
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -71,7 +72,7 @@ class SshEligibilityTests(unittest.TestCase):
                                                return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         book = ledger.CostLedger(mac_test.state_paths("aws").directory)
         book.record_inventory(ledger.ResourceInventory(self.now, (
             ledger.PricedResource("retained-storage", Decimal("0")),), "priced fixture inventory"))
