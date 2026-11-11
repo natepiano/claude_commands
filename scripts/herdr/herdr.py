@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, Typed
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import conf, operation_deadline
+from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -5143,6 +5143,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
+        agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
         try:
             trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
         except HerdrFailure as error:

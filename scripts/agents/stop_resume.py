@@ -403,6 +403,10 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
                     raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
             if kind == "claude":
                 herdr.trust_claude_launch(request.folder, pending.home)
+                from scripts.whoami.account import named_account_environment
+
+                arguments = models_registry.claude_arguments(arguments,
+                    herdr.agent_base_environment(named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
             client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + ":"], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
@@ -880,7 +884,10 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = resolve_program(kind, environment=environment)
-    command = [program, *trust_arguments(kind, entry["cwd"], resume_arguments(entry))]
+    arguments = resume_arguments(entry)
+    if kind == "claude":
+        arguments = models_registry.claude_arguments(arguments, environment)
+    command = [program, *trust_arguments(kind, entry["cwd"], arguments)]
     if message and kind == "claude":
         command.append(message)
     os.chdir(entry["cwd"])
