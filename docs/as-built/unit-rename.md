@@ -8,6 +8,47 @@ A rename sets the staff name and the display labels before it moves the folder.
 A same-name request sets the session, tab, and pane names to the staff name.
 A finished rename prints `unchanged`.
 
+## Worker name migration
+
+Run `agents rename OWNER OWNER` once per owner at deploy.
+Use the existing rename command without a new program or an all-owner option.
+The command checks direct worker rows of that unit or showrunner.
+A dashed role from staff.WORKER_ROLES keeps its full name and optional trailing digits.
+For example, the bare names can be astra-designer or astra-reviewer1481574.
+Other workers use the last name component as the bare name.
+The preceding prefix must equal the owner name or end with `-<owner name>`.
+For example, `cargo-liner-handler-review4` under `handler` becomes `review4`.
+
+Without a bare twin, the command sets an open agent's name and its pane label before the staff name.
+It also sets a retained shell pane's label before the staff name.
+It then writes the bare name through the existing staff rename path.
+It keeps the worker's fixed ID, native conversation, and parent.
+The pane label still comes from `agent_name(owner, worker)`.
+A rerun after either label step completes the staff rename.
+The bare row can then find its retained shell pane.
+
+Only OpenWorker, StoppedWorker, or ClosedWorker evidence permits the staff rename without a bare twin.
+Other observations retain the qualified staff name and the existing pane label.
+One kept line names the row and gives the evidence reason.
+A later run with recovered evidence completes the label and staff rename.
+The shared pane readers retain their existing evidence diagnostics.
+
+When a bare twin exists, the old qualified row must have a closed pane and no active dispatch.
+The command then uses the existing worker end path to remove the old row.
+An open pane, a retained shell pane, or an active dispatch keeps both rows.
+One line names both rows and the reason.
+Unavailable evidence also keeps both rows.
+A StaffRefused exception from worker.end keeps both rows.
+One line names both rows and includes the refusal text.
+The command continues with later workers and owner displays.
+
+A prefix such as `widget-enhancements` does not end with the current owner name `widget`.
+The command keeps `widget-enhancements-impl` and prints `/agents rename <id> impl`.
+A repeated run changes no completed row.
+It repeats the same explanation for an unresolved row and prints `unchanged` when nothing changes.
+
+## Director rename
+
 A new-name rename changes the staff name and sets the displays.
 It reads the folder from staff and the branch from Git.
 It uses `unit_names.swap_stem` for each name independently.
