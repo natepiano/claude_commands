@@ -1752,6 +1752,18 @@ print('two homes isolated; recorder lock retained; caller restored')
                              at=1_700_000_003)
         self.assertEqual(self.read_state(helper)["owner_staff_id"], unit.id)
         self.assertEqual(unit_runs.open_run(unit.current_session), session_dir)
+        # A reused run takes the plan that its next start-run names.
+        other = self.working_dir / "docs/other.md"
+        _ = other.write_text("# Other plan\n\n## Delegation Context\n\n- **Project:** Example\n", encoding="utf-8")
+        _ = self.run_command(
+            "start-run", "--session-dir", str(session_dir),
+            "--working-dir", str(self.working_dir), "--plan-doc", str(other),
+            "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh",
+            "--main-session-id", str(unit.current_session), at=1_700_000_004)
+        self.assertEqual(self.read_state(session_dir)["project_plan_doc"], "docs/other.md")
+        changed = session_staff.RowResolver(staff.snapshot()).unit_config(unit)
+        assert isinstance(changed, unit_config.UnitConfig)
+        self.assertEqual(changed.plan, unit_config.PlanFile(Path("docs/other.md")))
 
     def test_start_run_persists_the_plan_git_time_without_an_agent_timestamp(
         self,
