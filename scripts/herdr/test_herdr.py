@@ -286,6 +286,38 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(entry["cwd"], str(self.root))
         self.assertEqual(entry.get("pid"), 998070)
 
+        for source, report, failure in (("fresh", True, ""), ("fresh", False, ""),
+                                        ("two-fresh", False, "Codex launch has no unique foreground process"),
+                                        ("invalid-resume", False, "Codex launch identity is unavailable"),
+                                        ("herdr-failure", True, "Codex launch process info"),
+                                        ("write-failure", True, "Is a directory")):
+            with self.subTest(source=source, report=report), tempfile.TemporaryDirectory(dir=self.root) as folder:
+                arguments = ["resume", "invalid"] if source == "invalid-resume" else []
+                with (codex_launch_evidence(Path(folder), ["codex", *arguments]) as process_info,
+                      patch.object(client, "start_command", return_value=subprocess.CompletedProcess[str]([], 0, "", "")),
+                      redirect_stderr(io.StringIO()) as errors):
+                    if not report:
+                        herdr.json_object(process_info["pane"], "fixture pane")["session_id"] = ""
+                    if source == "two-fresh":
+                        processes = herdr.json_object(process_info["process_info"], "fixture process info")
+                        foreground = herdr.json_items(processes["foreground_processes"], "fixture foreground processes")
+                        processes["foreground_processes"] = [*foreground,
+                            {"pid": 998071, "argv": ["codex"], "cwd": folder}]
+                    if source == "herdr-failure":
+                        process_info["process_info"] = "unreadable"
+                    if source == "write-failure":
+                        (pane_launch.record_directory() / f"{client.session}.json").mkdir(parents=True)
+                    outcome = client.start_agent("codex-worker", "w1:p1", "codex", arguments,
+                                                 herdr.NoOpeningPrompt(), 1_000)
+                self.assertIsInstance(outcome, herdr.PromptSubmissionNotRequired)
+                if failure:
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn("legacy launch publication is unavailable:", errors.getvalue())
+                    self.assertIn(failure, errors.getvalue())
+                    self.assertIn("; launch continues\n", errors.getvalue())
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+
     def test_codex_launch_removes_retired_identity_before_retaining_the_launch(self) -> None:
         identity = fixture_runtime_id("clean-codex-launch")
         observation = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "same-start", {"SHOWRUNNER_UNIT": "old"})
