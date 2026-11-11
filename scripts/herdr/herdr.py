@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, Typed
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import operation_deadline
+from scripts.lib import conf, operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -1635,6 +1635,25 @@ class Herdr:
                 return NewTab(space["name"], title)
         return NewTab(fallback_workspace, title)
 
+    def producer_row_tab(self, row_id: str, title: str, workspace: str) -> NewTab | ExistingPane:
+        """Reuse a producer's shell only in its own tab in the configured workspace."""
+        destination = self.saved_row_tab(row_id, title, workspace)
+        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, title, workspace):
+            return destination
+        return NewTab(workspace, title)
+
+    def producer_pane(self, pane_id: str, title: str, workspace: str) -> bool:
+        """Check that the producer has one shell in its named tab and configured workspace."""
+        panes = self.listed("pane")
+        own = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
+        if own is None or not isinstance(self.pane_activity(pane_id), PaneAtShell):
+            return False
+        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == own.get("tab_id")), None)
+        return (tab is not None and tab.get("label") == title
+                and sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) == 1
+                and any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
+                        for space in self.listed("workspace")))
+
     def _retitle(self, row: dict[str, object], title: str, *, tab: bool) -> bool:
         changed = row.get("label") != title
         if changed:
@@ -2035,7 +2054,8 @@ class Herdr:
             try:
                 entry = self.codex_launch(pane, agent_arguments)
                 entry["name"] = name
-                pane_launch.write(pane_launch.record_directory() / f"{self.session}.json", entry)
+                directory = pane_launch.record_directory()
+                pane_launch.write(directory / f"{self.session}.json", entry, sources=tuple(directory.glob("*.json")))
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues", file=sys.stderr)
         if isinstance(opening, OpeningPrompt):
@@ -3210,7 +3230,9 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
 
 
 def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
-    """Use the showrunner workspace, then the supplied name, then the shared session."""
+    """Select the configured producer workspace or the owner's workspace."""
+    if isinstance(row, staff.StaffRow) and row.kind == "producer":
+        return conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
     while isinstance(row, staff.StaffRow):
         if row.kind == "showrunner":
             return row.name

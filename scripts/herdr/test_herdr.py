@@ -1991,6 +1991,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py")),
         })))
@@ -2015,6 +2017,32 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
 
                 self.assertEqual(closed, ["w1:p1" if verified else "w1:p2"])
                 self.assertEqual(pane_launch.read_strict(path), before)
+
+        for verified in (False, True):
+            with self.subTest(verified=verified, collision=True), self.retained() as (client, path, original):
+                del client
+                destination = path.with_name("agents.json")
+                replacement = original.copy()
+                replacement["written_at"] = "2026-11-03T12:00:00Z"
+                pane_launch.save(destination, {replacement["pane_id"]: replacement})
+                attempt = pane_launch.resume_attempt(destination, replacement["pane_id"])
+                panes = {path.stem: [original["pane_id"]], destination.stem: [replacement["pane_id"]]}
+                def close_source(pane: str) -> bool:
+                    panes[path.stem].remove(pane)
+                    return True
+                def close_destination(pane: str) -> bool:
+                    panes[destination.stem].remove(pane)
+                    return True
+                outcome = (pane_launch.VerifiedResume(replacement, frozenset({original["session_id"]}))
+                           if verified else pane_launch.FailedResume())
+                pane_launch.finish_restore(path, original, attempt, outcome, close=close_destination,
+                                           destination=destination, close_source=close_source)
+                self.assertEqual(panes, {path.stem: [] if verified else [original["pane_id"]],
+                                         destination.stem: [replacement["pane_id"]] if verified else []})
+                self.assertEqual(pane_launch.read_strict(destination),
+                                 {replacement["pane_id"]: replacement} if verified else {})
+                if not verified:
+                    self.assertEqual(pane_launch.read_strict(path)[original["pane_id"]], original)
 
     @contextmanager
     def retained(self) -> Generator[tuple[herdr.Herdr, Path, pane_launch.PaneLaunch]]:
@@ -6508,6 +6536,27 @@ class SavedLayoutTests(unittest.TestCase):
 
     def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
         client = LayoutHerdr()
+        cases: tuple[tuple[staff.Kind, str, str], ...] = (
+            ("showrunner", "production", "production"),
+            ("producer", "first-producer", "producers"),
+            ("producer", "second-producer", "producers"))
+        configuration = self.root / "configuration"
+        configuration.mkdir()
+        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        for kind, name, workspace in cases:
+            with self.subTest(kind=kind, name=name):
+                row = staff.StaffRow(staff.StaffId("missing-row"), kind, name, staff.STAFF_ROOT,
+                                    current_session=staff.StaffId("missing-current"))
+                record = staff.StaffSnapshot((row,))
+                self.assertEqual(client.saved_row_tab(row.id, row.name, herdr.row_workspace(row, record, row.name)),
+                                 herdr.NewTab(workspace, name))
+        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=crew\n")
+        producer = staff.StaffRow(staff.StaffId("producer-row"), "producer", "custom-producer", staff.STAFF_ROOT,
+                                  current_session=staff.StaffId("producer-current"))
+        self.assertEqual(client.saved_row_tab(producer.id, producer.name,
+                         herdr.row_workspace(producer, staff.StaffSnapshot((producer,)), producer.name)),
+                         herdr.NewTab("crew", producer.name))
         self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
                          herdr.NewTab("production", "unit"))
 

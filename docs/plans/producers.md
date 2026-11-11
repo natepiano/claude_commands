@@ -76,7 +76,7 @@ dwight=claude:fable:high
 - `config/models.conf` `[producers]` holds `morty=codex:astra:high`, `brain=codex:astra:medium`, `dwight=claude:fable:high`. `models_registry.launch_settings("producers", name)` reads and checks them.
 - hanadocs `morty/README.md` and `morty/checkins.json` name the new paths, uncommitted in hanadocs.
 
-### Phase 3 — One start path and account moves for producers  · status: pending
+### Phase 3 — One start path and account moves for producers  · status: done
 
 **Depends on:** Phase 1, Phase 2
 
@@ -93,9 +93,64 @@ dwight=claude:fable:high
 5. A workers swap moves the codex producers with the workers. A showrunners group move moves the claude producers. Each move updates the row's `home`.
 6. Add rows to the existing tests the research lists (resume account, workspace, group move). Add no new test file unless no test covers the behavior.
 
+**Files:**
+- `scripts/agents/member_account.py` — account by family
+- `scripts/agents/restart.py` — model and effort from `[producers]`
+- `scripts/agents/stop_resume.py` — resume and move of a producer row
+- `scripts/herdr/herdr.py` — `row_workspace` for a producer
+- `scripts/accounts/accounts.py` — group moves and workers swaps take producers
+- `config/staff.conf` — `PRODUCER_WORKSPACE=producers`
+- `scripts/agents/test_restart.py` — rows
+- `scripts/agents/test_stop_resume.py` — rows
+- `scripts/agents/test_pane_record.py` — the `producers` fixture
+- `scripts/herdr/test_herdr.py` — rows
+- `scripts/accounts/test_accounts.py` — rows
+- `scripts/agents/test_account_move.py` — rows
+
 **Workers:** 1 writer.
 
 **State:** none beyond the row `home` that a move writes now.
+
+**Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
+
+### Phase 3a — A group move rerun finishes a producer that exited early  · status: pending
+
+**Depends on:** Phase 3
+
+Moved out of phase 3 by the hard landing rule (repair rounds 6 and 7), with sdlc's go [03774015]. Findings F009, F014, F015, F017 and F018 of phase 3.
+
+#### Work Order
+
+**Goal:** a repeated group move or workers swap starts every producer that the first run stopped and did not bring up, also when the producer exited early after its `home` was written.
+
+**Spec:**
+
+1. Today the move writes the target `home` before the move confirms the start. A producer that exits in that window keeps the target `home`, so a rerun skips it and reports success with zero sessions.
+2. A rerun selects each eligible stopped producer, also when its saved `home` already matches the target. It skips only a producer verified live on the target account. Unknown liveness is an explicit failure. Keep the pause and machine limits. `home` is account data, not proof that a move finished.
+3. Producers use the same selection code as units and showrunners. Only the family and model come from `[producers]`.
+4. The phase 3 F007 source-unavailable row in `scripts/agents/test_restart.py` (near line 2017) uses a destination-close mock that always returns False. Make the callback record and perform the fixture close, and assert that source unavailability makes no destination close call.
+5. Add a row to the existing group move test in `scripts/agents/test_account_move.py`: the first move writes the target `home`, then start confirmation fails; a repeated move makes another start attempt. Keep the Codex swap row in `scripts/accounts/test_accounts.py` as a control. Each new row fails on the phase 3 code.
+6. Delete the producer-only branches that the shared path can carry (F017):
+   - `stop_resume.py` move check (near line 1235): a unit or showrunner with no matching tab skips the target-account check and reaches `_stop`; only a producer gets the check. Use one rule for all rows.
+   - `member_account.py` `repair_home` (near line 41) repairs only producer homes.
+   - `stop_resume.py` (near line 921) keeps a producer-only `home` write condition.
+   - `restart.py` `producer_resume` (near line 186) repeats the saved policy, remote-control and plugin handling of `pane_record.resume_arguments`.
+   Only the family and model come from `[producers]`. Add rows to the existing tests for units and showrunners with no matching tab.
+7. The Codex own-pane exec test in `scripts/agents/test_stop_resume.py` (near line 1193) uses a fake `os.execvpe` that publishes a binding, and its `SystemExit` runs the contract cleanup. A real exec does neither. Make the fake match the real exec (F018).
+
+**Files:**
+- `scripts/accounts/accounts.py` — rerun selection
+- `scripts/agents/stop_resume.py` — move start confirmation, `home` write order, the shared move check
+- `scripts/agents/member_account.py` — shared `repair_home`
+- `scripts/agents/restart.py` — shared resume arguments
+- `scripts/agents/test_stop_resume.py` — rows and the exec fixture
+- `scripts/agents/test_account_move.py` — rows
+- `scripts/accounts/test_accounts.py` — rows
+- `scripts/agents/test_restart.py` — the F007 row
+
+**Workers:** 1 writer.
+
+**State:** the row `home`.
 
 **Acceptance gate:** the Test command passes; basedpyright gives `0 errors, 0 warnings, 0 notes`.
 

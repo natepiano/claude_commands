@@ -162,7 +162,7 @@ def save(session: str, entries: dict[str, PaneLaunch]) -> None:
 
 def write(session: str, launch: PaneLaunch) -> None:
     """Delegate retained launch publication to the shared writer."""
-    pane_launch.write(record_path(session), without_legacy_identity(launch))
+    pane_launch.write(record_path(session), without_legacy_identity(launch), sources=tuple(record_directory().glob("*.json")))
 
 
 def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> dict[str, str]:
