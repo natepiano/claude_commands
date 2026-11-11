@@ -7,6 +7,9 @@ Its instance, Tailscale device, and data volumes are gone.
 Build jobs use `mac` and `natedev` only, in that order.
 Cloud gates still run merge gates and targeted tests on temporary AWS instances.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
+Cloud gates boot the official NixOS image and fetch their tools at boot.
+A saved gate image was taken out of use. Five gates with it had a 32 s median; gates without it had 29 s.
+`deploy.py remove-images --approve-destroy` switches the gates to the official image. It deletes the saved gate image, the former builder image, and their snapshots.
 
 The former builder used host `aws-build` and one persistent Spot `m7a.4xlarge` instance.
 It used NixOS and a retained, encrypted 500 GiB gp3 data volume at `/home`.
@@ -159,6 +162,13 @@ An interruption marker reports the instance generation.
   The section shows uptime, steps, estimated queue wait saved, costs, the account bill, and daily gate spend.
   `aws_report.estimate_wait_saved` compares natedev steps from the same day, kind, and repository.
   The report shows one AWS section before the Mac copies section.
+  The worker records `mode` in each launch, refusal, and finish event in `cloud-gate-launches.jsonl`.
+  After result validation, the worker records `gate_s` in the finish event.
+  The cost matrix separates machine types, merge gates, targeted tests, and totals over `gate_type_window_days` UTC days (default: 14).
+  Daily cost splits by box seconds; costs per run use billed days only.
+  Counts include all finished runs in the window.
+  A daily table shows median test time, median box time, and cost per run, newest day first.
+  Runs use their UTC completion day; the source line counts old rows without a run kind.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 

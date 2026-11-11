@@ -62,14 +62,27 @@ The display uses one age formatter for the table, the card, and the feed.
 `CloudPushIntervalUnavailable` names an unavailable push interval.
 The display omits the stale age when the push interval is unavailable.
 
-The wire envelope uses protocol version 2 and keeps the existing admission code version rule.
-The service accepts client versions 1 and 2.
+The wire envelope uses protocol version 3 and keeps the existing admission code version rule.
+The service accepts client versions 1, 2 and 3.
 The service sends a version 1 refusal when it cannot determine the request version.
-Both client versions can decode that refusal.
+All three client versions can decode that refusal.
 Version 1 view and mine replies carry plain `QueueRead` records without cloud rows.
 Version 2 replies can carry `CloudQueueRead` records.
 The shared codec encodes the new place field and its frozen dataclasses.
 Old requests default to local admission when they omit the place field.
+
+Version 3 adds placement messages without changing existing routing callers.
+`PlacementRequest` carries the episode, profile, fixed constraints and checked submitting owner.
+`PlacementWait` carries the original queue time, position and candidate eligibility.
+`Assignment` carries a persisted destination and attempt; it grants no execution permission.
+`ClaimFailure` closes the exact assignment before another placement decision.
+`ConsumePermission` carries the exact assignment and adopted provider claim reference.
+The first valid consumption returns `FirstAuthorization` after the state write completes.
+Every repeated consumption returns `DispatchStatus`, including a retry with a different transport request id.
+Unknown, changed and closed attempts grant no authority.
+`ExecutionReport` supplies execution evidence without creating another durable provider lifecycle.
+Version 1 and 2 requests retain their existing local or scaler destinations and reply shapes.
+Placement messages require version 3.
 `CloudSlotWait` carries the used slots and slot limit in wait replies.
 `CloudQueueRead` extends the local queue reading with cloud rows and the slot limit.
 Local queue readings keep their existing wire form when no cloud row exists.
@@ -286,6 +299,24 @@ Unavailable settings produce refusals rather than replacement policy values.
 ### Durable state and lifetime
 
 `admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, start spacing, and the replay ledger.
+It also holds placement requests, assignments and current attempt keys.
+`SavedPlacementAssignment` retains the assignment state, launch permission and exact provider reference.
+The consumption ledger key contains the episode and attempt, independent of the transport request id.
+The ledger stores status, never a replayable authorization.
+Current attempts retain their ledger entries through the existing replay retention path.
+A pruned or unknown attempt cannot create another permission.
+Restart restores unconsumed and consumed attempts without changing their identities or queue times.
+Only checked local submitting owners receive process watches.
+Remote execution identities retain their host and generation, separate from those submitting owners.
+
+Each provider evidence key includes the session, destination, scope, command policy and configuration generation.
+Each background reader publishes immutable evidence through the service wake path.
+The loop takes no provider lock and performs no remote probe.
+Evidence expires after the existing waiting poll interval plus the target probe timeout.
+Stale evidence prevents a new decision that needs it; it never releases a provider claim.
+Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
+Release compares the exact claim identity under the provider lock.
+The provider keeps its existing repository scopes and cleanup policy.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
@@ -619,7 +650,7 @@ Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply a ranked peak. One to nine earlier runs supply their largest peak.
 `ShapeRankedPeak` records the run count and the share used to select the peak.
 Stored `shape_ranked_peak` records retain that share; the decoder reads older `shape_p90` records as share 10.
-The wire retains protocol version 2.
+The wire uses protocol version 3 and retains decoding for versions 1 and 2.
 The encoder writes share-10 bases with the older `ShapeP90` tag and no share field.
 The wire decoder reads older `ShapeP90` tags as `ShapeRankedPeak` with share 10.
 Other shares use the `ShapeRankedPeak` tag and retain their recorded share.

@@ -270,6 +270,10 @@ class CallRecord(TypedDict):
 
 
 class BusyClaimRecord(TypedDict):
+    claim_id: str
+    episode: str
+    attempt: str
+    submitting_session: str
     pid: int
     proc_start: str
     what: str
@@ -421,10 +425,12 @@ if "--copy" in arguments:
 
     mac_test = os.environ.get("TEST_COPY_CLAIM", "")
     claimed = False
+    claim_identity = ["--claim-id", f"copy-claim-{os.getpid()}", "--episode", f"copy-episode-{os.getpid()}",
+                      "--attempt", f"copy-attempt-{os.getpid()}"]
 
     def release_copy_claim() -> None:
         if claimed:
-            subprocess.run([sys.executable, mac_test, "release", "--pid", str(os.getpid())],
+            subprocess.run([sys.executable, mac_test, "release", "--pid", str(os.getpid()), *claim_identity],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def stop_copy(signal_number: int, _frame: object) -> None:
@@ -438,7 +444,7 @@ if "--copy" in arguments:
     if mac_test:
         claim = subprocess.run(
             [sys.executable, mac_test, "claim", "--copy", "--pid", str(os.getpid()), "--what", "nextest sample",
-             "--worktree", arguments[arguments.index("--repo-root") + 1]],
+             "--worktree", arguments[arguments.index("--repo-root") + 1], *claim_identity],
             check=False, capture_output=True, text=True)
         if claim.returncode != 0:
             print("copy claim failed: " + claim.stdout + claim.stderr, file=sys.stderr, flush=True)

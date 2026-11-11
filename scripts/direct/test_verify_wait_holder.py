@@ -572,7 +572,9 @@ raise SystemExit(runner_status)
         return claims / f"{root.name}.json"
 
     def claim(self, path: Path, owner: str) -> dict[str, object]:
-        row: dict[str, object] = {"pid": os.getpid(), "proc_start": admission_records.process_start_time(os.getpid()),
+        row: dict[str, object] = {"claim_id": f"claim-{owner}", "episode": f"episode-{owner}",
+            "attempt": "fixture-attempt", "submitting_session": owner,
+            "pid": os.getpid(), "proc_start": admission_records.process_start_time(os.getpid()),
             "what": "private fixture work", "worktree": str(self.fixture.root),
             "since": datetime.now(timezone.utc).isoformat(), "holder_session": owner}
         _ = path.write_text(json.dumps(row))

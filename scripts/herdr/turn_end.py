@@ -318,7 +318,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         turn_reply = receipt.reply if isinstance(receipt, worker.DispatchWaitingForRuns) else receipt
         reply = turn_reply.last_reply if isinstance(turn_reply, worker.DispatchAwaitingReply) else turn_reply.reply
         if (event.kind == EventKind.TURN_END and reply != event.reply
-                and event.reply.rstrip().splitlines()[-1:] == [f"DONE {delivery.completion_id}"]
+                and worker_admission.reply_ends_dispatch(event.reply, delivery.completion_id)
                 and not (isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.has_live_run)):
             receipt = worker.DispatchComplete(event.reply,
                 receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ())
@@ -339,7 +339,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
                     completion_id = worker_panes.stage_two_completion_id(instance)
                     diff = delivery.early_ready.removesuffix(".ready") + ".diff"
                     line = (f"Stage 2: the final diff is at {json.dumps(diff)}. "
-                            + delivery.line.replace(f"DONE {instance}.", f"DONE {completion_id}."))
+                            + delivery.line.replace(f"DONE {instance}", f"DONE {completion_id}"))
                     delivery = replace(delivery, line=line, completion_id=completion_id)
                     progress_history.save_dispatch_delivery(run, instance, delivery)
                     return _submit_stage(parent, row, state, client, run, passed, instance, delivery)

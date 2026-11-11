@@ -219,11 +219,14 @@ class GateWorker:
                         ledger.GateTerminated(int(self.clock()), instance) if terminated else ledger.GateRunning(instance))
 
     def record_launch(self, request: dict[str, object], size: str, zone: str,
-                      result: Literal['launched', 'refused'], reason: str = '') -> None:
+                      result: Literal['launched', 'refused', 'finished'], reason: str = '', *, gate_s: float = 0) -> None:
         error_code = launch_error_code(reason)
         row: dict[str, object] = {'time': self.clock(), 'attempt': request['attempt'], 'instance_type': size,
-            'vcpus': self.size_vcpus, 'availability_zone': zone, 'result': result,
-            'error_code': error_code, 'reason': reason}
+            'vcpus': self.size_vcpus, 'result': result, 'mode': request['mode']}
+        if result == 'finished':
+            row['gate_s'] = gate_s
+        else:
+            row.update({'availability_zone': zone, 'error_code': error_code, 'reason': reason})
         with store.locked_append(self.book.directory / 'cloud-gate-launches.jsonl') as handle:
             store.append_locked(handle, row)
         if result == 'refused':
@@ -369,6 +372,8 @@ class GateWorker:
                                 raise ValueError('The final log is absent')
                             result = read(folder / 'remote-result.json')
                             validate_result(result, request)
+                            self.record_launch(request, ledger.text(arguments, 'InstanceType'), '', 'finished',
+                                               gate_s=float(str(result['gate_s'])))
                             row = result
                             self.publish_log(folder)
                             break

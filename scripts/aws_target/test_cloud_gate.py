@@ -10,6 +10,7 @@ import base64
 import gzip
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -121,8 +122,10 @@ class CloudGateTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         repository = Path(__file__).resolve().parents[2]
-        _ = (self.root / 'cloud_gate.conf').write_bytes(
-            (repository / 'config/cloud_gate.conf').read_bytes())
+        # The fixture keeps two sizes, so the shipped type list can change without these cases.
+        shipped = (repository / 'config/cloud_gate.conf').read_text()
+        _ = (self.root / 'cloud_gate.conf').write_text(
+            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(int(self.now) - 1,
@@ -149,7 +152,7 @@ class CloudGateTests(CostFixture):
         record = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest', self.now,
                                             self.now + 1, 'merge-gate')
         return {'attempt': 'attempt', 'commit': 'commit', 'tree': 'tree', 'host': 'fixture-guest',
-                'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run), 'record': record}
+                'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run), 'record': record, 'gate_s': 1.0}
 
     def execute(self) -> dict[str, object]:
         worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
@@ -304,6 +307,12 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(outcome['status'], 'complete')
         result = ledger.mapping(outcome['result'])
         self.assertFalse(gate_box.decode_run(result['gate']).passed)
+        self.assertEqual(self.book.launches()[-1]['result'], 'finished')
+
+    def test_invalid_result_does_not_record_finished_time(self) -> None:
+        self.fake.result['tree'] = 'other-tree'
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual([row['result'] for row in self.book.launches()], ['launched'])
 
     def test_capacity_tries_every_zone_before_the_smaller_size(self) -> None:
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 3
@@ -312,6 +321,20 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                    for row in self.fake.launches]
         self.assertEqual(choices, [('m7a.8xlarge', 'fixture-a'), ('m7a.8xlarge', 'fixture-b'),
                                    ('m7a.4xlarge', 'fixture-a'), ('m7a.4xlarge', 'fixture-b')])
+        self.assertEqual(self.book.launches()[-1], {'time': self.now, 'attempt': 'attempt',
+            'instance_type': 'm7a.4xlarge', 'vcpus': 16, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate'})
+        spends = self.book.spend_days(read_settings(self.settings), int(self.now))
+        self.assertEqual(sum(day.runs for day in spends), 1)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].instance_type, 'm7a.4xlarge')
+
+    def test_targeted_run_records_mode_in_every_event(self) -> None:
+        self.request['mode'] = 'targeted-test'
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture']
+        self.assertEqual(self.execute()['status'], 'complete')
+        rows = self.book.launches()
+        self.assertEqual([row['result'] for row in rows], ['refused', 'launched', 'finished'])
+        self.assertTrue(all(row['mode'] == 'targeted-test' for row in rows))
 
     def test_all_capacity_refusals_allow_local_fallback(self) -> None:
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 4
@@ -321,6 +344,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         rows = [ledger.mapping(cast(object, json.loads(line)))
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row['mode'] == 'merge-gate' for row in rows))
         self.assertTrue(all(row['result'] == 'refused' for row in rows))
         self.assertEqual(output.getvalue().count('Cloud gate refused:'), 4)
 
@@ -336,7 +360,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         rows = [ledger.mapping(cast(object, json.loads(line)))
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-            'vcpus': 32, 'availability_zone': 'a', 'result': 'refused', 'error_code': 'InvalidParameterValue', 'reason': reason}])
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'refused', 'mode': 'merge-gate', 'error_code': 'InvalidParameterValue', 'reason': reason}])
         self.assertEqual(output.getvalue(), 'Cloud gate refused: m7a.8xlarge in a: InvalidParameterValue\n')
         for private in ('123456789012', 'subnet-fixture', 'i-private', 'RED'):
             self.assertNotIn(private, output.getvalue() + str(outcome))
@@ -346,7 +370,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         rows = [ledger.mapping(cast(object, json.loads(line)))
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-            'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': ''}])
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': '', 'mode': 'merge-gate'},
+            {'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
+             'vcpus': 32, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate'}])
         data = ledger.text(self.fake.launches[0], 'UserData')
         self.assertTrue(data.startswith('#!/bin/sh\n'))
         links = ledger.mapping(cast(object, json.loads(data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))

@@ -444,9 +444,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         write_text_atomic(self.ready, "ready\n")
         self.assertEqual(self.fixture.finish("review", turn_end.EventKind.STAGE_READY), turn_end.TurnOutcome.SUBMITTED)
         first, second = self.fixture.agent.submitted
-        dispatch_id = first[1].split("DONE ")[-1].split(".")[0]
+        dispatch_id = first[1].split("DONE ")[-1].split()[0].removesuffix(".")
         self.assertEqual(first[0], second[0])
-        self.assertIn(f"DONE {dispatch_id}-2.", second[1])
+        self.assertIn(f"DONE {dispatch_id}-2\n", second[1])
         self.assertIn(str(self.ready.with_suffix(".diff")), second[1])
         self.assertEqual(summary.read_text(), "The previous full report.\n")
         self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
@@ -484,7 +484,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(self.fixture.agent.waited, [])
         self.fixture.agent.complete(submitted[-1][0])
         self.assertEqual(self.fixture.finish("review"), turn_end.TurnOutcome.DONE)
-        second_id = submitted[-1][1].split("DONE ")[-1].split(".")[0]
+        second_id = submitted[-1][1].split("DONE ")[-1].split()[0].removesuffix(".")
         self.assertTrue((self.phase / "review_summary_1.txt").read_text().endswith(f"DONE {second_id}\n"))
 
     def test_review_stage_one_done_does_not_complete_stage_two_or_replace_the_report(self) -> None:
