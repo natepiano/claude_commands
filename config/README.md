@@ -375,6 +375,14 @@ The cost for each run is a daily allocation: Spot compute divided by successful 
 Reports read local evidence without an AWS call or a coordination file.
 
 `### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
+`gate_type_window_days=14` sets the UTC window for the cost matrix by machine type and run kind.
+The matrix separates merge gates, targeted tests, and all runs.
+Costs per run use billed days only; each day's cost splits by box seconds.
+Counts include all finished runs in the window.
+The daily table shows median test time, median box time, and cost per run, newest day first.
+Both tables read the shared launch log and saved bills.
+Runs use their UTC completion day; box seconds include setup time.
+Old rows without a run kind remain outside the matrix; the source line shows their count.
 Missing comparisons remain unavailable. Run time differences can remain negative.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.

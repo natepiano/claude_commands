@@ -2355,6 +2355,11 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
         for spend in spends:
             if spend.source == 'AWS bill' or (current_report and spend.day == today):
                 lines.extend(aws_report.spend_lines(spend, daily_limit, today=spend.day == today))
+    try:
+        days = conf.read(settings).whole('gate_type_window_days')
+        lines.extend(aws_report.gate_type_lines(directory, day, days))
+    except (OSError, ValueError, ArithmeticError, KeyError) as error:
+        lines.append(f'Gate type comparison unavailable: {error}.')
     return [*lines, '']
 
 
