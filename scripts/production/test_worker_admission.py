@@ -219,6 +219,16 @@ class FamilyHandoffTests(StaffTestCase):
                     "message": {"role": "assistant" if kind == "assistant" else "user",
                                 "content": [{"type": "text", "text": "The request"}]},
                 }, set()), expected)
+        for record_type, message_type, role, expected in (
+                ("response_item", "agent_message", "", ""),
+                ("event_msg", "agent_message", "", "assistant:\nThe request"),
+                ("response_item", "message", "assistant", "assistant:\nThe request")):
+            with self.subTest(record_type=record_type, message_type=message_type):
+                self.assertEqual(worker_admission.transcript_entry({
+                    "type": record_type, "payload": {
+                        "type": message_type, "role": role, "content": [{"type": "output_text", "text": "The request"}],
+                    },
+                }, set()), expected)
 
     def source(self, family: Literal["claude", "codex"], *, turns: int = 1,
                malformed: bool = False, worker_name: str = "switch") -> tuple[worker_admission.WorkerStartAllowed, Path,
