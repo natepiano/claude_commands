@@ -47,7 +47,8 @@ def read_units(production_name: str, *,
         print(f"live_units: {problem.name}: unavailable: {problem.reason}", file=sys.stderr)
     with session_staff.anomalies(check) as lines:
         every = unit_lookup.every_labeled_session(record=record, sources=sources)
-    units = _with_status(_joined(production_name, every), session_staff.production_members(record).get(production_name, ()))
+    units = _with_status(_joined(production_name, every), session_staff.production_members(record).get(production_name, ()),
+                         record=record)
     return UnitListing(units, tuple(lines))
 
 
@@ -59,7 +60,9 @@ def units_of(production_name: str) -> list[LiveUnit]:
     return listing.units
 
 
-def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...]) -> list[LiveUnit]:
+def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...], *,
+                 record: staff.StaffSnapshot) -> list[LiveUnit]:
+    detached = session_state.running_detached_work(record)
     members = {row.name: row for row in rows}
     activities = {session["sessionId"]: session_state.LiveActivity(session.get("status", ""))
                   for session in sessions.running_sessions()}
@@ -76,7 +79,7 @@ def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...]) -> lis
                              or herdr.is_claude_process([observed.process.command])))):
                 activity = session_state.LiveActivity("idle")
         member = row if row is not None else session_state.UnrecordedStaff()
-        state = session_state.classify(member, activity)
+        state = session_state.classify(member, activity, detached=detached)
         machine = staff.worktree_machine(row) if row is not None else ""
         result.append(unit._replace(status=state, member=member, machine=machine))
     return result
@@ -87,7 +90,8 @@ def units_in(production_name: str, every: unit_lookup.LabeledProductions) -> lis
     units = _joined(production_name, every)
     if not units:
         return units
-    return _with_status(units, session_staff.production_members(staff.snapshot()).get(production_name, ()))
+    record = staff.snapshot()
+    return _with_status(units, session_staff.production_members(record).get(production_name, ()), record=record)
 
 
 def _joined(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:

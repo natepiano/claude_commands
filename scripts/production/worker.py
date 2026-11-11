@@ -25,7 +25,7 @@ from typing import Literal, cast, final
 
 from scripts.agents import detached_runs, worker_lifecycle
 from scripts.herdr import herdr_types
-from scripts.accounts import accounts
+from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
@@ -982,7 +982,13 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generato
         print(f"anomaly: {path}: {error}", file=sys.stderr)
 
 
-def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, WorkerDispatchRecord]:
+@dataclass(frozen=True)
+class RecordedWorkerDispatches:
+    by_worker: dict[StaffId, WorkerDispatchRecord]
+    runs: tuple[Path, ...]
+
+
+def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDispatches:
     workers = record.find(kind="worker")
     parents = {parent.id: parent for row in workers if (parent := record.parent_of(row)) is not None}
     names = {(row.parent.id, row.name): row for row in workers if isinstance(row.parent, staff.ReportsTo)}
@@ -1057,7 +1063,7 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, Wo
                 del pending[str(target.id).encode()]
             if not pending:
                 break
-    return found
+    return RecordedWorkerDispatches(found, tuple(runs))
 
 
 class WorkerFilter(Enum):
@@ -1075,22 +1081,22 @@ def _listed_worker(state: worker_panes.WorkerPane, selection: WorkerFilter) -> b
             or selection is WorkerFilter.CLOSED and isinstance(state, worker_panes.ClosedWorker))
 
 
-def _waiting_on(row: staff.StaffRow, record: staff.StaffSnapshot) -> str:
-    run = worker_panes.worker_run(row, record=record)
-    return ", ".join(item["label"] for item in detached_runs.live_runs(
-        run / worker_lifecycle.DETACHED_RUNS_DIR, row.name)) or "-"
+def _waiting_on(row: staff.StaffRow, detached: session_state.RunningDetachedWork) -> str:
+    return ", ".join(detached.labels.get(row.id, ())) or "-"
 
 
 def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = WorkerFilter.ALL,
                      as_json: bool = True) -> list[dict[str, object]]:
     dispatches = _recorded_worker_dispatches(record)
+    detached = (session_state.running_detached_work(record, additional_runs=dispatches.runs)
+                if not as_json else session_state.NO_DETACHED_WORK)
     states = {state.row.id: state for parent_id in dict.fromkeys(
         row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo))
         for state in worker_panes.observe(parent_id, record)} if selection is not WorkerFilter.ALL or not as_json else {}
     listing: list[dict[str, object]] = []
     for row in record.find(kind="worker"):
         parent = record.parent_of(row)
-        saved = dispatches.get(row.id, WorkerDispatchRecord({}, 0))
+        saved = dispatches.by_worker.get(row.id, WorkerDispatchRecord({}, 0))
         if parent is None:
             continue
         if selection is not WorkerFilter.ALL and (row.id not in states or not _listed_worker(states[row.id], selection)):
@@ -1106,7 +1112,9 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
         work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
         if status == "active":
             try:
-                dispatch = worker_panes.worker_dispatch_state(row, worker_panes.worker_run(row, record=record))
+                run = worker_panes.worker_run(row, record=record)
+                dispatch = (worker_panes.worker_dispatch_state(row, run) if as_json else
+                            worker_panes.worker_dispatch_state(row, run, detached=detached))
                 if isinstance(dispatch, worker_panes.ReleasedWorkerPass):
                     status, work = dispatch.value, "idle"
                 elif isinstance(dispatch, worker_panes.CompletedWorkerPass):
@@ -1117,7 +1125,10 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
             "activity": fields.get("activity") or status})
         if not as_json:
             item["list_activity"] = activity or item["role"]
-            item["waiting_on"] = _waiting_on(row, record)
+            observed = states.get(row.id)
+            if observed is not None and isinstance(observed, worker_panes.OpenWorker):
+                item["pane"], item["state"] = _worker_pane_state(observed, detached)
+            item["waiting_on"] = _waiting_on(row, detached)
         listing.append(item)
     if not as_json:
         listing.sort(key=lambda fields: not (StaffId(str(fields["id"])) in states
@@ -1125,13 +1136,12 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
     return listing
 
 
-def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
+def _worker_pane_state(state: worker_panes.WorkerPane,
+                       detached: session_state.RunningDetachedWork) -> tuple[str, str]:
     if isinstance(state, worker_panes.OpenWorker):
-        if isinstance(state.row.paused, staff.Paused):
-            return "open", "paused"
-        if isinstance(state.row.exited, staff.Exited):
-            return "open", "exited"
-        return "open", worker_panes.worker_state(state)
+        activity = worker_panes.worker_state(state)
+        classified = session_state.classify(state.row, session_state.LiveActivity(activity), detached=detached)
+        return "open", activity if activity == "unknown" and classified == "idle" else classified
     if isinstance(state, worker_panes.StoppedWorker):
         return "open", "exited"
     if isinstance(state, worker_panes.ClosedWorker):
@@ -1142,24 +1152,28 @@ def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
 def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True,
                  selection: WorkerFilter = WorkerFilter.ALL) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
-    observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
+    detached = session_state.running_detached_work(record)
+    observed = _read_workers(next(row for row in record.rows if row.id == parent), record,
+                             scanned=detached.launcher_runs.by_session)
     with progress_history.dispatch_reads(record, observed.runs):
         states = observed.states if as_json else sorted(observed.states, key=lambda state: not _open_worker(state))
         for state in states:
             if not _listed_worker(state, selection):
                 continue
-            facts: dict[str, object] = {"state": type(state).__name__, "work": worker_panes.worker_state(state)}
+            pane, displayed_state = _worker_pane_state(state, detached)
+            work = displayed_state if isinstance(state, worker_panes.OpenWorker) else worker_panes.worker_state(state)
+            facts: dict[str, object] = {"state": type(state).__name__, "work": work}
             fields = _worker_list_row(state.row, facts)
             if isinstance(state, worker_panes.OpenWorker):
                 fields["activity"] = state.status.value
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 fields["reason"] = state.reason
             if not as_json:
-                fields["pane"], fields["state"] = _worker_pane_state(state)
+                fields["pane"], fields["state"] = pane, displayed_state
                 dispatch = progress_history.last_dispatch(state.row.id)
                 fields["list_activity"] = (dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch)
                                            and dispatch.status in ("active", "refused") else fields["role"])
-                fields["waiting_on"] = _waiting_on(state.row, record)
+                fields["waiting_on"] = _waiting_on(state.row, detached)
             listing.append(fields)
     return listing
 
