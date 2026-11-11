@@ -81,6 +81,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def test_cancel_prior_reaches_validate_and_push_only_when_requested(self) -> None:
         self.push = "validate_and_push"
         self.production_doc()
+        self.executable(self.bin / "validate_and_push.sh", STUB + '''
+with (state / "validation-locks").open("a") as output:
+    output.write(os.environ.get("MAIN_PUSH_LOCK_HELD", "missing") + "\\n")
+''')
         first = self.checkpoint()
         first_result = self.run_checkpoint(first)
         self.assertEqual(first_result.process.returncode, 0, first_result.process.stderr + first_result.process.stdout)
@@ -92,6 +96,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(len(calls), 2)
         self.assertNotIn("--cancel-prior", calls[0])
         self.assertIn("--cancel-prior", calls[1])
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        self.assertEqual((self.state / "validation-locks").read_text().splitlines(),
+                         [str(common / "main-push.lock")] * len(calls))
     def test_cancel_prior_with_git_push_is_refused_before_merge(self) -> None:
         sha = self.checkpoint()
         result = self.run_checkpoint(sha, "--cancel-prior")

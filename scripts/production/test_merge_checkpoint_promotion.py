@@ -317,6 +317,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             pass
 
         self.prepare_bump_gate()
+        gate_command = self.bin / "checkpoint-test"
+        self.executable(gate_command, gate_command.read_text() + '''
+(state / "detached-lock-marker").write_text(os.environ.get("MAIN_PUSH_LOCK_HELD", ""))
+''')
         self.promotions = str(self.promote)
         self.production_doc()
         checkpoint = self.checkpoint()
@@ -354,6 +358,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), first["tip"])
         self.release_bump_gate()
         self.assertEqual(self.wait_bump_result(first["tip"])["result"], "green")
+        self.assertEqual((self.state / "detached-lock-marker").read_text(), "")
 
     def assert_gate_notices_follow_local_promotion(self, *, launch_failure: bool) -> None:
         self.prepare_bump_gate(red=True)

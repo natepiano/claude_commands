@@ -648,6 +648,9 @@ Each class builds a complete Git/worktree fixture once and restores a private co
 Synchronous CLI and formatter fixtures run their actual code in-process; a gate case retains the executable boundary.
 Concurrent refill tests release on observed lock contention and check committed tickets and disjoint files.
 
+The gate's main promotion takes the [shared main push lock](repair-rounds.md#shared-main-push-lock) after its hold and release waits.
+It releases the lock after the local main push and before the Mac pull.
+
 ### Small fixes on main
 
 `commands/unit/fast_track.md` defines the fast-track exception for small fixes.
@@ -670,7 +673,9 @@ Snapshot ref writes and recovery ref deletes use one `update-ref --stdin` batch.
 The change took `test_fast_track` from 7,158 to 6,433 Git processes and the copies tests from 497 to 319 fetches.
 
 A successful check creates a `fast-track(<unit>): <why>` commit with `Fast-Track: <unit>`.
-`main_push_lock` protects its fast-forward push.
+The shared `scripts.lib.main_push_lock` helper protects the final fetch and fast-forward push.
+It also protects local promotion when fast-track calls that step.
+The fast check runs before these holds.
 A moved main causes another application and check within `max_push_attempts`.
 The command then promotes through the production's configured targets and restores the selected source changes.
 A refusal before publication exits 2.

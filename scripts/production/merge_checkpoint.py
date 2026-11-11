@@ -16,7 +16,6 @@ except FileNotFoundError:
 import argparse
 import bisect
 import fcntl
-import json
 import os
 import re
 import shlex
@@ -33,7 +32,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import change_review, checkpoint_gate
 from scripts.worktree import worktrees
-from scripts.lib import main_publish, scratch
+from scripts.lib import main_publish, main_push_lock, scratch
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -178,26 +177,6 @@ def merge_lock(checkout: Path, name: str) -> Generator[None]:
 
 def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True, check=False)
-
-
-@contextmanager
-def main_push_lock(checkout: Path) -> Generator[None]:
-    """Serialize the final main fetch, merge-branch push and main promotion."""
-    common = good(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"), "push")
-    with (Path(common) / "main-push.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        started = time.monotonic()
-        try:
-            yield
-        finally:
-            seconds = time.monotonic() - started
-            try:
-                _ = lock.seek(0)
-                _ = lock.truncate()
-                _ = lock.write(json.dumps({"held_seconds": seconds}) + "\n")
-                lock.flush()
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def good(result: subprocess.CompletedProcess[str], step: str) -> str:
@@ -771,7 +750,7 @@ def tested_main_push(production: ProductionDocument, tested_tip: str,
     checkout = production.checkout
     with ExitStack() as publication_lock:
         with push_rollback(production, before_merge_tip):
-            _ = publication_lock.enter_context(main_push_lock(checkout))
+            _ = publication_lock.enter_context(main_push_lock.main_push_lock(checkout))
             while follow_main:
                 _ = good(git(checkout, "fetch", "origin", "main"), "push")
                 if git(checkout, "merge-base", "--is-ancestor", "origin/main", tested_tip).returncode == 0:
@@ -817,7 +796,9 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
         command.append("--cancel-prior")
     before_merge_tip = good(git(production.checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
     with push_rollback(production, before_merge_tip):
-        result = subprocess.run(command, cwd=production.checkout, capture_output=True, text=True, check=False)
+        result = subprocess.run(command, cwd=production.checkout,
+                                env=main_push_lock.held_environment(production.checkout),
+                                capture_output=True, text=True, check=False)
         if result.returncode:
             detail = failure_detail(result)
             raise checkpoint_gate.Stop("push", "failed", detail, "repair the push failure and send a new checkpoint")
@@ -830,38 +811,39 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
 def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
         PromotionAlreadyAtTip | PromotionOriginPushed | PromotionAdvanced | PromotionNotPushed):
     """Fast-forward one main checkout and push any eligible unpushed tip."""
-    _ = good(git(checkout, "fetch", "origin", merge_branch), "promote")
-    current_branch = good(git(checkout, "branch", "--show-current"), "promote")
-    if current_branch != "main":
-        raise checkpoint_gate.Stop("promote", "failed", f"{checkout} is on {current_branch}, expected main",
-                   "switch the promotion checkout to main and rerun this checkpoint")
-    current = good(git(checkout, "rev-parse", "main"), "promote")
-    _ = good(git(checkout, "fetch", "origin", "main"), "promote")
-    if current == tip:
+    with main_push_lock.main_push_lock(checkout):
+        _ = good(git(checkout, "fetch", "origin", merge_branch), "promote")
+        current_branch = good(git(checkout, "branch", "--show-current"), "promote")
+        if current_branch != "main":
+            raise checkpoint_gate.Stop("promote", "failed", f"{checkout} is on {current_branch}, expected main",
+                       "switch the promotion checkout to main and rerun this checkpoint")
+        current = good(git(checkout, "rev-parse", "main"), "promote")
+        _ = good(git(checkout, "fetch", "origin", "main"), "promote")
+        if current == tip:
+            unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
+            foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"),
+                           "promote")
+            if foreign:
+                return PromotionNotPushed(tip, True)
+            if unpushed:
+                _ = good(git(checkout, "push", "origin", "main"), "promote")
+                return PromotionOriginPushed(tip)
+            return PromotionAlreadyAtTip(tip)
+        if conflict := merge_gate.promotion_edit_conflict(checkout, tip):
+            raise checkpoint_gate.Stop("promote", "failed", conflict,
+                       "clear the listed checkout paths and rerun this checkpoint")
+        result = git(checkout, "merge", "--ff-only", tip)
+        if result.returncode:
+            status = git(checkout, "status", "--short").stdout.strip()
+            raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or result.stderr.strip()}",
+                       "the showrunner will clear the listed checkout paths and rerun this checkpoint")
         unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
-        foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"),
-                       "promote")
+        foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"), "promote")
         if foreign:
-            return PromotionNotPushed(tip, True)
+            return PromotionNotPushed(tip, False)
         if unpushed:
             _ = good(git(checkout, "push", "origin", "main"), "promote")
-            return PromotionOriginPushed(tip)
-        return PromotionAlreadyAtTip(tip)
-    if conflict := merge_gate.promotion_edit_conflict(checkout, tip):
-        raise checkpoint_gate.Stop("promote", "failed", conflict,
-                   "clear the listed checkout paths and rerun this checkpoint")
-    result = git(checkout, "merge", "--ff-only", tip)
-    if result.returncode:
-        status = git(checkout, "status", "--short").stdout.strip()
-        raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or result.stderr.strip()}",
-                   "the showrunner will clear the listed checkout paths and rerun this checkpoint")
-    unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
-    foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"), "promote")
-    if foreign:
-        return PromotionNotPushed(tip, False)
-    if unpushed:
-        _ = good(git(checkout, "push", "origin", "main"), "promote")
-    return PromotionAdvanced(tip)
+        return PromotionAdvanced(tip)
 
 
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulled | main_publish.MacPullPending:

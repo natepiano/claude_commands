@@ -15,10 +15,11 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-from scripts.lib import conf_reads, git_index
+from scripts.lib import conf_reads, git_index, main_push_lock
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -534,7 +535,10 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     target = _publish_repository(path)
     lock_path = (Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
                  if isinstance(target, SharedRegistry) else path.with_name(path.name + ".lock"))
-    with lock_path.open("a") as lock:
+    with ExitStack() as locks:
+        if isinstance(target, SharedRegistry) and _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main":
+            locks.enter_context(main_push_lock.main_push_lock(target.repository))
+        lock = locks.enter_context(lock_path.open("a"))
         fcntl.flock(lock, fcntl.LOCK_EX)
         if isinstance(target, SharedRegistry):
             _ = _publish(target.repository, path, changes, description, additive_catalog)
