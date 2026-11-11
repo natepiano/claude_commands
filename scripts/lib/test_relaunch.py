@@ -159,6 +159,7 @@ class RelaunchTests(ShutdownTestCase):
         state = cast(dict[str, object], json.loads(state_path.read_text()))
         passes = cast(dict[str, dict[str, object]], state["pass"])
         command = ("bash", "assign.sh", "--role", "impl", "--prompt", str(fixture.root / "saved prompt.md"))
+        passes[row.name]["worker_id"] = row.id
         passes[row.name]["launcher_command"] = list(command)
         for status in ("unsubmitted", "submitted", "done", "completed"):
             with self.subTest(status=status):

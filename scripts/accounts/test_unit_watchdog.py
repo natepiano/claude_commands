@@ -140,7 +140,7 @@ class UnitWatchdogTests(unittest.TestCase):
                 _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree), expected=member.worktree)
             tree.mkdir(exist_ok=True)
             _ = run_git([GIT, "init", "-b", "fixture", str(tree)], check=True, capture_output=True)
-            events: list[dict[str, object]] = [{"event_type": "run_started", "main_agent": {"session_id": member.current_session},
+            events: list[dict[str, object]] = [{"event_type": "run_started", "owner_staff_id": member.id,
                                               "working_dir": str(tree), "run_started_at": 1}]
             if name in self.finished:
                 events.append({"event_type": "run_finished"})

@@ -516,6 +516,7 @@ class DailiesInputFixture(unittest.TestCase):
             {"event_type": "run_finished"}]
         member = next(row for row in staff.snapshot().rows
                       if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == worktree)
+        events[0]["owner_staff_id"] = member.id
         events[0]["main_agent"] = {"session_id": member.current_session}
         _ = (runs / f"{worktree.name}.jsonl").write_text(
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")

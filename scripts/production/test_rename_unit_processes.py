@@ -166,7 +166,7 @@ class RunRecordLookupTests(StaffTestCase):
             folder.mkdir(parents=True)
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: member.id}))
             _ = staff.set_run(member.id, staff.OpenRun(folder))
-            events = [{"event_type": "run_started", "main_agent": {"session_id": member.current_session},
+            events = [{"owner_staff_id": member.id, "event_type": "run_started", "main_agent": {"session_id": member.current_session},
                        "run_started_at": at}]
             _ = (runs / f"{worktree.name}.jsonl").write_text(
                 "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")

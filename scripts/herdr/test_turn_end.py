@@ -224,12 +224,13 @@ class TurnEndTests(unittest.TestCase):
                     stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
-        opened = self.case.opened()
         original_run = self.case.run_dir
         original_state = (original_run / "progress_history_state.json").read_bytes()
         outside = Path(self.enterContext(TemporaryDirectory(prefix="outside-worker-run-")))
         atomic_file.write_text_atomic(outside / "progress_history_state.json", original_state.decode())
         self.case.run_dir = outside
+        _ = staff.set_run(self.case.fixture.parent.id, staff.OpenRun(outside))
+        opened = self.case.opened()
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
         self.assertEqual(worker_panes.worker_run(opened.row), outside)
         self.assertEqual(len(self.case.fixture.world.launches), 1)

@@ -688,7 +688,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
         passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(args.new_worker))
         repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
                       import_module("scripts.herdr.turn_end").repeat_completion_notice)
-        repeat(matched.worker_name, parent, run, passed)
+        repeat(args.new_worker, parent, run, passed)
         return staff_worker.DispatchSubmission.SUBMITTED
     for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
@@ -758,16 +758,16 @@ def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
             return
         if any(entry.get("team_slot") != slot for entry in passes):
             return
-        names: set[str] = set()
         record = staff.local_snapshot()
-        for path in run.glob("impl_worker_*.json"):
-            row = record.by_id(staff.StaffId(text(read_object(path).get("staff_id"))))
-            if row is not None:
-                names.add(row.name)
         parent = worker_admission.parent(record, run=run)
-        names.update(row.name for row in record.find(kind="worker", parent=parent.id))
-        own_names = {slot, *(text(entry.get("worker_name")) for entry in passes if entry.get("worker_name"))}
-        if names - own_names:
+        members = record.find(kind="worker", parent=parent.id)
+        own = {text(entry.get("worker_id")) for entry in passes}
+        for path in run.glob("impl_worker_*.json"):
+            entry = read_object(path)
+            if entry.get("slot") == slot:
+                own.add(text(entry.get("staff_id")))
+        own.update(row.id for row in members if row.name == slot)
+        if {row.id for row in members} - own:
             return
         held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), record=record)
         if {Path(folder).resolve() for folder in held} != {run}:

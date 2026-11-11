@@ -796,7 +796,7 @@ elif "comm=" in joined:
             event = {
                 "event_type": "run_started",
                 "run_started_at": started_at,
-                "main_agent": {"session_id": UNIT_ID},
+                "owner_staff_id": member.id,
                 "working_dir": str(self.checkout),
                 "plan_doc": plan,
                 "branch": "shutdown",

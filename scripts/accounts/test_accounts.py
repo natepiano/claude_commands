@@ -7521,9 +7521,10 @@ class PaneWorkerMoveTests(unittest.TestCase):
     def dispatch(self, row: staff.StaffRow, role: str = "impl", status: str = "active") -> None:
         if role in staff.WORKER_ROLES:
             _ = staff.set_worker_role(row.id, staff.KnownWorkerRole(role))
+        _ = staff.set_run(self.owner.id, staff.OpenRun(self.run_dir))
         atomic_file.write_text_atomic(self.run_dir / "progress_history_state.json", json.dumps({
-            "owner_session": self.owner.current_session, "history_file": str(self.run_dir / "history.jsonl"),
-            "pass": {row.name: {"worker_name": row.name, "team_slot": row.name, "kind": role,
+            "owner_staff_id": self.owner.id, "history_file": str(self.run_dir / "history.jsonl"),
+            "pass": {row.name: {"worker_id": row.id, "team_slot": row.name, "kind": role,
                                  "status": status, "started_at": time.time(), "instance_id": "dispatch-" + row.name,
                                  "launcher_command": ["assign.sh", "--to", row.name]}}}))
         if status == "completed":
@@ -7537,7 +7538,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
     def test_busy_move_keeps_the_pane_and_conversation_and_rerun_changes_nothing(self) -> None:
         row = self.worker()
         _ = self.fixture.worker_run("a-first", "unit", self.owner.current_session, director_run=True,
-            passes=({"worker_name": row.name, "kind": "review", "status": "active", "started_at": 0,
+            passes=({"worker_id": row.id, "kind": "review", "status": "active", "started_at": 0,
                      "instance_id": "old-dispatch", "launcher_command": ["assign.sh", "--old"]},))
         self.run_dir = self.fixture.worker_run("z-own", "unit", self.owner.current_session)
         self.dispatch(row)

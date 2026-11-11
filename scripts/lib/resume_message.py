@@ -144,7 +144,6 @@ def resume_worker_command(seat: ClaudeChildResume, cwd: str) -> str:
     options = {"--role": seat["role"]}
     dispatch = progress_history.last_dispatch(staff.StaffId(seat["staff_id"]))
     if isinstance(dispatch, progress_history.RecordedDispatch):
-        options["--role"] = dispatch.role
         options.update({option: value for option, value in (
             ("--phase", dispatch.phase_id), ("--lens", dispatch.lens), ("--paths", dispatch.paths))
                         if isinstance(value, str)})
