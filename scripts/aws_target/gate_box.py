@@ -162,7 +162,7 @@ def paired_trial():
                                         remaining = budget - (time.monotonic() - before)
                                         if remaining <= 0:
                                             timed_out = True
-                                            os.killpg(active.pid, signal.SIGKILL)
+                                            send_process_group(active.pid, signal.SIGKILL)
                                             break
                                         try:
                                             active.wait(timeout=min(0.02, remaining))
@@ -173,7 +173,7 @@ def paired_trial():
                                 finally:
                                     group = active.pid
                                     try:
-                                        os.killpg(group, signal.SIGKILL)
+                                        send_process_group(group, signal.SIGKILL)
                                     except ProcessLookupError:
                                         pass
                                     active.wait()
@@ -208,7 +208,7 @@ def paired_trial():
             output.write(reply['error'])
     finally:
         if active is not None:
-            os.killpg(active.pid, signal.SIGKILL)
+            send_process_group(active.pid, signal.SIGKILL)
             active.wait()
         reply['gate_s'] = time.monotonic() - started
         try:
@@ -225,12 +225,15 @@ def paired_supervisor() -> str:
     """Embed the installed gate environment and memory sampler."""
     from scripts.production import merge_gate
     from scripts.lib.descendants import adopt_descendants
+    from scripts.lib.process_group import check_process_group, send_process_group
     environment = inspect.getsource(merge_gate.test_module_environment).replace(
         'Path(__file__).resolve().parents[1] / "lib/py"', 'sys.executable')
     return ('from pathlib import Path\nimport ctypes\nfrom typing import cast\n'
             + inspect.getsource(adopt_descendants) + '\n' + environment + '\n'
             + inspect.getsource(merge_gate.swapped_kib) + '\n'
-            + inspect.getsource(merge_gate.process_memory_mib) + '\n' + PAIRED_GUEST)
+            + inspect.getsource(merge_gate.process_memory_mib) + '\n'
+            + inspect.getsource(check_process_group) + '\n'
+            + inspect.getsource(send_process_group) + '\n' + PAIRED_GUEST)
 
 
 # This program runs inside the instance's tool shell, not on natedev.
