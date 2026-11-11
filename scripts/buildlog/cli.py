@@ -380,8 +380,11 @@ def main(argv: list[str]) -> int:
         from scripts.buildlog import record
 
         return record.main(["backfill-verify", *rest])
+    if command and command not in ("-h", "--help", "help"):
+        print(f"buildlog: unknown command '{command}'; type buildlog to see the commands", file=sys.stderr)
+        return 2
     print(__doc__, file=sys.stderr)
-    return 0 if command in ("-h", "--help", "help") else 2
+    return 0 if command else 2
 
 
 if __name__ == "__main__":
