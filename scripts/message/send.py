@@ -681,6 +681,14 @@ class RecipientLookupFailed:
     reason: str
 
 
+class RecipientNameMissing(SystemExit):
+    """The recipient name has no staff row or live session."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(2)
+        self.reason: str = reason
+
+
 @dataclass(frozen=True)
 class NoStaffRecipient:
     """The target keeps its transport resolution because no staff row matches."""
@@ -1162,7 +1170,7 @@ def retire_record(record: Emergency) -> tuple[int, str]:
     # This host holds the key's window (remote() sends --repeat-minutes 0); the posting host holds the keys.
     forget_sent(record["key"], USER)
     forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", record["machine"], f"{REMOTE} {forwarded}"]
+    command = ["ssh", "-o", "BatchMode=yes", record["machine"], f"{REMOTE} {forwarded}"]
     code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
     last = (out.strip().splitlines() or [""])[-1]
     if code == 0:
@@ -2379,7 +2387,9 @@ def resolve_recipient(
             return QueuedStaffRecipient(address, member.name, str(member.current_session))
         if to.startswith("session:"):
             return ClaudeRecipient(to)
-        usage_error(f"no staff row or live session for {to!r}")
+        reason = f"no staff row or live session for {to!r}"
+        print(f"send.py: {reason}", file=sys.stderr)
+        raise RecipientNameMissing(reason)
 
     failed = True
     try:
@@ -2773,7 +2783,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
     elif message.to == USER and options.need == "blocked" and message.key is not None:
         # This host's claim holds the emergency's lifetime window; the run on host must not apply it again.
         forwarded += ["--repeat-minutes", "0"]
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
+    command = ["ssh", "-o", "BatchMode=yes", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
     failure: FailureText = NO_FAILED_PUSH
@@ -3365,7 +3375,13 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
                  else UserDelivery())
     else:
-        route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
+        try:
+            route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
+        except RecipientNameMissing as error:
+            from scripts.message import failed_lookup
+
+            failed_lookup.report(options.sender or default_sender(), options.to, f"send.py: {error.reason}")
+            raise
     destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
     member = _staff_recipient_match(options.to, membership, records=records, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
@@ -3442,6 +3458,9 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     elif guarded.held:
         result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif isinstance(route, RecipientLookupFailed):
+        from scripts.message import failed_lookup
+
+        failed_lookup.report(sender, options.to, f"FAILED: {route.reason}")
         result = Result("failed", route.reason)
     elif isinstance(route, RemoteDelivery):
         result = remote(message, route.host, options)

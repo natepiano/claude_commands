@@ -34,6 +34,7 @@ from uuid import uuid4
 
 
 from scripts.agents import detached_runs
+from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
 from scripts.message import session_send
 from scripts.lib.atomic_file import write_text_atomic
@@ -589,7 +590,7 @@ def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) 
     fields: dict[str, str] = {}
     for source in paths:
         try:
-            content = source.read_text(encoding="utf-8")
+            content = conf_reads.read_text(source)
         except FileNotFoundError:
             if status_defaults and source != defaults:
                 continue
