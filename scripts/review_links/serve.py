@@ -303,7 +303,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         completed = {result.name for result in results if result.message == "deleted"}
         selected = frozenset(result.name for result in results if result.message != "deleted")
-        remaining = branch_page.BranchPage(page.repository, tuple(row for row in page.rows if row.name not in completed), page.token)
+        removed = {row.name for row in page.rows if row.name in completed
+                   or (isinstance(row, branch_page.MergedUnownedBranch) and row.name not in selected)}
+        unowned_removed = sum(isinstance(row, branch_page.MergedUnownedBranch)
+                              and row.name in removed for row in page.rows)
+        remaining = branch_page.BranchPage(page.repository, tuple(row for row in page.rows if row.name not in removed),
+                                           page.token, page.unowned_total - unowned_removed)
         self.html_response(200, branch_page.render(remaining, results, selected=selected))
 
     def browser_answer(self, browser: change_browser.ReviewBrowser) -> None:
