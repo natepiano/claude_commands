@@ -53,7 +53,7 @@ class UnitResumeCommandTests(StaffTestCase):
                 self.assertIn(f"/unit:{unit_type}", text)
                 self.assertIn(f"~/.claude/commands/unit/{unit_type}.md", text)
                 self.assertIn("moved from claude1 to claude2", text)
-                self.assertIn("Background commands that you started before the restart ended with no result. Run them again.", text)
+                self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.", text)
 
     def test_relaunch_uses_the_retained_unit_after_rename(self) -> None:
         from scripts.agents import pane_record
@@ -155,7 +155,7 @@ class RelaunchTests(ShutdownTestCase):
         text = resume_message("a shutdown", move=AccountMove("source", "destination"), workers=workers)
         self.assertIn("for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.", text)
         self.assertIn("moved from source to destination", text)
-        self.assertIn("Background commands that you started before the restart ended with no result. Run them again.",
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
                       text.splitlines()[1])
         self.assertEqual(text.count("Worker busy-id: busy dispatch dispatch-id"), 1)
         self.assertEqual(text.count("Worker idle-id: idle"), 1)
@@ -168,7 +168,7 @@ class RelaunchTests(ShutdownTestCase):
         text = resume_message("a shutdown", workers=ResumeWorkers(panes=[
             PaneWorkerResume(staff.StaffId(name), IdleWorker()) for name in ("impl-id", "review-id")]))
         self.assertIn("You were stopped and resumed because a shutdown.", text)
-        self.assertIn("Background commands that you started before the restart ended with no result. Run them again.",
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
                       text.splitlines()[1])
         self.assertIn("for messages kept while you were down", text)
         for name in ("impl-id", "review-id"):

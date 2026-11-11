@@ -108,7 +108,7 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
         opening = context or f"You were stopped and resumed because {why}.{moved} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
                      + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting. "
-                     + "Background commands that you started before the restart ended with no result. Run them again.")
+                     + "Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.")
     if unit is not None and unit.kind == "unit":
         command = staff.unit_command(unit)
         path = command.removeprefix("/").replace(":", "/")
