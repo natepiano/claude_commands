@@ -105,7 +105,7 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/agents").mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "agents/worker_lifecycle.py", root / "scripts/agents/worker_lifecycle.py")
         (root / "scripts/herdr").mkdir()
-        for name in ("herdr.py", "place.py", "pane_launch.py"):
+        for name in ("herdr.py", "herdr_types.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
         for name in ("pane_record.py", "remote.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "agents" / name, root / "scripts/agents" / name)

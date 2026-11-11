@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
+from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
@@ -910,7 +911,7 @@ def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted
         return "; run the same command again"
     try:
         herdr.close_agent(found.unit.place.session, found.unit.place.pane)
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         return f"; its session {found.unit.place.session} could not be closed: {error}"
     return "; its session is closed: run the same command again"
 
@@ -1391,7 +1392,7 @@ def _main(argv: list[str]) -> int:
                 place = stopped_tab.unit.place
                 try:
                     herdr.close_agent(place.session, place.pane)
-                except herdr.HerdrFailure as error:
+                except herdr_types.HerdrFailure as error:
                     raise Refusal(f"cannot end session {place.session}: {error}") from error
             if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
@@ -1430,7 +1431,7 @@ def _main(argv: list[str]) -> int:
     except (Refusal, unit_config.ConfigRefused, git_exclude.ExcludeRefused) as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
-    except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr_types.HerdrFailure) as error:
         detail = str(error)
         print(f"add_unit: {detail}", file=sys.stderr)
         return 1

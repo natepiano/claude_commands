@@ -675,7 +675,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertIsInstance(staff.backend(moved), staff.CodexBackend)
                 self.assertEqual(moved.parent, row.parent)
                 self.assertEqual(moved.to_json() | {"current_session": row.current_session},
-                                 replace(row, role=staff.KnownWorkerRole("impl")).to_json())
+                                 replace(row, role=staff.KnownWorkerRole("impl"),
+                                         home=staff.SessionHome(self.native.fixture.root / "codex")).to_json())
                 self.assertNotEqual(self.native.agent.submitted[-1][0], "w1:p1")
                 self.assertIsInstance(world.launches[-1], herdr.SplitPane)
                 extract = worker_admission.handoff_path(self.session_dir, row)
@@ -732,9 +733,14 @@ class AssignLauncherTests(HookAssignmentFixture):
                      "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
         result = invoke_assignment(arguments, os.environ.copy())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        submitted = self.native.agent.submitted.copy()
+        self.native.fixture.world.locations[submitted[0][0]]["agent_status"] = "working"
+        repeated = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.native.agent.submitted, submitted)
         self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
-        passed = assign.object_map(assign.object_map(state["pass"])["impl"])
+        passed = assign.object_map(assign.object_map(state["pass"])["impl2"])
         self.assertEqual((passed["worker_name"], passed["worker_id"], passed["status"]),
                          ("impl2", opened.row.id, "completed"))
         phase = self.session_dir / "phases/7"

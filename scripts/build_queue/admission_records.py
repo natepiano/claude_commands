@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses)
 
@@ -25,6 +26,14 @@ from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as No
                                    TestPhaseChargeUse as TestPhaseChargeUse)
 
 GIB = 1 << 30
+
+
+@dataclass(frozen=True)
+class SavedPlacementAssignment:
+    assignment: placement.PlacementAssignment
+    state: placement.AssignmentState = placement.CurrentAssignment()
+    permission: placement.LaunchPermission = placement.PermissionAvailable()
+    provider: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125

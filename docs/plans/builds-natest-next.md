@@ -50,7 +50,7 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
   - Compare omitted modules with full-gate results for that same tree.
   - Separate same-commit passes, nearby-commit failures and unresolved single-commit failures.
   - Separate full-suite passes, affected passes, zero-module affected passes and reused full passes. Compare coverage with a full run of the same tree. Report dirty runs without a tree hash as unresolved for same-tree comparison.
-  - Audit both 107-module increases and the 147-module selection for `scripts/direct/verify.sh`.
+  - Audit both 107-module increases and the 264-module selection for `scripts/direct/verify.sh` and `scripts/direct/board.sh` (147 and 117 before the Phase 123 script-call closure).
   - Classify matches against repository files separately from names used only by fake commands.
   - Preserve selection of `direct/test_verify_lint_output.py`.
   - Audit the 26 direct repository scanners and actual scan use through the four identified support modules. The 493 importers do not prove 493 executed scans.

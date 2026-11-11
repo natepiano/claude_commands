@@ -17,6 +17,7 @@ import sys
 from typing import cast
 
 from scripts.herdr import herdr, pane_launch
+from scripts.herdr import herdr_types
 from scripts.agents import pane_record
 from scripts.lib import conf
 from scripts.agents.codex_trust import trust_arguments
@@ -33,7 +34,7 @@ SERVER_TIMEOUT_MS = 60_000
 def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
                   original: pane_record.PaneLaunch, entry: pane_record.PaneLaunch, *, reported_unknown: str) -> None:
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
-        raise herdr.HerdrFailure("the pane runs a program")
+        raise herdr_types.HerdrFailure("the pane runs a program")
     kind = pane_launch.agent_kind(entry)
     home = pane_launch.config_home(entry)
     if isinstance(home, staff.HomeUnknown):
@@ -48,7 +49,7 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
         kind, trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
         int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=title, reported_unknown=reported_unknown)
     if isinstance(launched, herdr.nix_env.Refused):
-        raise herdr.HerdrFailure(launched.reason)
+        raise herdr_types.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)
     attempt = pane_launch.resume_attempt(path, launched.pane)
     if restart.pane_holds_other_work(client, pane.pane_id, entry["session_id"]):
@@ -65,7 +66,7 @@ def restore(session: str, *, dry_run: bool) -> int:
     try:
         for note in herdr.repair_retained_launches(record, pane_record.record_directory(), dry_run=dry_run):
             print(note)
-    except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
+    except (herdr_types.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
         failures += 1
     selected: dict[staff.StaffId, staff.StaffRow] = {}
@@ -108,7 +109,7 @@ def restore(session: str, *, dry_run: bool) -> int:
                         _ = restart.start_row(row, current, client, target_account=target_accounts.get(holder.id, ""))
         except restart.ClaudeTrustWriteFailed:
             failures += 1
-        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
+        except (herdr_types.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{holder.name}: not resumed: {error}", file=sys.stderr)
     for pane in saved_panes:
@@ -143,7 +144,7 @@ def restore(session: str, *, dry_run: bool) -> int:
                             observed.reason if isinstance(observed, herdr.UnknownConversation) else ""))
             live.add(entry["session_id"])
             print(f"{pane.pane_id} {label}: resumed {entry['session_id']}")
-        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
+        except (herdr_types.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{pane.pane_id} {pane.label}: not resumed: {error}", file=sys.stderr)
     return 1 if failures else 0

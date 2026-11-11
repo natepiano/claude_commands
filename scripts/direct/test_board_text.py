@@ -28,27 +28,46 @@ class BoardTextTests(unittest.TestCase):
         return subprocess.run(["bash", str(BOARD), *arguments], env=self.environment, cwd=self.directory,
                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
+    def command_in(self, locale: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """Run board.sh in one caller locale; a launchd job or an `env -i` child sets none."""
+        environment = dict(self.environment)
+        if locale != "inherited":
+            environment = {key: value for key, value in environment.items()
+                           if key not in ("LANG", "LANGUAGE") and not key.startswith("LC_")}
+        if locale == "C":
+            environment["LC_ALL"] = "C"
+        return subprocess.run(["bash", str(BOARD), *arguments], env=environment, cwd=self.directory,
+                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+
     def test_printable_unicode_survives_while_control_characters_cannot_forge_a_record(self) -> None:
         message = "production · unité · 设计 reviewer 🚀\nnext\rline\ttab\x1b\x07\x7f"
-        posted = self.command("post", str(self.directory), "w7", "status", message)
-        self.assertEqual(posted.returncode, 0, posted.stdout + posted.stderr)
-        lines = (self.directory / "board.log").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 1, lines)
-        self.assertEqual(lines[0].split("] status: ", 1)[1],
-                         "production · unité · 设计 reviewer 🚀 next line tab")
-        read = self.command("read", str(self.directory), "--from", "w7")
-        self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
-        self.assertIn(lines[0], read.stdout)
+        for locale in ("inherited", "C", "none"):
+            with self.subTest(locale=locale):
+                board = self.directory / locale
+                board.mkdir()
+                posted = self.command_in(locale, "post", str(board), "w7", "status", message)
+                self.assertEqual(posted.returncode, 0, posted.stdout + posted.stderr)
+                lines = (board / "board.log").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertEqual(lines[0].split("] status: ", 1)[1],
+                                 "production · unité · 设计 reviewer 🚀 next line tab")
+                read = self.command_in(locale, "read", str(board), "--from", "w7")
+                self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
+                self.assertIn(lines[0], read.stdout)
 
     def test_the_message_limit_counts_characters_without_splitting_utf8(self) -> None:
         message = "界🚀é·" * 300
-        posted = self.command("post", str(self.directory), "w7", "status", message)
-        self.assertEqual(posted.returncode, 0, posted.stdout + posted.stderr)
-        line = (self.directory / "board.log").read_bytes().decode("utf-8", errors="strict")
-        body = line.rstrip("\n").split("] status: ", 1)[1]
-        self.assertEqual(len(body), 900)
-        self.assertEqual(body, message[:900])
-        self.assertEqual(line.count("\n"), 1)
+        for locale in ("inherited", "C", "none"):
+            with self.subTest(locale=locale):
+                board = self.directory / locale
+                board.mkdir()
+                posted = self.command_in(locale, "post", str(board), "w7", "status", message)
+                self.assertEqual(posted.returncode, 0, posted.stdout + posted.stderr)
+                line = (board / "board.log").read_bytes().decode("utf-8", errors="strict")
+                body = line.rstrip("\n").split("] status: ", 1)[1]
+                self.assertEqual(len(body), 900)
+                self.assertEqual(body, message[:900])
+                self.assertEqual(line.count("\n"), 1)
 
     def test_post_read_and_role_use_the_run_environment_without_a_folder_argument(self) -> None:
         self.environment["UNIT_RUN_DIR"] = str(self.directory)

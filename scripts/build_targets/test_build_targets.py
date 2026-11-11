@@ -11,6 +11,7 @@ import tempfile
 import time
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -36,8 +37,6 @@ from scripts.lib import test_hang_guard
 SHIPPED_STATUS = "\n".join((
     "mac: free",
     "natedev: free",
-    "aws: unavailable; evidence unavailable; month unavailable / $400.00",
-    "  spending unavailable; decision unavailable; no controller evidence; a priced resource inventory is required before spending",
     "",
 ))
 
@@ -114,7 +113,8 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                                     "BUILD_HOLD_RELEASE_DIR": str(root / "releases"),
                                     "MAC_TEST_STATE_DIR": str(root / "mac-state"),
                                     "MAC_IDLE_STATE_DIR": str(root / "mac-idle"),
-                                    "UNIT_RUN_DIR": str(root / "board"),
+                                    "UNIT_RUN_DIR": str(root / "board"), "UNIT_ACTIVE_DIR": str(root / "active"),
+                                    "CLAUDE_CODE_SESSION_ID": "",
                                     "NOTIFIER_SESSIONS_DIR": str(root / "sessions")})
                 _ = (configuration / "build_targets.conf").write_text(
                     f"targets=natedev,{target}\nkind.natedev=local\nplatform.natedev=linux\n"
@@ -129,14 +129,18 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                     started = process_identity.process_start(os.getpid())
                     self.assertIsInstance(started, process_identity.Started)
                     assert isinstance(started, process_identity.Started)
-                    owner = {"pid": os.getpid(), "proc_start": started.start,
+                    owner = {"claim_id": "fixture-claim", "episode": "fixture-episode",
+                             "attempt": "fixture-attempt", "submitting_session": "",
+                             "pid": os.getpid(), "proc_start": started.start,
                              "worktree": directory, "since": NOW.isoformat()}
                     _ = (claims / "local.json").write_text(json.dumps({**owner, "what": "local reservation"}))
                     _ = (claims / "remote.json").write_text(json.dumps(
                         {**owner, "what": "remote claim", "remote_host": "test-mac"}))
                 arguments = (["eligible", "--new-step", "--probe-marks-file", str(root / "probe-marks"),
                               "--kind", "test", "--repo-root", directory, "--package", ""]
-                             if command == "eligible" else ["release-wait", "--pid", str(os.getpid())])
+                             if command == "eligible" else ["release-wait", "--pid", str(os.getpid()),
+                                 "--claim-id", "fixture-claim", "--episode", "fixture-episode",
+                                 "--attempt", "fixture-attempt"])
                 result = REAL_SUBPROCESS_RUN(
                     [str(entry.parents[1] / "lib/py"), "-c", code, str(entry), *arguments],
                     cwd=entry.parent, env=environment, capture_output=True, text=True, timeout=30, check=False)
@@ -177,7 +181,8 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                             "BUILD_HOLD_RELEASE_DIR": str(root / "releases"),
                             "MAC_TEST_STATE_DIR": str(root / "mac-state"),
                             "MAC_IDLE_STATE_DIR": str(root / "mac-idle"),
-                            "UNIT_RUN_DIR": str(root / "board"),
+                            "UNIT_RUN_DIR": str(root / "board"), "UNIT_ACTIVE_DIR": str(root / "active"),
+                                    "CLAUDE_CODE_SESSION_ID": "",
                             "NOTIFIER_SESSIONS_DIR": str(root / "sessions")})
         common = ["--repo-root", directory, "--kind", "test"]
         reservation = ["reserve", *common, "--pid", str(os.getpid()),
@@ -225,6 +230,15 @@ class IsolatedBuildTargetTest(NotificationGuardedTestCase, IsolatedTargetTest):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
         })))
+
+    @override
+    def write_claim(self, file_name: str = "run.json", what: str = "nextest hana", since: datetime = SINCE) -> None:
+        super().write_claim(file_name, what, since)
+        path = self.mac_state / file_name
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record.update(claim_id=f"claim-{file_name}", episode=f"episode-{file_name}",
+                      attempt="attempt-1", submitting_session="")
+        _ = path.write_text(json.dumps(record))
 
 
 class StatusTests(IsolatedBuildTargetTest):
@@ -565,11 +579,9 @@ class StatusTests(IsolatedBuildTargetTest):
         self.assertEqual(output.getvalue(), (
             "mac: unreachable — ssh timed out\n"
             "natedev: held by hana since 13:05 PDT — render checks\n"
-            "aws: unreachable — ssh timed out\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
-                                  targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
@@ -702,10 +714,17 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         return output.getvalue(), errors.getvalue()
 
     def test_floor_sweep_admits_the_mac_after_a_disk_exclusion(self) -> None:
-        output, errors = self.floor_answer(60, offload.CommandOutput(0, "", ""))
-        self.assertEqual(output.splitlines()[0], "any_target")
-        self.assertIn("mac\teligible\t-", output)
-        self.assertEqual(errors, "")
+        for background in (False, True):
+            with self.subTest(background=background):
+                if background:
+                    with ThreadPoolExecutor(max_workers=1) as worker:
+                        output, errors = worker.submit(
+                            self.floor_answer, 60, offload.CommandOutput(0, "", "")).result(timeout=30)
+                else:
+                    output, errors = self.floor_answer(60, offload.CommandOutput(0, "", ""))
+                self.assertEqual(output.splitlines()[0], "any_target")
+                self.assertIn("mac\teligible\t-", output)
+                self.assertEqual(errors, "")
 
     def test_floor_sweep_shortfall_keeps_the_disk_route(self) -> None:
         output, _ = self.floor_answer(59, offload.CommandOutput(0, "", ""))
@@ -815,6 +834,21 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
     def test_unreadable_workspace_cannot_be_sent_to_the_mac(self) -> None:
         _ = (self.root / "Cargo.toml").write_text("[")
         self.assertEqual(self.kind_answer("doc"), "any_target\n")
+
+    def test_explicit_session_keeps_the_block_exemption_out_of_the_environment(self) -> None:
+        self.write_block()
+        target = targets.SshTarget("mac", "macos", self.settings)
+        for session in (build_hold.OwningSession("hana-session"), build_hold.OwningSession("other-session"),
+                        build_hold.NoOwningSession(), build_hold.OwningSession("hana-session")):
+            with self.subTest(session=session), \
+                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "service-session"}), \
+                 mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture-mac")):
+                result = build_targets.ssh_target_eligibility(
+                    target, self.root, "portable", "test", targets.AnyEligibleTarget(), session=session)
+            if session == build_hold.OwningSession("hana-session"):
+                self.assertEqual(result, targets.EligibleTarget(target))
+            else:
+                self.assertEqual(result, targets.ExcludedTarget(target, "blocked"))
 
 
 class WaitLocalTests(IsolatedBuildTargetTest):

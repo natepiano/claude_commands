@@ -54,6 +54,8 @@ class AwsStatusTests(MeasurementFixture):
         identity = REPOSITORY if name == "hana" else "github.com/example/other"
         path = mac_test.claim_path(paths, mac_test.RepositoryScope(name, identity, slot))
         row: dict[str, object] = {
+            "claim_id": f"{name}-{slot}-{pid}", "episode": f"episode-{name}",
+            "attempt": f"attempt-{slot}", "submitting_session": "",
             "pid": pid, "proc_start": "live-start", "what": f"nextest {name}",
             "worktree": str(self.root / name), "since": "2026-01-15T10:00:00+00:00",
             "remote_host": "aws-build", "repo_name": name, "repo_key": identity,

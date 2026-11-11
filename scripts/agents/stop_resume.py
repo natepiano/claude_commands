@@ -33,6 +33,7 @@ from uuid import uuid4
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.herdr import herdr
+from scripts.herdr import herdr_types
 from scripts.accounts import accounts, moves
 from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
@@ -157,7 +158,7 @@ def _signal_process(pid: int, number: int) -> None:
                     break
             else:
                 raise ValueError("herdr did not place the pid in a workspace pane")
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             raise PermissionError(f"{refusal}: {error}") from error
     if number in (signal.SIGTERM, signal.SIGKILL):
         operation_deadline.check()
@@ -180,7 +181,7 @@ def _record_launches(selected: list[str]) -> None:
                     or entry is not None and entry["session_id"] in selected)
         with _launch_note_output, redirect_stdout(StringIO()):
             _ = pane_record.seed(client.session, select=selected_pane)
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"stop: launch note anomaly: {error}", file=sys.stderr)
 
 
@@ -277,7 +278,7 @@ def _worker_stopped(before: worker_panes.WorkerPane, *,
             if ((closed or at_shell)
                     and not isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation)):
                 return NotRunning(identity)
-        except (OSError, ValueError, herdr.HerdrFailure) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             details += f"; {error}"
     return StopFailed(identity, f"worker stop has no fresh shell or closed-pane proof; {details}")
 
@@ -309,7 +310,7 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
             return member.current_session
         tab = _tab_of(session)
         return tab.session_id if isinstance(tab, herdr.TabSession) and tab.session_id else SessionNotFound(session)
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         return StopFailed(session, str(error))
 
 
@@ -371,7 +372,7 @@ def _stop(session: str, kind: str = "", *,
                 return Stopped(identity, live.pid)
             except herdr.NativeRegistryUnavailable:
                 pass
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
             else:
                 _signal_process(live.pid, signal.SIGKILL)
@@ -385,7 +386,7 @@ def _stop(session: str, kind: str = "", *,
         return Stopped(identity, live.pid)
     except ProcessLookupError:
         return NotRunning(identity)
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         reason = str(error)
         if isinstance(error, TimeoutError) and last_signal:
             reason += f"; pid {signal_pid} received {last_signal} and still runs"
@@ -415,7 +416,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
             for item, future in futures:
                 if not future.result():
                     unresolved.append(f"{item.row.name}: not proved stopped")
-    except (OSError, ValueError, herdr.HerdrFailure, SystemExit) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, SystemExit) as error:
         unresolved = [f"{unit}: {' '.join(str(error).splitlines())}"]
         print(f"anomaly: {unresolved[0]}", file=sys.stderr)
     return unresolved
@@ -430,7 +431,7 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_record.PaneLaunch) -> t
     client = herdr.Herdr(herdr.shared_session())
     pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
     if pane is None:
-        raise herdr.HerdrFailure(f"no pane {tab.pane_id!r}")
+        raise herdr_types.HerdrFailure(f"no pane {tab.pane_id!r}")
     unset = ["HERDR_TAB_ID", "STAFF_ID", "STAFF_OPERATION_FD", "PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY",
              *sorted(key for key in os.environ.keys() | entry["environment"].keys() if key.startswith("STAFF_ROW_FD_"))]
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
@@ -518,7 +519,7 @@ def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
     while True:
         try:
             return client.native_session(pane, "claude", operation_deadline.remaining(max(0.001, deadline - monotonic())))
-        except (OSError, ValueError, subprocess.SubprocessError, herdr.HerdrFailure):
+        except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure):
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise
@@ -548,16 +549,16 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     while isinstance(live, sessions.SessionNotLive):
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise herdr.HerdrFailure("never started")
+            raise herdr_types.HerdrFailure("never started")
         time.sleep(operation_deadline.remaining(min(0.5, remaining)))
         live = sessions.session_liveness(entry["session_id"])
     if isinstance(live, sessions.SessionLivenessUnknown):
-        raise herdr.HerdrFailure(live.reason)
+        raise herdr_types.HerdrFailure(live.reason)
     if not message:
         return live
     try:
         identity = _prompt_identity(client, tab.pane_id, deadline)
-    except (OSError, ValueError, subprocess.SubprocessError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure) as error:
         print(f"{entry['session_id']}: prompt identity anomaly: {error}", file=sys.stderr)
         return live
     if identity != entry["session_id"]:
@@ -816,13 +817,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             attempt_pane = pane
             tab = next((item for item in client.tab_sessions() if item.pane_id == pane), None)
             if tab is None:
-                raise herdr.HerdrFailure("new recovery pane is unavailable")
+                raise herdr_types.HerdrFailure("new recovery pane is unavailable")
             tab = replace(tab, session_id=identity)
         elif entry["name"]:
             try:
                 with herdr.restore_staff(names.tab_record, labels=names.labels):
                     _ = client.retitle(tab.pane_id, entry["name"])
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         workers = NO_WORKERS
         own = NO_OWN_PASS
@@ -862,7 +863,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
                 int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000), agent=entry["name"] or identity)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
-                raise herdr.HerdrFailure(launched.outcome.reason)
+                raise herdr_types.HerdrFailure(launched.outcome.reason)
             if row is not None:
                 try:
                     _ = staff.set_home(row.id, staff.SessionHome(target_dir.absolute()))
@@ -874,7 +875,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             live = sessions.session_liveness(identity)
             if isinstance(live, sessions.SessionLivenessUnknown):
-                raise herdr.HerdrFailure(live.reason)
+                raise herdr_types.HerdrFailure(live.reason)
             if isinstance(live, sessions.SessionNotLive):
                 attempt_pane = tab.pane_id
                 live = _start_session(tab, entry, label, message)
@@ -884,19 +885,19 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 attempt = pane_launch.resume_attempt(original.path, tab.pane_id)
                 proof = names.resume_proof(original.entry, entry)
                 pane_launch.finish_restore(original.path, original.entry, attempt, proof, close=client.close_tab_confirmed)
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: launch record anomaly: {error}", file=sys.stderr)
         attempt_pane = ""
         if not _move_resume.get():
             _watch_resume(identity, tab.pane_id, label, started, requester, why)
         return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         if original is not None and attempt_pane:
             try:
                 attempt = pane_launch.resume_attempt(original.path, attempt_pane)
                 pane_launch.finish_restore(original.path, original.entry, attempt, pane_launch.FailedResume(),
                                            close=herdr.Herdr(original.path.stem).close_tab_confirmed)
-            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as cleanup:
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup:
                 return ResumeFailed(identity, f"{error}; cleanup failed: {cleanup}")
         return ResumeFailed(identity, str(error))
 
@@ -1003,7 +1004,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         tab = _tab_of(identity)
         if isinstance(tab, herdr.TabSession):
             name = tab.label or name
-    except (OSError, ValueError, herdr.HerdrFailure):
+    except (OSError, ValueError, herdr_types.HerdrFailure):
         pass  # The saved launch name still identifies a session whose pane is gone.
     name = name or identity
     unit = row.name if row is not None and row.kind == "unit" else ""
@@ -1158,7 +1159,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                     _ = sources.setdefault(session, running.account)
                 if isinstance(running, ClaudeUp) and running.account == target:
                     already_up[session] = running
-        except (OSError, ValueError, herdr.HerdrFailure):
+        except (OSError, ValueError, herdr_types.HerdrFailure):
             pass  # The per-session stop below returns the read failure without affecting other members.
     _record_launches([session for session in selected if session not in already_up])
     handoff_failures: dict[str, StopFailed] = {}
@@ -1171,7 +1172,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 _handoff_batch(selected, target, why, warn_seconds, cause, sources)
                 return [MoveHandedOff(tab.session_id) if isinstance(tab, herdr.TabSession) and tab.session_id
                         else SessionNotFound(session) for session, tab in zip(selected, tabs)]
-        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(f"{caller}: move handoff anomaly: {error}", file=sys.stderr)
             for session in selected:
                 tab = _tab_of(session)

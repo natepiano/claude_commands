@@ -62,14 +62,27 @@ The display uses one age formatter for the table, the card, and the feed.
 `CloudPushIntervalUnavailable` names an unavailable push interval.
 The display omits the stale age when the push interval is unavailable.
 
-The wire envelope uses protocol version 2 and keeps the existing admission code version rule.
-The service accepts client versions 1 and 2.
+The wire envelope uses protocol version 3 and keeps the existing admission code version rule.
+The service accepts client versions 1, 2 and 3.
 The service sends a version 1 refusal when it cannot determine the request version.
-Both client versions can decode that refusal.
+All three client versions can decode that refusal.
 Version 1 view and mine replies carry plain `QueueRead` records without cloud rows.
 Version 2 replies can carry `CloudQueueRead` records.
 The shared codec encodes the new place field and its frozen dataclasses.
 Old requests default to local admission when they omit the place field.
+
+Version 3 adds placement messages without changing existing routing callers.
+`PlacementRequest` carries the episode, profile, fixed constraints and checked submitting owner.
+`PlacementWait` carries the original queue time, position and candidate eligibility.
+`Assignment` carries a persisted destination and attempt; it grants no execution permission.
+`ClaimFailure` closes the exact assignment before another placement decision.
+`ConsumePermission` carries the exact assignment and adopted provider claim reference.
+The first valid consumption returns `FirstAuthorization` after the state write completes.
+Every repeated consumption returns `DispatchStatus`, including a retry with a different transport request id.
+Unknown, changed and closed attempts grant no authority.
+`ExecutionReport` supplies execution evidence without creating another durable provider lifecycle.
+Version 1 and 2 requests retain their existing local or scaler destinations and reply shapes.
+Placement messages require version 3.
 `CloudSlotWait` carries the used slots and slot limit in wait replies.
 `CloudQueueRead` extends the local queue reading with cloud rows and the slot limit.
 Local queue readings keep their existing wire form when no cloud row exists.
@@ -286,6 +299,24 @@ Unavailable settings produce refusals rather than replacement policy values.
 ### Durable state and lifetime
 
 `admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, start spacing, and the replay ledger.
+It also holds placement requests, assignments and current attempt keys.
+`SavedPlacementAssignment` retains the assignment state, launch permission and exact provider reference.
+The consumption ledger key contains the episode and attempt, independent of the transport request id.
+The ledger stores status, never a replayable authorization.
+Current attempts retain their ledger entries through the existing replay retention path.
+A pruned or unknown attempt cannot create another permission.
+Restart restores unconsumed and consumed attempts without changing their identities or queue times.
+Only checked local submitting owners receive process watches.
+Remote execution identities retain their host and generation, separate from those submitting owners.
+
+Each provider evidence key includes the session, destination, scope, command policy and configuration generation.
+Each background reader publishes immutable evidence through the service wake path.
+The loop takes no provider lock and performs no remote probe.
+Evidence expires after the existing waiting poll interval plus the target probe timeout.
+Stale evidence prevents a new decision that needs it; it never releases a provider claim.
+Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
+Release compares the exact claim identity under the provider lock.
+The provider keeps its existing repository scopes and cleanup policy.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
@@ -619,7 +650,7 @@ Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply a ranked peak. One to nine earlier runs supply their largest peak.
 `ShapeRankedPeak` records the run count and the share used to select the peak.
 Stored `shape_ranked_peak` records retain that share; the decoder reads older `shape_p90` records as share 10.
-The wire retains protocol version 2.
+The wire uses protocol version 3 and retains decoding for versions 1 and 2.
 The encoder writes share-10 bases with the older `ShapeP90` tag and no share field.
 The wire decoder reads older `ShapeP90` tags as `ShapeRankedPeak` with share 10.
 Other shares use the `ShapeRankedPeak` tag and retain their recorded share.
@@ -816,7 +847,7 @@ A call that waits again keeps its original FIFO position through its `.again` wa
 The hold wait and token wait retain separate history records.
 `TOKEN_WAIT_FILE` carries a step's token wait to the call record.
 `TOKEN_WAIT_FILE.given_back` records a subshell release for its parent.
- An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `detached_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release run under an exclusive flock on `locks/<res>.guard`, taken by python3 `fcntl` on descriptor 9 (the Mac has no `flock(1)`) and dropped by the kernel when its holder dies: a reclaimer re-reads the lock under it, so two waiters cannot both reclaim and a release cannot remove a lock a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
+ An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `detached_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release use an exclusive flock on `locks/<res>.guard`. One perl call locks descriptor 9 because the Mac has no `flock(1)`. The shell retains the lock after perl exits. The kernel releases the lock when the holder dies. A reclaimer reads the lock again while it holds the guard. Thus, two waiters cannot both reclaim the lock. A release cannot remove a lock that a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
 
 ### Build log: records and schema
 

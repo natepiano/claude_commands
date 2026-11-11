@@ -13,6 +13,7 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.lib import names
+from scripts.herdr import herdr_types
 from scripts.lib.test_names import fixture_names
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
@@ -62,7 +63,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertTrue(tab)
         self.retitled.append((pane, title))
         if self.fault:
-            raise herdr.HerdrFailure("server gone")
+            raise herdr_types.HerdrFailure("server gone")
         return True
 
     def record(self, pid: int, session_id: str, name: str, entrypoint: str = "cli", *, proc_start: str = "") -> None:

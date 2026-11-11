@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from scripts.agents import remote
+from scripts.herdr import herdr_types
 
 import io
 import fcntl
@@ -180,7 +181,7 @@ class StopResumeTests(unittest.TestCase):
         before = worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(worker_panes, "observe", return_value=[before]),
-              patch.object(self.client, "panes", side_effect=herdr.HerdrFailure("unreadable")),
+              patch.object(self.client, "panes", side_effect=herdr_types.HerdrFailure("unreadable")),
               patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("native-worker", 123))):
             result = stop_resume.stop(row.id)
         self.assertIsInstance(result, stop_resume.StopFailed)
@@ -937,7 +938,7 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_failed_title_change_reports_an_anomaly_and_resumes(self) -> None:
-        with (patch.object(self.client, "retitle", side_effect=herdr.HerdrFailure("fixture")),
+        with (patch.object(self.client, "retitle", side_effect=herdr_types.HerdrFailure("fixture")),
               redirect_stderr(io.StringIO()) as output):
             result = stop_resume.resume("alpha")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -1899,7 +1900,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual([pane["pane_id"] for pane in self.client.panes() if select(pane)], ["w1:p2"])
 
     def test_move_resume_failure_is_pending_and_rerun_finishes_without_restopping(self) -> None:
-        self.start.side_effect = herdr.HerdrFailure("registry temporarily unreadable")
+        self.start.side_effect = herdr_types.HerdrFailure("registry temporarily unreadable")
         with patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("019b3a40-4250-7000-8000-000000000102", 123)):
             pending = stop_resume.move("alpha", "claude4", why="limit")
         self.assertIsInstance(pending, stop_resume.ResumePending)
@@ -1927,7 +1928,7 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_shutdown_resume_with_an_explicit_target_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
-        self.start.side_effect = herdr.HerdrFailure("cannot start yet")
+        self.start.side_effect = herdr_types.HerdrFailure("cannot start yet")
         self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
         self.start.side_effect = None
         for iteration in range(2):
@@ -1983,7 +1984,7 @@ class StopResumeTests(unittest.TestCase):
             _ = stop_resume.move_sessions(["019b3a40-4250-7000-8000-000000000102", "sid-beta"], "claude4", why="limit")
         self.assertEqual(order, ["seed", "stop", "stop"])
         self.launched.clear()
-        self.seed.side_effect = herdr.HerdrFailure("no reply")
+        self.seed.side_effect = herdr_types.HerdrFailure("no reply")
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
 
     def test_proof_workspace_refuses_a_stop_outside_its_panes(self) -> None:
@@ -2076,7 +2077,7 @@ class StopResumeTests(unittest.TestCase):
         self.signal_guard.stop()
         replies: tuple[dict[str, object] | Exception, ...] = (
             {}, {"process_info": {"foreground_processes": [{"pid": 123.0}]}},
-            herdr.HerdrFailure("pane unavailable"), OSError("herdr unavailable"))
+            herdr_types.HerdrFailure("pane unavailable"), OSError("herdr unavailable"))
         for reply in replies:
             with self.subTest(reply=reply):
                 self.live.return_value = sessions.LiveSessionProcess(123)
@@ -2542,7 +2543,7 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_resume_identity_mismatch_or_missing_proof_dispatches_no_work(self) -> None:
-        for proof in ("019b3a40-4250-7000-8000-000000000199", herdr.HerdrFailure("registry unavailable")):
+        for proof in ("019b3a40-4250-7000-8000-000000000199", herdr_types.HerdrFailure("registry unavailable")):
             with self.subTest(proof=proof):
                 self.launched.clear()
                 self.client.prompts.clear()
@@ -2571,7 +2572,7 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "native_session", side_effect=[
-                  herdr.HerdrFailure("registry unavailable"), self.entry["session_id"]]) as observed,
+                  herdr_types.HerdrFailure("registry unavailable"), self.entry["session_id"]]) as observed,
               redirect_stderr(errors)):
             result = stop_resume.resume("alpha", why="maintenance")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -2604,7 +2605,7 @@ class StopResumeTests(unittest.TestCase):
                              home=staff.SessionHome(self.root / ".claude3"))
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
-              patch.object(self.client, "native_session", side_effect=herdr.HerdrFailure(
+              patch.object(self.client, "native_session", side_effect=herdr_types.HerdrFailure(
                   "registry unavailable")) as observed,
               redirect_stderr(errors)):
             result = stop_resume.resume("alpha", why="maintenance")
@@ -2989,7 +2990,7 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_not_called()
 
     def test_a_failed_pane_run_never_reports_resume_success(self) -> None:
-        self.start.side_effect = herdr.HerdrFailure("pane run refused")
+        self.start.side_effect = herdr_types.HerdrFailure("pane run refused")
         self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ResumeFailed("019b3a40-4250-7000-8000-000000000102", "pane run refused"))
         self.assertEqual(self.client.closed, [])
 

@@ -4,6 +4,7 @@ lookups and add_showrunner's start: nothing real stops or starts. Git runs in te
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member
+from scripts.herdr import herdr_types
 from scripts.lib.atomic_file import write_text_atomic
 
 import io
@@ -161,7 +162,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promotion_continues_after_a_failed_pane_read(self) -> None:
         promotion = promote_showrunner.checked("demo", "child", self.child_doc)
         with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]),
-              mock.patch.object(herdr.Herdr, "panes", side_effect=herdr.HerdrFailure("unreadable")),
+              mock.patch.object(herdr.Herdr, "panes", side_effect=herdr_types.HerdrFailure("unreadable")),
               mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close,
               redirect_stderr(io.StringIO()) as errors):
             self.assertTrue(promote_showrunner.stop(promotion))

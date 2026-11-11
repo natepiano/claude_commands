@@ -460,9 +460,14 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
 Pane workers move under their worker locks.
-A live worker stops at the shell on the same terminal before its conversation resumes on the target account.
-A stopped pane keeps its terminal; a closed pane resumes the same conversation in a new worker pane.
-An active or refused pass receives one resume message; an idle worker receives no text.
+An idle worker without an active dispatch closes its pane and keeps its conversation.
+The move writes no journal row for that worker.
+The next assign resumes the conversation on the group account.
+A busy worker stops at the shell before its conversation resumes on the target account in the same terminal.
+A stopped worker with an active dispatch keeps its terminal.
+A closed worker with an active dispatch resumes its conversation in a new pane.
+An active or refused pass receives one resume message.
+A closed worker without an active dispatch has nothing to move.
 The last dispatch supplies the role; a missing role prints its reason and starts no replacement.
 A held worker lock or unknown evidence leaves that worker unchanged; unrelated proved moves continue.
 
@@ -474,7 +479,20 @@ A completed rerun prints one `unchanged` line, exits 0, and sends no restart not
 A swap prints `Workers moving <source> → <target>:` and one showrunner · unit · worker → target line per worker.
 A worker interrupted during its turn adds `, interrupted and resumed`.
 Each failure keeps its worker name and reason; other workers continue and the selected role stays changed.
-`--dry-run` uses `Workers would move` without stopping workers or changing roles and history.
+`swap workers --dry-run` uses `Workers would move` without stopping workers or changing roles and history.
+`move workers <target> --dry-run` lists idle panes that would close, workers that would resume, and refusals with each reason.
+It adds one count line for workers with nothing to move.
+For Codex, both preview and move require the target to match the workers role.
+A different target refuses with `workers role is <role>; run accounts.py swap workers <codexN> to select it`.
+The swap preview can show a new target without changing the role.
+Claude worker moves keep the requested Claude label.
+A closed worker without an active dispatch and a worker without a current session have nothing to move.
+A worker already on the target also needs no move.
+Moves and previews omit workers of the other family.
+An assignment reuses an open worker only when its process uses the selected account home.
+The check uses `CODEX_HOME` for Codex and `CLAUDE_CONFIG_DIR` for Claude.
+An unreadable environment permits reuse only for a worker whose pass is active in the current run.
+A different account follows the existing close checks, stop, and resume in the same pane.
 `set-role workers codexN` selects future launches without the swap's usage check or notices.
 Role writes preserve other selections; `unit` and `workers` history share `~/.local/state/accounts/roles.jsonl`.
 
@@ -492,8 +510,29 @@ A known 5-hour reset less than 20 minutes away waits once, with its reset time i
 An unknown window or reset, a passed reset, or exactly 20 minutes remaining causes a move.
 The selected home becomes the `workers` role through the `swap workers` path.
 Pane workers resume their conversation and active or refused pass on that account.
+The notes job writes the role and starts worker moves in their own process before it returns.
+The request stays pending until that process ends.
+If the process stops early, a later notes pass starts it again.
+An already running target stays unchanged during a retry.
+The process confirms requests for its final target and marks other requests `failed` with `superseded by <label>`.
+Each worker row records its own move result.
+A worker refusal does not keep the group request open.
+The next assign moves a refused or stopped worker to the selected account, so a lasting anomaly cannot cause endless group retries.
+One detached unit handles all targets without overlapping moves.
+Direct Codex worker moves use the same runner and read the selected role before each worker.
+Claude worker moves use the same run lock and retain the requested Claude label.
+It reads the selected role before each worker and checks it again before it ends.
+A role change causes another pass over workers that need the new account.
+Pending work survives a role change while that unit exits.
+A failed start leaves the request pending for the next notes pass and sends the existing blocked-entry notice once.
 
-When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each worker's confirmed resume, and records waits, failures and renewed room.
+When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset.
+A failed move to the selected home also falls back to Claude.
+The notice names the failed move and its cause.
+Assignments return only when the selected Codex account can work and its refusal is resolved.
+Recorded refusals override saved percentages.
+The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each worker's confirmed resume.
+It also records waits, failures, and renewed room.
 
 ## Automatic group rules
 
@@ -632,7 +671,7 @@ A member still on its old account shows as `moving`.
 
 ## Low-quota alerts
 
-When an in-use Claude account reaches 2% weekly and a group on it has no account move entry, the phone receives one reminder per episode: set up what happens next with natedev. Only entries targeting another account cover a group, and only while its replay history is readable. If entries cover every group on it, nothing is sent. Failed phone delivery retries; successful delivery never repeats until recovery or reset opens a new episode. Claude sends no session quota alert, restoration notice or instruction to stop starting work. `/quota_ack` is removed; `/quota_refresh` still refreshes readings. Codex also gets one phone reminder per low episode above 0% and at or below 2% when no workers entry targets another account and no scheduled Claude hold is open. At 0%, the default move is handled in the same pass and no reminder is sent. A reminder already delivered stays delivered across zero and subsequent readings until that weekly reset. An unreadable move journal makes coverage empty. Codex sends one rerun message to the unit director whose worker command stopped for quota, naming that command and asking for it to be rerun on Claude; an unknown director receives none. Waiting follows keep their continuation and receive no message. Zero, forecast, five-hour warnings and other refusal details are logged without session delivery; restoration is recorded only in the moves journal. Phone pushes and the natedev prompt notice remain.
+When an in-use Claude account reaches 2% weekly and a group on it has no account move entry, the phone receives one reminder per episode: set up what happens next with natedev. Only entries targeting another account cover a group, and only while its replay history is readable. If entries cover every group on it, nothing is sent. Failed phone delivery retries; successful delivery never repeats until recovery or reset opens a new episode. Claude sends no session quota alert, restoration notice or instruction to stop starting work. `/quota_ack` is removed; `/quota_refresh` still refreshes readings. Codex also gets one phone reminder per low episode above 0% and at or below 2% when no workers entry targets another account and no scheduled Claude hold is open. At 0%, the default move is handled in the same pass and no reminder is sent. A reminder already delivered stays delivered across zero and subsequent readings until that weekly reset. An unreadable move journal makes coverage empty. Codex sends one relay to the unit director whose worker stopped for quota. The relay says that the pass stays open, names the outcome when it is known, and tells the director not to rerun the assign command. An unknown director receives none. Waiting follows keep their continuation and receive no message. Zero, forecast, five-hour warnings and other refusal details are logged without session delivery; restoration is recorded only in the moves journal. Phone pushes and the natedev prompt notice remain.
 
 Readings and refusals rank move destinations; they never replace a configured launch account. A launch with no configured group refuses without writing the group file.
 

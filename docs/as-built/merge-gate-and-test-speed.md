@@ -98,7 +98,8 @@ The command adds the gate bucket, role, profile, security group, launch template
 It preserves Rust parameters and refuses a change set that changes a Rust resource.
 It records a priced shared resource entry before creation.
 It saves the image, template version, public subnets, and nixpkgs revision locally.
-This phase prepares tools at boot. A prepared image belongs to plan phase 7.
+Gates boot the official NixOS image and prepare tools at boot.
+A prepared gate image was built and then taken out of use, because it did not make gates faster.
 
 | Scaler grant | Scope |
 | --- | --- |
@@ -208,6 +209,9 @@ It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 `scripts/production/targeted_test.py --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
 Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
 File tokens can occur in a test or its imported test-support modules.
+A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or has an execute bit) also selects the tests that name any script that calls it, directly or through other scripts.
+A script calls another when it names its path by the test rule, by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the same folder (`"$SCRIPT_DIR/board.sh"`).
+Python files are not callers in this rule.
 Merge gates and nightly runs use all modules.
 Default merge and tests-only runs do not run basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.

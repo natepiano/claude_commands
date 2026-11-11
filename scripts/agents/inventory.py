@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
+from scripts.herdr import herdr_types
 from scripts.whoami import account
 from scripts.agents import remote
 from scripts.lib.probe_session import PROBE_ENV
@@ -464,7 +465,7 @@ def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         try:
             return herdr.darwin_process_environment(pid)
-        except (herdr.HerdrFailure, subprocess.TimeoutExpired):
+        except (herdr_types.HerdrFailure, subprocess.TimeoutExpired):
             return {}
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
@@ -765,7 +766,7 @@ def _launcher_command(pid: int) -> list[str]:
             if any(Path(arg).name in WORKER_LAUNCHERS for arg in argv):
                 return argv
             pid = parent
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError, herdr.HerdrFailure):
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError, herdr_types.HerdrFailure):
         return []
     return []
 

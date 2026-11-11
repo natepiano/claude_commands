@@ -10,7 +10,6 @@ import fcntl
 import json
 import os
 import re
-import shutil
 import shlex
 import subprocess
 import sys
@@ -19,6 +18,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
+from scripts.lib import git_index
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -351,7 +351,7 @@ def _preflight_fast_forward(repo: Path, target: str, *, replace_registry: bool,
     index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     with tempfile.TemporaryDirectory(prefix="models-ff-index-") as directory:
         trial_index = Path(directory) / "index"
-        _ = shutil.copyfile(index, trial_index)
+        git_index.private_copy(index, trial_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(trial_index)}
         if replace_registry:
             registry_entry = _git(repo, "ls-tree", target, "--", REGISTRY_PATH) + "\n"

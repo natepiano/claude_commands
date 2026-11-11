@@ -16,9 +16,13 @@ from pathlib import Path
 from typing import cast
 
 from scripts.agents import worker_lifecycle
+from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
 from scripts.production import staff, session_staff
 from scripts.agents.stop_results import ReleaseSource, SourceReleased
+
+
+UNKNOWN_LAUNCH_HOME = staff.HomeUnknown()
 
 
 class AdmissionRefused(ValueError):
@@ -368,9 +372,10 @@ def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchStat
 
 
 def publish_created(allowed: WorkerStartAllowed, identity: str,
-                    cleanup: Callable[[str], CleanupOutcome]) -> PublishedWorker:
+                    cleanup: Callable[[str], CleanupOutcome], *,
+                    launch_home: staff.SessionHome | staff.HomeUnknown = UNKNOWN_LAUNCH_HOME) -> PublishedWorker:
     with _cleanup_on_failure(cleanup, identity):
-        return publish(allowed, identity)
+        return publish(allowed, identity, launch_home=launch_home)
 
 
 @contextmanager
@@ -406,7 +411,8 @@ def worker_operation(allowed: WorkerStartAllowed) -> Generator[None]:
 def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                   start: Callable[[FamilyHandoff], str],
                   dispatch: Callable[[PublishedWorker], SwitchState] | DispatchOwner,
-                  cleanup: Callable[[str], CleanupOutcome], request: str = "") -> PublishedWorker:
+                  cleanup: Callable[[str], CleanupOutcome], request: str = "",
+                  launch_home: staff.SessionHome | staff.HomeUnknown = UNKNOWN_LAUNCH_HOME) -> PublishedWorker:
     """Hold the row through publication and dispatch acceptance, then release it."""
     with worker_operation(allowed):
         handoff: FamilyHandoff = NoFamilyHandoff()
@@ -448,7 +454,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                 record_dispatch(allowed, request, SwitchState.CREATION_INTENT_RECORDED)
             with _cleanup_on_failure(cleanup):
                 identity = start(handoff)
-            row = publish_created(allowed, identity, cleanup).row
+            row = publish_created(allowed, identity, cleanup, launch_home=launch_home).row
         published = PublishedWorker(row, handoff)
         if not isinstance(dispatch, DispatchOwner):
             state = dispatch(published)
@@ -457,8 +463,9 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
         return published
 
 
-def publish(allowed: WorkerStartAllowed, runtime_id: str) -> PublishedWorker:
-    """Publish the session before dispatch."""
+def publish(allowed: WorkerStartAllowed, runtime_id: str, *,
+            launch_home: staff.SessionHome | staff.HomeUnknown = UNKNOWN_LAUNCH_HOME) -> PublishedWorker:
+    """Publish the session and its supplied launch home before dispatch."""
     try:
         identity = staff.native_id(runtime_id)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -466,6 +473,9 @@ def publish(allowed: WorkerStartAllowed, runtime_id: str) -> PublishedWorker:
                 row = staff.update_current_session(allowed.slot.row.current_session, identity)
             else:
                 row = staff.ensure_worker(identity, allowed.name, allowed.parent)
+            if isinstance(launch_home, staff.SessionHome):
+                row = staff.set_home(row.id, launch_home)
+            row = pane_launch.staff_admitted(row)
         return PublishedWorker(row)
     except worker_lifecycle.OperationDeadlineExpired:
         raise

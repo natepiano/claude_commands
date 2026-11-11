@@ -134,6 +134,7 @@ The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`
 `refresh` finds the unit staff row through its plan.
 The parent showrunner row supplies the production name and `doc.path`.
 A plan outside a production writes no note.
+A run whose plan file was removed, as for ad hoc work after the as-built, writes no note and prints nothing.
 
 - **Path.** `<vault root>/<showrunner session name>/<file name>.md`. The folder is `showrunners.current_name(name)` (`scripts/production/showrunners.py`). While that answers empty, the note is rewritten in the folder of the unit's most recently modified owned note; with no owned note `refresh` refuses with `the showrunner of <showrunner name> is not running`.
 - **Name.** `unit_lookup.labeled_sessions(name)[unit].claude.name` when that is a `LiveClaude` with a name; in every other case the unit id. `/` and NUL become `-`, and leading `.` characters are dropped.

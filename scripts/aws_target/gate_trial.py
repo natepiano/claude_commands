@@ -25,7 +25,7 @@ from scripts.aws_target.gate_box import (
     GUEST as GUEST, SigningKey as SigningKey, presign as presign, user_data as user_data,
     boot_trap as boot_trap, log_push_loop as log_push_loop,
 )
-from scripts.aws_target import admin_secrets, box, ledger
+from scripts.aws_target import admin_secrets, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, execute_command
 from scripts.aws_target.config import read_settings
 from scripts.lib import conf
@@ -776,9 +776,6 @@ class GateTrial:
         bundle_bytes = 0
         try:
             with tempfile.TemporaryDirectory() as folder:
-                image = box.saved_image(self.api, self.directory / 'gate-image')
-                if image.get('State') == 'available':
-                    self.settings = replace(self.settings, image=ledger.text(image, 'ImageId'))
                 self.nixpkgs_revision = host_nixpkgs_revision()
                 print('Guest nixpkgs revision: ' + self.nixpkgs_revision, flush=True)
                 self.module_seconds = read_measures(gate_state_dir() / 'module_seconds.json')

@@ -1,4 +1,4 @@
-"""Select tests from direct Python imports and transitive configuration reads.
+"""Select tests from direct Python imports, transitive configuration reads and script calls.
 
 No source is imported or evaluated. Callers own certification and execution.
 """
@@ -91,8 +91,12 @@ class SourceGraph:
     config_reads: dict[str, frozenset[str]]
 
 
+def path_tokens(text: str) -> frozenset[str]:
+    return frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
+
+
 def extract_facts(text: str, path: str) -> SourceFacts:
-    tokens = frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
+    tokens = path_tokens(text)
     config_reads = {Path(token).name.removesuffix(".conf") for token in tokens if token.endswith(".conf")}
     try:
         tree = ast.parse(text, filename=path)
@@ -337,6 +341,25 @@ def dependency_graph(repo: Path, *, state_dir: Path | None = None
     return result.imports, result.tokens
 
 
+def folder_names_of(paths: set[str]) -> dict[str, set[str]]:
+    folder_names: dict[str, set[str]] = defaultdict(set)
+    for path in paths:
+        parent = str(Path(path).parent)
+        if parent != ".":
+            folder_names[parent].add(Path(path).name)
+    return folder_names
+
+
+def names_path(tokens: frozenset[str], source: str, paths: set[str],
+               folder_names: dict[str, set[str]]) -> bool:
+    """Match a complete path, or a file name with its folder."""
+    if tokens & paths:
+        return True
+    parent = str(Path(source).parent)
+    return any(tokens & names and (parent == folder or Path(folder).name in tokens)
+               for folder, names in folder_names.items())
+
+
 def names_changed_file(graph: SourceGraph, path: str, changed: set[str],
                        folder_names: dict[str, set[str]]) -> bool:
     """Match file tokens in the test and its imported test-support modules."""
@@ -347,16 +370,48 @@ def names_changed_file(graph: SourceGraph, path: str, changed: set[str],
         if source in seen:
             continue
         seen.add(source)
-        tokens = graph.tokens.get(source, frozenset())
-        if tokens & changed:
-            return True
-        parent = str(Path(source).parent)
-        if any(tokens & names and (parent == folder or Path(folder).name in tokens)
-               for folder, names in folder_names.items()):
+        if names_path(graph.tokens.get(source, frozenset()), source, changed, folder_names):
             return True
         pending.extend(dependency for dependency in graph.imports.get(source, set())
                        if dependency.endswith("_test_support.py"))
     return False
+
+
+def is_script(repo: Path, path: str) -> bool:
+    """A non-Python file under scripts/ that ends in .sh or has an execute bit."""
+    return (path.startswith("scripts/") and not path.endswith(".py")
+            and (path.endswith(".sh") or os.access(repo / path, os.X_OK)))
+
+
+def calls_script(tokens: frozenset[str], caller: str, targets: set[str],
+                 folder_names: dict[str, set[str]]) -> bool:
+    """Shell calls also prefix a full path or a sibling name with a variable."""
+    if names_path(tokens, caller, targets, folder_names):
+        return True
+    siblings = folder_names.get(str(Path(caller).parent), set())
+    names = {Path(target).name for target in targets}
+    for token in tokens:
+        _, slash, name = token.rpartition("/")
+        if slash and name in names and (name in siblings
+                                        or any(token.endswith(f"/{target}") for target in targets)):
+            return True
+    return False
+
+
+def script_callers(repo: Path, candidates: set[str], changed: set[str]) -> set[str]:
+    """Return the changed scripts and every script that calls one, directly or through others."""
+    found = {path for path in changed if is_script(repo, path)}
+    if not found:
+        return found
+    scripts = {path: path_tokens((repo / path).read_text(encoding="utf-8", errors="replace"))
+               for path in candidates if is_script(repo, path) and (repo / path).is_file()}
+    pending = set(found)
+    while pending:
+        folder_names = folder_names_of(pending)
+        pending = {caller for caller, tokens in scripts.items()
+                   if caller not in found and calls_script(tokens, caller, pending, folder_names)}
+        found |= pending
+    return found
 
 
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
@@ -404,16 +459,13 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         for source in python:
             if not is_test_module(source):
                 folder_stems[str(Path(source).parent)].add(Path(source).stem)
-        folder_names: dict[str, set[str]] = defaultdict(set)
-        for source in changed:
-            parent = str(Path(source).parent)
-            if parent != ".":
-                folder_names[parent].add(Path(source).name)
+        named = changed | script_callers(repo, set(blobs) | dirty, changed)
+        folder_names = folder_names_of(named)
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
             if (path in changed or graph.imports.get(path, set()) & python
-                    or old_graph.get(path, set()) & removed or names_changed_file(graph, path, changed, folder_names)
+                    or old_graph.get(path, set()) & removed or names_changed_file(graph, path, named, folder_names)
                     or config_reads.get(path, set()) & configs):
                 selected.append(module)
                 continue

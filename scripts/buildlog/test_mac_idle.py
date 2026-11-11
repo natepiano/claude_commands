@@ -332,7 +332,9 @@ done
 
     def claim(self, *, working: bool = False, remote: bool = True, work_idle_since: float = 1000,
               name: str = "research", since: float = 900) -> Path:
-        row: dict[str, object] = {"pid": os.getpid(), "proc_start": "ended-owner", "what": "P15 F11 L0 run",
+        row: dict[str, object] = {"claim_id": f"claim-{name}", "episode": f"episode-{name}",
+            "attempt": "fixture-attempt", "submitting_session": "research",
+            "pid": os.getpid(), "proc_start": "ended-owner", "what": "P15 F11 L0 run",
             "worktree": str(self.root / name), "since": datetime.fromtimestamp(since, timezone.utc).isoformat(),
             "holder_session": "research"}
         if remote:
