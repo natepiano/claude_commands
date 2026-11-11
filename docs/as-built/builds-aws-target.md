@@ -159,16 +159,15 @@ An interruption marker reports the instance generation.
 
 - `targets.read_aws_status` and `build_targets.format_aws_status` show state, spending decision, month dollars against the cap, slots per repository, cleanup state and recovery action. Status makes no AWS call, probe or write.
 - `report.py` renders `### AWS` from the AWS state folder without an SSH target registration.
-  The section shows uptime, steps, estimated queue wait saved, costs, the account bill, and daily gate spend.
+  The section shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+  Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+  The daily spend table shows bill days and estimate days after the newest bill day.
+  Historical reports omit estimate days after the report date.
   `aws_report.estimate_wait_saved` compares natedev steps from the same day, kind, and repository.
   The report shows one AWS section before the Mac copies section.
   The worker records `mode` in each launch, refusal, and finish event in `cloud-gate-launches.jsonl`.
   After result validation, the worker records `gate_s` in the finish event.
-  The cost matrix separates machine types, merge gates, targeted tests, and totals over `gate_type_window_days` UTC days (default: 14).
-  Daily cost splits by box seconds; costs per run use billed days only.
-  Counts include all finished runs in the window.
-  A daily table shows median test time, median box time, and cost per run, newest day first.
-  Runs use their UTC completion day; the source line counts old rows without a run kind.
+  `gate_type_window_days` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
@@ -490,3 +489,40 @@ CREATE reservation failures and UPDATE failures include current failed resource 
 A stable failure reconciles the compute request at once. A timeout or uncertain stack status keeps the request pending.
 The helper redacts the notification address from the prepared parameters. It does not read the private address file during failure reporting.
 The same administrator session reads failure details without another passphrase prompt.
+
+## Paired speed trials
+
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one disposable gate box.
+All boxes launch after the full trial obtains its cloud slots and cost reservations.
+The trial refuses costs above the daily or monthly room.
+It does not change either limit.
+It uses the scaler service, the existing launch template, and presigned transfers.
+It reads no administrator secret.
+
+Each box checks both trees and runs a separate `module_run.py` process for every sample.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The installed guest supplies the environment and memory sampler.
+Each tested tree supplies `module_run.py` and the test module.
+Periodic log transfers stop before measurement.
+The guest transfers each sample between measurements.
+
+Stdout contains run JSON lines, module JSON lines, and one final cost JSON line.
+The module summary gives the median CPU saving across complete pairs.
+A failed or missing sample makes `all_passed` false.
+The final line contains `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate counts only this trial's boxes, allowances, and new bill-query fees.
+Unconfirmed termination uses the reserved lifetime and returns a nonzero status.
+The command terminates boxes after results, errors, or cancellation.
+Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
+
+The paired trial replaces the size/start trials.
+The twelve `gate_trial_*` settings are removed.
+The paired trial uses the existing `cloud_gate.conf` settings.

@@ -37,7 +37,8 @@ from scripts.herdr import herdr_types
 from scripts.accounts import accounts, moves
 from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
-from scripts.lib import conf, operation_deadline
+from scripts.lib import conf, models_registry, operation_deadline
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_send
 from scripts.agents import member_account, pane_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
@@ -80,6 +81,362 @@ class RowStarter(Protocol):
     def producer_launch(self, row: StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
     def producer_resume(self, row: StaffRow, entry: pane_record.PaneLaunch
                         ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
+    def producer_first_arguments(self, name: str) -> tuple[Literal["claude", "codex"], list[str]]: ...
+
+
+@dataclass(frozen=True)
+class ProducerFirstStart:
+    """A configured producer that needs its first native conversation."""
+
+    name: str
+    folder: Path
+
+
+@dataclass(frozen=True)
+class PendingProducerAdmission:
+    """A reserved pane whose native conversation still needs staff admission."""
+
+    pane: str
+    terminal: str
+    kind: Literal["claude", "codex"]
+    home: Path
+
+
+def _producer_admission_path(name: str) -> Path:
+    if not name or Path(name).name != name or name in {".", ".."}:
+        raise ValueError("producer name must be one folder name")
+    return pane_record.record_directory() / f".producer-admission-{name}"
+
+
+def producer_admission_record(name: str) -> Path:
+    """Locate the validated producer reservation for cleanup."""
+    return _producer_admission_path(name)
+
+
+def _producer_folder(name: str) -> Path:
+    root = conf.read_or_repository("staff").text("PRODUCER_FOLDER_ROOT")
+    return Path(root).expanduser() / name
+
+
+def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", "codex"], home: Path,
+                           client: herdr.Herdr, *, lost_pane: str = "") -> PendingProducerAdmission:
+    from scripts.lib import nix_env
+    from scripts.whoami.account import named_account_environment
+
+    workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+    entries = pane_record.read_strict(client.session)
+    source = entries.get(lost_pane)
+    pending_identities = ({source["session_id"], pane_record.resume_launch(source)["session_id"]}
+                          if source is not None else set[str]())
+    shells = [row for row in client.panes() if row["pane_id"] != lost_pane
+              and (row["pane_id"] not in entries or entries[row["pane_id"]]["session_id"] in pending_identities)
+              and (not row["session_id"] or row["session_id"] in pending_identities)
+              and client.producer_pane(row["pane_id"], request.name, workspace)]
+    if len(shells) > 1:
+        raise ValueError("producer has several matching shells; retain them for inspection")
+    if shells:
+        row = shells[0]
+    else:
+        environment = named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
+        prepared = herdr.prepare_agent_environment(str(request.folder), environment)
+        if isinstance(prepared, nix_env.Refused):
+            raise OSError(str(prepared))
+        pane = client.open_tab(workspace, request.name, str(request.folder), prepared.env)
+        row = client.pane_row(pane)
+        if isinstance(row, herdr.NoPane):
+            raise ValueError("reserved producer pane is unavailable")
+    return PendingProducerAdmission(row["pane_id"], herdr.json_text(row.get("terminal_id"), "producer terminal"), kind, home)
+
+
+def _save_producer_reservation(request: ProducerFirstStart, pending: PendingProducerAdmission) -> None:
+    write_text_atomic(_producer_admission_path(request.name), json.dumps({
+        "pane": pending.pane, "terminal": pending.terminal, "kind": pending.kind,
+        "home": str(pending.home), "folder": str(request.folder)}))
+
+
+def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
+    """Find live named conversations and unresolved agents in labeled producer panes."""
+    from scripts.message import codex_daemon
+
+    panes = client.panes()
+    workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+    spaces = {row.get("workspace_id") for row in client.listed("workspace") if row.get("label") == workspace}
+    tabs = {row.get("tab_id") for row in client.listed("tab") if row.get("label") == name}
+    conflicts: list[tuple[str, str]] = []
+    for pane in panes:
+        if pane["workspace_id"] not in spaces or not (pane.get("label") == name or pane.get("tab_id") in tabs):
+            continue
+        identity = pane["session_id"] or "unidentified"
+        try:
+            info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
+                                     "named producer process info")
+            kinds = producer_pane_kinds(info)
+            if not kinds:
+                continue
+            if len(kinds) == 1:
+                identity = client.producer_admission_launch(pane["pane_id"], kinds[0])["session_id"]
+        except (OSError, ValueError, herdr_types.HerdrFailure):
+            pass
+        conflicts.append((identity, pane["pane_id"]))
+    named: list[tuple[str, tuple[int, ...]]] = [
+        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions() if row["name"] == name]
+    homes = {agent_accounts.codex_home(), *(owner.home for owner in codex_daemon.daemons(os.environ))}
+    threads: set[str] = set()
+    for home in sorted(homes):
+        try:
+            lines = (home / "session_index.jsonl").read_text().splitlines()
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            entry = herdr.json_object(cast(object, json.loads(line)), "producer thread index")
+            if entry.get("thread_name") == name:
+                threads.add(herdr.json_text(entry.get("id"), "producer thread id"))
+    if threads:
+        codex = herdr.codex_conversations()
+        named.extend((identity, codex.live[identity]) for identity in threads if identity in codex.live)
+    for daemon in codex_daemon.read_daemons(os.environ):
+        if isinstance(daemon.sessions, codex_daemon.DaemonUnreadable):
+            raise ValueError(f"producer thread registry is unreadable: {daemon.sessions.reason}")
+        named.extend((row.thread_id, ()) for row in daemon.sessions if row.name == name)
+    for identity, pids in named:
+        places = [pane["pane_id"] for pane in panes if pane["session_id"] == identity]
+        if not places:
+            for pid in pids:
+                place = herdr.herdr_place_of(pid)
+                if isinstance(place, herdr.HerdrPlace):
+                    places.append(place.pane if place.session == client.session else f"{place.session}:{place.pane}")
+        conflicts.append((identity, ",".join(places) or "outside herdr"))
+    locations: dict[str, set[str]] = {}
+    unresolved: list[tuple[str, str]] = []
+    for identity, pane in conflicts:
+        if identity == "unidentified":
+            unresolved.append((identity, pane))
+        else:
+            locations.setdefault(identity, set()).update(pane.split(","))
+    for identity, panes_for_session in locations.items():
+        panes_for_session.discard("outside herdr")
+        unresolved.append((identity, ",".join(sorted(panes_for_session)) or "outside herdr"))
+    return sorted(set(unresolved))
+
+
+def producer_pane_kinds(info: dict[str, object]) -> list[Literal["claude", "codex"]]:
+    """Read agent families from a pane's foreground processes."""
+    kinds: list[Literal["claude", "codex"]] = []
+    for value in herdr.json_items(info.get("foreground_processes"), "producer foreground processes"):
+        process = herdr.json_object(value, "producer foreground process")
+        argv = [herdr.json_text(argument, "producer argument")
+                for argument in herdr.json_items(process.get("argv"), "producer arguments")]
+        if herdr.is_claude_process(argv):
+            kinds.append("claude")
+        elif herdr.is_codex_process(argv):
+            kinds.append("codex")
+    return kinds
+
+
+def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> pane_record.PaneLaunch:
+    """Prove a named native conversation before staff admission."""
+    pane = pane.removeprefix(client.session + ":")
+    if any(row["pane_id"] == pane for row in client.panes()):
+        info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
+                                 "producer adoption process info")
+        kinds = producer_pane_kinds(info)
+        if len(kinds) != 1:
+            raise ValueError("producer has no unique native foreground process")
+        entry = client.producer_admission_launch(pane, kinds[0])
+        if entry["session_id"] != identity:
+            raise ValueError("producer pane runs another conversation")
+        return entry
+    from scripts.message import codex_daemon
+
+    observed = herdr.read_conversation(identity)
+    if isinstance(observed, herdr.LiveConversation) and len(observed.pids) > 1:
+        raise ValueError("producer conversation has several native processes")
+    if isinstance(observed, herdr.LiveConversation) and len(observed.pids) == 1:
+        pid = observed.pids[0]
+        native = herdr.native_process(pid, observed.kind)
+        if native.current_identity != identity:
+            raise ValueError("producer process runs another conversation")
+        if observed.kind == "claude":
+            records = [row for row in sessions.running_sessions() if row["sessionId"] == identity]
+            if len(records) != 1 or records[0]["pid"] != pid:
+                raise ValueError("producer registry has no unique native process")
+            folder = records[0].get("cwd", "")
+        else:
+            saved = _unrecorded_codex_launch(identity)
+            if isinstance(saved, SessionNotFound):
+                raise ValueError("producer thread folder is unavailable")
+            folder = saved["cwd"]
+        if not Path(folder).is_absolute():
+            raise ValueError("producer folder is unavailable")
+        entry = pane_record.launch("", identity, folder, native.environment, [observed.kind], kind=observed.kind)
+        key = "CLAUDE_CONFIG_DIR" if observed.kind == "claude" else "CODEX_HOME"
+        entry["config_dir"] = native.environment.get(key) or str(Path.home() / (".claude" if observed.kind == "claude" else ".codex"))
+        entry.update(pid=pid, proc_start=native.started)
+        if herdr.native_process(pid, observed.kind) != native:
+            raise ValueError("producer process changed before adoption")
+        return entry
+    for daemon in codex_daemon.read_daemons(os.environ):
+        if isinstance(daemon.sessions, codex_daemon.DaemonUnreadable):
+            raise ValueError(daemon.sessions.reason)
+        for thread in daemon.sessions:
+            if thread.thread_id == identity and Path(thread.cwd).is_absolute():
+                entry = pane_record.launch("", identity, thread.cwd, {"CODEX_HOME": str(daemon.owner.home)}, ["codex"], kind="codex")
+                entry["config_dir"] = str(daemon.owner.home)
+                return entry
+    raise ValueError("producer has no proved live native conversation")
+
+
+def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, client: herdr.Herdr) -> ClaudeUp:
+    """Admit one proved live conversation without a launch."""
+    from scripts.agents import remote
+
+    try:
+        entry = producer_adoption_launch(identity, pane, client)
+        native = staff.native_id(entry["session_id"])
+        home = pane_launch.config_home(entry, record=staff.StaffSnapshot(()))
+        if not isinstance(home, staff.SessionHome):
+            raise ValueError("producer account is unavailable")
+        folder = Path(entry["cwd"])
+        kind = pane_launch.agent_kind(entry)
+        entry["name"] = request.name
+        if entry["pane_id"]:
+            pane_record.write(client.session, entry)
+        row = staff.ensure("producer", name=request.name, runtime_id=native,
+            worktree=staff.PresentWorktree(remote.local_machine(), folder),
+            doc=staff.LiveDoc(remote.local_machine(), request.folder))
+        if entry["pane_id"]:
+            expectation = pane_launch.ProducerStartExpectation(row.id, native, kind, folder, home.path)
+            with pane_launch.producer_start(pane_record.record_directory(), expectation):
+                row = pane_launch.staff_admitted(row)
+        else:
+            row = staff.set_home(row.id, home)
+        _producer_admission_path(request.name).unlink(missing_ok=True)
+        label = accounts.claude_config_label(home.path) if kind == "claude" else agent_accounts.codex_home_role_label(home.path)
+        return ClaudeUp(str(row.current_session), entry["pane_id"], label, start_state=ClaudeStartState.ALREADY_RUNNING)
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+        raise ValueError(f"session {identity}, pane {pane}: producer adoption is unproved: {error}") from error
+
+
+def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str) -> ResumeResult:
+    """Serialize first admission before the producer has a staff row."""
+    _ = _producer_admission_path(request.name)
+    with staff.slot_operation("producer-first-" + request.name, request.name):
+        record = staff.initial_snapshot()
+        row = next((row for row in record.rows if row.kind == "producer" and row.name == request.name), None)
+        if row is not None and not _producer_admission_path(request.name).exists():
+            return _resume(str(row.id), to=to)
+        return _first_producer_resume(request, to=to)
+
+
+def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> ResumeResult:
+    """Retain the pane before launch and admit only its proved native identity."""
+    from scripts.agents import remote
+
+    began = monotonic()
+    try:
+        if not (request.folder / "README.md").is_file():
+            raise ValueError(f"producer README is unavailable: {request.folder / 'README.md'}")
+        starter = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
+        kind, arguments = starter.producer_first_arguments(request.name)
+        client = herdr.Herdr(herdr.shared_session())
+        path = _producer_admission_path(request.name)
+        recovering_admission = path.exists()
+        conflicts = producer_conflicts(request.name, client)
+        if len(conflicts) > 1:
+            raise ValueError("producer sessions conflict: " + "; ".join(
+                f"session {identity}, pane {pane}" for identity, pane in conflicts))
+        if recovering_admission:
+            saved = herdr.json_object(cast(object, json.loads(path.read_text(encoding="utf-8"))), "pending producer admission")
+            if saved.get("kind") != kind or saved.get("folder") != str(request.folder):
+                raise ValueError("pending producer settings differ; retain its pane and inspect the admission record")
+            pending = PendingProducerAdmission(herdr.json_text(saved.get("pane"), "producer pane"),
+                herdr.json_text(saved.get("terminal"), "producer terminal"), kind,
+                Path(herdr.json_text(saved.get("home"), "producer account")))
+            if to:
+                selected = member_account.producer_account(kind, to=to)
+                requested_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
+                if requested_home.resolve() != pending.home.resolve():
+                    raise ValueError("pending producer admission uses another account; complete its admission before an account move")
+            if conflicts:
+                retained = pane_record.read_strict(client.session).get(pending.pane)
+                if retained is None or retained["session_id"] != conflicts[0][0]:
+                    return adopt_named_producer(request, *conflicts[0], client)
+        else:
+            if conflicts:
+                return adopt_named_producer(request, *conflicts[0], client)
+            selected = member_account.producer_account(kind, to=to)
+            home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
+            pending = _reserve_producer_pane(request, kind, home, client)
+            _save_producer_reservation(request, pending)
+        pane_row = client.pane_row(pending.pane)
+        if isinstance(pane_row, herdr.NoPane) or pane_row.get("terminal_id") != pending.terminal:
+            lost = pending
+            retained = pane_record.read_strict(client.session).get(lost.pane)
+            if retained is not None and not isinstance(herdr.read_conversation(retained["session_id"], kind), herdr.StoppedConversation):
+                raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
+            pending = _reserve_producer_pane(request, kind, lost.home, client, lost_pane=lost.pane)
+            if retained is not None:
+                replacement = retained.copy()
+                replacement["pane_id"] = pending.pane
+                _ = replacement.pop("pid", None)
+                _ = replacement.pop("proc_start", None)
+                with pane_launch.locked(pane_record.record_path(client.session)):
+                    entries = pane_record.read_strict(client.session)
+                    current = entries.get(pending.pane)
+                    if (current is not None and pane_record.resume_launch(current)["session_id"]
+                            != pane_record.resume_launch(retained)["session_id"]):
+                        raise ValueError("replacement producer pane holds another conversation; retain its launch record")
+                    entries[pending.pane] = replacement
+                    pane_launch.save(pane_record.record_path(client.session), entries)
+            _save_producer_reservation(request, pending)
+            if retained is not None:
+                pane_launch.retire_launch(pane_record.record_path(client.session), lost.pane, retained)
+        if isinstance(client.pane_activity(pending.pane), herdr.PaneAtShell):
+            retained = pane_record.read_strict(client.session).get(pending.pane)
+            if retained is not None:
+                arguments = pane_record.configured_resume_arguments(retained, retained["session_id"], request.name,
+                    models_registry.launch_settings("producers", request.name))
+                live = herdr.read_conversation(retained["session_id"], kind)
+                if not isinstance(live, herdr.StoppedConversation):
+                    raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
+            if kind == "claude":
+                herdr.trust_claude_launch(request.folder, pending.home)
+                from scripts.whoami.account import named_account_environment
+
+                arguments = models_registry.claude_arguments(arguments,
+                    herdr.agent_base_environment(named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
+            client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + ":"], terminal=pending.terminal)
+            outcome = herdr.start_agent(client.session, pending.pane, kind,
+                trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
+                int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=request.name)
+            if isinstance(outcome, herdr.PromptNotSubmitted):
+                raise OSError(outcome.reason)
+        entry = client.producer_admission_launch(pending.pane, kind)
+        home = pane_launch.config_home(entry, record=staff.StaffSnapshot(()))
+        if (not isinstance(home, staff.SessionHome) or home.path.resolve() != pending.home.resolve()
+                or Path(entry["cwd"]).resolve() != request.folder.resolve()):
+            raise ValueError("producer process differs from its reserved folder or account")
+        entry["name"] = request.name
+        pane_record.write(client.session, entry)
+        identity = staff.native_id(entry["session_id"])
+        row = staff.ensure("producer", name=request.name, runtime_id=identity,
+            worktree=staff.PresentWorktree(remote.local_machine(), request.folder),
+            doc=staff.LiveDoc(remote.local_machine(), request.folder))
+        expectation = pane_launch.ProducerStartExpectation(row.id, identity, kind, request.folder, pending.home)
+        with pane_launch.producer_start(pane_record.record_directory(), expectation):
+            row = pane_launch.staff_admitted(row)
+        publication = pane_record.read_strict(client.session).get(pending.pane)
+        if publication is None or not publication.get("producer_binding", False):
+            raise ValueError("producer admission needs pane publication; retain its native conversation")
+        path.unlink(missing_ok=True)
+        label = (accounts.claude_config_label(pending.home) if kind == "claude"
+                 else agent_accounts.codex_home_role_label(pending.home))
+        return ClaudeUp(str(row.current_session), pending.pane, label,
+                        elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
+    except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        return ResumeFailed(request.name, str(error))
 
 
 
@@ -324,8 +681,18 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
             print(f"{session}: staff anomaly: {error}", file=sys.stderr)
             record = staff.StaffSnapshot(())
         member = record.by_member_reference(session)
+        if member is None:
+            producers = [row for row in record.rows if row.kind == "producer" and row.name == session]
+            if len(producers) == 1:
+                member = producers[0]
         if member is not None:
             return member.current_session
+        registered = {row["sessionId"] for row in sessions.running_sessions()
+                      if session in (row["sessionId"], row["name"])}
+        if len(registered) > 1:
+            return StopFailed(session, f"{session}: several live sessions match")
+        if registered:
+            return registered.pop()
         tab = _tab_of(session)
         return tab.session_id if isinstance(tab, herdr.TabSession) and tab.session_id else SessionNotFound(session)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
@@ -517,7 +884,10 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = resolve_program(kind, environment=environment)
-    command = [program, *trust_arguments(kind, entry["cwd"], resume_arguments(entry))]
+    arguments = resume_arguments(entry)
+    if kind == "claude":
+        arguments = models_registry.claude_arguments(arguments, environment)
+    command = [program, *trust_arguments(kind, entry["cwd"], arguments)]
     if message and kind == "claude":
         command.append(message)
     os.chdir(entry["cwd"])
@@ -729,8 +1099,32 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
         machine = _member_machine(member)
         if machine and machine != remote.local_machine():
             return ResumeFailed(session, f"session is on {machine}")
+        if member.kind == "producer" and _producer_admission_path(member.name).exists():
+            folder = (member.worktree.path if isinstance(member.worktree, staff.PresentWorktree)
+                      else _producer_folder(member.name))
+            return _locked_first_producer_resume(ProducerFirstStart(member.name, folder), to=to or "")
         session = member.current_session
     else:
+        if (session and Path(session).name == session and session not in {".", ".."}
+                and _producer_admission_path(session).exists()):
+            try:
+                return _locked_first_producer_resume(ProducerFirstStart(session, _producer_folder(session)), to=to or "")
+            except (OSError, ValueError) as error:
+                return ResumeFailed(session, str(error))
+        try:
+            configuration = (models_registry.launch_configuration(os.environ).text
+                if models_registry.OPERATION_ENVIRONMENT[0] in os.environ else models_registry.registry_text())
+            producers = models_registry.parse_registry(configuration).get("producers", {})
+        except (OSError, ValueError):
+            producers = {}
+        if session in producers:
+            try:
+                folder = _producer_folder(session)
+                if ((folder / "README.md").is_file()
+                        or isinstance(_tab_of(session, names=names), SessionNotFound)):
+                    return _locked_first_producer_resume(ProducerFirstStart(session, folder), to=to or "")
+            except (OSError, ValueError) as error:
+                return ResumeFailed(session, str(error))
         identities = _codex_name_ids(session)
         if len(identities) > 1:
             return ResumeFailed(session, "ambiguous name; candidates: " + ", ".join(identities))

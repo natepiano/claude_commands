@@ -10,6 +10,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 import json
 import os
@@ -170,11 +171,13 @@ class GateWorker:
             progress_profile.publish_counter(self.sidecar, counter)
         cloud_progress.publish(self.sidecar, log_cloud_progress(text, self.size_vcpus, self.clock()))
 
-    def charges(self) -> None:
+    def charges(self, record_query: Callable[[Decimal], None] = lambda _fee: None) -> None:
         now = int(self.clock())
         def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
             policy = read_settings(self.settings_path)
-            return fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
+            readings = fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
+            record_query(sum((reading.query_usd for reading in readings), Decimal(0)))
+            return readings
         _ = self.book.refresh_charges(self.settings_path, now, fetch, gate_workload=True)
 
     def upload(self, bucket: str, key: str, path: Path) -> None:
@@ -262,6 +265,8 @@ class GateWorker:
                              boot_error=url('PUT', prefix + '/boot-error.json'))
                 if request['source_key']:
                     links['source'] = url('GET', ledger.text(request, 'source_key'))
+                if request.get('task') == 'paired':
+                    links['paired'] = 'true'
                 policy = read_settings(self.settings_path)
                 tags = [{'Key': 'GateDeployment', 'Value': ledger.text(deployment, 'deployment_id')},
                         {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
@@ -274,7 +279,7 @@ class GateWorker:
                     'NetworkInterfaces': [{'DeviceIndex': 0, 'SubnetId': subnet['id'],
                                            'Groups': [deployment['security_group']], 'AssociatePublicIpAddress': True}],
                     'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
-                    'UserData': gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
+                    'UserData': gate_box.user_data({**links, 'instance_type': size}, ledger.text(deployment, 'revision'), lifetime,
                               settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
                 if deployment.get('image'):
                     arguments['ImageId'] = ledger.text(deployment, 'image')
@@ -335,8 +340,9 @@ class GateWorker:
         try:
             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock()))
             if not (folder / 'launch.json').exists():
-                self.reconcile()
-                self.charges()
+                if request.get('task') != 'paired':
+                    self.reconcile()
+                    self.charges()
                 reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
                     attempt, int(self.clock()), ledger.instant(request, 'expires'),
                     money(str(settings().number('spot_max_usd_per_hour'))),
@@ -371,7 +377,10 @@ class GateWorker:
                             if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                                 raise ValueError('The final log is absent')
                             result = read(folder / 'remote-result.json')
-                            validate_result(result, request)
+                            validate_result(result, request, instance=instance)
+                            if request.get('task') == 'paired' and any(
+                                    sample['instance_type'] != arguments['InstanceType'] for sample in ledger.rows(result, 'runs')):
+                                raise ValueError('The sample instance type differs from the launch')
                             self.record_launch(request, ledger.text(arguments, 'InstanceType'), '', 'finished',
                                                gate_s=float(str(result['gate_s'])))
                             row = result
@@ -390,19 +399,23 @@ class GateWorker:
                 if not row:
                     raise ValueError('The instance expired without a final result')
             finally:
-                self.terminate(attempt, instance)
+                with defer_cleanup_signals():
+                    self.terminate(attempt, instance)
             return {'status': 'complete', 'instance': instance, 'result': row}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
             # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
             if 'arguments' not in launch:
                 self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
-            if row and not gate_box.decode_run(row['gate']).passed:
+            if row and request.get('task') != 'paired' and not gate_box.decode_run(row['gate']).passed:
                 return {'status': 'complete', 'result': row}
             return {'status': 'fallback', 'reason': str(error)}
 
 
-def validate_result(row: dict[str, object], request: dict[str, object]) -> None:
+def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
+    if request.get('task') == 'paired':
+        gate_box.validate_paired_result(row, request, instance)
+        return
     for key in ('attempt', 'commit', 'tree'):
         if row.get(key) != request[key]:
             raise ValueError('The result differs from the current ' + key)
@@ -528,16 +541,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             folder = root / uuid4().hex
         folder.mkdir(parents=True, exist_ok=True)
         sidecar = folder / 'reservation.cgroup'
-        credential = str(Path(settings().text('credential_file')).expanduser())
-        command = ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=cloud-gate-' + folder.name,
-                   '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
-                   '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
-                   '--property=KillMode=control-group', '--property=UMask=0077',
-                   '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
-                   # Run the installed worker with the installed account settings.
-                   '--working-directory=' + str(Path.home() / '.claude'),
-                   sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
-                   '--sidecar', str(sidecar), '--settings', str(account_settings_path())]
+        command = service_command('scripts.aws_target.cloud_gate',
+            ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
+             '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
         with cloud_reservation(repo, sidecar, mode) as reservation:
             request = (read(folder / 'request.json') if (folder / 'request.json').exists()
                        else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
@@ -547,6 +553,19 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             outcome = run_service(repo, folder, request, command, service)
             reservation.status = int(not outcome.run.passed) if isinstance(outcome, CloudCompleted) else 0
             return outcome
+
+
+def service_command(module: str, arguments: Sequence[str], unit: str, *, paired: bool = False) -> list[str]:
+    """Use the installed scaler environment for each gate controller."""
+    credential = str(Path(settings().text('credential_file')).expanduser())
+    return ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=' + unit,
+            '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
+            '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
+            '--property=KillMode=' + ('mixed' if paired else 'control-group'), '--property=UMask=0077',
+            '--property=TimeoutStopSec=' + str(settings().number('termination_timeout_s')
+                + 2 * settings().number('api_timeout_s')),
+            '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
+            '--working-directory=' + str(Path.home() / '.claude'), sys.executable, '-m', module, *arguments]
 
 
 def run_service(repo: Path, folder: Path, request: dict[str, object], command: Sequence[str],

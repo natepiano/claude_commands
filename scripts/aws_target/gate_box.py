@@ -6,9 +6,13 @@ from datetime import datetime
 import hashlib
 import hmac
 import json
+import inspect
 import shlex
 from urllib.parse import quote
 from typing import TYPE_CHECKING
+from enum import StrEnum
+import math
+from scripts.aws_target import ledger
 
 if TYPE_CHECKING:
     from scripts.production.merge_gate import GateRun
@@ -45,8 +49,192 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
     return f'https://{host}{path}?{query}&X-Amz-Signature={signature}'
 
 
+class TrialVariant(StrEnum):
+    BASE = 'base'
+    CHANGED = 'changed'
+
+
+RUN_FIELDS = {'module', 'variant', 'round', 'cpu_s', 'peak_mib', 'wall_s', 'status', 'tests',
+              'failures', 'errors', 'instance_type', 'box'}
+
+
+def validate_paired_result(row: dict[str, object], request: dict[str, object], instance: str) -> None:
+    """Validate the task identity and each measured sample."""
+    for key in ('attempt', 'commit', 'tree', 'base', 'changed', 'module', 'rounds'):
+        if row.get(key) != request[key]:
+            raise ValueError('The paired result differs from ' + key)
+    seen: set[tuple[str, int]] = set()
+    for sample in ledger.rows(row, 'runs'):
+        if set(sample) != RUN_FIELDS or sample['module'] != request['module']:
+            raise ValueError('The paired sample has different fields or module')
+        variant = TrialVariant(ledger.text(sample, 'variant'))
+        number = ledger.instant(sample, 'round')
+        if not 1 <= number <= ledger.instant(request, 'rounds') or (variant, number) in seen:
+            raise ValueError('The paired sample has a duplicate or invalid round')
+        seen.add((variant, number))
+        if type(sample['status']) is not int:
+            raise ValueError('The paired status must be an integer')
+        for field in ('cpu_s', 'peak_mib', 'wall_s', 'tests', 'failures', 'errors'):
+            value = sample[field]
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError('The paired sample has an invalid ' + field)
+            if field in ('tests', 'failures', 'errors') and type(value) is not int:
+                raise ValueError('The paired count must be an integer')
+        if sample['box'] not in ('', instance):
+            raise ValueError('The paired sample has a different box')
+        sample['box'] = instance
+    if row.get('verdict') not in ('pass', 'fail', 'error'):
+        raise ValueError('The paired result has no verdict')
+
+
+# The installed controller supplies the supervisor for both tested trees.
+PAIRED_GUEST = r'''from pathlib import Path
+import math, signal, tempfile
+
+def paired_trial():
+    rows = []
+    reply = {key: gate_request[key] for key in ('attempt', 'commit', 'tree', 'base', 'changed', 'module', 'rounds')}
+    reply.update(runs=rows, gate_s=0, verdict='error')
+    started = time.monotonic()
+    active = None
+    adopt_descendants()
+    log = root / 'gate.log'
+    def put(url, content):
+        subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30',
+                        '-X', 'PUT', '--data-binary', '@-', url], input=content, check=True)
+    def upload():
+        put(links['log'], log.read_bytes() if log.exists() else b'')
+    try:
+        repo = root / 'repo'
+        subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
+        trees = {}
+        for variant in ('base', 'changed'):
+            revision = gate_request[variant]
+            path = root / variant
+            subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '--detach', str(path), revision['commit']], check=True)
+            tree = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+            if tree != revision['tree']:
+                raise ValueError('The source tree differs from the request')
+            trees[variant] = path
+        (root / 'measure').touch()
+        with (root / 'upload.lock').open('a') as lock:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for round_number in range(gate_request['rounds'] + 1):
+                warming = round_number == 0
+                variants = ('base', 'changed') if warming or round_number % 2 else ('changed', 'base')
+                remaining = gate_request['expires'] - time.time() - gate_request['delivery_s']
+                budget = min(gate_request['module_time_limit_s'], max(0, remaining / (2 * (gate_request['rounds'] - round_number + 1))))
+                for variant in variants:
+                    repo = trees[variant]
+                    subprocess.run(['git', '-C', str(repo), 'reset', '--hard'], check=True, capture_output=True)
+                    subprocess.run(['git', '-C', str(repo), 'clean', '-fdx', '-e', '__pycache__/'], check=True, capture_output=True)
+                    with tempfile.TemporaryDirectory(dir=root) as temporary:
+                        work = Path(temporary)
+                        environment = test_module_environment(work, dict(os.environ))
+                        if warming:
+                            environment.pop('TEST_TIMES_OUT', None)
+                        environment['CONF_DIR'] = str(repo / 'config')
+                        home = work / 'home'
+                        (home / '.claude').mkdir(parents=True)
+                        (home / '.claude/config').symlink_to(repo / 'config', target_is_directory=True)
+                        (home / '.claude/scripts').symlink_to(repo / 'scripts', target_is_directory=True)
+                        environment['HOME'] = str(home)
+                        folder, name = gate_request['module'].rsplit('/', 1)
+                        row = dict(module=gate_request['module'], variant=variant, round=round_number,
+                                   cpu_s=None, peak_mib=None, wall_s=None, status=124,
+                                   tests=None, failures=None, errors=None,
+                                   instance_type=links['instance_type'], box='')
+                        (work / 'output').touch()
+                        if budget > 0:
+                            before = time.monotonic()
+                            with (work / 'output').open('wb') as output:
+                                active = subprocess.Popen(['python3', 'scripts/test_times/module_run.py', 'scripts/' + folder, name],
+                                    cwd=repo, env=environment, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                                peak = 0.0
+                                timed_out = False
+                                try:
+                                    while active.poll() is None:
+                                        if not warming:
+                                            peak = max(peak, process_memory_mib({active.pid}).get(active.pid, 0.0))
+                                        remaining = budget - (time.monotonic() - before)
+                                        if remaining <= 0:
+                                            timed_out = True
+                                            os.killpg(active.pid, signal.SIGKILL)
+                                            break
+                                        try:
+                                            active.wait(timeout=min(0.02, remaining))
+                                        except subprocess.TimeoutExpired:
+                                            pass
+                                    status = active.wait()
+                                    row.update(status=124 if timed_out else status, peak_mib=peak)
+                                finally:
+                                    group = active.pid
+                                    try:
+                                        os.killpg(group, signal.SIGKILL)
+                                    except ProcessLookupError:
+                                        pass
+                                    active.wait()
+                                    while True:
+                                        try:
+                                            os.waitpid(-group, 0)
+                                        except ChildProcessError:
+                                            break
+                                    active = None
+                        timing = work / 'test-times.json'
+                        if not warming and timing.exists():
+                            measured = json.loads(timing.read_text())
+                            for field, source in (('cpu_s', 'cpu_s'), ('wall_s', 'wall_s'), ('tests', 'tests_run'),
+                                                  ('failures', 'failures'), ('errors', 'errors')):
+                                value = measured[source]
+                                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                                    raise ValueError('The timing output has an invalid ' + source)
+                                if field in ('tests', 'failures', 'errors') and type(value) is not int:
+                                    raise ValueError('The timing count must be an integer')
+                                row[field] = value
+                        if not warming:
+                            rows.append(row)
+                        with log.open('a') as output:
+                            output.write((work / 'output').read_text(errors='replace') + '\n')
+                            if not warming:
+                                output.write(json.dumps(row) + '\n')
+                        upload()
+        reply['verdict'] = 'pass' if len(rows) == 2 * gate_request['rounds'] and all(row['status'] == 0 and row['tests'] is not None for row in rows) else 'fail'
+    except BaseException:
+        reply['error'] = traceback.format_exc()
+        with log.open('a') as output:
+            output.write(reply['error'])
+    finally:
+        if active is not None:
+            os.killpg(active.pid, signal.SIGKILL)
+            active.wait()
+        reply['gate_s'] = time.monotonic() - started
+        try:
+            upload()
+        except Exception as error:
+            reply['log_error'] = str(error)
+        put(links['result'], json.dumps(reply).encode())
+
+paired_trial()
+'''
+
+
+def paired_supervisor() -> str:
+    """Embed the installed gate environment and memory sampler."""
+    from scripts.production import merge_gate
+    from scripts.lib.descendants import adopt_descendants
+    environment = inspect.getsource(merge_gate.test_module_environment).replace(
+        'Path(__file__).resolve().parents[1] / "lib/py"', 'sys.executable')
+    return ('from pathlib import Path\nimport ctypes\nfrom typing import cast\n'
+            + inspect.getsource(adopt_descendants) + '\n' + environment + '\n'
+            + inspect.getsource(merge_gate.swapped_kib) + '\n'
+            + inspect.getsource(merge_gate.process_memory_mib) + '\n' + PAIRED_GUEST)
+
+
 # This program runs inside the instance's tool shell, not on natedev.
-GUEST = r'''import concurrent.futures, contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
+LEGACY_GUEST = r'''import concurrent.futures, contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
 os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
@@ -210,6 +398,11 @@ finally:
 '''
 
 
+GUEST = LEGACY_GUEST.replace("links['boot'] =",
+    "if links.get('production') and gate_request.get('task') == 'paired':\n    exec(" + repr(paired_supervisor())
+    + ")\n    raise SystemExit(0)\nlinks['boot'] =", 1)
+
+
 def log_upload(links: dict[str, str]) -> str:
     transfer = f'curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links["log"])}'
     return f'''{{ cat "${{box_dir:-/var/lib/gate-trial}}/boot.log" "${{box_dir:-/var/lib/gate-trial}}/gate.log" "${{box_dir:-/var/lib/gate-trial}}/timeline.log" 2>/dev/null || :
@@ -220,16 +413,21 @@ def log_upload(links: dict[str, str]) -> str:
 
 
 def log_push_loop(links: dict[str, str], interval_s: float) -> str:
+    lock_start = ('if [ -e "$box_dir/measure" ]; then continue; fi\n        (\n        flock -x 9\n'
+                  + '        if [ -e "$box_dir/measure" ]; then exit 0; fi\n'
+                  if links.get('paired') else '')
+    lock_end = ') 9> "$box_dir/upload.lock"' if links.get('paired') else ''
     return f'''push_logs() {{
     cpu_ticks() {{ awk '/^cpu / {{for (i=2;i<=9;i++) t+=$i; printf "%.0f %.0f\\n", t, $5+$6+$9; exit}}' /proc/stat; }}
     set -- $(cpu_ticks)
     previous_total=$1 previous_idle=$2
     while sleep {interval_s:g}; do
-        set -- $(cpu_ticks)
+        {lock_start}        set -- $(cpu_ticks)
         busy=$(awk -v total="$(($1-previous_total))" -v idle="$(($2-previous_idle))" 'BEGIN {{printf "%.2f", (total>0 ? 100*(total-idle)/total : 0)}}')
         previous_total=$1 previous_idle=$2
         printf '%s loadavg=%s %s processes=%s cpu_busy_percent=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" "$busy" >> "${{box_dir:-/var/lib/gate-trial}}/timeline.log" || :
         {log_upload(links)}
+        {lock_end}
     done
 }}
 push_logs &

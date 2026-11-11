@@ -365,25 +365,19 @@ Existing boxes use their saved start and end times and the instance types in `cl
 A box without a saved instance type retains its bid rate.
 No migration is required.
 Reports use the saved AWS bill and label provisional days.
-Reports show today's spend, daily limit, successful launch count, and spend groups with amounts and percentage shares.
-Historical reports omit today's estimated spend.
+Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+Reports show daily spending, limits, run counts, and compute, storage, and other costs.
+The daily spend table shows bill days and estimate days after the newest bill day.
+Historical reports omit estimate days after the report date.
 The groups are gate compute at 32 CPU, compute at 16 CPU, storage, public IPv4, data transfer, and other.
 Compute at 16 CPU includes gates and the older builder.
-Unbilled days use the label `estimated from the newest bill` when a bill exists.
+Unbilled days use the label `estimate`.
 Spot compute includes the older Spot builder when it uses the same instance type.
-The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
+The matrix splits each day's Spot cost by box seconds and divides the cost by finished runs on billed days.
 Reports read local evidence without an AWS call or a coordination file.
 
-`### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
-`gate_type_window_days=14` sets the UTC window for the cost matrix by machine type and run kind.
-The matrix separates merge gates, targeted tests, and all runs.
-Costs per run use billed days only; each day's cost splits by box seconds.
-Counts include all finished runs in the window.
-The daily table shows median test time, median box time, and cost per run, newest day first.
-Both tables read the shared launch log and saved bills.
-Runs use their UTC completion day; box seconds include setup time.
-Old rows without a run kind remain outside the matrix; the source line shows their count.
-Missing comparisons remain unavailable. Run time differences can remain negative.
+`### AWS` shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+`gate_type_window_days=14` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.
@@ -816,20 +810,44 @@ The folder uses task `gate:aws-routing-proof`.
 The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 
-`deploy.py gate-trial` reads these keys when it uses them:
+Paired trials use the installed scaler service and the existing `cloud_gate.conf` settings.
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one box for all rounds.
+All module boxes run concurrently.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The command reserves the full trial cost before it permits any launch.
+A refused launch never uses a local runner.
 
-| Key | Value | Reason |
-| --- | --- | --- |
-| `gate_trial_size_reserve_usd` | `4` | Limit the spend of the size step. |
-| `gate_trial_start_reserve_usd` | `3` | Limit the spend of the start step. |
-| `gate_trial_lifetime_minutes` | `30` | Set the guest shutdown time and the attempt deadline. |
-| `gate_trial_url_lifetime_s` | `7200` | Keep presigned URLs valid through a stop and start. |
-| `gate_trial_target_gate_s` | `420` | Select the cheapest size that meets the 7-minute goal. |
-| `gate_trial_default_sizes` | `8,16,32,64` | Set the vCPU sizes of the size step. |
-| `gate_trial_size_runs` | `3` | Set the attempts for each size. |
-| `gate_trial_start_runs` | `5` | Set the attempts of the start step. |
-| `gate_trial_poll_pause_s` | `2` | Set the pause between state and result reads. |
-| `gate_trial_group_delete_wait_s` | `120` | Limit the security group delete retries. |
+Stdout contains JSON lines: each run, each module summary, and the final cost.
+Progress goes to stderr.
+The final line has `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate uses each box's rate, minimum billed seconds, lifetime, allowance, and new bill-query fees.
+Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
+The paired trial adds no settings.
+
+The paired trial replaces the size/start trials.
+The following settings are removed:
+
+1. `gate_trial_size_reserve_usd`.
+1. `gate_trial_start_reserve_usd`.
+1. `gate_trial_lifetime_minutes`.
+1. `gate_trial_url_lifetime_s`.
+1. `gate_trial_target_gate_s`.
+1. `gate_trial_module_limit_s`.
+1. `gate_trial_default_sizes`.
+1. `gate_trial_size_runs`.
+1. `gate_trial_start_runs`.
+1. `gate_trial_poll_pause_s`.
+1. `gate_trial_log_push_s`.
+1. `gate_trial_group_delete_wait_s`.
+
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.
 `deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.

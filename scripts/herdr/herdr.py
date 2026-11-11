@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, Typed
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import conf, operation_deadline
+from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -1982,6 +1982,37 @@ class Herdr:
                         _ = self.run("workspace", "close", candidate.workspace_id)
                 except HerdrFailure as error:
                     print(f"herdr {self.session}: workspace {candidate.workspace_id} retained: {error}", file=sys.stderr)
+
+    def producer_admission_launch(self, pane: str, kind: Literal["claude", "codex"]) -> pane_launch.PaneLaunch:
+        """Read the native identity and launch evidence before producer admission."""
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
+                           "producer process info")
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane):
+            raise HerdrFailure("producer pane is unavailable")
+        observed = pane_native_process(info, kind, row)
+        processes = [json_object(value, "producer process")
+                     for value in json_items(info.get("foreground_processes"), "producer processes")
+                     if _is_agent_process(_foreground_arguments(json_object(value, "producer process")), kind)]
+        if len(processes) != 1:
+            raise HerdrFailure("producer has no unique foreground process")
+        process = processes[0]
+        pid = process.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise HerdrFailure("producer has no process id")
+        folder = json_text(process.get("cwd"), "producer folder")
+        if (not Path(folder).is_absolute() or observed.environment.get("HERDR_PANE_ID") != pane
+                or observed.environment.get("HERDR_SESSION", "default") != self.session):
+            raise HerdrFailure("producer process does not match its pane")
+        entry = pane_launch.launch(pane, observed.current_identity, folder, observed.environment,
+                                   _foreground_arguments(process), kind=kind)
+        entry["config_dir"] = observed.environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR") or str(
+            Path.home() / (".codex" if kind == "codex" else ".claude"))
+        entry.update(pid=pid, proc_start=observed.started)
+        current = self.native_pane_process(pane, kind, PROGRAM_TIMEOUT_SECONDS, pane_row=row)
+        if current != observed:
+            raise HerdrFailure("producer process changed before admission")
+        return entry
 
     def codex_launch(self, pane: str, arguments: Sequence[str] = ()) -> pane_launch.PaneLaunch:
         """Read one Codex launch from its exact foreground process."""
@@ -5099,6 +5130,11 @@ class CodexLaunchRead(Enum):
     CURRENT = "read Codex at launch"
 
 
+def agent_alias_script(kind: str) -> str:
+    """Clear the agent alias before the shell starts the agent."""
+    return f"unalias {kind} 2>/dev/null; "
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
@@ -5107,6 +5143,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
+        agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
         try:
             trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
         except HerdrFailure as error:
@@ -5150,7 +5187,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
-        script = f"unalias {kind} 2>/dev/null; "
+        script = agent_alias_script(kind)
         if isinstance(destination, ExistingPane):
             # Set the environment in the existing shell before the agent starts.
             environment = _pane_environment(prepared.env)

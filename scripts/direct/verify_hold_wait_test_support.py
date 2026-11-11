@@ -74,10 +74,12 @@ def read_cycle_file(path: Path) -> build_hold.HoldCycle:
 @contextmanager
 def local_hold_environment(environment: Mapping[str, str]) -> Generator[None, None, None]:
     """Restore changed keys without clearing the admission reader's environment."""
+    from scripts.build_targets import build_targets
+
     previous_values = {name: os.environ[name] for name in environment if name in os.environ}
     try:
         os.environ.update(environment)
-        with hold_recorder_exits():
+        with hold_recorder_exits(), mock.patch.object(build_targets, "tell_wait_holder"):
             yield
     finally:
         for name in environment:

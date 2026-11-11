@@ -32,6 +32,10 @@ class PaneAstraReviewTests(HeldRolePaneCase):
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": sys.executable})))
         super().setUp()
+        from scripts.lib import unit_runs
+
+        _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.panes.root))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.panes.root)})))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
         self.panes.command_case.agent.final = "Verdict: clear."
         _ = self.enterContext(self.panes.world.process_starts())
@@ -216,8 +220,10 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     real_hold = astra_roles.hold
                     real_launch = assign.launch
                     def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
-                               policy: worker_panes.LaunchPolicy) -> worker_panes.WorkerStart:
-                        result = real_launch(target, policy)
+                               policy: worker_panes.LaunchPolicy, *,
+                               lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+                               ) -> worker_panes.WorkerStart:
+                        result = real_launch(target, policy, lock=lock)
                         if failure == "incomplete":
                             assert isinstance(result, worker_panes.OpenWorker)
                             rows.append(result.row)
@@ -280,7 +286,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     self.assertIn("no DONE", self.panes.command_case.agent.notices[-1])
                 state = read_object(self.panes.root / run_name / "progress_history_state.json")
                 self.assertEqual(recorder_state.open_phase_ids(state), [])
-                self.assertEqual(state["status"], "active" if operation == "finish-run" else "error")
+                self.assertEqual(state.get("status"), None if operation == "finish-run" else "error")
 
     def test_failed_pane_end_returns_one_and_keeps_the_hold(self) -> None:
         result = self.run_review()

@@ -63,6 +63,19 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture, UnitRenameFixture
 
 class AgentsUsageTests(unittest.TestCase):
+    def test_resume_dwight_admits_the_first_conversation_and_retains_the_live_conversation(self) -> None:
+        from scripts.agents.test_stop_resume import producer_first_fixture
+
+        with producer_first_fixture("claude") as world:
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    code, output, errors = self.invoke(["resume", "dwight"])
+                    self.assertEqual(code, 0, errors + output)
+                    self.assertIn(world.identity, output)
+            row = staff.initial_snapshot().rows[0]
+            self.assertEqual((row.name, row.kind, row.current_session), ("dwight", "producer", world.identity))
+            self.assertEqual(len(world.arguments), 1)
+
     def test_status_excludes_a_retired_unit_whose_process_still_runs(self) -> None:
         from scripts.agents.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
         from scripts.whoami.account import Account
@@ -108,9 +121,10 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray"])
         self.assertIn("resume NAME", output)
         self.assertIn("stop SESSION", output)
+        self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)
         self.assertIn("--dry-run", output)
         for command in ("records", "held-sessions", "remote-control"):

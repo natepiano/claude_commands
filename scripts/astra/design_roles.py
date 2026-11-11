@@ -10,6 +10,8 @@ try:
 except FileNotFoundError:
     pass
 
+from scripts.lib import unit_runs
+
 import argparse
 import configparser
 import fcntl
@@ -987,8 +989,7 @@ def _finish_end(design: HeldDesign, role: Role) -> None:
     directory = design_directory(design.placement.design_id)
     with _lock(directory):
         if isinstance(design.binding, DesignUnbound):
-            state = worker_lifecycle.read_worker_state(directory / 'progress_history_state.json')
-            if state.get('status') == 'active':
+            if unit_runs.run_is_open(directory):
                 _recorder_command(['finish-run', '--session-dir', str(directory), '--status', 'completed'])
         transition = directory / 'transition.json'
         pending = _read(transition) if transition.exists() else {}

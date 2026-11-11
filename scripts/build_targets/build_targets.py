@@ -968,6 +968,31 @@ def command_register_local(_call_id: str, *, pid: int) -> int:
     return command_check_local("verify")
 
 
+def tell_wait_holder(holder: build_hold.Holder, line: str, caller: str) -> None:
+    """Tell the holder about unresolved ownership without ending the wait."""
+    import subprocess
+
+    from scripts.lib import conf
+    from scripts.lib.process_failure import failure_detail
+    from scripts.message import session_send
+
+    try:
+        with conf.diagnostics(report=False):
+            timeout = conf.read("build_targets").number("hold_sender_timeout_seconds")
+        result = subprocess.run(session_send.send_argv("--to", f"session:{holder.key}", "--text", line),
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        reason = f"send timed out after {error.timeout:g} seconds"
+    except (OSError, conf.Unusable) as error:
+        reason = str(error)
+    else:
+        if result.returncode == 0:
+            return
+        reason = failure_detail(result)
+    print(f"{speaker(caller)}: could not tell {display_field(holder.name)}: {display_field(reason)}",
+          file=sys.stderr, flush=True)
+
+
 def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", caller: str = "",
                        session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
     """Wait until no hold applies. An empty caller is verify.sh; any other caller is a lint step."""
@@ -1034,6 +1059,18 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
                 print(f"{name}: natedev is held by {display_field(blocking.name)} for "
                       + f"{display_field(blocking.purpose)}{waiting}",
                       file=sys.stderr, flush=True)
+                resolution = build_hold.run_resolution()
+                if isinstance(resolution, build_hold.RunNotInStaff):
+                    line = (f"{name}: build has no run pointer ({display_field(str(resolution.run))}); "
+                            + f"waits on {display_field(blocking.name)} hold for {display_field(blocking.purpose)}.")
+                elif isinstance(session, build_hold.NoOwningSession):
+                    line = (f"{name}: build has no session; waits on {display_field(blocking.name)} hold "
+                            + f"for {display_field(blocking.purpose)}.")
+                else:
+                    line = ""
+                if line:
+                    print(line, file=sys.stderr, flush=True)
+                    tell_wait_holder(blocking, line, caller)
             # A held natedev cannot start this step, so a free Mac wins and the
             # call can leave without an allocation. As in memory_gate.sh, the
             # hook runs from the second poll on: a Mac that declines after

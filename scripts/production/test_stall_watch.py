@@ -458,7 +458,7 @@ always=natedev
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         for run_id, events in self.run_records.items():
             _ = (runs / f"{run_id}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-        for history in runs.iterdir():
+        for history in sorted(runs.iterdir()):
             folder = self.root / "held" / history.stem
             if history.stem in self.unheld_runs:
                 continue
@@ -479,6 +479,14 @@ always=natedev
                 assert parent is not None
                 run_state[unit_runs.OWNER_FIELD] = owner.id
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
+            if owner is not None:
+                history_events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+                if any(event.get("event_type") == "run_finished" for event in history_events):
+                    if isinstance(owner.run, staff.OpenRun):
+                        _ = staff.clear_run(owner.id, folder)
+                else:
+                    _ = staff.set_run(owner.id, staff.OpenRun(folder))
+
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
         if subprocess_cli:
@@ -651,16 +659,15 @@ always=natedev
         self.assertEqual(self.tick(START).returncode, 0)
         path = self.watches["unit-one"].stretch_path
         saved = path.read_bytes()
-        scan = unit_runs.held_by_session
+        lookup = unit_lookup.HeldRunLookup.unfinished_held_run
         damaged = self.root / "history/runs/unit-one.jsonl"
 
-        def damage() -> dict[str, list[str]]:
-            folders = scan()
-            with damaged.open("ab") as handle:
-                _ = handle.write(b"\xff\n")
-            return folders
+        def damage(runs: unit_lookup.HeldRunLookup, session: str) -> unit_lookup.HeldRun | unit_lookup.HeldRunUnknown | unit_lookup.NoUnfinishedRun:
+            if session == unit_session("unit-one"):
+                _ = damaged.write_bytes(b"\xff\n")
+            return lookup(runs, session)
 
-        with mock.patch.object(unit_runs, "held_by_session", side_effect=damage):
+        with mock.patch.object(unit_lookup.HeldRunLookup, "unfinished_held_run", damage):
             result = self.tick(START + 600)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(path.read_bytes(), saved)
@@ -724,7 +731,7 @@ always=natedev
               mock.patch.object(stall_watch, "read_place") as panes):
             result = self.tick(START + 600)
         self.assertEqual(result.returncode, 0, result.stderr)
-        scan.assert_called_once_with()
+        scan.assert_not_called()
         self.assertEqual(sessions, [unit_session("unit-one")])
         panes.assert_not_called()
         self.assertEqual({path: path.read_bytes() for path in saved}, saved)
@@ -789,7 +796,7 @@ always=natedev
               mock.patch.object(stall_watch, "send_all") as send):
             _ = stall_watch.tick(START)
             scans.assert_called_once_with(record=mock.ANY)
-            reads.assert_called_once_with()
+            reads.assert_not_called()
             self.assertEqual(forget.call_count, 4)
             send.assert_called_once_with(
                 [], START, deadline=mock.ANY,
@@ -2237,18 +2244,47 @@ always=natedev
         return {"type": "assistant", "message": {"content": list(blocks)}}
 
     def test_a_compacted_pane_reads_a_blocked_turn_end_from_the_transcript(self) -> None:
-        self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
-                       self.said({"type": "thinking", "thinking": ""}),
-                       self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}))
-        self.assertEqual(self.tick(START).returncode, 0)
-        self.assertEqual(self.tick(START + 3600).returncode, 0)
-        self.assertEqual(self.sent(), [])
+        peer_prompt: dict[str, object] = {
+            "type": "user", "message": {"content": "Peer update: the Ghostty check remains blocked."}}
+        peer_result: dict[str, object] = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "peer-call", "content": "Peer update sent."}]}}
+        for peer_entries in ([],
+                             [peer_prompt, self.said({"type": "text", "text": "—"})],
+                             [peer_prompt,
+                              self.said({"type": "tool_use", "name": "Bash", "id": "peer-call"}),
+                              peer_result,
+                              self.said({"type": "text", "text": " \n—\n "})]):
+            with self.subTest(peer_entries=peer_entries):
+                self.send_log.unlink(missing_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
+                               self.said({"type": "thinking", "thinking": ""}),
+                               self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}),
+                               *peer_entries)
+                if peer_entries:
+                    self.panes["unit-one"]["pane"] = "— holding: waiting on the tests\n"
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 3600).returncode, 0)
+                self.assertEqual(self.sent(), [])
 
     def test_a_compacted_pane_bumps_when_the_transcript_names_own_work_or_went_on(self) -> None:
+        peer_prompt: dict[str, object] = {"type": "user", "message": {"content": [
+            {"type": "text", "text": "Peer update: the Ghostty check remains blocked."}]}}
         for last, status in (([self.said({"type": "text", "text": "— holding: waiting on the tests"})],
                               "— holding: waiting on the tests"),
                              ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
-                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen")):
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "text", "text": "I continue the tests."}),
+                               self.said({"type": "text", "text": "—"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "text", "text": "—"}),
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "tool_use", "name": "Bash"}),
+                               peer_prompt,
+                               self.said({"type": "text", "text": "—"})], "none on screen")):
             with self.subTest(status=status):
                 self.compacted(*last)
                 self.assertEqual(self.tick(START).returncode, 0)

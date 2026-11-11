@@ -1735,6 +1735,10 @@ class ReportTests(unittest.TestCase):
         mac = self.section_lines(text, "### Mac")
         self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### AWS")
         aws = self.section_lines(text, "### AWS")
+        self.assertEqual(aws.count('No spend days.'), 1)
+        self.assertNotIn('| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Storage | Other | Gate runs | Source |', aws)
+        self.assertNotIn('AWS: up ', '\n'.join(aws))
+        self.assertFalse(any(line.startswith('**') for line in aws))
         self.assertEqual(lines[lines.index("### AWS") + len(aws)], "### Mac copies")
         section = self.section_lines(text, "### Mac copies")
         self.assertEqual(section[2], "| Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved"

@@ -478,24 +478,22 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertNotIn("large-peak", final)
         self.assertIn("keep-aside drops 0.0 GiB; free memory rises 9.0 GiB", final)
 
-    def test_release_advice_retains_the_running_ci_keep_aside(self) -> None:
+    def test_release_advice_keeps_ci_use_without_a_margin(self) -> None:
         self.reset_running(available=15, need=11)
         _ = self.running(800, "ending", "clippy", 8, 3, 3600)
         _ = self.running(801, "remaining", "clippy", 1, 1, 3600)
         inputs = gate.queue_read().explanation.decided_from
         ending = next(index for index, step in enumerate(inputs.running) if step.session_id == "id-ending")
         config = records.read_memory_config()
-        for job, expected in ((IdleService(), gate.HeadAdmitsAfterEnd),
-                              (RunningServiceJob(NOW - 120), gate.HeadStillHeld)):
+        for job in (IdleService(), RunningServiceJob(NOW - 120)):
             with self.subTest(job=job):
                 ci = ci_step(4 * GIB, job)
                 captured = replace(inputs, running=(*inputs.running, ci))
                 explanation = gate.queue_read_from(captured, config.policy).explanation
                 outcome = gate.head_after_steps_end(explanation, (ending,))
-                self.assertIsInstance(outcome, expected)
-                assert isinstance(outcome, (gate.HeadAdmitsAfterEnd, gate.HeadStillHeld))
-                expected_room = 8 * GIB if isinstance(job, RunningServiceJob) else 15 * GIB
-                self.assertEqual(outcome.decision.room.room, expected_room)
+                self.assertIsInstance(outcome, gate.HeadAdmitsAfterEnd)
+                assert isinstance(outcome, gate.HeadAdmitsAfterEnd)
+                self.assertEqual(outcome.decision.room.room, 15 * GIB)
 
     def test_release_ties_choose_least_charge_then_running_table_order(self) -> None:
         self.reset_running(available=4, need=14)
