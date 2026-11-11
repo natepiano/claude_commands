@@ -258,13 +258,51 @@ Dwight uses `~/rust/hanadocs/dwight/README.md`, with role `strategist`.
 The first-start path uses this order:
 
 1. Lock the producer's first admission through `staff.slot_operation`.
-2. Reserve the producer's tab in the configured workspace.
-3. Save `PendingProducerAdmission(pane, terminal, kind, home)` at `_producer_admission_path(name)`.
-4. Start without a resume argument through `restart.producer_first_arguments(name)`.
-5. Prove the native identity through `Herdr.producer_admission_launch`.
-6. Admit the row through `staff.ensure("producer", ..., runtime_id=identity)`.
-7. Publish the retained binding through `pane_launch.staff_admitted` under `producer_start`.
-8. Remove the pending admission record after publication succeeds.
+2. Adopt one proved live session with the producer name before a new reservation.
+3. Reserve the producer's tab in the configured workspace.
+4. Save `PendingProducerAdmission(pane, terminal, kind, home)` at `_producer_admission_path(name)`.
+5. Start without a resume argument through `restart.producer_first_arguments(name)`.
+6. Prove the native identity through `Herdr.producer_admission_launch`.
+7. Admit the row through `staff.ensure("producer", ..., runtime_id=identity)`.
+8. Publish the retained binding through `pane_launch.staff_admitted` under `producer_start`.
+9. Remove the pending admission record after publication succeeds.
+
+`producer_conflicts` uses `sessions.running_sessions`, the Codex index, and loaded daemon threads.
+It checks live agents in producer workspace tabs and panes with the producer label.
+An empty labeled shell does not count as a live session.
+`adopt_named_producer` adopts exactly one proved native conversation without a launch.
+It records that session as `current_session` and preserves its account and working folder.
+It records the configured producer folder as the document location.
+It publishes a retained binding when the live session has a proved pane.
+Two live sessions cause refusal before any staff write or launch.
+An unproved live session also causes refusal.
+The refusal names each conflicting session ID and pane on one line.
+An unreadable daemon registry also refuses admission.
+Recovery checks live sessions before it resumes a retained conversation.
+Recovery adopts a different proved live session and removes the pending admission record.
+Recovery resumes the retained conversation only when no other live session carries the producer name.
+
+`agents stop NAME` resolves a producer name to its row's `current_session` before tab label selection.
+Several tabs with the producer label therefore do not select a different conversation.
+The shared native process reader uses Claude's session registry to prove a plain `claude` start.
+The process arguments need no session ID.
+
+`agents remove-stray NAME SESSION` removes a local stray producer conversation.
+The command uses this order:
+
+1. Refuse a session that any staff row records as its `current_session`.
+2. Prove the producer name and native process identity before the stop.
+3. Stop the selected conversation through `stop_resume.stop`.
+4. Delete the admission record if its session ID or proved pane and terminal identify the selected conversation.
+5. Close its proved terminal through `Herdr.close_retained_pane`.
+6. Delete its transcripts across Claude account projects folders through `Path.unlink`.
+
+The pane and terminal match also applies when no retained launch entry exists.
+A repeated command completes cleanup after transcript deletion fails.
+
+Pane closure preserves other panes in the same tab.
+The command adds no permission rule and uses no shell deletion command.
+A repeated command prints `unchanged` when no selected resource remains.
 
 The record path is `<pane record directory>/.producer-admission-<name>`.
 The saved record also holds the folder.

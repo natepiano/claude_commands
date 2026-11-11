@@ -98,6 +98,7 @@ class CommandLine(argparse.Namespace):
     to_doc: str = ""
     to_branch: str = ""
     target: str = ""
+    producer: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -242,6 +243,7 @@ USAGE = """usage: agents COMMAND
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run]
+  agents remove-stray NAME SESSION
 """
 
 
@@ -259,6 +261,107 @@ def _result_code(result: StopResult | ResumeResult) -> int:
     else:
         print(f"{result.session_id}: unchanged")
     return 0
+
+
+@dataclass(frozen=True)
+class StrayProducerPane:
+    """A terminal that contains the selected stray conversation."""
+
+    pane: str
+    terminal: str
+
+
+def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProducerPane]:
+    """Retain only panes with native evidence or an idle retained conversation."""
+    retained = pane_record.read_strict(client.session)
+    record = staff.initial_snapshot()
+    observed = herdr.read_conversation(identity)
+    if isinstance(observed, herdr.UnknownConversation):
+        raise ValueError(observed.reason)
+    selected: list[StrayProducerPane] = []
+    for pane in client.panes():
+        entry = retained.get(pane["pane_id"])
+        retained_identity = ""
+        if entry is not None:
+            owner = record.by_member_reference(entry["session_id"])
+            retained_identity = owner.current_session if owner is not None else entry["session_id"]
+        if isinstance(observed, herdr.StoppedConversation) and retained_identity != identity:
+            continue
+        info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
+                                 "stray pane process info")
+        proved = False
+        for value in herdr.json_items(info.get("foreground_processes"), "stray pane foreground processes"):
+            process = herdr.json_object(value, "stray pane process")
+            pid = process.get("pid")
+            if not isinstance(observed, herdr.LiveConversation) or pid not in observed.pids:
+                continue
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise ValueError("stray pane process has no valid pid")
+            arguments = process.get("argv")
+            if not isinstance(arguments, list):
+                raise ValueError("stray pane process has no arguments")
+            argv = [herdr.json_text(argument, "stray process argument") for argument in cast(list[object], arguments)]
+            matches = herdr.is_claude_process(argv) if observed.kind == "claude" else herdr.is_codex_process(argv)
+            if not matches:
+                raise ValueError(f"{pid}: selected process no longer runs {observed.kind}")
+            native = herdr.native_process(pid, observed.kind)
+            proved = proved or native.current_identity == identity
+        idle_retained = (retained_identity == identity
+                         and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
+        if proved or idle_retained:
+            selected.append(StrayProducerPane(pane["pane_id"], herdr.json_text(pane.get("terminal_id"), "stray terminal")))
+    return selected
+
+
+def remove_stray_producer(name: str, session: str) -> int:
+    """Stop a proved stray and remove its terminal, transcripts, and admission record."""
+    identity = str(staff.native_id(session))
+    admission = stop_resume.producer_admission_record(name)
+    with staff.slot_operation("producer-first-" + name, name), staff.row_operation(name):
+        record = staff.initial_snapshot()
+        owners = [row for row in record.rows if row.kind == "producer" and row.name == name]
+        if len(owners) > 1:
+            raise ValueError(f"{name}: several producer rows match")
+        if any(row.current_session == identity for row in record.rows):
+            raise ValueError(f"{identity}: current_session belongs to a staff row; removal refused")
+        client = herdr.Herdr(herdr.shared_session())
+        panes = stray_producer_panes(client, identity)
+        saved: dict[str, object] = {}
+        if admission.exists():
+            saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
+        retained = pane_record.read_strict(client.session)
+        admission_matches = saved.get("session_id") == identity
+        for pane in panes:
+            if saved.get("pane") == pane.pane and saved.get("terminal") == pane.terminal:
+                admission_matches = True
+            entry = retained.get(pane.pane)
+            if entry is not None and saved.get("pane") == pane.pane:
+                owner = record.by_member_reference(entry["session_id"])
+                retained_identity = owner.current_session if owner is not None else entry["session_id"]
+                admission_matches = admission_matches or retained_identity == identity
+        observed = herdr.read_conversation(identity)
+        if isinstance(observed, herdr.UnknownConversation):
+            raise ValueError(observed.reason)
+        changed = bool(panes)
+        if isinstance(observed, herdr.LiveConversation):
+            conflicts = stop_resume.producer_conflicts(name, client)
+            if not any(found == identity or any(place == pane.pane for pane in panes) for found, place in conflicts):
+                raise ValueError(f"{identity}: session has no producer name or pane proof for {name}")
+            result = stop_resume.stop(identity, observed.kind, deadline=worker_lifecycle.effective_deadline())
+            if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+                return _result_code(result)
+            changed = True
+        if admission_matches:
+            admission.unlink(missing_ok=True)
+            changed = True
+        for pane in panes:
+            if not client.close_retained_pane(pane.pane, terminal=pane.terminal):
+                raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
+        for path in sessions.transcript_locations(identity):
+            path.unlink()
+            changed = True
+        print(f"{identity}: {'removed stray' if changed else 'unchanged'}")
+        return 0
 
 
 def _message(row: staff.StaffRow, text: str) -> restart_support.MessageSendOutcome:
@@ -384,6 +487,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = selection.add_argument("session", nargs="?")
     _ = selection.add_argument("--all", action="store_true")
     _ = command.add_argument("--dry-run", action="store_true")
+    command = commands.add_parser("remove-stray")
+    _ = command.add_argument("producer", metavar="NAME")
+    _ = command.add_argument("session", metavar="SESSION")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -431,6 +537,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--session", dest="account", required=True)
     options = parser.parse_args(arguments, namespace=CommandLine())
     try:
+        if options.command == "remove-stray":
+            return remove_stray_producer(options.producer, options.session)
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run)
         if options.command == "move":
@@ -518,7 +626,8 @@ def main(argv: list[str] | None = None) -> int:
     except staff.StaffRefused as error:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
         return 2
-    except (OSError, ValueError, staff.StaffNotFound, UnknownAccountName, UnreadableAccount, InvalidInventory) as error:
+    except (OSError, ValueError, staff.StaffNotFound, UnknownAccountName, UnreadableAccount,
+            InvalidInventory, herdr_types.HerdrFailure) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
 

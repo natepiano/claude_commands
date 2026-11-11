@@ -1,6 +1,6 @@
 ---
 description: Show, pause, exit, retire, rename, move, resume, stop, or restart sessions.
-argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run]'
+argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION'
 ---
 
 Use the `agents` program.
@@ -21,6 +21,32 @@ Use the `agents` program.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
+- `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
+
+First admission adopts one proved live Claude session or Codex thread with the producer name.
+It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
+Adoption writes the staff row with that native session. It launches nothing.
+Two live sessions cause refusal. An unproved live session also causes refusal.
+The refusal names each conflicting session and pane. It writes no staff row.
+An empty labeled shell does not count as a live session.
+Recovery checks live sessions before it resumes a retained conversation.
+Recovery adopts a different proved live session and removes the pending admission record.
+Stop selects the producer row's `current_session` when several tabs have the same label.
+The Claude session registry proves a plain start without a session ID in its arguments.
+
+Remove a stray producer with these steps:
+
+1. Run `agents remove-stray NAME SESSION` with the stray session ID.
+2. Read the command result.
+
+The command refuses any staff row's `current_session`.
+It proves the selected process before it sends a signal.
+It closes only the selected pane. Other panes in the tab stay open.
+It deletes the selected transcript files across Claude account projects folders with Python.
+It removes a producer admission record that matches the session or the proved pane and terminal.
+It removes the matching admission record before pane closure and transcript deletion.
+A repeated command completes cleanup after transcript deletion fails.
+A repeated command prints `unchanged` when nothing remains.
 
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
 Resume removes the record. A paused director receives one continuation message.
