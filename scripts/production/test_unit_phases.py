@@ -131,7 +131,7 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(session=session):
                 rendered = unit_phases.table([unit("namecheck", session)], {})
                 expected = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
-                self.assertEqual(rendered.splitlines()[2], f"| namecheck | {expected} | — | — | — | — | — | — |")
+                self.assertEqual(rendered.splitlines()[2], f"| namecheck | {expected} | — | — | — | — | — | — | — |")
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         plan = self.root / "outside-plan.md"
@@ -154,19 +154,20 @@ class UnitPhasesTests(unittest.TestCase):
             "working_dir": str(self.root), "plan_doc": plan.name}))
         outside = cast(dict[str, object], json.loads(phase_table.show(run_folder, ZoneInfo("UTC"), json_output=True)))
         self.assertIsInstance(outside["current"], dict)
-        cases: list[tuple[object, str]] = [
-            (open_record(self.root / "plan.md"), "phase 3 of 7 — Every session records itself"),
-            ({"current": None, "phases": phase_rows("done", "done", "todo")}, "between phases, 2 of 3 done"),
-            ({"current": None, "phases": phase_rows("todo", "todo")}, "not started"),
-            ({"current": None, "phases": phase_rows("done", "done")}, "plan done"),
-            ({"current": None, "phases": []}, "no phases"),
-            ({"unavailable": "Unable to read plan"}, "no plan"),
-            (None, "—"),
-            (outside, "not started"),
+        cases: list[tuple[object, str, str]] = [
+            (open_record(self.root / "plan.md"), "2/7", "phase 3 — Every session records itself"),
+            ({"current": None, "phases": phase_rows("done", "done", "todo")}, "2/3", "between phases"),
+            ({"current": None, "phases": phase_rows("todo", "todo")}, "0/2", "not started"),
+            ({"current": None, "phases": phase_rows("done", "done")}, "2/2", "plan done"),
+            ({"current": None, "phases": []}, "—", "no phases"),
+            ({"unavailable": "Unable to read plan"}, "—", "no plan"),
+            (None, "—", "—"),
+            (outside, "0/1", "not started"),
         ]
-        for record, expected in cases:
+        for record, count, expected in cases:
             with self.subTest(expected=expected):
-                self.assertEqual(unit_phases.phase_cell(record), expected)
+                self.assertEqual(unit_phases.phase_cell(record), count)
+                self.assertEqual(unit_phases.notes_cell(record), expected)
 
     def test_task_is_the_newest_open_activity_before_the_open_pass(self) -> None:
         self.assertEqual(self.task(
@@ -186,7 +187,7 @@ class UnitPhasesTests(unittest.TestCase):
         with patch.object(plan_history, "plan_runs", return_value=[self.run_file(
                 event("phase_started"), event("pass_started", pass_instance_id="p1", pass_kind="impl",
                                               pass_activity="writing the table"))]):
-            self.assertEqual(unit_phases.phase_cell(record), "phase 3 of 7 — impl: writing the table")
+            self.assertEqual(unit_phases.notes_cell(record), "phase 3 — impl: writing the table")
 
     def test_no_task_is_shown_once_its_step_or_phase_has_closed(self) -> None:
         self.assertEqual(self.task(
@@ -211,10 +212,19 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertTrue(task.startswith("Verification: verify.sh test hana --filter"))
         self.assertTrue(task.endswith("…"))
         with patch.object(plan_history, "plan_runs", return_value=[self.root / "run.jsonl"]):
-            cell = unit_phases.phase_cell(open_record(self.root / "plan.md"))
+            cell = unit_phases.notes_cell(open_record(self.root / "plan.md"))
         self.assertEqual(len(cell), unit_phases.TASK_WIDTH)
-        self.assertTrue(cell.startswith("phase 3 of 7 — Verification: verify.sh test hana"))
+        self.assertTrue(cell.startswith("phase 3 — Verification: verify.sh test hana"))
         self.assertTrue(cell.endswith("…"))
+        record = open_record(self.root / "plan.md")
+        current = record.current
+        assert isinstance(current, phase_table.OpenPhase)
+        for title, fix_done, expected in (
+                ("x" * 100, 0, "phase 3 — " + "x" * 69 + "…"),
+                ("x" * 56, 2, "phase 3 — " + "x" * 56 + " · fix rounds…")):
+            with self.subTest(title=title, fix_done=fix_done), patch.object(plan_history, "plan_runs", return_value=[]):
+                sample = record._replace(current=replace(current, title=title, fix_done=fix_done))
+                self.assertEqual(unit_phases.notes_cell(sample), expected)
 
     def test_non_phase_work_and_queued_items_share_the_units_row(self) -> None:
         owner = fixture_member("showrunner", name="table-owner")
@@ -258,16 +268,16 @@ class UnitPhasesTests(unittest.TestCase):
         selected = unit("messaging", live("messaging"))
         records: dict[str, object] = {"messaging": {"current": None, "phases": phase_rows("todo")}}
         with self.subTest(run="newest unfinished"):
-            self.assertIn("| messaging | idle | ░ 0/1 | not started | — | — | outside-b: impl: write newest | Review delivery +1 more · plan: phase 1: Delivery 1 |",
+            self.assertIn("| messaging | idle | ⬜ | 0/1 | not started | — | — | outside-b: impl: write newest | Review delivery +1 more · plan: phase 1: Delivery 1 |",
                           unit_phases.table([selected], records))
         _ = run("finished", member, "finished", 3, event("run_finished", summary="x" * 32_000))
         with self.subTest(run="newest finished"):
-            self.assertIn("| messaging | idle | ░ 0/1 | not started | — | — | — | Review delivery +1 more · plan: phase 1: Delivery 1 |",
+            self.assertIn("| messaging | idle | ⬜ | 0/1 | not started | — | — | — | Review delivery +1 more · plan: phase 1: Delivery 1 |",
                           unit_phases.table([selected], records))
         former = replace(member, current_session=staff.StaffId(fixture_runtime_id("previous-director")))
         _ = run("former", former, "previous-session", 4, use_timestamp=True)
         with self.subTest(run="newest from a previous session"):
-            self.assertIn("| messaging | idle | ░ 0/1 | not started | — | — | previous-session: impl: write former | Review delivery +1 more · plan: phase 1: Delivery 1 |",
+            self.assertIn("| messaging | idle | ⬜ | 0/1 | not started | — | — | previous-session: impl: write former | Review delivery +1 more · plan: phase 1: Delivery 1 |",
                           unit_phases.table([selected], records))
 
         newest = run("multi", member, "outside-a", 5,
@@ -282,13 +292,15 @@ class UnitPhasesTests(unittest.TestCase):
         with patch.object(display_cells, "run_events", wraps=display_cells.run_events) as whole_reads:
             rendered = unit_phases.table([selected], records)
         self.assertEqual([call.args[0] for call in whole_reads.call_args_list], [newest])
-        self.assertIn("| messaging | idle | ▓ 0/1 | phase 1 of 1 — impl: planned task | — | — | outside-b: impl: write newest +1 more | Review delivery +1 more |", rendered)
-        records["messaging"] = {"current": None, "phases": []}
-        self.assertIn("| messaging | idle | — | no phases | — | — | 1: impl: planned task +2 more | Review delivery +1 more |",
-                      unit_phases.table([selected], records))
-        records["messaging"] = {"unavailable": "no plan"}
-        self.assertIn("| messaging | idle | — | no plan | — | — | 1: impl: planned task +2 more | Review delivery +1 more |",
-                      unit_phases.table([selected], records))
+        self.assertIn("| messaging | idle | 🟨 | 0/1 | phase 1 — impl: planned task | — | — | outside-b: impl: write newest +1 more | Review delivery +1 more |", rendered)
+        notes_cases: tuple[tuple[dict[str, object], str], ...] = (
+            ({"current": None, "phases": []}, "no phases"),
+            ({"unavailable": "no plan"}, "no plan"))
+        for sample, notes in notes_cases:
+            with self.subTest(notes=notes):
+                records["messaging"] = sample
+                self.assertIn(f"| messaging | idle | — | — | {notes} | — | — | 1: impl: planned task +2 more | Review delivery +1 more |",
+                              unit_phases.table([selected], records))
         long_text = "Review delivery " + "x" * 120
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": member.current_session, "CODEX_THREAD_ID": ""}):
             with contextlib.redirect_stdout(io.StringIO()):
@@ -306,10 +318,10 @@ class UnitPhasesTests(unittest.TestCase):
             event("activity_started", phase_id="outside-c", activity_instance_id="a1",
                   activity_label="Verification", activity_text="check " + "x" * 150))
         cells = [cell.strip() for cell in unit_phases.table([selected], records).splitlines()[2].split("|")[1:-1]]
-        self.assertTrue(cells[6].startswith("outside-c: Verification: check"))
-        self.assertEqual(len(cells[6].removesuffix(" +3 more")), 80)
-        self.assertTrue(cells[6].endswith("… +3 more"))
-        queue = cells[7].split(" · ", 1)[0]
+        self.assertTrue(cells[7].startswith("outside-c: Verification: check"))
+        self.assertEqual(len(cells[7].removesuffix(" +3 more")), 80)
+        self.assertTrue(cells[7].endswith("… +3 more"))
+        queue = cells[8].split(" · ", 1)[0]
         self.assertTrue(queue.startswith("Review delivery"))
         self.assertEqual(len(queue.removesuffix(" +1 more")), 80)
         self.assertTrue(queue.endswith("… +1 more"))
@@ -319,7 +331,7 @@ class UnitPhasesTests(unittest.TestCase):
         with contextlib.redirect_stderr(errors):
             rendered = unit_phases.table([selected, unit("another-unit", None)], records)
         self.assertIn("| queue unreadable |", rendered)
-        self.assertIn("| another-unit | exited | — | — | — | — | another-phase: impl: write unrelated | — |", rendered)
+        self.assertIn("| another-unit | exited | — | — | — | — | — | another-phase: impl: write unrelated | — |", rendered)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertTrue(errors.getvalue().startswith(f"unit_phases: {path}: "))
 
@@ -333,19 +345,30 @@ class UnitPhasesTests(unittest.TestCase):
         current = small.current
         assert isinstance(current, phase_table.OpenPhase)
         fixed = replace(current, fix_done=2, fix_open_passes=1)
-        cases = [
-            (small, "███▓░░ 3/6"),
-            (small._replace(current=fixed), "███▓░░ 3/6 · fix rounds 3 + 1 running"),
-            (typed_record(self.root / "plan.md"), "—"),
-            (typed_record(self.root / "plan.md", *(["done"] * 44 + ["todo"])), "█" * 19 + "░ 44/45"),
+        cases: list[tuple[object, str, str, str]] = [
+            (small, "🟩🟩🟩🟨⬜⬜", "3/6", "phase 4 — Delivery 4"),
+            (small._replace(current=fixed), "🟩🟩🟩🟨⬜⬜", "3/6",
+             "phase 4 — Delivery 4 · fix rounds 3 + 1 running"),
+            (small._replace(current=replace(current, fix_done=2)), "🟩🟩🟩🟨⬜⬜", "3/6",
+             "phase 4 — Delivery 4 · fix rounds 2"),
+            (typed_record(self.root / "plan.md"), "—", "—", "no phases"),
+            (typed_record(self.root / "plan.md", "done"), "🟩", "1/1", "plan done"),
+            (typed_record(self.root / "plan.md", "todo"), "⬜", "0/1", "not started"),
+            ({"phases": [{"phase": "1", "status": "open"}]}, "🟨", "0/1", "not started"),
+            (typed_record(self.root / "plan.md", *(["done"] * 20)), "🟩" * 20, "20/20", "plan done"),
+            (typed_record(self.root / "plan.md", *(["done"] * 44 + ["todo"])),
+             "🟩" * 19 + "⬜", "44/45", "between phases"),
         ]
         large = ["done"] * 132
         for index, status in ((0, "todo"), (5, "running"), (6, "todo"), (12, "todo"), (125, "running")):
             large[index] = status
-        cases.append((typed_record(self.root / "plan.md", *large), "▓░" + "█" * 17 + "▓ 127/132"))
-        for record, expected in cases:
+        cases.append((typed_record(self.root / "plan.md", *large), "🟨⬜" + "🟩" * 17 + "🟨",
+                      "127/132", "phase 126 — Delivery 126"))
+        for record, expected, count, notes in cases:
             with self.subTest(expected=expected):
                 self.assertEqual(unit_phases.progress_cell(record), expected)
+                self.assertEqual(unit_phases.phase_cell(record), count)
+                self.assertEqual(unit_phases.notes_cell(record), notes)
 
     def test_eta_uses_the_latest_promise_and_local_calendar_time(self) -> None:
         record = typed_record(self.root / "plan.md", "running")
@@ -427,7 +450,7 @@ class UnitPhasesTests(unittest.TestCase):
                     snapshot=staff.snapshot(), pane_rows=panes,
                     runs_reader=worker_runs.WorkerRuns(1060, process_reader=lambda: {120}))
             self.assertEqual(rendered.splitlines()[2],
-                "| workers | exited | — | — | — | reader waiting on run: Tests 1m | — | — |")
+                "| workers | exited | — | — | — | — | reader waiting on run: Tests 1m | — | — |")
         self.assertEqual(requested, [member.id])
 
     def test_queued_combines_outside_work_with_only_waiting_plan_phases(self) -> None:
@@ -481,12 +504,20 @@ class UnitPhasesTests(unittest.TestCase):
         run = history / "run-2.jsonl"
         open_events = run.read_text()
         records: dict[str, object] = {"fallback": typed_record(self.root / "as-built.md")}
-        for finished, missing, progress, eta, queued in (
-                (False, False, "█▓ 1/2", "18:30 · ends 18:30", "plan: phase 3: New work +1 more"),
-                (True, False, "—", "—", "plan: phase 2: Open work +2 more"),
-                (False, True, "█▓ 1/2", "18:30 · ends 18:30", "—")):
-            with self.subTest(finished=finished, missing=missing):
-                _ = run.write_text(open_events + (event("run_finished") + "\n" if finished else ""))
+        for finished, missing, fixing, progress, notes, eta, queued in (
+                (False, False, False, "🟩🟨", "phase 2 — Open work",
+                 "18:30 · ends 18:30", "plan: phase 3: New work +1 more"),
+                (True, False, False, "—", "no phases", "—", "plan: phase 2: Open work +2 more"),
+                (False, False, True, "🟩🟨", "phase 2 — fix: repair Notes · fix rounds 1 + 1 running",
+                 "18:30 · ends 18:30", "plan: phase 3: New work +1 more"),
+                (False, True, False, "🟩🟨", "phase 2 — Open work", "18:30 · ends 18:30", "—")):
+            with self.subTest(finished=finished, missing=missing, fixing=fixing):
+                tail = (event("pass_started", phase_id="2", phase_instance_id="open-2",
+                              pass_instance_id="fix-2", pass_kind="fix", pass_activity="repair Notes")
+                        + "\n" if fixing else "")
+                _ = run.write_text(open_events + tail + (event("run_finished") + "\n" if finished else ""))
+                records["fallback"] = ({"plan": str(newest), "phases": [], "current": None} if fixing
+                                       else typed_record(self.root / "as-built.md"))
                 folder = self.root / "runs" / "run-2"
                 folder.mkdir(parents=True, exist_ok=True)
                 _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
@@ -501,8 +532,9 @@ class UnitPhasesTests(unittest.TestCase):
                     rendered = unit_phases.table([unit("fallback", None)], records, pane_rows={},
                                                 now=now, zone=ZoneInfo("UTC"))
                 cells = [cell.strip() for cell in rendered.splitlines()[2].split("|")[1:-1]]
-                self.assertEqual(cells[2:5], [progress, "no phases", eta])
-                self.assertEqual(cells[6:], ["—" if finished else "2: —", queued])
+                self.assertEqual(cells[2:6], [progress, "—" if finished else "1/2", notes, eta])
+                self.assertEqual(cells[7:], ["—" if finished else
+                    "2: fix: repair Notes" if fixing else "2: —", queued])
                 self.assertEqual([call.args[0] for call in reads.call_args_list], [run])
 
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
@@ -523,10 +555,10 @@ class UnitPhasesTests(unittest.TestCase):
                 first_machine = " natedev |" if machine == "mac" else ""
                 second_machine = " mac |" if machine == "mac" else ""
                 self.assertEqual(unit_phases.table(units, records), "\n".join([
-                    f"| Unit | Status |{column} Progress | Phase | ETA | Workers | Non-Phase Work | Queued |",
-                    f"| --- | --- |{separator} --- | --- | --- | --- | --- | --- |",
-                    f"| one | idle |{first_machine} ▓░ 0/2 | phase 1 of 2 — a\\|b | no ETA | — | — | plan: phase 2: Delivery 2 |",
-                    f"| two | exited |{second_machine} — | — | — | — | — | — |",
+                    f"| Unit | Status |{column} Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |",
+                    f"| --- | --- |{separator} --- | --- | --- | --- | --- | --- | --- |",
+                    f"| one | idle |{first_machine} 🟨⬜ | 0/2 | phase 1 — a\\|b | no ETA | — | — | plan: phase 2: Delivery 2 |",
+                    f"| two | exited |{second_machine} — | — | — | — | — | — | — |",
                 ]))
 
         config = self.root / "table-conf/build_targets.conf"
@@ -534,11 +566,11 @@ class UnitPhasesTests(unittest.TestCase):
         _ = config.write_text(configured.replace("kind.natedev=local", "kind.natedev=ssh\nkind.fixture-home=local"))
         selected = unit("one", live("a|b"))._replace(machine="fixture-home")
         self.assertEqual(unit_phases.table([selected], records).splitlines()[0],
-                         "| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |")
+                         "| Unit | Status | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |")
         _ = config.write_text(configured)
 
         records = {"one": typed_record(self.root / "plan.md", "todo")}
-        self.assertIn("| one | idle | ░ 0/1 | not started | — | — | — | plan: phase 1: Delivery 1 |",
+        self.assertIn("| one | idle | ⬜ | 0/1 | not started | — | — | — | plan: phase 1: Delivery 1 |",
                       unit_phases.table([unit("one", live("a|b"))], records))
 
     def test_plain_table_reads_live_activity_and_staff_holds_even_when_gone(self) -> None:
@@ -563,15 +595,15 @@ class UnitPhasesTests(unittest.TestCase):
                 return unit_phases.table(live_units.units_in(owner.name, every), {})
 
         initial = render()
-        self.assertIn("| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |", initial)
-        self.assertIn("| first | idle | — | — | — | — | — | — |", initial)
+        self.assertIn("| Unit | Status | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |", initial)
+        self.assertIn("| first | idle | — | — | — | — | — | — | — |", initial)
         _ = staff.pause(second.id, "review the change")
         paused = render()
-        self.assertIn("| first | idle | — | — | — | — | — | — |", paused)
-        self.assertIn("| second | paused | — | — | — | — | — | — |", paused)
+        self.assertIn("| first | idle | — | — | — | — | — | — | — |", paused)
+        self.assertIn("| second | paused | — | — | — | — | — | — | — |", paused)
         _ = staff.resume(second.id)
         resumed = render()
-        self.assertIn("| second | exited | — | — | — | — | — | — |", resumed)
+        self.assertIn("| second | exited | — | — | — | — | — | — | — |", resumed)
         for activity, hold, expected in (("busy", "", "busy"), ("shell", "", "idle"),
                                          ("busy", "pause", "paused"), ("busy", "exit", "exited")):
             with self.subTest(activity=activity, hold=hold):
@@ -588,7 +620,7 @@ class UnitPhasesTests(unittest.TestCase):
                       patch.object(session_state, "classify", wraps=session_state.classify) as states):
                     units = live_units.units_in(owner.name, every)
                     self.assertEqual(units[0].status, expected)
-                    self.assertIn(f"| first | {expected} | — | — | — | — | — | — |", unit_phases.table(units, {}, snapshot=snapshot, pane_rows={}))
+                    self.assertIn(f"| first | {expected} | — | — | — | — | — | — | — |", unit_phases.table(units, {}, snapshot=snapshot, pane_rows={}))
                     staff_read.assert_called_once_with()
                     self.assertEqual(states.call_count, len(units))
         _ = staff.resume(first.id)
@@ -617,12 +649,12 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertEqual(units[0].machine, machine)
                     output = unit_phases.table(units, {}, snapshot=snapshot, pane_rows={})
                     if machine == "mac":
-                        self.assertIn("| Unit | Status | Machine | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |", output)
-                        self.assertIn(f"| first | {expected} | mac | — | — | — | — | — | — |", output)
-                        self.assertIn("| second | exited | — | — | — | — | — | — | — |", output)
+                        self.assertIn("| Unit | Status | Machine | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |", output)
+                        self.assertIn(f"| first | {expected} | mac | — | — | — | — | — | — | — |", output)
+                        self.assertIn("| second | exited | — | — | — | — | — | — | — | — |", output)
                     else:
                         self.assertNotIn("Machine", output)
-                        self.assertIn(f"| first | {expected} | — | — | — | — | — | — |", output)
+                        self.assertIn(f"| first | {expected} | — | — | — | — | — | — | — |", output)
                 staff_read.assert_called_once_with()
 
     def test_read_failures_print_below_the_table_and_send_one_configured_message(self) -> None:
@@ -763,7 +795,7 @@ class UnitPhasesTests(unittest.TestCase):
               contextlib.redirect_stdout(out)):
             self.assertEqual(unit_phases.main([]), 0)
         found.assert_called_once_with()
-        self.assertIn("| a | idle | — | — | — | — | — | — |", out.getvalue())
+        self.assertIn("| a | idle | — | — | — | — | — | — | — |", out.getvalue())
 
     def test_a_session_that_is_no_showrunner_is_told_to_name_the_production(self) -> None:
         err = io.StringIO()
@@ -798,6 +830,19 @@ class UnitPhasesTests(unittest.TestCase):
         locate.assert_called_once_with(self.root)
         phases.assert_not_called()
         self.assertEqual(output.getvalue(), "ticket table\n")
+
+        unordered = [unit("zulu", live("zulu")), units[0], unit("Alpha", live("Alpha"))]
+        output = io.StringIO()
+        with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(unordered, ())),
+              patch.object(phase_table, "show_production", return_value=json.dumps(records)),
+              patch.object(style_units, "table", return_value="sorted ticket table") as tickets,
+              patch.object(style_ledger, "ledger_location", return_value=style_ledger.LedgerLocation(
+                  self.root, self.root / "ledger.sqlite")),
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(unit_phases.main(["--production", "show"]), 0)
+        tickets.assert_called_once_with([unordered[2], units[0], unordered[0]], records, doc=doc,
+                                        ledger_paths={"names": self.root / "ledger.sqlite"})
+        self.assertEqual(output.getvalue(), "sorted ticket table\n")
 
     def test_product_parent_reports_direct_style_units_and_product_units(self) -> None:
         from scripts.style import style_config
@@ -840,7 +885,24 @@ class UnitPhasesTests(unittest.TestCase):
                       patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
                     self.assertEqual(unit_phases.main(["--production", "show"]), 0)
                 tickets.assert_not_called()
-                self.assertEqual(output.getvalue(), "| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| a | idle | — | — | — | — | — | — |\n")
+                self.assertEqual(output.getvalue(), "| Unit | Status | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| a | idle | — | — | — | — | — | — | — |\n")
+
+                unordered = [unit("zulu", live("zulu"))._replace(machine="natedev"),
+                             unit("Beta", live("Beta"))._replace(machine="mac"),
+                             unit("alpha", live("alpha"))._replace(machine="natedev")]
+                output = io.StringIO()
+                with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(unordered, ())),
+                      patch.object(unit_phases, "production_records", return_value={}),
+                      patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
+                    self.assertEqual(unit_phases.main(["--production", "show"]), 0)
+                tickets.assert_not_called()
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "| Unit | Status | Machine | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |",
+                    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                    "| alpha | idle | natedev | — | — | — | — | — | — | — |",
+                    "| Beta | idle | mac | — | — | — | — | — | — | — |",
+                    "| zulu | idle | natedev | — | — | — | — | — | — | — |",
+                ])
 
     def test_a_missing_plan_folder_keeps_ledger_data_and_an_unresolved_worktree_keeps_its_row(self) -> None:
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)

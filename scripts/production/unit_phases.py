@@ -112,7 +112,7 @@ def record_fields(record: object) -> PlanCellRecord:
 
 
 def progress_cell(record: object) -> str:
-    """Show phase states and the open phase's repair rounds."""
+    """Show phase states as a colored bar."""
     rows = plan_phase_rows(record_fields(record))
     if not rows:
         return display_cells.NONE
@@ -120,13 +120,8 @@ def progress_cell(record: object) -> str:
     cells: list[str] = []
     for index in range(size):
         states = {row.get("status") for row in rows[index * len(rows) // size:(index + 1) * len(rows) // size]}
-        cells.append("▓" if states & {"running", "open"} else "░" if "todo" in states else "█")
-    result = "".join(cells) + f" {sum(row.get('status') == 'done' for row in rows)}/{len(rows)}"
-    if isinstance(record, phase_table.PhaseRecord) and isinstance(record.current, phase_table.OpenPhase):
-        current = record.current
-        if current.fix_rounds:
-            result += f" · fix rounds {current.fix_rounds}" + (" + 1 running" if current.fix_running else "")
-    return result
+        cells.append("🟨" if states & {"running", "open"} else "⬜" if "todo" in states else "🟩")
+    return "".join(cells)
 
 
 def elapsed_text(seconds: float) -> str:
@@ -195,8 +190,14 @@ def plan_phase_rows(fields: PlanCellRecord) -> list[PlanCellPhase]:
     return fields.get("phases", [])
 
 
-def phase_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
-    """Show the open phase and its task, or the plan's current state."""
+def phase_cell(record: object) -> str:
+    """Show the completed phase count and total."""
+    rows = plan_phase_rows(record_fields(record))
+    return f"{sum(row.get('status') == 'done' for row in rows)}/{len(rows)}" if rows else display_cells.NONE
+
+
+def notes_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
+    """Show the current phase, task, and repair rounds."""
     fields = record_fields(record)
     if not fields:
         return display_cells.NONE
@@ -212,12 +213,17 @@ def phase_cell(record: object, *, read_run: RunEventsReader = read_work_events) 
             return "no phases"
         if done == len(phases):
             return "plan done"
-        return f"between phases, {done} of {len(phases)} done" if done else "not started"
+        return "between phases" if done else "not started"
     phase = current
     task = task_cell(fields, read_run=read_run)
     if task == display_cells.NONE:
         task = str(phase.get("title", ""))
-    return shortened(f"phase {phase.get('phase')} of {phase.get('of')} — {task}")
+    parts = [f"phase {phase.get('phase')} — {task}"]
+    if isinstance(record, phase_table.PhaseRecord) and isinstance(record.current, phase_table.OpenPhase):
+        current = record.current
+        if current.fix_rounds:
+            parts.append(f"fix rounds {current.fix_rounds}" + (" + 1 running" if current.fix_running else ""))
+    return shortened(" · ".join(parts))
 
 
 def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
@@ -431,7 +437,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             print(f"unit_phases: workers: {error}", file=sys.stderr)
             pane_rows = {}
     machines = display_cells.machine_column([unit.machine for unit in units])
-    headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA",
+    headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "Notes", "ETA",
                worker_heading(), "Non-Phase Work", "Queued")
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(("---",) * len(headers)) + " |"]
     for index, unit in enumerate(units):
@@ -458,8 +464,9 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 rows = worker_runs.observe_pane_rows(session_directory(run), pane_rows.get(member.id, []),
                                                      snapshot, member.id, read_run(run.path), runs_reader)
                 workers = workers_cell(rows, now=now)
+        notes_record = progress_record if plan_phase_rows(record_fields(progress_record)) else record
         cells = (unit.unit, unit.status, *((machines[index],) if machines else ()),
-                 progress_cell(progress_record), phase_cell(record, read_run=read_run),
+                 progress_cell(progress_record), phase_cell(progress_record), notes_cell(notes_record, read_run=read_run),
                  eta_cell(progress_record, now=now, zone=zone), workers, other, queued)
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
     return "\n".join(lines)
@@ -565,7 +572,7 @@ def main(arguments: list[str]) -> int:
                 records = (cast(dict[str, object], json.loads(phase_table.show_production(doc)))
                            if style else production_records(doc))
                 listing = sessions.result()
-                units = listing.units
+                units = sorted(listing.units, key=lambda unit: unit.unit.casefold())
             configured: set[str] = set()
             if not style and style_config.has_style_units(doc.read_text().splitlines()):
                 configured = {assignment.unit for assignment in style_config.read_config(doc).assignments}

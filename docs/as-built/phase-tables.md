@@ -268,7 +268,17 @@ It excludes retired work under a reused phase number.
 `eta_trail` holds actual promises; `schedule_end` holds the prediction used for later phases.
 A passed promise remains visible as late, while the schedule advances for future work.
 Typical completed-phase durations and gaps predict the remaining phases.
-The Units table only formats these facts.
+The Units table formats these facts and sorts unit names without case distinctions.
+Progress shows only a bar: `🟩` done, `🟨` open, and `⬜` not started.
+It uses at most 20 equal groups, with open before not started before done.
+All three characters use the same display width, and the bar has no text cut.
+Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
+Notes follows Phase and contains the open phase's id, step, and task, or its title without a step.
+Without an open phase, Notes shows the plan state.
+Repair rounds append `fix rounds <n>[ + 1 running]` in Notes when the count exceeds zero.
+Notes joins parts with ` · ` and cuts text at 80 characters with `…`.
+An open run supplies Progress, Phase, and ETA when the plan has no phases.
+The optional Machine column stays directly after Status.
 
 ## The short report
 

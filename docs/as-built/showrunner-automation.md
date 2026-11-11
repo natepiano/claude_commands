@@ -629,22 +629,24 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
+  - **Phase productions:** `| Unit | Status | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |`.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
     Both tables add a **Machine** column after **Status** only when a row runs on another machine.
     The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
     `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
     `worker.py list --json` keeps its existing fields.
-    Phase shows `phase <n> of <m> — <task>`.
-    The task uses the newest plan run's open step, then the phase title.
-    Other phase states include `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
-    Cells limit task text to 80 characters and end longer text with `…`.
-    Progress uses `█` for done, `▓` for open, and `░` for todo, followed by `<done>/<total>`.
-    Plans above 20 phases use 20 equal groups, with open before todo before done.
-    Repair rounds append `fix rounds <n>` and `+ 1 running` when applicable.
-    When the plan has no phases, an open run supplies Progress and ETA from its full event history.
-    This fallback changes neither Phase, Non-Phase Work, nor Queued.
+    Both tables sort unit names without case distinctions before they select their rows.
+    Progress shows only `🟩` done, `🟨` open, and `⬜` not started.
+    Plans above 20 phases use 20 equal groups, with open before not started before done.
+    The bar has no text cut, and all three characters use the same display width.
+    Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
+    Notes shows `phase <id> — <step>: <task>`, with the phase title when no step is open.
+    Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+    Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
+    Notes limits text to 80 characters and ends longer text with `…`.
+    When the plan has no phases, an open run supplies Progress, Phase, and ETA from its full event history.
+    This fallback changes neither Notes, Non-Phase Work, nor Queued.
     A finished newest run supplies no fallback.
     ETA uses the latest stated promise from `eta_trail`, never `schedule_end`.
     Passed promises add `late <elapsed>`; open phases without promises show `no ETA`.

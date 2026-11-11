@@ -8,7 +8,7 @@ Run this in the showrunner session. Run
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's staff row. Print its total line too, when present.
-Both tables show only the production's staff units.
+Both tables show only the production's staff units, sorted by unit name without case distinctions.
 For the phase table, **Status** is `busy`, `idle`, `paused` or `exited`.
 The accounts board uses the same status rule. An exit record gives `exited`.
 A pause record gives `paused`, even with no live session.
@@ -22,35 +22,38 @@ Both tables add a **Machine** column after **Status** only when a row runs on an
 The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
 
 For units outside the `Style units` table in a production without `Kind: style`, the table is:
-`| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
+`| Unit | Status | Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |`.
 
-1. **Progress** shows `█` done, `▓` open, and `░` todo, followed by `<done>/<total>`.
+1. **Progress** shows only a bar: `🟩` done, `🟨` open, and `⬜` not started.
    It uses one cell per phase, or 20 equal groups above 20 phases.
-   An open phase takes priority over todo, then done.
-   Repair rounds append ` · fix rounds <n>[ + 1 running]` when the count exceeds zero.
-   When the plan has no phases, an open run supplies Progress and ETA from its recorded phases.
-   A finished newest run supplies neither value.
+   An open phase takes priority over not started, then done.
+   All three characters use the same display width.
    With no recorded phases, Progress gives `—`.
-2. **Phase** shows `phase <n> of <total> — <step>: <task>` for the open phase.
+2. **Phase** shows `<done>/<total>` from the same phases as Progress, or `—` with no phases.
+   When the plan has no phases, an open run supplies Progress, Phase, and ETA from its recorded phases.
+   A finished newest run supplies no fallback.
+3. **Notes** shows `phase <id> — <step>: <task>` for the open phase.
    The newest run supplies the open step; no step uses the phase title.
-   Other states remain `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
-3. **ETA** shows the latest stated promise, with ` · late <elapsed>` after that promise passes.
+   Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+   Repair rounds append ` · fix rounds <n>[ + 1 running]` when the count exceeds zero.
+4. **ETA** shows the latest stated promise, with ` · late <elapsed>` after that promise passes.
    An open phase without a promise shows `no ETA`.
    A predicted plan finish appends ` · ends <time>`.
    A completed plan adds no finish fact.
    Times use the production zone: `HH:MM` today, `Sat 18:41` within six days, otherwise `24 Oct`.
-4. **Workers** lists workers with runs before workers that are working.
+5. **Workers** lists workers with runs before workers that are working.
    Run states are `waiting on run: <label> <elapsed>`, `result queued: <label>`, and `run gone: <label>`.
    Idle workers append ` +<n> idle` to a nonempty cell.
    Closed workers and workers on another machine add nothing.
-5. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
-6. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
+6. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
+7. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
    Each part adds ` +<n> more` for later items.
    Plan work includes every phase that is neither done nor open.
    It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 
-Phase, ETA, and Workers use at most 80 characters per cell, with `…` for omitted text.
+Notes, ETA, and Workers use at most 80 characters per cell, with `…` for omitted text.
+The Progress bar has no text cut.
 Queued limits each item or title to 80 characters and keeps its count suffix after the cut.
 Empty cells show `—`.
 
