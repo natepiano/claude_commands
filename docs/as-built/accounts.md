@@ -304,6 +304,10 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, problems, and session input paths.
+Each account row exports `sessions` beside `role_counts`.
+Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
+The list reuses local count observations and reads no pane again.
+Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
 Status attributes a session to its account independently of the current role selection.
 This preserves visible off-target members during a move.
