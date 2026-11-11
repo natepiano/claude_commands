@@ -635,7 +635,6 @@ notice to the unit director before any merge command runs:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
    <showrunner name> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
-   --parallel "<the notice's Parallel: line>"
    --delivers "<one line of what the phase delivers>"`.
    Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
    review used the craft lens, `--holds <K>` (this phase's held checkpoints)
@@ -647,7 +646,7 @@ notice to the unit director before any merge command runs:
    <SCRATCH>` to keep its merge message and test log there. For a phase shrink
    notice, add `--shrink`; for a unit's closing as-built commit (its as-built
    docs and the plan's deletion, after its last phase merged), add
-   `--as-built`; with either, omit `--review-trial`, `--parallel` and `--delivers`. Add
+   `--as-built`; with either, omit `--review-trial` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
    watching its result or diagnosing a red run. Add `--bump` only for a user's
@@ -1213,7 +1212,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
     depend on which and start every independent phase now: beside the current
     phase in the same unit, or as its own unit (`/showrunner:add_unit`) when
     its files can be fenced. Packaging is yours, never the user's. User,
-    2026-10-13. Each dailies build identifies independent work; start it.
+    2026-10-13.
   - A unit's later phase runs beside its current one, with its own workers, berth
     reservation and checkpoint. A checkpoint commits only its own phase's paths.
     Where files overlap, it claims after the earlier phase and builds on its tree.

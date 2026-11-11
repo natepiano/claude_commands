@@ -524,3 +524,49 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Gotchas:** `repair` and `committed` take no shared lock, so a checkpoint during a repair of the same phase can lose its pending-release record. The cargo-berth side of the shared release belongs to tile.
 
 **Ruled out:** a repair/checkpoint lock in this phase (a new guard; a next item).
+
+### Phase 22 — Checkpoint notices carry no Parallel line  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** no script makes, checks or prints a `Parallel:` line, and no doc asks for one. Directors still start independent phases themselves, with no report line.
+
+**Spec:**
+- Source (user via the sdlc showrunner, 2026-11-11): "i never asked for it ... wasted time coding wasted time testing wasted time validating - the opposite of the Speed God". The line came in 93e669b76 (2026-10-13). Remove it completely. Add no replacement check.
+- `scripts/production/merge_checkpoint.py`: remove the `--parallel` argument, its pass-through, the `check_parallel` call and `check_parallel` itself. A code checkpoint no longer needs the line.
+- `scripts/direct/phase_table.py`: remove the `parallel` subcommand, `session_parallel_line`, `parallel_line`, `_parallel_check`, `CouldStart`, `NothingToStart`, `DependenciesUnknown`, `ParallelCheck`, the `PhaseRecord.parallel` field and the `parallel` key in the production JSON.
+- `scripts/direct/plan_history.py`: remove the `**Depends on:**` parse (`DEPENDS_ON_PATTERN`, the `depends_on` field). Only `_parallel_check` reads it. Plans keep their `**Depends on:**` lines for directors to read.
+- `scripts/production/dailies_input.py`: remove the `could_start` read and the `parallel check:` print.
+- Remove the tests and test support of all removed code. Keep every other test.
+- Docs: remove the `Parallel:` line, the `--parallel` option and `phase_table.py parallel` from each doc in Files. Keep the rule that a director starts independent phases itself (`docs/production_format.md` item 3, `commands/showrunner/produce.md` Rules, parallel by default). In `commands/plan/to_phased_plan.md`, keep the `**Depends on:**` rule and drop the sentence that `phase_table.py parallel` reads the lines.
+- Change-Review: none. The user sees no behavior change.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py`
+- `scripts/direct/phase_table.py`
+- `scripts/direct/plan_history.py`
+- `scripts/production/dailies_input.py`
+- `scripts/production/unit_phases.py` — drop the `resolver` keyword it passes to `plan_phases` only for the Depends parse
+- `scripts/production/test_merge_checkpoint.py`
+- `scripts/production/test_merge_checkpoint_validation.py`
+- `scripts/production/merge_checkpoint_test_support.py`
+- `scripts/direct/test_phase_table.py`
+- `scripts/direct/test_plan_history.py` — deleted: it held only the Depends parse tests
+- `scripts/production/test_merge_checkpoint_promotion.py` — drop the `PARALLEL` import and argument
+- `scripts/production/test_unit_phases.py`
+- `scripts/production/test_dailies_input.py`
+- `scripts/direct/test_progress_history.py` — the asserts on the removed dependency fields
+- `docs/production_format.md`
+- `commands/showrunner/produce.md`
+- `commands/unit/checkpoint.md`
+- `docs/direct/phase_end.md`
+- `commands/plan/to_phased_plan.md`
+- `docs/as-built/phase-tables.md`
+- `docs/as-built/showrunner-automation.md`
+
+**Workers:** `1 writer + 1 tester` — a removal; `test` removes the tests of the removed code.
+- `impl` — the five scripts and the seven docs
+- `test` — the nine test and test support files; it also runs the callers' tests
+
+**State:** none
