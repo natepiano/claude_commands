@@ -150,6 +150,13 @@ notifier.sh new showrunner-<staff-id> --to session:$CLAUDE_CODE_SESSION_ID --eve
 
 N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on the hour` in that line adds `--aligned`. There is no `--hold`. A repeated `new` on resume retargets the instance to the current session without moving the clock. The instance outlives the session. A tick arrives as a message from `showrunner-timer-<staff-id>` whose text starts `Scheduled update`; the showrunner treats it as the scheduled prompt and does not reply. A `/showrunner:dailies` the user types saves the `unit_status.sh` output and runs `dailies_input.py --user-run`, which checks the whole input, then runs `restart`, takes `next_due` for the report and appends it to `LOG`, so the next tick is N minutes after that report; a scheduled tick runs the builder without `--user-run` and restarts nothing. Every reply's `next dailies` time is read from `notifier.sh status`. `production_lifecycle.py wrap` runs `remove`, and the check removes the instance on its own once the doc says `wrapped`.
 
+A pending demotion stops the child showrunner's notifier instance.
+Restoration can start that instance again.
+After placement, demotion removes the instance, its generated prompt and its counts cache.
+It keeps reminders and history records.
+It marks the old production document ended and commits only that document on the unit branch.
+The final journal step supports repeated execution.
+
 ### Unit reports
 
 A unit run has no notifier instance (user, 2026-10-19). `/unit:report` runs only when someone asks. All 12 `worker-*` instances had been `ENABLED=0` since 2026-10-12 22:04 EDT. They were removed. `prepare_session.sh` creates none. `end_session.sh` removes none. A Codex unit's poll timeout composes no report. It lets `<EarlyReviewArm/>` run, as defined in `docs/direct/early_review.md`.
