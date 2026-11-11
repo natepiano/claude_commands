@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -9,15 +10,19 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import cast, final, override
-from unittest.mock import patch
+from collections.abc import Callable, Iterator
+from typing import BinaryIO, cast, final, override
+from unittest.mock import Mock, call, patch
 
+from scripts.lib import conf
 from scripts.usage import context_economy_read as reader
+from scripts.usage import context_economy_cache as cache_module
 
 
 FIXTURES = Path(__file__).with_name("fixtures") / "context_economy"
@@ -55,7 +60,8 @@ class ContextEconomyReadTests(unittest.TestCase):
             + "files = commands/unit/direct.md docs/direct/write_prompt_contract.md docs/fixture-policy.md\n"
             + "min_requests = 20\n"
             + "active_gap_seconds = 600\n"
-            + "# whole: 1..\nmac_timeout_seconds = 300\n", encoding="utf-8")
+            + "# whole: 1..\nmac_timeout_seconds = 300\n"
+            + "# whole: 1..\ncache_max_megabytes = 512\n# whole: 1..\nprogress_seconds = 1\n", encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
             "CONF_DIR": str(configuration),
@@ -358,11 +364,276 @@ class ContextEconomyReadTests(unittest.TestCase):
         numbered = self.root / "home/.codex1/sessions"
         numbered.parent.mkdir()
         numbered.symlink_to(shared, target_is_directory=True)
-        with patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
+        settings = conf.read("context_economy")
+        with (patch.object(conf, "read", return_value=settings),
+              patch.object(reader, "_read_codex_file", wraps=getattr(reader, "_read_codex_file")) as opened):
             sessions = reader.read_codex([shared, numbered, shared / "2026"], self.since, self.until, "fixture-machine")
             opened.assert_called_once()
         session, = sessions
         self.assertEqual([item.context for item in session.requests], [1000, 300, 350])
+
+    def cached_families(self, since: datetime) -> list[reader.Session]:
+        return [*reader.read_claude(self.projects, since, self.until, "fixture-machine"),
+                *reader.read_codex([self.root / "home/.codex/sessions"], since, self.until, "fixture-machine")]
+
+    def clear_summary_cache(self) -> None:
+        shutil.rmtree(self.root / "home/.cache/context_economy")
+
+    def test_warm_cache_parses_no_transcript_and_keeps_the_same_sessions(self) -> None:
+        _ = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
+        _ = self.codex_rollout()
+        cold = self.cached_families(self.since)
+        self.assertEqual({session.family for session in cold}, {"claude", "codex"})
+        with (patch.object(reader, "_read_transcript", side_effect=AssertionError("warm Claude parse")),
+              patch.object(reader, "_read_codex_file", side_effect=AssertionError("warm Codex parse")),
+              patch.object(cache_module, "prefix_hash", side_effect=AssertionError("warm prefix read"))):
+            self.assertEqual(self.cached_families(self.since), cold)
+
+    def test_appends_resume_both_parsers_at_the_last_complete_line(self) -> None:
+        paths = [self.transcript("version-restarts.jsonl", "project/versions.jsonl"), self.codex_rollout()]
+        original = {path: path.read_bytes() for path in paths}
+        offsets: list[int] = []
+        for path, content in original.items():
+            lines = content.splitlines(keepends=True)
+            middle = len(lines) // 2
+            prefix = b"".join(lines[:middle])
+            offsets.append(len(prefix))
+            _ = path.write_bytes(prefix + lines[middle][:len(lines[middle]) // 2])
+        _ = self.cached_families(self.since)
+        for path, content in original.items():
+            with path.open("ab") as stream:
+                _ = stream.write(content[path.stat().st_size:])
+        positions: list[int] = []
+        complete_lines = reader.complete_lines
+
+        def resumed_lines(stream: BinaryIO) -> Iterator[tuple[int, bytes]]:
+            positions.append(stream.tell())
+            yield from complete_lines(stream)
+
+        with patch.object(reader, "complete_lines", side_effect=resumed_lines):
+            resumed = self.cached_families(self.since)
+        self.assertEqual(positions, offsets)
+        self.clear_summary_cache()
+        self.assertEqual(self.cached_families(self.since), resumed)
+
+    def test_same_size_rewrite_and_truncation_restart_the_parser(self) -> None:
+        path = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
+        original = path.read_bytes()
+        for content in (original.replace(b"fixture-model", b"another-model"), original.splitlines(keepends=True)[0]):
+            with self.subTest(size=len(content)):
+                _ = self.cached_families(self.since)
+                _ = path.write_bytes(content)
+                with patch.object(reader, "_read_transcript", wraps=getattr(reader, "_read_transcript")) as parse:
+                    changed = self.cached_families(self.since)
+                parse.assert_called_once_with(path.resolve(), cache_module.ParseCheckpoint())
+                self.clear_summary_cache()
+                self.assertEqual(self.cached_families(self.since), changed)
+
+    def test_rewrite_then_append_matches_a_cold_parse_for_both_families(self) -> None:
+        paths = [self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl"), self.codex_rollout()]
+        cold = self.cached_families(self.since)
+        for path, old, new in zip(paths, (b"fixture-model", b"gpt-6.1-sol"),
+                                  (b"another-model", b"gpt-6.2-sol")):
+            original = path.read_bytes()
+            changed = original.replace(old, new)
+            self.assertEqual(len(changed), len(original))
+            self.assertNotEqual(changed, original)
+            _ = path.write_bytes(changed + b"{}\n")
+        updated = self.cached_families(self.since)
+        self.assertNotEqual(updated, cold)
+        self.clear_summary_cache()
+        self.assertEqual(self.cached_families(self.since), updated)
+
+    def test_prefix_hash_covers_all_blocks_and_stops_at_the_saved_offset(self) -> None:
+        path = self.projects / "blocks.jsonl"
+        prefix = b"a" * (2 * 1024 * 1024 + 17)
+        _ = path.write_bytes(prefix + b"unparsed tail")
+        digest = cache_module.prefix_hash(path, len(prefix))
+        self.assertEqual(digest, hashlib.blake2b(prefix).hexdigest())
+        _ = path.write_bytes(prefix + b"different tail")
+        self.assertEqual(cache_module.prefix_hash(path, len(prefix)), digest)
+        middle = len(prefix) // 2
+        _ = path.write_bytes(prefix[:middle] + b"b" + prefix[middle + 1:] + b"different tail")
+        self.assertNotEqual(cache_module.prefix_hash(path, len(prefix)), digest)
+
+    def test_middle_request_rewrite_then_growth_matches_a_cold_parse(self) -> None:
+        path = self.transcript("parent-fixture.jsonl", "project/middle.jsonl")
+        request = next(line for line in path.read_bytes().splitlines(keepends=True)
+                       if b'"requestId":"request-b"' in line)
+        padding = b"{}\n" * 1700
+        original = padding + request + padding
+        marker = b'"input_tokens":5'
+        position = original.index(marker)
+        self.assertGreater(position, 4096)
+        self.assertLess(position + len(marker), len(original) - 4096)
+        _ = path.write_bytes(original)
+        cold = self.cached_families(self.since)
+        changed = original.replace(marker, b'"input_tokens":9')
+        self.assertEqual(len(changed), len(original))
+        _ = path.write_bytes(changed + b"{}\n")
+        with patch.object(reader, "_read_transcript", wraps=getattr(reader, "_read_transcript")) as parse:
+            updated = self.cached_families(self.since)
+        parse.assert_called_once_with(path.resolve(), cache_module.ParseCheckpoint())
+        self.assertNotEqual(updated, cold)
+        self.clear_summary_cache()
+        self.assertEqual(self.cached_families(self.since), updated)
+
+    def test_resume_checks_both_ends_of_the_saved_prefix(self) -> None:
+        path = self.projects / "samples.jsonl"
+        original = b"a" * 16383 + b"\n"
+        for position in (0, len(original) - 2):
+            with self.subTest(position=position), closing(cache_module.TranscriptCache()) as cache:
+                _ = path.write_bytes(original)
+                checkpoint = cache_module.ParseCheckpoint(len(original), "saved")
+                self.assertEqual(cache.read(path, "claude", lambda path, held: checkpoint), checkpoint)
+                _ = path.write_bytes(original[:position] + b"b" + original[position + 1:] + b"next\n")
+                parse = Mock(return_value=cache_module.ParseCheckpoint(path.stat().st_size, "rebuilt"))
+                parse_file = cast(Callable[[Path, cache_module.ParseCheckpoint], cache_module.ParseCheckpoint], parse)
+                self.assertEqual(cache.read(path, "claude", parse_file),
+                                 cache_module.ParseCheckpoint(path.stat().st_size, "rebuilt"))
+                parse.assert_called_once_with(path.resolve(), cache_module.ParseCheckpoint())
+
+    def test_warm_access_releases_the_transaction_before_another_parse(self) -> None:
+        path = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
+        other = self.projects / "other.jsonl"
+        _ = other.write_bytes(b"{}\n")
+        checkpoint = cache_module.ParseCheckpoint(path.stat().st_size, "saved")
+        with closing(cache_module.TranscriptCache()) as first, closing(cache_module.TranscriptCache()) as second:
+            _ = second.database.execute("PRAGMA busy_timeout = 0")
+            self.assertEqual(first.read(path, "claude", lambda path, held: checkpoint), checkpoint)
+            self.assertEqual(first.read(path, "claude", lambda path, held: checkpoint), checkpoint)
+            self.assertFalse(first.database.in_transaction)
+
+            def parse_other(source: Path, held: cache_module.ParseCheckpoint) -> cache_module.ParseCheckpoint:
+                self.assertEqual(held, cache_module.ParseCheckpoint())
+                self.assertFalse(first.database.in_transaction)
+                second.mark_final(path)
+                self.assertFalse(second.database.in_transaction)
+                return cache_module.ParseCheckpoint(source.stat().st_size, "other")
+
+            self.assertEqual(first.read(other, "claude", parse_other), cache_module.ParseCheckpoint(3, "other"))
+            self.assertFalse(first.database.in_transaction)
+
+    def test_another_window_reuses_all_cached_events(self) -> None:
+        _ = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
+        _ = self.codex_rollout()
+        _ = self.cached_families(instant("2026-11-01T10:30:00Z"))
+        with (patch.object(reader, "_read_transcript", side_effect=AssertionError("window reparsed Claude")),
+              patch.object(reader, "_read_codex_file", side_effect=AssertionError("window reparsed Codex"))):
+            broader = self.cached_families(self.since)
+        self.clear_summary_cache()
+        self.assertEqual(self.cached_families(self.since), broader)
+
+    def test_deleted_transcripts_keep_their_cached_sessions_and_last_mtime(self) -> None:
+        paths = [self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl"), self.codex_rollout()]
+        cold = self.cached_families(self.since)
+        for path in paths:
+            path.unlink()
+        with (patch.object(reader, "_read_transcript", side_effect=AssertionError("deleted Claude parse")),
+              patch.object(reader, "_read_codex_file", side_effect=AssertionError("deleted Codex parse"))):
+            self.assertEqual(self.cached_families(self.since), cold)
+            self.assertEqual(self.cached_families(self.until + timedelta(seconds=2)), [])
+
+    def test_compressed_transcripts_share_the_logical_entry_without_parsing(self) -> None:
+        paths = [self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl"), self.codex_rollout()]
+        cold = self.cached_families(self.since)
+        with closing(cache_module.TranscriptCache()) as cache:
+            for path in paths:
+                cache.mark_final(path)
+                _ = path.rename(path.with_suffix(".jsonl.zst"))
+        with (patch.object(reader, "_read_transcript", side_effect=AssertionError("compressed Claude parse")),
+              patch.object(reader, "_read_codex_file", side_effect=AssertionError("compressed Codex parse"))):
+            self.assertEqual(self.cached_families(self.since), cold)
+
+    def test_uncached_compressed_files_count_as_skipped(self) -> None:
+        path = self.projects / "project/unread.jsonl.zst"
+        path.parent.mkdir()
+        _ = path.write_bytes(b"not parsed in this phase")
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(self.cached_families(self.since), [])
+        self.assertIn("files 1 of 1; skipped 1", errors.getvalue())
+
+    def test_cache_bound_evicts_the_least_recently_used_reproducible_summary(self) -> None:
+        self.assert_cache_eviction(deleted=False)
+
+    def test_cache_bound_keeps_a_summary_whose_source_is_gone(self) -> None:
+        self.assert_cache_eviction(deleted=True)
+
+    def assert_cache_eviction(self, *, deleted: bool) -> None:
+        configuration = self.root / "configuration/context_economy.conf"
+        _ = configuration.write_text(configuration.read_text().replace(
+            "cache_max_megabytes = 512", "cache_max_megabytes = 1"))
+        paths = [self.projects / f"summary-{index}.jsonl" for index in range(2)]
+        for path in paths:
+            _ = path.write_text("source\n")
+        summary = cache_module.ParseCheckpoint(7, "x" * 700_000)
+        with closing(cache_module.TranscriptCache()) as cache:
+            with patch.object(time, "time_ns", side_effect=[1, 2, 3]):
+                for path in paths:
+                    self.assertEqual(cache.read(path, "claude", lambda path, held: summary), summary)
+                if deleted:
+                    paths[0].unlink()
+                else:
+                    self.assertEqual(cache.read(paths[0], "claude", lambda path, held: summary), summary)
+        with closing(cache_module.TranscriptCache()) as cache:
+            parse = Mock(return_value=summary)
+            parse_file = cast(Callable[[Path, cache_module.ParseCheckpoint], cache_module.ParseCheckpoint], parse)
+            self.assertEqual(cache.read(paths[0], "claude", parse_file), summary)
+            parse.assert_not_called()
+            self.assertEqual(cache.read(paths[1], "claude", parse_file), summary)
+            parse.assert_called_once_with(paths[1].resolve(), cache_module.ParseCheckpoint())
+
+    def test_progress_rewrites_terminal_lines_and_keeps_pipe_lines_separate(self) -> None:
+        for terminal, separator in ((True, "\r"), (False, "\n")):
+            with (self.subTest(terminal=terminal), redirect_stderr(io.StringIO()) as errors,
+                  patch.object(errors, "isatty", return_value=terminal),
+                  patch.object(time, "monotonic", side_effect=[0, 2, 4])):
+                progress = cache_module.FileProgress("fixture-machine", "claude", 2)
+                progress.advance()
+                progress.advance()
+            self.assertEqual(errors.getvalue(),
+                "fixture-machine claude: files 1 of 2; skipped 0" + separator
+                + "fixture-machine claude: files 2 of 2; skipped 0\n")
+
+    def test_mac_progress_reaches_stderr_without_changing_the_result_document(self) -> None:
+        program = ("import sys; print('mac claude: files 1 of 1; skipped 0', file=sys.stderr); "
+                   + "print('{\"type\":\"timeline\",\"entries\":[]}')")
+        with (patch.dict(os.environ, {"CONTEXT_ECONOMY_MAC_COMMAND": json.dumps([sys.executable, "-I", "-c", program])}),
+              redirect_stderr(io.StringIO()) as errors):
+            result = reader.read_mac(self.since, self.until)
+        self.assertEqual(result, reader.MacSessions([], []))
+        self.assertEqual(errors.getvalue(), "mac claude: files 1 of 1; skipped 0\n")
+
+    def test_mac_payload_carries_settings_and_emit_ignores_missing_remote_keys(self) -> None:
+        _ = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
+        rollout = self.codex_rollout()
+        _ = self.settings_history()
+        configuration = self.root / "configuration/context_economy.conf"
+        _ = configuration.write_text(configuration.read_text(encoding="utf-8").replace(
+            "cache_max_megabytes = 512", "cache_max_megabytes = 3").replace(
+            "progress_seconds = 1", "progress_seconds = 7"), encoding="utf-8")
+        with patch.dict(os.environ, {
+            "CONTEXT_ECONOMY_MAC_PROJECTS_ROOT": str(self.projects),
+            "CONTEXT_ECONOMY_MAC_CODEX_ROOTS": json.dumps([str(rollout.parents[3])]),
+            "CONTEXT_ECONOMY_MAC_CHECKOUT": str(self.checkout),
+        }):
+            payload = cast(Callable[[datetime, datetime], str], getattr(reader, "_mac_payload"))
+            request = cast(dict[str, object], json.loads(payload(self.since, self.until)))
+        self.assertEqual(request["cache_max_megabytes"], 3)
+        self.assertEqual(request["progress_seconds"], 7)
+        _ = configuration.write_text("\n".join(line for line in configuration.read_text(encoding="utf-8").splitlines()
+            if not line.startswith(("cache_max_megabytes =", "progress_seconds ="))) + "\n", encoding="utf-8")
+        with (redirect_stdout(io.StringIO()) as output,
+              patch.object(reader, "TranscriptCache", wraps=cache_module.TranscriptCache) as cache,
+              patch.object(reader, "FileProgress", wraps=cache_module.FileProgress) as progress):
+            reader.emit_mac(request)
+        settings = cache_module.TranscriptReadSettings(3, 7)
+        self.assertEqual(cache.call_args_list, [call(settings), call(settings)])
+        self.assertEqual(progress.call_args_list, [call("mac", "claude", 1, settings), call("mac", "codex", 1, settings)])
+        rows = [cast(dict[str, object], json.loads(line)) for line in output.getvalue().splitlines()]
+        self.assertEqual(rows[0]["type"], "timeline")
+        self.assertEqual([(row["machine"], row["family"], row["agent_id"]) for row in rows[1:]],
+                         [("mac", "claude", "parent-fixture"), ("mac", "codex", "codex-fixture")])
 
     def test_mac_payload_reads_both_families_and_the_remote_timeline_without_writes(self) -> None:
         parent = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")

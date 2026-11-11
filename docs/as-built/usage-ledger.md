@@ -243,7 +243,27 @@ Those requests remain in context quantities and contribute no cost samples.
 Resumes do not split this count or discard compaction pairs.
 
 The Mac reader uses one SSH call.
-It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac prints JSON lines and writes nothing.
+It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac returns summary JSON lines.
+Both machines keep parsed events and complete-line checkpoints under `~/.cache/context_economy/`.
+A warm read reuses unchanged files; an appended file resumes with its saved parser state.
+Before resuming a grown file, the cache checks a BLAKE2b hash of every byte before the saved offset.
+The hash reader uses blocks of up to 1 MiB.
+A changed prefix causes a full parse.
+Unchanged files need no prefix read.
+Each access update and entry write uses a short transaction; parsing holds no database transaction.
+The cache stores all events before the report applies its time window.
+The cache uses resolved logical paths; `x.jsonl` and `x.jsonl.zst` share one entry.
+Summaries remain available after their transcript files are deleted.
+The cached source mtime still controls the old-file skip rule.
+A compressed file uses its saved entry; a compressed file without an entry is skipped.
+`TranscriptCache.mark_final(path)` lets the compressor mark a saved summary as final.
+`cache_max_megabytes` in `config/context_economy.conf` bounds reproducible summaries, using least recent access first.
+Entries whose source files are gone remain protected, even when the cache exceeds that bound.
+Long reads show file progress on stderr, including skipped files and progress from the Mac.
+`progress_seconds` in the same config sets the progress update interval.
+Natedev sends both values in the Mac request.
+The Mac uses these request values without reading the new keys from its checkout config.
+Transcript files remain unchanged.
 `CONTEXT_ECONOMY_MAC_COMMAND` (a JSON list) replaces the SSH command, for tests and a forced failure.
 `mac_timeout_seconds` in `config/context_economy.conf` limits it to 300 seconds by default.
 A failed read prints `mac: <reason>` on `report` and `save`; local measurements remain available.

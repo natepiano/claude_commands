@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TypedDict, cast
+from typing import BinaryIO, TypedDict, cast
 
 
 class TokenUsageJson(TypedDict, total=False):
@@ -234,4 +235,14 @@ def is_compaction(record: RolloutRecordJson) -> bool:
         or payload.get("type") in ("compacted", "contextCompaction")
         or item.get("type") == "contextCompaction"
     )
+
+
+
+def complete_lines(source: BinaryIO) -> Iterator[tuple[int, bytes]]:
+    while True:
+        offset = source.tell()
+        line = source.readline()
+        if not line or not line.endswith(b"\n"):
+            return
+        yield offset, line
 
