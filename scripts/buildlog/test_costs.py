@@ -278,12 +278,14 @@ class CostTests(unittest.TestCase):
         with mock.patch.object(index, "update", side_effect=AssertionError("index updated")):
             self.assertEqual(mac_report.main(["--hours", "1e300"]), 2)
 
-    def test_removed_costs_command_prints_usage_without_reading_the_index(self) -> None:
-        errors = io.StringIO()
-        with redirect_stderr(errors), mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
-            self.assertEqual(cli.main(["costs", "--days", "7"]), 2)
-        self.assertEqual(errors.getvalue(), f"{cli.__doc__}\n")
-        self.assertNotIn("buildlog costs", errors.getvalue())
+    def test_removed_commands_print_usage_without_reading_the_index(self) -> None:
+        for command in ("costs", "charts"):
+            with self.subTest(command=command):
+                errors = io.StringIO()
+                with redirect_stderr(errors), mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
+                    self.assertEqual(cli.main([command, "--days", "7"]), 2)
+                self.assertEqual(errors.getvalue(), f"{cli.__doc__}\n")
+                self.assertNotIn(f"buildlog {command}", errors.getvalue())
 
     def test_cli_help_does_not_import_collectors_or_the_report(self) -> None:
         command = ("import sys; from scripts.buildlog import cli; cli.main(['help']); "
