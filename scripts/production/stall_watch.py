@@ -444,28 +444,40 @@ def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
 
 
 def transcript_turn_end(session_id: str) -> re.Match[str] | None:
-    """The turn-end line closing the session's last assistant text, read from its transcript.
+    """Read the turn-end line from the session's latest assistant text.
 
-    Read before the pane, whose text can be stale after resume or compaction. The pane supplies
-    the fallback when the transcript has no usable turn end. A tool call after the text means
-    the turn went on, so there is no turn-end line.
+    Read the transcript before the pane, which can show stale text after resume or compaction.
+    Use the pane when the transcript has no usable turn-end line.
+    If the stripped text is only "—", skip that turn and its tool calls to read the previous assistant text.
+    A user prompt ends this skip; a tool result does not.
+    Otherwise, a tool call after the text means the turn continued, so return no turn-end line.
     """
     try:
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
         if transcript is None:
             return None
+        skipping_peer_turn = False
         for line in lines_from_end(transcript):
-            if b'"assistant"' not in line:
+            if b'"assistant"' not in line and (not skipping_peer_turn or b'"user"' not in line):
                 continue
             try:
                 entry = cast(TranscriptEntry, json.loads(line))
             except ValueError:
                 continue
-            content = entry.get("message", {}).get("content") if entry.get("type") == "assistant" else None
+            content = entry.get("message", {}).get("content")
             blocks = content if isinstance(content, list) else []
-            if any(block.get("type") == "tool_use" for block in blocks):
+            if entry.get("type") == "user":
+                if not any(block.get("type") == "tool_result" for block in blocks):
+                    skipping_peer_turn = False
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            if not skipping_peer_turn and any(block.get("type") == "tool_use" for block in blocks):
                 return None
             text = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            if text.strip() == "—":
+                skipping_peer_turn = True
+                continue
             if text:
                 turns = list(TURN_END.finditer(text))
                 return turns[-1] if turns else None
