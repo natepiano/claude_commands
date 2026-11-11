@@ -2799,14 +2799,26 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The direct and production suites pass.
 - An aws paired trial, 3 rounds, over the named modules with the most recorder starts gives a summed paired median saving of at least 30 CPU s, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
 
-### Phase 139 — Find where the fast-track test module spends its CPU  · status: todo
+### Phase 139 — Find where the fast-track test module spends its CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed. `production/test_fast_track.py` measures 45.7 CPU s, 8,618 processes and 52 tests at `bcda46a2e`. Git commands use 13.9 CPU s in 7,703 starts; repeated setup uses 1.0 CPU s.
+- The module is at its Git floor. devtools-unit owns the Git read path.
+
+**Gotchas:** One local pair on natedev can vary by more than 10 CPU s. Check process and exec counts before trusting a local saving.
+
+**Ruled out:** direct fixture calls (-2.6 CPU s alone); retained immutable Git reads (-4.9 CPU s alone); both together remove only 16 of 8,618 processes.
+
+### Phase 140 — Find where the style sync test module spends its CPU  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A measured report names where `production/test_fast_track.py` (median 48.2 CPU s, 52 tests) spends its CPU, and which changes save CPU with the same tests.
+**Goal:** A measured report names where `style/test_style_sync.py` (median 47.7 CPU s, 70 tests) spends its CPU, and which changes save CPU with the same tests.
 
-**Decision:** Director, 2026-11-11: the next module in the descending sort after the Phase 137 module, whose change waits on sdlc lands. Research first, as in Phases 133 and 137. Savings may join across modules, so the report also names each candidate that reaches other modules.
+**Decision:** Director, 2026-11-11: the next module in the descending sort, beside the Phase 139 research. Research first, as in Phases 137 and 139.
 
 **Spec:**
 1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
@@ -2817,15 +2829,16 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 6. Edit no repository file.
 
 **Files:**
-- `scripts/production/test_fast_track.py` — read only.
+- `scripts/style/test_style_sync.py` — read only.
 
 **Workers:** 1 writer; research only.
 - impl: the report.
 
 **Constraints from prior phases:**
-- Phase 137: a recorder start costs about 0.22 CPU s, and Phase 138 defers recorder and staff imports. Do not count that saving again here.
+- Phase 137: Phase 138 defers recorder and staff imports. Do not count that saving again here.
+- Phase 134: `run_style_command` in `scripts/style/style_plan_test_support.py` runs style plan commands in process; reuse it where it fits.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report at `phases/139/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
+- The report at `phases/140/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
