@@ -85,7 +85,7 @@ class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
         self.record("finish-run", "--status", "completed")
         _ = self.successful("implement", "--to", name)
         self.assertEqual(self.assignment_records()[name], original)
-        self.assertEqual(read_object(self.session_dir / "progress_history_state.json")["status"], "active")
+        self.assertNotIn("status", read_object(self.session_dir / "progress_history_state.json"))
         self.assertTrue(any(event.get("event_type") == "reopened" for event in self.events()))
         self.assertEqual(self.turn_starts, 2)
 

@@ -524,8 +524,6 @@ def _newest_open_instance(
     if not runs:
         return NoOpenPhase()
     events = runs[-1]
-    if any(_text(event.get("event_type")) == "run_finished" for event in events):
-        return NoOpenPhase()
     started: list[PhaseInstance] = []
     closed: set[str] = set()
     for event in events:
@@ -593,9 +591,7 @@ def _open_instance(
 
 
 def _open_phase_ids(runs: list[list[dict[str, object]]]) -> set[str]:
-    if not runs or any(
-        _text(event.get("event_type")) == "run_finished" for event in runs[-1]
-    ):
+    if not runs:
         return set()
     opened: dict[str, str] = {}
     for event in runs[-1]:
@@ -1023,6 +1019,17 @@ def _with_history(
     )
 
 
+def _current_run_events(runs: list[list[dict[str, object]]], record: staff.StaffSnapshot) -> list[list[dict[str, object]]]:
+    """Select the run that its owner's staff pointer names."""
+    opened = {row.run.path.name: row.run.path for row in record.rows if isinstance(row.run, staff.OpenRun)}
+    for events in runs:
+        start = next((event for event in events if event.get("event_type") == "run_started"), dict[str, object]())
+        folder = opened.get(_text(start.get("run_id")))
+        if folder is not None and unit_runs.run_is_open(folder):
+            return [events]
+    return []
+
+
 def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> PhaseRecord:
     """Build one plan's phase view entirely from its durable events."""
     plan_path = plan_path.expanduser().resolve()
@@ -1042,10 +1049,12 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
 
     run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
-    open_instance = _newest_open_instance(run_events)
+    current_run = _current_run_events(run_events, resolver.record)
+    open_instance = _newest_open_instance(current_run)
     return _build_phase_record(
         plan_path, phases, run_events, _instances_by_phase(phases, instances),
         [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
+        open_ids=_open_phase_ids(current_run),
     )
 
 
@@ -1102,10 +1111,11 @@ def _build_phase_record(
     run_events: list[list[dict[str, object]]],
     assigned: list[list[PhaseInstance]],
     open_instances: list[OpenPhaseInstance],
+    *, open_ids: set[str] | None = None,
 ) -> PhaseRecord:
     """Apply the same timing and history rules to plan and run phase rows."""
     open_instance = open_instances[-1] if open_instances else NoOpenPhase()
-    open_ids = _open_phase_ids(run_events)
+    open_ids = _open_phase_ids(run_events) if open_ids is None else open_ids
     current: OpenPhase | NoOpenPhase = NoOpenPhase()
     current_position: PlanPhasePosition | OutsidePlan = OutsidePlan()
     if isinstance(open_instance, OpenPhaseInstance):
