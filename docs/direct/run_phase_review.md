@@ -51,7 +51,7 @@ Choose a retained worker that did not write the affected files when one is avail
 Otherwise have their writer review its choices without relying on its earlier reasoning.
 Apply <RoleReassignment/> and <ReviewPromptContract/>.
 Use `assign.sh --role review` with this session and the next review index.
-For `herdr`, use `worker.py list` and pass the short name with `--to` for a retained worker.
+For `herdr`, use `worker.py list all` and pass the short name with `--to` for a retained worker.
 If all pane workers are busy, pass `--new-worker <free review name>` to `assign.sh --role review`.
 For a phase review outside a unit run, omit both worker options.
 Otherwise omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
