@@ -767,18 +767,15 @@ def push_git(production: ProductionDocument, may_undo: bool) -> str:
 def tested_main_push(production: ProductionDocument, tested_tip: str,
                      retest: Callable[[tuple[str, ...], str], None], before_merge_tip: str,
                      *, follow_main: bool = True) -> Generator[str]:
-    """Hold the main lock for publication after tests cover the latest main."""
+    """Hold the main lock through retests, the push, and main promotion."""
     checkout = production.checkout
     with ExitStack() as publication_lock:
         with push_rollback(production, before_merge_tip):
-            while True:
-                _ = publication_lock.enter_context(main_push_lock(checkout))
-                if not follow_main:
-                    break
+            _ = publication_lock.enter_context(main_push_lock(checkout))
+            while follow_main:
                 _ = good(git(checkout, "fetch", "origin", "main"), "push")
                 if git(checkout, "merge-base", "--is-ancestor", "origin/main", tested_tip).returncode == 0:
                     break
-                publication_lock.close()
                 merge_main(production)
                 tip = good(git(checkout, "rev-parse", "HEAD"), "test")
                 paths = tuple(good(git(checkout, "diff", "--name-only", tested_tip, tip), "test").splitlines())

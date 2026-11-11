@@ -268,8 +268,8 @@ Each local Promote checkout must exist before the command pushes.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
   8. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
-     Otherwise, it releases the lock, merges main, retests the new paths, and tries again.
-     Tests never run inside this lock.
+     Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
+     The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
      Preparation failure restores the tip before this run when origin still has its old tip.

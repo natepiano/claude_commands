@@ -152,10 +152,12 @@ All main-path tests remain.
 
 1. Acquire `main_push_lock` and fetch main.
 2. Yield the tested tip when it already contains `origin/main`.
-3. Otherwise, release the lock, merge main, and retest the new paths.
+3. Otherwise, keep the lock, merge main, and retest the new paths.
 4. Repeat the comparison before publication.
 
-Tests run outside the lock.
+The first checkpoint test runs outside the lock.
+Retests run inside it, so main cannot move under a tested tip.
+This retest is the one lock hold through long work; other main pushers hold the lock only for their fetch, merge and push.
 The checkpoint push, interrupted promotion, and child handoff share this loop.
 `push_rollback` restores the original tip before publication when origin retains its old tip.
 It handles `checkpoint_gate.Stop`, `OSError`, and `ValueError`.
