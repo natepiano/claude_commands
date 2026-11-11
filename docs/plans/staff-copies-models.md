@@ -25,35 +25,19 @@
 
 ### Phase 1 — Usage runs keep no state or branch  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** `usage.db` table `runs` has no `state` and no `branch` column. No code reads either column.
-
-**Spec:**
-
-1. `scripts/usage/collect.py` `SCHEMA`: remove `branch` and `state` from `CREATE TABLE IF NOT EXISTS runs`.
-2. `save_history_event`: the `run_started` INSERT names its columns and writes no `branch` and no `state`. `run_finished` updates `finished_at` only. Phase and pass finishes keep `SET state = ?, finished_at = ?`.
-3. Do not add a `migrate_store` step or bump `PRAGMA user_version`. The deploy program changes old databases.
-4. Deploy program (director scratchpad, not the repository): `ALTER TABLE runs DROP COLUMN branch` and `ALTER TABLE runs DROP COLUMN state` on `~/.local/state/usage-model/usage.db`, with the collector timer stopped. It does nothing when the columns are gone.
-5. Add no other guard, refusal or scan.
+- `usage.db` table `runs` has the columns `machine`, `run_id`, `started_at`, `plan_doc`, `worktree`, `finished_at` and `source_event`. It has no `state` and no `branch` column.
+- `HISTORY_FIELDS` gives `run_started` the fields `plan_doc` and `worktree`, and gives `run_finished` no fields.
+- The `run_started` INSERT names its six columns. `run_finished` sets only `finished_at`. Phase and pass finishes keep `SET state = ?, finished_at = ?`.
+- `validate_history_fields` checks an open status only for `phase_finished` and `pass_finished`.
+- The new code writes to an old database that still has the two columns: they are nullable and stay NULL. A one-off deploy program outside the repository drops them.
 
 **Files:**
-- `scripts/usage/collect.py` — schema and history writes.
-- `scripts/usage/test_outcomes.py` — schema and history rows.
+- `scripts/usage/collect.py` — `HISTORY_FIELDS`, `SCHEMA` and the history event writers.
+- `scripts/usage/test_outcomes.py` — schema and history row tests.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `scripts/usage/collect.py`.
-- `test` — `scripts/usage/test_outcomes.py`. Change the rows that assert `runs.branch` or `runs.state` (`test_outcome_schema_keeps_identity_and_source_event_without_finding_details`, `test_history_rows_use_file_run_id_creation_event_and_later_status`, `test_history_finish_tail_waits_for_newline_then_updates_existing_rows`, `test_mac_history_updates_incrementally_and_unchanged_pass_sends_no_outcomes`, `test_mac_history_without_newline_waits_then_finishes_run`). A finished run keeps its `finished_at`.
-
-**State:** `usage.db` schema; deploy program above.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-1. The unittest line passes for `scripts.usage.test_outcomes` and `scripts.usage.test_collect`.
-2. basedpyright over the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** a collector schema migration or `PRAGMA user_version` bump — old data changes once at deploy.
 
 ### Phase 2 — Production records keep staff ids  · status: todo
 
