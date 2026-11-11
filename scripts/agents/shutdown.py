@@ -31,7 +31,7 @@ from scripts.direct import progress_history
 from scripts.herdr import herdr, worker_panes
 from scripts.lib import process_group, process_start, conf, berth_board, unit_runs
 from scripts.lib.conf import UseConfiguredValue
-from scripts.message import sessions
+from scripts.message import sessions, session_send, send_budget, send_result
 from scripts.production import (
     staff,
     staff_sources,
@@ -1989,7 +1989,10 @@ def rename_move_branch(move: DocBranchMove) -> bool:
 
 def rename_owner(row: staff.StaffRow, name: str) -> staff.StaffRow:
     """Keep the old owner name until every worker pane has its new name."""
-    worker_panes.rename_workers(replace(row, name=name), herdr.Herdr(herdr.shared_session()))
+    client = herdr.Herdr(herdr.shared_session())
+    if row.name != name:
+        client.mark_tab_rename(row.id)
+    worker_panes.rename_workers(replace(row, name=name), client)
     return staff.rename(row.id, name) if row.name != name else row
 
 
@@ -2085,34 +2088,43 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
         changed = row.name != request.name
         branch_move = isinstance(request.move, UnitBranchMove) and request.move.old_branch != request.move.branch
         pending = unit_move.pending_move(row.id)
+        if isinstance(pending, unit_move.PendingRename) and pending.name != request.name:
+            raise ValueError(f"{row.name}: finish the pending rename to {pending.name}")
         if (isinstance(request.move, UnitBranchMove)
                 and isinstance(pending, (unit_move.FolderMove, unit_move.PendingRename))
                 and pending.branch != request.move.branch):
             pending_branch = pending.branch if isinstance(pending.branch, str) else pending.branch.value
             raise ValueError(f"{row.name}: finish the pending move to branch {pending_branch}")
-        if isinstance(pending, unit_move.FolderMove) and (changed or branch_move):
-            if not unit_move.move_folder(row.id, pending.destination, branch=pending.branch):
-                print("unchanged")
+        rename_prepare_notice(row, request.name)
+        journal = rename_notice_path(row.id)
+        notice = unit_move.json_object(read_json(journal)) if journal.exists() else {}
+        original_name = str(notice.get("old_name", row.name)) if notice.get("name") == request.name else row.name
+        finish_folder = (changed or branch_move or original_name != row.name)
+        folder_finished = False
+        if isinstance(pending, unit_move.FolderMove) and finish_folder:
+            if not unit_move.move_idle_folder(row.id, pending.destination, branch=pending.branch):
+                row = rename_owner(row, request.name)
+                _ = rename_repair_displays(row)
+                _ = rename_notify_unit(row)
                 return request
             if (row := staff.by_id(request.member.id)) is None:
                 raise ValueError(f"{request.member.id}: no unit staff row")
             pending = unit_move.pending_move(row.id)
+            folder_finished = True
         movement = pending
-        if isinstance(pending, unit_move.PendingRename) and pending.name != request.name:
-            raise ValueError(f"{row.name}: finish the pending rename to {pending.name}")
-        if isinstance(pending, unit_move.NoPendingMove) and (changed or branch_move):
+        if isinstance(pending, unit_move.NoPendingMove) and (changed or branch_move or folder_finished):
             if isinstance(row.worktree, staff.WorktreeUnfilled):
                 print(f"anomaly: {request.name}: the staff worktree is unfilled", file=sys.stderr)
             else:
                 if row.worktree.machine != remote.local_machine():
                     raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
                 folder = row.worktree.path.expanduser().resolve()
-                target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
+                target = unit_names.swap_stem(folder.name, original_name, request.name) if changed or folder_finished else folder.name
                 destination = folder.with_name(target) if target is not None else folder
                 checkout = folder if folder.exists() else destination
                 branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
                 renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
-                                  unit_names.swap_stem(branch, row.name, request.name))
+                                  unit_names.swap_stem(branch, original_name, request.name))
                 if target is None:
                     print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
                 if renamed_branch is None:
@@ -2127,10 +2139,76 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
         except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: display: {error}", file=sys.stderr)
             changed = True
+        changed = rename_notify_unit(row) or changed
         if isinstance(movement, (unit_move.FolderMove, unit_move.PendingRename)):
-            changed = unit_move.move_folder(row.id, movement.destination, branch=movement.branch) or changed
+            changed = unit_move.move_idle_folder(row.id, movement.destination, branch=movement.branch) or changed
+        if journal.exists() and isinstance(unit_move.pending_move(row.id), unit_move.NoPendingMove):
+            fields = unit_move.json_object(read_json(journal))
+            if not fields.get("pending"):
+                journal.unlink()
         print("done" if changed else "unchanged")
         return request
+
+
+def rename_notice_path(identity: staff.StaffId) -> Path:
+    """Keep notice recovery separate from document move recovery."""
+    return production_journal(identity).with_name("rename-notices.json")
+
+
+def rename_prepare_notice(row: staff.StaffRow, name: str) -> None:
+    """Retain the director and its workers before the staff name changes."""
+    if row.name == name:
+        return
+    path = rename_notice_path(row.id)
+    previous = unit_move.json_object(read_json(path)) if path.exists() else {}
+    if previous.get("name") == name:
+        return
+    if previous.get("pending"):
+        raise RenameRefused(f"{row.name}: finish the pending rename messages first")
+    record = staff.snapshot()
+    members = [row, *record.find(kind="worker", parent=row.id)]
+    write_json(path, {"name": name, "old_name": row.name, "key": f"rename:{row.id}:{time.time_ns()}",
+                      "pending": [str(member.id) for member in members]})
+
+
+def rename_notify_unit(row: staff.StaffRow) -> bool:
+    """Send one rename notice to each retained recipient through the shared send path."""
+    path = rename_notice_path(row.id)
+    if not path.exists():
+        return False
+    fields = unit_move.json_object(read_json(path))
+    pending = fields.get("pending")
+    if fields.get("name") != row.name or not isinstance(pending, list):
+        return False
+    recipients = [recipient for recipient in cast(list[object], pending) if isinstance(recipient, str)]
+    text = f"The unit director {fields.get('old_name')} is now named {row.name}. Continue the current work."
+    changed = False
+    for recipient in recipients.copy():
+        try:
+            rename_send_notice(recipient, str(fields["key"]), text)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+            detail = " ".join(str(error).splitlines())
+            print(f"anomaly: {row.name}: rename message to {recipient}: {detail}", file=sys.stderr)
+            changed = True
+            continue
+        recipients.remove(recipient)
+        fields["pending"] = recipients
+        write_json(path, fields)
+        changed = True
+    return changed
+
+
+def rename_send_notice(recipient: str, key: str, text: str) -> None:
+    """Use the shared transport with a sender that does not request shutdown."""
+    result = subprocess.run(session_send.send_argv("--to", recipient, "--from", "agents rename",
+        "--summary", "Unit director renamed", "--key", key,
+        "--repeat-minutes", str(100 * 365 * 24 * 60)),
+        input=text, capture_output=True, text=True, check=False, timeout=send_budget.seconds())
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if (not isinstance(outcome, send_result.ConfirmedSendOutcome)
+            or outcome.header.outcome not in {"sent", "queued", "skipped", "kept", "replaced"}):
+        lines = (result.stderr or result.stdout).splitlines()
+        raise RuntimeError(lines[0] if lines else "rename message has no confirmed send result")
 
 
 def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> int:
