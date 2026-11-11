@@ -23,13 +23,18 @@ A later assignment resumes the same conversation when the worker remains availab
 Codex code review uses read-only review workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
+A failed compaction prints one error line, and the dispatch continues without compaction.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.
 
 ## Pane submission and completion
 
 `assign.sh` returns after successful prompt delivery. Exit 0 means submitted.
-The transcript can record the prompt later.
+Codex dispatch also requires the prompt in its transcript before it reports submission.
+Codex dispatch waits up to `WORKER_SETTLE_SECONDS` for the receipt.
+An unproved Codex prompt returns uncertain when this bound passes or the process exits.
+A recorded prompt remains submitted after a process exit.
+Claude can record the prompt later.
 A failed delivery command returns an error.
 The transcript prevents replay.
 A matching final transcript reply proves completion.
@@ -56,6 +61,11 @@ This lookup includes dispatches outside the run root.
 Older workers without a link use the held-run lookup.
 A session without a worker pass changes nothing.
 A later event retries unfinished completion steps for a completed pass.
+The hook reads the worker's run inside the worker lock.
+A new assign finishes the unfinished completion before it replaces the link.
+That notice names its own pass and says it is a late result. The pane stays for the new assign.
+The late step does not retire the worker, and it keeps a hold that the new assign also owns.
+If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
 
 An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
 It saves the reply without typing another prompt.
@@ -90,8 +100,11 @@ An unexpected screen prompt ends no turn, and the director finds it only when it
 A turn without DONE reports `no DONE` when no pending work explains it.
 The notice includes the worker's last reply and leaves the pass active.
 The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
-The close accepts the saved DONE hook completion for the same dispatch.
-It retains its status, live-run, and idle checks.
+The completion rule accepts the saved DONE hook completion for the same dispatch.
+Live detached work prevents completion before pane closure.
+The hook ends `scratch.worker_task(row.id)` before it closes the pane.
+This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
+A failed cleanup adds one line to the director notice and permits pane closure.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
@@ -102,10 +115,8 @@ Their DONE reply records `done` and sends one notice.
 The hook also saves an assigned style review result.
 A close anomaly retains the completed outcome and reaches the director in the hook message.
 A held reviewer role remains held after submission. Completion ends that reviewer and releases the role.
-Native process exit alone does not prove that a pane can close.
-The close retains a pane until it observes its shell or confirms pane closure.
-The close adds no wait for foreground cleanup.
-A failed stop reports the pane id and the program name of each foreground process from the proof read.
+The close matches the pane's terminal identity and closes it without a foreground-process wait.
+Uncertain ownership or failed closure produces a retained-pane diagnostic.
 
 Event producers call `handle(WorkerEvent(thread_id, EventKind.RUN_FINISHED))` after a run record reaches `finished`.
 The final diff event uses `EventKind.STAGE_READY` for a review with two stages.
@@ -136,7 +147,9 @@ Each registered Codex home must trust the shared `hooks.json` handlers.
 The installer reports the `turn-end` handler as trusted.
 A worker needs no new launch-line setting to use the installed Stop hook.
 Every Codex session runs the handler at each turn end. A non-worker turn exits as ignored and adds one line to `~/.local/state/herdr/turn-end-ignored.jsonl`.
-A pane launched before the change keeps `-c notify` on its launch line. The handler ignores that payload, and the Stop hook carries the turn.
+A Codex process that started before the Stop hook was installed (2026-11-09 08:27 EST) runs no Stop hook. Measured: such a process finished turns after that time and added no line.
+Close that worker's pane. Its next assign starts a new process that has the hook.
+A pane launched with `-c notify` sends a payload that the handler saves as an ignored line with an empty thread.
 Why: legacy notify passed the payload as one argument, and Linux refuses one argument over 128 KiB. Long-lived threads lost turn ends that way (2026-11-09).
 
 ## Unit code reviewers
@@ -171,6 +184,20 @@ A publication failure runs the caller's cleanup callback and reports the native 
 The Claude coordinator tries to stop an unpublished session.
 A failed stop reports `cleanup unproved`.
 A failed pane admission closes only the new pane that this call created.
+A reviewer hold failure or a failure before dispatch submission ends only the worker pane that this call created.
+The same cleanup applies when worker restore fails before it submits its resume prompt.
+Cleanup closes only the saved pane and terminal.
+The close target is the worker's current session for both Claude and Codex.
+It retires a staff row only if this launch created the row.
+A resumed worker keeps its existing row after cleanup.
+An existing pane keeps its pane and staff row.
+A failed close prints `anomaly: <pane>: cleanup failed: <reason>` and preserves the original failure code.
+An incomplete start also closes its new pane.
+The start result identifies a new pane and its saved terminal.
+Dispatch reads staff rows before start and adds no pane scan for cleanup.
+A target refusal before prompt delivery runs cleanup.
+Cleanup stops only after target checks pass and the prompt can reach the agent.
+Restore cancels cleanup through the callback in `Herdr.prompt`.
 For an existing pane, the launcher quits its own agent and keeps the shell.
 Both paths compare the current terminal and process with the identities saved after launch.
 A replacement process remains open. Cleanup prints one anomaly with the pane id.
@@ -439,11 +466,11 @@ An ended identity cannot reopen.
 `[roles] new_open=false` in `config/design_roles.conf` preserves existing roles and refuses new ones.
 
 A design role uses `worker.py` operations.
-`worker.py list --json` gives each worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
+`worker.py list all --json` gives each retained worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
 The staff row supplies `role` and `home`. The `home` folder name supplies the account label.
 `work` is `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
 An unknown role uses `WorkerRoleUnavailable`. An unknown home uses `AccountUnavailable` and omits `home`.
-`worker.py list --json --all` reads workers for every manager and adds each parent's name as `manager`.
+`worker.py list all --json --all-parents` reads workers for every manager and adds each parent's name as `manager`.
 It needs no caller row and makes no process, pane, or thread read.
 Its `state` uses the saved dispatch status or staff hold.
 Its `activity` uses the saved pass activity, then its status.
@@ -582,7 +609,8 @@ Daemon sessions retain their `codex:<thread>` route.
 ## Retirement and resume
 
 Unit retirement stops workers through the pane worker path.
-Run cleanup preserves worker threads.
+DONE closure preserves worker rows and conversations.
+Run cleanup selects workers from its dispatch records and calls `worker.py end` for each selected member.
 `remove_workers.py` resolves the selected staff member before it calls the worker command.
 Shutdown keeps saved Claude child launcher commands in `ClaudeChildResume`.
 Pane worker resume messages keep the fixed staff id and dispatch id.
@@ -617,13 +645,40 @@ Account moves preserve closed idle workers.
 
 ## Worker account display
 
-`worker.py list --json` gives each worker its name, fixed id, current session, state, role and activity.
+`worker.py list all --json` gives each retained worker its name, fixed id, current session, state, role and activity.
 It computes `work`, `account` and `home` when it reads each worker.
 It stores none of these three fields.
 `worker_panes.worker_state` supplies `work` as `idle`, `busy` or `unknown`.
 `member_account.resume_account` supplies the account label and absolute home path.
 Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
 That row has no `home` field.
+
+`worker.py list [open|closed|all]` defaults to open panes.
+`list closed` shows closed panes. `list all` includes uncertain rows too.
+The positional filter uses `WorkerFilter`; `--all-parents` replaces the old `--all` flag.
+The flag still selects saved dispatches from every parent.
+`list all --json --all-parents` needs no caller staff row or live pane read.
+Open and closed filters use current pane evidence, including with `--all-parents`.
+
+Text output has aligned headers: `#`, `Name`, `Account`, `Activity`, `Pane`, `State`, and `Waiting on`.
+Activity uses the active dispatch kind, then the worker's role when no dispatch is active.
+Waiting on uses existing live detached run labels and shows `-` without a specific run.
+Text rows place open panes first and retain the current order inside each group.
+`_worker_pane_state` maps each observed worker to its pane and state words.
+
+| Observed worker | Pane | State |
+| --- | --- | --- |
+| `OpenWorker` | `open` | `paused` or `exited` from staff, else `busy`, `idle` or `unknown` |
+| `StoppedWorker` | `open` | `exited` |
+| `ClosedWorker` | `closed` | `-` |
+| Any other class | `unknown` | `-`, with its reason |
+
+A row whose pane is not open prints `-` for the account.
+Saved dispatch rows print `-` for Pane and use their recorded dispatch state.
+`display_cells.machine_column` adds a foreign machine inside the account cell, in parentheses.
+A worker uses the machine of its parent's worktree.
+`list_workers(as_json=False)` supplies text values without changing JSON fields.
+JSON retains its existing row order and schema; only the selected filter removes rows.
 
 ## Assignment settings and command files
 

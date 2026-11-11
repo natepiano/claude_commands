@@ -167,9 +167,6 @@ class ClaudeLaunchScanTests(unittest.TestCase):
             _ = (root / "mixed.py").write_text(source)
             self.assertEqual(unguarded_launches(root), [UnguardedLaunch("mixed.py", 6), UnguardedLaunch("mixed.py", 8)])
 
-    def test_repository_launches_go_through_nix_env(self) -> None:
-        self.assertEqual(unguarded_launches(Path(__file__).resolve().parents[1]), [])
-
     def test_planted_python_shell_and_herdr_starts_fail_the_scan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

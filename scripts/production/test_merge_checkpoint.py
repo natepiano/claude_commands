@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from scripts.production import checkpoint_gate
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -121,8 +122,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
         _ = config.write_text((checkout / "config/staff.conf").read_text())
-        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config),
-                         "CLAUDE_PYTHON": sys.executable})
+        self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         library = Path(self.env["HOME"]) / ".claude/scripts/lib"
         library.symlink_to(checkout / "scripts/lib", target_is_directory=True)
         _ = self.git("remote", "set-head", "origin", "production")
@@ -512,22 +512,74 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                       never_pushed.process.stdout)
         self.assertEqual(never_pushed.process.stdout, unpushed.process.stdout)
     def test_checkpoint_on_second_origin_branch_merges_the_checkpoint_and_names_branch(self) -> None:
-        _ = self.git("checkout", "-b", "alpha-phase", cwd=self.unit)
-        sha = self.checkpoint(push=False)
-        _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
-        # The accepted checkpoint need not be the containing branch's tip.
-        later = self.checkpoint("outside.txt", "later work\n", push=False)
-        _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
-        _ = self.git("config", "remote.origin.fetch",
-                     "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch")
-        result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertIn("ancestry: ok — checkpoint exists and is on origin/alpha-phase\n",
-                      result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
-        self.assertNotEqual(self.git("rev-parse", "HEAD^2"), later)
-        self.assertFalse((self.checkout / "outside.txt").exists())
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
+        for outcome in ("live-owner", "ancestor", "equal-patch", "merge-branch", "moved", "unlanded",
+                        "delete-failed", "no-promotion"):
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                _ = self.git("checkout", "-b", "alpha-phase", cwd=self.unit)
+                sha = self.checkpoint(push=False)
+                # The request can name a commit before the branch tip.
+                later = self.checkpoint("outside.txt", "later work\n", push=False)
+                _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
+                if outcome not in ("live-owner", "equal-patch", "unlanded"):
+                    _ = self.git("update-ref", "refs/heads/alpha-phase", sha, cwd=self.origin)
+                if outcome != "live-owner":
+                    _ = self.git("checkout", "alpha-branch", cwd=self.unit)
+                if outcome == "equal-patch":
+                    _ = self.git("cherry-pick", later, cwd=self.promote)
+                    _ = self.git("push", "origin", "main", cwd=self.promote)
+                if outcome == "merge-branch":
+                    doc = self.root / "other-production.md"
+                    _ = doc.write_text("- **Merge branch:** alpha-phase\n")
+                    _ = recorded_showrunner("other", doc)
+                if outcome == "moved":
+                    self.executable(self.checkout / ".git/hooks/pre-push", "#!/bin/sh\n"
+                        + 'read local_ref local_sha remote_ref remote_sha\n'
+                        + 'if [ "$local_sha" = 0000000000000000000000000000000000000000 ] '
+                        + '&& [ "$remote_ref" = refs/heads/alpha-phase ]; then\n'
+                        + f"git --git-dir={shlex.quote(str(self.origin))} update-ref refs/heads/alpha-phase {later} {sha}\n"
+                        + "fi\nexit 0\n")
+                if outcome == "delete-failed":
+                    self.executable(self.origin / "hooks/pre-receive", "#!/bin/sh\n"
+                        + 'read old new ref\n'
+                        + '[ "$new" != 0000000000000000000000000000000000000000 ]\n')
+                if outcome != "no-promotion":
+                    _ = self.doc.write_text(self.doc.read_text() + f"\n- **Promote:** {self.promote}\n")
+                _ = self.git("config", "remote.origin.fetch",
+                             "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch")
+                if outcome != "no-promotion":
+                    for branch in ("production", "main"):
+                        _ = self.git("config", "--add", "remote.origin.fetch",
+                                     f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+                result = self.run_checkpoint(sha)
+                self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+                self.assertIn("ancestry: ok — checkpoint exists and is on origin/alpha-phase\n",
+                              result.process.stdout)
+                if outcome == "equal-patch":
+                    self.assertEqual(self.git("merge-base", "--is-ancestor", sha, "HEAD"), "")
+                    self.assertNotIn(later, self.git("rev-list", "HEAD").splitlines())
+                else:
+                    self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+                    self.assertNotEqual(self.git("rev-parse", "HEAD^2"), later)
+                self.assertEqual((self.checkout / "outside.txt").exists(), outcome == "equal-patch")
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
+                remote = self.git("ls-remote", "--heads", "origin", "refs/heads/alpha-phase")
+                if outcome in ("ancestor", "equal-patch"):
+                    self.assertEqual(remote, "")
+                    self.assertIn("branch: deleted — origin/alpha-phase", result.process.stdout)
+                    if outcome == "equal-patch":
+                        self.assertEqual(self.git("cherry", "origin/main", later).split()[0], "-")
+                    rerun = self.run_checkpoint(sha)
+                    self.assertEqual(rerun.process.returncode, 0, rerun.process.stdout + rerun.process.stderr)
+                else:
+                    expected = later if outcome in ("live-owner", "moved", "unlanded") else sha
+                    self.assertEqual(remote.split()[0], expected)
+                    reasons = {"live-owner": "present worktree", "merge-branch": "production merge branch",
+                               "moved": "delete failed or branch moved", "unlanded": "work has not reached main",
+                               "delete-failed": "delete failed", "no-promotion": "no promotion configured"}
+                    self.assertIn(reasons[outcome], result.process.stdout)
 
     def test_checkpoint_on_no_origin_branch_checks_all_heads_and_still_holds(self) -> None:
         sha = self.checkpoint(push=False)

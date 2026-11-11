@@ -21,7 +21,7 @@ The style table uses the same status words as the phase table.
 Both tables add a **Machine** column after **Status** only when a row runs on another machine.
 The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
 
-For a production without `Kind: style`, the table is:
+For units outside the `Style units` table in a production without `Kind: style`, the table is:
 `| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
 
 1. **Progress** shows `█` done, `▓` open, and `░` todo, followed by `<done>/<total>`.
@@ -54,7 +54,7 @@ Phase, ETA, and Workers use at most 80 characters per cell, with `…` for omitt
 Queued limits each item or title to 80 characters and keeps its count suffix after the cut.
 Empty cells show `—`.
 
-For `Kind: style`, the table is
+For `Kind: style` or units named in the production's `Style units` table, the table is
 `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`:
 
 - **Ticket**: `#<n> · <rule> · <crate> · <work>`. The number drops the unit
@@ -70,9 +70,9 @@ For `Kind: style`, the table is
   With no open step: `starting <work>` for an assigned ticket, `waiting for the
   showrunner to merge` for a checkpointed one, else `idle — <outcome>` or `idle`.
 - **ETA**: the current phase ETA as `<HH:MM>`, else `—`.
-- **Findings built**: the all-time built count for the unit's family.
-- **Last 24 h**: findings first built in the last 24 hours.
-- **Findings left**: the family's filed findings with an approved decision:
+- **Findings built**: the all-time built count across the unit's configured families.
+- **Last 24 h**: findings first built in the last 24 hours across those families.
+- **Findings left**: filed findings with an approved decision across those families:
   `<approved>`, or `<approved> approved of <filed> filed` when not all filed
   findings are approved. A recorded split adds `: ready <a> · changed <b> ·
   structure <c> · other <d> (<age>)`. Age is whole minutes below 60 (`<n> min`),

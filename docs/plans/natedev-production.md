@@ -65,7 +65,7 @@
 | `scripts/hooks/fn_length_lib.py` | stalls-unit | mul_add-unit (shared scanner, edit parser, lint reader and multiply-add target-root helper) |
 | `commands/showrunner/produce.md` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges); feature-log-unit (<ChangeReviewFeatureLog/> and <CloseChangeReview/>) |
 | `commands/showrunner/promote_unit.md` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
-| `scripts/production/showrunners.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
+| `scripts/production/showrunners.py` | devtools-unit (sdlc) | — |
 | `scripts/production/stall_watch.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
 
 ## Close-out

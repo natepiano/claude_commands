@@ -37,22 +37,18 @@ arguments = sys.argv[2:]
 record = staff.snapshot()
 owner = owner_for(arguments[1] if arguments[0] == "--production" else arguments[0], record=record)
 for row in record.find(parent=owner.id, kind="unit"):
-    print(f"{row.name}\t{row.id}")
+    run = str(row.run.path) if isinstance(row.run, staff.OpenRun) else ""
+    print(f"{row.name}\t{row.id}\t{run}")
 PYTHON
 ) || exit 1
 staff_rows=("${(@f)staff_lines}")
-typeset -A state_keys
+typeset -A state_keys open_runs
 for line in $staff_rows; do
   fields=("${(@ps:\t:)line}")
   state_keys[$fields[1]]=$fields[2]
+  open_runs[$fields[1]]=$fields[3]
 done
 NOTIFIER=$REPO/scripts/message/notifier.sh
-# Run markers sit under unit/, or delegate/ for a run started before the rename.
-if [[ -n ${UNIT_ACTIVE_DIR:-${PLAN_DELEGATE_ACTIVE_DIR:-}} ]]; then
-  ACTIVE_DIRS=(${UNIT_ACTIVE_DIR:-$PLAN_DELEGATE_ACTIVE_DIR})
-else
-  ACTIVE_DIRS=(/tmp/claude/unit/active /tmp/claude/delegate/active)
-fi
 mkdir -p "$DIR"
 SEEN=$DIR/decisions_seen
 BLOCKS=$DIR/blocks_open
@@ -156,19 +152,13 @@ for line in $units; do
     unknown) echo 'CLAUDE STATE UNKNOWN' ;;
     stopped) echo 'CLAUDE NOT RUNNING' ;;
   esac
-  marker=
-  for active in $ACTIVE_DIRS; do
-    if [[ -n $session_id && -f $active/$session_id ]]; then marker=$active/$session_id; break; fi
-  done
-  if [[ -n $marker ]]; then
-    session_dir=$(< "$marker")
-    if [[ -n $session_dir ]]; then
-      instance=unit-${session_dir:t}
-      [[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-${session_dir:t}
-      health=$(zsh "$NOTIFIER" health "$instance" 2>&1)
-      if (( $? == 1 )); then
-        print -r -- "TICKS FAILING (${health#failing: })"
-      fi
+  session_dir=${open_runs[$u]}
+  if [[ -n $session_id && -n $session_dir ]]; then
+    instance=unit-${session_dir:t}
+    [[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-${session_dir:t}
+    health=$(zsh "$NOTIFIER" health "$instance" 2>&1)
+    if (( $? == 1 )); then
+      print -r -- "TICKS FAILING (${health#failing: })"
     fi
   fi
   [[ $claude_state == unknown || $claude_state == stopped ]] && continue

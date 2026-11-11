@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production import session_labels, session_staff, staff, unit_config
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
@@ -43,8 +43,8 @@ class NativeSessionLabelTests(StaffTestCase):
         self.assertEqual(labels.environment(environment, unit.id), {})
 
     def test_retained_reference_projects_the_current_session_without_copied_identity(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.launch_names import LaunchNames
+        from scripts.agents import pane_record
+        from scripts.agents.launch_names import LaunchNames
 
         fixture = self.row_production()
         self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
@@ -100,7 +100,7 @@ class RowResolverTests(StaffTestCase):
                 ("shared-fixture",)))
             self.assertEqual(resolver.unit_config(fixture.worker), resolver.unit_config(fixture.unit))
             self.assertEqual(resolver.production_doc(fixture.unit),
-                             session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner))
+                             session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner, "# Production\n"))
             self.assertEqual(resolver.merge_branch(fixture.unit), session_staff.Branch("merge-from-git"))
             self.assertIsInstance(resolver.unit_state(fixture.unit), session_staff.ActiveUnit)
             self.assertEqual(resolver.member_by_folder("natedev", fixture.worktree),
@@ -112,7 +112,8 @@ class RowResolverTests(StaffTestCase):
         worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
         resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, fixture.unit, worker)))
         self.assertIsInstance(resolver.unit_config(worker), session_staff.NoUnitConfig)
-        self.assertEqual(resolver.production_doc(worker), session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner))
+        self.assertEqual(resolver.production_doc(worker),
+                         session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner, "# Production\n"))
 
     def test_unfilled_locations_keep_explicit_incomplete_outcomes(self) -> None:
         runner, unit, worker = self.tree()
@@ -206,9 +207,9 @@ class RowResolverTests(StaffTestCase):
 
         def transport(arguments: list[str], *, input: str, capture_output: bool,
                       text: bool, check: bool) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(arguments[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac"])
+            self.assertEqual(arguments[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
             transports.append(arguments)
-            command = shlex.split(arguments[6])
+            command = shlex.split(arguments[4])
             return real_run([sys.executable, *command[1:]], input=input, capture_output=capture_output,
                             text=text, check=check)
 
@@ -222,7 +223,8 @@ class RowResolverTests(StaffTestCase):
             self.assertIsInstance(config, unit_config.UnitConfig)
             assert isinstance(config, unit_config.UnitConfig)
             self.assertEqual(config.plan, unit_config.StandbyPlan())
-            self.assertEqual(resolver.production_doc(first), session_staff.ProductionDoc("mac", fixture.doc, runner))
+            self.assertEqual(resolver.production_doc(first),
+                             session_staff.ProductionDoc("mac", fixture.doc, runner, "# Production\n"))
             self.assertEqual(resolver.merge_branch(first), session_staff.Branch("merge-from-git"))
         self.assertEqual(len(transports), 1)
 

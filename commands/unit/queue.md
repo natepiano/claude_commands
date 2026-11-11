@@ -8,6 +8,7 @@ argument-hint: "add <text> | done | clear | show"
 Use this in the unit director session. The script finds your unit from your staff row.
 The list holds work that comes after the current work outside the plan.
 The showrunner sees its first item and the count of later items in `/showrunner:units`.
+The queue only stores this list and wakes nobody; for a timed action, use a scheduled wakeup.
 Queued also shows unfinished plan phases, excluding done and open phases.
 
 ## Steps

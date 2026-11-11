@@ -12,14 +12,15 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import Mock, patch
 
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit
 from scripts.production import staff, unit_config
 from scripts.production import unit_lookup
 from scripts.message import sessions
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.herdr import herdr
 from scripts.herdr.herdr import HerdrPlace
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
@@ -462,6 +463,25 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = source.write_text(standing + "\nShowrunner template changed\n", encoding="utf-8")
         _ = self.successful("alpha", "--plan", plan.as_posix())
         self.assertEqual(copied.read_text(encoding="utf-8"), progress)
+
+        with self.subTest(plan="committed only on the unit branch"):
+            _ = self.git("add", "-f", "--", plan.as_posix(), cwd=worktree)
+            _ = self.git("commit", "-q", "-m", "commit the unit plan", cwd=worktree)
+            write_text_atomic(source, header)
+            row = unit_membership("build-followups", "alpha")
+            state = self.repository_state()
+            for flag, observed in (("--resume", sessions.SessionNotLive()),
+                                   ("--attach", sessions.LiveSessionProcess(os.getpid()))):
+                with (self.subTest(flag=flag),
+                      patch.object(sessions, "session_liveness", return_value=observed),
+                      patch.object(add_unit, "attach_source", return_value=add_unit.RunningSessionHandoff(
+                          row.current_session, os.getpid(), "fixture-start", "fixture-login")),
+                      patch.object(add_unit, "stop_for_attach") as stopped):
+                    _ = self.successful("alpha", "--plan", plan.as_posix(), flag, row.current_session,
+                                        "--cwd", str(worktree), "--check")
+                    stopped.assert_not_called()
+                    self.assertEqual(self.repository_state(), state)
+                    self.assertEqual(copied.read_text(encoding="utf-8"), progress)
 
     def test_transcript_model_reads_newest_file_and_crosses_chunk_boundaries(self) -> None:
         root = Path(self.env["HOME"]) / ".claude/projects"

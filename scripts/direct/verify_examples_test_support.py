@@ -203,7 +203,7 @@ esac
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
@@ -304,8 +304,8 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
     @override
     def setUpClass(cls) -> None:
         builder = ExampleWorkspaceFixture()
-        builder.setUp()
         cls.addClassCleanup(builder.doCleanups)
+        builder.setUp()
         cls.fixture_root = builder.root
         seed = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="example-workspace-seed-"))
         cls.fixture_seed = Path(seed) / "seed"

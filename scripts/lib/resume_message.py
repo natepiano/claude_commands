@@ -106,7 +106,8 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
     if why or context:
         opening = context or f"You were stopped and resumed because {why}.{moved} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
-                     + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
+                     + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting. "
+                     + "Background commands that you started before the restart ended with no result. Run them again.")
     for pane in workers.panes:
         if isinstance(pane.turn, UnsubmittedAssignment):
             lines.append(launcher_prompt(pane.staff_id, pane.turn.dispatch_id, pane.turn.command))

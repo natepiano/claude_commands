@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, cast
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 from scripts.test_times.coverage_overlap import TestCoverage, select_candidates
@@ -174,7 +175,7 @@ class CoverageOverlapTests(unittest.TestCase):
                 (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
                 (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
                 *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
-                    "lib/py", "lib/conf.py", "lib/terminal_cells.py", "buildlog/treekey.py",
+                    "lib/py", "lib/conf.py", "lib/conf_reads.py", "lib/terminal_cells.py", "buildlog/treekey.py",
                     "production/gate_modules.py", "test_times/module_run.py",
                 )),
             ):
@@ -194,7 +195,7 @@ class CoverageOverlapTests(unittest.TestCase):
             output = root / "coverage.json"
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith(("GIT_", "NATEST_COVERAGE_"))}
-            env.update({"HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
+            env.update({**interpreter_cache_environment(root / "cache"), "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
                    "BUILDLOG_DIR": str(root / "buildlog"), "PYTHONDONTWRITEBYTECODE": "1",
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
                    "COVERAGE_OUT": str(output)})

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import contextlib
 import io

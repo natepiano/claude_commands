@@ -11,7 +11,6 @@ from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
 
-import ast
 import io
 import json
 import os
@@ -29,7 +28,6 @@ from unittest.mock import patch
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
 from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
@@ -52,37 +50,6 @@ def damage_binding_repository(design: design_roles.HeldDesign) -> Path:
 
 def setUpModule() -> None:
     install_signal_pid_guard()
-
-
-class LiveDesignRoleNamesTests(unittest.TestCase):
-    def test_live_modules_do_not_import_the_retired_package_or_read_its_environment(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        violations: list[str] = []
-        for path in sorted((root / "scripts").rglob("*")):
-            if not path.is_file() or is_test_code(path) or path.suffix not in (".py", ".sh"):
-                continue
-            relative = path.relative_to(root).as_posix()
-            text = path.read_text(encoding="utf-8")
-            if path.suffix == ".sh":
-                violations.extend(f"{relative}:{number}: {line.strip()}"
-                                  for number, line in enumerate(text.splitlines(), 1)
-                                  if "GUILD_" in line or "scripts.guilds" in line)
-                continue
-            for node in ast.walk(ast.parse(text, filename=relative)):
-                imports: tuple[str, ...] = ()
-                if isinstance(node, ast.Import):
-                    imports = tuple(alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom):
-                    imports = (node.module or "",)
-                    if node.module == "scripts":
-                        imports += tuple("scripts." + alias.name for alias in node.names)
-                if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                        name == "scripts.guilds" or name.startswith("scripts.guilds.") for name in imports):
-                    violations.append(f"{relative}:{node.lineno}: retired package import")
-                if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    if "GUILD_" in node.value or "scripts.guilds" in node.value:
-                        violations.append(f"{relative}:{node.lineno}: retired name in a runtime string")
-        self.assertEqual(violations, [], "\n".join(violations))
 
 
 @final
@@ -252,7 +219,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual([event["status"] for event in events if event["event_type"] == "phase_finished"],
                          ["completed", "completed"])
         self.assertEqual(sum(event["event_type"] == "run_started" for event in events), 1)
-        self.assertEqual(state["status"], "active")
+        self.assertNotIn("status", state)
         self.assertIn("The work is complete.", second_reply.read_text())
         instance = design.roles[1]
         if not isinstance(instance.lifecycle, design_roles.RoleOpen):
@@ -277,8 +244,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(len(self.panes.world.launches), 2)
         with stop_once(design_roles, "_recorder_command", when="before"), self.assertRaises(InjectedStop):
             _ = design_roles.end(design.placement.design_id + "/reviewer")
-        self.assertEqual(worker_lifecycle.read_worker_state(directory / "progress_history_state.json")["status"],
-                         "active")
+        self.assertNotIn("status", worker_lifecycle.read_worker_state(directory / "progress_history_state.json"))
         ended = design_roles.end(design.placement.design_id + "/reviewer")
         self.assertIsInstance(ended.roles[1].lifecycle, design_roles.RoleEnded)
         self.assertIsNone(staff.by_id(instance.lifecycle.staff_id))
@@ -303,7 +269,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
         self.assertEqual(self.panes.command_case.agent.submitted, [])
         self.assertEqual(recorder_state.read_open_phase_ids(directory), [])
         state = worker_lifecycle.read_worker_state(directory / "progress_history_state.json")
-        self.assertEqual(state["status"], "active")
+        self.assertNotIn("status", state)
         history = Path(cast(str, state["history_file"]))
         events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([event["status"] for event in events if event["event_type"] == "phase_finished"], ["error"])

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production import log_backup, staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

@@ -11,10 +11,11 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from unittest import mock
 
 from scripts.agents import worker_lifecycle
+from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct import claude_worker
@@ -25,7 +26,7 @@ from scripts.production.staff_test_support import (
     production_membership, unit_membership, recorded_showrunner, transcript_fixture,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 
 
 def record_destination_stop(identities: list[str], identity: str) -> worker_admission.DestinationStopped:
@@ -118,22 +119,32 @@ class WorkerAdmissionTests(StaffTestCase):
 
     def test_start_permission_creates_no_row_and_publication_uses_the_returned_thread(self) -> None:
         _, unit, _ = self.tree()
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        with mock.patch.object(staff, "runtime_id", return_value=unit.id):
-            allowed = worker_admission.admit("test", self.root)
-        self.assertIsInstance(allowed, worker_admission.WorkerStartAllowed)
-        self.assertEqual((allowed.name, allowed.parent, allowed.slot),
-                         ("test", unit.id, worker_admission.NewWorkerSlot()))
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
         self.assertEqual(staff.find(kind="worker", parent=unit.id), [self.tree()[2]])
-        thread = fixture_runtime_id("returned-test-thread")
-        published = worker_admission.publish(allowed, thread)
-        self.assertIsInstance(published, worker_admission.PublishedWorker)
-        self.assertEqual((published.row.id, published.row.name, published.row.parent), (thread, "test", staff.ReportsTo(unit.id)))
-        self.assertEqual(staff.by_id(staff.StaffId(thread)), published.row)
-        after = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        self.assertEqual(worker_admission.publish(allowed, thread), published)
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), after)
+        for retained_home in (False, True):
+            with self.subTest(retained_home=retained_home):
+                name = "test-home" if retained_home else "test"
+                before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                with mock.patch.object(staff, "runtime_id", return_value=unit.id):
+                    allowed = worker_admission.admit(name, self.root)
+                self.assertIsInstance(allowed, worker_admission.WorkerStartAllowed)
+                self.assertEqual((allowed.name, allowed.parent, allowed.slot),
+                                 (name, unit.id, worker_admission.NewWorkerSlot()))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+                thread = fixture_runtime_id("returned-" + name + "-thread")
+                home = self.root / "codex"
+                if retained_home:
+                    fixture_session(thread, staff.CodexBackend(home))
+                published = worker_admission.publish(allowed, thread)
+                self.assertIsInstance(published, worker_admission.PublishedWorker)
+                self.assertEqual((published.row.id, published.row.name, published.row.parent),
+                                 (thread, name, staff.ReportsTo(unit.id)))
+                self.assertEqual(published.row.home, staff.SessionHome(home) if retained_home else staff.HomeUnknown())
+                self.assertEqual(staff.by_id(staff.StaffId(thread)), published.row)
+                if retained_home:
+                    self.assertEqual(staff.backend(published.row), staff.CodexBackend(home))
+                after = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+                self.assertEqual(worker_admission.publish(allowed, thread), published)
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), after)
 
     def test_codex_unit_admits_under_its_fixed_parent_id_after_thread_replacement(self) -> None:
         _, unit, _ = self.tree()
@@ -208,6 +219,16 @@ class FamilyHandoffTests(StaffTestCase):
                     "message": {"role": "assistant" if kind == "assistant" else "user",
                                 "content": [{"type": "text", "text": "The request"}]},
                 }, set()), expected)
+        for record_type, message_type, role, expected in (
+                ("response_item", "agent_message", "", ""),
+                ("event_msg", "agent_message", "", "assistant:\nThe request"),
+                ("response_item", "message", "assistant", "assistant:\nThe request")):
+            with self.subTest(record_type=record_type, message_type=message_type):
+                self.assertEqual(worker_admission.transcript_entry({
+                    "type": record_type, "payload": {
+                        "type": message_type, "role": role, "content": [{"type": "output_text", "text": "The request"}],
+                    },
+                }, set()), expected)
 
     def source(self, family: Literal["claude", "codex"], *, turns: int = 1,
                malformed: bool = False, worker_name: str = "switch") -> tuple[worker_admission.WorkerStartAllowed, Path,
@@ -228,19 +249,31 @@ class FamilyHandoffTests(StaffTestCase):
 
 
     def test_family_switch_uses_native_release_without_run_discovery(self) -> None:
-        cases: tuple[tuple[Literal["claude", "codex"], bool], ...] = (
-            ("claude", False), ("claude", True), ("codex", False), ("codex", True))
-        for family, stopped in cases:
-            allowed, _, _ = self.source(family, worker_name=f"native-{stopped}")
+        cases: tuple[tuple[Literal["claude", "codex"], bool, bool], ...] = (
+            ("claude", False, True), ("claude", True, True),
+            ("codex", False, True), ("codex", True, True), ("claude", False, False))
+        for family, stopped, retained_launch in cases:
+            allowed, _, _ = self.source(family, worker_name=f"native-{stopped}-{retained_launch}")
             assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
             row = allowed.slot.row
             result = stop_resume.Stopped(row.current_session, 123) if stopped else stop_resume.NotRunning(row.current_session)
-            identity = fixture_runtime_id(f"native-{family}-{stopped}")
-            fixture_session(identity, staff.ClaudeBackend() if family == "codex" else staff.CodexBackend(self.root / "destination"))
+            identity = fixture_runtime_id(f"native-{family}-{stopped}-{retained_launch}")
+            backend = staff.ClaudeBackend() if family == "codex" else staff.CodexBackend(self.root / "destination")
+            fixture_session(identity, backend)
+            if not retained_launch:
+                for path in pane_launch.record_directory().glob("*.json"):
+                    path.unlink()
+
+            def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
+                self.assertEqual(staff.backend(published.row), backend)
+                self.assertEqual(staff.by_id(published.row.id), published.row)
+                return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
+
             with (mock.patch.object(stop_resume, "stop", return_value=result),
                   mock.patch.object(session_staff, "worker_run_index", side_effect=AssertionError("unnecessary run discovery"))):
                 published = worker_admission.switch_worker(allowed, "claude" if family == "codex" else "codex",
-                    start=lambda handoff: identity, dispatch=lambda published: worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, cleanup=lambda identity: worker_admission.NoDestinationToStop())
+                    start=lambda handoff: identity, dispatch=dispatch, cleanup=lambda identity: worker_admission.NoDestinationToStop(),
+                    launch_home=staff.SessionHome(backend.codex_home) if isinstance(backend, staff.CodexBackend) else staff.HomeUnknown())
             self.assertEqual(published.row.id, row.id)
             self.assertEqual(published.row.current_session, identity)
 
@@ -381,6 +414,8 @@ class FamilyHandoffTests(StaffTestCase):
                 old = allowed.slot.row
                 destination = "codex" if family == "claude" else "claude"
                 identity = fixture_runtime_id("new-" + destination)
+                expected = replace(old, current_session=staff.StaffId(identity),
+                    home=staff.SessionHome(self.root / "destination-codex") if destination == "codex" else old.home)
                 inbox = session_staff.inbox_path(old.id)
                 inbox.parent.mkdir(parents=True, exist_ok=True)
                 _ = inbox.write_text(json.dumps({"messages": ["held work"], "accepting_messages": True}))
@@ -423,7 +458,7 @@ class FamilyHandoffTests(StaffTestCase):
                 def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
                     locked()
                     self.assertEqual(events, ["stop", "start"] if not attempts else ["stop", "start", "dispatch"])
-                    self.assertEqual(published.row, replace(old, current_session=staff.StaffId(identity)))
+                    self.assertEqual(published.row, expected)
                     self.assertEqual(staff.by_id(old.id), published.row)
                     self.assertIsInstance(published.handoff, worker_admission.TranscriptHandoff)
                     events.append("dispatch")
@@ -444,14 +479,17 @@ class FamilyHandoffTests(StaffTestCase):
                     allowed = worker_admission.admit(old.name, allowed.run, reference=old.id)
                     result = worker_admission.switch_worker(allowed, destination,
                         start=start, dispatch=dispatch, cleanup=partial(record_destination_stop, cleaned), request="stable-assignment")
-                self.assertEqual(result.row, replace(old, current_session=staff.StaffId(identity)))
+                self.assertEqual(result.row, expected)
                 self.assertEqual(events, ["stop", "start", *(["dispatch"] * (2 if interrupted else 1))])
                 self.assertEqual(cleaned, [])
                 self.assertEqual(len(attempts), 2 if interrupted else 1)
                 self.assertEqual(attempts[0], attempts[-1])
                 assert isinstance(attempts[-1], worker_admission.TranscriptHandoff)
                 self.assertEqual(attempts[-1].source, source)
-                self.assert_only_current_session_changed(before[0], old, identity)
+                expected_record = cast(dict[str, object], json.loads(before[0]))
+                expected_record["rows"] = [expected.to_json() if item["id"] == old.id else item
+                                           for item in cast(list[dict[str, object]], expected_record["rows"])]
+                self.assertEqual(cast(object, json.loads(self.staff_file.read_bytes())), expected_record)
                 self.assertEqual(inbox.read_bytes(), held_messages)
                 self.assertEqual(session_staff.worker_directory(staff.snapshot(), old.id), tree)
                 saved = self.staff_state()
@@ -726,7 +764,8 @@ except admission.AdmissionRefused as error:
                     self.assertEqual(self.staff_file.read_bytes(), before)
                 else:
                     self.assertEqual(events, ["start", "dispatch"])
-                    self.assertEqual(staff.by_id(old.id), replace(old, current_session=staff.StaffId(identity)))
+                    self.assertEqual(staff.by_id(old.id), replace(old, current_session=staff.StaffId(identity),
+                        home=staff.SessionHome(self.root / "destination")))
                 self.assertEqual(errors.getvalue().count("transcript extract:"), 1)
 
 

@@ -24,7 +24,7 @@ from scripts.lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPromp
 from scripts.lib import relaunch
 from scripts.lib import resume_message
 from scripts.production import session_staff, staff
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record
 from scripts.hooks import conversation_pause
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",

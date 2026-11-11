@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, cast
 
 from scripts.message import send_budget, session_send
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
+from scripts.production import staff
 
 if TYPE_CHECKING:
     from scripts.lib import script_prompts, unit_runs
@@ -418,34 +419,46 @@ def is_showrunner_session(session_id: str) -> bool:
     return bool(showrunner_footer.targeted_instances(session_id))
 
 
-def is_showrunner_or_unit_director(session_id: str) -> bool:
-    """A showrunner's dailies timer or a unit run's status timer targets it, or a unit run marks it."""
-    prefixes = ("showrunner-", *unit_runs.INSTANCE_PREFIXES)
-    if any(report.name.startswith(prefixes) for report in session_reports(session_id)):
+def session_staff(session_id: str) -> staff.StaffSnapshot:
+    """Read one staff row for the timer and open run lookups."""
+    try:
+        row = staff.local_by_current_session(session_id)
+    except (OSError, UnicodeError) as error:
+        print(f"conversation-pause: timer lookup: {first_error_line(str(error))}", file=sys.stderr)
+        row = None
+    return staff.StaffSnapshot((row,) if row is not None else ())
+
+
+def is_showrunner_or_unit_director(
+    session_id: str, *,
+    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+) -> bool:
+    """A timer targets the session, or its staff row names an open run."""
+    record = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
+    if unit_runs.open_run(session_id, record=record) is not None:
         return True
-    return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None).is_file()
+    prefixes = ("showrunner-", *unit_runs.INSTANCE_PREFIXES)
+    return any(report.name.startswith(prefixes) for report in session_reports(session_id, record=record))
 
 
-def session_reports(session_id: str) -> list[Report]:
-    from scripts.hooks import showrunner_footer
-
+def session_reports(session_id: str, *,
+                    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> list[Report]:
     reports: list[Report] = []
     try:
         entries = list(notifier_root().iterdir())
     except OSError:
         return reports
-    try:
-        showrunner_instances = showrunner_footer.targeted_instances(session_id)
-    except (OSError, UnicodeError) as error:
-        print(f"conversation-pause: timer lookup: {first_error_line(str(error))}", file=sys.stderr)
-        showrunner_instances = []
+    snapshot = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
+    row = snapshot.by_current_session(session_id)
+    reference = row.id if row is not None else session_id
     for entry in entries:
         try:
             if not entry.is_dir():
                 continue
             conf_lines = (entry / "conf").read_text(encoding="utf-8").splitlines()
             if (f"TARGET=session:{session_id}" not in conf_lines
-                    and entry not in showrunner_instances):
+                    and not (entry.name.startswith("showrunner-")
+                             and f"TARGET=session:{reference}" in conf_lines)):
                 continue
             if any(line.startswith("RUN=") for line in conf_lines):
                 continue
@@ -635,9 +648,9 @@ def ensure_watcher() -> None:
     _ = run_notifier("new", WATCHER, "--every", "1", "--run", command)
 
 
-def _pause_locked(session_id: str, now: int) -> PauseResult:
+def _pause_locked(session_id: str, now: int, staff_record: staff.StaffSnapshot) -> PauseResult:
     current = _record(session_id)
-    reports = session_reports(session_id)
+    reports = session_reports(session_id, record=staff_record)
     if isinstance(current, NoPauseRecord) and not any(report.enabled for report in reports):
         return NothingToPause()
     ensure_watcher()
@@ -679,7 +692,7 @@ def _pause_locked(session_id: str, now: int) -> PauseResult:
 
 def pause(session_id: str, now: int) -> PauseResult:
     with record_lock():
-        return _pause_locked(session_id, now)
+        return _pause_locked(session_id, now, session_staff(session_id))
 
 
 def _resume_items(record: PauseRecord) -> tuple[str, ...]:
@@ -807,21 +820,23 @@ class DirectorTurn(Enum):
     HOLD = "hold"
 
 
-def director_turn(session_id: str) -> DirectorTurn:
+def director_turn(
+    session_id: str, *,
+    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+) -> DirectorTurn:
     """Read the staff hold before a director starts another turn."""
-    from scripts.production import staff
-
-    try:
-        row = staff.snapshot().by_current_session(session_id)
-    except (OSError, ValueError, staff.StaffRefused) as error:
-        print(f"anomaly: staff hold: {error}", file=sys.stderr)
-        return DirectorTurn.ACTIVE
+    row = (staff.local_by_current_session(session_id) if isinstance(record, unit_runs.RunStaffAtUse)
+           else record.by_current_session(session_id))
     return (DirectorTurn.HOLD if row is not None and
             isinstance(row.paused, staff.Paused) else DirectorTurn.ACTIVE)
 
 
-def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int) -> HookReply:
-    if director_turn(session_id) is DirectorTurn.HOLD:
+def message_arrived(
+    session_id: str, source: PromptSource, prompt: str, now: int, *,
+    record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+) -> HookReply:
+    record = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
+    if director_turn(session_id, record=record) is DirectorTurn.HOLD:
         return ContextOnly("This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume.")
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
     return_question = is_return_question(prompt)
@@ -864,7 +879,7 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                     f"Automatic updates stay off. {_ask_again()}",
                     _keep_context(),
                 )
-            _ = _pause_locked(session_id, now)
+            _ = _pause_locked(session_id, now, record)
             if source is not PromptSource.TYPED:
                 return NoReply.NOTHING
             return ContextOnly(
@@ -882,7 +897,7 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                     "Automatic updates already returned on their own. Tell the user that in one line."
                 )
             if late_answer and isinstance(response, No):
-                result = _pause_locked(session_id, now)
+                result = _pause_locked(session_id, now, record)
                 refreshed = _record(session_id)
                 if isinstance(refreshed, PauseRecord):
                     write_record(replace(refreshed, phase=KeptOff()))
@@ -893,8 +908,8 @@ def message_arrived(session_id: str, source: PromptSource, prompt: str, now: int
                     _keep_context(),
                 )
             record_path(session_id).unlink(missing_ok=True)
-            return _pause_reply(_pause_locked(session_id, now))
-        return _pause_reply(_pause_locked(session_id, now))
+            return _pause_reply(_pause_locked(session_id, now, record))
+        return _pause_reply(_pause_locked(session_id, now, record))
 
 
 def _keep(session_id: str) -> bool:

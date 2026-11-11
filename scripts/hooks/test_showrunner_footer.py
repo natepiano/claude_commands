@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import contextlib
 import io
@@ -35,7 +35,18 @@ class QuestionLibraryTests(unittest.TestCase):
                 valid = root / f"showrunner-{owner.id}"
                 valid.mkdir()
                 _ = (valid / "conf").write_text(f"TARGET=session:{owner.id}\n")
-                self.assertEqual(showrunner_footer.targeted_instances(owner.current_session), [valid])
+                parent = fixture_member("showrunner", name="parent")
+                for kind, enabled in (("showrunner", 1), ("showrunner", 0), ("unit", 0)):
+                    with self.subTest(kind=kind, enabled=enabled):
+                        _ = (valid / "state").write_text(f"ENABLED={enabled}\n")
+                        if kind == "unit":
+                            _ = staff.change_director(owner.id, staff.UnitRole(owner.name, parent.id,
+                                                     staff.PresentWorktree("natedev", root)))
+                        errors = io.StringIO()
+                        with contextlib.redirect_stderr(errors):
+                            self.assertEqual(showrunner_footer.targeted_instances(owner.current_session),
+                                             [valid] if kind == "showrunner" else [])
+                        self.assertEqual(errors.getvalue(), "")
 
     def test_read_production_uses_one_staff_read_and_the_timer_folder_owner(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

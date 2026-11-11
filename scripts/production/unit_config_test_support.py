@@ -1,7 +1,7 @@
 """One private repository and home for unit configuration recovery tests."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import os
 from pathlib import Path

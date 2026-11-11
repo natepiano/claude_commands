@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 import io
@@ -17,6 +20,7 @@ from scripts.mac_test import offload, mac_test
 from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
@@ -38,6 +42,8 @@ class MacCleanupProtocolTests(unittest.TestCase):
             ("mac_cleanup=kept\n", 0, offload.CleanupKept()),
             ("mac_cleanup=7\n", 0, offload.CleanupFailed(7)),
             ("mac_cleanup=skipped\n", 0, offload.CleanupSkipped()),
+            ("mac_trim=status=0 elapsed_seconds=2 over_budget=yes\nmac_cleanup=kept\n",
+             0, offload.CleanupKept()),
             ("", 255, offload.CleanupUnconfirmed()),
         )
         for marker, ssh_status, expected in cases:
@@ -50,7 +56,8 @@ class MacCleanupProtocolTests(unittest.TestCase):
                         "test output\nmac_exit=42\n" + marker, str(ssh_status),
                     ])
                 self.assertEqual(answer, offload.ReportedMacStatus(42, expected))
-                self.assertEqual(output.getvalue(), "test output\n")
+                trim_output = "mac_trim=status=0 elapsed_seconds=2 over_budget=yes\n" if marker.startswith("mac_trim=") else ""
+                self.assertEqual(output.getvalue(), "test output\n" + trim_output)
 
     def test_bare_success_confirms_cleanup_without_a_removal_line(self) -> None:
         output = io.StringIO()
@@ -86,6 +93,7 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     mirror: Path = Path()
     temporary_directory: Path = Path()
     bin_directory: Path = Path()
+    configuration_environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -97,6 +105,10 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.temporary_directory.mkdir()
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
+        self.configuration_environment = config_environment(self.root / "configuration")
+        python = self.home_directory / ".claude/scripts/lib/py"
+        python.parent.mkdir(parents=True)
+        write_shell(python, f'exec {shlex.quote(sys.executable)} "$@"\n')
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
@@ -127,12 +139,16 @@ exit "$CLEANUP_TEST_STATUS"
         disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
         disk_status: int = 0,
         free_floor_gib: float = 100,
+        abandoned_session_minutes: int = 7,
+        budget_gib: str = "24",
+        budget_values: tuple[tuple[str, str], ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         config = offload.OffloadConfig(
             enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
-            default_target_budget_gib="24", values={},
+            default_target_budget_gib=budget_gib,
+            values={"abandoned_session_minutes": str(abandoned_session_minutes), **dict(budget_values)},
         )
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
@@ -140,12 +156,67 @@ exit "$CLEANUP_TEST_STATUS"
         )
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
-            env={**os.environ, "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
+            env={**os.environ, **self.configuration_environment,
+                 "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                 "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
                  "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
                  "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status)},
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
+
+    def cleanup_lines(self, answer: subprocess.CompletedProcess[str]) -> list[str]:
+        lines = answer.stdout.splitlines()
+        if lines[-1] == "mac_cleanup=skipped":
+            return lines
+        self.assertRegex(lines[2], r"^mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=(yes|no|unknown)$")
+        return lines[:2] + lines[3:]
+
+    def test_remote_text_removes_only_old_abandoned_sessions_before_building(self) -> None:
+        minutes = 3
+        cases: tuple[tuple[str, int, bool, tuple[str, ...]], ...] = (
+            ("debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("aarch64-apple-darwin/debug/incremental/crate/s-old-working", minutes + 2, False, ()),
+            ("debug/incremental/crate/s-new-working", 1, True, ()),
+            ("aarch64-apple-darwin/debug/incremental/crate/s-new-working", 1, True, ()),
+            ("debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            ("aarch64-apple-darwin/debug/incremental/crate/s-finished", minutes + 2, True, ()),
+            *((f"debug/{name}/incremental/crate/s-old-working", minutes + 2, True, ())
+              for name in ("deps", "build", ".fingerprint", "examples")),
+            ("deep/triple/debug/incremental/crate/s-old-working", minutes + 2, True, ()),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir", "other-target")),
+            ("debug/incremental/crate/s-old-working", minutes + 2, True, ("--target-dir=other-target",)),
+            ("", 0, False, ()),
+        )
+        target = self.mirror / "target"
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for relative, age, keep, words in cases:
+                for status in (0, 42):
+                    with self.subTest(shell=shell, session=relative, words=words, status=status):
+                        shutil.rmtree(target, ignore_errors=True)
+                        session = target / relative
+                        lock = session.with_name(session.name.removesuffix("-working") + ".lock")
+                        if relative:
+                            session.mkdir(parents=True)
+                            _ = (session / "compiler-output").write_text("session data")
+                            _ = lock.write_text("session lock")
+                            modified = time.time() - age * 60
+                            os.utime(session, (modified, modified))
+                            os.utime(lock, (modified, modified))
+                        answer = self.run_remote(shell, status, words, free_floor_gib=50,
+                                                 abandoned_session_minutes=minutes)
+                        self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                        cleanup = "skipped" if words else "kept"
+                        self.assertEqual(self.cleanup_lines(answer),
+                                         ["nextest finished", f"mac_exit={status}", f"mac_cleanup={cleanup}"])
+                        build_target = self.mirror / "other-target" if words else target
+                        self.assertEqual((build_target / "nextest-output").read_text(), "built\n")
+                        if relative:
+                            self.assertEqual(session.exists(), keep)
+                            self.assertEqual(lock.exists(), keep)
+                            if keep:
+                                self.assertEqual((session / "compiler-output").read_text(), "session data")
+                                self.assertEqual(lock.read_text(), "session lock")
 
     def test_remote_text_below_space_floor_removes_only_repository_target_after_pass_and_failure(self) -> None:
         target = self.mirror / "target"
@@ -162,7 +233,7 @@ exit "$CLEANUP_TEST_STATUS"
                     _ = (target / "previous-build").write_text("old\n")
                     answer = self.run_remote(shell, status)
                     self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                    lines = answer.stdout.splitlines()
+                    lines = self.cleanup_lines(answer)
                     self.assertEqual(lines[:2], ["nextest finished", f"mac_exit={status}"])
                     self.assertEqual(len(lines), 3)
                     self.assertRegex(lines[2], r"^mac_cleanup=0 [0-9]+ 99$")
@@ -192,7 +263,7 @@ exit 1
             with self.subTest(shell=shell):
                 answer = self.run_remote(shell, 0)
                 self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                self.assertEqual(answer.stdout.splitlines(),
+                self.assertEqual(self.cleanup_lines(answer),
                                  ["nextest finished", "mac_exit=0", "mac_cleanup=0 - 99"])
                 self.assertEqual(answer.stderr, "")
                 self.assertFalse((self.mirror / "target").exists())
@@ -213,9 +284,66 @@ exit 1
                             disk_output=f"Filesystem GiB Used Available Capacity Mounted\nfixture 500 400 {free_space} 80% /\n",
                         )
                         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
+
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
+                    with self.subTest(shell=shell, status=status, default_kib=default_kib,
+                                      repository_kib=repository_kib):
+                        shutil.rmtree(target)
+                        old = target / "debug/incremental/old-session/output.o"
+                        new = target / "debug/incremental/new-session/output.o"
+                        for path, age in ((old, 7200), (new, 600)):
+                            path.parent.mkdir(parents=True)
+                            _ = path.write_bytes(os.urandom(64 * 1024))
+                            modified = time.time() - age
+                            os.utime(path, (modified, modified))
+                            os.utime(path.parent, (modified, modified))
+                        (target / "debug/.fingerprint").mkdir()
+                        overrides = (("mac_budget_gib.hana's project", str(repository_kib / 1024 ** 2)),) if repository_kib else ()
+                        answer = self.run_remote(
+                            shell, status, free_floor_gib=100,
+                            disk_output="Filesystem GiB Used Available Capacity Mounted\nfixture 500 300 200 60% /\n",
+                            budget_gib=str(default_kib / 1024 ** 2), budget_values=overrides,
+                        )
+                        self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+                        self.assertEqual(self.cleanup_lines(answer),
+                                         ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                        self.assertEqual(old.exists(), not trim)
+                        self.assertEqual(len(new.read_bytes()), 64 * 1024)
+                        remaining = sum(path.stat().st_blocks * 512 for path in target.rglob("*") if path.is_file())
+                        self.assertLessEqual(remaining, (repository_kib or default_kib) * 1024)
+
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for trim_fails in (False, True):
+                with self.subTest(shell=shell, trim_fails=trim_fails):
+                    shutil.rmtree(target, ignore_errors=True)
+                    target.mkdir()
+                    retained = target / "unmatched-output"
+                    _ = retained.write_bytes(os.urandom(128 * 1024))
+                    python = self.home_directory / ".claude/scripts/lib/py"
+                    write_shell(python, 'exit 9\n' if trim_fails else
+                                f'exec {shlex.quote(sys.executable)} "$@"\n')
+                    answer = self.run_remote(
+                        shell, 42, budget_gib=str(96 / 1024 ** 2),
+                        disk_output=("Filesystem GiB Used Available Capacity Mounted\n"
+                                     + f"fixture 500 300 {99 if trim_fails else 200} 60% /\n"),
+                    )
+                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                    self.assertEqual(retained.exists(), not trim_fails)
+                    lines = answer.stdout.splitlines()
+                    trim_lines = [line for line in lines if line.startswith("mac_trim=")]
+                    self.assertEqual(len(trim_lines), 1, answer.stdout)
+                    self.assertRegex(trim_lines[0],
+                                     rf"^mac_trim=status={9 if trim_fails else 0} elapsed_seconds=[0-9]+ over_budget=yes$")
+                    self.assertNotIn("lint sweep:", answer.stdout)
+                    if trim_fails:
+                        self.assertRegex(lines[-1], r"^mac_cleanup=0 [0-9]+ 99$")
+                    else:
+                        self.assertEqual(lines[-1], "mac_cleanup=kept")
 
     def test_remote_text_with_unreadable_space_keeps_build_output(self) -> None:
         target = self.mirror / "target"
@@ -228,7 +356,7 @@ exit 1
                     with self.subTest(shell=shell, status=status, disk_output=disk_output, disk_status=disk_status):
                         answer = self.run_remote(shell, status, disk_output=disk_output, disk_status=disk_status)
                         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
@@ -261,7 +389,7 @@ exit 7
                     with self.subTest(shell=shell, status=status):
                         answer = self.run_remote(shell, status)
                         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=7"])
+                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=7"])
                         self.assertTrue((self.mirror / "target" / "nextest-output").exists())
                         arguments = cast(list[str], json.loads((self.root / "remove-arguments.json").read_text()))
                         self.assertEqual([word for word in arguments if not word.startswith("-")], [str(self.mirror / "target")])

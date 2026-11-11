@@ -33,7 +33,7 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-from scripts.lib import nix_env
+from scripts.lib import conf_reads, models_registry, nix_env
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -57,7 +57,7 @@ EXPIRY_KEYS_FILE = Path.home() / ".config/pushover/env"
 def review_timeout_seconds() -> float:
     """Read the reviewer limit once; configuration faults use the 60 s default."""
     try:
-        contents = NOTIFY_CONFIG.read_text(encoding="utf-8")
+        contents = conf_reads.read_text(NOTIFY_CONFIG)
         for line in contents.splitlines():
             key, separator, value = line.partition("#")[0].partition("=")
             if separator and key.strip() == "REVIEW_TIMEOUT_SECONDS":
@@ -676,8 +676,8 @@ def reviewer_environment() -> tuple[dict[str, str], str]:
 def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
                         timeout: float) -> tuple[str, str]:
     try:
-        result = runner(["bash", "-c", "source ~/.claude/scripts/agents/models_config.sh; " +
-                         "agents_resolve_print message_review.reviewer"],
+        result = runner(["bash", "-c", 'source "$1" && agents_resolve_print message_review.reviewer', "review-model",
+                         str(Path(__file__).resolve().parents[1] / "agents/models_config.sh")],
                         timeout=timeout, env=environment)
         fields = dict(item.split("=", 1) for item in result.stdout.split() if "=" in item)
         if result.returncode == 0 and fields.get("agent") and fields.get("effort"):
@@ -754,10 +754,6 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                             f"Code-counted length failures: {', '.join(length_failures(draft)) or 'none'}\n"
                             f"Code-found second actions: {'; '.join(action_conflicts(draft.action, draft.body)) or 'none'}")
         draft_prompt = zone_line() + "\n" + draft_prompt
-        command = [str(binary.path), "-p", "--model", model, "--effort", effort,
-                   "--system-prompt", guide.stdout + "\n" + prompt,
-                   "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
-                   "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
         if time.monotonic() - started >= timeout:
             return Unreviewed("timeout", details())
         loaded = nix_env.ensure(Path.cwd(), environment)
@@ -766,6 +762,11 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         from scripts.lib.models_registry import agent_environment
 
         environment = agent_environment(loaded.env)
+        model = models_registry.claude_model(model, environment)
+        command = [str(binary.path), "-p", "--model", model, "--effort", effort,
+                   "--system-prompt", guide.stdout + "\n" + prompt,
+                   "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
+                   "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
             return Unreviewed(f"reviewer exit {result.returncode}", details())

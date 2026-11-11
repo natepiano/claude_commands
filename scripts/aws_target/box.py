@@ -31,6 +31,11 @@ from scripts.mac_test import linux_runner, offload, mac_test
 IMAGE_OWNER_TAG = 'aws-build-image'
 
 
+def builder_state_paths() -> mac_test.StatePaths:
+    """Resolve the former builder's claims and locks without target registration."""
+    return mac_test.StatePaths(target_config.ssh_target_state_directory('aws'), 'aws', platform='linux')
+
+
 def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]:
     """Read remote job claims whose owner process still runs without deleting claims."""
     return tuple(claim for claim in mac_test.read_claims(paths)
@@ -39,9 +44,9 @@ def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]
 
 def close_routing(settings: Path) -> bool:
     """Disable AWS routing while excluding new claims."""
-    path = target_config.ssh_target_state_directory('aws') / 'routing.json'
+    paths = builder_state_paths()
+    path = paths.directory / 'routing.json'
     desired: dict[str, object] = {'enabled': False, 'settings': str(settings.resolve())}
-    paths = mac_test.state_paths('aws')
     with mac_test.locked(paths.lock):
         changed = not path.exists() or json_record(path.read_text()) != desired
         if changed:
@@ -66,6 +71,45 @@ def saved_image(api: AwsCli, directory: Path) -> dict[str, object]:
             return {}
         raise
     return next(iter(ledger.rows(reply, 'Images')), dict[str, object]())
+
+
+
+def create_saved_image(api: AwsCli, directory: Path, instance: str, *, name: str,
+                       tags: list[dict[str, str]], identity: dict[str, object],
+                       exclude_devices: tuple[str, ...] = ()) -> dict[str, object]:
+    """Save an image and its identity through the common image boundary."""
+    arguments = ['--instance-id', instance, '--no-reboot', '--name', name]
+    if exclude_devices:
+        arguments.extend(('--block-device-mappings', json.dumps([
+            {'DeviceName': device, 'NoDevice': ''} for device in exclude_devices])))
+    reply = api.call('create-image', *arguments, '--tag-specifications', json.dumps([
+        {'ResourceType': kind, 'Tags': tags} for kind in ('image', 'snapshot')]))
+    record = {**identity, 'image_id': ledger.text(reply, 'ImageId')}
+    write_text_atomic(directory / 'image.json', json.dumps(record, sort_keys=True) + '\n')
+    return record
+
+
+def image_leftovers(api: AwsCli, current: dict[str, object], owner_tag: str) -> tuple[list[str], list[str]]:
+    filters = json.dumps([{'Name': 'tag:' + owner_tag, 'Values': ['true']}])
+    images = api.call('describe-images', '--owners', 'self', '--filters', filters)
+    snapshots = api.call('describe-snapshots', '--owner-ids', 'self', '--filters', filters)
+    # An empty current image keeps no snapshot: every owned image and snapshot goes.
+    mappings: tuple[dict[str, object], ...] = ledger.rows(current, 'BlockDeviceMappings') if current else ()
+    kept = {ledger.mapping(row.get('Ebs')).get('SnapshotId') for row in mappings}
+    return ([ledger.text(image, 'ImageId') for image in ledger.rows(images, 'Images')
+             if image.get('ImageId') != current.get('ImageId')],
+            [ledger.text(snapshot, 'SnapshotId') for snapshot in ledger.rows(snapshots, 'Snapshots')
+             if snapshot.get('SnapshotId') not in kept])
+
+
+def cleanup_images(api: AwsCli, current: dict[str, object], owner_tag: str) -> bool:
+    """Delete older owned images before their snapshots; report whether anything was deleted."""
+    images, snapshots = image_leftovers(api, current, owner_tag)
+    for image in images:
+        _ = api.call('deregister-image', '--image-id', image)
+    for snapshot in snapshots:
+        _ = api.call('delete-snapshot', '--snapshot-id', snapshot)
+    return bool(images or snapshots)
 
 
 def policy_source() -> dict[str, object]:
@@ -607,24 +651,10 @@ class BoxSetup:
         return current.get('State') == 'available' and not any(self._image_leftovers(current))
 
     def _image_leftovers(self, current: dict[str, object]) -> tuple[list[str], list[str]]:
-        api = self._api()
-        filters = json.dumps([{'Name': 'tag:' + IMAGE_OWNER_TAG, 'Values': ['true']}])
-        images = api.call('describe-images', '--owners', 'self', '--filters', filters)
-        snapshots = api.call('describe-snapshots', '--owner-ids', 'self', '--filters', filters)
-        kept = {ledger.mapping(row.get('Ebs')).get('SnapshotId')
-                for row in ledger.rows(current, 'BlockDeviceMappings')}
-        return ([ledger.text(image, 'ImageId') for image in ledger.rows(images, 'Images')
-                 if image.get('ImageId') != current.get('ImageId')],
-                [ledger.text(snapshot, 'SnapshotId') for snapshot in ledger.rows(snapshots, 'Snapshots')
-                 if snapshot.get('SnapshotId') not in kept])
+        return image_leftovers(self._api(), current, IMAGE_OWNER_TAG)
 
     def _cleanup_images(self, current: dict[str, object]) -> None:
-        images, snapshots = self._image_leftovers(current)
-        api = self._api()
-        for image in images:
-            _ = api.call('deregister-image', '--image-id', image)
-        for snapshot in snapshots:
-            _ = api.call('delete-snapshot', '--snapshot-id', snapshot)
+        _ = cleanup_images(self._api(), current, IMAGE_OWNER_TAG)
 
     def _restore_image_items(self) -> None:
         _ = self._ssm('set -eu; keep=/home/.aws-build-image-keep; ' +
@@ -664,15 +694,11 @@ class BoxSetup:
                     spending = read_settings(self.settings)
                     tags = [{'Key': spending.cost_explorer_tag_key, 'Value': spending.cost_explorer_tag_value},
                             {'Key': IMAGE_OWNER_TAG, 'Value': 'true'}]
-                    reply = api.call('create-image', '--instance-id', self._instance(), '--no-reboot',
-                                     '--name', 'aws-build-image-' + Path(self.desired_system).name[:12] + '-' + str(int(time.time())),
-                                     '--block-device-mappings', json.dumps([{'DeviceName': '/dev/sdf', 'NoDevice': ''}]),
-                                     '--tag-specifications', json.dumps([
-                                         {'ResourceType': kind, 'Tags': tags} for kind in ('image', 'snapshot')]))
-                    record = {'image_id': ledger.text(reply, 'ImageId'), 'system': self.desired_system,
-                              **({'idle_stop_system': self.desired_system}
-                                 if record.get('idle_stop_system') == self.desired_system else {})}
-                    write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
+                    record = create_saved_image(api, self.directory, self._instance(),
+                        name='aws-build-image-' + Path(self.desired_system).name[:12] + '-' + str(int(time.time())),
+                        tags=tags, exclude_devices=('/dev/sdf',), identity={'system': self.desired_system,
+                            **({'idle_stop_system': self.desired_system}
+                               if record.get('idle_stop_system') == self.desired_system else {})})
                     def snapshotted() -> bool:
                         image = saved_image(api, self.directory)
                         self._image_failed(image)

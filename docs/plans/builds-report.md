@@ -235,9 +235,9 @@ The user, 2026-11-03: tables do not work for them. Lower priority. Design a char
 #### As-built
 
 - Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
-- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.py` and prints the tailnet link (Phase 22). The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- The charts are on the shared build page. `/build:page` prints its link, and `charts.page_data` (`scripts/buildlog/charts.py`) feeds it. Phase 47 removed the `buildlog charts` command. The charts have light, dark and Auto themes and daily buckets in the user's zone.
 - Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
-- `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
+- `costs.py` is the cost reader for `charts.page_data`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
 - `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
 - Speed, as process CPU time (user+sys): 7 days 0.60–0.71 s (limit 1.5 s); 30 days 1.76–1.82 s (limit 3 s).
 - The fresh design check found two label defects; Phase 10 fixes them.
@@ -320,14 +320,14 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 - `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
 - Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
 - `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
-- `buildlog charts` output is unchanged; `main` and `page_data` share `read_index`, and `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
+- `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
 **Files:**
 - `scripts/buildlog/charts.py` — `page_data`, its types, the snapshot and index helpers.
 - `scripts/buildlog/test_charts.py` — `PageDataTests`.
 - `config/buildlog.conf` — recent days, actions and owners.
 
-**Binds later work:** queue's build page feed calls `charts.page_data`; it stays when `buildlog charts` moves to the shared page.
+**Binds later work:** queue's build page feed calls `charts.page_data`; it stays.
 
 **Ruled out:** a `read_costs` keyword that skips phase rows (one read makes it unnecessary); a snapshot inside `read_costs` for every reader (`buildlog costs` is its only unsnapshotted reader and goes away with the shared page).
 
@@ -446,6 +446,8 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 #### As-built
 
+- Phase 26 removed `present_page`. Phase 47 removed `buildlog charts` and `local_display`. The bullets below are history.
+
 - `buildlog charts` writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.snapshot`, and prints only the bare tailnet link. It prints no file path. Two runs print the same link.
 - `charts.present_page(series, path, no_open) -> int` puts the page write and the snapshot under one handler of `review_link.SNAPSHOT_ERRORS`. A failure prints one stderr line (`buildlog charts: publication failed: <reason>`) and returns 1.
 - `charts.local_display(environ, platform) -> bool`: false in any ssh session (`SSH_CONNECTION` set); otherwise true on darwin, or with `DISPLAY` or `WAYLAND_DISPLAY`. Only then does `webbrowser.open(link)` run, under `suppress(OSError, webbrowser.Error)`. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip the open.
@@ -534,6 +536,8 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 ### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: done
 
 #### As-built
+
+- Phase 47 removed `buildlog charts` and `charts.main`. `/build:page` is the one way to the build page. The `buildlog charts` bullets below are history.
 
 - `buildlog charts` publishes no page of its own. `charts.main` runs `scripts/build_queue/memory_feed.py link` (the `/build:page` command) from the same checkout and prints its one URL line. It opens the URL when a local display exists and `--no-open` is absent. `--days 7|30` stays.
 - No link prints `buildlog charts: <reason>` to stderr and exits 1. No link means: a non-zero exit, a missing command, or stdout that is not one printable `http`/`https` URL with a valid port. The reason is the command's stderr when it gave one.
@@ -921,3 +925,66 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Gotchas:**
 - Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
+
+### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
+
+#### As-built
+
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
+
+### Phase 45 — Copy watch test processes end by themselves · status: done
+
+#### As-built
+
+- Every helper process that `test_copy_watch.py` starts arms `signal.alarm` at the test hang guard as its first action: the step stub, the runner stub, the parent wrapper, its delayed child and the live-pid child.
+- The fixture passes `TEST_HANG_GUARD_SECS` from `test_hang_guard` in each process environment.
+- A suite that is killed before `tearDown` leaves no helper for longer than the guard. The real watcher did not change and ends when its parent is gone.
+- No new test. A one-second trial showed the step stub and the runner stub in hold mode end with SIGALRM.
+
+**Files:**
+- `scripts/mac_test/test_copy_watch.py` — the fixture processes and their time limit.
+
+**Gotchas:**
+- A forked child does not inherit a pending alarm, so each process arms its own. An alarm does stay across `exec`.
+
+### Phase 46 — Report and memory commands load only the code they use · status: done
+
+#### As-built
+
+- `disk.py` imports `scripts.lint.sweep` inside the four functions that use it. `disk.read_snapshot` does not load it.
+- `memory.window_report` imports `queue_snapshot` on each run. It imports `room_text` and `memory_admit` only for a queue snapshot in the window.
+- `report.py` has no direct queue or sweep import, so the report command loads neither `sweep` nor `queue_evidence`.
+- Thirty interleaved process pairs measured 0.268 CPU seconds saved per report process and 0.148 per memory process. The saving is 16.25 CPU seconds per merge gate at 7 report, 41 `test_index` and 23 memory children, and 5.3 without the `test_index` children.
+- Program output, row counts and SQL do not change.
+
+**Files:**
+- `scripts/buildlog/disk.py` — the disk snapshot and its floor.
+- `scripts/buildlog/memory.py` — the memory snapshot and the window report.
+
+**Gotchas:**
+- A module-level import of `sweep` or `queue_evidence` in these files brings the cost back.
+
+**Ruled out:**
+- A separate module for the `disk.py` writers needs caller and test edits and saves no more.
+
+### Phase 47 — buildlog charts is removed; /build:page is the one way to the build page · status: done
+
+#### As-built
+
+- `buildlog charts` is removed. It takes the unknown-command path: the usage text on stderr and exit 2, as `buildlog costs` does.
+- `/build:page` is the one way to the shared build page link. `charts.page_data` stays and feeds that page, with the same output.
+- `charts.main`, `local_display` and `MEMORY_FEED` are removed with their tests.
+- The as-built docs and the charts design name `/build:page`.
+
+**Files:**
+- `scripts/buildlog/cli.py` — the command list and usage text.
+- `scripts/buildlog/charts.py` — `page_data` and the chart series.
+- `scripts/buildlog/test_costs.py` — the removed-command test, with rows for `costs` and `charts`.

@@ -1568,8 +1568,7 @@ def collect_mac(db: sqlite3.Connection) -> None:
         payload = reader_payload(offsets)
         with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
             process: subprocess.Popen[str] = subprocess.Popen(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", MAC_HOST, command],
+                ["ssh", "-o", "BatchMode=yes", MAC_HOST, command],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
                 text=True, encoding="utf-8", errors="strict")
             try:

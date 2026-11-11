@@ -1,7 +1,7 @@
 """Tests for each unit's staff name, phase and task."""
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import contextlib
 import io
@@ -34,8 +34,10 @@ from scripts.production import unit_lookup
 from scripts.herdr import herdr, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
+from scripts.production.production_doc import read_production
 from scripts.production import style_units
 from scripts.style import style_ledger
+from scripts.style.ledger_test_support import write_style_units
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id, fixture_worker
 
@@ -97,6 +99,7 @@ class UnitPhasesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         config = self.root / "table-conf"
         _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
@@ -133,16 +136,22 @@ class UnitPhasesTests(unittest.TestCase):
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         plan = self.root / "outside-plan.md"
         _ = plan.write_text("# Plan\n### Phase 1 — Planned work · status: todo\n")
+        owner = fixture_member("showrunner", name="outside")
+        member = fixture_member("unit", name="outside", parent=owner.id,
+                                worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         history = self.root / "history" / "runs"
         history.mkdir(parents=True)
         _ = (history / "outside.jsonl").write_text("\n".join([
             json.dumps({"event_type": "run_started", "working_dir": str(self.root),
+                        "run_id": "outside", "owner_staff_id": member.id,
                         "plan_doc": plan.name, "run_started_at": 1}),
             json.dumps({"event_type": "phase_started", "phase_id": "ad-hoc", "phase_title": "Other work",
                         "phase_instance_id": "outside-instance", "phase_started_at": 2, "timestamp_epoch": 2})]) + "\n")
-        run_folder = self.root / "outside-run"
-        run_folder.mkdir()
-        _ = (run_folder / plan_history.STATE_FILENAME).write_text(json.dumps({"working_dir": str(self.root), "plan_doc": plan.name}))
+        run_folder = self.root / "runs" / "outside"
+        run_folder.mkdir(parents=True)
+        _ = staff.set_run(member.id, staff.OpenRun(run_folder))
+        _ = (run_folder / plan_history.STATE_FILENAME).write_text(json.dumps({"owner_staff_id": member.id,
+            "working_dir": str(self.root), "plan_doc": plan.name}))
         outside = cast(dict[str, object], json.loads(phase_table.show(run_folder, ZoneInfo("UTC"), json_output=True)))
         self.assertIsInstance(outside["current"], dict)
         cases: list[tuple[object, str]] = [
@@ -227,6 +236,16 @@ class UnitPhasesTests(unittest.TestCase):
                 json.dumps(header), event("phase_started", phase_id=phase),
                 event("pass_started", phase_id=phase, pass_instance_id="p1", pass_kind="impl",
                       pass_activity=f"write {name}"), *tail]) + "\n")
+            folder = self.root / "runs" / name
+            folder.mkdir(parents=True, exist_ok=True)
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": director.id}))
+            if any(cast(dict[str, object], json.loads(line)).get("event_type") == "run_finished" for line in tail):
+                current = staff.snapshot().by_id(director.id)
+                assert current is not None
+                if isinstance(current.run, staff.OpenRun):
+                    _ = staff.clear_run(director.id, current.run.path)
+            else:
+                _ = staff.set_run(director.id, staff.OpenRun(folder))
             return path
 
         _ = run("older", member, "outside-a", 1)
@@ -446,7 +465,7 @@ class UnitPhasesTests(unittest.TestCase):
         now = datetime(2026, 10, 16, 18, 10, tzinfo=UTC).timestamp()
         for index, plan in enumerate((older, newest), 1):
             events: list[dict[str, object]] = [{"event_type": "run_started",
-                "owner_staff_id": str(member.id), "working_dir": str(self.root), "plan_doc": plan.name,
+                "owner_staff_id": str(member.id), "run_id": f"run-{index}", "working_dir": str(self.root), "plan_doc": plan.name,
                 "run_started_at": index},
                 {"event_type": "phase_started", "phase_id": "1", "phase_title": "Done work",
                  "phase_instance_id": f"done-{index}", "phase_started_at": now - 600},
@@ -468,6 +487,13 @@ class UnitPhasesTests(unittest.TestCase):
                 (False, True, "█▓ 1/2", "18:30 · ends 18:30", "—")):
             with self.subTest(finished=finished, missing=missing):
                 _ = run.write_text(open_events + (event("run_finished") + "\n" if finished else ""))
+                folder = self.root / "runs" / "run-2"
+                folder.mkdir(parents=True, exist_ok=True)
+                _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
+                if finished:
+                    _ = staff.clear_run(member.id, folder)
+                else:
+                    _ = staff.set_run(member.id, staff.OpenRun(folder))
                 if missing:
                     newest.unlink()
                 with (patch.object(display_cells, "run_events", wraps=display_cells.run_events) as reads,
@@ -748,7 +774,9 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_style_kind_routes_to_the_ticket_table(self) -> None:
         doc = self.root / "style-production.md"
-        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
+        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Merge branch:** style/main\n"
+                           + f"- **Branch point:** main\n- **Showrunner checkout:** `{self.root}`\n")
+        write_style_units(doc)
         self.production_document(doc)
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True,
                            timeout=10)
@@ -771,6 +799,32 @@ class UnitPhasesTests(unittest.TestCase):
         phases.assert_not_called()
         self.assertEqual(output.getvalue(), "ticket table\n")
 
+    def test_product_parent_reports_direct_style_units_and_product_units(self) -> None:
+        from scripts.style import style_config
+
+        doc = self.root / "product-production.md"
+        _ = doc.write_text(f"# Production\n- **Kind:** product\n- **Merge branch:** main\n"
+                           + f"- **Showrunner checkout:** {self.root}\n")
+        write_style_units(doc, (style_config.StyleUnitAssignment(
+            "cargo-liner-style", ("names", "values", "types", "modules")),))
+        self.production_document(doc)
+        style_unit = unit("cargo-liner-style", live("cargo-liner-style"))
+        product_unit = unit("feature", live("feature"))
+        units = [product_unit, style_unit]
+        output = io.StringIO()
+        before = doc.read_bytes()
+        with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(units, ())),
+              patch.object(phase_table, "show_production", return_value="{}"),
+              patch.object(unit_phases, "style_ledger_paths", return_value={}),
+              patch.object(unit_phases, "table", return_value="product table") as phases,
+              patch.object(style_units, "table", return_value="ticket table") as tickets,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(unit_phases.main(["--production", "show"]), 0)
+        phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone)
+        tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
+        self.assertEqual(doc.read_bytes(), before)
+        self.assertEqual(output.getvalue(), "product table\n\nticket table\n")
+
     def test_other_or_absent_kind_keeps_the_phase_table(self) -> None:
         owner = fixture_member("showrunner", name="table-owner")
         _ = fixture_member("unit", name="a", parent=owner.id)
@@ -792,7 +846,9 @@ class UnitPhasesTests(unittest.TestCase):
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
         _ = self.enterContext(patch.dict(os.environ, {"STYLE_LEDGER_STATE_DIR": str(self.root / "state")}))  # pyright: ignore[reportAny]
         doc = self.root / "style-production.md"
-        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Showrunner checkout:** `{self.root}`\n")
+        _ = doc.write_text(f"# Production\n- **Kind:** style\n- **Merge branch:** style/main\n"
+                           + f"- **Branch point:** main\n- **Showrunner checkout:** `{self.root}`\n")
+        write_style_units(doc)
         self.production_document(doc)
         owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc(remote.local_machine(), doc))
         for name, folder in (("names", self.root), ("types", self.root / "gone")):
@@ -800,7 +856,7 @@ class UnitPhasesTests(unittest.TestCase):
                                worktree=staff.PresentWorktree(remote.local_machine(), folder))
         decision = self.root / "decision.md"
         names = next(row for row in staff.initial_snapshot().find(kind="unit", parent=owner.id) if row.name == "names")
-        _ = decision.write_text(f"---\nstatus: open\nunit: {names.id}\nplan: approved\n---\n")
+        _ = decision.write_text(f"---\nstatus: open\nunit: {names.id}\nplan: approved\nstyle_rule_blob: names\n---\n")
         database = style_ledger.ledger_location(self.root).database
         database.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(database)) as connection, connection:
@@ -812,6 +868,7 @@ class UnitPhasesTests(unittest.TestCase):
                 CREATE TABLE refill_results(unit TEXT,at TEXT,outcome TEXT,split_at TEXT,
                     ready INTEGER,changed INTEGER,structure INTEGER,other INTEGER);
             """)
+            _ = connection.execute("INSERT INTO rule_texts VALUES ('names',?)", (b"---\nfamily: names\n---\n",))
             _ = connection.execute("INSERT INTO tickets VALUES ('12',?,'proposal','names',"
                 + "'global:rust/read.md','alpha','[]','[]','[]','[\"one\"]','assigned','2026-10-01')", (str(names.id),))
             _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','12','')", (str(decision),))

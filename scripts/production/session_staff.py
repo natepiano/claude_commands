@@ -22,7 +22,7 @@ from typing import NamedTuple, cast
 from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
@@ -168,18 +168,14 @@ class WorkerRunEvidence(NamedTuple):
 
 
 def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) -> dict[staff.StaffId, WorkerRunEvidence]:
-    """Read records and marker associations once, with one anomaly for each failed read."""
+    """Read records and staff run associations once."""
     from scripts.lib import unit_runs
     rows = tuple(rows)
     owners = {owner.current_session: owner for row in rows if (owner := record.parent_of(row)) is not None}
     marked: dict[Path, set[staff.StaffId]] = {}
     for owner in owners.values():
-        try:
-            marker = unit_runs.marker(owner.current_session)
-            if marker.is_file():
-                marked.setdefault(Path(marker.read_text().strip()), set()).update(row.id for row in rows if row.parent == staff.ReportsTo(owner.id))
-        except (OSError, ValueError) as error:
-            report_anomaly(f"{owner.name}: {error}")
+        if isinstance(owner.run, staff.OpenRun):
+            marked.setdefault(owner.run.path, set()).update(row.id for row in rows if row.parent == staff.ReportsTo(owner.id))
     paths = [*marked, *unit_runs.run_folders()]
     if current := unit_runs.environ("RUN_DIR"):
         paths.append(Path(current))
@@ -250,12 +246,15 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
     row = record.by_id(reference)
     if row is not None:
         owner = record.parent_of(row) if row.kind == "worker" else row
-        if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
-            from scripts.production.production_doc import read_production
-            return read_production(owner).checkout
-        tree = RowResolver(record).unit_worktree(row)
-        if isinstance(tree, PresentWorktree):
-            return tree.path
+        if owner is not None:
+            if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
+                from scripts.production.production_doc import read_production
+                return read_production(owner).checkout
+            tree = RowResolver(record).unit_worktree(row)
+            if isinstance(tree, PresentWorktree):
+                return tree.path
+            if row.kind == "worker" and isinstance(tree, RemovedWorktree):
+                return Path.cwd()
     report_anomaly(f"{reference}: staff worktree is unavailable")
     return Path.cwd()
 
@@ -275,6 +274,7 @@ class ProductionDoc:
     machine: str
     path: Path
     owner: staff.StaffRow
+    text: str
 
 
 @dataclass(frozen=True)
@@ -390,7 +390,7 @@ class RowResolver:
             )
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", machine,
+                    ["ssh", "-o", "BatchMode=yes", machine,
                      "~/.claude/scripts/lib/py -B -c " + shlex.quote(code)],
                     input=json.dumps(requests), capture_output=True, text=True, check=False,
                 )
@@ -472,7 +472,7 @@ class RowResolver:
         if isinstance(doc, staff.DocUnfilled):
             return LocationUnfilled("the production document is not recorded")
         state, text = self._fact(doc.machine, "file", doc.path)
-        return ProductionDoc(doc.machine, doc.path, owner) if state == "value" else DocumentUnavailable(text)
+        return ProductionDoc(doc.machine, doc.path, owner, text) if state == "value" else DocumentUnavailable(text)
 
     def merge_branch(self, row: staff.StaffRow) -> Branch | BranchUnreadable:
         doc = self.production_doc(row)
@@ -633,7 +633,7 @@ class MemberSources:
 
 def member_sources(*, dependencies: Callable[[Path], None] | None = None) -> MemberSources:
     from scripts.herdr import herdr
-    from scripts.shutdown import pane_record
+    from scripts.agents import pane_record
 
     session = herdr.shared_session(dependencies=dependencies)
     try:
@@ -873,7 +873,7 @@ class LaunchMembership:
 
 def record_membership(launch: PaneLaunch) -> PaneLaunch:
     """Keep pane settings from the conversation history without staff labels."""
-    from scripts.shutdown import pane_record
+    from scripts.agents import pane_record
 
     result = launch.copy()
     result["environment"] = pane_record.retained_environment(result, pane_record.launches())
@@ -890,7 +890,7 @@ class RepairedSessionLabels:
 def repair_marks() -> list[RepairedSessionLabels]:
     """Remove saved staff labels and recover missing pane observations."""
     from scripts.message import sessions
-    from scripts.shutdown import pane_record
+    from scripts.agents import pane_record
 
     record = staff.snapshot()
     history = pane_record.launches()
