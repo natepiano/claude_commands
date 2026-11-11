@@ -22,7 +22,7 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import admin_secrets, box, deploy, gate_trial as trial, ledger
+from scripts.aws_target import admin_secrets, deploy, gate_trial as trial, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.production import merge_gate
@@ -690,11 +690,6 @@ class GateTrialTests(unittest.TestCase):
         self.assertNotIn('governor_gib', data)
         self.assertNotIn('RERUN_LIMIT', data)
         _ = compile(trial.GUEST, '<guest>', 'exec')
-
-    def test_trial_uses_the_available_saved_gate_image(self) -> None:
-        with mock.patch.object(box, 'saved_image', return_value={'ImageId': 'ami-gate-tools', 'State': 'available'}):
-            _ = self.run_trial()
-        self.assertEqual(self.fake.requests[0]['ImageId'], 'ami-gate-tools')
 
     def test_host_lock_pins_every_tool_to_the_host_revision(self) -> None:
         _ = self.run_trial()

@@ -924,7 +924,7 @@ class VaultPullTests(unittest.TestCase):
                 self.assertEqual(vault_pull.read_state(), vault_pull.VaultState(vault_pull.LastGoodPull(self.now), vault_pull.NoOutage()))
                 self.assertEqual(self.commands[0][-2:], ["fixture-mac:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main"])
                 ssh = next(args for args in self.commands if args[0] == "ssh")
-                self.assertEqual(ssh[:-1], ["ssh", *sync.ssh_options(), "fixture-mac"])
+                self.assertEqual(ssh[:-1], ["ssh", *sync.ssh_options("fixture-mac"), "fixture-mac"])
                 self.assertEqual(self.git(self.local, "rev-parse", "refs/remotes/mac/main"), self.git(self.mac, "rev-parse", "HEAD"))
                 if mac_changes:
                     _ = self.commit(self.mac, {"note.md": "new Mac commit\n"})

@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, scratch_accounts_config
 from scripts.accounts import accounts, new_account
+from scripts.lib import conf_reads
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 
@@ -238,9 +239,12 @@ class NewAccountTests(unittest.TestCase):
 
     def test_next_claude_account_gets_the_second_free_color_after_the_first_is_taken(self) -> None:
         before = self.colors.read_bytes()
-        first = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
-
-        second = new_account.statusline_color_step(new_account.parse_account("claude", "claude6"))
+        reads = self.home / "config-reads"
+        _ = reads.write_text("")
+        with conf_reads.record_reads(reads):
+            first = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
+            second = new_account.statusline_color_step(new_account.parse_account("claude", "claude6"))
+        self.assertEqual(reads.read_text().splitlines(), [self.colors.stem] * 2)
 
         self.assertTrue(first.done, first.text)
         self.assertTrue(second.done, second.text)

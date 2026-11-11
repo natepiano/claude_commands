@@ -36,10 +36,6 @@ example_hold=$(conf_value production mac_run_example_seconds) || exit 2
 # Each entry names a crate, an example, and its optional feature.
 example_settings=$(conf_value production mac_run_examples) || exit 2
 examples=("${(@s:;:)example_settings}")
-connect_seconds=$(conf_value mac_test connect_timeout_s) || exit 2
-# SSH requires a whole timeout; retain the configured minimum.
-integer connect_whole=$connect_seconds
-connect_seconds=$(( connect_whole + (connect_seconds > connect_whole) ))
 claim_seconds=$(conf_value production mac_run_claim_seconds) || exit 2
 deployment_target=$(conf_value production mac_run_deployment_target) || exit 2
 status_grace=$(conf_value production mac_run_status_grace_seconds) || exit 2
@@ -68,16 +64,26 @@ on_mac() {
   return $code
 }
 
-ssh -o ConnectTimeout=$connect_seconds -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
+ssh -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
 
 mac_test=$lib/../mac_test/mac_test.py
-claim_output=$("$lib/py" "$mac_test" claim --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
+claim_output=$("$lib/py" "$mac_test" claim --identity --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
 claim_status=$?
 if (( claim_status == 10 || claim_status == 11 || claim_status == 12 )); then
   print -r -- $claim_output
   exit 9
 fi
 (( claim_status == 0 )) || { print -r -- $claim_output; exit $claim_status }
+claim_identity=$("$lib/py" -c '
+import json
+import sys
+
+line = next(line for line in sys.argv[1].splitlines() if line.startswith("claim_identity="))
+identity = json.loads(line.removeprefix("claim_identity="))
+for field in ("claim_id", "episode", "attempt"):
+    print(identity[field])
+' "$claim_output")
+claim_fields=("${(@f)claim_identity}")
 mac_claimed=1
 release_mac_claim() {
   (( mac_claimed )) || return 0
@@ -99,7 +105,7 @@ release_mac_claim() {
       cleanup_failed=1
     fi
   fi
-  "$lib/py" "$mac_test" release --pid $$ >/dev/null 2>&1
+  "$lib/py" "$mac_test" release --pid $$ --claim-id "$claim_fields[1]" --episode "$claim_fields[2]" --attempt "$claim_fields[3]" >/dev/null 2>&1
   mac_claimed=0
   return $cleanup_failed
 }
@@ -116,7 +122,7 @@ stop_mac_run() {
   local exit_status=$1
   trap '' INT TERM HUP
   if [[ -n $clone ]]; then
-    ssh -o ConnectTimeout=$connect_seconds -o BatchMode=yes $host "for pid in \$(pgrep -f '[c]argo build'); do cwd=\$(lsof -a -p \"\$pid\" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); case \"\$cwd\" in $clone_arg|$clone_arg/*) pkill -TERM -P \"\$pid\" 2>/dev/null || true; kill \"\$pid\" 2>/dev/null || true;; esac; done; rm -f $bundle_arg $launch_arg $status_arg" </dev/null >/dev/null 2>&1 || true
+    ssh -o BatchMode=yes $host "for pid in \$(pgrep -f '[c]argo build'); do cwd=\$(lsof -a -p \"\$pid\" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); case \"\$cwd\" in $clone_arg|$clone_arg/*) pkill -TERM -P \"\$pid\" 2>/dev/null || true; kill \"\$pid\" 2>/dev/null || true;; esac; done; rm -f $bundle_arg $launch_arg $status_arg" </dev/null >/dev/null 2>&1 || true
   fi
   [[ -z $bundle ]] || rm -f $bundle
   exit $exit_status

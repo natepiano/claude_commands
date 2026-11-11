@@ -36,6 +36,8 @@ def write_aws_claim(directory: Path, *, kept: bool, remote: bool = True) -> Path
     owner = process_start.process_start(os.getpid())
     assert isinstance(owner, process_start.Started)
     record: mac_test.ProcessBoundClaim = {
+        'claim_id': 'fixture-claim', 'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
+        'submitting_session': '',
         'pid': os.getpid(), 'proc_start': 'ended-owner' if kept else owner.start,
         'what': 'fixture tests', 'worktree': str(directory), 'since': '2026-11-06T09:00:00+00:00',
         'repo_name': 'fixture', 'repo_key': 'fixture',
@@ -428,7 +430,9 @@ class BoxTests(unittest.TestCase):
             output = StringIO()
             with redirect_stdout(output):
                 self.assertTrue(subject.up(approve_resources=True))
-            self.assertTrue(all(line.endswith(': present') for line in output.getvalue().splitlines()))
+            stage_lines = [line for line in output.getvalue().splitlines() if not line.startswith('up: ')]
+            self.assertEqual(len(stage_lines), 12)
+            self.assertTrue(all(line.endswith(': present') for line in stage_lines))
             later = self.commands()[commands:]
             self.assertFalse(any('systemd-run' in c[-1] or c[0] == 'nix' and 'copy' in c for c in later))
             results = box.json_record((self.directory / 'up.json').read_text())

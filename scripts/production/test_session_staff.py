@@ -7,6 +7,7 @@ import os
 from typing import cast
 import json
 from io import StringIO
+from pathlib import Path
 from unittest import mock
 
 from scripts.agents import worker_lifecycle
@@ -20,6 +21,44 @@ from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_worker_home_uses_the_recorded_account_with_shared_sessions(self) -> None:
+        fixture = self.row_production()
+        shared = Path.home() / ".codex" / "sessions"
+        shared.mkdir(parents=True)
+        numbered = Path.home() / ".codex1"
+        numbered.mkdir()
+        (numbered / "sessions").symlink_to(shared, target_is_directory=True)
+        (shared / f"{fixture.worker.current_session}.jsonl").touch()
+        row = staff.set_home(fixture.worker.id, staff.SessionHome(numbered))
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}):
+            self.assertEqual(labels.worker_home({"staff_id": row.id}, staff.local_snapshot()), str(numbered))
+
+    def test_worker_directory_reports_only_unavailable_worktree_states(self) -> None:
+        fixture = self.row_production()
+        checkout = fixture.doc.parents[1]
+        write_text_atomic(fixture.doc, "# Production\n"
+                          + f"- **Repository:** `{checkout}`\n"
+                          + f"- **Showrunner checkout:** `{checkout}`\n"
+                          + "- **Merge branch:** `merge-from-git`\n"
+                          + "- **Log:** `production.log`\n")
+        retired = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree))
+        unfilled = replace(fixture.unit, worktree=staff.WorktreeUnfilled())
+        show_worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
+        cases = (
+            ("retired-worker", (retired, fixture.worker), fixture.worker, Path.cwd(), ""),
+            ("missing-parent", (fixture.worker,), fixture.worker, Path.cwd(), "staff worktree is unavailable"),
+            ("unfilled-worker", (unfilled, fixture.worker), fixture.worker, Path.cwd(), "staff worktree is unavailable"),
+            ("present-worker", (fixture.unit, fixture.worker), fixture.worker, fixture.worktree, ""),
+            ("showrunner-worker", (fixture.runner, show_worker), show_worker, checkout, ""),
+            ("retired-unit", (retired,), retired, Path.cwd(), "staff worktree is unavailable"),
+        )
+        before = self.staff_state()
+        for state, rows, row, expected, anomaly in cases:
+            with self.subTest(state=state), labels.anomalies() as lines:
+                self.assertEqual(labels.worker_directory(staff.StaffSnapshot(rows), row.id), expected)
+                self.assertEqual(lines, [f"anomaly: {row.id}: {anomaly}"] if anomaly else [])
+        self.assertEqual(self.staff_state(), before)
+
     def test_missing_roster_read_creates_nothing_and_a_writer_creates_the_folder(self) -> None:
         path = self.root / "missing/run/mesh_roster.json"
         self.assertEqual(labels.read_worker_roster(path), {})
@@ -31,8 +70,8 @@ class StatusDiscoveryTests(StaffTestCase):
 
 
     def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.launch_names import LaunchNames
+        from scripts.agents import pane_record
+        from scripts.agents.launch_names import LaunchNames
 
         fixture = self.row_production()
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
@@ -61,8 +100,8 @@ class StatusDiscoveryTests(StaffTestCase):
         self.assertEqual(entry["session_id"], fixture.unit.current_session)
 
     def test_record_membership_derives_staff_marks_only_at_launch(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.launch_names import LaunchNames
+        from scripts.agents import pane_record
+        from scripts.agents.launch_names import LaunchNames
 
         fixture = self.row_production()
         entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
@@ -75,7 +114,7 @@ class StatusDiscoveryTests(StaffTestCase):
 
     def test_repair_removes_saved_staff_marks_and_keeps_pane_data(self) -> None:
         from scripts.message import sessions
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
 
         fixture = self.row_production()
         entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
@@ -288,7 +327,7 @@ class StatusDiscoveryTests(StaffTestCase):
 
 
 class WorkerRunDiscoveryTests(StaffTestCase):
-    def test_run_index_keeps_the_owner_marker_without_a_worker_record(self) -> None:
+    def test_run_index_keeps_the_staff_run_without_a_worker_record(self) -> None:
         owner = unit_membership("show", "owner")
         worker = fixture_worker("worker", owner.id)
         runs = self.root / "runs"
@@ -296,7 +335,7 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         run.mkdir(parents=True)
         with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
               mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
-            unit_runs.activate(run, owner.current_session)
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
             record = staff.local_snapshot()
             found = labels.worker_run_index(record)
             entries = labels.worker_run_entries(record, (worker,))
@@ -304,7 +343,7 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         self.assertNotIn(worker.id, entries)
 
 
-    def test_run_index_reads_workers_without_writing_to_the_marker_folder(self) -> None:
+    def test_run_index_reads_workers_without_writing_staff(self) -> None:
         owner = unit_membership("show", "owner")
         worker = fixture_worker("worker", owner.id)
         runs = self.root / "runs"
@@ -312,30 +351,10 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         run.mkdir(parents=True)
         with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
               mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
-            unit_runs.activate(run, owner.current_session)
-            markers = runs / "active"
-            before = {path.name: path.read_bytes() for path in markers.iterdir()}
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
+            before = staff.record_path().read_bytes()
             found = labels.worker_run_index(staff.local_snapshot())
-            after = {path.name: path.read_bytes() for path in markers.iterdir()}
+            after = staff.record_path().read_bytes()
         self.assertEqual(found[worker.id], (run,))
         self.assertEqual(after, before)
 
-    def test_unreadable_owner_marker_reports_one_anomaly_and_keeps_other_workers_runs(self) -> None:
-        broken = unit_membership("show", "broken")
-        healthy = unit_membership("show", "healthy")
-        first = fixture_worker("broken-worker", broken.id)
-        second = fixture_worker("healthy-worker", healthy.id)
-        runs = self.root / "runs"
-        run = runs / "healthy-run"
-        run.mkdir(parents=True)
-        errors = StringIO()
-        with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
-              mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
-            unit_runs.activate(run, healthy.current_session)
-            _ = unit_runs.marker(broken.current_session).write_bytes(b"\xff")
-            with redirect_stderr(errors):
-                found = labels.worker_run_index(staff.local_snapshot())
-        self.assertEqual(found[second.id], (run,))
-        self.assertNotIn(first.id, found)
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn(f"anomaly: {broken.name}:", errors.getvalue())

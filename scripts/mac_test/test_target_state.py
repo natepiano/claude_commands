@@ -104,7 +104,7 @@ class IsolatedTargetState(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "CLAUDE_CODE_SESSION_ID": "",
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
@@ -155,6 +155,13 @@ class IsolatedTargetState(unittest.TestCase):
     def claim(self, target: str, pid: int = 101) -> subprocess.CompletedProcess[str]:
         return self.invoke_mac(["claim", "--target", target, "--pid", str(pid),
                                 "--what", f"test {target}", "--worktree", str(self.root / "project")])
+
+    def release(self, target: str = "", pid: int = 101) -> subprocess.CompletedProcess[str]:
+        paths = mac_test.state_paths(target or "mac")
+        record = next(claim.record for claim in mac_test.read_claims(paths) if claim.record["pid"] == pid)
+        selection = ["--target", target] if target else []
+        return self.invoke_mac(["release", *selection, "--pid", str(pid), "--claim-id", record["claim_id"],
+                                "--episode", record["episode"], "--attempt", record["attempt"]])
 
     def block(self, target: str, holder: str = "alice") -> subprocess.CompletedProcess[str]:
         return self.invoke_mac(["block", "--target", target, "--holder", holder, "--for", f"inspect {target}"])
@@ -279,7 +286,7 @@ class TargetStateTests(IsolatedTargetState):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         result = self.block("aws")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.invoke_mac(["release", "--target", "aws", "--pid", "101"])
+        result = self.release("aws")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         paths = mac_test.state_paths("aws")
         config = mac_test.read_config("aws")
@@ -343,7 +350,7 @@ class TargetStateTests(IsolatedTargetState):
                 self.assertEqual([job.what for job in state.jobs], [f"test {name}"])
         self.assertEqual(self.claim("linux-one", 202).returncode, 11)
         mac_before = {path: path.read_bytes() for path in self.mac_state.rglob("*.json")}
-        result = self.invoke_mac(["release", "--target", "linux-one", "--pid", "101"])
+        result = self.release("linux-one")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsInstance(targets.target_state(self.selected_target("linux-one")), targets.Free)
         self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Running)
@@ -386,7 +393,8 @@ class TargetStateTests(IsolatedTargetState):
             self.assertEqual(result.returncode, 0 if answer == "free" else 1)
 
     def test_unknown_target_commands_refuse_before_any_state_write(self) -> None:
-        commands = (["claim", "--pid", "101", "--what", "test"], ["release", "--pid", "101"],
+        commands = (["claim", "--pid", "101", "--what", "test"],
+                    ["release", "--pid", "101", "--claim-id", "claim-a", "--episode", "episode-a", "--attempt", "attempt-a"],
                     ["block", "--holder", "alice", "--for", "inspect"], ["unblock", "--holder", "alice"],
                     ["status"], ["free-now"])
         before = self.snapshot()
@@ -474,7 +482,8 @@ class TargetStateTests(IsolatedTargetState):
         self.use_generic_linux_target()
         self.mac_state.mkdir()
         legacy = self.mac_state / "run.json"
-        _ = legacy.write_text(json.dumps({"pid": 101, "proc_start": "fake-start", "what": "legacy test",
+        _ = legacy.write_text(json.dumps({"claim_id": "claim-a", "episode": "episode-a", "attempt": "attempt-a",
+                                         "submitting_session": "", "pid": 101, "proc_start": "fake-start", "what": "legacy test",
                                          "worktree": str(self.root), "since": NOW.isoformat()}), encoding="utf-8")
         _ = (self.mac_state / "unreachable_until").write_text(str(NOW.timestamp() + 30), encoding="utf-8")
         before = self.snapshot()
@@ -487,7 +496,7 @@ class TargetStateTests(IsolatedTargetState):
             self.assertIsInstance(targets.target_state(self.selected_target(name)), targets.Free)
             self.assertNotIsInstance(offload.read_backoff(NOW.timestamp(), name), offload.ActiveBackoff)
         self.assertEqual(self.snapshot(), before)
-        result = self.invoke_mac(["release", "--pid", "101"])
+        result = self.release()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(legacy.exists())
 

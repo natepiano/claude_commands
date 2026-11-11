@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -186,21 +186,31 @@ class RegistrationTests(RegistrationFixture):
         _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
         _ = self.git("worktree", "add", "-b", "unit-copy", str(unit))
         _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
+        asker = staff.by_id(asker_id)
+        assert asker is not None
+        _ = staff.set_worktree(asker_id, staff.PresentWorktree(remote.local_machine(), unit), expected=asker.worktree)
         staff_file = self.state / "staff/staff.json"
         before = staff_file.read_bytes()
-        for checkout, title in ((unit, "Unit checkout question"), (main, "Main checkout question")):
-            with self.subTest(checkout=checkout):
+        cases = ((unit, "Unit checkout question", True),
+                 (main, "Main checkout question", True),
+                 (unit, "Parent document question", False))
+        for checkout, title, select_production in cases:
+            with self.subTest(checkout=checkout, select_production=select_production):
                 self.checkout: Path = checkout
                 self.doc: Path = relative
                 with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
-                    filed = self.run_command("ask", "--text", title, "--question", "Keep this layout?",
-                                             "--unit", str(asker_id))
+                    arguments = ["ask", "--text", title, "--question", "Keep this layout?", "--unit", str(asker_id)]
+                    if select_production:
+                        filed = self.run_command(*arguments)
+                    else:
+                        filed = invoke_cli(registration, registration.main, arguments,
+                                           self.env, self.checkout, production_state=True)
                 self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
                 listed = self.run_command("questions-table")
                 self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
                 self.assertIn(title, listed.stdout)
         records = list((self.root / "issues").glob("question-*.md"))
-        self.assertEqual(len(records), 2)
+        self.assertEqual(len(records), len(cases))
         for record in records:
             self.assertIn(f"asked_by: {asker_id}", record.read_text().splitlines())
             self.assertIn(f"production_id: {owner_id}", record.read_text().splitlines())

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from contextlib import contextmanager
 from collections.abc import Generator
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import staff
 from scripts.message.recipient_test_support import staff_child_command
 from unittest.mock import patch
@@ -47,7 +48,7 @@ class SendMessageMissTests(unittest.TestCase):
             executable.chmod(0o755)
         _ = (binaries / "ps").write_text("#!/bin/sh\nexit 0\n")
         self.environment = {
-            "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(self.root / "agents"),
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(self.root / "agents"),
             "PROCESS_TABLE_PS": str(binaries / "ps"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "DESIGN_ROLES_STATE": str(self.root / "roles"),

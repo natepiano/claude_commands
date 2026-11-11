@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production import session_labels, session_staff, staff, unit_config
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
@@ -43,8 +43,8 @@ class NativeSessionLabelTests(StaffTestCase):
         self.assertEqual(labels.environment(environment, unit.id), {})
 
     def test_retained_reference_projects_the_current_session_without_copied_identity(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.launch_names import LaunchNames
+        from scripts.agents import pane_record
+        from scripts.agents.launch_names import LaunchNames
 
         fixture = self.row_production()
         self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
@@ -207,9 +207,9 @@ class RowResolverTests(StaffTestCase):
 
         def transport(arguments: list[str], *, input: str, capture_output: bool,
                       text: bool, check: bool) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(arguments[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac"])
+            self.assertEqual(arguments[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
             transports.append(arguments)
-            command = shlex.split(arguments[6])
+            command = shlex.split(arguments[4])
             return real_run([sys.executable, *command[1:]], input=input, capture_output=capture_output,
                             text=text, check=check)
 

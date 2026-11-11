@@ -34,6 +34,8 @@ Saved event names remain historical text.
 Active readers obtain the current folder through `plan_history.staff_directory`.
 They do not route through saved folder copies or an absolute plan path.
 `start-run` with a plan calls `unit_config.set_plan` on the unit's existing `.unit.toml`.
+`start-run` with a different plan on an existing run records that plan and its project clock.
+The same plan changes nothing.
 Staff stores neither the plan nor the port.
 
 `progress_history.last_dispatch(worker_id)` returns `RecordedDispatch` or `NoDispatchRecorded`.

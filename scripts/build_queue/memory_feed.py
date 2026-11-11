@@ -401,8 +401,6 @@ class MemoryPage(TypedDict):
     shown_reserved: float
     ci_name: str
     ci_ram: float
-    ci_kept: float
-    shown_ci_kept: float
     shown_safety: float
     waiting: int
     smallest_need: float
@@ -526,7 +524,7 @@ def ci_amount(value: float) -> str:
     return ci_bytes_text(round(value * admission_records.GIB))
 
 
-def build_ci_row(used: float, ci_kept: float, now: float,
+def build_ci_row(used: float, now: float,
                  cgroup: Path = CI_CGROUP, proc: Path = PROC) -> RunRow:
     runners: list[CIRunner]
     try:
@@ -551,9 +549,6 @@ def build_ci_row(used: float, ci_kept: float, now: float,
         else:
             lines.append(f"{runner['name']} · idle · {ci_amount(runner['used'])}")
     lines.append(f"hana CI uses {ci_amount(used)} now. This use is part of the work inside the cap.")
-    if ci_kept > 0:
-        lines.append(f"CI keep-aside {ci_kept:g} GiB also reduces the room.")
-    lines.append("CI builds do not wait in the queue yet.")
     idle = [runner for runner in runners if runner["state"] == "idle" and isinstance(runner["pid"], int)]
     pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else admission_records.PidNotRecorded()
     return {"name": "hana CI", "showrunner": "", "unit": cgroup.name, "state": detail if not busy else "",
@@ -825,7 +820,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     used = gib(captured.used)
     total = gib(host.total) if isinstance(host.total, int) else used + gib(captured.available)
     reserved = gib(sum(run.bytes for run in captured.runs))
-    ci_kept = gib(captured.ci_keep_aside.bytes)
     ci_ram, ci_name = gib(captured.ci_use), "hana CI"
     by_owner: dict[str, admission_records.RunningStep] = {}
     steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
@@ -883,14 +877,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                            "progress": row_progress((step,)),
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
             if service and isinstance(memory, admission_records.UnownedSliceMemory):
-                row = build_ci_row(gib(memory.bytes), ci_kept, explanation.now,
+                row = build_ci_row(gib(memory.bytes), explanation.now,
                                    Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
                 if memory.diagnostic:
                     row["keep_text"] += "\n" + memory.diagnostic
                 name, detail = row["name"], row["detail"]
             if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
-                group = "Codex servers" if program in ("codex", "codex-real", "detached_runs.py") else "worker background runs"
+                group = "Codex servers" if program in ("codex", "codex-real") else "unowned processes"
                 row["detail"] = " · ".join(part for part in (detail, program) if part)
                 groups.setdefault(group, []).append(row)
             else:
@@ -975,10 +969,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
-        "taken": gib(captured.cap_use) + reserved + ci_kept, "room": gib(captured.room), "room_source": "free", "limit": "room and head protection",
+        "taken": gib(captured.cap_use) + reserved, "room": gib(captured.room), "room_source": "free", "limit": "room and head protection",
         "other": max(0.0, total - gib(captured.available) - gib(captured.cap_use)),
-        "ci_name": ci_name, "ci_ram": ci_ram, "ci_kept": ci_kept,
-        "shown_ci_kept": max(0.0, min(ci_kept, gib(captured.available) - safety - reserved)),
+        "ci_name": ci_name, "ci_ram": ci_ram,
         "shown_safety": min(safety, used + gib(captured.available)),
         "shown_reserved": max(0.0, min(reserved, gib(captured.available) - safety)),
         "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),

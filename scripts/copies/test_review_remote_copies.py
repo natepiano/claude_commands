@@ -23,6 +23,8 @@ from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
@@ -34,9 +36,10 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import offload
-from scripts.mac_test import mac_test
+from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
+from scripts.build_hold.build_hold import NoOwningSession
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
 
@@ -66,9 +69,9 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
-        self.enterContext(mock.patch.dict(os.environ, {"UNIT_ACTIVE_DIR": str(self.root / "active")}))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
-        _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
+        _ = self.enterContext(mock.patch("scripts.mac_test.offload", offload))
         self.source = self.root / "checkout"
         self.source_seed.copy_to(self.source, self.root / "origin.git")
         self.mirror = self.root / "mirrors/repository"
@@ -196,6 +199,8 @@ class RemoteEntryTests(unittest.TestCase):
             self.fail("The test process has no start identity")
         paths.claims.mkdir(parents=True)
         _ = (paths.claims / "repository.json").write_text(json.dumps({
+            "claim_id": "live-copy-claim", "episode": "copy-episode", "attempt": "copy-attempt",
+            "submitting_session": "",
             "pid": os.getpid(), "proc_start": start.start, "what": "tests", "worktree": str(self.source),
             "since": "2026-11-05T12:00:00+00:00", "repo_name": "repository", "repo_key": "",
         }))
@@ -289,9 +294,11 @@ class RemoteEntryTests(unittest.TestCase):
     def remove_trees_through_cli(self, owner: str) -> None:
         """Run the real remote CLI without another SSH interpreter."""
         def remote_cli(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-            command = shlex.split(arguments[-1])[2:]
-            return invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
-                              combined_output=not bool(options.get("capture_output")))
+            command = shlex.split(arguments[-1].partition("; copies_status=")[0])[2:]
+            answer = invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
+                                combined_output=not bool(options.get("capture_output")))
+            return subprocess.CompletedProcess(arguments, answer.returncode,
+                                               answer.stdout + f"\nrc={answer.returncode}\n", answer.stderr)
 
         with mock.patch.object(copies, "subprocess", SimpleNamespace(run=remote_cli)):
             copies.remove_trees(owner)
@@ -575,7 +582,7 @@ from scripts.mac_test import linux_runner
 root, exports = Path(sys.argv[1]), Path(sys.argv[2])
 print('RUNNER', os.getpid(), flush=True)
 values = dict(kinds='test', devshell='default', shell_cache='cache', shell_timeout_s='1',
-              build_budget_gib='20', target_budget_gib='10', free_floor_gib='1')
+              build_budget_gib='20', target_budget_gib='10', free_floor_gib='1', abandoned_session_minutes='1')
 with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner.ShellEnvironment('key', exports, exports)),
       mock.patch.object(linux_runner, 'permission_refused', return_value=False),
       mock.patch.object(linux_runner, 'output_free_bytes', return_value=100 * 1024**3),
@@ -658,13 +665,20 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             with redirect_stdout(output):
                 status = mac_test.command_claim(args, mac_test.state_paths(args.target))
             attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, output.getvalue(), ""))
+            if status in (0, 13):
+                controller.claim_identity = claim_state.reply_claim_identity(output.getvalue())
 
         def release(current: offload.ProcessController, name: str) -> None:
             self.assertIs(current, controller)
+            identity = current.claim_identity
+            if isinstance(identity, claim_state.NoClaimIdentity):
+                return
             args = mac_test.CliArguments()
             args.pid = os.getpid()
             args.target = name
+            args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
             _ = mac_test.command_release(args, mac_test.state_paths(name))
+            current.claim_identity = claim_state.NO_CLAIM_IDENTITY
 
         def stream(arguments: Sequence[str]) -> offload.ReportedMacStatus:
             self.assertIn("mirror-use", arguments[-1])
@@ -682,7 +696,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         with (
             mock.patch.object(offload, "mac_step_eligibility", return_value=offload.KnownRepository("repository")),
             mock.patch.object(offload, "trusted_linux_source", return_value=True),
-            mock.patch.object(offload, "configured_ssh_target", return_value=target),
+            mock.patch.object(target_config, "configured_ssh_target", return_value=target),
             mock.patch.object(offload, "remote_mirror", side_effect=mirror_path),
             mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope("repository", "key")),
             mock.patch.object(mac_test, "start_claim_watcher"),
@@ -742,15 +756,14 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 _ = offload.run_offload(controller, bad_config, request, 0)
 
     def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
-        active = self.root / "active"
-        active.mkdir()
         run = self.root / "unit-run"
-        _ = (active / "director-session").write_text(str(run))
+        owner = fixture_member("showrunner", name="director-session")
+        _ = staff.set_run(owner.id, staff.OpenRun(run))
         environment = {key: value for key, value in os.environ.items()
                        if key not in {"UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR",
-                                      "PLAN_DELEGATE_SESSION_DIR", "UNIT_ACTIVE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
+                                      "PLAN_DELEGATE_SESSION_DIR", 
                                       "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}}
-        environment.update(UNIT_RUN_DIR=str(run), UNIT_ACTIVE_DIR=str(active),
+        environment.update(UNIT_RUN_DIR=str(run),
                            CLAUDE_CODE_SESSION_ID="worker-shell-session")
         with mock.patch.dict(os.environ, environment, clear=True):
             args = offload.parser().parse_args([
@@ -761,7 +774,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             mirror = offload.request_mirror(config, request, offload.KnownRepository("repository"))
             with copies.remote_lease(mirror):
                 copies.register_remote(mirror)
-                with self.assertRaisesRegex(copies.CopyError, "busy; held by session director-session"):
+                with self.assertRaisesRegex(copies.CopyError, f"busy; held by session {owner.current_session}"):
                     copies.remove_trees(mirror.owner)
 
     def test_failed_admission_keeps_both_local_and_remote_owners(self) -> None:
@@ -805,9 +818,11 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             paths = mac_test.state_paths("linux")
             scope = mac_test.RepositoryScope("repository", "key")
             with mac_test.locked(paths.lock), redirect_stdout(io.StringIO()):
-                first = mac_test.claim_once(args, paths, scope, reserve_wait=True)
+                first = mac_test.claim_once(args, paths, scope, session=NoOwningSession(), reserve_wait=True)
             self.assertEqual(first, mac_test.ClaimFinished(0))
-            request = replace(request, admission=offload.MacClaimFromWait(os.getpid()))
+            reservation, = mac_test.read_claims(paths)
+            request = replace(request, admission=offload.MacClaimFromWait(
+                os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))
             result = offload.claim_for_run(controller, config, request, offload.KnownRepository("repository"), (2,))
             self.assertIsInstance(result, offload.MacClaimNotConfirmed)
             claims = mac_test.read_claims(paths)

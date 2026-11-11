@@ -13,7 +13,7 @@ import platform
 import shlex
 import sys
 
-from scripts.lib import conf, main_publish
+from scripts.lib import conf, conf_reads, main_publish
 from scripts.lib.conf import Unusable, check
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_hold.override_guard import refuse_overrides
@@ -100,6 +100,7 @@ def change(args: RequestedValueChange) -> int:
     if old == args.value:
         print(f"already {args.key}={args.value}")
         return _publish(args, checkout, already=True)
+    conf_reads.record(source.stem)
     before = source.read_bytes().decode("utf-8")
     write_text_atomic(source, _replace_line(before, index, args.value))
     message = (f"tune({args.file}): {args.key} {old} -> {args.value}\n\n"

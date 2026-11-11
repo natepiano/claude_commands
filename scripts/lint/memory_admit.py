@@ -56,7 +56,6 @@ from scripts.build_queue.admission_records import (
     BasisNotRecorded,
     BehindHead,
     BetweenStepsSlot,
-    CIKeepAside,
     CallerRun,
     CapNotRecorded,
     CapUnavailable,
@@ -460,9 +459,6 @@ def head_override_event(action: Literal["set", "admitted", "lapsed"], override: 
                           reserve, override["why"], override["set_by"], at)
 
 
-NO_CI_KEEP_ASIDE = CIKeepAside()
-
-
 def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
     return (not waiter.get("build_history_current", True) or now - waiter.get("estimated_at", now) >= (policy.timing.fresh_test_seconds
                  if waiter.get("fresh_test", False) else policy.timing.estimate_refresh_seconds))
@@ -620,7 +616,6 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
 
 def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory],
                 policy: AdmissionPolicy, *,
-                ci_keep_aside: CIKeepAside = NO_CI_KEEP_ASIDE,
                 ci_use: int = 0) -> MemoryRoom | ReadingUnavailable:
     """Calculate room once from swap-backed use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
@@ -630,20 +625,13 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
                   max(0, run.need - run.use.bytes) + run.held
                   if isinstance(run.use, AnonymousRunUse) else run.need + run.held) for run in runs)
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
-    kept = sum(run.bytes for run in holds) + ci_keep_aside.bytes
+    kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
                                  else max(0, used + ci_use + host.available - safety))
     return MemoryRoom(host.available, safety, used, kept,
                       host.available - safety - kept, cap, holds, total=host.total,
-                      ci_keep_aside=ci_keep_aside, ci_use=ci_use)
-
-
-def ci_keep_aside(readings: Iterable[StepMemory], margin: int) -> CIKeepAside:
-    """Keep one margin for a CI job with readable slice evidence."""
-    running = any(isinstance(reading, UnownedSliceMemory)
-                  and isinstance(reading.job_state, RunningServiceJob) for reading in readings)
-    return CIKeepAside(margin if running else 0)
+                      ci_use=ci_use)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -1878,8 +1866,7 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     ci_use = sum(reading.bytes for reading in readings
                  if isinstance(reading, UnownedSliceMemory)
                  and not isinstance(reading.job_state, NotServiceSlice))
-    return memory_room(inputs.host, run_memories(inputs), policy,
-        ci_keep_aside=ci_keep_aside(readings, policy.ci_memory_margin_bytes), ci_use=ci_use)
+    return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
@@ -2616,6 +2603,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
         result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), owner=ci_memory_slice, diagnostic=ci_group.reason))
     children.extend(group for group in ci_groups if group not in children)
     for child in children:
+        if child.name == "builds-detached.slice":
+            continue
         required = child in ci_groups
         if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue

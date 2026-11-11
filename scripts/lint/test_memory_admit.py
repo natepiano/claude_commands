@@ -44,8 +44,9 @@ from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
-from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted
-from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, ci_step
+from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted, caller_admission
+from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
+from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
 from scripts.lint import nextest_budget as budget
 from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
 from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, commit_config_fixture
@@ -380,7 +381,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
         reading = ci.measured
         assert isinstance(reading, admission_records.UnownedSliceMemory)
         baseline_ci = replace(ci, measured=replace(reading, bytes=0))
-        for need, state in ((5, "admit"), (6, "hold")):
+        for need, state in ((12, "admit"), (13, "hold")):
             with self.subTest(need=need):
                 waiter: admission_records.Waiter = {"pid": 200, "start_time": "200", "need": need * GIB,
                                        "since": NOW_EPOCH}
@@ -392,17 +393,6 @@ class MemoryRoomRulesTests(unittest.TestCase):
                 after = gate.admission_pass(inputs, NOW_EPOCH, policy).rows[0].decision
                 self.assertEqual(after.state, state)
                 self.assertEqual(after, before)
-
-    def test_ci_keep_aside_stays_separate_from_run_use_and_run_holds(self) -> None:
-        reading = gate.memory_room(admission_records.HostMemory(20 * GIB, 64 * GIB), [admission_records.RunMemory("run", 8 * GIB, admission_records.AnonymousRunUse(3 * GIB))], admission_policy_fixture(), ci_keep_aside=admission_records.CIKeepAside(7 * GIB))
-        assert isinstance(reading, admission_records.MemoryRoom)
-        self.assertEqual(reading.used, 3 * GIB)
-        self.assertEqual(reading.kept, 12 * GIB)
-        self.assertEqual(reading.room, 5 * GIB)
-        self.assertEqual(reading.cap, 20 * GIB)
-        self.assertEqual(len(reading.runs), 1)
-        self.assertEqual(reading.runs[0].bytes, 5 * GIB)
-        self.assertEqual(reading.ci_keep_aside.bytes, 7 * GIB)
 
     def test_negative_room_shows_zero_and_keeps_the_exact_shortfall(self) -> None:
         reading = gate.memory_room(admission_records.HostMemory(5 * GIB, 64 * GIB), [admission_records.RunMemory("run", 18 * GIB, admission_records.AnonymousRunUse(10 * GIB))], admission_policy_fixture())
@@ -1832,6 +1822,8 @@ class RepositoryHistoryTests(unittest.TestCase):
                     ["cargo", "nextest", "run", "run"],
                     ["cargo", "+nightly", "nextest", "run", "-E", "test(one)"],
                     ["cargo", "nextest", "run", "--filterset=test(one)"],
+                    ["cargo", "nextest", "run", "-E", "package(sample)", "--run-ignored", "only"],
+                    ["cargo", "nextest", "run", "-E", "package(sample)", "--run-ignored=only"],
                     ["cargo", "test", "-p", "hana", "one_test"],
                     ["cargo", "test", "--", "--skip", "one_test"])
         for arguments in full:
@@ -4868,6 +4860,51 @@ class ProcessMemoryTests(unittest.TestCase):
                 self.assertIsInstance(result.rows[0].blocker, gate.NoSingleBlocker)
 
 
+class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
+    def test_detached_verify_cargo_and_lint_steps_ask_the_private_queue(self) -> None:
+        _ = self.package("sample")
+        cargo = self.root / "stubs/cargo"
+        source = cargo.read_text().replace('"check --workspace")', '"check --workspace"|"clippy --workspace")')
+        _ = cargo.write_text(source)
+        git = self.root / "stubs/git"
+        source = git.read_text().replace('    *" ls-tree "*) : ;;',
+            '    *" ls-files "*) printf "Cargo.toml\\0" ;;\n    *" ls-tree "*) : ;;')
+        _ = git.write_text(source)
+        reader = self.root / "lint-config.sh"
+        _ = reader.write_text('lint_config_enabled() { [[ "$1" == check || "$1" == clippy ]]; }\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        taplo = self.root / "stubs/taplo"
+        _ = taplo.write_text("#!/bin/sh\nexit 0\n")
+        taplo.chmod(0o755)
+        self.environment.update({"UNIT_DETACHED_RUN": "1", "BUILDLOG_OFF": "0",
+            "TEST_METADATA": json.dumps(workspace_metadata(self.root))})
+        _ = self.environment.pop("BUILDLOG_RUN", None)
+        _ = write_config_fixture(self.root / "build_targets.conf",
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        admission = caller_admission(self, self.root, self.environment)
+        grants: list[tuple[str, wire.RunIdentity | wire.NoRun]] = []
+
+        def capture(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.Admitted):
+                record, = (record for record in admission.server.reservations.values()
+                    if record.reservation_id == reply.reservation)
+                grants.append((record.step, record.run))
+            return reply
+
+        admission.server.reply_filter = capture
+        for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
+            with self.subTest(command=command):
+                grants.clear()
+                result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
+                    env=self.environment, start_new_session=True, capture_output=True, text=True,
+                    check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([grant[0] for grant in grants], [step])
+                for name, run in grants:
+                    self.assertIsInstance(run, wire.RunIdentity, name)
+                self.assertEqual(admission.caller_reservations(), {})
+
+
 class ShellTests(unittest.TestCase):
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
 
@@ -4897,7 +4934,7 @@ class ShellTests(unittest.TestCase):
             env={**os.environ, "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                  "BUILD_HOLD_DIR": str(self.admission.root / "holders"),
                  "BUILD_HOLD_RELEASE_DIR": str(self.admission.root / "releases"),
-                 "UNIT_ACTIVE_DIR": str(self.admission.root / "active"), "UNIT_RUN_DIR": "",
+                 "UNIT_RUN_DIR": "",
                  "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": "", **environment},
             capture_output=True, text=True, check=False, timeout=30)
 
@@ -5729,7 +5766,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "build_admission.conf"
             for key in ("estimate_refresh_seconds", "slot_gap_seconds", "program_first_peak_gib.cargo",
-                        "ci_memory_margin_gib", "peak_history_share_percent"):
+                        "peak_history_share_percent"):
                 invalid_values = (None, "invalid", "70") if key == "peak_history_share_percent" else (None, "invalid")
                 for bad in invalid_values:
                     with self.subTest(key=key, value=bad), patch.dict(os.environ, {"CONF_DIR": directory}):
@@ -5748,27 +5785,10 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                             self.assertEqual(repaired.config.policy.timing.estimate_refresh_seconds, 7)
                         elif key == "slot_gap_seconds":
                             self.assertEqual(repaired.config.policy.timing.slot_gap_seconds, 7)
-                        elif key == "ci_memory_margin_gib":
-                            self.assertEqual(repaired.config.policy.ci_memory_margin_bytes, 7 * GIB)
                         elif key == "peak_history_share_percent":
                             self.assertEqual(repaired.peak_history_share_percent, 7)
                         else:
                             self.assertEqual(repaired.config.program_first_peaks["cargo"], 7 * GIB)
-
-    def test_ci_margin_reads_bytes_and_recovers_invalid_values_like_other_policy_keys(self) -> None:
-        for margin in (0, 2.5, 7):
-            with self.subTest(margin=margin):
-                self.write_config(ci_memory_margin_gib=str(margin))
-                config = admission_records.read_memory_config()
-                self.assertEqual(config.policy.ci_memory_margin_bytes, int(margin * GIB))
-        for raw in (None, "abc", "-1", "nan", "inf"):
-            with self.subTest(raw=raw):
-                self.write_config(ci_memory_margin_gib=raw)
-                with contextlib.redirect_stderr(io.StringIO()) as errors:
-                    config = admission_records.read_memory_config()
-                self.assertEqual(config.policy.ci_memory_margin_bytes, 7 * GIB)
-                self.assertIn("ci_memory_margin_gib", errors.getvalue())
-                self.assertIn("warning:", errors.getvalue())
 
     def test_cargo_estimate_reads_the_configured_first_peak_at_each_use(self) -> None:
         for peak in (7, 13):
@@ -6020,8 +6040,8 @@ class CiSliceMemoryTests(unittest.TestCase):
                 f"anon {(6 - shared) * GIB}\nshmem {shared * GIB}\ninactive_file 0\n")
             processes = gate.process_table(self.proc)
             policy = admission_records.read_memory_config().policy
-            for registered, margin, registered_use, unregistered_use in (
-                    ((), 7, 0, 6), ((235,), 7, 2, 4), ((235, 346), 0, 6, 0)):
+            for registered, registered_use, unregistered_use in (
+                    ((), 0, 6), ((235,), 2, 4), ((235, 346), 6, 0)):
                 with self.subTest(registered=registered, shared=shared):
                     reservations = [fixture_reservation(pid, 8 * GIB) for pid in registered]
                     runs: list[admission_records.RunningStep] = []
@@ -6050,11 +6070,10 @@ class CiSliceMemoryTests(unittest.TestCase):
                     room = gate.inputs_room(inputs, policy)
                     self.assertIsInstance(room, admission_records.MemoryRoom)
                     if isinstance(room, admission_records.MemoryRoom):
-                        self.assertEqual(room.ci_keep_aside.bytes, margin * GIB)
                         self.assertEqual(room.used, registered_use * GIB)
                         self.assertEqual(room.ci_use, unregistered_use * GIB)
                         self.assertEqual(room.cap, 23 * GIB)
-                        self.assertEqual(room.kept, (8 * len(registered) - registered_use + margin) * GIB)
+                        self.assertEqual(room.kept, (8 * len(registered) - registered_use) * GIB)
 
     def queue_with_ci(self, reading: admission_records.StepMemory, available: int = 20 * GIB) -> admission_records.QueueRead:
         config = admission_records.read_memory_config()
@@ -6077,7 +6096,7 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(room.ci_use, expected)
                 self.assertEqual(room.cap, 17 * GIB + expected)
 
-    def test_running_ci_job_keeps_one_margin_and_reduces_room_by_seven_gib(self) -> None:
+    def test_running_ci_job_has_no_margin_and_keeps_the_same_room(self) -> None:
         idle = self.queue_with_ci(self.reading()).explanation.room
         self.start_ci_job()
         reading = self.reading()
@@ -6085,15 +6104,14 @@ class CiSliceMemoryTests(unittest.TestCase):
         active = self.queue_with_ci(reading).explanation.room
         assert isinstance(idle, admission_records.MemoryRoom)
         assert isinstance(active, admission_records.MemoryRoom)
-        self.assertEqual(active.ci_keep_aside.bytes, 7 * GIB)
-        self.assertEqual(active.kept, 7 * GIB)
-        self.assertEqual(active.room, 10 * GIB)
-        self.assertEqual(idle.room - active.room, 7 * GIB)
+        self.assertEqual(active.kept, 0)
+        self.assertEqual(active.room, 17 * GIB)
+        self.assertEqual(idle.room, active.room)
         self.assertEqual(active.runs, ())
         self.assertEqual(active.cap, idle.cap)
         config = admission_records.read_memory_config()
         policy = config.policy
-        self.assertEqual(queue_decision(20 * GIB, 64 * GIB, 11 * GIB, [reading], policy=policy).state, "hold")
+        self.assertEqual(queue_decision(20 * GIB, 64 * GIB, 11 * GIB, [reading], policy=policy).state, "admit")
         self.assertEqual(queue_decision(20 * GIB, 64 * GIB, 10 * GIB, [reading, reading], policy=policy).state, "admit")
 
     def test_ci_ram_changes_free_memory_without_entering_use_or_keep_asides(self) -> None:
@@ -6107,10 +6125,10 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(reading.bytes, resident * GIB)
                 self.assertEqual(room.available, available * GIB)
                 self.assertEqual(room.used, 0)
-                self.assertEqual(room.kept, 7 * GIB)
+                self.assertEqual(room.kept, 0)
                 self.assertEqual(room.runs, ())
                 self.assertEqual(room.cap, (resident + available - 3) * GIB)
-                self.assertEqual(room.room, (available - 10) * GIB)
+                self.assertEqual(room.room, (available - 3) * GIB)
 
     def test_idle_ci_charges_resident_memory_and_records_swap_separately(self) -> None:
         resident = int(0.09 * GIB)
@@ -6123,7 +6141,6 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertIsInstance(reading.job_state, IdleService)
         room = self.queue_with_ci(reading).explanation.room
         assert isinstance(room, admission_records.MemoryRoom)
-        self.assertEqual(room.ci_keep_aside.bytes, 0)
         self.assertEqual((room.used, room.kept, room.room), (0, 0, 17 * GIB))
 
     def test_empty_ci_slice_allows_the_sole_oversized_step(self) -> None:
@@ -6158,6 +6175,18 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertEqual(gate.unowned_slice_memory([], {}, self.proc), ())
 
 
+    def test_detached_slice_excludes_its_scopes_without_hiding_a_build_sibling(self) -> None:
+        builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+        detached = builds / "builds-detached.slice"
+        write_scope(detached, current=4 * GIB, anonymous=4 * GIB)
+        write_scope(detached / "python.scope", members=(123,), current=3 * GIB, anonymous=3 * GIB)
+        write_scope(detached / "python.scope/child.scope", current=GIB, anonymous=GIB)
+        sibling = builds / "build.scope"
+        write_scope(sibling, current=2 * GIB, anonymous=2 * GIB)
+        readings = gate.unowned_slice_memory([], gate.process_table(self.proc), self.proc)
+        self.assertEqual([(reading.cgroup, reading.bytes) for reading in readings], [(str(sibling), 2 * GIB)])
+
+
     def test_unreadable_or_invalid_ci_stat_records_a_diagnostic(self) -> None:
         self.start_ci_job()
         stat = self.ci / "memory.stat"
@@ -6173,7 +6202,6 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(captured.view.running[0].measured, reading)
                 room = captured.explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
-                self.assertEqual(room.ci_keep_aside.bytes, 0)
                 self.assertEqual((room.used, room.kept, room.room), (0, 0, 17 * GIB))
 
 

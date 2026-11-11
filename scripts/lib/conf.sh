@@ -1,5 +1,7 @@
+# shellcheck shell=bash
 # Live configuration reader for bash 3.2 and zsh. Valid integer and text reads use builtins.
 if [[ -n "${ZSH_VERSION:-}" ]]; then
+    # shellcheck disable=SC2296 # zsh reads its source path.
     _CONF_SOURCE="${(%):-%x}"
 else
     _CONF_SOURCE="${BASH_SOURCE[0]}"
@@ -9,6 +11,8 @@ case "$_CONF_SOURCE" in
     *) _CONF_LIB="." ;;
 esac
 unset _CONF_SOURCE
+# shellcheck source=/dev/null
+source "$_CONF_LIB/conf_record.sh"
 if [[ -r /proc/sys/kernel/hostname ]]; then
     IFS= read -r _CONF_HOST < /proc/sys/kernel/hostname
 else
@@ -18,6 +22,7 @@ _CONF_HOST="${_CONF_HOST%%.*}"
 
 conf_value() {
     local file="$1" key="$2" folder="${CONF_DIR:-$HOME/.claude/config}"
+    conf_record "$file"
     local raw line name value previous="" limit=""
     local base="" base_limit="" host_value="" host_limit="" base_seen=0 host_seen=0 found=0
     local low high choices choice numeric valid=1

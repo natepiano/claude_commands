@@ -101,7 +101,7 @@ class UnitTransferFixture(StaffTestCase):
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "SHOWRUNNERS_SEND": str(self.root / "fake_send.py"),
             "TRANSFER_MESSAGE_LOG": str(self.root / "messages.jsonl"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),

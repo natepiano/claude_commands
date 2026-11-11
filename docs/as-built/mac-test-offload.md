@@ -256,7 +256,9 @@ The default verb is `nextest`.
 Claims use the verb and the package name, or `workspace`.
 Remote doc sets `LINT_CONFIG_FORCE=1`.
 Workspace verbs use the same manifest-based Linux-only check as eligibility.
-`--settings` selects the target's configuration.
+With `--target`, the target record gives the settings for both the platform choice and the copy host.
+A `--settings` path that resolves to another file is refused before any copy.
+Without `--target`, `--settings` selects the configuration.
 `--last-decline` suppresses an unchanged retry notice.
 
 `write_result` writes `mac`, `reason`, and `seconds` from the typed run outcome.
@@ -280,6 +282,15 @@ Declined, lost, and invalid results return the step to its waiting state.
   The runner prints `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`.
   Nextest exit 4 becomes `NoTestMatchedOnMac` and runner exit 75.
   The runner prints `mac_test: no test matched on the Mac; running on natedev instead`.
+- **Abandoned compiler sessions.** Before a build on a Mac or Linux target, the step removes old abandoned compiler sessions and their locks.
+  It removes them only from its own mirror's default build folder.
+  `abandoned_session_minutes` sets the minimum age.
+  The bounded walk skips `deps`, `build`, `.fingerprint`, and `examples`.
+  It preserves recent sessions and finished sessions.
+  A Mac step skips this removal when it has an explicit `--target-dir`.
+  A Linux step skips this removal when `--target-dir` selects another folder.
+  A Linux step checks tool versions before this removal.
+  A missing target or a failed removal does not stop the build.
 - **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
 - **Markers.** Output streams as it arrives. `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
 - `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.
@@ -305,6 +316,12 @@ Declined, lost, and invalid results return the step to its waiting state.
 - Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
+
+`test [<package>] --run-ignored only` runs only ignored tests on the selected target.
+It accepts repeated `--filter <name>` flags and `--features <list>`, but refuses `--test <name>`.
+Omit the package to select named tests across two packages in one call.
+The call must match a test. Its filtered result never supplies a full package pass.
+Its saved-result key includes `--run-ignored only`.
 
 `test [<package>] --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
@@ -448,7 +465,10 @@ Both values use the existing configuration reader.
 
 ## Calibration and gotchas
 
-- The mirror copy is `rsync -rlpc`: checksums, no modification times. A touch-only edit never reaches the Mac; time a rebuild with a content edit.
+- The mirror copy and the tracked script copy use `copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS` (`rsync -rlpc`).
+  Checksums skip files with equal content and keep their destination modification times.
+  Changed files get the receiver write time, so Cargo detects changed source even when its source modification time is old.
+  A change to the source modification time alone causes no transfer.
 - GitHub lists hana's macOS job only after `macOS: Runner Availability` completes, and lists it at once as completed/skipped while the switch is off. A pending block therefore also waits on queued runs that have not reached that job.
 - A lost run whose cleanup cannot confirm the end keeps its claim. A remote claimant takes it over with exit 13 and checks the stored host. Remaining work declines `busy`; an unreadable host or failed check declines `unreachable` and starts the unreachable backoff. Both keep the claim. Stderr says `mac_test: <N> leftover processes of a lost run are still on the Mac; it stays busy until they end`, or `mac_test: could not confirm that a lost run's leftovers ended: <reason>; the Mac stays busy`.
 - A non-interactive bash starts an `&` child with `SIGINT` ignored, so a forwarded INT is lost until `offload.py run` installs its own handlers. `verify.sh` therefore forwards INT as TERM. A terminal interrupt reaches the runner twice: INT from the process group and TERM from the forward.

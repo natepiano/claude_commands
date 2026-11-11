@@ -45,7 +45,7 @@ from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
 from scripts.production import change_routing, session_staff, showrunner_tree, staff, unit_config, unit_lookup
 from scripts.production.production_doc import Refusal, production_field
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
@@ -1635,8 +1635,13 @@ def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list
             if _git(repo, "rev-parse", ref).strip() != merge:
                 excluded.add(ref)
             continue
-        descendants = {merge, *(commit[0] for commit in path)}
-        excluded.update(parent for commit in path for parent in commit[1:] if parent not in descendants)
+        ancestry = {commit[0]: commit[1:] for commit in path}
+        current = path[0][0]
+        while current in ancestry:
+            parent = ancestry[current][0]
+            if parent != merge and parent not in ancestry:
+                excluded.add(parent)
+            current = parent
     return sorted(excluded)
 
 

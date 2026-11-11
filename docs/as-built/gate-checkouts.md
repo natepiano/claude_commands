@@ -123,9 +123,13 @@ The standing folder retains only `target/`, `.gate.json`, and `.claude-busy` aft
 The code does not remove legacy checkout files.
 
 The cache's `.gate.json` stores each tracked path's blob identity and modification time in nanoseconds.
-After preparation, a path with the same blob identity receives its saved time.
+After preparation, one `git grep` finds tracked files that name `CARGO_MANIFEST_DIR`.
+These files retain their new checkout times, including when their blob identities stay unchanged.
+Cargo rebuilds their crates and the dependents instead of reusing compiled output that holds a removed checkout path.
+Every other path with the same blob identity receives its saved time.
 A changed blob retains its new checkout time.
-This preserves unchanged source times across temporary checkouts.
+Unchanged crates without these files can reuse their cached build output.
+This rule does not cover a dependency macro that reads `CARGO_MANIFEST_DIR` at expansion in a caller without that text.
 Cargo gates refresh source remotes and both gate records after use.
 
 `scratch.mark_cargo_cache` marks and refreshes the standing cache's `target/`.
@@ -327,7 +331,7 @@ An unset source or Git path inside interpreter text can also pass when its top-l
 | --- | --- |
 | `scripts/copies/copies.py` | Creates temporary gate checkouts, standing caches, remote mirrors, and registered test clones. |
 | `scripts/production/add_unit.py` | Creates original unit worktrees. |
-| `scripts/shutdown/shutdown.py` | Restores original unit worktrees. |
+| `scripts/agents/shutdown.py` | Restores original unit worktrees. |
 | `scripts/style/add_style.py` | Creates a unit's original checkout, like `add_unit.py`. |
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
@@ -417,15 +421,45 @@ Without `origin/HEAD`, it records an empty merge branch, so a production merge d
 
 `landed(record)` returns `Landed` or `NotLanded(commits, paths)`.
 It accepts patch-equivalent commits, merge commits, and commits that change only `docs/plans/`.
-Each other changed path must match the merge branch or have a newer change on that merge branch.
+It checks changed paths outside `docs/plans/` when HEAD is not an ancestor of the merge branch.
+Each path must match the merge branch or have a newer change on the merge branch.
 
 After a successful merge-branch push, `merge_checkpoint.py` calls `end_landed(repo, merge_branch)`.
 It reports `Ended` or `Kept` as a `worktrees` step.
 It keeps a staff-held tree, a dirty tree, a different checked-out branch, and work that has not landed.
+It ends an eligible tree whose branch HEAD is an ancestor of the merge branch.
+It keeps a tree whose origin branch has commits that the local branch lacks.
+It also keeps a branch whose only commits outside the merge branch are merges that brought it in.
 A kept tree does not fail the merge.
-An eligible tree ends through worktree removal, local and origin branch deletion, then record deletion.
+An eligible tree ends through origin branch deletion, worktree removal, local branch deletion, then record deletion.
+The origin check returns the checked tip in `CheckedOriginTip` or reports `OriginBranchAbsent`.
+Origin deletion uses `--force-with-lease` with that checked tip.
+Local deletion uses `update-ref -d` with the checked local SHA.
+If the local branch changes during removal, deletion stops and keeps the branch without the folder.
+A retry keeps the record until the new commit satisfies the landing checks.
+After local branch deletion, Git removes its config section.
+If origin rejects deletion, the tree, local branch, and record remain for a retry.
 Missing paths or branches allow a retry to complete an interrupted end.
+Older partial records can lack the folder and local branch while origin's branch remains.
+Their origin tip must be an ancestor of the merge branch before deletion proceeds.
 The main checkout is the first entry from `git worktree list`.
+
+`/worktree_delete` skips confirmation when `worktrees.py cleanup <path>` proves that deletion preserves all work.
+The check fetches origin and requires a clean tree on a branch.
+It uses the recorded base and merge branch when a record exists.
+Without a record, it uses origin's default branch and the merge base.
+It refuses a missing default branch.
+`landed()` and the shared origin check must both pass.
+The command exits 0 for cleanup, 1 for retained work, and 2 for a Git fault.
+The validation JSON includes `cleanup` and `cleanup_reason` beside the existing fields.
+Without a confirmation nonce, `perform_deletion.sh` repeats the cleanup check before deletion.
+It obtains the checked local and origin tips through `cleanup --checked-tips`.
+It also checks that the path, branch argument, and caller belong to the same repository.
+It deletes origin's branch with a lease before local removal.
+Without a nonce, a failed normal worktree removal stops deletion and preserves the changed tree.
+Other deletion requires the existing confirmation nonce and its checks.
+Both nonce states preserve a local branch that moves after the check.
+A confirmed deletion without an origin remote deletes only the local items.
 
 There is no `end` command, sweep command, timer, or session-end cleanup for these original trees.
 The successful landing operation owns their end.

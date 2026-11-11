@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-from scripts.mac_test import offload
+from scripts.mac_test import offload, claim_state
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -426,6 +426,11 @@ class OffloadSettingsTests(unittest.TestCase):
         with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
             self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / ".local/state/build-targets/aws")
             self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "build-targets")}):
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "build-targets/aws")
+                self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": "~/private-targets", "HOME": str(self.root)}):
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "private-targets/aws")
 
     def test_ssh_target_state_path_refuses_invalid_names(self) -> None:
         for target in (".", "..", "../aws", "/tmp/aws", "aws/other"):
@@ -636,14 +641,18 @@ class OffloadSettingsTests(unittest.TestCase):
         destination = self.root / "result"
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
 
-        def complete_claim(arguments: Sequence[str], attempt: offload.LocalClaimAttempt) -> None:
-            _ = arguments
+        def complete_claim(controller: offload.ProcessController, arguments: Sequence[str],
+                           attempt: offload.LocalClaimAttempt) -> None:
+            claim = claim_state.ClaimIdentity(
+                arguments[arguments.index("--claim-id") + 1], arguments[arguments.index("--episode") + 1],
+                arguments[arguments.index("--attempt") + 1])
+            controller.claim_identity = claim
             attempt.answer = offload.FreshMacClaim()
 
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination)]), \
              mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
-             mock.patch.object(offload.ProcessController, "complete_claim", side_effect=complete_claim), \
+             mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(offload.main(), 75)
@@ -812,19 +821,46 @@ class OffloadCommandTests(OffloadCommandFixture):
                                  template="mac_test")
         self.config["offload"] = "off"
         self.sync_config()
-        result = self.command(settings=alternate)
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assert_wire("passed", "")
-        ssh = self.events_for("ssh")
-        self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
-        self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
-        self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
-        remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
-        lint_index = remote_words.index("~/.claude/scripts/lint/lint")
-        self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
-        self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
-        self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
-        self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
+        linux_settings = self.root / "linux.conf"
+        _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", template="mac_test")
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text("targets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
+            + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n")
+        self.environment["BUILD_TARGETS_CONFIG"] = str(registry)
+        for target, settings in (("", alternate), ("mac", alternate), ("mac", Path(alternate.name)),
+                                 ("builder", alternate)):
+            with self.subTest(target=target, settings=settings):
+                self.clear_events()
+                options = ("--target", target) if target else ()
+                if target == "builder":
+                    with (
+                        mock.patch.object(offload, "mac_step_eligibility", return_value=HANA),
+                        mock.patch.object(offload, "trusted_linux_source", return_value=True),
+                        mock.patch.object(offload, "recorded_linux_version_mismatch", return_value=""),
+                        mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim()),
+                        mock.patch.object(offload, "expected_linux_parity", return_value={}),
+                        mock.patch.object(offload, "copy_tracked_scripts", return_value=False) as scripts_copy,
+                    ):
+                        result = self.command(settings=settings, runner_options=options, separate_stderr=True)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(str(alternate.resolve()), result.stderr)
+                    self.assertIn(str(linux_settings.resolve()), result.stderr)
+                    self.assertEqual(self.events_for("rsync"), [])
+                    scripts_copy.assert_not_called()
+                    continue
+                result = self.command(settings=settings, runner_options=options)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assert_wire("passed", "")
+                ssh = self.events_for("ssh")
+                self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
+                self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
+                self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
+                remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                lint_index = remote_words.index("~/.claude/scripts/lint/lint")
+                self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+                self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
+                self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
+                self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
 
     def test_low_disk_declines_after_probe(self) -> None:
         self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]
@@ -880,7 +916,9 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(self.wire_result().get("holder"), "other tests")
         self.assertTrue(self.claim_file.exists())
         self.assertEqual(self.events(), [])
-        released = self.state_command("release", "--pid", str(os.getpid()))
+        claim = self.remote_claim()
+        released = self.state_command("release", "--pid", str(os.getpid()), "--claim-id", claim["claim_id"],
+                                      "--episode", claim["episode"], "--attempt", claim["attempt"])
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
 
         _ = (self.state_directory / "block.json").write_text(
@@ -1030,7 +1068,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(controller.copy_failure_detail, "copy: rsync: rsync: config denied")
         self.assertEqual(commands[-1][0], "rsync")
         self.assertIn("--compress", commands[-1])
-        self.assertIn("-rlptc", commands[-1])
+        self.assertIn("-rlpc", commands[-1])
 
     def test_each_mac_verb_keeps_arguments_and_names_its_claim(self) -> None:
         self.write_portable_workspace()
@@ -1262,7 +1300,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(
             copy["args"],
             [
-                "-rlptc",
+                "-rlpc",
                 "--stats",
                 "--compress",
                 "--delete",

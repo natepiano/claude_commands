@@ -33,7 +33,7 @@ from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, available_timezones
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import main_publish, user_zone  # noqa: E402
+from scripts.lib import conf_reads, main_publish, user_zone  # noqa: E402
 from scripts.lib.main_publish import Refusal as Refusal
 from scripts.lib.main_publish import checkout_of, first_line as _first_line, git, queue, read_queue
 from scripts.lib.main_publish import ready as _ready
@@ -106,7 +106,7 @@ def stored(conf: Path) -> str:
 
 def write_zone(conf: Path, zone: str) -> None:
     """Set the zone= line of `conf`, keeping its comments; add the line when it has none."""
-    lines = conf.read_text(encoding="utf-8").splitlines() if conf.exists() else []
+    lines = conf_reads.read_text(conf).splitlines() if conf.exists() else []
     written = [f"zone={zone}" if line.startswith("zone=") else line for line in lines]
     if written == lines and not any(line.startswith("zone=") for line in lines):
         written.append(f"zone={zone}")
@@ -196,7 +196,7 @@ def set_zone(name: str) -> int:
     _ready(checkout)
     before = stored(conf)
     print(f"zone: {describe(zone)}")
-    before_text = conf.read_text(encoding="utf-8") if conf.exists() else None
+    before_text = conf_reads.read_text(conf) if conf.exists() else None
     if before != zone:
         print(f"was: {before}")
         write_zone(conf, zone)

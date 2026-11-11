@@ -50,7 +50,7 @@ class TemporaryHoldTest(unittest.TestCase):
             "CONF_DIR": str(Path(targets).parent),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "caller",
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
         }))
@@ -125,6 +125,25 @@ class HoldAppliesTest(TemporaryHoldTest):
         self.hold()
         self.assertEqual(hold_applies.hold_applies(), REFUSAL)
         self.assert_cli(0, REFUSAL)
+        proc = self.root / "proc"
+        for pid, parent in ((10, 1), (20, 10), (30, 1)):
+            directory = proc / str(pid)
+            directory.mkdir(parents=True)
+            fields = ["S", str(parent), *(["0"] * 17), str(pid * 100)]
+            _ = (directory / "stat").write_text(f"{pid} (gate) " + " ".join(fields))
+        holder = self.holders / "other"
+        _ = holder.write_text(json.dumps({
+            "holder": "builder", "since": "2026-10-28T12:00:00+00:00",
+            "for": "app test", "release_eta": "unknown",
+            "keep": [{"pid": 10, "start_time": "1000"}],
+        }))
+        for pid, refusal in ((10, ""), (20, ""), (30, REFUSAL)):
+            with self.subTest(caller_pid=pid), mock.patch.object(build_hold, "PROC_ROOT", proc), \
+                 mock.patch.object(os, "getpid", return_value=pid):
+                self.assertEqual(hold_applies.hold_applies(), refusal)
+                holds = build_hold.natedev_holds(self.holders)
+                self.assertTrue(holds.in_force)
+                self.assertEqual(build_targets.caller_waits_on_hold(holds, self.holders), bool(refusal))
 
     def test_another_holder_alongside_caller(self) -> None:
         self.hold("caller", "caller builder")
@@ -173,9 +192,9 @@ class HoldAppliesTest(TemporaryHoldTest):
 
     def test_uses_wait_local_decision(self) -> None:
         self.hold()
-        with mock.patch.object(build_targets, "caller_holds_only_own", return_value=True) as own:
+        with mock.patch.object(build_targets, "caller_waits_on_hold", return_value=False) as waits:
             self.assertEqual(hold_applies.hold_applies(), "")
-            own.assert_called_once_with()
+            waits.assert_called_once_with(build_hold.natedev_holds(self.holders), self.holders)
 
     def test_main_returns_diagnostic(self) -> None:
         self.unreadable()

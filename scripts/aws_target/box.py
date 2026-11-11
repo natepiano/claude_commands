@@ -31,6 +31,11 @@ from scripts.mac_test import linux_runner, offload, mac_test
 IMAGE_OWNER_TAG = 'aws-build-image'
 
 
+def builder_state_paths() -> mac_test.StatePaths:
+    """Resolve the former builder's claims and locks without target registration."""
+    return mac_test.StatePaths(target_config.ssh_target_state_directory('aws'), 'aws', platform='linux')
+
+
 def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]:
     """Read remote job claims whose owner process still runs without deleting claims."""
     return tuple(claim for claim in mac_test.read_claims(paths)
@@ -39,9 +44,9 @@ def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]
 
 def close_routing(settings: Path) -> bool:
     """Disable AWS routing while excluding new claims."""
-    path = target_config.ssh_target_state_directory('aws') / 'routing.json'
+    paths = builder_state_paths()
+    path = paths.directory / 'routing.json'
     desired: dict[str, object] = {'enabled': False, 'settings': str(settings.resolve())}
-    paths = mac_test.state_paths('aws')
     with mac_test.locked(paths.lock):
         changed = not path.exists() or json_record(path.read_text()) != desired
         if changed:
@@ -88,30 +93,23 @@ def image_leftovers(api: AwsCli, current: dict[str, object], owner_tag: str) -> 
     filters = json.dumps([{'Name': 'tag:' + owner_tag, 'Values': ['true']}])
     images = api.call('describe-images', '--owners', 'self', '--filters', filters)
     snapshots = api.call('describe-snapshots', '--owner-ids', 'self', '--filters', filters)
-    kept = {ledger.mapping(row.get('Ebs')).get('SnapshotId')
-            for row in ledger.rows(current, 'BlockDeviceMappings')}
+    # An empty current image keeps no snapshot: every owned image and snapshot goes.
+    mappings: tuple[dict[str, object], ...] = ledger.rows(current, 'BlockDeviceMappings') if current else ()
+    kept = {ledger.mapping(row.get('Ebs')).get('SnapshotId') for row in mappings}
     return ([ledger.text(image, 'ImageId') for image in ledger.rows(images, 'Images')
              if image.get('ImageId') != current.get('ImageId')],
             [ledger.text(snapshot, 'SnapshotId') for snapshot in ledger.rows(snapshots, 'Snapshots')
              if snapshot.get('SnapshotId') not in kept])
 
 
-def delete_saved_image(api: AwsCli, image: dict[str, object]) -> None:
-    """Delete one image before its snapshots."""
-    snapshots = [ledger.text(ledger.mapping(row['Ebs']), 'SnapshotId')
-                 for row in ledger.rows(image, 'BlockDeviceMappings') if 'Ebs' in row]
-    _ = api.call('deregister-image', '--image-id', ledger.text(image, 'ImageId'))
-    for snapshot in snapshots:
-        _ = api.call('delete-snapshot', '--snapshot-id', snapshot)
-
-
-def cleanup_images(api: AwsCli, current: dict[str, object], owner_tag: str) -> None:
-    """Delete older owned images before their snapshots."""
+def cleanup_images(api: AwsCli, current: dict[str, object], owner_tag: str) -> bool:
+    """Delete older owned images before their snapshots; report whether anything was deleted."""
     images, snapshots = image_leftovers(api, current, owner_tag)
     for image in images:
         _ = api.call('deregister-image', '--image-id', image)
     for snapshot in snapshots:
         _ = api.call('delete-snapshot', '--snapshot-id', snapshot)
+    return bool(images or snapshots)
 
 
 def policy_source() -> dict[str, object]:
@@ -656,7 +654,7 @@ class BoxSetup:
         return image_leftovers(self._api(), current, IMAGE_OWNER_TAG)
 
     def _cleanup_images(self, current: dict[str, object]) -> None:
-        cleanup_images(self._api(), current, IMAGE_OWNER_TAG)
+        _ = cleanup_images(self._api(), current, IMAGE_OWNER_TAG)
 
     def _restore_image_items(self) -> None:
         _ = self._ssm('set -eu; keep=/home/.aws-build-image-keep; ' +

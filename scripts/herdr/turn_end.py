@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import cast
 
 from scripts.direct import progress_history
-from scripts.lib import atomic_file
+from scripts.herdr import herdr_types
+from scripts.lib import atomic_file, scratch
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, worker, worker_admission
 
@@ -150,7 +151,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
         try:
             result = (worker.dispatch_turn(parent.id, state, client, delivery.line, delivery.completion_id, run=run)
                       if isinstance(state, worker_panes.OpenWorker) else worker.ExitCode.UNCERTAIN)
-        except (OSError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(str(error), file=sys.stderr)
             result = worker.ExitCode.UNCERTAIN
     if result is worker.DispatchSubmission.SUBMITTED:
@@ -190,6 +191,10 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
                                        status="completed" if outcome == TurnOutcome.DONE else "error")
     details = list(completion.details)
     try:
+        _ = scratch.end(scratch.worker_task(row.id))
+    except Exception as error:
+        details.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
+    try:
         if not completion.pane_closed:
             with redirect_stderr(io.StringIO()) as diagnostics:
                 if delivery.actions.end_worker:
@@ -210,7 +215,7 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
                 astra_roles.release(delivery.actions.held_role)
             completion = replace(completion, role_released=True)
             progress_history.save_hook_completion(run, instance, completion)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
             staff.StaffRefused, staff.StaffUnreadable) as error:
         details.append(_kept_pane_anomaly(row, state, str(error)))
     if not completion.recording_done:
@@ -253,7 +258,7 @@ def finish_late_completion(row: staff.StaffRow, parent: staff.StaffRow, hold: wo
                                replace(delivery, actions=replace(delivery.actions, end_worker=False)),
                                replace(completion, pane_closed=True,
                                        role_released=completion.role_released or same_hold, details=details), state, hold)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
             staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"anomaly: {row.name}: late result of pass {instance} was not reported: {error}; the result is in {completion.reply_file}", file=sys.stderr)
 
@@ -313,7 +318,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         turn_reply = receipt.reply if isinstance(receipt, worker.DispatchWaitingForRuns) else receipt
         reply = turn_reply.last_reply if isinstance(turn_reply, worker.DispatchAwaitingReply) else turn_reply.reply
         if (event.kind == EventKind.TURN_END and reply != event.reply
-                and event.reply.rstrip().splitlines()[-1:] == [f"DONE {delivery.completion_id}"]
+                and worker_admission.reply_ends_dispatch(event.reply, delivery.completion_id)
                 and not (isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.has_live_run)):
             receipt = worker.DispatchComplete(event.reply,
                 receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ())
@@ -334,7 +339,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
                     completion_id = worker_panes.stage_two_completion_id(instance)
                     diff = delivery.early_ready.removesuffix(".ready") + ".diff"
                     line = (f"Stage 2: the final diff is at {json.dumps(diff)}. "
-                            + delivery.line.replace(f"DONE {instance}.", f"DONE {completion_id}."))
+                            + delivery.line.replace(f"DONE {instance}", f"DONE {completion_id}"))
                     delivery = replace(delivery, line=line, completion_id=completion_id)
                     progress_history.save_dispatch_delivery(run, instance, delivery)
                     return _submit_stage(parent, row, state, client, run, passed, instance, delivery)
@@ -361,6 +366,36 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         runs = receipt.runs if isinstance(receipt, worker.DispatchWaitingForRuns) else ()
         _send_notice(row.name, parent, run, passed, instance, outcome, path, reply, details, runs)
         return outcome
+
+
+def report_quota_refusals() -> list[str]:
+    """Report a pane Codex worker's quota refusal once per pass; Codex runs no Stop hook for that turn."""
+    from scripts.accounts import refusal_watch
+    from scripts.whoami import agent_accounts, note_file, quota_alert
+
+    record = staff.local_snapshot()
+    lines: list[str] = []
+    for row in record.rows:
+        parent = record.parent_of(row)
+        recorded = progress_history.recorded_dispatch_run(row.id)
+        if row.kind != "worker" or parent is None or not isinstance(recorded, progress_history.RecordedDispatchRun):
+            continue
+        active = progress_history.active_dispatch(row.id, recorded.directory)
+        backend = staff.backend(row)
+        if (not isinstance(active, progress_history.ActiveDispatch) or not isinstance(backend, staff.CodexBackend)
+                or worker_panes.worker_pass(row, recorded.directory).get("quota_refusal")):
+            continue
+        refusal = refusal_watch.transcript_refusal(str(row.current_session), config_dir=backend.codex_home)
+        if not isinstance(refusal, refusal_watch.TranscriptRefusal):
+            continue
+        try:
+            stopped = quota_alert.StoppedWorker(str(parent.current_session), row.name)
+            lines += quota_alert.blocked(list(note_file.read_notes()), agent_accounts.codex_account(backend.codex_home),
+                                         window=refusal.window, refused_at=refusal.refused_at, stopped=stopped)
+            progress_history.record_quota_refusal(recorded.directory, active.instance_id, refusal.entry_id)
+        except (OSError, ValueError) as error:
+            lines.append(f"anomaly: {row.name}: quota refusal not reported: {' '.join(str(error).splitlines())}")
+    return lines
 
 
 def run_finished(thread_id: str) -> None:
@@ -390,7 +425,7 @@ def main(arguments: list[str] | None = None) -> int:
             with cast(io.BufferedWriter, child.stdin) as stream:
                 _ = stream.write(payload.encode())
         return 0
-    except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr_types.HerdrFailure) as error:
         print(f"turn_end: {error}", file=sys.stderr)
         return 1
 

@@ -264,6 +264,8 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
+`abandoned_session_minutes` sets the minimum age for removing abandoned compiler sessions before builds on Mac and Linux targets.
+
 The Mac floor sweep reads `sweep_floor_gib=150` from this file.
 The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
 `sweep_floor_roots` names `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
@@ -363,19 +365,19 @@ Existing boxes use their saved start and end times and the instance types in `cl
 A box without a saved instance type retains its bid rate.
 No migration is required.
 Reports use the saved AWS bill and label provisional days.
-Reports show today's spend, daily limit, successful launch count, and spend groups with amounts and percentage shares.
-Historical reports omit today's estimated spend.
+Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+Reports show daily spending, limits, run counts, and compute, storage, and other costs.
+The daily spend table shows bill days and estimate days after the newest bill day.
+Historical reports omit estimate days after the report date.
 The groups are gate compute at 32 CPU, compute at 16 CPU, storage, public IPv4, data transfer, and other.
 Compute at 16 CPU includes gates and the older builder.
-Unbilled days use the label `estimated from the newest bill` when a bill exists.
+Unbilled days use the label `estimate`.
 Spot compute includes the older Spot builder when it uses the same instance type.
-The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
+The matrix splits each day's Spot cost by box seconds and divides the cost by finished runs on billed days.
 Reports read local evidence without an AWS call or a coordination file.
-`go-live.json` records the first permitted running observation for the wait comparison.
 
-`### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
-Missing comparisons remain unavailable. Run time differences can remain negative.
-The daily wait comparison remains unmatched for load.
+`### AWS` shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+`gate_type_window_days=14` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.
@@ -433,25 +435,17 @@ The guard runs before each resource request. `deployment_timeout_s` bounds each 
 `scaler_key_check_delay_s=5` allows IAM time to publish the key between checks.
 The scaler stage keeps other credential profiles and writes the private file with mode `0600`.
 It verifies the new key before deleting old keys. It deletes a new key that fails verification.
-Run `scripts/lib/py scripts/aws_target/deploy.py gate-image --approve-resources` at the terminal to prepare a cloud gate image.
+Cloud gates boot the official NixOS image that `ami_id` names, and fetch their tools at boot.
+A saved gate image was measured and taken out of use: gates were no faster with it, and its snapshot cost 1.60 USD each month.
+To inspect the saved image removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-images`.
 Without the flag, the command prints its plan and needs no credentials.
-The command uses one temporary box and terminates it after success, failure, interruption, or the time limit.
-`gate_image_timeout_s=1200` limits preparation and image availability to 1200 seconds.
-The box also has an expiry timer and the existing gate expiry tags.
-The image key contains only the configured cloud gate packages and the host nixpkgs revision.
-Gate source changes still arrive through the source bundle and never require an image build.
-Changed packages or a changed revision create a new image on the next approved command.
-After the image becomes available, the command removes older gate images and their snapshots.
-It retains the builder image independently.
-The command updates only the live stack GateImage parameter and retains every other parameter and template definition.
-The launch template and its image permission then use the saved image.
-The next gate launch uses the saved image without other launch changes.
-A gate without matching saved tools uses the existing tool fetch.
-The boot stages remain `boot`, `tools ready`, `source ready`, and `tests start`.
-The expected saving is the measured tool fetch: median 24 seconds, range 18 to 119 seconds.
-`gate_image_snapshot_usd_per_gib_month=0.05` supplies the monthly snapshot estimate per GiB.
-The command prints the logical image size and the estimate; AWS bills stored snapshot blocks.
-The ledger includes this estimate until `down` removes the gate image and its snapshot.
+To remove the saved images, run `scripts/lib/py scripts/aws_target/deploy.py remove-images --approve-destroy`.
+The command switches the live stack GateImage parameter to `ami_id` and keeps every other parameter and template definition.
+The old image stays launchable until `gate-deployment.json` names the official image.
+A second stack update then removes the old image permission.
+Then the command deletes the saved gate image, its snapshot, and its cost row.
+Last, it deletes the former builder image, its snapshot, and `image.json`. A later builder `up` would make a new image.
+A repeat after a partial removal continues from the live state. A repeat after a full removal changes nothing.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
 `scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
 The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.

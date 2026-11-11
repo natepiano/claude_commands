@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import record, store
+    from scripts.buildlog.repository import GIT_DIR, repo_name as repo_name
     from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                                               TargetFolderOverride, recorded_output_roots)
     from scripts.notify.push_texts import RenderedPush
@@ -212,6 +213,7 @@ else:
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import store
+    from scripts.buildlog.repository import GIT_DIR, repo_name as repo_name
     from scripts.buildlog.step_outputs import (AbsoluteRecordedRoot, KnownStepStart, RecordedStepOutput, RecordedStepOutputs,
                                               TargetFolderOverride, recorded_output_roots)
 
@@ -226,10 +228,6 @@ MIB = 1 << 20
 DAY_SECONDS = 86_400
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
-GIT_DIR = ".git"
-GITDIR_PREFIX = "gitdir:"
-COMMONDIR_FILE = "commondir"
-ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
 DOC_LOCK_NAME = ".lock"
@@ -3308,7 +3306,7 @@ def folder_choice(path: str, size: int) -> FolderChoice:
 
 def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: Sequence[tuple[str, int]], shortfall: int, *,
                    now: float, lint_settings: conf.ConfigRead, held_targets: Sequence[str] = ()) -> FolderChoices:
-    """Classify measured folders and exclude held output from recommendations."""
+    """Offer build output outside source checkouts and exclude held output from recommendations."""
     choices = [FolderChoice(home_relative(path), size, FolderChoiceKind.PROTECTED)
                for path, size in protected if size > 0]
     if isinstance(measurement, CurrentMacFolders):
@@ -3321,11 +3319,17 @@ def folder_choices(measurement: DiskMeasurement | CurrentMacFolders, protected: 
             choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
                            if item.bytes > 0 and item.path not in protected_paths)
     held_paths = tuple(Path(path).expanduser().resolve() for path in held_targets)
-    for index, item in enumerate(choices):
+    output_roots = OUTPUT_ROOTS.get().output_owners
+    candidates: list[FolderChoice] = []
+    for item in choices:
         path = Path(item.label).expanduser().resolve()
+        if ((path / "Cargo.toml").exists() or (path / GIT_DIR).exists()
+                or (path not in output_roots and not is_cargo_target(str(path), lint_settings=lint_settings))):
+            continue
         if any(path.is_relative_to(held) or held.is_relative_to(path) for held in held_paths):
-            choices[index] = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
-    choices.sort(key=lambda item: (-item.bytes, item.label))
+            item = replace(item, kind=FolderChoiceKind.HELD_OUTPUT)
+        candidates.append(item)
+    choices = sorted(candidates, key=lambda item: (-item.bytes, item.label))
     if not choices:
         return UNAVAILABLE_FOLDER_CHOICES
     eligible = [item for item in choices if item.kind is not FolderChoiceKind.HELD_OUTPUT]
@@ -4482,93 +4486,6 @@ def size_bytes(raw: str, unit: int) -> int | None:
     except ValueError:
         return None
     return int(value * unit) if math.isfinite(value) and value >= 0 else None
-
-
-def repo_name(directory: str) -> str | None:
-    """Name of the directory holding the git common dir of the repo directory is
-    in: every worktree of a repo shares it, and a scratch clone takes the name of
-    the repo it was cloned from (source_git_dir). Read from the .git files rather
-    than from git, which a bare PATH may not reach."""
-    common = git_common_dir(directory)
-    if common is None:
-        return None
-    return os.path.basename(os.path.dirname(source_git_dir(common))) or None
-
-
-def git_common_dir(directory: str) -> str | None:
-    """The git dir every worktree of directory's repo shares."""
-    current = os.path.abspath(directory)
-    while not os.path.lexists(os.path.join(current, GIT_DIR)):
-        parent = os.path.dirname(current)
-        if parent == current:
-            return None
-        current = parent
-    common = os.path.join(current, GIT_DIR)
-    if os.path.isfile(common):
-        # A linked worktree: .git names its private git dir, whose commondir
-        # file leads back to the shared one.
-        try:
-            with open(common, encoding="utf-8") as handle:
-                pointer = handle.readline().strip()
-        except OSError:
-            return None
-        if not pointer.startswith(GITDIR_PREFIX):
-            return None
-        common = os.path.join(current, pointer[len(GITDIR_PREFIX) :].strip())
-        try:
-            with open(os.path.join(common, COMMONDIR_FILE), encoding="utf-8") as handle:
-                common = os.path.join(common, handle.readline().strip())
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return None
-    return os.path.normpath(common)
-
-
-def source_git_dir(common: str) -> str:
-    """The git dir a scratch clone came from, followed to its end: a
-    `git clone --shared` copy borrows its objects (alternates), and a plain local
-    clone names its source as a local origin. A merge check's clone of hana is
-    hana for the Mac mirror and the sweep budget. A git dir with neither is its
-    own answer."""
-    seen = {common}
-    while True:
-        source = borrowed_git_dir(common) or local_origin_git_dir(common)
-        if source is None or source in seen:
-            return common
-        seen.add(source)
-        common = source
-
-
-def borrowed_git_dir(common: str) -> str | None:
-    try:
-        with open(os.path.join(common, ALTERNATES_FILE), encoding="utf-8") as handle:
-            objects = handle.readline().strip()
-    except OSError:
-        return None
-    if not objects:
-        return None
-    return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
-
-
-def local_origin_git_dir(common: str) -> str | None:
-    """The shared git dir of origin when origin is a directory on this machine."""
-    try:
-        with open(os.path.join(common, "config"), encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
-    except OSError:
-        return None
-    in_origin = False
-    for line in lines:
-        text = line.strip()
-        if text.startswith("["):
-            in_origin = text == '[remote "origin"]'
-        elif in_origin and text.partition("=")[0].strip() == "url":
-            url = text.partition("=")[2].strip().removeprefix("file://")
-            if not os.path.isabs(url) or not os.path.isdir(url):
-                return None
-            return git_common_dir(url)
-    return None
 
 
 def budget_bytes(environ: dict[str, str], config: str | conf.ConfigRead, repo: str | None) -> tuple[int | None, str]:

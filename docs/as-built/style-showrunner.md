@@ -2,7 +2,15 @@
 
 ## What it is
 
-A style production is a standing child production named `<repo>-style`. A repo's main showrunner starts it with `/showrunner:add_style`. It has four family units (`<style showrunner name>-names`, `<style showrunner name>-values`, `<style showrunner name>-types`, `<style showrunner name>-modules`). They sweep the repo against every style rule in `~/rust/nate_style` and the repo's local rule folders. A per-repo sqlite ledger records which (rule, file or crate) cells are covered at the synced branch-point tip. Units apply mechanical fixes. They hold every other change as a finding, and the style showrunner files findings as style decisions. The style showrunner merges unit work into a style merge branch and hands each style-branch tip back to the parent, which merges it into the branch point. The style production replaced the old fix pipeline (`scripts/fix/`, `/fix`, `/style_eval`, `/style_fix_review`, `/style_usage`, `/nightly_weights`), which is deleted. The runtime procedure the style showrunner follows is `docs/style_production.md`. That doc takes precedence over `commands/showrunner/produce.md` for a `**Kind:** style` production.
+A repository's production document configures one to four style units in its `Style units` table.
+Each family has exactly one owner. One unit can own all four families.
+Units sweep `~/rust/nate_style` and the repository's local rules.
+A shared SQLite ledger records coverage at the synced branch-point tip.
+Units apply mechanical fixes and hold other changes for style decisions.
+With a style showrunner, units merge through its style branch and the parent receives hand-offs.
+Without one, the parent receives each ticket as a normal unit checkpoint.
+The runtime procedure is `docs/style_production.md`.
+For `**Kind:** style`, that procedure takes precedence over `commands/showrunner/produce.md`.
 
 ## How it works
 
@@ -15,7 +23,8 @@ A style production is a standing child production named `<repo>-style`. A repo's
 | `scripts/style/candidate_generators.py` | `CandidatesSpec`, 15 generator kinds, `enumerate_candidates` (no cap) |
 | `scripts/style/style_ledger.py` | The ledger: cells, judgments, lint runs, tickets, hand-offs, held findings, declaration follow, CLI |
 | `scripts/style/finding_sites.py` | Site evidence for an open finding after its file changed: `UnchangedSite`, `NeedsJudgment`; cached source, item and owner indexes per blob |
-| `scripts/style/style_plan.py` | Refill (`next-phase`), ticket gate (`gate`), `queue`, ticket selection, phase text |
+| `scripts/style/style_plan.py` | Refill (`next-phase`), publication coordinator (`checkpoint`), ticket gate (`gate`), `queue`, ticket selection, phase text |
+| `scripts/style/style_config.py` | `Style units` reader, family ownership, ticket capacity and merge route |
 | `scripts/style/mechanical_classes.toml`, `mechanical_classes.py` | The classes of change a unit applies without the user (`pure-move`, `stale-allow-lint`, `binding-rename`): name, proof, rules, summary; the loader `classes()` and `explained_files` |
 | `scripts/style/style_footprint.py` | Mechanical-fix filter (`check`), lexical Rust tokenizer, item starts (`item_starts`), module paths (`crate_module`, `resolved_module`, `use_trees`), canonical comparison (`canonical_code`, `comment_gaps`, `sorted_use_groups`) |
 | `scripts/style/style_sync.py` | `notify`, `own-handoff`, `lint`, `resume`, `send-handoff`, `wake-waiters` |
@@ -44,6 +53,27 @@ The merge gate finds the `test_*.py` modules under `scripts/style` and reports t
 
 Import direction: `declarations → approved_renames → style_footprint`. `style_footprint` imports neither. `style_ledger` never imports `style_proposals` (two module copies under `__main__`), so vault-aware checks live in `style_proposals.py`, and the ledger takes approval as a callable.
 
+### Repository configuration
+
+`style_config.read_config(doc)` reads the `Style units` table and returns `StyleRepositoryConfig`.
+The columns are `Unit`, `Families` and `Open tickets`.
+The unit is a staff name. `Families` lists its owned families, separated by commas.
+Each family needs exactly one owner; refill refuses a missing owner.
+`Open tickets` is the number assigned at once, default 1.
+A row whose unit reads `<name> (retired <date>)` makes no assignment and claims no family.
+A table with only retired rows returns no assignments and has no owner check.
+`style_sync.sync_productions` leaves out a parent production with no assignments.
+A style showrunner with no assignments stays in the result and still gets its sync notice.
+Each ticket gets its own Codex worker through `assign.sh`.
+The Families table in `docs/style_production.md` sets work order, not owners.
+Apply an exception the same way in every crate, for any unit count.
+
+`**Kind:** style` selects `StyleShowrunnerRoute` with its merge branch, branch point, document and checkout.
+Other production documents select `ParentUnitRoute`; the parent's merge branch is the branch point and receiving branch.
+Direct units branch from that branch point.
+Configuration carries no unit branch. Branch consumers use `session_staff.RowResolver.unit_branch`.
+`style_config.has_style_units(lines)` shares the configuration reader's heading pattern with bootstrap, sync and phase readers.
+
 ### Rule metadata and loading
 
 - Each global rule's frontmatter declares `tier` (A-E), `family: names|values|types|modules` (B, C and D only) and `input_scope: file|crate|manifest` (absent means `crate`). Each `candidates:` block declares `surface: whole|partial`, and `partial` needs an `uncovered:` line.
@@ -55,14 +85,22 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 - `Rule.reach: RepoReach | MemberReach(member, crate_dir)`. A `docs/<member>/style` rule reaches the workspace member whose directory name or package name is `<member>`, else `RuleValidationError`.
 - `workspace_members(manifests) -> tuple[WorkspaceMember(directory, package_name), ...]`, deepest first: explicit members plus in-tree path dependencies, recursively, minus `exclude`. The loader and the ledger share it.
 - `rules.py list [--repo] [--json]` prints `rule_id` first and shows unclassified rules. Exit 2 on a validation error. `STYLE_HISTORY_NATE_STYLE_DIR` points the loader at another rule folder.
-- `approval: always` loads as `Rule.approval = AlwaysApproved(family)`; absent is `UserApproves()`. Any other value raises `approval must be always`, and a rule with no family raises `approval always requires a family`. `DecisionWriter.rule_approval` gives a new decision with no inherited approval the approval fields (`unit` and `plan` from the live family row of the standing production's Units table, `family_units`; `showrunner` and `approved_in` the style showrunner name; `approved_by: rule <rule id>`), passed to `create` as initial fields, so it starts `stage: active` and never reads `AwaitingApproval`. At each `file`, `approve_by_rule` gives every open `UnansweredDecision` whose rule id (any blob) is always approved the same fields through `proposal_issue.approve`, the function the approve verb uses. A decision key holds one rule, so no decision mixes an always approved rule with another.
+- `approval: always` loads as `Rule.approval = AlwaysApproved(family)`; absence gives `UserApproves()`.
+  Other values raise `approval must be always`. A rule without a family raises `approval always requires a family`.
+  `DecisionWriter.rule_approval` reads the family owner from the production document's `Style units` table through `family_units`.
+  Staff supplies the unit, and `.unit.toml` supplies its plan.
+  The receiving production supplies `showrunner` and `approved_in`; `approved_by` is `rule <rule id>`.
+  `create` receives these fields, so the decision starts at `stage: active`.
+  At each `file`, `approve_by_rule` applies the same fields to open unanswered decisions through `proposal_issue.approve`.
+  A decision key holds one rule, so each decision has one approval policy.
 - `style_rules.parse_frontmatter` returns `tier`, `family`, `input_scope`, `mechanism`, `mode`, `approval` as one-element lists, quotes stripped. `read_pre_filter` reads only an unindented top-level `pre_filter:`.
 
 ### Coverage ledger
 
 **Location.** `~/.local/state/style/<repo>/ledger.sqlite`, where `<repo>` is the main checkout's basename through `--git-common-dir`, so every worktree shares one ledger. `STYLE_LEDGER_STATE_DIR` replaces the root. Only `style_ledger.py` writes it. `open_ledger(repo) -> Ledger` (context manager); `preview_ledger(repo)` migrates a temp copy and leaves the real file unchanged.
 
-**Schema.** `schema_version` drives numbered `MIGRATIONS` 1-23; a newer version than the script knows raises `CheckCouldNotRun`. Current tables:
+**Schema.** `schema_version` drives numbered `MIGRATIONS`.
+A version that the script does not support raises `CheckCouldNotRun`. Current tables:
 
 | Table | Holds |
 | --- | --- |
@@ -70,9 +108,9 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 | `lint_runs` | tip, tree, tool, scope (`workspace`), config_hash, passed, diagnostics_json, rule_blobs_json; unique on (tree, tool, scope, config_hash) |
 | `sync` | one row: tip, style_branch, synced_at |
 | `listed_rules`, `listed_sites` | one marker row per enumerated (rule, rule_blob, tip), and its sites (path, line, text); cascade delete |
-| `tickets` | id `<unit>-<n>`, unit, kind, family, rule, crate, files, sites, rules, rule_blobs, state, branch, checkpoint, base, proposal, cells, finding_ids, timestamps; at most two open tickets per unit, with at most one `assigned` (unique index); assignment may follow one checkpointed predecessor |
+| `tickets` | id `<unit>-<n>`, unit, kind, family, rule, crate, files, sites, rules, rule_blobs, state, branch, checkpoint, base, proposal, cells, finding_ids, timestamps; the configured `Open tickets` count limits assigned tickets |
 | `rule_texts` | blob → pinned rule bytes |
-| `ticket_predecessors` | successor ticket and predecessor ticket; migration 27 replaces `tickets_one_open` with `tickets_one_assigned`, preserving existing tickets and allowing repeat execution |
+| `ticket_predecessors` | successor and predecessor tickets; merge waits for predecessors |
 | `handoffs` | checkpoint, state, merge_commit, sent_to, timestamps |
 | `processed_tips` | tips the sync finished, with `reason` `linted` (`tip done`) or `own hand-off` |
 | `held_findings` | finding_id, rule, path, line, text, kind, before, after, rule_blob, ticket, state, proposal, build_ticket, moved_from, withdrawn_by, person_read_by, duplicate_of, unwaived_by, followed_from, followed_from_line, followed_at, declaration_gone_at, waive_provenance, waived_by, anchor_commit, followed_from_commit, timestamps |
@@ -134,6 +172,7 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 - `handoff add|send --to SLUG|reroute --to SLUG|merged [--merge-commit M] --checkpoint C`, `handoff pending`.
 - `tip seen --tip C` (prints `new` or `seen`), `tip done --tip C`.
 - `held add ...` (prints the finding id), `held file --id F --proposal PATH`, `held waive --id F (--ticket T | --person NAME)`, `held replace --id F --after TEXT [--person NAME]`, `held built --id F [--id F ...] [--commit <merge> [--by <who>]]` (`--commit` must contain each non-dropped ticket checkpoint of the finding), `held list [--state S] [--json]`.
+- `held unbuilt --repo <checkout> --id F [--id F ...] --by <who>` clears merged proposal claims and records the reader and time.
 
 ### Tickets, hand-offs, processed tips, reconcile
 
@@ -171,11 +210,29 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 
 - `add_style.py --production <showrunner name> --model <m> --effort <e> [--pilot <unit>[=<crate>,...]]... [--check]`, run by the repo's main showrunner (`commands/showrunner/add_style.md`).
 - `_request` derives everything from the parent doc: main checkout through `--git-common-dir` on `**Repository:**`; showrunner name `<repo>-style`; branch point = parent merge branch; style merge branch `style/<branch point with / as ->`; checkout `<repo parent>/<repo>-style`; doc `docs/<repo>-style-production.md`. A missing `**Proposals:**` refuses.
-- `standing_style_production(repo_dir) -> StandingStyleProduction | NoStyleProduction` (frozen; `checkout`, `doc`, `name`, `branch_point`) is the one shared lookup. `style_plan.style_document`, `style_sync.notify` and `add_style` use it. A new caller that resolves from a repo folder must use it.
+- `standing_style_production(repo_dir)` returns `StandingStyleProduction` or `NoStyleProduction`.
+  The record holds `checkout`, `doc`, `name` and `branch_point`.
+  It finds style showrunner documents and parent documents with configured direct units.
+  Bootstrap and decision filing use this lookup. Sync reads the configured routes through `sync_productions`.
 - **Existing production** = doc present and staff name in `showrunners.timer_names()`. `_attach` detaches from any old parent, attaches under the caller, rewrites `**Parent production:**` and `**Proposals:**`, then runs `style_sync.py resume`. A doc on another branch point raises `StyleBranchPointTaken` (exit 2) with no write. A doc with no timer is an interrupted bootstrap and reruns the create path, which also rewrites the two fields.
 - Production docs and standing plans use `atomic_file.write_text_atomic` for each whole-file write. A stopped first write leaves no partial file that bootstrap could mistake for a completed file.
-- **Create path:** Each step is idempotent. The command creates the branch and worktree from the branch-point tip. It writes a production document without a Units table. It writes four plans at `docs/style-production/units/<showrunner name>-<family>-unit.md`. Each plan records rule ids and tiers in `**Family:**` and has an empty `## Phases`. The command excludes `/docs/style-production/`, the document, and the log through `.git/info/exclude`. It calls `set_tip` with the stored synced tip, or the style branch commit. It then runs `add_showrunner.py`. Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code. A live herdr session with the showrunner name and no timer prevents writes.
-- **Pilot:** `--pilot` applies only during creation. Otherwise, the command exits 2 with `--pilot applies only while creating <showrunner name>`. It records selected and already launched units in `**Pilot units:**`. All four plans remain. `=<crates>` writes `- **Pilot scope:** <packages>` into the selected unit's showrunner-copy plan. `--pilot` accepts a family or a full `<showrunner name>-<family>` staff name. `--check` prints seven steps with full ids and changes nothing.
+- **Create path:** Each step is idempotent.
+  The command creates the branch and worktree from the branch-point tip.
+  The production document contains a `Style units` table with four default family rows and `Open tickets` set to 1.
+  The table can name one to four units with any staff names.
+  Bootstrap reads that table and writes missing plans at `docs/style-production/units/<unit>-unit.md`.
+  Each plan records its owned families and rule ids, with an empty `## Phases`.
+  The command excludes `/docs/style-production/`, the production document and the log through `.git/info/exclude`.
+  It calls `set_tip` with the stored synced tip or the style branch commit, then runs `add_showrunner.py`.
+  Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code.
+  A live herdr session with the showrunner name and no timer prevents writes.
+- **Pilot:** `--pilot` applies only during creation.
+  Other calls return exit 2 with `--pilot applies only while creating <showrunner name>`.
+  The command records selected and launched units in `**Pilot units:**`.
+  Plans remain for every configured unit.
+  `=<crates>` writes `- **Pilot scope:** <packages>` into the selected unit's template plan.
+  The bootstrap selector accepts a family or its full default staff name, `<showrunner name>-<family>`.
+  `--check` prints the steps and changes nothing.
 
 - Format fields (`docs/production_format.md`): `**Kind:** style` (absent = product production), `**Branch point:**`, `**Parent production:**`; `**Proposals:**` required for style. Plan header (`docs/direct_plan_format.md`): `> **Standing:** style_plan.py`. A standing plan never closes and is git-excluded.
 - `add_unit._is_excluded_standing_plan` accepts a plan absent on the merge branch when the showrunner copy is git-ignored and carries `> **Standing:**`. `ensure_worktree` copies it into the unit worktree only when the unit copy is missing. After first launch, the unit copy is the only one that counts.
@@ -189,19 +246,29 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 It collects each unit's branch diff, dirty paths, and other style units' open-ticket files.
 Dirty paths include untracked files and both sides of a rename.
 
-**`style_plan.py next-phase --unit U --plan P --repo R`** (`next_phase -> NextPhase`):
+**`style_plan.py next-phase --unit U --plan P --repo R --session-dir S`** (`next_phase -> NextPhase`):
 
 1. Resolve the unit's configured plan through staff and `.unit.toml`.
    A different `--plan` refuses with exit 2.
 2. A `### Phase` heading with `repair` and `status: todo` returns `repair first` before any write.
 3. Run `style_proposals.complete`. Discard each ticket phase whose state is `merged` or `dropped` (`discarded <id>: <state>`).
-4. An assigned ticket rebuilds its phase, `resume <id>`, without reading the board. Two checkpointed tickets return exit 5. With one checkpointed ticket, require a readable checkpoint exactly at the unit branch tip, then select a disjoint successor as described below; unknown footprints keep exit 5.
+4. Restore every assigned ticket's phase.
+   With `--session-dir`, restore each ticket's worker through `assign.sh`.
+   Fill the remaining configured assignment slots only with disjoint tickets.
+   Unknown footprints keep exit 5.
 5. Read the pushed branch-point tip. If the synced tip already contains it, there are no new main inputs. Otherwise require the synced tip to be its ancestor and read touched paths from every new commit once, with rename and copy detection. Missing tips, git errors, divergence, and any rename or copy hold refill closed (`waiting for sync: touched set unknown: <reason>`, exit 3).
 6. Read the board (unavailable → exit 4, no ticket). Run `_select_phase`. At the first ticket it would assign (queued, approved decision or coverage), check its files and each affected crate’s `Cargo.toml` and `build.rs`, plus workspace `Cargo.toml` and `Cargo.lock`, against the shared touched set. For the selected proposal only, union its footprint at pushed main with its synced-tip and unit-base footprint, so new references to a renamed or moved item count. An unreadable main footprint holds with `touched set unknown`. An overlap records a sync wait and exits 3 (`waiting for sync: <kind> <crate> [<rule>]: main touched <path>`); an unknown crate holds closed with `touched set unknown`. Do not choose another ticket to avoid a hold. Unrelated main changes allow the ticket to start using the old synced inputs; its final merge still takes the style branch. On no work, record a sync wait, read the board again and select once more, so a wake that arrives between the check and the wait is not lost.
 
 **Refill lock.** `style_ledger.refill_lock(repo)` is a context manager beside `open_ledger`. It opens `refill.lock` (mode `"a"`) in the ledger folder, makes the folder when it is absent, and holds an exclusive `fcntl.flock` for the `with` body. One ledger gives one lock per style production. The lock blocks and has no timeout. `next_phase` takes it once for each selection pass, in two separate `with` blocks. Each block covers the board read, the busy-files read, `_select_phase` with its ticket add and assignment, the sync-wait clear and the return. Both ticket writes commit before the lock is released. So the next unit's `busy_files` reads those files as busy through `unit_file_holders`, and units that refill at the same time get disjoint files. The rule catalog read (`rules.load_rules`) runs once before the first block and serves both passes. The sync wait runs between the two blocks. Both are outside the lock. The one main-history name-status read also runs before the lock and serves both passes; it records all commits, including edits later reverted, with rename/copy detection. The NUL-delimited range read uses bytes and exact path decoding, preserving carriage returns and refusing paths that cannot cross the ledger text boundary. `MainChanges(pushed_tip, paths, crates) | UnknownMainChanges` carries that evidence; `ticket_sync_check` returns `SyncNeeded(reason) | SyncNotNeeded`. `queue` takes no lock.
 
-`_select_phase` order: the oldest queued ticket is assigned under its own id when its files are free and in scope, and every other queued ticket is dropped (`dropped <id>: files busy|outside pilot scope`). For a queued proposal ticket, its files are its own files, its widened paths and each file that its findings' changes edit (`EditedFiles.of_ticket`); a queued ticket with a file rename whose `uncertain` files are not empty (`EditedFiles.uncertain_of_ticket`) is dropped with `dropped <id>: <file> has a path attribute the rename gate cannot read`, and its finding then waits on the decision path. Then approved decisions for the unit: the declaration step runs once, findings whose file is gone or whose site moved to another file are waived with the actor `WaiveByLedger()` and print a waive line, and each decision gives one `proposal` ticket of free, in-scope files (structure limits when a restructure finding is present). Each busy file of the decision prints `waiting <decision>: <path> busy` (sorted); the decision's free files are still planned in the same run. A finding whose own file is free but whose change edits a busy file waits and prints `waiting <decision>: <finding id> edits <file>, busy`; the other findings of its file stay available, and a file whose findings all wait is not selected.
+`_select_phase` order: the oldest queued ticket is assigned under its own id when its files are free and in scope, and every other queued ticket is dropped (`dropped <id>: files busy|outside pilot scope`). For a queued proposal ticket, its files are its own files, its widened paths and each file that its findings' changes edit (`EditedFiles.of_ticket`); a queued ticket with a file rename whose `uncertain` files are not empty (`EditedFiles.uncertain_of_ticket`) is dropped with `dropped <id>: <file> has a path attribute the rename gate cannot read`, and its finding then waits on the decision path. Then select approved decisions whose rule family the unit owns in the `Style units` table.
+The decision's `unit` field names the unit that filed it; no reader routes work by that field.
+A decision whose rule has no catalog entry has no owner, so no unit selects it.
+The declaration step runs once.
+It waives findings when their file is gone or their site moved to another file.
+It records the actor `WaiveByLedger()` and prints a waive line.
+Each decision gives one `proposal` ticket of free files within the scope.
+Structure limits apply when a restructure finding is present. Each busy file of the decision prints `waiting <decision>: <path> busy` (sorted); the decision's free files are still planned in the same run. A finding whose own file is free but whose change edits a busy file waits and prints `waiting <decision>: <finding id> edits <file>, busy`; the other findings of its file stay available, and a file whose findings all wait is not selected.
 
 **Edited files.** `EditedFiles(repo, ledger, base)` is made once for each selection pass, with the unit base that `_select_phase` also gives `unsynced_changes`. It reads the footprint at the synced tip and at the unit base (once when they are the same commit), so a reference that the unit's branch added after the sync counts: the gate's scanner accepts that edit, and the unsynced-file guard checks only the finding's own file. It reads the synced tip on first use, when a rename or restructure finding needs a footprint, so a queued coverage ticket reads no tip. `of(finding)` gives the files that the gate lets the finding's change edit: for a file rename (`file_rename`), its own file, its new file and each Rust file at either commit that names the old stem (`Ledger.files_naming`) and in which `renamed_text` finds a module site, the renamed file's own text included (a file that `renamed_text` cannot read, or that has a `path` word whose file the scan cannot read with certainty (`UncertainModulePath`), counts as edited); for a qualified rename (`approved_rename`), its own file and each `.rs` and `.md` file at either commit that holds the old name as a word, the files `approved_reference_file` can take (a superset: a file with another item of that name also waits); for a restructure of a `.rs` file, its own file and each Rust file at either commit that names the module (its stem, or its folder's name for a `mod.rs`) and that `DeclarationScan.declares` finds declaring it, by a `mod <name>;` line that resolves to it or a `#[path]` string that names it (a move of a test file into its owner removes the owner's declaration; a file that `declares_module` cannot read, a module file outside a crate it can name, and a file with a `path` word whose file the scan cannot read with certainty (`PathAttributes.uncertain`: a `path` attribute in an inline module, a `cfg_attr` that holds `path`, or a `path` on an inline module, which mounts a folder) count as edited; `declares_module` reads each raw identifier as its plain word, so `#[r#path = ...]` and `mod r#name;` count as `path` and `name`, as `renamed_text` does (`plain_words`)); any other finding, its own file only. `uncertain(finding)` gives the files of a file rename whose reading is `UncertainModulePath`; the gate refuses an edit to each, so the finding waits with `waiting <decision>: <finding id> <file> has a path attribute the rename gate cannot read`, busy or not, before the busy check. The candidates of a file rename or a restructure (`EditedFiles.declaring`) are the files that hold the name as a word and each Rust file with a `path` string the scan cannot read with certainty (`UNREAD_PATH_STRING`: a raw string or a string with an escape, as in `#[path = "pro\u{62}e.rs"]`), found from the files that hold the word `path`; such a string can name the module file without its name, and the scan reads that file as uncertain. A named file outside the crate's root folder is scanned only when its text holds the library's name, the old file's name (a `path` attribute) or such a string. Cost: `files_naming` is one `git grep` for each name and commit, kept for the ledger's life; for a file rename or a restructure, one `git ls-tree` for each commit and one `git cat-file --batch` (`style_ledger.blob_contents`) read the named blobs not read yet (`EditedFiles.naming`), and `renamed_text` or `declares_module` scans each kept path once for each distinct blob, so a file the unit base did not change is scanned once; the `renamed_text` readings are kept for each file rename (`EditedFiles.module_readings`), so `of` and `uncertain` share one scan. On cargo-liner, `a1a46e50` (`probe.rs`) names 96 other files; `of` takes about 1.2 s under load 20, of which the read is 0.02 s and the `renamed_text` scan of 15 files is 1.1 s. Coverage tickets (`_tickets_from`) are checked on their own files only: their findings do not exist before the ticket judges its files, so no footprint is known at refill. A mechanical fix that edits another file (a `pure-move`, or a rename in at most 10 files) meets a busy file at build time, and the phase's skip and yield text covers it. Then coverage through `_tickets_from`. No candidate: exit 6 when a stored style branch would change left-out cells, else `waiting for structure` or `waiting for sync`.
 
@@ -223,8 +290,12 @@ The preview applies no pilot scope.
 
 **Coverage candidates** (`_tickets_from`) use only `open` and `stale` cells. `_refill_cells` leaves out two kinds of stale cell: a held cell whose file blob did not change since its held judgment and whose live findings are all filed on open decisions; and a unit cell whose newest judgment is in the unit tip and the style branch and saw the inputs the unit tip has (`judged_at_base`), because a new ticket would record the same verdict. Ranking and structure blocking still count both.
 
-- Crates are ordered by most stale cells, then name. The modules unit orders structure crates first, by other-family pending cells they block inside each family's pilot scope.
-- **Structure** (modules unit): batches of tier D file cells (and the crate's manifest cells, keyed on `<crate>/Cargo.toml`) cut by `read_slices` with `BatchLimits(6, 3000, 5)`. Each ticket records its owned `cells`.
+- Refill selects only from the unit's configured families, with tier D first.
+  Structure crates come first by the number of pending cells they block.
+  Family rank orders the remaining work. Units do not borrow other owners' families.
+- **Structure:** the unit that owns `modules` takes tier D file cells and manifest cells keyed on `<crate>/Cargo.toml`.
+  `read_slices` cuts batches with `BatchLimits(6, 3000, 5)`.
+  Each ticket records its owned `cells`.
 - Other families: a file cell waits only for open or stale tier D cells at its own path; a crate cell waits for every one in its crate (`blocked_by_structure`).
 - **Listed:** per tier B rule, whole files in path order packed up to 150 sites; a file over 150 sites gets a ticket alone. A file's sites never split.
 - **Read:** per tier C rule set (`#uncovered` included). `name-bindings-to-match-parameters` gets its own read tickets. `**First files:**` files get their own slices and rank first.
@@ -266,9 +337,29 @@ Schema 25 stores the latest refill result in `refill_results`. Each unit has one
 
 The result words are `phase written`, `resumed`, `repair first`, `waiting for merge`, `waiting for sync`, `waiting for structure: <crates>`, `merge the style branch first` and `board unavailable`. Refill writes only the time and outcome. It leaves the split columns unchanged.
 
-Refill stops after it writes the first ticket. It does not classify later decisions. `style_plan.py split --unit <unit> --repo <unit worktree> [--timeout-minutes <n>]` runs a separate scan. The default limit is 90 minutes. Before the scan, `require_split_table(repo)` checks the stored ledger through a read-only connection. A missing table fails with `ledger has no refill_results (schema below 25)`. The scan uses `preview_ledger` to read a backup copy and takes no refill lock. It makes no ticket, declaration follow, waive, close, phase edit or issue command. An explicit `GitReadCache` keeps one recursive tree listing per commit and reads blob bytes in batches. `style_proposals.judged_at_current_file` and `ranked_work` accept a keyword `reader`; refill uses `GitProposalReader`, and split passes the cache. Both use the same selection code. No module function is replaced at run time.
+Refill fills the configured assignment capacity without a split scan.
+`style_plan.py split --unit <unit> --repo <unit worktree> [--timeout-minutes <n>]` runs that scan separately.
+The default limit is 90 minutes.
+`require_split_table(repo)` checks the stored ledger through a read-only connection.
+A missing table fails with `ledger has no refill_results (schema below 25)`.
+The scan reads a backup through `preview_ledger` and takes no refill lock.
+It writes no tickets, declaration follows, waives, closes, phases or issues.
+`GitReadCache` keeps one recursive tree listing per commit and reads blob bytes in batches.
+`style_proposals.judged_at_current_file` and `ranked_work` accept a keyword `reader`.
+Refill uses `GitProposalReader`; split uses the cache. Both use the same selection code.
 
-The population matches the approved count in the table's Findings left cell: each filed finding whose decision is approved and names the unit's family. Both read a stored relative proposal path from the current directory. The scan matches selected decisions to findings with refill's exact stored proposal key and `_unbuilt_findings` filter. It puts each finding in the first category that holds it, in the order of the selection loop (`_select_phase`). `changed` means its judged file is old where family rank requires a new judgment, or its file has an unsynced change on the unit base. `structure` means higher-rank work holds its file and no finding exemption applies. `ready` means it reaches the available set, or an open build ticket holds it. `other` includes a finding still held by a merged build, a decision the selection loop does not select, a missing catalog rule, a declaration wait, a finding that refill would waive, a file outside pilot scope, a busy file, an uncertain path attribute or an edit to another busy file. The counts sum to that approved count. The declaration reader can project a proved move in memory; it never writes that move.
+The population matches the approved count in Findings left for the unit's configured families.
+Each filed finding needs an approved decision. Both readers use the stored relative proposal path from the current directory.
+The scan uses refill's exact proposal key and `_unbuilt_findings` filter.
+It assigns each finding to its first matching category in `_select_phase` order:
+
+1. `changed`: family rank requires a new judgment, or the file has an unsynced change on the unit base.
+2. `structure`: higher-rank work holds the file and no finding exemption applies.
+3. `ready`: the finding reaches the available set or an open build ticket holds it.
+4. `other`: a merge, decision, rule, declaration, scope, busy file or uncertain edit footprint prevents selection.
+
+The counts sum to the approved count.
+The declaration reader can project a proved move in memory without writing it.
 
 `style_ledger.RecordedSplit(ready, changed, structure, other, measured_at)` holds a completed scan. `NoSplitRecorded()` means no completed scan exists; zero counts still mean a real scan. `measured_at` is the UTC ISO time with offset at which the scan started. At the end, inside the time limit, `split` calls `record_split(repo, unit, split, busy_timeout_seconds=min(BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds()))`. It uses a short connection to set only `split_at` and the four counts. `split_time_limit` yields a frozen `SplitDeadline(at, timeout_minutes)` on `time.monotonic()`; `remaining_seconds()` raises the alarm's `TimeoutError` (`time limit of N min reached`) when no time is left. The busy timeout has its own limit because a Python SIGALRM handler cannot run while sqlite3 waits in its C busy handler: with the alarm alone, a write on a locked ledger could run up to 30 s past the limit. A write that reaches the deadline rolls back. `record_split`'s keyword `busy_timeout_seconds` defaults to `BUSY_TIMEOUT_SECONDS` (30 s), and `record_refill` and every other caller keep that value. A first split inserts `at=''` and `outcome=''`, which the report reads as no refill record. A timeout or error writes nothing and keeps the last split. The command prints `split <unit>: <cause>` to stderr and exits 1. Success prints `<unit>: <ready>/<changed>/<structure>/<other> in <m> min` and exits 0; minutes have two decimal places.
 
@@ -280,27 +371,52 @@ Schema 25 also adds `held_findings.built_at`. For old built findings it uses the
 
 **Unit side** (`docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md`): refill uses this command:
 
-`style_plan.py next-phase --unit <unit> --plan <unit worktree>/<configured plan> --repo <unit worktree>`
+`style_plan.py next-phase --unit <unit> --plan <unit worktree>/<configured plan> --repo <unit worktree> --session-dir <run folder>`
 
 It runs at startup, after compaction or restart, and at each `<NextPhase/>`.
+With N above 1, it restores each ticket's phase and worker before filling available slots.
 It first resumes checkpoint step 7 for any reservation record in `checkpoint_committed_awaiting_release_confirmation`.
 Exits 3, 4 and 5 report once and end the turn blocked.
 The message is `waiting on the showrunner: sync | board | ticket <id> merge`.
 A sync message or `ticket <id> merged; refill.` resumes a sync wait.
 A sync message or any showrunner message resumes a board wait.
 The message `ticket <id> merged; refill.` resumes a ticket wait.
-Exit 6 runs `git fetch origin <style branch> && git merge --ff-only origin/<style branch>`, then runs refill.
-A refused or empty fast-forward goes to the showrunner.
+Exit 6 uses the configured sync route below.
+A pending sync stops new assignments while assigned workers finish.
 A standing plan never runs FinalGate, RunAsBuilt, final PeriodicCI, CICleanup, RunSummary or shrink.
 
-- Units sync at phase start with that `--ff-only` merge (the `docs/production_format.md` item 5 exception).
-- Checkpoint: gate exit 0 stages only code paths from `git status --porcelain` (rename pairs together), commits once, records `phase_reservation.py committed --ticket <id>` (the pending record names the ticket and the worktree, and step 7 releases nothing), then `ticket checkpoint --session-dir <run> --phase <id>`, which stores the run folder and phase on the ticket in the same write as its state (migration 22: `reservation_session_dir`, `reservation_phase`); a repeat at the same commit stores them when the first checkpoint named none, and refuses a different pair. `ticket merge`, and every `reconcile` for each merged ticket that still names a record, then run `Ledger.release_held_reservation`, which calls `phase_reservation.py release-held --merged <style branch tip>`: it releases an `active` reservation from the recorded worktree when its HEAD is the checkpoint, confirms `outstanding` or `released_after_checkpoint` on the board when its `protected_tip` is the checkpoint, or descends from it and is in the style branch tip (a unit that merged style/main after its checkpoint releases at that merge), and clears the record. Exit 0 also clears the ticket's two columns, so a later merge or reconcile makes no berth call. An earlier confirmed release is not made again, a record not held for the ticket prints `no reservation held`, and a moved worktree or an unconfirmed release keeps it held and keeps the columns (`ticket merge` exits 2 with `rerun ticket merge`; `reconcile` prints the line and retries on its next run). A ticket checkpoint without the two flags merges as before. The plan, `docs/style-production/` and pinned rules never appear in `git add`. Exit 1 keeps the reservation and returns to repair; exit 2 keeps the reservation and reruns the gate, and stops when the same error comes back.
-- No-change ticket (no tracked diff): no commit; `git merge-base --is-ancestor HEAD refs/heads/<style branch>` (else report, ticket stays assigned); the committed-awaiting-release record with that `HEAD` and `--ticket <id>`; `ticket checkpoint --commit HEAD --session-dir <run> --phase <id>`; `ticket merge`, which releases the reservation and clears the record; report `From <unit>: ticket <id> closed with no code change; <n> held.`; refill at once.
+Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrunner route or Direct route.
+
+- Checkpoint: use `style_plan.py checkpoint --repo R --ticket T --session-dir S --phase P --message-file M`.
+  The publication lock serializes checkpoint publication.
+  With N=1 and one assigned ticket, the gate and verification use the editing tree.
+  Otherwise, they use the reused candidate copy.
+  The coordinator publishes with an expected-HEAD update and updates only the ticket's index entries.
+  It records the checkpoint and confirms reservation release before another publication can move HEAD.
+  Other workers continue to edit their assigned paths.
+  The ledger and approval documents stay in the original repository.
+  Repeat the coordinator command to recover a retained publication record without another commit.
+  `ticket merge` and `reconcile` also recover retained reservation records.
+  Never stage plans, `docs/style-production/` or pinned rules.
+- **N=1 no-change ticket:** one assigned ticket with no tracked diff makes no commit.
+  Verify `git merge-base --is-ancestor HEAD refs/heads/<receiving branch>`.
+  On failure, report the error and leave the ticket assigned.
+  Record the committed-awaiting-release state with that HEAD and `--ticket <id>`.
+  Run `ticket checkpoint --commit HEAD --session-dir <run> --phase <id>`, then `ticket merge` to confirm reservation release.
+  Report `From <unit>: ticket <id> closed with no code change; <n> held.`, then refill.
 - Sync waits: refill writes a `sync_waits` row before its last check; `ticket merge` runs `style_sync.py wake-waiters`, which sends `From the showrunner of <showrunner name>: ticket <id> merged; refill.` to each waiting unit director found through `message/roster.py --json` and clears only a delivered wait (`acknowledge_sync_wait` keys on the wait token). A queued wake keeps its wait: the next merge wakes the director at its current roster address.
 
 **Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` (two copies; 30 s subprocess timeout; one-line failure) call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges. It is silent with no style production on `b`; else `send.py --timeout 10` of `From <caller>: branch point <b> moved to <sha7>; sync.` keyed `style-sync:<showrunner name>`, bounded at 35 s. A failure prints one line and exits 0.
 
-**Sync steps.** Skip these steps when `tip seen` prints `seen`.
+**Direct sync.** `notify` reads the configured units and sends each direct director a sync notice.
+`resume` reconciles the parent's receiving branch without replaying hand-offs.
+`own-handoff --unit U` takes the publication lock and merges the tip into the unit branch with a normal Git merge.
+Assigned tickets or local changes return exit 4; let the workers finish before repeating the command.
+A matching unit tree records the tip as synced without lint.
+Otherwise, run lint, `set-tip` and `tip done` as the runtime procedure requires.
+The parent merges each ticket checkpoint as a normal unit checkpoint, then runs `ticket merge`.
+
+**Style showrunner sync steps.** Skip these steps when `tip seen` prints `seen`.
 `style_sync.py own-handoff --repo R --tip T --style-branch B` checks whether T and B have the same tree.
 When they match, it runs `set-tip` and `tip done` with reason `own hand-off`, then exits 0.
 Only the merge with an unchanged tree and the wake remain.
@@ -486,13 +602,14 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - A fix applies without asking only when `style_footprint.py` calls it mechanical. Every other change is held and shown only when asked.
 - Any code that matches tiers handles `"unclassified"`. An unclassified rule has no cells or tickets and never counts as current or done.
 - `candidate_generators` returns every site. Any limit belongs to its callers.
-- `rules.style_family(unit)` maps unit names to `Family | NotStyleUnit`.
+- `style_config` maps each family to its configured unit and resolves the route from the production document.
   Ticket ownership uses the fixed staff id.
-  Commands resolve names once within their production before they call the ledger.
+  Commands resolve names within their production before calling the ledger.
   A unit rename changes no ticket or sync wait.
-  `board_json.py` joins ticket owners through staff and reads phase records through `phase_table.build_run`.
-
-- A style unit id already starts with `<style showrunner name>-`. Code that builds a worktree, branch or herdr host name from a unit stem goes through `unit_names.branch` (or `worktree`), which returns the stem unchanged when it starts with `<showrunner name>-`; else the prefix doubles. `add_unit.host_session_name` uses this rule. Shutdown restart uses the staff name.
+  `unit_phases.py` reads staff worktrees for the style table.
+  The style table keeps its ticket, step, ETA, and findings columns.
+- Unit names need no family suffix or production prefix.
+  Use staff for the worktree and `RowResolver.unit_branch` for the branch.
 - Every ledger row and `--rule` uses `Rule.rule_id`.
   Staff supplies the worktree, and Git supplies its branch.
 - Every `set-tip` caller that expects awaiting-merge cells passes `--style-branch`. `reconcile` never moves the synced tip.
@@ -504,7 +621,8 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - A proposal ticket's Work Order gives a build Goal (`Apply the approved findings ...`, never `Judge`) and states its scope as plain fact, never as an override of a copied invariant.
 - A unit director builds each prompt only from its own Work Order, plan and conversation, never from another unit's prompt files under `/tmp/claude/unit/*` (`docs/delegate/compose_work_order.md` **Fallback**). A missing build fact goes to the showrunner.
 - Plan and pin writes use `atomic_write`.
-- The style showrunner's unit-checkpoint merge keeps the unit tip an ancestor, so the unit's next `--ff-only` merge succeeds. Standing units never make `--no-ff` merges.
+- The style showrunner's unit-checkpoint merge preserves the unit tip as an ancestor for its next fast-forward.
+  Direct style units use the normal unit merge route.
 - Hand-off readers use git ancestry and the recorded checkpoint.
 - No acknowledgment of a hand-off precedes a successful push.
 - `proposal_issue.create` keeps both `_decision_path_state` checks, before and inside the folder lock.
@@ -546,7 +664,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - `rules.load_rules` takes 4.5 s warm and 21 s cold on cargo-liner. Keep it, and every other read of no shared state, outside the refill lock: work inside the lock delays the refill of every other unit.
 - A todo phase that a unit plan already holds is not written again. Only a resume with no todo phase for the open ticket rebuilds it from `phase_text`, so a `phase_text` change reaches an open ticket only through such a rebuild.
 - `ticket_base` refuses every state but `assigned` until a base is stored.
-- A `checkpointed` ticket blocks the unit's next `assign` until `ticket merge`.
+- Assigned tickets consume the configured capacity. Additional assignments must pass the disjoint-footprint proof.
 - `git add` on a path under the shared exclude exits 1 without `-f`; stage from `git status --porcelain`.
 - `add_unit` copies a standing plan only when the unit copy is missing; later showrunner-copy edits never reach a launched unit.
 - Unit checkpoints do not filter code paths by responsibilities. The ticket gate and cargo-berth manage ticket files and reservations.
@@ -585,7 +703,9 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - **Pinned text in a ledger table:** `git gc` can prune loose objects; private refs outlive terminal tickets.
 - **No `cargo-berth check` in selection:** it acquires reservations.
 - **Lint in check mode:** a check never touches the tree, so no rewrite-and-rollback is needed.
-- **`--ff-only` for standing units:** a `--no-ff` merge breaks no-change ticket ancestry. No-change tickets make no empty commits, which would carry empty merges into the branch point.
+- **Style showrunner fast-forwards:** units take its branch with `--ff-only`.
+  Direct units take the branch point through the normal unit merge route.
+  No-change tickets make no empty commits.
 - **Delivery state from git, not stored:** a single local ancestry check would acknowledge an unpushed merge after a failed push.
 - **A hand-off is not a unit phase:** it is the child's work landing, so it counts toward no unit CI point. The hand-off does not use a responsibility filter.
 - **`style_plan.py gate` serves both gates:** one place reads `SelectedByCoverage.base` and the proposal rules.
@@ -606,33 +726,25 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - **`active` stage for in progress:** the vault already ranks `active` as in progress, so no new stage value is needed.
 - **Wrap detaches style children last:** the style child must stay attached until the parent's close-out steps finish.
 - **A build Goal and a plain scope line for proposal tickets:** the old proposal Work Order said `Judge the proposal ticket ...` and that the approved proposal `overrides the mechanical-only invariant in the copied context`. With no build model, a unit director copied and rewrote another unit's `/tmp/claude/unit` prompt files, and auto mode refused the dispatches as a bypass. The build Goal gives the director the build model, and a scope fact gives it no override to work around.
-- **The split is a separate scan, not part of refill:** classifying every decision inside refill took 11–40 min per refill on the live ledger, mostly blob reads in `judged_at_current_file`. Refill writes one ticket and stops; `style_plan.py split` fills the split in Findings left.
+- **Split scan:** `style_plan.py split` fills the split in Findings left.
+  Refill assigns up to the configured capacity without a split scan.
 - **Off-rule ideas become rule candidates:** an off-rule build ticket has no rule to judge; approved off-rule work builds as plain code phases.
 
-Refill may issue one disjoint successor while one ticket of that unit is
-checkpointed and waiting for merge. It requires the unit branch to be exactly
-at the waiting checkpoint and records that commit as the successor base. Both
-footprints include proposal paths, rename references and new paths at the
-synced tip and ticket bases; editing crate Cargo.toml/build.rs or workspace
-Cargo.toml/Cargo.lock overlaps source work that depends on those inputs.
-Unknown footprints or unreadable checkpoints keep the wait; overlap exit 5
-names the paths. At most two tickets are open per unit: after the successor
-checkpoints, refill waits until a merge frees one place. This bounds the merge
-backlog. Ledger assignment enforces the bound under its write lock and stores
-the dependency; merge refuses an unmerged predecessor even when both commits
-are already contained in the style branch. Reconciliation orders dependency
-roots first, independently of ticket id ordering.
+Refill assigns up to the configured `Open tickets` count from the unit's owned families.
+Each ticket gets its own Codex worker through `assign.sh`.
+The ledger proves that all open ticket footprints are disjoint at assignment, gate and merge.
+Footprints include proposal paths, rename references and new paths at the synced tip and ticket bases.
+Editing a protected crate or workspace build input blocks source work that depends on it.
+Unknown footprints or unreadable checkpoints keep the wait; overlap exit 5 names the paths.
+The ledger records dependencies, and merge refuses an unmerged predecessor.
+Reconciliation processes dependency roots first.
 
-Assignment rechecks both footprints under the ledger write lock, so a widen
-between selection and assignment cannot use an old snapshot. Widen, finding
-follow/replace, base/tip changes and checkpoint writes revalidate the pair
-before committing; conflict or uncertainty rolls the write back. Resume, gate
-and merge also recheck, even when the predecessor is already merged. The proof
-reads both bases/checkpoints, current unit/style tips and actual committed
-paths, covering later references and unplanned edits. A legacy overlap waits
-for repair; its successor can be dropped to recover.
-The ledger's independent guard conservatively counts every module-name mention
-and possible path-attribute owner, with refill's shared build-input protection.
+Assignment repeats the proof under the ledger write lock.
+Widen, finding follow or replace, base or tip changes, and checkpoint writes revalidate the affected footprints.
+Conflict or uncertainty cancels the write.
+Resume, gate and merge repeat the proof, including after predecessors merge.
+The proof reads bases, checkpoints, live unit and receiving branch tips, and actual committed paths.
+The ledger guard includes all module-name mentions, possible path-attribute owners and protected build inputs.
 
 ### Reservation waits in identified crate runs
 

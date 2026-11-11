@@ -127,7 +127,6 @@ class MacCollectTests(MacCollectorFixture):
         self.assertEqual(run.stream["cursor_records"], 4)
         self.assertGreater(run.stream["stdin_bytes"], 10_000)
         self.assertIn("BatchMode=yes", run.stream["options"])
-        self.assertIn("ConnectTimeout=5", run.stream["options"])
         self.assertEqual(list(self.execution_directory.iterdir()), [])
         after = {str(path.relative_to(self.mac_home)): path.read_bytes()
                  for path in self.mac_home.rglob("*") if path.is_file()}

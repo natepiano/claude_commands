@@ -17,6 +17,7 @@ from scripts.copies import copies
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib import unit_runs
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
@@ -31,7 +32,6 @@ class EndSessionTests(unittest.TestCase):
 
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    marker: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     script: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     calls: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     runs: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -49,10 +49,7 @@ class EndSessionTests(unittest.TestCase):
         member = fixture_member("unit", name="end-unit", parent=owner.id, runtime_id=session_id)
         with (self.session_dir / "progress_history_state.json").open("w") as handle:
             json.dump({"owner_staff_id": member.id}, handle)
-        active_root = self.root / "active"
-        active_root.mkdir()
-        self.marker = active_root / session_id
-        _ = self.marker.write_text(f"{self.session_dir}\n", encoding="utf-8")
+        _ = staff.set_run(member.id, staff.OpenRun(self.session_dir))
         self.calls = self.root / "calls"
         self.runs = self.root / "runs"
         self.runs.mkdir()
@@ -61,8 +58,12 @@ class EndSessionTests(unittest.TestCase):
         direct_dir = scripts / "direct"
         direct_dir.mkdir(parents=True)
         (scripts / "lib").mkdir()
+        (scripts / "production").mkdir()
+        (scripts / "production/staff.py").symlink_to(Path(staff.__file__))
         (scripts / "copies").mkdir()
         (scripts / "copies/copies.py").symlink_to(Path(copies.__file__))
+        (scripts / "astra").mkdir()
+        (scripts / "astra/design_roles.py").symlink_to(END_SESSION.parent.parent / "astra/design_roles.py")
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
@@ -75,18 +76,24 @@ class EndSessionTests(unittest.TestCase):
             # The run scan and scratch cleanup use private paths.
             "#!/usr/bin/env bash\ncase \"$1\" in */remove_run_scratch.py)"
             + " printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
-            + f" exec {sys.executable} \"$@\";; */unit_runs.py)"
+            + f" exec {sys.executable} \"$@\";; -c|*/staff.py|*/unit_runs.py)"
             + f" exec {sys.executable} \"$@\";; */copies.py)"
-            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;; esac\n"
+            + f" if [[ ${{END_SESSION_REAL_COPIES:-}} == 1 ]]; then exec {sys.executable} \"$@\"; fi;;"
+            + " */design_roles.py) printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\";"
+            + f" exec {sys.executable} \"$@\";; esac\n"
             + "printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\"\n",
             encoding="utf-8",
         )
         python_shim.chmod(0o755)
         self.session_id = session_id
 
-    @override
-    def tearDown(self) -> None:
-        self.marker.unlink(missing_ok=True)
+    def run_pointer(self) -> Path | None:
+        return unit_runs.open_run(self.session_id)
+
+    def set_run_pointer(self, run: Path) -> None:
+        row = staff.by_current_session(self.session_id)
+        assert row is not None
+        _ = staff.set_run(row.id, staff.OpenRun(run))
 
     def environment(self) -> dict[str, str]:
         environment = {name: value for name, value in os.environ.items()
@@ -99,10 +106,10 @@ class EndSessionTests(unittest.TestCase):
             "COPIES_CONFIG": str(END_SESSION.resolve().parents[2] / "config/copies.conf"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
             "END_SESSION_CALLS": str(self.calls),
-            "UNIT_ACTIVE_DIR": str(self.marker.parent),
             "UNIT_RUN_ROOT": str(self.runs),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+            "DESIGN_ROLES_STATE": str(self.root / "designs"),
             "SCRATCH_ROOT": str(self.root / "tracked-scratch"),
             "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
@@ -135,7 +142,7 @@ class EndSessionTests(unittest.TestCase):
             self.assertFalse(other.exists())
             self.assertFalse(cache.exists())
             self.assertTrue(other_cache.is_dir())
-            self.assertFalse(self.marker.exists())
+            self.assertIsNone(self.run_pointer())
 
     def test_end_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
         environment = self.environment()
@@ -151,10 +158,10 @@ class EndSessionTests(unittest.TestCase):
             self.assertFalse(tree.exists())
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(self.marker.exists())
+            self.assertIsNone(self.run_pointer())
             self.assertEqual(copies.owned_trees(owner).standing, ())
 
-    def test_end_keeps_a_busy_tree_and_still_clears_the_marker(self) -> None:
+    def test_end_keeps_a_busy_tree_and_still_clears_the_run_pointer(self) -> None:
         environment = self.environment()
         environment["END_SESSION_REAL_COPIES"] = "1"
         with patch.dict(os.environ, environment):
@@ -164,7 +171,7 @@ class EndSessionTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("busy", result.stderr)
                 self.assertTrue(tree.exists())
-            self.assertFalse(self.marker.exists())
+            self.assertIsNone(self.run_pointer())
 
 
     def make_run(self, name: str, director: str) -> Path:
@@ -184,11 +191,34 @@ class EndSessionTests(unittest.TestCase):
             json.dumps({"owner_staff_id": parent.id}), encoding="utf-8")
         return run
 
+    def test_failed_role_cleanup_still_clears_only_its_run_pointer(self) -> None:
+        directory = self.root / "designs" / "20000000-0000-4000-8000-000000000001"
+        directory.mkdir(parents=True)
+        _ = (directory / "design.json").write_text(json.dumps({
+            "binding": {"run_directory": str(self.session_dir)},
+            "schema": 1,
+            "placement": {"design_id": directory.name},
+            "roles": [],
+        }))
+        side = self.make_run("run-side", self.session_id)
+        other = self.make_run("run-other", "another-director")
+        other_owner = next(row for row in staff.local_snapshot().rows if row.name == "other")
+        _ = staff.set_run(other_owner.id, staff.OpenRun(other))
+        result = self.run_end(self.environment())
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("design_roles.py unbind-run", result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn(f"unbind-run {side}", calls)
+        self.assertIn("remove_workers.py", calls)
+        self.assertIn("remove_run_scratch.py", calls)
+        self.assertIsNone(self.run_pointer())
+        self.assertEqual(unit_runs.open_run(other_owner.current_session), other)
+
     def test_every_run_the_director_holds_is_cleaned_and_no_other(self) -> None:
         marked = self.make_run("run-marked", self.session_id)
         side = self.make_run("run-side", self.session_id)
         other = self.make_run("run-other", "another-director")
-        _ = self.marker.write_text(f"{marked}\n", encoding="utf-8")
+        self.set_run_pointer(marked)
 
         result = self.run_end(self.environment())
 
@@ -209,17 +239,19 @@ class EndSessionTests(unittest.TestCase):
         self.assertTrue((other / "verify_cache").is_dir())
         self.assertTrue((other / "phases" / "p3" / "gate" / ".git").is_dir())
         self.assertTrue((other / "p62_bin").is_dir())
-        self.assertFalse(self.marker.exists())
+        self.assertIsNone(self.run_pointer())
 
-    def test_held_runs_are_cleaned_after_the_marker_is_gone(self) -> None:
+    def test_held_runs_are_cleaned_after_the_pointer_is_cleared(self) -> None:
         side = self.make_run("run-side", self.session_id)
         other = self.make_run("run-other", "another-director")
-        self.marker.unlink()
+        row = staff.by_current_session(self.session_id)
+        assert row is not None
+        _ = staff.clear_run(row.id, self.session_dir)
 
         result = self.run_end(self.environment())
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("No active unit run marker", result.stdout)
+        self.assertIn("No active unit run pointer", result.stdout)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
         unbind = next(line for line in calls if "roles.py unbind-run" in line)
         removal = next(line for line in calls if "remove_workers.py" in line)

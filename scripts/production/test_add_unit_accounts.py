@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from scripts.production import add_unit
 from scripts.production import autocompact
-from scripts.shutdown import inventory
+from scripts.agents import inventory
 from scripts.accounts import accounts
 
 

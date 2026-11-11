@@ -14,6 +14,7 @@ from unittest.mock import call, patch
 
 
 from scripts.herdr import herdr
+from scripts.herdr import herdr_types
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -331,7 +332,7 @@ class ConversationReaderTests(StaffTestCase):
             for registry_fails in (False, True):
                 with (self.subTest(kind=kind, registry_fails=registry_fails),
                       patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
-                      patch.object(herdr.Herdr, "pane_tab", side_effect=herdr.HerdrFailure("tab read failed")),
+                      patch.object(herdr.Herdr, "pane_tab", side_effect=herdr_types.HerdrFailure("tab read failed")),
                       patch.object(sessions, "running_sessions", return_value=[record],
                           side_effect=OSError("registry read failed") if registry_fails else None),
                       patch.object(sessions, "session_liveness", return_value=sessions.SessionLivenessUnknown("998071.json: unreadable")),

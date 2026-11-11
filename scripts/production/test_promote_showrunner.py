@@ -4,6 +4,8 @@ lookups and add_showrunner's start: nothing real stops or starts. Git runs in te
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member
+from scripts.herdr import herdr_types
+from scripts.lib.atomic_file import write_text_atomic
 
 import io
 import json
@@ -22,7 +24,7 @@ from unittest import mock
 from scripts.production import add_showrunner
 from scripts.production import promote_showrunner
 from scripts.production import showrunners, worker
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.production import showrunner_tree
 from scripts.production import unit_effort
 from scripts.production import unit_lookup
@@ -160,7 +162,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promotion_continues_after_a_failed_pane_read(self) -> None:
         promotion = promote_showrunner.checked("demo", "child", self.child_doc)
         with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]),
-              mock.patch.object(herdr.Herdr, "panes", side_effect=herdr.HerdrFailure("unreadable")),
+              mock.patch.object(herdr.Herdr, "panes", side_effect=herdr_types.HerdrFailure("unreadable")),
               mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close,
               redirect_stderr(io.StringIO()) as errors):
             self.assertTrue(promote_showrunner.stop(promotion))
@@ -264,7 +266,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
         self.runs_production, self.pane, self.child_refusal = True, unit_effort.Ready(), ""
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(session_records), "UNIT_ACTIVE_DIR": str(self.root / "active")}))
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(session_records)}))
         self.assertEqual(accounts.setup("claude2"), [])
         _ = self.enterContext(mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
@@ -541,8 +543,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.pane = unit_effort.Skipped("a form, prompt or menu is open")
 
         def run_open() -> None:
-            (self.root / "active").mkdir()
-            _ = (self.root / "active" / SESSION).write_text("/tmp/run")
+            row = staff.local_snapshot().by_current_session(SESSION)
+            assert row is not None
+            _ = staff.set_run(row.id, staff.OpenRun(self.root / "run"))
 
         cases = {
             "this session runs no production": no_production,
@@ -582,6 +585,62 @@ class PromoteShowrunnerTests(unittest.TestCase):
                                                     "--model", "opus", "--effort", "high"])
                 self.assertEqual(code, 2)
                 self.assertIn(cause, err.getvalue())
+
+    def test_default_document_reads_valid_markdown_with_any_name(self) -> None:
+        self.child_doc.unlink()
+        first = self.worktree / "docs/child.md"
+        write_text_atomic(first, doc_text(self.worktree))
+        for ignored in (".git/ignored.md", "target/ignored.md", "docs/incomplete-production.md"):
+            write_text_atomic(self.worktree / ignored,
+                "- **Showrunner checkout:** invalid\n" if "incomplete" in ignored else doc_text(self.worktree))
+        second = self.worktree / "other.md"
+        for count in (1, 2):
+            with self.subTest(documents=count):
+                if count == 2:
+                    write_text_atomic(second, doc_text(self.worktree))
+                commit_all(self.worktree)
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+                    code = promote_showrunner.main(["demo", "--model", "opus", "--effort", "high", "--check"])
+                if count == 1:
+                    self.assertEqual(code, 0, errors.getvalue())
+                else:
+                    self.assertEqual(code, 2)
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn(str(first), errors.getvalue())
+                    self.assertIn(str(second), errors.getvalue())
+                self.assert_nothing_stopped()
+
+    def test_promote_requires_the_showrunner_model_and_effort(self) -> None:
+        for flags in (("--model", "opus"), ("--effort", "high"), ()):
+            with self.subTest(flags=flags), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as refused:
+                    _ = promote_showrunner.main(["demo", "--check", *flags])
+                self.assertEqual(refused.exception.code, 2)
+                self.assert_nothing_stopped()
+
+    def test_name_only_uses_the_recorded_production_document(self) -> None:
+        config = unit_config.UnitConfig(unit_config.PlanFile(self.child_doc.relative_to(self.worktree)),
+                                        unit_config.NoAppPort(), ())
+        _ = unit_config.write(self.worktree, config)
+        for another_document in (False, True):
+            if another_document:
+                write_text_atomic(self.worktree / "other-production.md", doc_text(self.worktree))
+                commit_all(self.worktree)
+            with (self.subTest(another_document=another_document),
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+                code = promote_showrunner.main(["demo", "--model", "opus", "--effort", "high", "--check"])
+            self.assertEqual(code, 0, errors.getvalue())
+            self.assert_nothing_stopped()
+
+    def test_name_only_without_a_production_document_reports_one_refusal_line(self) -> None:
+        self.child_doc.unlink()
+        with redirect_stderr(io.StringIO()) as errors:
+            code = promote_showrunner.main(["demo", "--model", "opus", "--effort", "high", "--check"])
+        self.assertEqual(code, 2)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("doc", errors.getvalue())
+        self.assertIn(str(self.worktree), errors.getvalue())
+        self.assert_nothing_stopped()
 
     def test_check_stops_nothing(self) -> None:
         code, out, err = self.run_main("--check")

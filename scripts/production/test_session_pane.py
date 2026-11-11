@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.fake_unit_host import labeled as labeled_host
+from scripts.herdr import herdr_types
 
 import json
 import math
@@ -208,9 +209,9 @@ class SessionPaneTests(unittest.TestCase):
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
             with self.subTest(deadline=99.0):
                 program.reset_mock()
-                with self.assertRaises(herdr.HerdrFailure):
+                with self.assertRaises(herdr_types.HerdrFailure):
                     _ = session_pane.read_place(place, deadline=99.0)
-                with self.assertRaises(herdr.HerdrFailure):
+                with self.assertRaises(herdr_types.HerdrFailure):
                     _ = session_pane.agent_status(place, deadline=99.0)
                 program.assert_not_called()
 
@@ -308,7 +309,7 @@ class SessionPaneTests(unittest.TestCase):
               mock.patch.object(herdr, "native_process", side_effect=native)):
             for verb in ("type", "keys"):
                 with self.subTest(verb=verb), self.assertRaisesRegex(
-                        herdr.HerdrFailure, "does not run session selected-session"):
+                        herdr_types.HerdrFailure, "does not run session selected-session"):
                     if verb == "type":
                         session_pane.type_place(place, "message for A", target=selected)
                     else:
@@ -358,7 +359,7 @@ class SessionPaneTests(unittest.TestCase):
               mock.patch.object(herdr, "native_process", side_effect=native)):
             for verb in ("type", "keys", "close"):
                 with self.subTest(verb=verb), self.assertRaisesRegex(
-                        herdr.HerdrFailure, f"does not run session {selected}") as refused:
+                        herdr_types.HerdrFailure, f"does not run session {selected}") as refused:
                     send(verb, selected)
                 self.assertEqual(refused.exception.code, "wrong_target")
             self.assertFalse(any(command[:2] in (

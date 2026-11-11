@@ -1,6 +1,12 @@
+# shellcheck shell=sh
 # Source this file from the statusLine command with statusline set to this folder.
 # Read the account, colors, zone, quota labels, and cached counts with shell builtins.
 # assignment.py reads the staff row and unit configuration, then replaces itself with jq.
+
+if [ -n "${CONF_READ_LOG:-}" ]; then
+  # shellcheck source=/dev/null
+  . "$statusline/../lib/conf_record.sh"
+fi
 
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 account=
@@ -21,13 +27,17 @@ labels="$HOME/.local/state/agent-notes/by-label.json"
 
 colors="$statusline/../../config/statusline.conf"
 [ -r "$colors" ] || colors=/dev/null
+[ -z "${CONF_READ_LOG:-}" ] || [ "$colors" = /dev/null ] || conf_record statusline
 
 zone=${USER_ZONE:-}
 if [ -z "$zone" ]; then
+  zone_conf=${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}
+  zone_stem=${zone_conf##*/}
+  [ -z "${CONF_READ_LOG:-}" ] || conf_record "${zone_stem%.conf}"
   {
     while IFS= read -r line; do
       case $line in zone=*) zone=${line#zone=}; break ;; esac
-    done < "${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}"
+    done < "$zone_conf"
   } 2>/dev/null
 fi
 export TZ="${zone:-America/New_York}"
@@ -35,11 +45,11 @@ export TZ="${zone:-America/New_York}"
 [ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
 counts=
-# zsh otherwise aborts on an empty notifier glob before jq can render the line.
-[ -z "${ZSH_VERSION:-}" ] || setopt nonomatch
 # bash has EPOCHSECONDS built in; a shell with neither leaves a deferred question to the next change.
 [ -z "${ZSH_VERSION:-}" ] || zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
-for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/conf; do
+# Staff ids contain no spaces. Select owners before reading their timer folders.
+for identity in $(jq -r '.rows[]? | select(.kind == "showrunner") | .id' "$staff" 2>/dev/null); do
+  conf="${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$identity/conf"
   [ -f "$conf" ] && [ -r "$conf" ] || continue
   instance=${conf%/conf}
   target=
