@@ -20,6 +20,7 @@ from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.lib import unit_runs
 from scripts.direct import phase_table
 from scripts.message import sessions
 from scripts.direct.recorder_fixture import invoke_recorder
@@ -61,6 +62,8 @@ class PhaseTableTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"SCRATCH_ROOT": str(self.root / "scratch")})))
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         production_membership("show")
         self.history_dir = self.root / "history"
@@ -91,7 +94,7 @@ class PhaseTableTests(unittest.TestCase):
         row = recorded_unit("show", "table", self.working_dir,
                             self.working_dir / "docs/production.md", plan="docs/plan.md")
         state = self.session_dir / "progress_history_state.json"
-        _ = state.write_text(json.dumps({"owner_staff_id": row.id, "status": "active", "plan_doc": "docs/plan.md"}))
+        _ = state.write_text(json.dumps({"owner_staff_id": row.id, "plan_doc": "docs/plan.md"}))
         before = state.read_bytes()
         destination = self.root / "moved"
         _ = self.working_dir.rename(destination)
@@ -110,7 +113,6 @@ class PhaseTableTests(unittest.TestCase):
             "plan_doc": "docs/plan.md",
             "project_plan_doc": str(self.plan),
             "phase": phase,
-            "status": "active",
         }
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state),
@@ -132,8 +134,22 @@ class PhaseTableTests(unittest.TestCase):
     ) -> Path:
         path = self.history_dir / "runs" / f"{name}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        row = staff.snapshot().unit_by_worktree(remote.local_machine(), self.working_dir)
+        if row is None:
+            row = unit_membership("show", "table")
+            row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.working_dir), expected=row.worktree)
+        folder = self.root / "unit" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": row.id}))
+        if any(event.get("event_type") == "run_finished" for event in events):
+            if isinstance(row.run, staff.OpenRun):
+                _ = staff.clear_run(row.id, row.run.path)
+        else:
+            _ = staff.set_run(row.id, staff.OpenRun(folder))
         started = {
             "event_type": "run_started",
+            "run_id": name,
+            "owner_staff_id": row.id,
             "working_dir": str(self.working_dir),
             "plan_doc": "docs/plan.md",
             "run_started_at": started_at,
@@ -176,6 +192,7 @@ class PhaseTableTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
             "PHASE_TABLE_VAULT": str(self.vault_root),
             "UNIT_HISTORY_DIR": str(self.history_dir),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
             "UNIT_NOW_EPOCH": str(at),
             **fake_unit_host.environment(self.root),
         }
@@ -241,8 +258,16 @@ class PhaseTableTests(unittest.TestCase):
     ) -> None:
         path = self.history_dir / "runs" / f"{name}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        row = unit_membership("show", "worker")
+        row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=row.worktree)
+        folder = self.root / "unit" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": row.id}))
+        _ = staff.set_run(row.id, staff.OpenRun(folder))
         started = {
             "event_type": "run_started",
+            "run_id": name,
+            "owner_staff_id": row.id,
             "working_dir": str(worktree),
             "plan_doc": str(plan.relative_to(worktree)),
             "run_started_at": started_at,
@@ -660,6 +685,11 @@ class PhaseTableTests(unittest.TestCase):
             )
         )
 
+        owner = unit_membership("show", "table")
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.working_dir), expected=owner.worktree)
+        _ = (self.working_dir / ".unit.toml").write_text('plan = "docs/plan.md"\nresponsibilities = []\n')
+        self.session_dir = self.root / "unit" / "checkpoint"
+        self.session_dir.mkdir(parents=True)
         def record(at: int, command: str, *arguments: str) -> None:
             environment = {
                 **self.environment(at),
@@ -678,7 +708,7 @@ class PhaseTableTests(unittest.TestCase):
 
         record(
             900, "start-run", "--working-dir", str(self.working_dir),
-            "--plan-doc", str(self.plan), "--main-model", "fixture-model",
+            "--plan-doc", str(self.plan), "--main-model", "fixture-model", "--main-session-id", owner.current_session,
         )
         record(1_000, "start-phase", "--phase-id", "2", "--phase-title", "Current delivery")
         record(1_050, "eta", "--phase-id", "3", "--time", "00:30", "--basis", "checkpoint")
@@ -1634,6 +1664,11 @@ class PhaseTableTests(unittest.TestCase):
         self.write_state(None)
 
         self.assertIsInstance(self.build(1_200).current, phase_table.NoOpenPhase)
+
+        owner = staff.snapshot().unit_by_worktree(remote.local_machine(), self.working_dir)
+        assert owner is not None
+        _ = staff.set_run(owner.id, staff.OpenRun(self.root / "unit" / "older"))
+        self.assertIsInstance(self.build(1_200).current, phase_table.OpenPhase)
 
     def test_run_with_unparseable_first_line_is_skipped(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Ignored delivery  · status: todo"))

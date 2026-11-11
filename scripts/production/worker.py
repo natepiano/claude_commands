@@ -10,7 +10,7 @@ import argparse
 from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, redirect_stderr
 from dataclasses import dataclass, replace
-from enum import IntEnum
+from enum import Enum, IntEnum
 from importlib import import_module
 from functools import partial
 import io
@@ -1060,17 +1060,45 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, Wo
     return found
 
 
-def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
+class WorkerFilter(Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+    ALL = "all"
+
+
+def _open_worker(state: worker_panes.WorkerPane) -> bool:
+    return isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker, worker_panes.ProcessUnknownWorker))
+
+
+def _listed_worker(state: worker_panes.WorkerPane, selection: WorkerFilter) -> bool:
+    return (selection is WorkerFilter.ALL or selection is WorkerFilter.OPEN and _open_worker(state)
+            or selection is WorkerFilter.CLOSED and isinstance(state, worker_panes.ClosedWorker))
+
+
+def _waiting_on(row: staff.StaffRow, record: staff.StaffSnapshot) -> str:
+    run = worker_panes.worker_run(row, record=record)
+    return ", ".join(item["label"] for item in detached_runs.live_runs(
+        run / worker_lifecycle.DETACHED_RUNS_DIR, row.name)) or "-"
+
+
+def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = WorkerFilter.ALL,
+                     as_json: bool = True) -> list[dict[str, object]]:
     dispatches = _recorded_worker_dispatches(record)
+    states = {state.row.id: state for parent_id in dict.fromkeys(
+        row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo))
+        for state in worker_panes.observe(parent_id, record)} if selection is not WorkerFilter.ALL or not as_json else {}
     listing: list[dict[str, object]] = []
     for row in record.find(kind="worker"):
         parent = record.parent_of(row)
         saved = dispatches.get(row.id, WorkerDispatchRecord({}, 0))
         if parent is None:
             continue
+        if selection is not WorkerFilter.ALL and (row.id not in states or not _listed_worker(states[row.id], selection)):
+            continue
         fields = saved.fields
         status = fields.get("status", "unknown")
         status = status if isinstance(status, str) else "unknown"
+        activity = fields.get("kind") if status in ("active", "refused") else ""
         if isinstance(row.exited, staff.Exited):
             status = "exited"
         elif isinstance(row.paused, staff.Paused):
@@ -1085,8 +1113,15 @@ def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
                     status, work = "completed", "idle"
             except (OSError, ValueError) as error:
                 print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
-        listing.append(_worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
-            "activity": fields.get("activity") or status}))
+        item = _worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
+            "activity": fields.get("activity") or status})
+        if not as_json:
+            item["list_activity"] = activity or item["role"]
+            item["waiting_on"] = _waiting_on(row, record)
+        listing.append(item)
+    if not as_json:
+        listing.sort(key=lambda fields: not (StaffId(str(fields["id"])) in states
+                     and _open_worker(states[StaffId(str(fields["id"]))])))
     return listing
 
 
@@ -1104,11 +1139,15 @@ def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
     return "unknown", "-"
 
 
-def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True) -> list[dict[str, object]]:
+def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True,
+                 selection: WorkerFilter = WorkerFilter.ALL) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
     with progress_history.dispatch_reads(record, observed.runs):
-        for state in observed.states:
+        states = observed.states if as_json else sorted(observed.states, key=lambda state: not _open_worker(state))
+        for state in states:
+            if not _listed_worker(state, selection):
+                continue
             facts: dict[str, object] = {"state": type(state).__name__, "work": worker_panes.worker_state(state)}
             fields = _worker_list_row(state.row, facts)
             if isinstance(state, worker_panes.OpenWorker):
@@ -1117,6 +1156,10 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
                 fields["reason"] = state.reason
             if not as_json:
                 fields["pane"], fields["state"] = _worker_pane_state(state)
+                dispatch = progress_history.last_dispatch(state.row.id)
+                fields["list_activity"] = (dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch)
+                                           and dispatch.status in ("active", "refused") else fields["role"])
+                fields["waiting_on"] = _waiting_on(state.row, record)
             listing.append(fields)
     return listing
 
@@ -1131,18 +1174,26 @@ def _print_workers(listing: list[dict[str, object]], as_json: bool, record: staf
             parent = record.parent_of(row) if row is not None else None
             locations.append(staff.worktree_machine(parent) if parent is not None else "")
         machines = display_cells.machine_column(locations)
-        width = len(str(len(listing)))
+        rows = [["#", "Name", "Account", "Activity", "Pane", "State", "Waiting on"]]
         for number, fields in enumerate(listing, 1):
-            role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
-            account = fields["account"] if isinstance(fields.get("account"), str) else "account unknown"
+            activity = fields.get("list_activity", fields.get("role"))
+            activity = activity if isinstance(activity, str) and activity else "activity unknown"
+            account = fields.get("account")
+            account = account if isinstance(account, str) else "account unknown"
             pane = fields.get("pane", "-")
             state = fields["state"]
             if pane == "-":
                 state = state if state in ("paused", "exited") else "busy" if state == "active" else "idle"
             elif pane != "open":
                 account = "-"
-            machine = f" {machines[number - 1]}" if machines else ""
-            print(f"{number:>{width}} {fields['name']} {role} {account}{machine} {pane} {state} {fields.get('reason', '')}".rstrip())
+            machine = f" ({machines[number - 1]})" if machines else ""
+            reason = f" ({fields['reason']})" if fields.get("reason") else ""
+            rows.append([str(number), str(fields["name"]), account + machine, activity, str(pane), str(state) + reason,
+                         " ".join(str(fields.get("waiting_on", "-")).splitlines())])
+        widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+        for row in rows:
+            print("  ".join(cell.rjust(widths[column]) if column == 0 else cell.ljust(widths[column])
+                            for column, cell in enumerate(row)).rstrip())
     return ExitCode.OK
 
 
@@ -1177,7 +1228,8 @@ class Arguments(argparse.Namespace):
     effort: str = ""
     completion_actions: str = ""
     json: bool = False
-    all: bool = False
+    all_parents: bool = False
+    selection: WorkerFilter = WorkerFilter.OPEN
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -1187,7 +1239,9 @@ def main(arguments: list[str] | None = None) -> int:
         child = commands.add_parser(command)
         if command == "list":
             _ = child.add_argument("--json", action="store_true")
-            _ = child.add_argument("--all", action="store_true")
+            _ = child.add_argument("selection", nargs="?", type=WorkerFilter,
+                                   choices=list(WorkerFilter), default=WorkerFilter.OPEN, metavar="open|closed|all")
+            _ = child.add_argument("--all-parents", action="store_true", help="read saved dispatches for every parent")
     answering = commands.add_parser("answer")
     _ = answering.add_argument("name")
     _ = answering.add_argument("--text", required=True)
@@ -1213,16 +1267,16 @@ def main(arguments: list[str] | None = None) -> int:
     _ = assignment.add_argument("--completion-actions", default="{}")
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
-        if args.command == "list" and args.all:
+        if args.command == "list" and args.all_parents:
             record = staff.local_snapshot()
-            return _print_workers(list_all_workers(record), args.json, record)
+            return _print_workers(list_all_workers(record, selection=args.selection, as_json=args.json), args.json, record)
         record = staff.snapshot()
         owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
         if owner is None or owner.kind not in ("unit", "showrunner"):
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
         if args.command == "list":
-            return _print_workers(list_workers(owner.id, record, as_json=args.json), args.json, record)
+            return _print_workers(list_workers(owner.id, record, as_json=args.json, selection=args.selection), args.json, record)
         if args.command == "check":
             observed = _read_workers(owner, record)
             with progress_history.dispatch_reads(record, observed.runs):

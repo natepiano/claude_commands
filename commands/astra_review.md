@@ -27,7 +27,7 @@ changes no file.
    Report a busy or unavailable reviewer; do not start a replacement.
    Without a held document, a unit or showrunner review starts through `assign.sh --role review --operation astra-review`.
    The launcher uses the review run's transport pin.
-   If worker end fails, its staff row remains visible in `worker.py list`.
+   If worker end fails, its staff row remains visible in `worker.py list all`.
    The exec hold ends with the launcher process.
    A review outside the staff hierarchy uses `assign.sh --target consultation-pane --operation astra-review`.
    Its consultation pane uses Codex `gpt-6-astra` at `xhigh` with read-only access and approval `never`.

@@ -452,7 +452,7 @@ def _state_path(session_dir: Path) -> Path:
 
 def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> dict[str, object]:
     """Omit folder copies from state, events, and nested wait attribution."""
-    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
+    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status"):
         return dict(fields)
     if not unit_owned and (fields.get(unit_runs.OWNER_FIELD) or fields.get("main_agent") or fields.get("owner_session")):
         unit_owned = isinstance(unit_runs.run_owner(fields, staff.initial_snapshot()), staff.StaffRow)
@@ -472,7 +472,7 @@ def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> di
     return result
 
 
-def _read_state(session_dir: Path) -> dict[str, object]:
+def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None) -> dict[str, object]:
     path = _state_path(session_dir)
     try:
         state = _json_object(path.read_text(encoding="utf-8"))
@@ -482,12 +482,12 @@ def _read_state(session_dir: Path) -> dict[str, object]:
         raise SystemExit(f"Invalid progress state: {path}")
     if not state.get("main_agent") and not state.get("owner_session"):
         state["owner_session"] = unit_runs.director(session_dir)
-    return plan_history.staff_directory(state, staff.initial_snapshot())
+    return plan_history.staff_directory(state, staff.initial_snapshot() if record is None else record)
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     stored = _stored_fields(state)
-    if state.get(unit_runs.OWNER_FIELD) and state.get("status") == "active":
+    if state.get(unit_runs.OWNER_FIELD) and "status" not in state:
         for key in ("production", "unit", "branch"):
             _ = stored.pop(key, None)
     write_text_atomic(
@@ -502,8 +502,8 @@ SESSION_ROOTS = tuple(
 )
 
 
-def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str) -> bool:
-    if fields.get("status") != "active" or fields.get("working_dir") not in (str(old), str(new)):
+def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str, folder: Path) -> bool:
+    if not unit_runs.run_is_open(folder) or fields.get("working_dir") not in (str(old), str(new)):
         return False
     fields["branch"] = new_branch
     fields.update(_stored_fields(fields))
@@ -523,7 +523,7 @@ def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[
             except (OSError, UnicodeError):
                 continue
             if state is not None and state.get("history_file") == str(history_file) and _moved_fields(
-                state, old, new, new_branch
+                state, old, new, new_branch, path.parent
             ):
                 _write_state(path.parent, state)
                 moved.append(path)
@@ -1468,7 +1468,7 @@ def _close_active_activity(
 def _start_activity(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    if _string(state.get("status")) != "active":
+    if not unit_runs.run_is_open(session_dir):
         raise SystemExit("Cannot start an activity: the run is finished")
     if _object_dict(state.get("phase")) is None:
         raise SystemExit("Start a phase before starting an activity")
@@ -1502,18 +1502,9 @@ def _finish_activity(args: argparse.Namespace) -> None:
 
 
 def _claim_run_pointer(owner: staff.StaffRow, session_dir: Path) -> None:
-    """Point the owner at this run, unless the owner holds another active run.
-
-    A helper run, such as an Astra review folder, then never moves its director's run.
-    """
-    if isinstance(owner.run, staff.OpenRun) and owner.run.path.resolve() != session_dir.resolve():
-        try:
-            held = _json_object(_state_path(owner.run.path).read_text(encoding="utf-8"))
-        except OSError:
-            held = None
-        if held is not None and held.get("status") == "active":
-            return
-    _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+    """Publish the pointer for a unit run folder."""
+    if unit_runs.is_unit_run(session_dir):
+        _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
 
 
 def _assign_unit_plan(member: staff.StaffRow | unit_runs.RunOwnerUnrecorded | None, working_dir: Path, plan_doc: str) -> None:
@@ -1599,7 +1590,6 @@ def _start_run(args: argparse.Namespace) -> None:
         "last_percent": None,
         "percent_started_at": None,
         "pending_calibration": None,
-        "status": "active",
     }
     owner = unit_runs.run_owner(state, record)
     if isinstance(owner, staff.StaffRow):
@@ -1642,7 +1632,8 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 
 def _start_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
+    record = staff.initial_snapshot()
+    state = _read_state(session_dir, record=record)
     now = plan_history.now_epoch()
     phase_id = _arg_string(args, "phase_id", "ad hoc")
     phase_dir = phase_reservation.phase_directory(session_dir, phase_id)
@@ -1677,22 +1668,19 @@ def _start_phase(args: argparse.Namespace) -> None:
         _ = phase_reservation.restore(phase_dir, phase_id)
     except phase_reservation.StateRefused as refused:
         raise SystemExit(str(refused)) from refused
-    if _string(state.get("status")) != "active" and "finished_at" in state:
-        director = unit_runs.director(session_dir) or _string(
-            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
-        if director:
-            row = staff.by_current_session(director)
-            if row is not None:
-                _claim_run_pointer(row, session_dir)
+    if not unit_runs.run_is_open(session_dir, record=record) or "status" in state:
         previous_status = _string(state.get("status"))
-        state["status"] = "active"
+        _ = state.pop("status", None)
         _ = state.pop("finished_at", None)
         reopened = _event(state, "reopened", now)
         reopened.update({"previous_status": previous_status, "cause": "start-phase", "phase_id": phase_id})
         _append_event(state, reopened)
         _write_state(session_dir, state)
+        row = unit_runs.run_owner(state, record)
+        if isinstance(row, staff.StaffRow):
+            _claim_run_pointer(row, session_dir)
     _close_active_activity(session_dir, state, "interrupted", "", now)
-    state = _read_state(session_dir)
+    state = _read_state(session_dir, record=record)
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
         _park_current(state, active)
@@ -5796,7 +5784,7 @@ def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
     if _optional_arg(args, "missing_reason") and not hasattr(args, "phase_id"):
         return WaitPhaseNotRecorded("missing wait has no phase selector")
     phase = _open_phase_named(state, phase_id) if hasattr(args, "phase_id") else _object_dict(state.get("phase"))
-    if phase is not None and phase.get("status") == "active" and state.get("status") == "active":
+    if phase is not None and phase.get("status") == "active" and unit_runs.run_is_open(_session_dir(args)):
         return WaitPhaseResolved(phase)
     return WaitPhaseNotRecorded(f"phase {phase_id or '(current)'} is not open")
 
@@ -6277,7 +6265,7 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
             declaration = str(uuid.uuid4())
         marker = {**identity, "declaration_id": declaration}
         write_text_atomic(marker_path, json.dumps(marker) + "\n")
-        args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
+        args = argparse.Namespace(session_dir=str(session_dir), missing_reason="", kind=kind, reason=reason,
                                   owner_session=owner_session, unit="", expected_supplier=supplier_fields,
                                   declaration_id=declaration)
         wait_id = _record_wait(state, args)
@@ -6620,15 +6608,17 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     _refresh_phase_table(session_dir)
 
 
-def _clear_run_pointer(session_dir: Path) -> None:
-    for row in staff.initial_snapshot().rows:
-        if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == session_dir.resolve():
+def _clear_run_pointer(session_dir: Path, *, record: staff.StaffSnapshot) -> None:
+    folder = session_dir.resolve()
+    for row in record.rows:
+        if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == folder:
             _ = staff.clear_run(row.id, session_dir)
 
 
 def _finish_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
+    record = staff.initial_snapshot()
+    state = _read_state(session_dir, record=record)
     now = plan_history.now_epoch()
     run_status = _arg_string(args, "status")
     # Every open phase, newest first: closing the current one makes the next
@@ -6636,12 +6626,16 @@ def _finish_run(args: argparse.Namespace) -> None:
     while recorder_state.open_phase_ids(state):
         finish_args = argparse.Namespace(session_dir=str(session_dir), status=run_status)
         _finish_phase(finish_args)
-        state = _read_state(session_dir)
-    if _string(state.get("status")) != "active":
-        _clear_run_pointer(session_dir)
+        state = _read_state(session_dir, record=record)
+    if not unit_runs.run_is_open(session_dir, record=record):
+        _clear_run_pointer(session_dir, record=record)
+        return
+    # A repeated finish clears a restored pointer without recording the outcome again.
+    if worker_lifecycle.finished_run_status(str(session_dir)):
+        _clear_run_pointer(session_dir, record=record)
         return
     _close_active_activity(session_dir, state, "interrupted", "", now)
-    state = _read_state(session_dir)
+    state = _read_state(session_dir, record=record)
     event = _event(state, "run_finished", now)
     event["status"] = run_status
     event["run_elapsed_seconds"] = max(
@@ -6656,7 +6650,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
-    _clear_run_pointer(session_dir)
+    _clear_run_pointer(session_dir, record=record)
     _refresh_phase_table(session_dir)
 
 

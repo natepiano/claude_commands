@@ -63,7 +63,6 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .seg-used { background: var(--used); }
 .seg-room { background: var(--room); }
 .seg-ci { background: var(--used); border-left: 1px solid var(--card); }
-.reserve-tip { position: absolute; top: 0; height: 100%; z-index: 1; cursor: help; }
 .seg-other { background: var(--other); }
 .seg-free { background: var(--free); box-shadow: inset 0 0 0 1px var(--ink-2); }
 .seg-floor { background: var(--floor); }
@@ -234,7 +233,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .why { padding-left: 28px; }
   .answer .big { font-size: 2.2rem; }
 }
-#s-ci_ram[hidden], #s-ci_kept[hidden], #ci-kept-legend[hidden], #mark[hidden], #marklabel[hidden], .sw.cap[hidden] { display: none; }
+#s-ci_ram[hidden], #mark[hidden], #marklabel[hidden], .sw.cap[hidden] { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .wait-reason { color: var(--ink-2); font-size: 0.8rem; overflow-wrap: anywhere; }
@@ -276,7 +275,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="bar">
         <div class="seg-used" id="s-used" data-tip="used"><span class="lbl" id="l-used"></span></div>
         <div class="seg-ci" id="s-ci_ram" data-tip="ci"><span class="lbl" id="l-ci_ram"></span></div>
-        <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span><div class="reserve-tip" hidden id="s-ci_kept" data-tip="ci_kept"><span hidden id="l-ci_kept"></span></div></div>
+        <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
         <div class="seg-floor" id="s-floor" data-tip="floor"><span class="lbl" id="l-floor"></span></div>
         <div class="seg-other" id="s-other" data-tip="other"><span class="lbl" id="l-other"></span></div>
@@ -292,7 +291,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="used"><span class="sw used"></span><span class="name">Builds use now</span><span class="v num" id="v-used">–</span></div>
       <div class="row" data-tip="ci"><span class="sw used ci"></span><span class="name">hana CI</span><span class="v num" id="v-ci_ram">–</span></div>
       <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Reserved, not used yet</span><span class="v num" id="v-reserved">–</span></div>
-      <div class="row" data-tip="ci_kept" id="ci-kept-legend" hidden><span class="sw res"></span><span class="name">CI reserved</span><span class="v num" id="v-ci_kept">–</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
       <div class="row" data-tip="cap"><span class="sw cap"></span><span class="name">Cap line</span><span class="v num" id="v-cap">–</span></div>
       <div class="row" data-tip="floor"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-floor">–</span></div>
@@ -361,7 +359,6 @@ const TIPS = {
     const row = d.walk.find((r) => r.ci);
     return [`hana CI · ${row ? row.detail : `${f1(d.ci_ram)} GiB RAM`}`, row ? row.keep_text : "CI runner memory is not readable."];
   },
-  ci_kept: (d) => d.ci_kept > 0 ? [`CI reserved ${f1(d.ci_kept)} GiB`, "The queue reserves this memory while a CI job runs. It reduces room and stays separate from admitted runs."] : ["", ""],
   other: (d) => [`Other programs and the system · ${f1(d.other)} GiB`, "Memory that is not builds: editors, agents, browsers and the system."],
   past: (d) => [`Shortfall · ${f1(d.shortfall)} GiB`, "Reserved exceeds free memory minus safety. The bar shows zero room."],
   floor: (d) => [`Safety · ${f1(d.floor)} GiB`, `The queue keeps ${f1(d.floor)} GiB free.`],
@@ -466,8 +463,8 @@ function tipText(key, d) {
 }
 function roomEquation(d) {
   const terms = d.room_source === "cap"
-    ? [["cap", d.cap], ["builds use", d.used], ["hana CI", d.ci_ram], ["reserved", d.reserved], ["CI reserved", d.ci_kept]]
-    : [["free", d.available], ["reserved", d.reserved], ["CI reserved", d.ci_kept], ["safety", d.floor]];
+    ? [["cap", d.cap], ["builds use", d.used], ["hana CI", d.ci_ram], ["reserved", d.reserved]]
+    : [["free", d.available], ["reserved", d.reserved], ["safety", d.floor]];
   const shown = terms.filter((term, index) => index === 0 || f1(term[1]) !== "0.0");
   const sum = shown.map(([name, amount]) => `${name} ${f1(amount)}`).join(" − ");
   return `Next step room = ${d.shortfall > 0 ? `max(0, ${sum})` : sum} = ${f1(d.room)} GiB`;
@@ -538,7 +535,6 @@ function render(d) {
   setSeg("s-room", d.room, t);
   setSeg("s-other", d.other, t);
   setSeg("s-ci_ram", d.ci_ram, t);
-  setSeg("s-ci_kept", d.shown_ci_kept, t);
   setSeg("s-past", 0, t);
   setSeg("s-floor", d.shown_safety, t);
   $("mark").hidden = !hasCap(d);
@@ -546,20 +542,18 @@ function render(d) {
   document.querySelector('.sw.cap').hidden = !hasCap(d);
   $("marklabel").textContent = !hasCap(d) ? "cap unavailable" : `cap ${f1(d.cap)}`;
   $("barwrap").setAttribute("aria-label",
-    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, ${d.ci_kept > 0 ? `CI reserved ${f1(d.ci_kept)}, ` : ""}room ${f1(d.room)}, ${!hasCap(d) ? d.cap_text : `cap ${f1(d.cap)}`}`);
+    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, room ${f1(d.room)}, ${!hasCap(d) ? d.cap_text : `cap ${f1(d.cap)}`}`);
 
   const [roomValue, roomUnit] = memoryAmount(d.room).split(" ");
   $("room").textContent = roomValue;
   $("room-unit").textContent = roomUnit;
   const wait = d.waiting > 0 ? `${d.waiting} ${d.waiting === 1 ? "step waits" : "steps wait"}.` : "No step waits.";
   $("answer").textContent = `Next step room · ${wait}`;
-  for (const k of ["used", "reserved", "room", "other", "floor", "ci_ram", "ci_kept"]) $(`v-${k}`).textContent = memoryAmount(d[k]);
+  for (const k of ["used", "reserved", "room", "other", "floor", "ci_ram"]) $(`v-${k}`).textContent = memoryAmount(d[k]);
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : memoryAmount(d.cap);
   $("v-past").textContent = memoryAmount(d.shortfall);
-  const segVals = { used: shownUse, reserved: d.shown_reserved + d.shown_ci_kept, room: d.room, other: d.other, past: 0, floor: d.shown_safety, ci_ram: d.ci_ram, ci_kept: d.shown_ci_kept };
-  $("s-ci_kept").hidden = d.ci_kept === 0;
-  $("ci-kept-legend").hidden = d.ci_kept === 0;
+  const segVals = { used: shownUse, reserved: d.shown_reserved, room: d.room, other: d.other, past: 0, floor: d.shown_safety, ci_ram: d.ci_ram };
   for (const [k, v] of Object.entries(segVals)) $(`l-${k}`).textContent = f1(v);
   latest = d;
   setTimeout(fitLabels, 650);
@@ -847,7 +841,7 @@ function fitWalkDetails() {
   measureColumn("machine");
   context.font = getComputedStyle(walk.querySelector(".amounts")).font;
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci))
-    .map(row => [useValue(row), row.ci ? latest.ci_kept : row.reserved].filter(value => value > 0));
+    .map(row => [useValue(row), row.reserved].filter(value => value > 0));
   amountGroups.push([latest.room], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
@@ -906,12 +900,11 @@ function placeMemoryBars(d) {
   const width = range.width;
   const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const unit = width / d.total;
-  const end = ((hasCap(d) ? d.cap : Math.min(d.total, d.used + d.ci_ram + d.shown_reserved + d.shown_ci_kept + d.room))) * unit;
+  const end = ((hasCap(d) ? d.cap : Math.min(d.total, d.used + d.ci_ram + d.shown_reserved + d.room))) * unit;
   const used = Math.min(end, d.used * unit);
   const ci = Math.min(end - used, d.ci_ram * unit);
   let reserved = Math.min(end - used - ci, d.shown_reserved * unit);
-  const kept = Math.min(end - used - ci - reserved, d.shown_ci_kept * unit);
-  let room = Math.min(d.room * unit, Math.max(0, end - used - ci - reserved - kept));
+  let room = Math.min(d.room * unit, Math.max(0, end - used - ci - reserved));
   const extra = d.ci_ram > 0 ? Math.min(Math.max(0, 4 - ci), room + reserved) : 0;
   const fromRoom = Math.min(extra, room);
   room -= fromRoom;
@@ -919,13 +912,10 @@ function placeMemoryBars(d) {
   const ciWidth = ci + extra;
   $("s-ci_ram").hidden = d.ci_ram === 0;
   const reserveAt = used + ciWidth;
-  const keptAt = reserveAt + reserved;
-  const roomAt = keptAt + kept;
-  for (const [name, pixels] of Object.entries({used, ci_ram: ciWidth, reserved: reserved + kept, room})) {
+  const roomAt = reserveAt + reserved;
+  for (const [name, pixels] of Object.entries({used, ci_ram: ciWidth, reserved, room})) {
     $("s-" + name).style.flex = `0 0 ${pixels}px`;
   }
-  $("s-ci_kept").style.left = `${reserved}px`;
-  $("s-ci_kept").style.width = `${kept}px`;
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   function placeAmounts(row, amounts) {
@@ -941,12 +931,11 @@ function placeMemoryBars(d) {
     let bars = "";
     const amounts = [];
     if (run.ci) {
-      bars = box(used, ciWidth, "seg-ci", "ci") + box(keptAt, kept, "hatch", "ci_kept");
+      bars = box(used, ciWidth, "seg-ci", "ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
-      if (kept > 0) amounts.push({kind: "reserved-amount", left: keptAt, value: d.ci_kept});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, Math.min(useValue(run) * unit, used - usedAt));
-      const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, keptAt - reservedAt));
+      const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, roomAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.min(Math.max(3, useWidth), end - usedAt) : 0;
       bars = box(usedAt, drawnUse, "seg-used") + box(reservedAt, reserveWidth, "hatch");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: run.used});
@@ -1013,7 +1002,7 @@ function fitLabels() {
   const at = latest && hasCap(latest) ? $("barwrap").getBoundingClientRect().width * latest.cap / latest.total : 0;
   $("mark").style.left = `${at}px`;
   $("marklabel").style.left = `${at}px`;
-  for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram", "ci_kept"]) {
+  for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram"]) {
     const seg = $(`s-${k}`), lbl = $(`l-${k}`);
     lbl.classList.toggle("hide", lbl.offsetWidth + 6 > seg.clientWidth);
   }

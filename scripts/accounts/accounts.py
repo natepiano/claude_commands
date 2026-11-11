@@ -46,6 +46,7 @@ from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel,
 from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 from scripts.whoami import usage_store  # noqa: E402
@@ -2123,7 +2124,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         if refusal_problem:
             reason = refusal_problem
         elif refusal is not None and not refusals.resolved(refusal, reading, now):
-            reason = "refused at " + refusal.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+            reason = "refused at " + refusal.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
         elif tool == "claude" and isinstance(reading, FreshReading) and any(
             isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five)
         ):
@@ -2585,13 +2586,13 @@ def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, 
 
 def no_room_line(tool: str, outcome: NoAccountWithRoom) -> str:
     reset = outcome.earliest_reset
-    time = reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
+    time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
     return f"no {tool} account has room; the earliest reset is {time}"
 
 
 def _pick_explanation(reason: PickReason) -> str:
     weekly = f"{reason.weekly.left:g}%" if isinstance(reason.weekly, ReadingWindow) else "unavailable"
-    reset = (reason.weekly.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
+    reset = (reason.weekly.reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
              if isinstance(reason.weekly, ReadingWindow) and isinstance(reason.weekly.reset, KnownReset) else "unknown")
     five = f"{reason.five_hour.left:g}%" if isinstance(reason.five_hour, ReadingWindow) else "no window"
     return f"{reason.label}: weekly {weekly}, resets {reset}, 5-hour {five}; {reason.status}"
@@ -2609,8 +2610,6 @@ def _iso_time(text: str, place: str) -> datetime:
         raise AccountsError(f"accounts: {place} must be an ISO timestamp") from error
     if at.tzinfo is None:
         # Command-line and historical wall times use the user's zone.
-        from scripts.lib.user_zone import user_zone
-
         at = at.replace(tzinfo=user_zone())
     return at.astimezone(timezone.utc)
 
@@ -3162,7 +3161,7 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
         if reading.credits != "unlimited" and (not math.isfinite(credits) or credits <= 0):
             for name, window in (("weekly", reading.weekly), ("5-hour", reading.five_hour)):
                 if isinstance(window, ReadingWindow) and window.left <= 0:
-                    reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
+                    reset = (window.reset.at.astimezone(user_zone()).strftime("%a %-I:%M %p")
                              if isinstance(window.reset, KnownReset) else "unknown")
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep(), account_config=account_config)
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
@@ -4125,7 +4124,7 @@ def _usage_store_problem(report: agent_accounts.Report, warning: agent_accounts.
     return StatusProblem(subject,
         "usage store read continued without a hold" if claim_failed else "usage store reading not saved",
         ProblemCause("usage claim" if claim_failed else "usage save",
-            f"{warning.reason}; read at {at.astimezone(agent_accounts.user_zone()):%Y-%m-%d %H:%M %Z}",
+            f"{warning.reason}; read at {at.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}",
             CauseFile(str(directory.directory if isinstance(directory, agent_accounts.ClaudeDirectorySource)
                           else directory.home if isinstance(directory, agent_accounts.CodexHomeSource)
                           else usage_store.store_file()))),
@@ -4181,6 +4180,11 @@ class RoleSessionCountsDocument(TypedDict):
     total: int
 
 
+class AccountSessionDocument(TypedDict):
+    session: str
+    state: session_state.SessionState
+
+
 @dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
@@ -4200,6 +4204,7 @@ class StatusRow:
     role_counts: tuple[RoleSessionCounts | NoRoleCount, ...] = ()
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
     selected_roles: tuple[str, ...] = ()
+    sessions: tuple[AccountSessionDocument, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4220,6 +4225,7 @@ class StatusAccountDocument(TypedDict):
     roles: list[str]
     selected_roles: list[str]
     role_counts: list[RoleSessionCountsDocument | None]
+    sessions: list[AccountSessionDocument]
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
@@ -4347,6 +4353,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
                 idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
                 if isinstance(count, RoleSessionCounts) else None for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
+            sessions=list(row.sessions),
             role_counts_by_machine=row.role_counts_by_machine,
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
@@ -4870,7 +4877,7 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
     """
     account_config = read_account_settings(account_config)
-    zone = agent_accounts.user_zone()
+    zone = user_zone()
     statuses = account_statuses()
     for status in statuses:
         for problem in _status_problems(status, detail=detail, zone=zone):
@@ -5062,7 +5069,7 @@ def _observe_status_problem(problem: StatusProblem, raw: tuple[str, ...] = (), *
 def _map_provenance_problem(provenance: role_map.RoleMapProvenance) -> list[StatusProblem]:
     if not isinstance(provenance, role_map.CachedAfterFetchFailure):
         return []
-    stamp = provenance.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+    stamp = provenance.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
     cause = f"natedev fetch failed: {provenance.failure}"
     return [StatusProblem("role map", "using saved assignments",
         ProblemCause("role", f"map saved at {stamp}; {cause}", CauseFile(str(role_map.role_map_cache_file()))),
@@ -5162,7 +5169,7 @@ def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_U
 class LocalRoleSessions:
     """One local observation supplies counts and detail output."""
 
-    counts: dict[tuple[Path, str], dict[str, str]]
+    counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]
     members: dict[ClaudeGroup, list[LiveGroupMember]]
     inputs: tuple[str, ...]
     session_lines: tuple[str, ...]
@@ -5205,7 +5212,7 @@ def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.No
     return account.ConfiguredClaudeFolder(Path(directory)) if directory else account.NoAccountSetting()
 
 
-def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]:
+def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, session_state.SessionState]], tuple[str, ...]]:
     with role_map.stored_role_map():
         observed = _read_local_role_sessions(group_accounts())
     return observed.counts, observed.inputs
@@ -5227,7 +5234,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
     from scripts.production import session_staff, staff
 
     inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
-    counts: dict[tuple[Path, str], dict[str, str]] = {}
+    counts: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
     try:
         membership = staff.local_snapshot()
@@ -5293,7 +5300,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             if role == "workers":
-                state = "busy" if session.get("status") == "busy" else "idle"
+                state = session_state.classify(session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")))
             else:
                 member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
                 state = session_state.classify(
@@ -5313,7 +5321,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             continue
         directory = account_dir(selected)
         state = session_state.classify(member, session_state.NoLiveSession())
-        counts.setdefault((directory, role), {})[str(member.id)] = state
+        counts.setdefault((directory, role), {})[member.current_session] = state
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
     if include_workers and (parents := session_staff.pane_parents(membership)):
@@ -5332,7 +5340,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                     continue
                 if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
-                    counts.setdefault((directory, "workers"), {})[state.row.current_session] = status
+                    counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
+                        session_state.UnrecordedStaff(), session_state.LiveActivity(status))
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
@@ -5345,7 +5354,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if isinstance(setting, account.ProcessEnvironmentUnread):
                     continue
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
-                counts.setdefault((directory, "workers"), {})[member.current_session] = process.activity
+                counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
+                    session_state.UnrecordedStaff(), session_state.LiveActivity(process.activity))
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), ())
 
@@ -5358,7 +5368,11 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
         roles = tuple(dict.fromkeys((*row.roles, *(role for folder, role in observed.counts if folder == directory))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
-        counted.append(replace(row, roles=roles, selected_roles=tuple(role for role in row.roles if role != "spare"),
+        members: dict[str, session_state.SessionState] = {identity: state for role in roles
+                   for identity, state in observed.counts.get((directory, role), {}).items()}
+        counted.append(replace(row, roles=roles,
+            sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
+            selected_roles=tuple(role for role in row.roles if role != "spare"),
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
                 tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
     return tuple(counted), observed.inputs
@@ -5379,8 +5393,8 @@ def _session_counts_machine() -> str:
     return "mac" if remote.other_machine() == "natedev" else "natedev"
 
 
-def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
-    mapped: dict[tuple[str, str], dict[str, str]] = {}
+def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]) -> MachineSessionCounts:
+    mapped: dict[tuple[str, str], dict[str, session_state.SessionState]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
         if re.fullmatch(r"codex(?:[1-9][0-9]*)?", label):
