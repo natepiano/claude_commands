@@ -72,20 +72,19 @@ def review_pause_path(name: str) -> Path:
 
 def targeted_instances(session_id: str) -> list[Path]:
     root = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
-    owner = staff.snapshot().by_current_session(session_id)
+    record = staff.snapshot()
+    owner = record.by_current_session(session_id)
     reference = owner.id if owner is not None else session_id
     matches: list[Path] = []
-    try:
-        for instance in root.iterdir():
-            if not instance.name.startswith("showrunner-") or not instance.is_dir():
-                continue
-            try:
-                if f"TARGET=session:{reference}" in (instance / "conf").read_text().splitlines():
-                    matches.append(instance)
-            except (OSError, UnicodeError):
-                continue
-    except OSError:
-        pass
+    for row in showrunners.showrunner_rows(record):
+        instance = root / f"showrunner-{row.id}"
+        if not instance.is_dir():
+            continue
+        try:
+            if f"TARGET=session:{reference}" in (instance / "conf").read_text().splitlines():
+                matches.append(instance)
+        except (OSError, UnicodeError):
+            continue
     return sorted(matches)
 
 
