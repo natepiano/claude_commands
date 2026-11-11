@@ -134,7 +134,7 @@ dwight=claude:fable:high
 - A test row for a live member needs process evidence in the fake herdr. A unit row needs a parent showrunner row.
 - A fake `os.execvpe` runs the exit callback only in the forked child; the parent fails on a second exec.
 
-### Phase 4 — A herdr restart and a reboot bring the producers back  · status: pending
+### Phase 4 — A herdr restart and a reboot bring the producers back  · status: done
 
 **Depends on:** Phase 3a
 
