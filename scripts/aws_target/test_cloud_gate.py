@@ -1170,6 +1170,26 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
         start.assert_not_called()
 
+    def test_service_command_omits_conf_dir_without_caller_override(self) -> None:
+        configuration = cloud_gate.settings()
+        for paired in (False, True):
+            with (self.subTest(paired=paired), mock.patch.dict(os.environ),
+                  mock.patch.object(cloud_gate, 'settings', return_value=configuration)):
+                _ = os.environ.pop('CONF_DIR', None)
+                command = cloud_gate.service_command('scripts.aws_target.gate_trial', [], 'fixture', paired=paired)
+                self.assertFalse(any(argument.startswith('--setenv=CONF_DIR=') for argument in command))
+
+    def test_service_command_preserves_caller_conf_dir(self) -> None:
+        configuration = cloud_gate.settings()
+        for paired in (False, True):
+            for directory in ('', str(self.root / 'caller-config')):
+                with (self.subTest(paired=paired, directory=directory),
+                      mock.patch.dict(os.environ, {'CONF_DIR': directory}),
+                      mock.patch.object(cloud_gate, 'settings', return_value=configuration)):
+                    command = cloud_gate.service_command('scripts.aws_target.gate_trial', [], 'fixture', paired=paired)
+                    overrides = [argument for argument in command if argument.startswith('--setenv=CONF_DIR=')]
+                    self.assertEqual(overrides, ['--setenv=CONF_DIR=' + directory])
+
     def test_session_runs_only_scaler_service_and_imports_explicit_record(self) -> None:
         for dirty, later_edit, changed_head in ((False, False, False), (True, False, False),
                                                (True, True, False), (True, False, True)):
