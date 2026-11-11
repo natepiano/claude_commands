@@ -114,6 +114,7 @@ class TurnEndTests(unittest.TestCase):
         cases.extend((family, "closed", transcript) for family in ("codex", "claude")
                      for transcript in ("no final reply", "older reply"))
         cases.append(("codex", "scratch", "current"))
+        cases.append(("codex", "closed", "trailing period"))
         for family, close, transcript in cases:
             with self.subTest(family=family, close=close, transcript=transcript):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
@@ -138,7 +139,8 @@ class TurnEndTests(unittest.TestCase):
                 if transcript != "current":
                     if transcript == "older reply":
                         self.case.agent.append(pane, "assistant", "The previous result is pending.")
-                    self.case.agent.replies.append("The work is complete.\nDONE " + active.instance_id)
+                    self.case.agent.replies.append("The work is complete.\nDONE " + active.instance_id
+                                                  + ("." if transcript == "trailing period" else ""))
                     self.case.fixture.world.locations[pane]["agent_status"] = "done"
                 payload: dict[str, object] = {
                     "hook_event_name": "Stop", "session_id": str(row.current_session), "transcript_path": "unused",
@@ -433,9 +435,10 @@ class TurnEndTests(unittest.TestCase):
 
     def test_a_final_diff_event_before_the_review_reply_keeps_the_same_pass(self) -> None:
         self.case.agent.finish_after = 1
-        for ready_first, hook_only in ((True, False), (False, False), (True, True)):
-            with self.subTest(ready_first=ready_first, hook_only=hook_only):
-                name = "review-hook" if hook_only else "review-first" if ready_first else "review-last"
+        for ready_first, hook_only, instruction in (
+                (True, False, "new"), (False, False, "new"), (True, True, "new"), (True, False, "old")):
+            with self.subTest(ready_first=ready_first, hook_only=hook_only, instruction=instruction):
+                name = ("review-hook" if hook_only else "review-first" if ready_first else "review-last") + "-" + instruction
                 ready = self.case.run_dir / f"{name}.ready"
                 code = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "review", self.case.prompt,
                     session_dir=self.case.run_dir, slot=name, phase="8", kind="review", launcher_command=[name],
@@ -444,6 +447,15 @@ class TurnEndTests(unittest.TestCase):
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                if instruction == "old":
+                    passed = worker_panes.worker_pass(row, self.case.run_dir)
+                    delivery = progress_history.dispatch_delivery(passed)
+                    old_line = (f'Read the unchanged prompt file "{self.case.prompt}". '
+                                f"End your final reply with DONE {active.instance_id}. "
+                                "A reply that waits on a detached run is not final.")
+                    progress_history.save_dispatch_delivery(self.case.run_dir, active.instance_id,
+                                                           replace(delivery, line=old_line))
                 before = len(self.case.agent.submitted)
                 notices = len(self.case.agent.notices)
                 if ready_first:
@@ -469,6 +481,9 @@ class TurnEndTests(unittest.TestCase):
                     with patch.dict(os.environ, {"CODEX_THREAD_ID": str(self.case.fixture.parent.current_session)}):
                         self.assertEqual(turn_end.main(["stage-ready", name]), 0)
                 self.assertEqual(len(self.case.agent.submitted), before + 1)
+                stage_line = self.case.agent.submitted[-1][1]
+                ending = ". " if instruction == "old" else "\n"
+                self.assertIn(f"DONE {active.instance_id}-2{ending}", stage_line)
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": str(self.case.fixture.parent.current_session)}):
                     self.assertEqual(turn_end.main(["stage-ready", name]), 0)
                 self.assertEqual(len(self.case.agent.submitted), before + 1)
@@ -477,7 +492,8 @@ class TurnEndTests(unittest.TestCase):
 
     def test_a_turn_ending_question_reaches_the_director_without_ending_the_pass(self) -> None:
         for name, reply in (("question", "Which output format must I use? JSON or Markdown?"),
-                            ("recorder", "The two file-clock changes are complete. Results are pending.")):
+                            ("recorder", "The two file-clock changes are complete. Results are pending."),
+                            ("subagent", "The worker result is pending.")):
             with self.subTest(name=name):
                 self.case.agent.without_done = True
                 self.case.agent.final = reply
@@ -486,8 +502,20 @@ class TurnEndTests(unittest.TestCase):
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
-                self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.NO_DONE)
-                self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.NO_DONE)
+                event = turn_end.EventKind.TURN_END
+                if name == "subagent":
+                    assert isinstance(active, progress_history.ActiveDispatch)
+                    backend = staff.backend(row)
+                    assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
+                    source = worker_admission.transcript_source(row, backend)
+                    with source.open("a") as stream:
+                        _ = stream.write(json.dumps({"type": "response_item", "payload": {
+                            "type": "agent_message", "author": "/root/reviewer", "recipient": "/root",
+                            "content": [{"type": "input_text", "text": "The review is complete.\nDONE " + active.instance_id}],
+                        }}) + "\n")
+                    event = turn_end.EventKind.RUN_FINISHED
+                self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.NO_DONE)
+                self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.NO_DONE)
                 self.assertEqual(len(self.case.agent.notices), notices + 1)
                 self.assertIn(self.case.agent.final, self.case.agent.notices[-1])
                 self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)

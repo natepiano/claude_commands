@@ -1048,11 +1048,14 @@ class WorkerPaneTests(StaffTestCase):
         self.world.add(row, "w1:p1", family="codex")
         self.completed_dispatch(row, "review")
         source = worker_admission.transcript_source(row, staff.CodexBackend(self.root / "codex"))
-        write_text_atomic(source, source.read_text().replace(f"DONE dispatch-{row.name}", f"DONE dispatch-{row.name}-2"))
+        transcript = source.read_text()
         observed = self.observation(row)
         assert isinstance(observed, worker_panes.OpenWorker)
-        self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
-        self.assertEqual(self.world.closed, [])
+        for suffix in ("", "."):
+            with self.subTest(suffix=suffix):
+                write_text_atomic(source, transcript.replace(f"DONE dispatch-{row.name}", f"DONE dispatch-{row.name}-2{suffix}"))
+                self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+                self.assertEqual(self.world.closed, [])
 
     def test_close_holder_keeps_the_fixed_id_locked_until_row_retirement(self) -> None:
         row = self.worker()

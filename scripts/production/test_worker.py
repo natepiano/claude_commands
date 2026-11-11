@@ -107,7 +107,7 @@ class DispatchAgent:
 
     def complete(self, pane: str) -> None:
         line = next(text for target, text in reversed(self.submitted) if target == pane)
-        dispatch_id = line.split("DONE ")[-1].split(".")[0].strip()
+        dispatch_id = line.split("DONE ")[-1].split()[0].removesuffix(".").strip()
         response = self.final if self.without_done else self.final + "\nDONE " + dispatch_id
         self.replies.append(response)
         self.append(pane, "assistant", response)
@@ -617,21 +617,30 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_claude_done_reply_after_an_api_request_blob_completes_the_receipt(self) -> None:
         dispatch_id = "phase-28d"
-        prompt = (f'Read the unchanged prompt file "{self.prompt}". '
-                  + f"End your final reply with DONE {dispatch_id}.")
-        reply = "The work is complete.\nDONE " + dispatch_id
         source = self.run_dir / "claude-transcript.jsonl"
-        records = [
-            {"type": "user", "message": {"role": "user", "content": prompt}},
-            {"type": "api-request-blob", "message": {"role": "user", "content": [{
-                "type": "text", "text": json.dumps({"messages": [{"role": "user", "content": prompt}]}),
-            }]}},
-            {"type": "assistant", "message": {"role": "assistant", "content": reply}},
-        ]
-        _ = source.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-        receipt = worker.transcript_receipt(worker_admission.transcript_entries(source, set()),
-                                            prompt, worker.DoneReply(dispatch_id))
-        self.assertEqual(receipt, worker.TranscriptReceipt(worker.DispatchComplete(reply), frozenset()))
+        for instruction, lookup, suffix, completed in (
+                ("old", "exact prompt", "", True), ("old", "dispatch id", "", True),
+                ("new", "dispatch id", "", True), ("new", "dispatch id", ".", True),
+                ("new", "dispatch id", "..", False), ("new", "dispatch id", " extra", False),
+                ("new", "dispatch id", "\nLater text", False), ("new", "dispatch id", "-another", False)):
+            with self.subTest(instruction=instruction, lookup=lookup, suffix=suffix):
+                prompt = (f'Read the unchanged prompt file "{self.prompt}". ' + (
+                    f"End your final reply with DONE {dispatch_id}." if instruction == "old" else
+                    f"End your final reply with this line alone: DONE {dispatch_id}\n"
+                    + "A reply that waits on a detached run is not final."))
+                reply = "The work is complete.\nDONE " + dispatch_id + suffix
+                records = [
+                    {"type": "user", "message": {"role": "user", "content": prompt}},
+                    {"type": "api-request-blob", "message": {"role": "user", "content": [{
+                        "type": "text", "text": json.dumps({"messages": [{"role": "user", "content": prompt}]}),
+                    }]}},
+                    {"type": "assistant", "message": {"role": "assistant", "content": reply}},
+                ]
+                _ = source.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+                receipt = worker.transcript_receipt(worker_admission.transcript_entries(source, set()),
+                    prompt if lookup == "exact prompt" else worker.DispatchPrompt(dispatch_id), worker.DoneReply(dispatch_id))
+                expected = worker.DispatchComplete(reply) if completed else worker.DispatchSubmitted(reply)
+                self.assertEqual(receipt, worker.TranscriptReceipt(expected, frozenset()))
 
     def test_agent_exit_after_done_still_publishes_the_reply(self) -> None:
         opened = self.opened()
@@ -1091,7 +1100,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_a_reply_after_the_state_read_completes_the_dispatch(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane, line = self.agent.submitted[-1]
-        dispatch_id = line.split("DONE ")[-1].split(".")[0]
+        dispatch_id = line.split("DONE ")[-1].split()[0].removesuffix(".")
         self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
         final = "The result is verified.\nDONE " + dispatch_id
         observe = worker_panes.observe_worker
@@ -1121,7 +1130,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.unfinished_turn("review")
         pane, line = self.agent.submitted[-1]
         row = self.agent.row(pane)
-        dispatch_id = line.split("DONE ")[-1].split(".")[0]
+        dispatch_id = line.split("DONE ")[-1].split()[0].removesuffix(".")
         path, record = self.detached_record(row, "stage-one-check")
         record["delivery"] = f"sent: worker {row.name} at {pane}"
         atomic_file.write_text_atomic(path, json.dumps(record))
@@ -1137,7 +1146,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         pane, line = self.agent.submitted[-1]
         row = self.agent.row(pane)
-        dispatch_id = line.split("DONE ")[-1].split(".")[0]
+        dispatch_id = line.split("DONE ")[-1].split()[0].removesuffix(".")
         path, record = self.detached_record(row, "private-check")
         for status, delivery, pending in (
             ("finished", "nothing delivered: exit 1 with a done message", False),
@@ -1741,8 +1750,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
         atomic_file.write_text_atomic(ready, "ready\n")
         self.assertEqual(self.finish("review", turn_end.EventKind.STAGE_READY), turn_end.TurnOutcome.SUBMITTED)
-        first = self.agent.submitted[0][1].split("DONE ")[-1].split(".")[0]
-        second = self.agent.submitted[1][1].split("DONE ")[-1].split(".")[0]
+        first = self.agent.submitted[0][1].split("DONE ")[-1].split()[0].removesuffix(".")
+        second = self.agent.submitted[1][1].split("DONE ")[-1].split()[0].removesuffix(".")
         self.assertEqual(second, first + "-2")
         self.assertEqual(self.reply.read_text(), "The previous full report.\n")
         self.assertEqual(self.finish("review"), turn_end.TurnOutcome.DONE)
