@@ -87,6 +87,22 @@ class ShellConfTests(unittest.TestCase):
             self.assertEqual(result.stdout, "4\n")
             self.assertEqual(result.stderr, "")
             self.assertFalse(log.exists())
+        _ = log.write_text("")
+        for destination in (str(log), "", None):
+            with self.subTest(conf_record=destination):
+                environment = {**self.env}
+                if destination is None:
+                    _ = environment.pop("CONF_READ_LOG", None)
+                else:
+                    environment["CONF_READ_LOG"] = destination
+                before = log.read_text().splitlines()
+                result = subprocess.run(
+                    [*self.shell, "-c", 'source "$1"; conf_record raw_reader; printf done',
+                     "record-test", str(SHELL_READER)], env=environment,
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done", ""))
+                self.assertEqual(log.read_text().splitlines(), before + (["raw_reader"] if destination else []))
 
     def test_normal_integer_enum_and_text_reads_use_no_child_process(self) -> None:
         self.write("# whole: -2..4\ncount=4\n# one of: fast, slow\nmode=fast\npath=a=b\n")

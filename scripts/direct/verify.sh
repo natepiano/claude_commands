@@ -626,6 +626,9 @@ hash_stream() {
     printf '%s\n' "${hash%% *}"
 }
 
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf_record.sh"
+
 lint_code_key() {
     local file hash
     hash="$(
@@ -635,6 +638,7 @@ lint_code_key() {
                 "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"; do
                 if [[ -f "$file" ]]; then
                     printf 'present\0'
+                    case "$file" in *.conf) stem="${file##*/}"; conf_record "${stem%.conf}" ;; esac
                     cat -- "$file" || exit 1
                 else
                     printf 'absent\0'

@@ -2563,3 +2563,42 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Floor: the per-fixture copies already turned off most upkeep. The Work Order estimate (about 50 CPU s on 12 modules) did not hold on this base.
 
 **Ruled out:** a runner-wide Git upkeep setting for speed. Keep the per-fixture copies; several of them are race guards for fixture removal.
+
+### Phase 129 — Every config reader records its read, so a config edit selects its tests  · status: done
+**Depends on:** Phase 128
+
+#### Work Order
+
+**Goal:** Each of the nine raw config readers that Phase 127 named records the config stem in `CONF_READ_LOG`, so a full gate records the modules that read that config.
+
+**Decision:** Builds showrunner, 2026-11-10: after Phase 128, route the nine raw readers through `conf.py` or `conf.sh`; where a reader cannot use them, state why in the plan; get each owner's go.
+
+**Spec:**
+1. `scripts/lib/conf.sh`: add `conf_record <stem>`. It appends the stem to `CONF_READ_LOG` when the variable is set and does nothing otherwise. `conf_value` calls it in place of its own append. One recorder for shell readers.
+2. Python readers record through `scripts/lib/conf_reads.py`: `conf_reads.read_text(path)` for a text read, `conf_reads.record(stem)` before any other read of the file (bytes, a hash, a line loop). Do not add a second recorder.
+3. Record at each raw config read in these files:
+   - `scripts/statusline/statusline.sh`: `statusline.conf` and `user_zone.conf`. Source `conf.sh` or call `conf_record`; keep the status line start time (no added process).
+   - `scripts/lint/lint_config.sh`: `lint.conf`.
+   - `scripts/direct/progress_history.py`: `direct.conf` in `_config_digest`.
+   - `scripts/direct/verify.sh`: `lint.conf` in `lint_code_key`, and each other raw read of a `config/*.conf` file.
+   - `scripts/accounts/new_account.py`: `statusline.conf` in `statusline_color_step`.
+   - `scripts/lib/zone.py`: `user_zone.conf` reads.
+   - `scripts/lib/tune.py`: the source read at `:103`.
+   - `scripts/lib/models_registry.py`: the edit snapshots (`before`, `after`) record `models`.
+   - `scripts/aws_target/deploy.py`: each raw `config/*.conf` read.
+   A read of a file that is not under `config/` gets no record. A reader that cannot record gets one plan line that says why.
+4. Search `scripts/` for other raw `config/*.conf` reads that do not record (outside `conf.py`, `conf.sh`, `conf_reads.py`). List them in the reply; do not change them.
+5. Tests: one row in `scripts/lib/test_conf_sh.py` for `conf_record` (log set and unset). For each changed reader, add a row to its existing test module only where that module already runs the read path; the row sets `CONF_READ_LOG` and checks the stem. Name each reader without a row in the reply. The rows fail on the old code.
+
+**Files:**
+- `scripts/lib/conf.sh` — `conf_record`
+- `scripts/statusline/statusline.sh`, `scripts/lint/lint_config.sh`, `scripts/direct/progress_history.py`, `scripts/direct/verify.sh`, `scripts/accounts/new_account.py`, `scripts/lib/zone.py`, `scripts/lib/tune.py`, `scripts/lib/models_registry.py`, `scripts/aws_target/deploy.py` — one recorder line at each read
+- `scripts/lib/test_conf_sh.py` — the `conf_record` row
+- `scripts/statusline/test_statusline.py`, `scripts/lib/test_zone.py`, `scripts/lib/test_tune.py`, `scripts/accounts/test_new_account.py`, `scripts/direct/test_progress_history.py`, `scripts/aws_target/test_deploy.py`, `scripts/lib/test_models_registry.py`, `scripts/direct/test_verify_lint_cache_versions.py`, `scripts/lint/test_invoke_scope.py` — one row each where the read path already runs
+
+**Workers:** 1 writer. Each edit is one recorder line, and each test row follows its read path, so the work does not split.
+- impl: all files.
+
+**Goes:** sdlc, builds and natedev (root showrunner), 2026-11-11, for all files. Keep each edit to one recorder line at each read: open branches change `verify.sh` (builds-queue, natedev-verify), `progress_history.py` (build-followups-hierarchies, sdlc-devtools-readers3t, sdlc-roles) and `models_registry.py` (devtools producers).
+
+**Acceptance gate:** every changed module passes through `module_run.py`; basedpyright 0/0/0 and shellcheck clean on the changed files. A full gate on a cloud box records the new stems: `statusline`, `user_zone`, `lint`, `direct`, `models` appear for the modules that run those readers. The phase is not a speed phase; its proof is the recorded stems.

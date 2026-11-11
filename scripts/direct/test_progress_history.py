@@ -8,7 +8,7 @@ from scripts.agents import remote
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import atomic_file, models_registry
+from scripts.lib import atomic_file, conf_reads, models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -169,9 +169,11 @@ class ProgressHistoryTests(unittest.TestCase):
         script.chmod(0o755)
         digest = cast(Callable[[], str], vars(progress_history)["_config_digest"])
         clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
+        reads = self.root / "config-reads"
         original = self.models_config_file.read_text()
         configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
         for inherited in (False, True):
+            _ = reads.write_text("")
             with self.subTest(inherited=inherited), patch.object(models_registry, "launch_configuration", wraps=models_registry.launch_configuration) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
                 "HOME": str(self.root), "CONF_DIR": str(settings), "MODELS_CONFIG_FILE": str(self.models_config_file),
                 "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
@@ -181,7 +183,9 @@ class ProgressHistoryTests(unittest.TestCase):
                 clear()
                 try:
                     text = original if inherited else self.models_config_file.read_text()
-                    self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                    with conf_reads.record_reads(reads):
+                        self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                    self.assertIn("direct", reads.read_text().splitlines())
                     self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
                     self.assertEqual(launches.call_count, int(inherited), "telemetry entered the fresh launch path")
                 finally:
