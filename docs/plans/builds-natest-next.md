@@ -109,12 +109,11 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
   - Measure current claim and release command CPU before proposing another change. Route any remaining production change through its owner. Give `offload.py` one writer.
   - Completion condition: report the measured remaining cost and any owner proposal, and update affected caller measurements under matching conditions.
   - Revealed by: Phase 29 trace and Phase 30 profile, 2026-11-05. Updated after Phase 117.
-- [ ] **Architecture proposal: one injected Git runner in fast_track.py**
-  - Target: `scripts/production/fast_track.py` (owner: production) and `scripts/production/test_fast_track.py`
-  - Why needed: Phase 33 measured 2,937 Git calls that take 27.6 s. The module's paired median is 97.9 s.
-  - Completion condition: decision tests run against the runner; a few process tests keep real Git; same-load pairs show the real gain.
-  - Risk: a recorded Git transcript is a second model of Git that can drift from real Git (showrunner, 2026-11-04).
-  - Revealed by: Phase 7; showrunner ruling 2026-11-04 (next, not current).
+- [ ] **Assess further Git savings through the existing GitRunner.**
+  - Target: `scripts/production/fast_track.py` (owner: devtools-unit) and `scripts/production/test_fast_track.py`
+  - Why needed: Git and required children dominate the module. Phase 139 establishes no reliable candidate saving through `GitRunner` extensions.
+  - Completion condition: controlled paired measures before another implementation is proposed. Real interruption, concurrent publication, recovery, garbage collection and process-group tests keep real Git.
+  - Revealed by: Phases 7 and 139; Phase 143 measures which Git calls the tests need.
 - [ ] **Measure `test_verify_lint_judgment.py` again when its owners' changes land.**
   - Target: `direct/test_verify_lint_judgment.py` (198.6 s after Phase 31)
   - Queue Phase 13 completed the admission start-spacing fix. Measure both lint modules on the merged code. Owners (showrunner, 2026-11-05): queue-unit keeps the lighter admission client start (`scripts/lint/memory_gate.sh:17-22`) and the `build_hold.py` import work. verify-unit keeps step-record state reuse (`verify.sh:356-358`, `verify.sh:1925-1934`), then a callable repair decision (`verify.sh:3711-3714`).
@@ -157,7 +156,7 @@ Each floor row states its measurement conditions: revision, filesystem roots and
 
 | Module | Floor (pair median wall s) | Limiting operation | Phase |
 | --- | --- | --- | --- |
-| `production/test_fast_track.py` | Historical wall median: 97.9 s in Phase 33; Phase 88 reports 58.4 CPU s | Real Git and remaining child processes. Phase 87 removed the blocked-hook guard. Profile current fixture, Git and child-process CPU before confirming a floor. | 33, 87, 88 |
+| `production/test_fast_track.py` | Historical wall median: 97.9 s in Phase 33; Phase 88 reports 58.4 CPU s. Phase 139 profile: 45.7 CPU s, 52 tests. | Git and required children dominate. Both isolated trials regress; combined gains remain uncertain. No absolute CPU floor is established. devtools-unit owns further Git work. | 33, 87, 88, 139 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | `eligible` and `reserve` process startup after queue Phases 30–31 removed the admission imports. Remeasured 2026-11-09 with `module_cost.py`, sequential, revision `5ff151123`: 47.9 CPU s; `build_targets.py` makes 49 starts for 15.9 s through `verify.sh` | 24 |
 | `style/test_crate_run.py` | Phase 77 CPU floor: 53.25 s | Production Git wrappers cost 40.8 CPU s; natedev-style owns reuse of the validated checkout | 77 |
 | `direct/test_verify_mac_only.py` | 185.8 (load 52-70) | Real `build_targets.py` processes through `verify.sh`. Queue Phases 30–31 removed the old admission imports. Profile current startup and fixture CPU before confirming this floor. | 39, 41, 42 |
