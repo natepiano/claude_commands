@@ -23,8 +23,9 @@ from typing import cast
 
 from scripts.lib import conf
 from scripts.test_times.gate_record import (
-    ModuleReadRecord, NoConfigReadRecord, NoFolderScanRecord, RecordedConfigReads,
-    RecordedFolderScans, module_read_record,
+    ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
+    NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
+    RecursiveDirectory, WholeRepository, module_read_record,
 )
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
@@ -313,24 +314,29 @@ def latest_module_reads() -> dict[str, ModuleReadRecord]:
 
     _ = index.update()
     with closing(index.read_only()) as connection:
-        rows = cast(list[tuple[str, str, str | None, str | None]], connection.execute(
+        rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
             "WITH latest AS (SELECT "
             + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
             + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
             + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
             + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
             + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate) "
+            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
             + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
-            + "CASE WHEN run_id = folder_gate THEN folder_scans END FROM gate_modules CROSS JOIN latest "
-            + "WHERE run_id = config_gate OR run_id = folder_gate ORDER BY suite, module, attempt"
+            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
+            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
+            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
         ).fetchall())
     recorded: dict[str, ModuleReadRecord] = {}
-    for suite, module, config_json, folder_json in rows:
+    for suite, module, config_json, folder_json, content_json in rows:
         path = f"scripts/{suite}/{module}"
         reads = module_read_record(json.loads(config_json) if config_json is not None else None,
-                                   json.loads(folder_json) if folder_json is not None else None)
-        previous = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord()))
+                                   json.loads(folder_json) if folder_json is not None else None,
+                                   json.loads(content_json) if content_json is not None else None)
+        previous = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
         configs = previous.config_reads
         if isinstance(reads.config_reads, RecordedConfigReads):
             stems = reads.config_reads.stems
@@ -343,7 +349,13 @@ def latest_module_reads() -> dict[str, ModuleReadRecord]:
             if isinstance(folders, RecordedFolderScans):
                 scans |= folders.folders
             folders = RecordedFolderScans(scans)
-        recorded[path] = ModuleReadRecord(configs, folders)
+        contents = previous.content_reads
+        if isinstance(reads.content_reads, RecordedContentReads):
+            paths = reads.content_reads.paths
+            if isinstance(contents, RecordedContentReads):
+                paths |= contents.paths
+            contents = RecordedContentReads(paths)
+        recorded[path] = ModuleReadRecord(configs, folders, contents)
     return recorded
 
 
@@ -369,10 +381,15 @@ def changed_path_parents(repo: Path, changed: set[str], base_paths: set[str]) ->
 
 def scans_changed_paths(scans: RecordedFolderScans, changed: set[str], parents: set[str]) -> bool:
     for folder in scans.folders:
-        if folder == "/" or folder in parents:
-            return True
-        if folder.endswith("/") and any(path == folder[:-1] or path.startswith(folder) for path in changed):
-            return True
+        match folder:
+            case WholeRepository():
+                return True
+            case ListedDirectory(path):
+                if path in parents:
+                    return True
+            case RecursiveDirectory(prefix):
+                if any(path == prefix or path.startswith(prefix + "/") for path in changed):
+                    return True
     return False
 
 
@@ -504,6 +521,8 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                    if path.startswith("config/") and path.endswith(".conf")}
         recorded = latest_module_reads() if changed else {}
         has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
+        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
+        content_changes = {path for path in changed if not path.startswith("config/")}
         base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
         scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
         retained = source_blobs(paths | dirty, blobs)
@@ -525,15 +544,17 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
-            reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord()))
+            reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
             config_reads = reads.config_reads
             config_changed = bool(configs) and (isinstance(config_reads, NoConfigReadRecord)
                 or bool(config_reads.stems & configs) or bool(graph.config_reads.get(path, frozenset()) & configs))
             folder_changed = has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
                 or scans_changed_paths(reads.folder_scans, changed, scanned_parents))
+            content_changed = bool(content_changes) and has_content_records and (isinstance(reads.content_reads, NoContentReadRecord)
+                or bool(reads.content_reads.paths & content_changes))
             if (path in changed or graph.imports.get(path, set()) & python
                     or old_graph.get(path, set()) & removed or names_changed_file(graph, path, named, folder_names)
-                    or config_changed or folder_changed):
+                    or config_changed or folder_changed or content_changed):
                 selected.append(module)
                 continue
             stems = folder_stems.get(str(Path(path).parent), set())

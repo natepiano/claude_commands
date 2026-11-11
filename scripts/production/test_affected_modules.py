@@ -174,6 +174,43 @@ class AffectedModulesTests(unittest.TestCase):
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
 
+    def test_content_reads_select_read_files_and_keep_config_selection(self) -> None:
+        self.add_test("checks/test_reader.py", "VALUE = 1\n")
+        cases: tuple[tuple[str, str, object, bool, bool, tuple[str, ...]], ...] = (
+            ("changed script", "scripts/component/subject.py", ["scripts/component/subject.py"], False, True, ("test_reader.py",)),
+            ("removed script", "scripts/component/subject.py", ["scripts/component/subject.py"], True, True, ("test_reader.py",)),
+            ("copied config", "config/limits.conf", ["config/limits.conf"], False, True, ()),
+            ("null content", "scripts/component/subject.py", None, False, True, ("test_reader.py",)),
+            ("empty content", "scripts/component/subject.py", [], False, True, ()),
+            ("no content gate", "scripts/component/subject.py", [], False, False, ()),
+        )
+        for label, path, contents, removed, recorded, expected in cases:
+            with self.subTest(case=label):
+                self.write(path, "VALUE = 1\n")
+                self.certify()
+                log = self.repo / ".git/buildlog/mac/fixture.jsonl"
+                run = cast(dict[str, object], json.loads(log.read_text()))
+                module_rows = cast(list[dict[str, object]], run["modules"])
+                for row in module_rows:
+                    row["folder_scans"] = []
+                    if recorded:
+                        row["content_reads"] = contents if row["module"] == "test_reader.py" else []
+                run.update(id="content-full", started_at="2028-01-01T00:00:00Z")
+                newer = {**run, "id": "newer-no-content", "started_at": "2029-01-01T00:00:00Z",
+                         "modules": [{key: value for key, value in row.items() if key != "content_reads"}
+                                     for row in module_rows]}
+                ignored: list[dict[str, object]] = [{**run, "id": selection, "selection": selection, "aborted": aborted,
+                            "started_at": "2030-01-01T00:00:00Z",
+                            "modules": [{**row, "content_reads": []} for row in module_rows]}
+                           for selection, aborted in (("full", True), ("affected", False))]
+                _ = log.write_text("".join(json.dumps(record) + "\n" for record in (run, newer, *ignored)))
+                if removed:
+                    (self.repo / path).unlink()
+                else:
+                    self.write(path, "# .astimezone()\nVALUE = 2\n")
+                _ = self.commit()
+                self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
+
     def test_folder_and_config_records_use_independent_latest_full_gates(self) -> None:
         self.write("config/limits.conf", "value=one\n")
         self.write("assets/kept.txt", "base\n")

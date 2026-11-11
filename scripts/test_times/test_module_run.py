@@ -364,6 +364,19 @@ class Reads(unittest.TestCase):
             ("bytes", "os.listdir(os.fsencode(ROOT / 'listed'))", ["listed"]),
             ("relative", "os.listdir('listed')", ["listed"]),
             ("root", "os.listdir(ROOT)", ["."]),
+            ("read file", """(ROOT / 'listed/item.txt').read_text()
+with open(ROOT / 'listed/item.txt', 'rb') as source: source.read()
+descriptor = os.open(ROOT / 'listed/item.txt', os.O_RDONLY)
+try:
+    os.read(descriptor, 16)
+finally:
+    os.close(descriptor)""", []),
+            ("read outside", "(OUTSIDE / 'outside.txt').read_text()", []),
+            ("read config", "(ROOT / 'config/limits.conf').read_text()", []),
+            ("read cache", "(ROOT / '__pycache__/saved.bin').read_bytes()", []),
+            ("write modes", """for mode in ('a', 'w', 'r+'):
+    with open(ROOT / 'listed/item.txt', mode) as target: target.write('fixture')""", []),
+            ("child read", "subprocess.run([sys.executable, '-c', \"from pathlib import Path; Path('listed/item.txt').read_text()\"], cwd=ROOT, check=True)", []),
             ("patch isolation", """listed = str(ROOT / 'listed')
 outside = str(OUTSIDE)
 with mock.patch.object(os.path, 'realpath', wraps=os.path.realpath) as realpath, \\
@@ -414,6 +427,11 @@ finally:
                 target = root / folder
                 target.mkdir()
                 _ = (target / "item.txt").write_text("fixture\n")
+            (root / "config").mkdir()
+            _ = (root / "config/limits.conf").write_text("value=fixture\n")
+            (root / "__pycache__").mkdir()
+            _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
+            _ = (outside / "outside.txt").write_text("fixture\n")
             environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(root),
                            "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
             for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
@@ -433,6 +451,7 @@ finally:
                                             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(read_times(output).get("folder_scans"), expected)
+                    self.assertEqual(read_times(output).get("content_reads"), ["listed/item.txt"] if name == "read file" else [])
 
     def sender_fixture(self, mode: str) -> FixtureRun:
         with tempfile.TemporaryDirectory() as directory:
