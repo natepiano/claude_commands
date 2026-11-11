@@ -990,31 +990,13 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/buildlog/test_costs.py` — the removed-command test, with rows for `costs` and `charts`.
 
 ### Phase 48 — buildlog names a wrong command in one line · status: done
-**Depends on:** none.
 
-From the builds showrunner (not the user), 2026-11-11, with the user's words on change C1402: "a wrong word must be named". `buildlog charts`, like any unknown command, prints the full help page and never says the word is wrong.
+#### As-built
 
-#### Work Order
-
-**Goal:** An unknown `buildlog` command prints one line that names the word, and exits 2. It prints no help page.
-
-**Spec:**
-- In `scripts/buildlog/cli.py`, an unknown command prints `buildlog: unknown command '<word>'; type buildlog to see the commands` to stderr and returns 2.
-- `buildlog` with no command still prints the help page to stderr and returns 2. `buildlog help`, `-h` and `--help` still print the help page and return 0.
-- `scripts/buildlog/test_costs.py`: the removed-commands test becomes one table. Its rows are `costs`, `charts` and a word that never was a command, each with the one line and exit 2. A row for no command expects the help page and exit 2. Each row keeps the assertion that the index is not opened.
-- The usage text in the `cli.py` docstring does not change.
+- An unknown `buildlog` command prints one line to stderr and exits 2: `buildlog: unknown command '<word>'; type buildlog to see the commands`. It prints no help page.
+- `buildlog` with no command prints the help page and exits 2. `help`, `-h` and `--help` print it and exit 0.
+- `test_unknown_commands_and_help_do_not_read_the_index` is one table: `costs`, `charts`, a word that never was a command, no command, and the three help forms. No row opens the index.
 
 **Files:**
-- `scripts/buildlog/cli.py`
-- `scripts/buildlog/test_costs.py`
-
-**Workers:** `1 writer`
-- writer — both files and the test.
-
-**State:** none.
-
-**Acceptance gate:**
-- `cli.main(["charts"])` prints `buildlog: unknown command 'charts'; type buildlog to see the commands` and returns 2, by the `test_costs` row.
-- `cli.main([])` prints the help page and returns 2, by the `test_costs` row.
-- `scripts.buildlog.test_costs` and `scripts.buildlog.test_charts` pass.
-- `basedpyright` reports 0 errors and 0 warnings on the two files.
+- `scripts/buildlog/cli.py` — the unknown-command line at the end of `main`.
+- `scripts/buildlog/test_costs.py` — the unknown-command and help table.
