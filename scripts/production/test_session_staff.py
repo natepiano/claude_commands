@@ -10,7 +10,6 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
@@ -59,14 +58,20 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertEqual(lines, [f"anomaly: {row.id}: {anomaly}"] if anomaly else [])
         self.assertEqual(self.staff_state(), before)
 
-    def test_missing_roster_read_creates_nothing_and_a_writer_creates_the_folder(self) -> None:
-        path = self.root / "missing/run/mesh_roster.json"
-        self.assertEqual(labels.read_worker_roster(path), {})
-        self.assertFalse(path.parent.parent.exists())
-        with worker_lifecycle.locked_state(path) as handle:
-            handle.publish('{}')
-        self.assertEqual(path.read_text(), '{}')
-        self.assertEqual(labels.read_worker_roster(path), {})
+    def test_run_workers_follow_the_staff_owner_without_a_roster(self) -> None:
+        fixture = self.row_production()
+        showrunner_worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
+        rows = (fixture.runner, fixture.unit, fixture.worker)
+        before = self.staff_state()
+        for state, membership, expected in (
+            ({"owner_staff_id": fixture.unit.id}, rows, (fixture.worker,)),
+            ({"owner_staff_id": fixture.runner.id}, (*rows[:-1], showrunner_worker), (showrunner_worker,)),
+            ({"main_agent": {"session_id": fixture.unit.current_session}}, rows, (fixture.worker,)),
+            ({}, rows, ()),
+        ):
+            with self.subTest(state=state):
+                self.assertEqual(labels.run_workers(state, staff.StaffSnapshot(membership)), expected)
+        self.assertEqual(self.staff_state(), before)
 
 
     def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:

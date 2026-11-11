@@ -664,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--why", default="")
     command = commands.add_parser("restart")
+    _ = command.add_argument("--why", default=restart.DEFAULT_RESTART_CAUSE)
     _ = command.add_argument("--all", action="store_true")
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--only", default="")
@@ -710,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
                     selected_account = accounts.NamedAccount(named.label, accounts.account_dir(named.label))
             return restart.restart(stop_all=options.all, dry_run=options.dry_run,
                                    only=tuple(item for item in options.only.split(",") if item),
-                                   account=selected_account)
+                                   account=selected_account, why=options.why)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0
