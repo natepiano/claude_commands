@@ -39,6 +39,11 @@ class WorkerResume:
     state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker
     role: staff.WorkerRole
     source: str
+    close_check: worker_panes.CloseAllowed | worker_panes.Kept = worker_panes.CloseAllowed()
+
+    @property
+    def kept_open_reason(self) -> str:
+        return self.close_check.blocker if isinstance(self.close_check, worker_panes.Kept) else ""
 
 
 def _observe(move: WorkerMove) -> worker_panes.WorkerPane:
@@ -136,10 +141,13 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
     return replace(failure, reason=reason)
 
 
-def _move_decision(move: WorkerMove,
-                   lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+def _move_decision(move: WorkerMove, *, lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse =
+                   worker_panes.WorkerLockAtUse.ACQUIRE
                    ) -> WorkerResume | accounts.IdleWorkerPaneClose | accounts.SessionMoveRefused | stop_results.ClaudeUp:
     """Use the same evidence for a preview and a locked move."""
+    locked = worker_panes.check_worker_lock(move.row, lock)
+    if isinstance(locked, worker_panes.Kept):
+        return accounts.SessionMoveRefused(move.row.id, locked.blocker)
     state = _observe(move)
     if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: {state.reason}")
@@ -148,11 +156,12 @@ def _move_decision(move: WorkerMove,
         return accounts.SessionMoveRefused(move.row.id, f"anomaly: {' '.join(active.reason.splitlines())}")
     if isinstance(active, progress_history.NoActiveDispatch) and isinstance(state, worker_panes.ClosedWorker):
         return accounts.SessionMoveRefused(move.row.id, "nothing to move", 0)
+    close_check: worker_panes.CloseAllowed | worker_panes.Kept = worker_panes.CloseAllowed()
     if (isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
-            and worker_panes.worker_state(state) == "idle"
-            and isinstance(worker_panes.worker_dispatch_state(move.row, move.run, lock),
-                           (worker_panes.ReleasedWorkerPass, worker_panes.CompletedWorkerPass))):
-        return accounts.IdleWorkerPaneClose()
+            and worker_panes.worker_state(state) == "idle"):
+        close_check = worker_panes.can_close(state, run=worker_panes.DispatchRun(move.run), lock=lock)
+        if isinstance(close_check, worker_panes.CloseAllowed):
+            return accounts.IdleWorkerPaneClose()
     role = worker_panes.dispatch_role(move.row)
     if isinstance(role, worker_panes.WorkerRoleUnavailable):
         return accounts.SessionMoveRefused(move.row.id, role.reason)
@@ -166,11 +175,11 @@ def _move_decision(move: WorkerMove,
             return replace(running, session_id=move.row.id)
     else:
         source = _source_account(move.row)
-    return WorkerResume(state, role, source)
+    return WorkerResume(state, role, source, close_check)
 
 
 def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
-    decision = _move_decision(move, hold)
+    decision = _move_decision(move, lock=hold)
     if isinstance(decision, accounts.IdleWorkerPaneClose):
         closed = worker_panes.close(move.parent, staff.WorkerName.parse(move.row.name), lock=hold)
         if isinstance(closed, worker_panes.Closed):

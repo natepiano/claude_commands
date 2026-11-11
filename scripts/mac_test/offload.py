@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict,
 from urllib.parse import quote
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import cargo_manifest, claim_state
 from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
@@ -2630,13 +2631,12 @@ def holder_session() -> str:
     from scripts.build_hold import build_hold
 
     owner = build_hold.owning_session()
-    if isinstance(owner, build_hold.OwningSession):
+    if isinstance(owner, OwningSession):
         return owner.session_id
     return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"
 
 
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
-    from scripts.build_hold.build_hold import NoOwningSession, OwningSession
     from scripts.copies import copies
 
     words = arguments.nextest_words

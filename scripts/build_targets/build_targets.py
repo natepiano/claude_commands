@@ -29,6 +29,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 
@@ -106,8 +107,6 @@ def parser() -> argparse.ArgumentParser:
         _ = release.add_argument("--" + field, default="")
 
     def parsed_session(value: str) -> SubmittingSession:
-        from scripts.build_hold.build_hold import NoOwningSession, OwningSession
-
         return OwningSession(value) if value else NoOwningSession()
 
     _ = release.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
@@ -936,13 +935,13 @@ class NoBlockingHold:
 
 
 def hold_waited_on(holds: build_hold.NatedevHolds,
-                   owner: build_hold.OwningSession | build_hold.NoOwningSession,
+                   owner: OwningSession | NoOwningSession,
                    directory: Path) -> build_hold.Holder | NoBlockingHold:
     """Choose the oldest hold that applies to the caller and belongs to another session."""
     from scripts.build_hold import build_hold
 
     own_key = ""
-    if isinstance(owner, build_hold.OwningSession):
+    if isinstance(owner, OwningSession):
         try:
             own_key = build_hold.holder_path(directory, owner.session_id).name
         except ValueError:
@@ -1063,7 +1062,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
                 if isinstance(resolution, build_hold.RunNotInStaff):
                     line = (f"{name}: build has no run pointer ({display_field(str(resolution.run))}); "
                             + f"waits on {display_field(blocking.name)} hold for {display_field(blocking.purpose)}.")
-                elif isinstance(session, build_hold.NoOwningSession):
+                elif isinstance(session, NoOwningSession):
                     line = (f"{name}: build has no session; waits on {display_field(blocking.name)} hold "
                             + f"for {display_field(blocking.purpose)}.")
                 else:
@@ -1161,7 +1160,7 @@ def command_check_local(caller: str = "", *,
             if (wait_clock() - blocking.since).total_seconds() >= escalation:
                 print(f"{label}: natedev has been held for 2 h by {display_field(blocking.name)}; ask them.", file=output)
         else:
-            if isinstance(owner, build_hold.OwningSession):
+            if isinstance(owner, OwningSession):
                 _ = build_hold.register_wait(owner.session_id)
             print(f"natedev is held by {display_field(blocking.name)} for {display_field(blocking.purpose)}; launch after the release.")
         return 10
