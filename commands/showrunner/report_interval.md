@@ -5,30 +5,37 @@ argument-hint: "[minutes]"
 
 # Report interval
 
-Changes how often the scheduled updates come. Run it in the showrunner session
-during `/showrunner:produce`, whose state (`PRODUCTION_DOC`, `PROMPT_FILE`,
-`LOG`, `ZONE`, `CHECKOUT`, `NOTIFIER`, `UPDATES`) it uses.
+This command changes the interval for scheduled updates.
+Run it in the showrunner session during `/showrunner:produce`.
+It uses `PRODUCTION_DOC`, `LOG`, `ZONE`, `CHECKOUT`, `NOTIFIER`, and `UPDATES` from that session.
 
-**Usage:** `/showrunner:report_interval [minutes]`. With no argument, run
-`NOTIFIER status UPDATES`, report the interval and the next tick, and change
-nothing; when the doc's Updates line reads `on demand`, say updates are on demand. With anything but a whole number of minutes above 0, say so and stop.
+**Usage:** `/showrunner:report_interval [minutes]`.
+Without an argument, run `NOTIFIER status UPDATES`.
+Report the interval and the next tick.
+If the document specifies `on demand`, report that setting.
+An interval must be a whole number of minutes above zero.
+Report an invalid argument without changes.
 
-1. **Change it.** With the Edit tool, change the production doc's
-   `**Updates:**` line to `every N minutes`, adding it under Production
-   Context when there is none, and `every N minutes` in `PROMPT_FILE`.
-   Run `NOTIFIER interval UPDATES <minutes>`; it restarts the instance and
-   prints `next_due`. When it refuses (exit 2), report what it names and stop.
-   A doc whose line read `on demand`, or had none, has a stopped instance: commit the doc
-   first (step 2), run `update_registration.py register` as
-   `/showrunner:produce` does at start, which rewrites `PROMPT_FILE` and sets
-   the interval, then `NOTIFIER start UPDATES`, which starts the instance and
-   prints `next_due`.
-2. **Commit** the production doc in `CHECKOUT` as
-   `production(<name>): updates every <minutes> minutes`. It goes out with the
-   next push of the merge branch.
-3. **Log** one line in `LOG`: the old and new interval, and the next tick.
-4. **Tell the user** in one line: the new interval and the next tick, in `ZONE`
-   and UTC.
+1. Change the production document's `**Updates:**` line to `every N minutes`.
+2. Add that line under Production Context if the line is absent.
+3. Run `NOTIFIER interval UPDATES <minutes>`.
+4. Report any refusal from that command.
+5. Commit the production document in `CHECKOUT` with `production(<name>): updates every <minutes> minutes`.
 
-The new interval holds from then on: a `/showrunner:dailies` the user runs
-restarts the instance at it (`/showrunner:dailies` → Status check and clock).
+The interval command restarts the timer and prints `next_due`.
+A refusal has exit code 2 and ends this command.
+The document commit accompanies the next push of the merge branch.
+A document that specified `on demand`, or had no Updates line, has a stopped timer.
+For that timer, continue after the document commit:
+
+1. Run `update_registration.py register` as `/showrunner:produce` does at start.
+2. Run `NOTIFIER start UPDATES`.
+
+Registration sets the timer interval.
+The start command enables the timer and prints `next_due`.
+Each tick builds its prompt from the owner's current staff row and production document.
+
+1. Record the old interval, the new interval, and the next tick in `LOG`.
+2. Report the new interval and next tick in `ZONE` and UTC.
+
+A user-requested `/showrunner:dailies` restarts the timer with the new interval.

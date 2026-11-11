@@ -509,7 +509,6 @@ def remove_updates(owner: staff.StaffRow) -> None:
     """Remove the generated schedule files and retain reminders and history."""
     _ = notifier(["remove", f"showrunner-{owner.id}"])
     root = _showrunner_state_root()
-    (root / owner.id / "prompt.txt").unlink(missing_ok=True)
     (root / "counts" / owner.id).unlink(missing_ok=True)
 
 
@@ -563,7 +562,7 @@ def scheduled_prompt(minutes: int, production: Production) -> str:
 
 
 def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | None = None) -> list[str]:
-    """Copy missing scratchpad state and update the scheduled prompt."""
+    """Copy missing scratchpad state."""
     done: list[str] = []
     try:
         record = staff.snapshot() if record is None else record
@@ -571,15 +570,6 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
         copied = showrunners.adopt_session_state(identity, record=record)
         if copied:
             done.append(f"copied {', '.join(copied)} to {showrunners.session_state_dir(identity)}")
-        prompt_file = showrunners.SHOWRUNNER_STATE_DIR / identity / "prompt.txt"
-        if not prompt_file.exists():
-            return done
-        schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
-        minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
-        prompt = scheduled_prompt(minutes, production)
-        if prompt_file.read_text(encoding="utf-8") != prompt:
-            write_text_atomic(prompt_file, prompt)
-            done.append(f"rewrote {prompt_file} from produce.md")
     except (OSError, UnicodeError, RegistrationFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
         done.append(f"state move skipped: {error}")
     return done
@@ -603,22 +593,16 @@ def register(production: Production) -> None:
     # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
     minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
                         else (DEFAULT_MINUTES, False))
-    prompt = scheduled_prompt(minutes, production)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
         raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
     # The staff row owns the timer.
     owner = production.owner
-    state_root = _showrunner_state_root()
-    prompt_file = state_root / owner.id / "prompt.txt"
     updates = f"showrunner-{owner.id}"
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
-        write_text_atomic(prompt_file, prompt)
     check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {owner.id}"
     _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(minutes),
-              "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.name}",
+              "--prompt", "scheduled", "--from", f"showrunner-timer-{production.name}",
               "--check", check, *(["--aligned"] if aligned else [])])
     if isinstance(schedule, UpdatesOnDemand):
         _ = notifier(["stop", updates])
@@ -1531,6 +1515,8 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
+    prompt = commands.add_parser("prompt")
+    _ = prompt.add_argument("--owner", required=True)
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "questions-table", "migrate-questions"):
         subcommand = commands.add_parser(action)
@@ -1558,6 +1544,12 @@ def main() -> int:
     args = parser.parse_args()
     action = cast(str, args.action)
     try:
+        if action == "prompt":
+            production = read_production(cast(str, args.owner))
+            schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
+            minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
+            print(scheduled_prompt(minutes, production))
+            return 0
         identities = QuestionStaff.read() if action in ("ask", "questions-table") else None
         name = cast(str | None, args.production)
         if name is None:

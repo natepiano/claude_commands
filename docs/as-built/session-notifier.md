@@ -50,7 +50,13 @@ The session notifier sends a message to a live Claude session on a schedule: the
 
 The root is `$NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`. Each instance is a directory named `^[A-Za-z0-9][A-Za-z0-9._-]*$` holding:
 
-- `conf`: `TARGET` (`session:<id>` or a session name), `EVERY` (minutes), `COMMAND` or `PROMPT_FILE` (absolute), or `RUN` (a command line: a run-only instance, which has no `TARGET` and sends nothing), `FROM` (sender name, default the instance name), `CHECK` (a command line, may be empty), `HOLD` (0/1), `TIMEOUT` (seconds, default 120).
+- `conf`: `TARGET`, `EVERY`, `COMMAND` or `PROMPT=scheduled`, `RUN`, `FROM`, `CHECK`, `HOLD`, `ALIGN`, and `TIMEOUT`.
+  A scheduled showrunner target is `session:<staff-id>`.
+  `COMMAND` holds fixed message text; `PROMPT=scheduled` selects a prompt built at delivery.
+  `RUN` holds a command for an instance that sends no message.
+  `EVERY` specifies minutes; `TIMEOUT` specifies seconds and defaults to 120.
+  `FROM` defaults to the instance name; `CHECK` can be empty.
+  `HOLD` and `ALIGN` use 0 or 1.
 - `state`: `ENABLED`, `NEXT_DUE`, `LAST_SENT`, `LAST_RESTART`, `LAST_TARGET` (the socket of the last send).
 - `lock`: the instance's flock. Every read-modify-write of `conf` or `state` holds it, and each file is rewritten whole (temp file, then `mv`).
 - `fire.log`: one line per attempt, stamped in local time with UTC beside it: `<stamp> | exit <rc> | to <target> uds:<socket> | <send.py output>`, `<stamp> | skip <reason>` (`check timeout`, `check exit <rc>`, `session not running`, `session lookup exit <rc>`, `hold`), `<stamp> | hold released: socket changed|two intervals`, or, for a run-only instance, `<stamp> | run timeout` or `<stamp> | run exit <rc>` (a clean run logs nothing; its output replaces `run.log`).
@@ -74,9 +80,10 @@ job (15 s) → notifier.sh tick
     sessions.py socket TARGET       → none: skip "session not running"; records unreadable
                                       (exit 3): skip "session lookup exit 3"
     hold (HOLD=1 only)              → skip, or release and go on
+    PROMPT=scheduled               → build prompt from the current owner row; failure skips this tick
     record LAST_SENT, LAST_TARGET
     send.py --to uds:<socket> --from FROM --key notifier-<instance>
-            --summary 'scheduled update' --timeout TIMEOUT (--text COMMAND | --file PROMPT_FILE)
+            --summary 'scheduled update' --timeout TIMEOUT --text <fixed command or built prompt>
     append the outcome to fire.log
   wait for every subshell, release .tick.lock
 ```
@@ -87,7 +94,21 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 
 ### Delivery
 
-`sessions.py socket` reads every `*.json` record in the sessions directory, matches `session:<id>` against `sessionId` or a bare name against `name`, keeps records whose pid is alive (`PermissionError` counts as alive) and whose `messagingSocketPath` is a socket, and prints the socket with the newest `updatedAt`. `sessions.py address` takes the same targets and prints that socket as `uds:<socket>`, the `to` that `SendMessage` accepts for a session on this machine. No match exits 1; a usage error exits 2; a registry that cannot be listed, or an unreadable entry with no live match, exits 3. The socket is resolved on every send, so a restarted process is found at its new socket. `send.py` then relays through a headless `claude -p` (sonnet) that makes one `SendMessage` call to that socket. A `COMMAND` is sent as text; a `PROMPT_FILE` is read at send time, so editing the file changes the next tick's text. The key `notifier-<instance>` means a tick that could not be delivered (`QUEUED`, exit 1) replaces the previous queued one, so each instance has at most one tick in `send.py`'s queue.
+The notifier resolves `TARGET` through `sessions.py member-socket` for every send.
+For `session:<staff-id>`, the staff row supplies the current session.
+A restarted session can therefore receive messages at its current socket.
+
+`COMMAND` supplies fixed message text.
+For `PROMPT=scheduled`, the notifier runs `update_registration.py prompt --owner <staff-id>` before delivery.
+It removes the `session:` prefix from `TARGET` for that command.
+The command reads the owner's current staff row and production document.
+The document supplies the update interval; the staff row supplies the current name and document path.
+A failed build skips the tick and prints one stderr line.
+It does not record `LAST_SENT` or send a message.
+
+The notifier sends the prompt with `send.py --text`.
+The key `notifier-<instance>` limits each instance to one queued tick.
+An undelivered tick replaces the previous queued tick for that instance.
 
 ### CLI
 
@@ -95,7 +116,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 
 | Verb | What it does |
 | --- | --- |
-| `new <instance> --every <min> (--run <cmd> \| --to <target> (--command <text> \| --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--timeout <s>]` | `--run` makes a run-only instance that sends nothing; it takes none of `--to`, `--from`, `--check`, `--command`, `--prompt-file`, `--hold` (usage error, exit 2), and `status` shows its command in place of a target. Fresh instance: writes `conf` and `state`, enabled, prints `next_due`. Existing instance: rewrites `conf` only, prints nothing, so the clock and `ENABLED` stay as they were. Refuses (2) an empty command or prompt file, both or neither, `--every` or `--timeout` not a whole number above 0, a relative prompt path. |
+| `new <instance> --every <min> (--run <cmd> \| --to <target> (--command <text> \| --prompt scheduled)) [--from <sender>] [--check <cmd>] [--hold] [--timeout <s>]` | Creates an enabled instance with `conf` and `state`. An existing instance retains its clock and enabled setting. `--run` accepts no message options. Message instances require exactly one source: `--command` or `--prompt scheduled`. Empty commands and invalid intervals or timeouts return exit 2. |
 | `start <instance>` | `ENABLED=1`, schedules from now, prints `next_due`. |
 | `resume <instance>` | `ENABLED=1`, keeps `NEXT_DUE` unchanged, and prints `next_due`. A missed slot runs on the next tick; a future slot runs at its existing time. |
 | `stop <instance>` | `ENABLED=0`; `NEXT_DUE` stays. |
@@ -138,21 +159,38 @@ With `HOLD=1`, a tick skips (`skip hold`) while `LAST_SENT > LAST_RESTART`, that
 ### The showrunner instance
 
 `/showrunner:produce` owns `UPDATES` = `showrunner-<staff-id>`.
-The staff id keeps the timer instance and saved prompt path stable across a production rename.
+The staff id keeps the timer instance stable across a production rename.
 The rename command moves no timer instance.
-At start and resume, `update_registration.py register --production <showrunner name> --session <name>` writes the prompt and registers the timer:
+At start and resume, `update_registration.py register --production <showrunner name>` registers the timer:
 
 ```sh
-notifier.sh new showrunner-<staff-id> --to session:$CLAUDE_CODE_SESSION_ID --every <N> \
-  --prompt-file <PROMPT_FILE> --from showrunner-timer-<staff-id> \
+notifier.sh new showrunner-<staff-id> --to session:<staff-id> --every <N> \
+  --prompt scheduled --from showrunner-timer-<showrunner-name> \
   --check "zsh $HOME/.claude/scripts/production/production_check.sh <staff-id>"
 ```
 
-N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on the hour` in that line adds `--aligned`. There is no `--hold`. A repeated `new` on resume retargets the instance to the current session without moving the clock. The instance outlives the session. A tick arrives as a message from `showrunner-timer-<staff-id>` whose text starts `Scheduled update`; the showrunner treats it as the scheduled prompt and does not reply. A `/showrunner:dailies` the user types saves the `unit_status.sh` output and runs `dailies_input.py --user-run`, which checks the whole input, then runs `restart`, takes `next_due` for the report and appends it to `LOG`, so the next tick is N minutes after that report; a scheduled tick runs the builder without `--user-run` and restarts nothing. Every reply's `next dailies` time is read from `notifier.sh status`. `production_lifecycle.py wrap` runs `remove`, and the check removes the instance on its own once the doc says `wrapped`.
+Registration writes `PROMPT=scheduled` and creates no prompt file.
+Each tick builds the prompt from the current owner row, production document, and `commands/showrunner/produce.md` template.
+A rename changes the name in the next prompt.
+A document move changes the path in the next prompt.
+
+N comes from the document's `**Updates:** every N minutes` line.
+The text `on the hour` adds `--aligned`.
+An absent schedule or `on demand` creates a stopped timer with the default interval of 15 minutes.
+There is no `--hold`.
+A repeated `new` retains the clock and enabled setting.
+The instance continues across session restarts.
+A delivered prompt starts with `Scheduled update`.
+
+A user-requested `/showrunner:dailies` restarts the timer through `dailies_input.py --user-run`.
+A scheduled tick does not restart the timer.
+Reports read the next update time from `notifier.sh status`.
+`production_lifecycle.py wrap` removes the instance.
+The check also removes the instance when the document says `wrapped`.
 
 A pending demotion stops the child showrunner's notifier instance.
 Restoration can start that instance again.
-After placement, demotion removes the instance, its generated prompt and its counts cache.
+After placement, demotion removes the instance and its counts cache.
 It keeps reminders and history records.
 It marks the old production document ended and commits only that document on the unit branch.
 The final journal step supports repeated execution.
@@ -163,7 +201,12 @@ A unit run has no notifier instance (user, 2026-10-19). `/unit:report` runs only
 
 ### Changing the interval
 
-- `/showrunner:report_interval [minutes]` edits the doc's `**Updates:**` line and the `every N minutes` text in `PROMPT_FILE`, runs `notifier.sh interval UPDATES <minutes>`, commits the doc, logs the old and new interval, and tells the user the next tick in `ZONE` and UTC. No argument reports status only.
+`/showrunner:report_interval [minutes]` changes the document's `**Updates:**` line and runs `notifier.sh interval UPDATES <minutes>`.
+It commits the document and records the old interval, new interval, and next tick.
+It reports the next tick in `ZONE` and UTC.
+Without an argument, it reports status only.
+The next prompt uses the interval from the document at delivery.
+
 ### TICKS FAILING
 
 `unit_status.sh` reads each unit's open run from its staff row.

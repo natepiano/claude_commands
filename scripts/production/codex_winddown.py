@@ -501,12 +501,11 @@ def announce(sender: str, showrunner: str, unit: str) -> bool:
 
 
 def start_count(record: SessionRecord) -> bool:
-    prompt = STATE / f"{instance_name(record['name'])}.txt"
-    _ = prompt.write_text(TICK.format(minutes=EVERY_MINUTES, script=Path(__file__).resolve(),
-                                      session=shlex.quote(record["name"])) + "\n", encoding="utf-8")
+    text = TICK.format(minutes=EVERY_MINUTES, script=Path(__file__).resolve(),
+                       session=shlex.quote(record["name"]))
     done = subprocess.run(["zsh", str(NOTIFIER), "new", instance_name(record["name"]), "--every",
-                           str(EVERY_MINUTES), "--to", f"session:{record['sessionId']}", "--prompt-file",
-                           str(prompt), "--from", "codex-winddown"], capture_output=True, text=True, check=False)
+                           str(EVERY_MINUTES), "--to", f"session:{record['sessionId']}", "--command",
+                           text, "--from", "codex-winddown"], capture_output=True, text=True, check=False)
     return done.returncode == 0
 
 

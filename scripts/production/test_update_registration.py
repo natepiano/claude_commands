@@ -30,7 +30,7 @@ from scripts.hooks import showrunner_footer
 
 
 class RegistrationTests(RegistrationFixture):
-    def test_unreadable_timer_reports_and_continues_prompt_adoption(self) -> None:
+    def test_unreadable_timer_reports_without_rewriting_a_legacy_prompt(self) -> None:
         timer = self.state / "notifier" / f"showrunner-{self.owner_id}"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_bytes(b"TARGET=\xff\n")
@@ -46,8 +46,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("timer configuration unreadable", result.stderr)
         self.assertIn("decode", result.stderr)
-        self.assertIn(f"rewrote {prompt} from produce.md", result.stdout)
-        self.assertIn(str(self.state / "showrunner" / self.owner_id / "session"), prompt.read_text())
+        self.assertEqual(prompt.read_text(), "old prompt\n")
 
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         doc_bytes = self.doc.read_bytes()
@@ -58,6 +57,9 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
         self.assertEqual(updates[updates.index("--to") + 1], f"session:{self.fixture_staff_id()}")
+        self.assertEqual(updates[updates.index("--prompt") + 1], "scheduled")
+        self.assertNotIn("--prompt-file", updates)
+        self.assertFalse((self.state / "showrunner" / self.owner_id / "prompt.txt").exists())
         self.assertIn("next_due", first.stdout)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)

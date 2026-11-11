@@ -60,7 +60,8 @@ State:
   Unit records identify each phase checkpoint. Commit subjects supply no state.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<staff id>`, where `<staff id>` is the showrunner row id.
-- `PROMPT_FILE` — `~/.local/state/showrunner/<staff id>/prompt.txt`.
+- The timer conf carries `PROMPT=scheduled`.
+  Each tick builds the prompt from the owner's current staff row.
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit staff id>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
@@ -480,10 +481,12 @@ and registers it: an account move restarts a showrunner on its own, so register
 must not fail. `attach` refuses that name for a new production.
 `add_showrunner.py` and `promote_showrunner.py` use the showrunner staff name for a new session.
 Pass `--doc <path>` for a new showrunner or a promotion. An existing showrunner reads its doc from its staff row.
-The command writes `PROMPT_FILE`,
-retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
-stall-watch only when absent, and prints `next_due`. Use the
-reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
+The command registers `UPDATES` with `PROMPT=scheduled` through `NOTIFIER new`.
+It retains the timer's clock and creates stall-watch only when absent.
+Each tick builds the prompt from the owner's current staff row.
+The command prints `next_due`.
+Record the reported next tick in the log.
+`CLAUDE_CODE_SESSION_ID` must be set.
 When the doc's Updates line reads `on demand`, or there is none, it makes
 `UPDATES` at the default 15 minutes and stops it, prints `on demand: no
 scheduled dailies`, and no scheduled update comes: a dailies runs only when

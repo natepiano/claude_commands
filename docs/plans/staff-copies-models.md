@@ -60,7 +60,7 @@
 
 **Ruled out:** resolving all recipient names once before delivery — a rename during an earlier notice sends to a stale name.
 
-### Phase 3 — Scheduled prompts are built at delivery  · status: todo
+### Phase 3 — Scheduled prompts are built at delivery  · status: done
 
 **Depends on:** none.
 
