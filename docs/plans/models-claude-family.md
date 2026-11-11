@@ -62,40 +62,20 @@ No code change. `test_sync_codex_catalog.sh` and `test_models_config.sh` set `HO
 
 ### Phase 3 — Run records name the model that ran  · status: done
 
-**Depends on:** Phase 1.
+#### As-built
 
-#### Work Order
-
-**Goal:** the review and assign run records store the model id that the Claude launch passed to `--model` (for example `claude-fable-5-2`), not the family word (`fable`).
-
-**Spec:**
-
-Cause: phase 1 keeps the family word in `AGENT_MODEL` and `launch.model` and resolves it only at the launch. The records are written before that, from the word.
-
-1. `scripts/direct/review.sh` writes `agent=${AGENT_MODEL}` to the agent file (line ~242), the board `register` line (~245), `--called-model "${AGENT_MODEL}"` (~259) and the heartbeat header (~277). `agent_exec.sh` resolves later, after `claude_launch_environment`. Each of these must carry the resolved id for a Claude review.
-2. `scripts/direct/assign_claude.py` writes `launch.model` to `impl_agent_<slot>` (~233), `--called-model` (~242), the heartbeat header (~251), the board line (~253) and the worker record (~266). `claude_worker.py:157` resolves with `loaded.env`. Each record must carry the id that `claude_worker.py` passes.
-3. Resolve once per launch with the launch account's environment, through `models_registry.claude_model` or `_agents_model_slug claude`. Use that one value for the record and for the launch. Do not add a second resolver or a Python copy of its logic.
-4. Effort validation and `[claude.agents]` lookups keep the family word.
-5. Codex launches stay as they are.
-6. Add no guard, refusal, scan or fallback (user rule). A failed resolver keeps the input model, as in phase 1.
+- A Claude review and a Claude assign record the model id that the launch passes to `--model` (for example `claude-fable-5-2`), not the family word. The agent file, board `register` line, `--called-model`, heartbeat header and worker record carry that one value.
+- `review.sh` sources `claude_account.sh`, runs `claude_launch_environment workers` and resolves `AGENT_MODEL` before it writes records. It passes `AGENT_EXEC_CLAUDE_MODEL`, so `agent_exec.sh` skips its own account choice and resolve.
+- `claude_worker.prepare_launch(turn)` returns `PreparedClaudeLaunch(model, environment, loaded)`. `assign_claude.py` writes every record from `prepared.model` and passes `launch=prepared` to `open_worker`.
+- `_switch` returns `NewClaudeWorker`, `ClaudeDeliveryRetry` or `ClaudeFollowUp`. Only `NewClaudeWorker` prepares a launch. A delivery retry and a follow-up take the model from the saved worker record.
+- Effort validation and `[claude.agents]` lookups keep the family word. Codex launches are unchanged.
 
 **Files:**
-- `scripts/direct/review.sh` — the review records listed in Spec 1.
-- `scripts/agents/agent_exec.sh` — read where the Claude account environment and the resolved model are set.
-- `scripts/direct/assign_claude.py` — the assign records listed in Spec 2.
-- `scripts/direct/claude_worker.py` — the launch resolve at line ~157.
-- `scripts/direct/test_review_launcher.py` — review record rows.
-- `scripts/direct/test_assign_claude_records.py` — assign record rows.
+- `scripts/direct/review.sh`, `scripts/agents/agent_exec.sh` — review records and launch.
+- `scripts/direct/assign_claude.py`, `scripts/direct/claude_worker.py` — assign records and launch.
+- `scripts/direct/recorder_fixture.py` — removes the caller's Claude account variables from the shared fixture.
+- `scripts/direct/test_review_launcher.py`, `scripts/direct/test_assign_claude_records.py`, `scripts/direct/test_assign_claude_follow.py` — record rows with a fixture catalog.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `review.sh`, `agent_exec.sh`, `assign_claude.py`, `claude_worker.py`.
-- `test` — `test_review_launcher.py` and `test_assign_claude_records.py`. Each row makes a temporary `CLAUDE_CONFIG_DIR` with a fixture `*-cc.json` and a fake `claude` that prints a version. A Claude review and a Claude assign with the word `opus` record the account's catalog target in the agent file and in `--called-model`. Each row must fail on the phase 1 tree.
+**Gotchas:** a delivery retry reuses the published session without a new start, so a new resolve there records a model that never ran.
 
-**State:** none.
-
-**Constraints from prior phases:** resolve after the launch account is chosen (phase 1 design). `launch_settings` and `agents_resolve` keep the family word.
-
-**Acceptance gate:**
-1. The unittest line passes for `scripts.direct.test_review_launcher`, `scripts.direct.test_assign_claude_records`, every other `scripts.direct.test_assign_claude*` module, `scripts.direct.test_progress_history` and `scripts.lib.test_models_registry`.
-2. `bash scripts/agents/test_agent_exec.sh` and `bash scripts/agents/test_models_config.sh` pass.
-3. basedpyright over the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** a second resolve on a delivery retry.
