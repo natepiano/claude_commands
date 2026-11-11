@@ -641,7 +641,13 @@ Review-list publication, style notification, checkout announcement, and Mac prom
 Each merge retains its own review ownership and completion record.
 
 A held or failed item before the push starts drops from the batch.
-The checkout returns to the starting tip before the remaining items retry once.
+Every later item from the same unit drops with it and receives a report that names the stopped item.
+The checkout returns to the starting tip before each retry.
+Retries continue until an attempt passes or no item remains.
+Each stopped attempt removes at least one item, so attempts never exceed the initial item count.
+Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
+Subjects without the closing-item format retain the configured plan.
+An ancestry hold names the first unmerged commit by its short hash and subject.
 Reset aborts an unfinished merge only when no merge was unfinished at batch start.
 An earlier unfinished merge and its staged edits remain unchanged.
 A red test identifies its items through the shared checkpoint test selector.
@@ -660,12 +666,10 @@ The starting tip is treated as green; the last candidate is known red.
 Seven candidates need at most three probes.
 Each probe reports its item, merge commit, and green or red result.
 Each batch invocation clears its shared test log once before the first attempt.
-Full tests, probes, main retests, and the retry append to that log.
-The search restores the starting tip and drops only the causing item.
+Full tests, probes, main retests, and all retries append to that log.
+The search restores the starting tip and drops the causing item and that unit's later items.
 A cancelled probe or another non-red stop drops every candidate with that stop.
 A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-A second stop resets the checkout and lands nothing.
-The remaining directors receive instructions to send their checkpoints again.
 Already-merged items receive `resume it alone with the single command`.
 The push start is the boundary for drop, reset, and retry.
 Once the push starts, a failure drops no items and starts no batch reset or retry.
@@ -676,6 +680,8 @@ Each item receives the stop report.
 It also covers unpublished paths after interruption and a wrapper failure after a successful push.
 The interruption rows include a shrink-only retry.
 The held-batch rows preserve an earlier unfinished merge and its staged edits.
+They also land a clean item after two holds and remove a held unit's later item.
+The history rows merge closing items for an older plan after the configured plan changes.
 The shared-red row uses two probes to identify the middle item and land the other two.
 The main-integration row keeps new main content at every probe and drops the first item.
 The package-rename row skips the renamed test at the earlier tip and drops the second item.

@@ -2018,6 +2018,42 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def publish_files(tree: Path, paths: Sequence[str], command_exit: int) -> None:
+    """Copy requested build files into one scratch folder with a deadline."""
+    if not paths:
+        return
+    try:
+        sources: list[Path] = []
+        for path in paths:
+            source = tree / path
+            if source.exists():
+                sources.append(source)
+            else:
+                print(f"copies: publish: {path} not built", file=sys.stderr)
+        if not sources:
+            return
+        commit = commit_at(tree, "HEAD")
+        repository = repository_name(tree)
+        with ExitStack() as cleanup:
+            publication = scratch.new(word="gate-binary", throwaway=True)
+            record = cast(copy_record.Registered, scratch.task_of(publication))
+            _ = cleanup.callback(scratch.end, record.task)
+            for source in sources:
+                destination = publication / source.name
+                temporary = publication / f".{source.name}.tmp"
+                _ = shutil.copy2(source, temporary)
+                _ = temporary.replace(destination)
+            write_text_atomic(publication / "manifest.json", json.dumps({
+                "repository": repository, "commit": commit, "command_exit": command_exit,
+                "files": [source.name for source in sources],
+            }) + "\n")
+            _ = cleanup.pop_all()
+        for source in sources:
+            print(f"published: {publication / source.name} {commit}")
+    except (CopyError, OSError, scratch.ScratchError) as error:
+        print(f"copies: publish: {error}", file=sys.stderr)
+
+
 def receive_metadata(tree: Path, args: CopyArguments) -> None:
     """Finish pending removal and publish all metadata before deleting its authority."""
     authority = floor_claims.removal_authority_path(tree)
@@ -2071,6 +2107,7 @@ class CopyArguments(argparse.Namespace):
     commit: str = ""
     apply_uncommitted: str | None = None
     merge: str | None = None
+    publish: list[str] = []
     command: list[str] = []
     source: str = ""
     task: str = ""
@@ -2118,6 +2155,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = run.add_argument("--commit", required=True)
     _ = run.add_argument("--apply-uncommitted")
     _ = run.add_argument("--merge")
+    _ = run.add_argument("--publish", action="append", default=[], metavar="PATH",
+                         help="copy a built relative path into a scratch folder")
     _ = run.add_argument("command", nargs=argparse.REMAINDER)
     _ = commands.add_parser("list", help="list standing trees and their busy state")
     try:
@@ -2165,7 +2204,9 @@ def main(argv: list[str] | None = None) -> int:
             with standing(caller_owner(), args.repo or "", policy, merge=merge) as tree:
                 result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
                                         cwd=tree, pass_fds=COMMAND_LOCKS.get())
-                return result.returncode if result.returncode >= 0 else 128 - result.returncode
+                command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
+                publish_files(tree, args.publish, command_exit)
+                return command_exit
         if args.action == "list":
             list_trees()
         else:

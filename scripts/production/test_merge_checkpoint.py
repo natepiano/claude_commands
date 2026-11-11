@@ -208,12 +208,14 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.assertNotIn(code_merge, self.git("rev-list", "--first-parent", "HEAD").splitlines())
                 self.assertEqual(self.git("merge-base", "--is-ancestor", code_merge, "production"), "")
                 closing = self.as_built_commit()
+                held_commit = closing
                 if unmerged_code:
                     closing = self.checkpoint(content="code after the as-built commit\n")
                 if side_docs:
                     _ = self.git("checkout", "-b", "side-phase", f"{closing}^", cwd=self.unit)
                     side = self.checkpoint("docs/side.md", "unmerged side phase\n",
                                            subject="checkpoint(beta): side phase", push=False)
+                    held_commit = side
                     _ = self.git("checkout", "alpha-branch", cwd=self.unit)
                     _ = self.git("merge", "--no-ff", "-m", "Merge side phase after as-built", side, cwd=self.unit)
                     _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
@@ -234,8 +236,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 (self.state / "events.jsonl").unlink()
                 result = self.run_checkpoint(closing, "--as-built", review=False)
                 if unmerged_code or side_docs:
-                    self.assert_stopped_before_merge(result, "held", "phase 2 code checkpoint has not merged")
-                    self.assertIn("wait for the phase code checkpoint to merge, then resend the shrink",
+                    subject = self.git("show", "-s", "--format=%s", held_commit)
+                    self.assert_stopped_before_merge(result, "held", f"unmerged commit {held_commit[:12]}: {subject}")
+                    self.assertIn(f"wait for {held_commit[:12]} to merge, then resend the as-built",
                                   result.process.stdout)
                 else:
                     self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
