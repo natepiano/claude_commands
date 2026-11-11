@@ -4,7 +4,6 @@
   buildlog query [--json] "<SQL>"   bring the index up to date, run SQL read-only
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
-  buildlog charts [--days 7|30] [--no-open]  print or open the shared build page link
   buildlog moments [YYYY-MM-DD]     before/after build moments, read-only
   buildlog mac-report [--hours N]    Mac test outcomes over the last N hours and three local days
   buildlog reindex                  rebuild the index from the JSON lines
@@ -270,10 +269,6 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
-    if command == "charts":
-        from scripts.buildlog import charts
-
-        return charts.main(rest)
     if command == "moments":
         return moments_report(rest)
     if command == "usage-hours":
