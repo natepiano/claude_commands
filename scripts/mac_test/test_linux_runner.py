@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test import claim_state, linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -1918,6 +1918,7 @@ class LinuxDispatchTests(unittest.TestCase):
         with redirect_stdout(output):
             status = mac_test.command_claim(args, mac_test.state_paths(args.target))
         self.actions.append(f"claim:{status}")
+        self.controller.claim_identity = claim_state.reply_claim_identity(output.getvalue())
         attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, output.getvalue(), ""))
 
     def capture(self, arguments: Sequence[str],
