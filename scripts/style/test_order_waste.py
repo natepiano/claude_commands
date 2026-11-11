@@ -150,6 +150,11 @@ class OrderWasteTests(unittest.TestCase):
         self.finding("gone", "dont-repeat-type-name-in-fields", "src/z.rs", "withdrawn", at(0, 30), at(2, 30), ticket="types-2",
                      gone_at="abc1234", followed_from="src/a.rs")
         self.finding("duplicate", "spell-out-names", "src/a.rs", "withdrawn", at(0, 30), at(6), duplicate_of="qualified")
+        self.finding("qualified", "spell-out-names", "src/a.rs", "unfiled", at(0, 30), at(6))
+        self.finding("whole-test-file", "split-by-type-ownership", "src/widget_tests.rs", "unfiled", at(0, 30), at(6))
+        _ = self.connection.execute("UPDATE held_findings SET kind='restructure' WHERE finding_id='whole-test-file'")
+        self.finding("folded-test-item", "split-by-type-ownership", "src/widget_tests.rs", "withdrawn", at(0, 30), at(6),
+                     duplicate_of="whole-test-file")
 
     def measured(self) -> order_waste.Report:
         return order_waste.report(order_waste.measure(self.connection, self.repo))
@@ -172,7 +177,7 @@ class OrderWasteTests(unittest.TestCase):
         self.assertEqual((data["changing_tickets"], data["counted_findings"]), (4, 4))
         self.assertEqual(data["not_counted"], {
             "bare rename duplicate": 1, "exception under a newer rule text": 1, "no other rule's merged fix changed its file": 1,
-            "person waive": 1,
+            "person waive": 1, "folded test file duplicate": 1,
         })
 
     def test_moved_lines_are_not_rework_and_keep_their_writer(self) -> None:

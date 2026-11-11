@@ -63,7 +63,13 @@ git add "${FILES[@]}"
 if ! git diff --cached --quiet -- "${FILES[@]}"; then
   git commit --only -m "chore: restore [Unreleased] sections after v$VERSION" -- "${FILES[@]}"
 fi
-git push origin "$BASE_BRANCH"
+if [ "$BASE_BRANCH" = main ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/main_push_lock.py" \
+    --checkout "$PWD" -- git push origin "$BASE_BRANCH"
+else
+  git push origin "$BASE_BRANCH"
+fi
 
 echo ""
 echo "[Unreleased] sections restored ✓"

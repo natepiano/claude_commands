@@ -6743,6 +6743,8 @@ class SavedLayoutTests(unittest.TestCase):
 
 
     def test_the_snapshot_keeps_the_row_id_when_its_name_changes(self) -> None:
+        from scripts.agents import shutdown
+
         client = self.running()
         record = staff.initial_snapshot()
         roles = next((row for row in record.rows if row.name == "roles"), None)
@@ -6761,6 +6763,63 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(saved["sdlc"], layout_row_ids(["sdlc", "design"]))
         self.assertEqual(saved["sdlc"][-1], roles.id)
         self.assertIn("design", dict(client.layout())["sdlc"])
+
+        member = next(row for row in staff.initial_snapshot().rows if row.name == "herdr")
+        for order, name, interruption, display, expected in (
+                (("natedev", "accounts", "herdr", "unit-board"), "zulu", "", "rename",
+                 ["natedev", "accounts", "unit-board", "zulu"]),
+                (("natedev", "unit-board", "accounts", "zulu"), "aardvark", "", "rename",
+                 ["natedev", "aardvark", "unit-board", "accounts"]),
+                (("natedev", "unit-board", "aardvark", "accounts"), "yankee", "sort", "rename",
+                 ["natedev", "unit-board", "accounts", "yankee"]),
+                (("natedev", "yankee", "unit-board", "accounts"), "zebra", "", "pane already renamed",
+                 ["natedev", "unit-board", "accounts", "zebra"]),
+                (("natedev", "zebra", "unit-board", "accounts"), "zebra", "", "tab restore",
+                 ["natedev", "zebra", "unit-board", "accounts"]),
+                (("natedev", "zebra", "unit-board", "accounts"), "zulu", "layout save", "rename",
+                 ["natedev", "unit-board", "accounts", "zulu"])):
+            with self.subTest(order=order, name=name, display=display, interruption=interruption):
+                workspace = next(ident for ident, label in client.spaces if label == "natedev")
+                others = [tab for tab in client.tabs if tab["workspace_id"] != workspace]
+                siblings = [next(tab for tab in client.tabs if tab["label"] == label) for label in order]
+                client.tabs = others + siblings
+                client.save_layout()
+                pane = next(tab for tab in siblings if tab["session_id"] == member.current_session)
+                before = {tab["pane_id"]: tab["tab_id"] for tab in client.tabs}
+                if display == "tab restore":
+                    client.label_pane(pane["pane_id"], "previous")
+                else:
+                    with patch.object(herdr, "Herdr", return_value=client):
+                        member = shutdown.rename_owner(member, name)
+                if display == "pane already renamed":
+                    client.label_pane(pane["pane_id"], name)
+                if interruption == "sort":
+                    with patch.object(client, "order_tabs", side_effect=OSError("stopped after the label changes")):
+                        with self.assertRaisesRegex(OSError, "stopped after the label changes"):
+                            _ = client.retitle(pane["pane_id"], name)
+                if interruption == "layout save":
+                    replace_file = Path.replace
+
+                    def refuse_layout_save(path: Path, target: str | os.PathLike[str]) -> Path:
+                        if Path(target) == herdr.layout_path("fixture"):
+                            value = cast(herdr.SavedLayout, json.loads(path.read_text()))
+                            saved_space = next(space for space in value["workspaces"] if space["name"] == "natedev")
+                            if [tab["name"] for tab in saved_space["tabs"]] == layout_row_ids(expected):
+                                raise OSError("private layout save failure")
+                        return replace_file(path, target)
+
+                    with patch.object(Path, "replace", refuse_layout_save), redirect_stderr(io.StringIO()):
+                        try:
+                            _ = client.retitle(pane["pane_id"], name)
+                        except OSError:
+                            pass
+                    client.tabs = others + siblings
+                self.assertTrue(client.retitle(pane["pane_id"], name))
+                self.assertEqual(dict(client.layout())["natedev"], expected)
+                self.assertEqual({tab["pane_id"]: tab["tab_id"] for tab in client.tabs}, before)
+                saved_space = next(space for space in herdr.saved_layout("fixture")["workspaces"]
+                                   if space["name"] == "natedev")
+                self.assertEqual([tab["name"] for tab in saved_space["tabs"]], layout_row_ids(expected))
 
     def test_without_a_saved_layout_the_showrunner_comes_first_then_a_to_z(self) -> None:
         self.assertEqual(herdr.tab_order("boss", ["delta", "boss", "alpha"], [], set()), [1, 2, 0])

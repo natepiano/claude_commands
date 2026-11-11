@@ -28,8 +28,9 @@ from scripts.herdr import herdr_types
 from scripts.message import sessions, codex_daemon
 from scripts.production import staff, session_staff
 from scripts.accounts import accounts
-from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs
+from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcripts import transcript_paths
 from scripts.agents import member_account, shutdown_record, pane_record
 from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.agents.codex_trust import trust_arguments
@@ -48,6 +49,8 @@ class AllRestartAccounts:
 
 
 ALL_RESTART_ACCOUNTS = AllRestartAccounts()
+NO_RESTART_MESSAGE = herdr.NoOpeningPrompt()
+DEFAULT_RESTART_CAUSE = "agents restart ran"
 
 
 def account_matches(kind: Literal["claude", "codex"], environment: dict[str, str],
@@ -62,6 +65,11 @@ def account_matches(kind: Literal["claude", "codex"], environment: dict[str, str
 class WorkerRestartScope(Enum):
     FOLLOW_OWNER = "restore the owner's workers"
     SELECTED_ROWS = "restart only selected rows"
+
+
+class RestartDisposition(Enum):
+    RESTORED = "the row started or already runs"
+    HELD = "the row keeps its pause or exit record"
 
 
 class ClaudeTrustWriteFailed(OSError):
@@ -205,13 +213,13 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
     if entry is not None:
         return _saved_launch(entry, identity, name)
     for directory in sessions.config_dirs():
-        if any((directory / "projects").glob(f"*/{identity}.jsonl")):
+        if transcript_paths(directory / "projects", f"*/{identity}.jsonl"):
             return "claude", named_account_environment(directory), ["--resume", identity, "--name", name]
     homes = list(Path.home().glob(".codex*"))
     if home := os.environ.get("CODEX_HOME"):
         homes.insert(0, Path(home))
     for directory in homes:
-        if any((directory / "sessions").glob(f"**/rollout-*{identity}.jsonl")):
+        if transcript_paths(directory / "sessions", f"**/rollout-*{identity}.jsonl"):
             return "codex", {"CODEX_HOME": str(directory)}, ["resume", identity]
     raise OSError(f"no transcript for {identity}")
 
@@ -279,7 +287,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               present: bool = False, target_account: str | accounts.AccountSelection = "", deadline: float = math.inf,
               resolver: session_staff.RowResolver | None = None,
               worker_scope: WorkerRestartScope = WorkerRestartScope.FOLLOW_OWNER,
-              observed: RestartObservations | None = None) -> str:
+              observed: RestartObservations | None = None,
+              opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE) -> str:
     with operation_deadline.within(deadline):
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
@@ -357,12 +366,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         start_seconds = settings.number("START_SECONDS")
         operation_deadline.check()
         selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
+        if isinstance(opening, herdr.OpeningPrompt):
+            opening = replace(opening, transcript=herdr.SessionTranscript(selected_home, str(row.current_session)))
         expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(folder), selected_home)
         scope = (pane_launch.producer_start(pane_record.record_directory(), expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
-                trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
+                trust_arguments(kind, str(folder), arguments),
+                opening if kind == "claude" else NO_RESTART_MESSAGE,
                 int(operation_deadline.remaining(start_seconds) * 1000), agent=row.name,
                 reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
                                   live.reason if isinstance(live, herdr.UnknownConversation) else ""),
@@ -373,6 +385,11 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             if isinstance(target, herdr.ExistingPane) and not target.terminal:
                 return result.pane
             raise OSError(result.outcome.reason)
+        if kind == "codex" and isinstance(opening, herdr.OpeningPrompt):
+            try:
+                client.prompt(result.pane, opening.text, target=str(row.current_session))
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+                _anomaly(row, f"continuation message was not sent: {error}")
         if row.kind == "producer":
             home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
             try:
@@ -619,7 +636,8 @@ def stop_all(*, dry_run: bool = False) -> int:
 
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = (),
             account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
-            after_stop: AfterStop = AfterStop.RESTART) -> int:
+            after_stop: AfterStop = AfterStop.RESTART,
+            why: str = DEFAULT_RESTART_CAUSE) -> int:
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -701,7 +719,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
     if stop_all and any(row.current_session in callers for row in selected):
-        arguments = ["restart", "--all", "--only", ",".join(str(row.id) for row in selected)]
+        arguments = ["restart", "--all", "--only", ",".join(str(row.id) for row in selected),
+                     "--why", why]
         if not isinstance(account, AllRestartAccounts):
             arguments.append(account.label)
         log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve())
@@ -773,13 +792,17 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             present = isinstance(server, herdr.WindowServerCreated)
         except errors as error:
             print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
-    def start_holder(holder: staff.StaffRow, focus: bool) -> None:
+    def start_holder(holder: staff.StaffRow, focus: bool) -> RestartDisposition:
         with staff.row_operation(str(holder.id)):
             current_record = staff.initial_snapshot()
             current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
             current = current_record.by_id(holder.id)
             if current is None:
                 raise ValueError("staff row no longer exists")
+            if current.kind in ("unit", "showrunner") and (
+                    isinstance(current.paused, staff.Paused) or isinstance(current.exited, staff.Exited)):
+                print(f"{current.name}: {'exited' if isinstance(current.exited, staff.Exited) else 'paused'}")
+                return RestartDisposition.HELD
             if holder.id in unconfirmed:
                 fresh = _after_unconfirmed_stop(current, pre_stop_codex)
                 if isinstance(fresh, herdr.UnknownConversation):
@@ -788,14 +811,18 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                     if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                         _ = _restore_workers(current, current_record, observed=observed)
                     print(f"{current.name}: unchanged")
-                    return
+                    return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
+            opening = (herdr.OpeningPrompt(resume_message.resume_message(why))
+                       if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _ = start_row(current, current_record, client, present=focus, resolver=facts, observed=observed)
+                _ = start_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
+                              opening=opening)
             else:
                 _ = start_row(current, current_record, client, present=focus, resolver=facts,
                               target_account="" if isinstance(account, AllRestartAccounts) else account,
-                              worker_scope=worker_scope, observed=observed)
+                              worker_scope=worker_scope, observed=observed, opening=opening)
+            return RestartDisposition.RESTORED
 
     if holders:
         with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
@@ -804,7 +831,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             for holder, future in futures:
                 members = members_by_holder[holder.id]
                 try:
-                    future.result()
+                    if future.result() is RestartDisposition.HELD:
+                        pending.extend(members)
+                        continue
                     started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
                     pending.extend(member for member in members if staff.StaffId(member) in blocked_workers)
                 except ClaudeTrustWriteFailed:

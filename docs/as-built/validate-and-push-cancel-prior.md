@@ -11,7 +11,7 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 | File | Role |
 | --- | --- |
 | `scripts/validate_and_push/validate_and_push.sh` | The `--cancel-prior` flag and `cancel_prior_runs`. |
-| `scripts/validate_and_push/push_direct.sh` | Pushes, runs the post-push hook, waits for the sha's run, prints the CI handoff. Unchanged by this feature. |
+| `scripts/validate_and_push/push_direct.sh` | Locks main publication, runs the post-push hook, waits for the sha's run, and prints the CI handoff. |
 | `scripts/validate_and_push/test_cancel_prior.sh` | Test with stubbed `git` and `gh`. |
 | `commands/showrunner/produce.md` | The cancel-prior rule at <MergeCheckpoint/> (the `merge_checkpoint.py` call) and <CIPoint/> (`ci_points.py ci start`). |
 
@@ -25,6 +25,13 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
    - Each path saves the push's exit code with `bash push_direct.sh || push_status=$?`, calls `cancel_prior_runs` if the flag is set, then runs `exit "$push_status"`.
    - The PR path exits 2 and never cancels, so it ignores the flag.
 4. `push_direct.sh` checks up to 40 times, 3 s apart (120 s), for the first run of any workflow on the pushed sha before it returns. `cancel_prior_runs` starts only after that return.
+
+Main publication uses the [shared lock's shell entry](repair-rounds.md#shared-main-push-lock).
+The hold covers publication checks and push.
+Validation runs before it.
+Hooks, CI discovery, and cancellation run after it.
+A child of a checkpoint uses the inherited hold for the same repository.
+Other branches take no main push lock.
 
 ### `cancel_prior_runs`
 

@@ -69,6 +69,7 @@ def live_detached_run(run: Path, row: staff.StaffRow) -> Generator[None]:
     with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
                           stdin=subprocess.PIPE, text=True) as supervisor:
         write_text_atomic(path, json.dumps({"worker": row.name, "staff_id": row.id,
+                                           "run_id": row.name, "log": str(path.with_suffix(".log")),
                                            "status": "running", "pid": supervisor.pid}))
         try:
             yield

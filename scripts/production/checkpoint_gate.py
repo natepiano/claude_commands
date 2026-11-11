@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -46,6 +46,14 @@ class CheckpointTestStep(NamedTuple):
     label: str
     command: list[str]
     folder: Path
+
+
+class RedCheckpointTests(Stop):
+    """The unresolved commands that prevent a checkpoint publication."""
+
+    def __init__(self, detail: str, message: str, steps: tuple[CheckpointTestStep, ...]) -> None:
+        super().__init__("red", "failed", detail, message)
+        self.steps: tuple[CheckpointTestStep, ...] = steps
 
 
 class CargoPackage(NamedTuple):
@@ -99,10 +107,12 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
     return steps
 
 
-def run_test_command(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
+def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False)
     except OSError as error:
+        if raise_start_errors:
+            raise
         return subprocess.CompletedProcess(command, 127, "", f"{error}\n")
 
 # A nextest failure row: `FAIL [  12.2s] (1012/1067) <binary> <test>`.
@@ -130,13 +140,18 @@ def stop_cancelled_test(name: str, result: subprocess.CompletedProcess[str], log
 def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, ...],
                               merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str],
                               flaky_tests: frozenset[str], log: Path) -> str:
-    """Run checkpoint commands and their retries; the caller owns merge rollback."""
-    steps = test_steps(production, paths, merge_tests)
+    """Select checkpoint commands and run them with the flake rules."""
+    return run_test_steps(production, test_steps(production, paths, merge_tests), flakes, flaky_tests, log)
+
+
+def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTestStep], flakes: frozenset[str],
+                   flaky_tests: frozenset[str], log: Path, *, raise_start_errors: bool = False) -> str:
+    """Run the given commands and their retries; the caller owns merge rollback."""
     log.parent.mkdir(parents=True, exist_ok=True)
     failed: list[tuple[CheckpointTestStep, frozenset[str]]] = []
     with log.open("a", encoding="utf-8") as output:
         for step in steps:
-            result = run_test_command(step.command, step.folder)
+            result = run_test_command(step.command, step.folder, raise_start_errors=raise_start_errors)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
@@ -144,12 +159,14 @@ def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, 
             if not test_passed(result):
                 failed.append((step, failed_tests(result.stdout + result.stderr)))
     unresolved: list[str] = []
+    red_steps: list[CheckpointTestStep] = []
     for step, tests in failed:
         name, command, folder = step
         # Run only the known flaky tests when they cause the failure.
         alone = bool(tests) and tests <= flaky_tests
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(only_tests(command, tests) if alone else command, folder)
+            result = run_test_command(only_tests(command, tests) if alone else command, folder,
+                                      raise_start_errors=raise_start_errors)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)
@@ -163,10 +180,12 @@ def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, 
         else:
             names = tests | failed_tests(result.stdout + result.stderr)
             unresolved.append(name + (f" ({', '.join(sorted(names))})" if names else ""))
+            red_steps.append(step)
     report("test", "ok", f"{len(steps)} commands ran; {len(failed)} red; log {log}")
     if unresolved:
-        raise Stop("red", "failed", f"{', '.join(unresolved)} failed; log {log}",
-                   f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}")
+        raise RedCheckpointTests(f"{', '.join(unresolved)} failed; log {log}",
+                                 f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}",
+                                 tuple(red_steps))
     report("red", "ok", "all commands green or known flakes green alone")
     return ", ".join(step.label for step in steps) if steps else "no tests"
 

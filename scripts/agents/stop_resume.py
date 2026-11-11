@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
-from io import StringIO
+from io import StringIO, TextIOWrapper
 from importlib import import_module
 from threading import Event, Lock
 from time import monotonic
@@ -39,6 +39,7 @@ from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_send
 from scripts.agents import member_account, pane_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
@@ -1062,7 +1063,7 @@ def _codex_name_ids(name: str) -> list[str]:
 
 def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionNotFound:
     """Read the native resume arguments and the folder from the rollout metadata."""
-    path = next((agent_accounts.codex_home() / "sessions").glob(f"**/rollout-*{identity}.jsonl"), None)
+    path = next(iter(transcript_paths(agent_accounts.codex_home() / "sessions", f"**/rollout-*{identity}.jsonl")), None)
     if path is None:
         return SessionNotFound(identity)
     restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
@@ -1072,8 +1073,8 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
         return SessionNotFound(identity)
     if kind != "codex":
         return SessionNotFound(identity)
-    with path.open(encoding="utf-8") as stream:
-        meta = herdr.json_object(cast(object, json.loads(stream.readline())), "Codex rollout metadata")
+    with open_transcript(path) as stream, TextIOWrapper(stream, encoding="utf-8") as transcript:
+        meta = herdr.json_object(cast(object, json.loads(transcript.readline())), "Codex rollout metadata")
     folder = herdr.json_text(herdr.json_object(meta.get("payload"), "Codex session metadata").get("cwd"), "Codex rollout cwd")
     return pane_record.launch("", identity, folder, environment, [kind, *arguments], kind=kind)
 
@@ -1232,7 +1233,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         else:
             _ = entry.pop("config_dir", None)
-        if row is not None and row.kind == "producer":
+        if row is not None and row.kind == "producer" and not (
+                isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
+                and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
             space = herdr.row_workspace(row, names.tab_record, row.name)
             if isinstance(tab, SessionNotFound) or not client.producer_pane(tab.pane_id, str(row.id), space, record=names.tab_record):
                 destination = client.producer_row_tab(str(row.id), row.name, space, record=names.tab_record)
@@ -1258,20 +1261,28 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         workers = NO_WORKERS
         own = NO_OWN_PASS
+        detached = ""
         from scripts.production import worker
         try:
             if row is not None and row.kind == "worker":
-                own = worker.own_pass(row, names.tab_record)
+                from scripts.agents import detached_runs
+                from scripts.herdr import worker_panes
+
+                run = worker_panes.worker_run(row, record=names.tab_record)
+                own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
+                detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         if isinstance(own, worker.UnsubmittedAssignment):
             message = launcher_prompt(row.id, own.dispatch_id, own.command) if row is not None else ""
+            if detached:
+                message += "\n" + detached
         else:
             message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                     workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
-                                         row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
+                                     workers=workers, own_pass=own, detached=detached) if (kind != "codex" or row is not None) and (
+                                         row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":
             expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
@@ -1314,7 +1325,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         selected_home = staff.SessionHome(target_dir.absolute())
         if row is not None and row.home != selected_home:
             try:
-                _ = staff.set_home(row.id, selected_home)
+                # The launch hook can publish the new home before the start returns.
+                current = staff.by_id(row.id)
+                if current is None or current.home != selected_home:
+                    _ = staff.set_home(row.id, selected_home)
             except (staff.StaffUnreadable, staff.StaffNotFound) as error:
                 print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
         if original is not None:

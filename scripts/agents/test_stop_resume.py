@@ -20,6 +20,7 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from dataclasses import replace
+from enum import Enum
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import Literal, Never, cast, final, override
@@ -30,6 +31,7 @@ from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
 from scripts.agents import restart, stop_resume, stop_results
 from scripts.lib import agent_program, atomic_file, conf, operation_deadline, unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
 from scripts.agents.stop_results import ClaudeStartState, StopResult
 
@@ -191,6 +193,8 @@ class ResumeClock(local):
 
 class WorkerResumeTests(unittest.TestCase):
     def test_resume_without_a_worker_record_returns_the_restored_pane(self) -> None:
+        from scripts.herdr.test_worker_panes import live_detached_run
+
         case = test_worker.WorkerCommandTests("runTest")
         case.setUp()
         self.addCleanup(case.doCleanups)
@@ -214,6 +218,7 @@ class WorkerResumeTests(unittest.TestCase):
 
         with (patch.object(stop_resume, "running_on_account", side_effect=running) as proof,
               patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              live_detached_run(case.run_dir, opened.row),
               redirect_stdout(io.StringIO())):
             result = stop_resume.resume(str(opened.row.id))
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -224,6 +229,10 @@ class WorkerResumeTests(unittest.TestCase):
         self.assertEqual(world.closed, [])
         self.assertEqual(result.start_state, ClaudeStartState.STARTED)
         self.assertEqual(proof.call_args.args, (opened.row.current_session, result.pane_id))
+        prompt = next(command[-1] for command in reversed(world.commands) if command[:2] == ("agent", "prompt"))
+        self.assertIn(f"Detached run {opened.row.name} remains live.", prompt)
+        self.assertIn(f"{case.run_dir}/detached_runs/{opened.row.name}.json", prompt)
+        self.assertNotIn("ended with no result", prompt)
 
 
 @final
@@ -873,6 +882,7 @@ class StopResumeTests(unittest.TestCase):
             row = replace(row, home=home)
             return row
         with (patch.object(staff, "initial_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
+              patch.object(staff, "snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
               patch.object(staff, "set_home", side_effect=record_home),
               patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
@@ -919,34 +929,38 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("observer anomaly:", errors)
 
     def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
-        identity = self.saved_codex_name()
-        source = self.root / ".codex2"
-        for target in (None, "codex3"):
-            expected = target or "codex1"
-            with (self.subTest(target=target), patch.dict(os.environ, {"CODEX_HOME": str(source)}),
-                  patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
-                      "codex1", self.root / ".codex1")) as role,
-                  patch.object(self.client, "open_tab", return_value="w1:p2"),
-                  patch.object(self.client, "prompt") as prompt,
-                  patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
-                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
-                      self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
-                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
-                      "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
-                result = stop_resume.resume("saved-worker", to=target)
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                assert isinstance(result, stop_resume.ClaudeUp)
-                self.assertEqual((result.session_id, result.account), (identity, expected))
-                self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
-                self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
-                self.assertEqual(launch.call_args.args[3], "codex")
-                self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
-                prompt.assert_not_called()
-                self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
-                if target is None:
-                    role.assert_called_once_with("workers")
-                else:
-                    role.assert_not_called()
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                identity = self.saved_codex_name()
+                source = self.root / ".codex2"
+                if compressed:
+                    _ = compressed_copy(source / "sessions" / f"rollout-{identity}.jsonl")
+                for target in (None, "codex3"):
+                    expected = target or "codex1"
+                    with (self.subTest(target=target), patch.dict(os.environ, {"CODEX_HOME": str(source)}),
+                          patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                              "codex1", self.root / ".codex1")) as role,
+                          patch.object(self.client, "open_tab", return_value="w1:p2"),
+                          patch.object(self.client, "prompt") as prompt,
+                          patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
+                          patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                              self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
+                          patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                              "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
+                        result = stop_resume.resume("saved-worker", to=target)
+                        self.assertIsInstance(result, stop_resume.ClaudeUp)
+                        assert isinstance(result, stop_resume.ClaudeUp)
+                        self.assertEqual((result.session_id, result.account), (identity, expected))
+                        self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
+                        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
+                        self.assertEqual(launch.call_args.args[3], "codex")
+                        self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
+                        prompt.assert_not_called()
+                        self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
+                        if target is None:
+                            role.assert_called_once_with("workers")
+                        else:
+                            role.assert_not_called()
 
     def test_unknown_codex_process_does_not_block_a_stopped_thread_without_a_pane(self) -> None:
         identity = self.saved_codex_name()
@@ -1698,8 +1712,13 @@ class StopResumeTests(unittest.TestCase):
         row = staff.StaffRow(fixed, "producer", "row-name", staff.StaffRoot(), current_session=current)
         retained = {**self.client.rows[0], "agent_session": {"kind": "none"}}
         self.publish_new_launch = True
-        cases: list[tuple[str, bool, tuple[str, ...], bool, bool, bool, Literal["claude", "codex"], bool]] = [
-                 (workspace, shared, commands, refuse_close, metadata, cross, "claude", False)
+
+        class ResumeCaller(Enum):
+            OTHER_PANE = "another pane"
+            TARGET_PANE = "the bound target pane"
+
+        cases: list[tuple[str, bool, tuple[str, ...], bool, bool, bool, Literal["claude", "codex"], bool, ResumeCaller]] = [
+                 (workspace, shared, commands, refuse_close, metadata, cross, "claude", False, ResumeCaller.OTHER_PANE)
                  for workspace, shared, commands, refuse_close, metadata, cross in (
                 ("producers", False, (), False, False, False),  # Control: reuse the valid producer tab.
                 ("morty", False, (), False, False, False),
@@ -1708,12 +1727,14 @@ class StopResumeTests(unittest.TestCase):
                 ("morty", False, ("background-job",), False, True, False),
                 ("morty", False, (), True, True, False),
                 ("morty", False, (), False, False, True))]
-        cases.extend(("morty", False, ("editor",), False, True, False, family, True)
+        cases.extend(("morty", False, ("editor",), False, True, False, family, True, ResumeCaller.OTHER_PANE)
                      for family in ("claude", "codex"))
-        cases.append(("producers", False, (), False, False, False, "claude", False))
-        for case, (workspace, shared, commands, refuse_close, metadata, cross, family, stale) in enumerate(cases):
+        cases.append(("producers", False, ("python3",), False, False, False, "claude", False, ResumeCaller.TARGET_PANE))
+        cases.append(("producers", False, (), False, False, False, "claude", False, ResumeCaller.OTHER_PANE))
+        for case, (workspace, shared, commands, refuse_close, metadata, cross, family, stale, caller) in enumerate(cases):
             shell = not commands
-            with self.subTest(workspace=workspace, shared=shared, commands=commands, refuse_close=refuse_close, family=family, stale=stale):
+            with self.subTest(workspace=workspace, shared=shared, commands=commands, refuse_close=refuse_close,
+                              family=family, stale=stale, caller=caller):
                 _ = write_registry(self.root / "configuration/models.conf", {"producers": {
                     row.name: "codex:gpt-test:high" if family == "codex" else "claude:opus:max"}}, update=True)
                 variable = "CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"
@@ -1824,7 +1845,26 @@ class StopResumeTests(unittest.TestCase):
                       patch.object(self.client, "run", side_effect=run),
                       patch.object(self.client, "result", side_effect=layout),
                       patch.object(self.client, "pane_activity", side_effect=activity),
-                      patch.object(self.client, "open_tab", side_effect=open_tab) as opened):
+                      patch.object(self.client, "open_tab", side_effect=open_tab) as opened,
+                      patch.dict(os.environ, {"HERDR_SESSION": "agents", "HERDR_PANE_ID": self.entry["pane_id"]}
+                                 if caller is ResumeCaller.TARGET_PANE else {}),
+                      patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
+                    if caller is ResumeCaller.TARGET_PANE:
+                        with self.assertRaises(SystemExit):
+                            _ = stop_resume._resume_once(str(current), why="recovery",  # pyright: ignore[reportPrivateUsage]
+                                                         names=LaunchNames(staff.StaffSnapshot((row,))))
+                        execute.assert_called_once()
+                        target = cast(herdr.TabSession, execute.call_args.args[0])
+                        resumed = cast(pane_record.PaneLaunch, execute.call_args.args[1])
+                        self.assertEqual((target.pane_id, target.session_id), (self.entry["pane_id"], current))
+                        self.assertEqual(resumed["session_id"], current)
+                        opened.assert_not_called()
+                        self.start.assert_not_called()
+                        codex_start.assert_not_called()
+                        self.assertEqual(self.client.closed, [])
+                        publication = pane_record.read("agents")[self.entry["pane_id"]]
+                        self.assertEqual(publication["session_id"], fixed)
+                        continue
                     result = stop_resume._resume_once(str(current), why="recovery",  # pyright: ignore[reportPrivateUsage]
                                                      to=target_home.name.removeprefix(".") if stale else None,
                                                      names=LaunchNames(staff.StaffSnapshot((row,))))
@@ -2571,16 +2611,47 @@ class StopResumeTests(unittest.TestCase):
 
 
     def test_shutdown_resume_with_an_explicit_target_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
-        self.start.side_effect = herdr_types.HerdrFailure("cannot start yet")
-        self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
-        self.start.side_effect = None
-        for iteration in range(2):
-            output = io.StringIO()
-            with redirect_stdout(output):
-                status = shutdown.main(["resume", "alpha", "--why", "finish move", "--to", "claude4"])
-            self.assertEqual(status, 0, output.getvalue())
-            self.assertEqual(len(output.getvalue().splitlines()), 1)
-            self.assertIn("Claude is up on claude4" if iteration == 0 else "unchanged; Claude runs on claude4", output.getvalue())
+        for state in ("pending move", "paused account change"):
+            with self.subTest(state=state), ExitStack() as scope:
+                case = StopResumeTests("runTest")
+                _ = scope.callback(case.doCleanups)
+                case.setUp()
+                if state == "pending move":
+                    case.start.side_effect = herdr_types.HerdrFailure("cannot start yet")
+                    self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
+                    case.start.side_effect = None
+                else:
+                    parent = fixture_member("showrunner", name="demo")
+                    owner = fixture_member("unit", name="alpha", parent=parent.id,
+                        runtime_id=case.entry["session_id"],
+                        worktree=staff.PresentWorktree(remote.local_machine(), case.root))
+                    _ = staff.set_home(owner.id, staff.SessionHome(case.root / ".claude3"))
+                    _ = staff.pause(str(owner.id), "review")
+
+                    def launch(pane: str, command: list[str], *, terminal: str = "") -> None:
+                        case.run_in_pane(pane, command, terminal=terminal)
+                        arguments = case._typed(case.start.call_args.args)
+                        environment = dict(item.split("=", 1) for item in arguments[:arguments.index("exec")] if "=" in item)
+                        publication = pane_record.launch(pane, owner.current_session, str(case.root), environment,
+                            ["claude", *arguments[arguments.index("exec") + 2:]])
+                        pane_record.write("agents", publication)
+
+                    _ = scope.enter_context(patch.object(case.client, "run_in_pane", side_effect=launch))
+                for iteration in range(2):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        status = shutdown.main(["resume", "alpha", "--why", "finish move", "--to", "claude4"])
+                    self.assertEqual(status, 0, errors.getvalue() + output.getvalue())
+                    self.assertEqual(len(output.getvalue().splitlines()), 1)
+                    self.assertIn("Claude is up on claude4" if iteration == 0 else "unchanged; Claude runs on claude4", output.getvalue())
+                    self.assertNotIn("unchanged", errors.getvalue())
+                    if iteration == 0:
+                        self.assertNotIn("unchanged", output.getvalue())
+                    if state == "paused account change":
+                        current = staff.by_current_session(case.entry["session_id"])
+                        assert current is not None
+                        self.assertEqual(current.home, staff.SessionHome(case.root / ".claude4"))
+                        self.assertIsInstance(current.paused, staff.Active)
 
     def test_move_writes_target_trust_before_start(self) -> None:
         target = self.root / ".claude4/.claude.json"

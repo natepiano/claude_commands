@@ -35,8 +35,13 @@ def open_transcript(path: Path) -> Generator[BinaryIO]:
             yield stream
         return
     with tempfile.TemporaryFile() as stream:
-        _ = subprocess.run(["zstd", "-q", "-d", "-c", "--", str(source)],
-                           stdout=stream, stderr=subprocess.PIPE, check=True)
+        try:
+            _ = subprocess.run(["zstd", "-q", "-d", "-c", "--", str(source)],
+                               stdout=stream, stderr=subprocess.PIPE, check=True)
+        except subprocess.CalledProcessError as error:
+            if not source.exists():
+                raise FileNotFoundError(source) from error
+            raise
         _ = stream.seek(0)
         yield stream
 

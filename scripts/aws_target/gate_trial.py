@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from decimal import Decimal
+from datetime import UTC, datetime
 import json
 import multiprocessing
 import sys
@@ -30,7 +31,7 @@ from scripts.aws_target.gate_box import (
 )
 from scripts.aws_target import ledger, cloud_gate
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
-from scripts.aws_target.config import read_settings, account_settings_path
+from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
 from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
@@ -154,7 +155,8 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
     worker.charges(record_query)
     fallback = Decimal(str(cloud_gate.settings().number('spot_max_usd_per_hour')))
     readings = worker.book.read_bills()
-    rate, reserved_type = max((ledger.box_rate(readings, size, fallback, int(worker.clock())).usd_per_hour, size)
+    day = datetime.fromtimestamp(worker.clock(), UTC).date().isoformat()
+    rate, reserved_type = max((ledger.gate_rate(readings, size, fallback, int(worker.clock()), day).usd_per_hour, size)
                               for size in cloud_gate.settings().words('instance_types'))
     policy = read_settings(worker.settings_path)
     state = worker.book.read_snapshot()
@@ -189,13 +191,15 @@ def trial_cost(book: ledger.CostLedger, attempts: set[str], settings_path: Path,
     policy = read_settings(settings_path)
     total = Decimal(0)
     complete = True
-    for reservation in book.read_snapshot().gate_reservations:
+    state = book.priced_snapshot(now)
+    intervals = ledger.gate_compute_intervals(state, now, policy.box_minimum_seconds, reserve=True)
+    for reservation in state.gate_reservations:
         if reservation.attempt not in attempts or isinstance(reservation.state, ledger.GateAbsent):
             continue
         confirmed = isinstance(reservation.state, ledger.GateTerminated)
         complete = complete and confirmed
-        end = reservation.state.at if isinstance(reservation.state, ledger.GateTerminated) else max(now, reservation.expires)
-        total += ledger.box_cost(reservation.rate, end - reservation.at, policy.box_minimum_seconds) + reservation.allowance_usd
+        total += sum((row.usd for row in intervals if row.source == 'gate:' + reservation.attempt), Decimal(0))
+        total += ledger.gate_allowance(reservation).usd
     return total, complete
 
 
@@ -239,6 +243,7 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
                                          and row.state.instance_id == instance
                                          for row in worker.book.read_snapshot().gate_reservations)
                         if not terminated:
+                            worker.box_region = str(launch.get('region', worker.api.region))
                             slot.status = 1
                             worker.terminate(attempt, instance)
     except BaseException as error:
@@ -385,7 +390,9 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         if len(modules) > cloud_gate.settings().whole('slots'):
             raise GateRefused('The trial needs more cloud slots than configured')
         trial = pushed_request(args.repo, args.base, args.changed, modules, args.rounds)
-        deployment = cloud_gate.read(directory / 'gate-deployment.json')
+        home = conf.read(account_settings_path()).text('region')
+        _ = gate_regions(home)
+        deployment = gate_deployment(directory / 'gate-deployment.json', home)
         folder = directory / 'paired-trials' / uuid4().hex
         folder.mkdir(parents=True)
         expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
