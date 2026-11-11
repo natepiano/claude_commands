@@ -2552,36 +2552,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Ruled out:** the transitive closure rule of Phase 96 — one `merge_gate.conf` edit selected 429 of 743 modules.
 
-### Phase 128 — Test runs start no background Git upkeep  · status: todo
+### Phase 128 — Test runs start no background Git upkeep  · status: done
 **Depends on:** Phase 127
 
-#### Work Order
+#### As-built
 
-**Goal:** Git starts no automatic maintenance or garbage collection inside any test module that the gate runner starts, and the eight per-fixture copies of that setting are gone.
+- No repository change. The trial gained 2.8 CPU s on the 21 most Git-heavy modules, far under the 30 CPU s bar, and did not land.
+- The trial: `module_run.py` appended `maintenance.auto=false` and `gc.auto=0` through `GIT_CONFIG_COUNT`, one fixture helper kept those settings, and nine per-fixture copies were removed. Review closed four findings, and the full gate passed (748 modules).
+- Measure: `module_cost.py --commands` on 21 Git-heavy modules, base and change side by side. Command CPU 451.3 to 448.5 CPU s, Git CPU 92.1 to 90.2 CPU s, Git starts 82,028 to 79,432 (3%). No measured row was a detached `gc` or `maintenance` task.
+- Floor: the per-fixture copies already turned off most upkeep. The Work Order estimate (about 50 CPU s on 12 modules) did not hold on this base.
 
-**Decision:** Builds showrunner go, 2026-11-10 21:28: run after Phase 127; remove the per-fixture git upkeep copies in the same phase; get each file owner's go before the checkpoint and name the goes in the notice; proof is paired gate CPU on a review copy.
-
-**Cause:** Test fixtures make thousands of temporary Git repositories. After commits and fetches, Git starts `git maintenance run --auto` and `git gc --auto`, about 10% of all Git starts in a gate. Some of that work detaches and escapes the module's CPU count. Measured with `module_cost.py --commands` on 12 Git-heavy modules: Git CPU 135.4 and 125.8 CPU s with upkeep, 79.2 and 79.7 CPU s without it (about 50 CPU s saved). The measure set `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=maintenance.auto`, `GIT_CONFIG_VALUE_0=false`.
-
-**Spec:**
-1. `scripts/test_times/module_run.py`: before it starts the module, add two command-line Git settings through the environment, `maintenance.auto=false` and `gc.auto=0`. Use `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`. Append after any inherited entries: read the inherited `GIT_CONFIG_COUNT` and number the new keys from it, as `scripts/production/ci_points.py:166` does. Child processes inherit the settings. Command-line settings also apply when a fixture sets `GIT_CONFIG_NOSYSTEM=1` or `GIT_CONFIG_GLOBAL`, which many fixtures do; a system config file would not reach those fixtures.
-2. Remove each per-fixture copy that only turns off Git upkeep in a test repository:
-   - `scripts/production/test_fast_track.py:351` (`maintenance.auto false`)
-   - `scripts/production/rename_unit_test_support.py:131` (`gc.auto 0` in the config loop) and `:321` (`gc.auto 0`)
-   - `scripts/production/add_unit_test_support.py:242` (`GIT_CONFIG_PARAMETERS` patch) and `:249` (`maintenance.auto false` loop)
-   - `scripts/production/test_staff.py:534` (change only this upkeep line; another unit may edit staff tests)
-   - `scripts/production/rename_test_support.py:595` (`gc.auto`, `maintenance.auto` loop)
-   - `scripts/production/transfer_unit_test_support.py:139` (`gc.auto 0` in the config loop)
-   - `scripts/production/test_affected_modules.py:31`
-   Search `scripts/` for others (`maintenance.auto`, `gc.auto`, `GIT_CONFIG_PARAMETERS` with those keys) and list them in the reply. Keep a copy when its test proves Git upkeep behavior itself, and say why. Do not touch `scripts/style/test_style_footprint.py:2022`: it is text in a generated Rust fixture.
-3. Confirm in the reply that every gate path runs modules through `module_run.py`: `merge_gate.py` (full and targeted) and the Mac runner. Name any path that does not.
-4. Tests: one row in `scripts/test_times/test_module_run.py`. A module run under `module_run.py` reads `git config --get maintenance.auto` as `false` and `gc.auto` as `0`, also with `GIT_CONFIG_NOSYSTEM=1`, and an inherited `GIT_CONFIG_COUNT` entry stays visible. The row fails on the old code.
-
-**Files:**
-- `scripts/test_times/module_run.py` — command-line Git upkeep settings
-- `scripts/test_times/test_module_run.py` — one new row
-- `scripts/production/test_fast_track.py`, `scripts/production/rename_unit_test_support.py`, `scripts/production/add_unit_test_support.py`, `scripts/production/test_staff.py`, `scripts/production/rename_test_support.py`, `scripts/production/transfer_unit_test_support.py`, `scripts/production/test_affected_modules.py` — remove the per-fixture copies
-**Workers:** 1 writer (one setting and its removed copies).
-- impl: all files.
-
-**Acceptance gate:** the changed modules pass through `module_run.py`; basedpyright 0/0/0 on the changed files. The director runs paired gate CPU on a review copy (base and change, alternating order) for the 12 Git-heavy modules and the changed modules, scales it to the gate, and reports the whole-phase gain. The phase lands only at 30 CPU s per gate or more.
+**Ruled out:** a runner-wide Git upkeep setting for speed. Keep the per-fixture copies; several of them are race guards for fixture removal.
