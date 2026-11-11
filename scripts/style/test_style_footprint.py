@@ -1996,6 +1996,54 @@ class StyleFootprintTests(unittest.TestCase):
         assert isinstance(result, style_footprint.NoItemMoves)
         self.assertIn(reason, result.reason)
 
+    def test_a_whole_sibling_test_file_moves_into_its_parent_inline_module(self) -> None:
+        source = "// Keep the fixture comment.\nuse super::*;\nconst LIMIT: usize = 3;\n"
+        source += "#[test]\nfn first() { assert_eq!(LIMIT, 3); }\n#[test]\nfn second() { assert!(LIMIT > 0); }\n"
+        for name, edit, proven in (("widget_tests", "", True), ("tests", "", True),
+                                    ("tests", "body", False), ("tests", "parent", False),
+                                    ("tests", "cfg", False), ("tests", "reference", False),
+                                    ("tests", "existing", True), ("file_tests", "path", True),
+                                    ("file_tests", "path-first", True)):
+            with self.subTest(name=name, edit=edit):
+                declaration = "#[cfg(test)]\nmod widget_tests;\n"
+                parent_path = "src/widget/mod.rs"
+                if edit in ("path", "path-first"):
+                    declaration = ('#[cfg(test)]\n#[path = "widget_tests.rs"]\nmod file_tests;\n'
+                                   if edit == "path" else
+                                   '#[path = "widget_tests.rs"]\n#[cfg(test)]\nmod file_tests;\n')
+                    parent_path = "src/widget/owner.rs"
+                    self.write("src/widget/mod.rs", "mod owner;\n")
+                parent = "pub fn widget() {}\n" + declaration
+                if edit == "reference":
+                    parent += "#[cfg(test)]\nfn caller() { widget_tests::first(); }\n"
+                if edit == "existing":
+                    parent += "#[cfg(test)]\nmod tests {\nuse super::*;\nfn previous() {}\n}\n"
+                self.write("src/lib.rs", "mod widget;\n")
+                self.write(parent_path, parent)
+                self.write("src/widget/widget_tests.rs", source)
+                base = self.commit()
+                _ = self.git("rm", "src/widget/widget_tests.rs")
+                body = source.replace("= 3;", "= 4;") if edit == "body" else source
+                inline = "#[cfg(test)]\nmod " + name + " {\n" + "".join("    " + line + "\n" for line in body.splitlines()) + "}\n"
+                after = (parent.replace(declaration, "").replace(
+                    "fn previous() {}\n}", "fn previous() {}\n" + source + "}") if edit == "existing" else
+                    parent.replace(declaration, inline))
+                if edit == "parent":
+                    after = after.replace("pub fn widget() {}", "pub fn widget() { panic!(); }")
+                if edit == "cfg":
+                    after = after.replace("#[cfg(test)]", "")
+                self.write(parent_path, after)
+                head = self.commit()
+                changes = style_footprint.changes_between(self.repo, base, head)
+                tree = style_footprint.RevisionTree(self.repo, base)
+                result = style_footprint.prove_item_moves(changes, tree)
+                if proven:
+                    self.assertIsInstance(result, style_footprint.ItemMoves, result)
+                    self.assertEqual(style_footprint.moved_files(changes, tree),
+                                     frozenset({"src/widget/widget_tests.rs", parent_path}))
+                else:
+                    self.assertIsInstance(result, style_footprint.NoItemMoves, result)
+
     def test_a_const_moved_to_an_existing_constants_module_is_proven(self) -> None:
         result = self.prove_move(self.LIMIT_FILES, self.LIMIT_MOVED)
         assert isinstance(result, style_footprint.ItemMoves), result

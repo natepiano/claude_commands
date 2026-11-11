@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
@@ -3029,9 +3029,111 @@ def prove_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> 
     new one or adds or removes a `use` line the move needs. The proof refuses whenever it is not sure.
     """
     try:
+        if any(change.status == FileStatus.DELETED for change in changes):
+            return proven_test_file_inlining(changes, sources)
         return proven_item_moves(changes, sources)
     except MoveRefused as refusal:
         return NoItemMoves(str(refusal))
+
+
+def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:
+    """Prove that complete sibling test files replace their private test module declarations."""
+    crates = {sources.crate(change.path) for change in changes}
+    if len(crates) != 1:
+        raise MoveRefused("the change crosses crates")
+    crate = crates.pop()
+    manifest = crate_manifest(sources, crate)
+    keywords = edition_keywords(crate_edition(sources, crate, manifest))
+    library = library_name(manifest)
+    befores = {change.path: move_text(change.path, False, change.before, file_module(change.path, crate, sources), library)
+               for change in changes}
+    afters = {change.path: move_text(change.path, True, change.after, file_module(change.path, crate, sources), library)
+              for change in changes}
+    standard = (STANDARD_CRATES & dependency_names(manifest)
+                | bound_standard_names(sources, crate, STANDARD_CRATES, befores, afters))
+    refuse_binding_macros(sources, crate, befores, afters, standard, keywords)
+    moves: list[ItemMove] = []
+    module_lines: list[FileSpan] = []
+    parents: set[str] = set()
+    for change in changes:
+        if change.status != FileStatus.DELETED:
+            continue
+        path = PurePosixPath(change.path)
+        path_attribute = ("#", "[", "path", "=", f'"{path.name}"', "]")
+        cfg = ("#", "[", "cfg", "(", "test", ")", "]")
+        declarations = [
+            (file, item) for file, old in befores.items()
+            if PurePosixPath(file).parent == path.parent
+            for item in old.items if item.kind == "mod" and item.visibility == ""
+            and old.words[item.keyword + 2:item.end] == (";",)
+            and (old.words[item.start:item.keyword] in (cfg + path_attribute, path_attribute + cfg)
+                 or (PurePosixPath(file).name in {"mod.rs", "lib.rs", "main.rs"}
+                     and item.name == path.stem and old.words[item.start:item.keyword] == cfg))
+        ]
+        if not path.name.endswith("_tests.rs") or len(declarations) != 1:
+            raise MoveRefused(f"{change.path}: not one complete sibling test file move")
+        parent, declared = declarations[0]
+        if parent in parents:
+            raise MoveRefused(f"{change.path}: not one complete sibling test file move")
+        source = befores[change.path]
+        expansion = item_level_expansion(source.words, frozenset(), keywords)
+        if expansion is not None:
+            raise MoveRefused(f"{change.path} has {expansion}")
+        old, new = befores[parent], afters[parent]
+        candidates = [item for item in new.items if item.kind == "mod"
+                      and new.words[item.start:item.keyword] == ("#", "[", "cfg", "(", "test", ")", "]")
+                      and new.words[item.keyword + 2:item.keyword + 3] == ("{",)]
+        declaration = word_span(old, declared.start, declared.end)
+        matched = False
+        for item in candidates:
+            body = FileSpan(parent, True, new.spans[item.keyword + 2].end, new.spans[item.end - 1].start)
+            wrapper = word_span(new, item.start, item.end)
+            existing = [member for member in old.items if member.kind == "mod" and member.name == item.name
+                        and old.words[member.keyword + 2:member.keyword + 3] == ("{",)]
+            removed = [declaration]
+            if existing:
+                member, = existing
+                if old.words[member.start:member.keyword] != new.words[item.start:item.keyword]:
+                    continue
+                old_body = old.text[old.spans[member.keyword + 2].end:old.spans[member.end - 1].start]
+                if region_shape(change_text(new, body)) not in (
+                        region_shape(old_body + "\n" + change.before), region_shape(change.before + "\n" + old_body)):
+                    continue
+                previous = move_text(parent, False, old_body, old.scope.module, library)
+                old_imports = {previous.words[entry.start:entry.end] for entry in previous.items if entry.kind == "use"}
+                source_imports = {source.words[entry.start:entry.end] for entry in source.items if entry.kind == "use"}
+                if old_imports != source_imports:
+                    continue
+                if (any(entry.name in source.words for entry in previous.items if entry.kind != "use" and entry.name)
+                        or any(entry.name in previous.words for entry in source.items if entry.kind != "use" and entry.name)):
+                    continue
+                previous_span = word_span(old, member.start, member.end)
+                expected = edited_text(old.text, (declaration, replace(previous_span, text=change_text(new, wrapper))))
+                removed.append(previous_span)
+            else:
+                if region_shape(change_text(new, body)) != region_shape(change.before):
+                    continue
+                expected = edited_text(old.text, (replace(declaration, text=change_text(new, wrapper)),))
+            if region_shape(expected) != region_shape(new.text):
+                continue
+            if item.name != declared.name:
+                other_code = edited_text(old.text, (declaration,))
+                if any(declared.name in plain_words(other_code if file == parent else sources.text(file))
+                       for file in crate_files(sources, crate, ())):
+                    continue
+                if set(source.words) & {"mod", "type_name", "type_name_of_val"}:
+                    continue
+            moves.append(ItemMove("mod", declared.name, FileSpan(change.path, False, 0, len(change.before)), wrapper, None))
+            module_lines.extend(removed)
+            parents.add(parent)
+            matched = True
+            break
+        if not matched:
+            raise MoveRefused(f"{change.path}: the complete test file does not replace its module declaration")
+    if not moves or any(change.path not in parents and change.path not in {move.source.path for move in moves}
+                        or change.path in parents and change.status != FileStatus.MODIFIED for change in changes):
+        raise MoveRefused("the change contains edits outside the test file moves")
+    return ItemMoves(tuple(moves), (), (), tuple(module_lines), ())
 
 
 def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:

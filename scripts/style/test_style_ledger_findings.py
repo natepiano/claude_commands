@@ -1275,6 +1275,68 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         _ = self.cli("held", "replace", "--id", finding_id, "--after", "corrected")
         self.assertEqual(ledger.named_held((finding_id,))[0].after, "corrected")
 
+    def test_sibling_test_file_moves_fold_at_filing_and_through_the_cli(self) -> None:
+        for mode in ("filing", "fold"):
+            with self.subTest(mode=mode):
+                rule = self.rule("test-moves-" + mode, "tier: D\nfamily: modules\ninput_scope: file\n")
+                ledger = self.ledger()
+                parent = f"crates/alpha/src/{mode}/mod.rs"
+                paths = tuple(f"crates/alpha/src/{mode}/{name}.rs"
+                              for name in ("first_tests", "second_tests", "mixed_tests", "ordinary", "missing_tests", "ambiguous_tests"))
+                self.write(parent, "mod first_tests;\nmod mixed_tests;\nmod ambiguous_tests;\n")
+                owner = f"crates/alpha/src/{mode}/owner.rs"
+                self.write(owner, '#[cfg(test)]\n#[path = "second_tests.rs"]\nmod file_tests;\n')
+                self.write(f"crates/alpha/src/{mode}/other.rs",
+                           '#[path = "ambiguous_tests.rs"]\nmod duplicate;\n')
+                for path in paths:
+                    self.write(path, "fn item_1() {}\nfn item_2() {}\nfn item_3() {}\n")
+                anchor = self.commit("Declare the sibling test modules")
+                originals: list[style_ledger.HeldFinding] = []
+                for path in paths:
+                    for line in range(1, 4):
+                        module = "other_tests" if path == paths[2] and line == 3 else "tests"
+                        originals.append(ledger.hold(
+                            rule, path, line, f"fn item_{line}() {{}}", "restructure", f"item_{line} lives in {path}.",
+                            f"Move item_{line} into the inline {module} module in {parent}.",
+                            self.blob(rule), "outside"))
+                issue = self.root / (mode + ".md")
+                if mode == "filing":
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.executemany("UPDATE held_findings SET anchor_commit=? WHERE finding_id=?",
+                                                   [(anchor, finding.finding_id) for finding in originals])
+                    self.write(parent, "")
+                    self.write(owner, "")
+                    _ = self.commit("Remove the current declarations after judgment")
+                    for finding in originals:
+                        ledger.file_held(finding.finding_id, issue)
+                    live = tuple(finding for finding in ledger.proposal_findings(issue)
+                                 if isinstance(finding.state, style_ledger.Filed))
+                else:
+                    result = self.cli("held", "fold-test-files")
+                    self.assertIn("folded 3 files: 9 -> 3 findings\n", result.stdout)
+                    self.assertEqual(len(result.stdout.splitlines()), 4)
+                    live = tuple(finding for finding in ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
+                                 if finding.rule == rule)
+                    before = self.held_rows(ledger.database)
+                    self.assertEqual(self.cli("held", "fold-test-files").stdout, "folded 0 files: 0 -> 0 findings\n")
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                self.assertEqual(len(live), 12)
+                for path in paths[:3]:
+                    whole, = tuple(finding for finding in live if finding.path == path)
+                    self.assertEqual(whole.line, 1)
+                    self.assertIn(f"Move the whole file {path}", whole.after)
+                    declaring, module = (owner, "file_tests") if path == paths[1] else (parent, path.rsplit("/", 1)[1][:-3])
+                    self.assertIn(f"inline {module} module in {declaring}", whole.after)
+                    for original in (finding for finding in originals if finding.path == path):
+                        history, = ledger.named_held((original.finding_id,))
+                        self.assertIsInstance(history.state, style_ledger.Withdrawn)
+                        assert isinstance(history.state, style_ledger.Withdrawn)
+                        self.assertEqual(history.state.by, style_ledger.DuplicateOf(whole.finding_id))
+                        self.assertEqual((history.line, history.text, history.before, history.after),
+                                         (original.line, original.text, original.before, original.after))
+                for path in paths[3:]:
+                    self.assertEqual(sum(finding.path == path for finding in live), 3)
+
     def test_hold_of_a_different_change_at_a_held_site_gets_its_own_row(self) -> None:
         rule = self.rule("change-ids")
         self.set_tip(self.initial_tip)
