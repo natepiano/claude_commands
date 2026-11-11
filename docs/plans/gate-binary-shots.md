@@ -32,35 +32,19 @@
 
 **Depends on:** none.
 
-#### Work Order
+#### As-built
 
-**Goal:** `copies.py run --publish <relative path>` copies a file the gate built into a scratch folder under `/tmp/claude/scratch` and prints its path. A unit launches shots from that path with no permission prompt.
-
-**Spec:**
-
-Cause: a unit copied `<gate checkout>/target/debug/hana`. `target` is a symlink into `~/worktrees/gates`, which is outside every unit's allowed folders, so the copy asked for permission.
-
-1. Add `--publish <relative path>` to the `run` parser. It may repeat.
-2. After the command returns, while `standing()` still holds the checkout, for each `--publish` path that exists under the tree: make one folder with `scratch.new(word="gate-binary", throwaway=True)` for the run. Copy each file into it with its base name, following the symlink and keeping the executable mode. Copy to a temporary name, then rename.
-3. Write `manifest.json` in that folder: `repository`, full `commit` (the checkout `HEAD`), `command_exit` and the published file names.
-4. Print one line per file to stdout: `published: <absolute path> <full commit>`. A path that does not exist prints `copies: publish: <path> not built` to stderr. The run exit code stays the command's exit code.
-5. A failed copy removes the folder with `scratch.end()` and prints the error on stderr. The run exit code stays the command's exit code.
-6. `commands/hana_shot.md`: add one short paragraph. A shot from a gate build uses the `published:` path with `--binary`, and assets from a matching worktree with `--worktree`. Never copy from a gate checkout's `target`.
-7. Add no other guard, refusal or scan (user rule).
+- `copies.py run --publish <relative path>` (repeatable) copies built files out of the gate checkout while `standing()` still holds it. `publish_files(tree, paths, command_exit)` does the work.
+- All files of one run go into one `scratch.new(word="gate-binary", throwaway=True)` folder under `/tmp/claude/scratch`. Each copy follows the `target` symlink, keeps the mode, and lands by a temporary name and a rename.
+- `manifest.json` in that folder holds `repository`, the full checkout `commit`, `command_exit` and the file names.
+- Stdout prints `published: <absolute path> <full commit>` per file. A missing path prints `copies: publish: <path> not built` on stderr. A copy error ends the scratch folder and prints `copies: publish: <error>`. The run exit code is always the command's exit code.
+- `commands/hana_shot.md` tells units to pass the `published:` path as `--binary` and a matching worktree as `--worktree`, and never to copy from a gate checkout's `target`.
 
 **Files:**
-- `scripts/copies/copies.py` — `--publish` on `run`.
-- `scripts/copies/test_copies.py` — publish rows.
+- `scripts/copies/copies.py` — `publish_files` and the `run --publish` option.
+- `scripts/copies/test_copies.py` — publish rows in the `run` command test.
 - `commands/hana_shot.md` — the gate-binary paragraph.
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `scripts/copies/copies.py`, `commands/hana_shot.md`.
-- `test` — `scripts/copies/test_copies.py`. Rows use a temporary repository and a temporary scratch root. A `run --publish target/debug/x` whose command writes `target/debug/x` through a symlinked `target` prints a `published:` path outside the checkout, the file is a real file with the same bytes and mode, and `manifest.json` names the full commit. A missing path prints the `not built` line and keeps the command's exit code. The publication survives the checkout removal.
+**Gotchas:** the scratch default task carries a random suffix, so `scratch.end()` on a failed publication removes only that folder. The publication lives until the scratch deadline, then the hourly sweep removes it.
 
-**State:** none.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-1. The unittest line passes for `scripts.copies.test_copies`, `scripts.copies.test_copy_guard_sources` and `scripts.lib.test_scratch`.
-2. basedpyright over the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** refusals for a published name that matches `.<name>.tmp` or `manifest.json` — no unasked guards; the gate publishes `target/debug/hana`.
