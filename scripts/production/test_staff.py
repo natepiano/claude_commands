@@ -148,7 +148,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
 
         _, parent, member = self.tree()
         with mock.patch.object(pane_launch, "staff_admitted", wraps=pane_launch.staff_admitted) as publication:
-            _ = staff.ensure("agent", name="TEST-no-pane-read", runtime_id=fixture_runtime_id("TEST-no-pane-read"))
+            _ = staff.ensure("producer", name="TEST-no-pane-read", runtime_id=fixture_runtime_id("TEST-no-pane-read"))
             _ = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-no-worker-pane-read")), "TEST-new", parent.id)
             _ = staff.update_current_session(member.current_session, staff.native_id(fixture_runtime_id("TEST-next-native")))
         publication.assert_not_called()
@@ -284,22 +284,22 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                         self.assertEqual(staff.by_id(holder.id), holder)
 
 
-    def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
+    def test_guarded_cli_adds_a_producer_without_a_parent_and_reads_its_locations(self) -> None:
         identity = fixture_runtime_id("morty-agent")
         for field, state in (("worktree", "present"), ("doc", "live")):
             with self.subTest(field=field):
                 self.staff_file.unlink(missing_ok=True)
-                result = self.cli("ensure", "agent", "--name", "morty", "--runtime-id", identity,
+                result = self.cli("ensure", "producer", "--name", "morty", "--runtime-id", identity,
                                   "--" + field, "natedev", str(self.root / "morty"), state, "--json")
                 payload = cast(object, json.loads(result.stdout))
                 row = staff.StaffRow.from_json(payload)
                 self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
-                                 (identity, identity, "agent", "morty", staff.StaffRoot()))
+                                 (identity, identity, "producer", "morty", staff.StaffRoot()))
                 self.assertEqual(staff.snapshot().rows, (row,))
                 self.assertEqual(staff.by_path("morty"), row)
-                shown = self.cli("show", "--kind", "agent")
+                shown = self.cli("show", "--kind", "producer")
                 self.assertIn("morty", shown.stdout)
-                self.assertIn("agent", shown.stdout)
+                self.assertIn("producer", shown.stdout)
                 self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
@@ -1206,7 +1206,7 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(record.by_path("unfilled/removed"), units[2])
         self.assertCountEqual(record.find(), [*runners, *units])
 
-    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_agents(self) -> None:
+    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_producers(self) -> None:
         runner, unit, worker = self.tree()
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
@@ -1214,7 +1214,7 @@ class StaffTests(StaffCommandTestCase):
                     self.assert_refused(lambda: staff.retire(row.id))
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
-                agent = fixture_member("agent", name="test-agent-" + machine)
+                agent = fixture_member("producer", name="test-agent-" + machine)
                 self.assertEqual(staff.retire(agent.id), agent)
                 self.assertIsNone(staff.by_id(agent.id))
         self.assertEqual(staff.retire(worker.id), worker)

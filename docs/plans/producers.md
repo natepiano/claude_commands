@@ -55,7 +55,7 @@ dwight=claude:fable:high
 
 ## Phases
 
-### Phase 1 — Staff kind producer replaces agent  · status: pending
+### Phase 1 — Staff kind producer replaces agent  · status: done
 
 **Depends on:** none
 

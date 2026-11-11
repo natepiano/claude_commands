@@ -1048,7 +1048,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
     def test_caller_without_a_staff_row_launches_with_an_empty_owner(self) -> None:
         self.stop_fake_listener()
         self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
-        _ = fixture_member("agent", name="another-caller")
+        _ = fixture_member("producer", name="another-caller")
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": fixture_runtime_id("missing-caller")}):
             _ = self.launch_without_starting_hana()
         self.assertIn("HANA_TEST_OWNER=", self.launch_command)

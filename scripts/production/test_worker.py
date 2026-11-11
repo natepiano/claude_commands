@@ -663,7 +663,7 @@ class WorkerCommandTests(unittest.TestCase):
         closed = [self.fixture.worker(name) for name in ("impl3", "fix1", "rev10a", "rev10c", "fix2", "port6", "ft7", "cr7")]
         for pane, reason in (("w1:p9", "agent argv is unavailable"), ("w2:p9", "pane_not_found"),
                              ("w2:p8", "current Codex rollout changed")):
-            foreign = fixture_member("agent", name="foreign-" + pane.replace(":", "-"))
+            foreign = fixture_member("producer", name="foreign-" + pane.replace(":", "-"))
             self.fixture.world.add(foreign, pane, workspace=pane.split(":")[0],
                                    tab="w1:t1" if pane.startswith("w1:") else "w2:t2")
             self.fixture.world.unknown[pane] = reason
