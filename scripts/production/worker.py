@@ -358,10 +358,13 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              policy: worker_panes.LaunchPolicy | worker_panes.UseRolePolicy = worker_panes.UseRolePolicy.CURRENT,
              started: worker_panes.OpenWorker | StartAtDispatch = START_AT_DISPATCH,
              completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
-             on_submission: Callable[[], object] = lambda: None) -> DispatchSubmission | ExitCode:
+             on_submission: Callable[[], object] = lambda: None,
+             lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+             ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
-    with worker_panes.worker_lock(parent, name) as hold, ExitStack() as cleanup:
+    with ExitStack() as operations, ExitStack() as cleanup:
+        hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.BUSY
@@ -397,6 +400,14 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if not isinstance(current_start, worker_panes.OpenWorker):
             return startup_result(name, current_start)
         started = current_start
+        if not isinstance(matched, progress_history.MatchedDispatch):
+            ready = _dispatch_ready(parent, started, _client())
+            if not isinstance(ready, worker_panes.OpenWorker):
+                return ready
+            started = ready
+            if started.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+                print(f"{started.row.name}: agent is {started.status.value}", file=sys.stderr)
+                return ExitCode.BUSY
 
         def submitted() -> None:
             _ = cleanup.pop_all()
@@ -436,20 +447,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         return result
 
 
-def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
-                   line: str, dispatch_id: str, *, run: Path,
-                   on_submission: Callable[[], object] = lambda: None) -> DispatchSubmission | ExitCode:
-    """Submit the saved prompt after the bounded idle checks."""
-    current = started
+def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
+                    client: herdr.Herdr) -> worker_panes.OpenWorker | ExitCode:
+    """Use the existing bounded wait before replacing a submitted pass."""
     codex = isinstance(staff.backend(current.row), staff.CodexBackend)
     if current.status == herdr.AgentStatus.BLOCKED and codex:
         return _blocked_question(client, current)
-    receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
-    if isinstance(receipt, DispatchEvidenceUnknown):
-        print(f"anomaly: {current.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
-        return ExitCode.UNCERTAIN
-    if not isinstance(receipt, DispatchNotSubmitted):
-        return DispatchSubmission.SUBMITTED
     if current.status == herdr.AgentStatus.WORKING:
         try:
             _ = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
@@ -470,6 +473,27 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         current = observed
         if current.status == herdr.AgentStatus.BLOCKED and codex:
             return _blocked_question(client, current)
+    return current
+
+
+def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
+                   line: str, dispatch_id: str, *, run: Path,
+                   on_submission: Callable[[], object] = lambda: None) -> DispatchSubmission | ExitCode:
+    """Submit the saved prompt after the bounded idle checks."""
+    if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
+        return _blocked_question(client, started)
+    receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
+        return ExitCode.UNCERTAIN
+    if not isinstance(receipt, DispatchNotSubmitted):
+        return DispatchSubmission.SUBMITTED
+    ready = _dispatch_ready(parent, started, client)
+    if not isinstance(ready, worker_panes.OpenWorker):
+        return ready
+    current = ready
+    codex = isinstance(staff.backend(current.row), staff.CodexBackend)
+    if started.status == herdr.AgentStatus.WORKING:
         receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
         if isinstance(receipt, DispatchEvidenceUnknown):
             print(f"{current.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
@@ -568,10 +592,12 @@ def _free_name(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot) -
 
 
 def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
-           policy: worker_panes.LaunchPolicy) -> worker_panes.WorkerStart:
+           policy: worker_panes.LaunchPolicy, *,
+           lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           ) -> worker_panes.WorkerStart:
     """Start an explicit staff target with the supplied policy."""
     with staff.row_operation(target.parent):
-        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy)
+        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
@@ -850,6 +876,15 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         outcome = ExitCode.UNCERTAIN
                         continue
                     if not isinstance(active, progress_history.ActiveDispatch):
+                        if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
+                            allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
+                            if isinstance(allowed, worker_panes.Kept):
+                                continue
+                            closed = worker_panes.close(parent, WorkerName.parse(state.row.name), lock=hold)
+                            if not isinstance(closed, worker_panes.Closed):
+                                outcome = ExitCode.UNCERTAIN
+                                continue
+                            changed = True
                         if only != "all":
                             print(f"{state.row.name}: closed; its next assign resumes it")
                         continue
