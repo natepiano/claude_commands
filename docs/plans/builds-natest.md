@@ -2772,3 +2772,68 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `scripts/test_times/show.py` — `TrendRun.run_id`, `TrendDay.run_ids`, cost cells at print time in `trend`.
 - `scripts/test_times/test_show.py` — the settled-day case re-prices the ledger and checks the cached day's new cost and note.
 - `commands/test_times.md` — the ledger and cache rules.
+
+### Phase 137 — Find where the slowest test module spends its CPU  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A measured report names where `direct/test_verify_wait_holder.py` (median 67.9 CPU s, 27 tests) spends its CPU, and which changes save at least 30 CPU s per gate with the same tests.
+
+**Decision:** Director, 2026-11-11: the next module in the descending sort; research first, as in Phase 133. It runs beside Phase 134, which waits on the aws trial fix.
+
+**Spec:**
+1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
+2. Name each fixed cost: interpreter starts, real sleeps or wait intervals, subprocess trees, repeated setup.
+3. Measure one local pair for each candidate change in a scratch copy. A test that proves a process boundary keeps its process.
+4. Name the owning unit of each file a change would touch.
+5. Edit no repository file.
+
+**Files:**
+- `scripts/direct/test_verify_wait_holder.py` — read only.
+
+**Workers:** 1 writer; research only.
+- impl: the report.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report at `phases/137/research_report.md` in the unit session gives the measures, each candidate with its saving, and the owners.
+
+**Result:** No single change in this module saves 30 CPU s. Baseline 76.0 CPU s, 27 tests. One local pair each: deferred recorder and staff imports save 16.4 CPU s; the seeded interpreter cache saves 2.2 CPU s; sharing the verify helper saves 7.3 CPU s; all three together save 9.0 CPU s. Recorder starts cost 19.6 CPU s in 88 starts. The recorder import costs about 133 ms, and 57 test modules plus `verify.sh` start the recorder, so the import change can save CPU across many modules. Phase 138 measures that.
+
+### Phase 138 — Recorder commands import only what they use  · status: todo
+**Depends on:** Phase 134
+**Blocked by:** sdlc and builds go — the files are sdlc's shared recorder and staff code.
+
+#### Work Order
+
+**Goal:** A recorder start costs less CPU, and the gate modules that start the recorder save at least 30 CPU s in sum, with the same tests.
+
+**Decision:** Director, 2026-11-11, from the Phase 137 research: deferred imports saved 16.4 CPU s in `direct/test_verify_wait_holder.py` alone. Savings may join across modules.
+
+**Spec:**
+1. In `scripts/direct/progress_history.py`, `scripts/direct/plan_history.py` and `scripts/production/session_staff.py`, move each top-level import that only a function uses into that function.
+2. Keep each import that a module expression, class base or argument default uses at the top level.
+3. Keep every public name, including `OPEN_PHASES_KEY` and `STATE_FILENAME`.
+4. Change no recorder, staff or holder decision. Keep every process boundary.
+5. Change no test body or assertion.
+
+**Files:**
+- `scripts/direct/progress_history.py`
+- `scripts/direct/plan_history.py`
+- `scripts/production/session_staff.py`
+
+**Workers:** 1 writer; three small edits in one import chain.
+- impl: all three files.
+
+**Constraints from prior phases:**
+- Phase 122 rejected a smaller recorder-only import change. This change also covers `session_staff.py`.
+- Phase 134 gives the aws paired trial command for acceptance.
+
+**State:** none.
+
+**Acceptance gate:**
+- basedpyright reports zero errors and zero warnings on the three files and their callers.
+- The direct and production suites pass.
+- An aws paired trial over the modules with the most recorder starts gives a summed paired median saving of at least 30 CPU s, with the same test counts.
