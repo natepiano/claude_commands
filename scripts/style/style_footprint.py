@@ -2655,6 +2655,10 @@ def crate_manifest(sources: RevisionTree, crate: str) -> dict[str, object]:
             targets.extend(cast(list[object], entries))
     if any(isinstance(target, dict) and "path" in target for target in targets):
         raise MoveRefused(f"{manifest} sets a target path")
+    package = data.get("package")
+    if isinstance(package, dict) and any(cast(dict[str, object], package).get(key) is False
+                                         for key in ("autolib", "autobins", "autoexamples", "autotests", "autobenches")):
+        raise MoveRefused(f"{manifest} changes target discovery")
     main = str(root / "src" / "main.rs")
     if (str(root / "src" / "lib.rs") in sources.paths and main in sources.paths
             and any(token.value == "mod" for token in tokens(sources.text(main)))):
