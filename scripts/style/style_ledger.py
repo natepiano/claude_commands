@@ -6619,6 +6619,28 @@ class Ledger:
 
         return retry_on_change(attempt)
 
+    def mark_unbuilt(self, names: tuple[str, ...], reading: ReadByPerson) -> tuple[str, ...]:
+        """Release filed findings from merged proposal tickets after a person finds their changes absent."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            findings = self.named_held(names)
+            for finding in findings:
+                if not isinstance(finding.state, Filed):
+                    raise LedgerError(f"{finding.finding_id}: cannot mark a {held_state_name(finding.state)} finding unbuilt")
+                if not isinstance(finding.build_ticket, BuildTicket):
+                    raise LedgerError(f"{finding.finding_id}: no merged build ticket")
+                ticket = self._ticket(finding.build_ticket.ticket)
+                if ticket["state"] not in FINAL_TICKET_STATES:
+                    raise LedgerError(f"{finding.finding_id}: build ticket {ticket['id']} still holds the finding")
+                if ticket["state"] != "merged" or ticket["kind"] != "proposal":
+                    raise LedgerError(f"{finding.finding_id}: no merged build ticket")
+            now = _now()
+            _ = self._connection.executemany(
+                "UPDATE held_findings SET build_ticket='',person_read_by=?,updated_at=? WHERE finding_id=?",
+                [(reading.by, now, finding.finding_id) for finding in findings],
+            )
+        return tuple(finding.finding_id for finding in findings)
+
     def mark_built_at_merge(self, names: tuple[str, ...], merge: str, reading: PersonReading) -> tuple[BuiltAtMerge, ...]:
         """Mark filed findings built after a plain merge put their change in the code, with no build ticket.
 
@@ -7752,6 +7774,7 @@ class LedgerArguments(argparse.Namespace):
     site: str = ""
     idea: str = ""
     # `held built` takes more than one --id only with --commit.
+    # `held unbuilt` always permits multiple ids.
     ids: list[str] = []
     merge: str | None = None
     session_dir: str = ""
@@ -7873,7 +7896,7 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "replace", "file", "waive", "built", "list", "recheck-merged")),
+        ("held", ("add", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -7926,10 +7949,11 @@ def main() -> None:
             elif action == "list":
                 _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built", "withdrawn"), default=None)
                 _ = command.add_argument("--json", action="store_true")
-            elif action == "built":
+            elif action in ("built", "unbuilt"):
                 _ = command.add_argument("--id", dest="ids", action="append", required=True)
-                _ = command.add_argument("--commit", dest="merge", default=None)
-                _ = command.add_argument("--by", default=None)
+                if action == "built":
+                    _ = command.add_argument("--commit", dest="merge", default=None)
+                _ = command.add_argument("--by", required=action == "unbuilt", default=None)
             elif action != "recheck-merged":
                 _ = command.add_argument("--id", required=True)
                 if action == "file":
@@ -7944,16 +7968,16 @@ def main() -> None:
     args = parser.parse_args(namespace=LedgerArguments())
     if not args.repo:
         parser.error("--repo is required")
-    if args.command == "held" and args.action == "built":
+    if args.command == "held" and args.action in ("built", "unbuilt"):
         # A blank name is a prefix of every finding.
         if any(not name.strip() for name in args.ids):
-            parser.error("held built --id requires a finding id")
-        if args.merge is None and len(args.ids) > 1:
+            parser.error(f"held {args.action} --id requires a finding id")
+        if args.action == "built" and args.merge is None and len(args.ids) > 1:
             parser.error("held built takes more than one --id only with --commit")
-        if args.merge is None and args.by is not None:
+        if args.action == "built" and args.merge is None and args.by is not None:
             parser.error("held built --by requires --commit")
         if args.by is not None and not args.by.strip():
-            parser.error("held built --by requires a name")
+            parser.error(f"held {args.action} --by requires a name")
     if args.command == "ticket" and args.action == "checkpoint" and bool(args.session_dir) != bool(args.phase):
         parser.error("ticket checkpoint takes --session-dir and --phase together")
     try:
@@ -8086,6 +8110,10 @@ def main() -> None:
                         reading: PersonReading = ReadByPerson(args.by.strip()) if args.by is not None else NotReadByPerson()
                         for item in ledger.mark_built_at_merge(tuple(args.ids), args.merge, reading):
                             print(built_at_merge_line(item))
+                elif args.action == "unbuilt":
+                    person_reading = ReadByPerson(cast(str, args.by).strip())
+                    for finding_id in ledger.mark_unbuilt(tuple(args.ids), person_reading):
+                        print(f"unbuilt {finding_id}, read by {person_reading.by}")
                 elif args.action == "recheck-merged":
                     for item in ledger.recheck_merged_findings():
                         print(not_built_line(ledger.repo, item))
