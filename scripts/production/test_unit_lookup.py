@@ -890,6 +890,16 @@ print(observed.row.id)
                   *({"event_type": kind} for kind in later)]
         path = runs / f"{name}.jsonl"
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        root = self.root / "held"
+        _ = cast(object, self.enterContext(mock.patch.multiple(unit_runs, RUN_ROOT=root, FORMER_RUN_ROOT=self.root / "former-held")))
+        folder = root / name
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": row.id}))
+        if "run_finished" in later:
+            if isinstance(row.run, staff.OpenRun):
+                _ = staff.clear_run(row.id, row.run.path)
+        else:
+            _ = staff.set_run(row.id, staff.OpenRun(folder))
         return path
 
     def held_folder(self, history: Path, director: str) -> Path:
@@ -898,7 +908,7 @@ print(observed.row.id)
         _ = cast(object, self.enterContext(mock.patch.multiple(
             unit_runs, RUN_ROOT=root, FORMER_RUN_ROOT=self.root / "former-held")))
         folder = root / history.stem
-        folder.mkdir(parents=True)
+        folder.mkdir(parents=True, exist_ok=True)
         first = cast(dict[str, object], json.loads(history.read_text().splitlines()[0]))
         agent = cast(dict[str, str], first["main_agent"])
         source = staff.snapshot().by_member_reference(agent["session_id"])
@@ -920,6 +930,8 @@ print(observed.row.id)
         first["main_agent"] = {"session_id": director}
         later = history.read_text().splitlines()[1:]
         _ = history.write_text("\n".join([json.dumps(first), *later]) + "\n")
+        if not any(cast(dict[str, object], json.loads(line)).get("event_type") == "run_finished" for line in later):
+            _ = staff.set_run(row.id, staff.OpenRun(folder))
         return folder
 
     def test_run_state_follows_staff_without_a_history_rewrite(self) -> None:
@@ -944,8 +956,8 @@ print(observed.row.id)
             runs = unit_lookup.HeldRunLookup()
             found = runs.unfinished_held_run(fixture_runtime_id("staff-director"))
             history_opens = [call for call in opened.call_args_list if call.args[0] in (old, current)]
-        # Read the first and last events of different-run-id; stop before old-run.
-        self.assertEqual(len(history_opens), 2)
+        # Read the current run header once.
+        self.assertEqual(len(history_opens), 1)
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)
         self.assertEqual((found.path, found.worktree), (current, self.root / "new"))
@@ -984,7 +996,7 @@ print(observed.row.id)
         self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("replacement")), unit_lookup.HeldRun)
         self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("original")), unit_lookup.NoUnfinishedRun)
 
-    def test_held_run_order_skips_finished_staff_pointer_and_keeps_an_older_open_run(self) -> None:
+    def test_held_run_uses_the_staff_pointer_despite_a_history_finish_event(self) -> None:
         open_run = self.record("open-run", self.root / "tree", 1.0)
         latest = self.record("finished-run", self.root / "tree", 2.0, "run_finished")
         _ = self.held_folder(open_run, fixture_runtime_id("director"))
@@ -997,8 +1009,8 @@ print(observed.row.id)
         found = runs.unfinished_held_run(fixture_runtime_id("director"))
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)
-        self.assertEqual(found.path, open_run)
-        self.assertIs(unit_lookup.read_run_states().state(self.root / "tree"), UnitState.RUN_FINISHED)
+        self.assertEqual(found.path, latest)
+        self.assertIs(unit_lookup.read_run_states().state(self.root / "tree"), UnitState.RUNNING)
 
     def test_finished_held_run_is_not_eligible(self) -> None:
         history = self.record("finished", self.root / "tree", 1.0, "run_finished")
@@ -1009,7 +1021,7 @@ print(observed.row.id)
         history = self.record("run", self.root / "tree", 1.0)
         _ = self.held_folder(history, fixture_runtime_id("director"))
         for contents in (b"not JSON\n", b"\xff\n", b'{"event_type":"not_run_started"}\n',
-                         b'{"event_type":"run_started","working_dir":"/tree"}\n\xff\n'):
+                         b'{"event_type":"not_run_started","working_dir":"/tree"}\n\xff\n'):
             with self.subTest(contents=contents):
                 _ = history.write_bytes(contents)
                 runs = unit_lookup.HeldRunLookup()
@@ -1058,7 +1070,7 @@ print(observed.row.id)
         with self.assertRaises(OSError):
             _ = unit_lookup.run_state(self.root / "trunk")
 
-    def test_only_the_first_and_last_events_are_parsed(self) -> None:
+    def test_only_the_first_event_is_parsed(self) -> None:
         tree = self.root / "trunk"
         path = self.record("run", tree, 1.0)
         first = path.read_text(encoding="utf-8").strip()
@@ -1066,8 +1078,8 @@ print(observed.row.id)
         _ = path.write_text(first + "\nnot JSON\n[also broken\n" + last + "\n", encoding="utf-8")
         with mock.patch.object(unit_lookup, "json", wraps=json) as history_json:
             parses = cast(mock.MagicMock, history_json.loads)
-            self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
-        self.assertEqual(parses.call_args_list, [mock.call(first + "\n"), mock.call(last)])
+            self.assertIs(unit_lookup.run_state(tree), UnitState.RUNNING)
+        self.assertEqual(parses.call_args_list, [mock.call(first + "\n")])
 
     def test_last_event_larger_than_a_read_block(self) -> None:
         tree = self.root / "trunk"
@@ -1075,7 +1087,7 @@ print(observed.row.id)
         with path.open("a", encoding="utf-8") as handle:
             _ = handle.write(json.dumps({"event_type": "run_finished", "detail": "界" * (64 * 1024)},
                                         ensure_ascii=False) + "\n")
-        self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
+        self.assertIs(unit_lookup.run_state(tree), UnitState.RUNNING)
 
     def test_partial_last_line_uses_the_previous_complete_object(self) -> None:
         tree = self.root / "trunk"
@@ -1127,8 +1139,11 @@ print(observed.row.id)
                 else:
                     with path.open("ab") as handle:
                         _ = handle.write(b'\xff\n')
-                with self.assertRaises(UnicodeError):
-                    _ = unit_lookup.read_run_states()
+                if where == "first":
+                    with self.assertRaises(UnicodeError):
+                        _ = unit_lookup.read_run_states()
+                else:
+                    self.assertIs(unit_lookup.read_run_states().state(self.root / "trunk"), UnitState.RUNNING)
 
 
 if __name__ == "__main__":

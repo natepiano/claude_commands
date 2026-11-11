@@ -121,9 +121,10 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray"])
         self.assertIn("resume NAME", output)
         self.assertIn("stop SESSION", output)
+        self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)
         self.assertIn("--dry-run", output)
         for command in ("records", "held-sessions", "remote-control"):

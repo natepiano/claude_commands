@@ -2210,33 +2210,80 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Gotchas:** the `local_hold_environment` patch reaches only an in-process wait. A wait that `verify.sh` starts as a child process runs the real `tell_wait_holder`, inside the fixture `HOME` and `XDG_STATE_HOME`.
 
-### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: todo
+### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: done
 
-**Depends on:** Phase 103 (it changes `scripts/build_hold/build_hold.py`); done.
+#### As-built
 
-**Source:** builds 2026-11-11, from natedev. fps took and released three holds from 12:33 to 12:56 UTC. Each release sent the same text, `/build:hold: the build hold has been released …`, to session dea51c3e. The send-repeat guard held the later copies, so a stopped session can miss its release.
+- `release_notice(holders)` adds `Released holds: <name> hold for <purpose>, from <HH:MM:SS zone>; …` to `RELEASE_NOTICE`, one entry for each holder, with the time in the user zone. A holder with no purpose reads `<name> hold, from <time>`. Seconds keep the texts of holds in one minute different.
+- `send_release(entry, socket, notice)` and `send_release_broadcast(notice)` send that text. `send_cycle_notices` makes it from `cycle["holders"]`.
+- `start_hold` writes `{"name", "purpose", "since", "released_at"}` into the cycle holders, because the holder file is gone at release.
+- `ReleaseIntent` has `holder_purpose` and `cycle_holders` (both `NotRequired`). `finish_recorded_notices` uses `cycle_holders` for the recovered cycle and the broadcast. An old intent falls back to its one holder.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — release notice text, cycle holder record, release intent.
+- `scripts/build_hold/test_build_hold.py` — `ReleaseDeliveryTests` rows: current-cycle, old-cycle, multiple-holders, recovered-cycle, broadcast, same-minute.
+- `scripts/build_hold/test_hold_enforcer.py` — the drain test's `send_release` fake takes the notice.
+- `docs/as-built/build-targets.md` — the release notice text.
+
+**Gotchas:** a `side_effect` fake of `send_release` must take three arguments.
+
+**Ruled out:** a start time with minutes only — three holds in one minute give equal texts.
+
+### Phase 105 — The Mac floor alert lists the build output inside each Mac test copy  · status: todo
+
+**Depends on:** Phase 99 (the Mac floor offers only build output); done.
+
+**Source:** builds 2026-11-11, from the user's check of C1327. The Mac floor alert, rendered from live data with a test floor, says `Folder sizes are unknown`. `mac_folder_measurement` (`scripts/lint/sweep.py:3762`) measures only the direct children of `/tmp`, `~/rust` and `~/.local/state/mac-test/mirror`. The large children are `mirror/hana` (58.2 GiB) and `mirror/cargo-liner` (23.9 GiB). Each holds a `Cargo.toml`, so `folder_choices` (:3307) drops it as a source tree, and no one measures the `target` folders inside them.
 
 #### Work Order
 
-**Goal:** Each release notice is a distinct message: it names the hold's purpose and its start time.
+**Goal:** When the Mac disk falls below the alert line, the alert lists each Mac cargo target with its size in GiB, marks held ones, and recommends one that frees the shortfall.
 
 **Spec:**
 
-1. **The text.** `send_release` (`scripts/build_hold/build_hold.py:1469`) and `send_release_broadcast` (:1483) add the released hold to `RELEASE_NOTICE`: `<holder> hold for <purpose>, from <HH:MM zone>`. The time is in the user zone (`scripts/lib/user_zone.py`). A cycle with more than one holder names each one.
-2. **The record.** The hold cycle keeps each holder's purpose beside `since` (`HoldCycle.holders`, :69; written at :1405 and in the recovery at :1348), because the holder file is gone at release. A cycle saved before this change has no purpose: the notice then names the holder and its start time only.
-3. **Proof.** Add rows to the existing release notice tests in `scripts/build_hold/test_build_hold.py` (:1197): two releases of two holds in one session give two different texts; each text names the purpose and start time; an old cycle with no purpose still sends.
-4. **Docs.** `docs/as-built/build-targets.md`: the release notice text names the hold, its purpose and its start time.
-
-**Constraints from prior phases:** Phase 103 added `run_resolution` and the `hold_sender_timeout_seconds` key; release sends keep their own path and do not use that key.
+1. **The list.** The floor pass already finds the Mac cargo targets: `target_dirs(roots, …)` filtered by `policy.allows` (:4236–4243). `FloorOutcome` (:3812) carries that filtered list to `notify_floor_problem`. `mac_folder_measurement(policy, targets)` measures each listed target that still exists with `mac_folder_reclaimable_bytes`, beside the root children it measures now. Do not scan the roots a second time.
+2. **The choices.** `folder_choices` keeps its filters: a measured target is a candidate, a source tree is not. A target inside held output gets the held label as now.
+3. **Proof.** Add a row to the existing Mac floor alert test in `scripts/lint/test_sweep.py` (the `mac_folder_measurement` cases near :3930 and :4317): a root child with a `Cargo.toml` and a cargo `target` inside it. The alert names `<child>/target` with its size and recommends it; a held target gets the held label and is not recommended.
+4. **Docs.** `docs/as-built/build-memory-admission.md` (:1569): the Mac measurement reads each root's direct children and each cargo target the floor pass found.
 
 **Files:**
-- `scripts/build_hold/build_hold.py`
-- `scripts/build_hold/test_build_hold.py`
-- `docs/as-built/build-targets.md`
+- `scripts/lint/sweep.py`
+- `scripts/lint/test_sweep.py`
+- `docs/as-built/build-memory-admission.md`
 
 **Workers:** `1 writer`
-- `impl` owns all three files; step 4 of the Spec names the as-built change.
+- `impl` owns all three files.
 
-**Gate:** the targeted test; `scripts/build_hold/test_build_hold.py` passes; `basedpyright` 0 warnings on the changed files (the import cycles go in their own phase).
+**Gate:** the targeted test; `scripts/lint/test_sweep.py` passes; `basedpyright` 0 errors and 0 warnings on the changed files. After the checkpoint, render the Mac alert from live data with a test floor (no send, no state change) and confirm it lists `~/.local/state/mac-test/mirror/hana/target` with its size.
 
-**Change-Review:** Two hold releases in a row both reach a waiting session | Take and release two natedev holds with different purposes while a session waits | The session gets two release notices, each naming its hold's purpose and start time
+**Change-Review:** The Mac disk alert lists the build folders inside the Mac test copies | On natedev, read the Mac disk alert in the natedev Claude session the next time the Mac disk falls below its alert line | The alert lists ~/.local/state/mac-test/mirror/hana/target and the other Mac build folders with their sizes in GiB and recommends one
+
+### Phase 106 — The hold module has no import cycle  · status: todo
+
+**Depends on:** Phase 104 (it changes `scripts/build_hold/build_hold.py`); done.
+
+**Source:** builds 2026-11-11. `basedpyright` reports four `reportImportCycles` errors on `scripts/build_hold/build_hold.py`. Each chain ends at `scripts/build_queue/placement.py`, which imports `OwningSession` and `NoOwningSession` from `build_hold` (a `TYPE_CHECKING` import and a deferred `__getattr__` class, :9–22). `build_hold.admitted_processes` (:584) imports `admission_service`, which reaches `placement`.
+
+#### Work Order
+
+**Goal:** `basedpyright` reports zero errors on `scripts/build_hold/build_hold.py` and on `scripts/build_queue/placement.py`.
+
+**Spec:**
+
+1. **One owner.** Move `OwningSession` and `NoOwningSession` (`build_hold.py:54`, :59) to a new module `scripts/build_hold/owning_session.py` that imports no repo module.
+2. **All callers.** Every module that names these types imports them from the new module. `build_hold` keeps no re-export. `placement.py` drops the `TYPE_CHECKING` import, the `_DeferredBuildHold` class and the string alias, and writes `SubmittingSession = OwningSession | NoOwningSession`.
+3. **Proof.** No new test: the type check is the gate. Run the test modules of every changed file.
+4. **Docs.** Update each as-built line that names `build_hold.OwningSession` or the deferred placement import.
+
+**Files:**
+- `scripts/build_hold/owning_session.py` (new)
+- `scripts/build_hold/build_hold.py`, `scripts/build_queue/placement.py`
+- each module and test that imports `OwningSession` or `NoOwningSession` (`grep -rln OwningSession scripts`)
+- `docs/as-built/*.md` lines that name them
+
+**Workers:** `1 writer`
+- `impl` owns all files.
+
+**Gate:** the targeted test; `basedpyright` 0 errors and 0 warnings on every changed file.
+
+**Change-Review:** none — the type check changes; nothing visible changes.

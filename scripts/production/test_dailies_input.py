@@ -24,6 +24,7 @@ from scripts.production.dailies_input import (BevyUpgradeUnavailable, Block, Cla
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 from scripts.production import unit_lookup
 from scripts.production import staff
+from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.herdr import HerdrPlace
 from scripts.agents.remote import local_machine
@@ -222,6 +223,16 @@ class DailiesInputTests(DailiesInputFixture):
              "phase_percent": 60, "phase_elapsed_seconds": 3000, "phase_calibration": None,
              "timestamp_epoch": epoch(23, 30)},
         )
+        member = staff.snapshot().unit_by_worktree(remote.local_machine(), self.root / "alpha")
+        assert member is not None
+        events[0]["owner_staff_id"] = member.id
+        events[0]["run_id"] = "current"
+        folder = self.root / "unit" / "current"
+        folder.mkdir(parents=True)
+        _ = (folder / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": member.id}))
+        _ = staff.set_run(member.id, staff.OpenRun(folder))
+        self.env["SCRATCH_ROOT"] = str(self.root / "scratch")
+        _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
         _ = run.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
         self.status_lines(f"== {ALPHA}", "● Checking panel labels")
         fields = cast(dict[str, object], json.loads(self.judgment.read_text(encoding="utf-8")))

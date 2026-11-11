@@ -635,12 +635,14 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
 
     if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
         path = _worker_lock_path(row.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return DispatchHoldsWorker("dispatch lock is held")
+        try:
+            with path.open("r") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return DispatchHoldsWorker("dispatch lock is held")
+        except FileNotFoundError:
+            pass
     live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
     if live_runs(run / "detached_runs", row.name):
         return DispatchHoldsWorker("a detached run is live")
