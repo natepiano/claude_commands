@@ -20,9 +20,13 @@ A rename never stops or restarts the director, its workers, or their commands.
 It sends the director and each worker one message with the new director name.
 The command uses the shared send path and stable staff IDs.
 The sender is `agents rename`.
-A separate notice journal retains incomplete messages and the original name during a deferred folder move.
-The command removes this journal when no message or folder move remains.
-Document moves use their own journal.
+A separate notice file keeps a delivery key and pending recipient IDs.
+Messages use the current staff name at delivery.
+A second name change prepares all members again with a new delivery key.
+Each member receives the final name, including members that received an earlier name.
+The command removes this file when no message or folder move remains.
+Document moves use current staff, files, and Git evidence.
+The command ignores legacy rename journals.
 One message timeout prints one anomaly line and keeps that recipient pending.
 Other recipients and the folder move still run.
 The send path can queue a message for a stopped member.

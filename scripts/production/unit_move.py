@@ -33,7 +33,7 @@ from scripts.herdr import pane_launch
 from scripts.herdr import herdr  # noqa: E402
 from scripts.agents import pane_record, detached_run_process  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.production.rename_state import RenameRefused, read_json, write_json  # noqa: E402
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf, unit_runs  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -41,6 +41,26 @@ from scripts.production import staff  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
+
+
+class RenameRefused(ValueError):
+    """A rename or folder move cannot safely complete the requested operation."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason: str = reason
+
+
+def read_json(path: Path) -> object:
+    try:
+        return cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise RenameRefused(f"cannot parse {path}: {error}") from error
+
+
+def write_json(path: Path, value: object) -> None:
+    """Publish folder move state, delivery state, or trust configuration atomically."""
+    write_text_atomic(path, json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 @contextmanager
@@ -81,7 +101,7 @@ def move(path_move: PathMove) -> None:
 
 def json_object(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
-        raise RenameRefused("invalid rename journal: expected an object")
+        raise RenameRefused("expected a JSON object")
     return cast(dict[str, object], value)
 
 
