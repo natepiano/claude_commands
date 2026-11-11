@@ -356,6 +356,7 @@ class WorkerCommandTests(unittest.TestCase):
         result = worker_panes.start_or_resume(self.fixture.parent.id, staff.WorkerName.parse(name), role)
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
+        pane_fixtures.idle_transcript(result.row)
         return result
 
     def dispatch(self, name: str = "impl", role: staff.WorkerRole = "impl", dispatch_id: str = "") -> worker.DispatchSubmission | worker.ExitCode:
@@ -2933,6 +2934,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_end_closes_a_busy_worker_and_retires_its_row(self) -> None:
         opened = self.opened()
         self.fixture.world.locations[opened.pane]["agent_status"] = "working"
+        self.fixture.completed_dispatch(opened.row, "impl")
         with patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()), \
              patch("scripts.production.staff_sources.require_worker_stopped"):
             code, output, errors = self.command("end", "impl")

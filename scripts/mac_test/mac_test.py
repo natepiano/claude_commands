@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast
 from urllib.parse import quote
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import (
@@ -89,7 +90,6 @@ from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
 
 if TYPE_CHECKING:
-    from scripts.build_hold import build_hold
     from scripts.build_queue.placement import SubmittingSession
     from scripts.mac_test import offload
 
@@ -1680,19 +1680,17 @@ def requested_delivery(holder: str) -> MessageDelivery:
     owner = build_hold.owning_session()
     return (
         RecordedSession(owner.session_id, holder)
-        if isinstance(owner, build_hold.OwningSession)
+        if isinstance(owner, OwningSession)
         else HolderQueue(holder)
     )
 
 
 def block_belongs_to(
     block: PendingMacBlock | ActiveMacBlock,
-    owner: build_hold.OwningSession | build_hold.NoOwningSession,
+    owner: OwningSession | NoOwningSession,
 ) -> bool:
-    from scripts.build_hold import build_hold
-
     return (
-        isinstance(owner, build_hold.OwningSession)
+        isinstance(owner, OwningSession)
         and isinstance(block.delivery, RecordedSession)
         and block.delivery.name == owner.session_id
     )
@@ -1754,8 +1752,6 @@ def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
-    from scripts.build_hold import build_hold
-
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
@@ -1847,7 +1843,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
         bind_instance_generation(paths, remote_claim)
         claimed = remote_claim
-    if isinstance(owner, build_hold.OwningSession):
+    if isinstance(owner, OwningSession):
         claimed["holder_session"] = owner.session_id
     if isinstance(scope, RepositoryScope):
         claimed["repo_name"] = scope.name
@@ -2464,9 +2460,7 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("watch-claim")
 
     def parsed_session(value: str) -> SubmittingSession:
-        from scripts.build_hold import build_hold
-
-        return build_hold.OwningSession(value) if value else build_hold.NoOwningSession()
+        return OwningSession(value) if value else NoOwningSession()
 
     for command in (claim, wait_claim, free):
         _ = command.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
