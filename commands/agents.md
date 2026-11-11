@@ -45,8 +45,10 @@ It closes only the selected pane. Other panes in the tab stay open.
 It deletes the selected transcript files across Claude account projects folders with Python.
 It removes a producer admission record that matches the session or the proved pane and terminal.
 It removes the matching admission record before pane closure and transcript deletion.
-A repeated command completes cleanup after transcript deletion fails.
-A repeated command prints `unchanged` when nothing remains.
+It saves the proved cleanup targets before the first change.
+A repeated command uses that record to complete failed steps.
+It deletes the cleanup record after every step completes.
+A repeated command prints `unchanged` when no cleanup record or selected resource remains.
 
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
 Resume removes the record. A paused director receives one continuation message.

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
+from enum import Enum
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -44,7 +45,7 @@ from scripts.production import (
 )
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused, production_journal, read_json, write_json
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.agents import (
     restart,
     restart_support,
@@ -271,6 +272,138 @@ class StrayProducerPane:
     terminal: str
 
 
+class ProducerCleanupStep(Enum):
+    """The first cleanup step that still needs completion."""
+
+    STOP = "stop"
+    ADMISSION = "admission"
+    PANES = "panes"
+    TRANSCRIPTS = "transcripts"
+    COMPLETE = "complete"
+
+
+@dataclass(frozen=True)
+class ProvedStrayProcess:
+    """A native process proved before cleanup changes its evidence."""
+
+    pid: int
+    started: str
+    kind: Literal["claude", "codex"]
+
+
+@dataclass(frozen=True)
+class ProvedStrayTerminal:
+    """The pane, tab, and terminal selected before cleanup starts."""
+
+    pane: str
+    tab: str
+    terminal: str
+
+
+@dataclass(frozen=True)
+class PendingProducerCleanup:
+    """Durable targets and progress for one proved stray conversation."""
+
+    name: str
+    session: str
+    herdr_session: str
+    processes: tuple[ProvedStrayProcess, ...]
+    panes: tuple[ProvedStrayTerminal, ...]
+    admission_matches: bool
+    admission: dict[str, object]
+    transcripts: tuple[Path, ...]
+    step: ProducerCleanupStep = ProducerCleanupStep.STOP
+
+
+def save_producer_cleanup(path: Path, cleanup: PendingProducerCleanup) -> None:
+    """Persist the targets and the first incomplete step together."""
+    write_text_atomic(path, json.dumps({
+        "name": cleanup.name, "session": cleanup.session,
+        "herdr_session": cleanup.herdr_session,
+        "processes": [{"pid": process.pid, "started": process.started, "kind": process.kind} for process in cleanup.processes],
+        "panes": [{"pane": pane.pane, "tab": pane.tab, "terminal": pane.terminal} for pane in cleanup.panes],
+        "admission_matches": cleanup.admission_matches, "admission": cleanup.admission,
+        "transcripts": [str(transcript) for transcript in cleanup.transcripts], "step": cleanup.step.value,
+    }) + "\n", new_file_mode=0o600)
+
+
+def read_producer_cleanup(path: Path, name: str, identity: str) -> PendingProducerCleanup:
+    """Read cleanup evidence without observing its former process or pane."""
+    saved = herdr.json_object(cast(object, json.loads(path.read_text())), "producer cleanup")
+    if saved.get("name") != name or saved.get("session") != identity:
+        raise ValueError("producer cleanup targets another name or session")
+    processes: list[ProvedStrayProcess] = []
+    for value in herdr.json_items(saved.get("processes"), "cleanup processes"):
+        process = herdr.json_object(value, "cleanup process")
+        pid = process.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValueError("producer cleanup has an invalid pid")
+        kind = herdr.json_text(process.get("kind"), "cleanup process kind")
+        if kind not in ("claude", "codex"):
+            raise ValueError("producer cleanup has an invalid agent kind")
+        processes.append(ProvedStrayProcess(pid, herdr.json_text(process.get("started"), "cleanup process start"), kind))
+    panes: list[ProvedStrayTerminal] = []
+    for value in herdr.json_items(saved.get("panes"), "cleanup panes"):
+        pane = herdr.json_object(value, "cleanup pane")
+        panes.append(ProvedStrayTerminal(herdr.json_text(pane.get("pane"), "cleanup pane id"),
+            herdr.json_text(pane.get("tab"), "cleanup tab id"),
+            herdr.json_text(pane.get("terminal"), "cleanup terminal id")))
+    matches = saved.get("admission_matches")
+    if not isinstance(matches, bool):
+        raise ValueError("producer cleanup has no admission match result")
+    transcripts = tuple(Path(herdr.json_text(value, "cleanup transcript"))
+                        for value in herdr.json_items(saved.get("transcripts"), "cleanup transcripts"))
+    if any(not transcript.is_absolute() or transcript.name != identity + ".jsonl" for transcript in transcripts):
+        raise ValueError("producer cleanup has an invalid transcript target")
+    return PendingProducerCleanup(name, identity,
+        herdr.json_text(saved.get("herdr_session"), "cleanup herdr session"), tuple(processes), tuple(panes), matches,
+        herdr.json_object(saved.get("admission"), "cleanup admission"), transcripts,
+        ProducerCleanupStep(herdr.json_text(saved.get("step"), "cleanup step")))
+
+
+def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admission: Path) -> int:
+    """Complete saved steps and retain their evidence through every failure."""
+    client = herdr.Herdr(cleanup.herdr_session)
+    if cleanup.step == ProducerCleanupStep.STOP:
+        kind = cleanup.processes[0].kind if cleanup.processes else ""
+        result = stop_resume.stop(cleanup.session, kind, deadline=worker_lifecycle.effective_deadline())
+        if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+            return _result_code(result)
+        transcripts = tuple(sorted(set(cleanup.transcripts) | set(sessions.transcript_locations(cleanup.session))))
+        cleanup = replace(cleanup, step=ProducerCleanupStep.ADMISSION, transcripts=transcripts)
+        save_producer_cleanup(path, cleanup)
+    if cleanup.step == ProducerCleanupStep.ADMISSION:
+        if cleanup.admission_matches and admission.exists():
+            saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
+            if saved == cleanup.admission:
+                admission.unlink()
+                sync_folder(admission.parent)
+        cleanup = replace(cleanup, step=ProducerCleanupStep.PANES)
+        save_producer_cleanup(path, cleanup)
+    if cleanup.step == ProducerCleanupStep.PANES:
+        for pane in cleanup.panes:
+            current = client.pane_row(pane.pane)
+            if not isinstance(current, herdr.NoPane) and current.get("tab_id") != pane.tab:
+                raise ValueError(f"{pane.pane}: stray tab identity changed")
+            if not client.close_retained_pane(pane.pane, terminal=pane.terminal):
+                raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
+        cleanup = replace(cleanup, step=ProducerCleanupStep.TRANSCRIPTS)
+        save_producer_cleanup(path, cleanup)
+    if cleanup.step == ProducerCleanupStep.TRANSCRIPTS:
+        for transcript in cleanup.transcripts:
+            transcript.unlink(missing_ok=True)
+            try:
+                sync_folder(transcript.parent)
+            except FileNotFoundError:
+                pass
+        cleanup = replace(cleanup, step=ProducerCleanupStep.COMPLETE)
+        save_producer_cleanup(path, cleanup)
+    path.unlink()
+    sync_folder(path.parent)
+    print(f"{cleanup.session}: removed stray")
+    return 0
+
+
 def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProducerPane]:
     """Retain only panes with native evidence or an idle retained conversation."""
     retained = pane_record.read_strict(client.session)
@@ -324,6 +457,9 @@ def remove_stray_producer(name: str, session: str) -> int:
             raise ValueError(f"{name}: several producer rows match")
         if any(row.current_session == identity for row in record.rows):
             raise ValueError(f"{identity}: current_session belongs to a staff row; removal refused")
+        cleanup_path = admission.with_name(f".producer-cleanup-{name}-{identity}")
+        if cleanup_path.exists():
+            return finish_producer_cleanup(cleanup_path, read_producer_cleanup(cleanup_path, name, identity), admission)
         client = herdr.Herdr(herdr.shared_session())
         panes = stray_producer_panes(client, identity)
         saved: dict[str, object] = {}
@@ -342,26 +478,30 @@ def remove_stray_producer(name: str, session: str) -> int:
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
             raise ValueError(observed.reason)
-        changed = bool(panes)
+        processes: list[ProvedStrayProcess] = []
         if isinstance(observed, herdr.LiveConversation):
             conflicts = stop_resume.producer_conflicts(name, client)
             if not any(found == identity or any(place == pane.pane for pane in panes) for found, place in conflicts):
                 raise ValueError(f"{identity}: session has no producer name or pane proof for {name}")
-            result = stop_resume.stop(identity, observed.kind, deadline=worker_lifecycle.effective_deadline())
-            if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
-                return _result_code(result)
-            changed = True
-        if admission_matches:
-            admission.unlink(missing_ok=True)
-            changed = True
+            for pid in observed.pids:
+                native = herdr.native_process(pid, observed.kind)
+                if native.current_identity != identity:
+                    raise ValueError(f"{pid}: stray native identity changed")
+                processes.append(ProvedStrayProcess(pid, native.started, observed.kind))
+        terminals: list[ProvedStrayTerminal] = []
         for pane in panes:
-            if not client.close_retained_pane(pane.pane, terminal=pane.terminal):
-                raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
-        for path in sessions.transcript_locations(identity):
-            path.unlink()
-            changed = True
-        print(f"{identity}: {'removed stray' if changed else 'unchanged'}")
-        return 0
+            current = client.pane_row(pane.pane)
+            if isinstance(current, herdr.NoPane) or current.get("terminal_id") != pane.terminal:
+                raise ValueError(f"{pane.pane}: stray terminal identity changed")
+            terminals.append(ProvedStrayTerminal(pane.pane, herdr.json_text(current.get("tab_id"), "stray tab"), pane.terminal))
+        transcripts = tuple(sessions.transcript_locations(identity))
+        if not processes and not panes and not transcripts and not admission_matches:
+            print(f"{identity}: unchanged")
+            return 0
+        cleanup = PendingProducerCleanup(name, identity, client.session, tuple(processes), tuple(terminals),
+                                         admission_matches, saved, transcripts)
+        save_producer_cleanup(cleanup_path, cleanup)
+        return finish_producer_cleanup(cleanup_path, cleanup, admission)
 
 
 def _message(row: staff.StaffRow, text: str) -> restart_support.MessageSendOutcome:

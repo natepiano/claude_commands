@@ -8,8 +8,9 @@ import math
 import os
 import signal
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
+from typing import cast
 from unittest.mock import call, patch
 
 from scripts.agents import pane_record, shutdown, test_stop_resume
@@ -88,8 +89,9 @@ class ProducerCommandsTests(unittest.TestCase):
                 case.doCleanups()
 
     def test_remove_stray_preserves_the_real_producer_and_completes_a_rerun(self) -> None:
-        for target in ("stray", "current", "split", "pane-admission", "other-admission", "no-row", "unrelated-unproved",
-                       "unretained-admission", "transcript-failure"):
+        for target, failure_step in (("stray", ""), ("current", ""), ("split", ""), ("pane-admission", ""),
+                ("other-admission", ""), ("no-row", ""), ("unrelated-unproved", ""), ("unretained-admission", ""),
+                ("transcript-failure", "transcript"), ("pane-failure", "pane")):
             with self.subTest(target=target):
                 case = self.world()
                 identity = self.register(case)
@@ -103,10 +105,12 @@ class ProducerCommandsTests(unittest.TestCase):
                     case.client.rows.append({"pane_id": "w1:p9", "terminal_id": "unknown-terminal",
                         "tab_id": "unknown-tab", "workspace_id": "w1", "label": "unknown"})
                 receipt = case.root / "panes/.producer-admission-alpha"
-                if target in ("unretained-admission", "transcript-failure"):
+                if target == "unretained-admission" or failure_step:
                     pane_record.save("agents", {})
+                if failure_step == "pane":
+                    _ = case.client.rows[0].pop("agent_session")
                 saved = ({"pane": "w1:p2", "terminal": "w1:p2-terminal"}
-                         if target in ("unretained-admission", "transcript-failure") else
+                         if target == "unretained-admission" or failure_step else
                          {"pane": "w1:p2"} if target == "pane-admission" else
                          {"session_id": fixture_runtime_id("other-admission"), "pane": "w1:p8"}
                          if target == "other-admission" else {"session_id": identity, "pane": "w1:p2"})
@@ -120,7 +124,7 @@ class ProducerCommandsTests(unittest.TestCase):
                     transcripts.append(path)
                 output = io.StringIO()
                 with patch.object(herdr, "native_process", NATIVE_PROCESS), redirect_stdout(output):
-                    if target == "transcript-failure":
+                    if failure_step:
                         unlink = Path.unlink
 
                         def fail_transcript(path: Path, missing_ok: bool = False) -> None:
@@ -128,11 +132,22 @@ class ProducerCommandsTests(unittest.TestCase):
                                 raise OSError("fixture transcript deletion failure")
                             unlink(path, missing_ok=missing_ok)
 
-                        with patch.object(Path, "unlink", new=fail_transcript):
+                        with ExitStack() as failure:
+                            if failure_step == "transcript":
+                                _ = failure.enter_context(patch.object(Path, "unlink", new=fail_transcript))
+                            else:
+                                _ = failure.enter_context(patch.object(case.client, "close_retained_pane", return_value=False))
                             failed = shutdown.main(["remove-stray", "alpha", identity])
                         self.assertNotEqual(failed, 0)
+                        pending = herdr.json_object(cast(object, json.loads(
+                            (receipt.parent / f".producer-cleanup-alpha-{identity}").read_text())), "pending cleanup")
+                        self.assertEqual(pending["session"], identity)
+                        self.assertEqual(pending["processes"], [{"pid": 123, "started": "generation-1", "kind": "claude"}])
+                        self.assertEqual(pending["panes"], [{"pane": "w1:p2", "tab": "w1:t9", "terminal": "w1:p2-terminal"}])
+                        self.assertEqual(pending["admission"], saved)
+                        self.assertTrue(pending["admission_matches"])
                     status = shutdown.main(["remove-stray", "alpha", identity])
-                    if target == "transcript-failure":
+                    if failure_step:
                         self.assertIn(f"{identity}: removed stray", output.getvalue())
                     if target != "current":
                         repeated = shutdown.main(["remove-stray", "alpha", identity])

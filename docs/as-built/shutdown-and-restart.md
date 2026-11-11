@@ -292,17 +292,27 @@ The command uses this order:
 
 1. Refuse a session that any staff row records as its `current_session`.
 2. Prove the producer name and native process identity before the stop.
-3. Stop the selected conversation through `stop_resume.stop`.
-4. Delete the admission record if its session ID or proved pane and terminal identify the selected conversation.
-5. Close its proved terminal through `Herdr.close_retained_pane`.
-6. Delete its transcripts across Claude account projects folders through `Path.unlink`.
+3. Save `PendingProducerCleanup` before the first change.
+4. Stop the selected conversation through `stop_resume.stop`.
+5. Delete the admission record if its saved content still matches the proved admission record.
+6. Close its proved terminal through `Herdr.close_retained_pane`.
+7. Delete its transcripts across Claude account projects folders through `Path.unlink`.
+8. Delete the cleanup record after every step completes.
 
 The pane and terminal match also applies when no retained launch entry exists.
-A repeated command completes cleanup after transcript deletion fails.
+The cleanup record path is `<pane record directory>/.producer-cleanup-<name>-<session>`.
+The record holds the name, session ID, process IDs, process start times, agent kinds, and herdr session.
+It also holds the pane IDs, tab IDs, terminal IDs, admission match, admission content, and transcript paths.
+`ProducerCleanupStep` identifies the first incomplete step.
+Each completed step atomically saves its progress before the next step starts.
+A repeated command reads the saved targets without native identity discovery.
+Each step permits repetition after a failure between its action and its progress write.
+A failed pane closure retains the terminal target even without herdr session metadata or a retained launch entry.
+A failed transcript deletion retains the transcript targets.
 
 Pane closure preserves other panes in the same tab.
 The command adds no permission rule and uses no shell deletion command.
-A repeated command prints `unchanged` when no selected resource remains.
+A repeated command prints `unchanged` when no cleanup record or selected resource remains.
 
 The record path is `<pane record directory>/.producer-admission-<name>`.
 The saved record also holds the folder.
