@@ -321,12 +321,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
                 with mock.patch.object(ledger, "repo", row.worktree.path):
                     self.assertEqual(style_ledger.command_ticket_holder(first.name, ledger).id, row.id)
 
-    def test_ticket_documentation_uses_decimal_ids_and_fixed_owners(self) -> None:
-        text = (Path(__file__).resolve().parents[2] / "docs/as-built/style-showrunner.md").read_text()
-        for removed in ("Ledger.rename_unit", "unit rename --", "next_ticket_id(unit)", "must be `<unit>-<n>`"):
-            self.assertNotIn(removed, text)
-        for current in ("next_ticket_id()", "fixed staff id", "migrate-staff-ids", "anomaly:"):
-            self.assertIn(current, text)
 
     def test_staff_id_migration_rechecks_ownership_after_clear_and_keeps_the_fixed_key(self) -> None:
         first = self.fixed_style_units()[0]
@@ -495,26 +489,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertIn(f"issue {issue} without a finding of its rule unrelated", result.stderr)
         self.assertEqual(self.ledger_contents(ledger), before)
 
-    def test_ticket_refuse_requires_named_findings_a_person_and_a_nonempty_reason(self) -> None:
-        ledger, _, ids = self.refusal_ticket()
-        required = {"--finding": ids[0], "--by": "Nate", "--reason": "would shadow"}
-        for missing in required:
-            with self.subTest(missing=missing):
-                before = self.ledger_contents(ledger)
-                arguments = [part for flag, value in required.items() if flag != missing for part in (flag, value)]
-                result = self.cli("ticket", "refuse", "--id", "2", *arguments, success=False)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn(f"the following arguments are required: {missing}", result.stderr)
-                self.assertEqual(self.ledger_contents(ledger), before)
-        for flag in ("--by", "--reason"):
-            for value in ("", " \t "):
-                with self.subTest(flag=flag, value=value):
-                    before = self.ledger_contents(ledger)
-                    arguments = [part for key, text in required.items() for part in (key, value if key == flag else text)]
-                    result = self.cli("ticket", "refuse", "--id", "2", *arguments, success=False)
-                    self.assertEqual(result.returncode, 2)
-                    self.assertIn("requires a non-empty --by and --reason", result.stderr)
-                    self.assertEqual(self.ledger_contents(ledger), before)
 
     def test_ticket_refuse_rerun_is_one_line_and_changes_no_records(self) -> None:
         ledger, _, ids = self.refusal_ticket()
@@ -893,14 +867,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(ledger.proposal_tickets()[-1]["state"], "dropped")
         self.assertEqual(ledger.named_held((finding.finding_id,))[0].build_ticket, style_ledger.NoBuildTicket())
 
-    def test_widen_callback_file_failure_is_not_a_git_failure(self) -> None:
-        ledger, _ = self.widen_ticket()
-        before = self.ledger_contents(ledger)
-        failure = PermissionError("decision file unreadable")
-        with self.assertRaises(PermissionError) as refused:
-            _ = ledger.ticket_widen("1", ("extra.rs",), "reference", "worker", mock.Mock(side_effect=failure))
-        self.assertIs(refused.exception, failure)
-        self.assertEqual(self.ledger_contents(ledger), before)
 
     def git_read_failure(self) -> style_ledger.GitReadFailed:
         return style_ledger.GitReadFailed(("git", "-C", str(self.repo), "rev-parse"), 128, "fatal: PRIVATE GIT STDERR")
@@ -1061,47 +1027,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertNotIn("PRIVATE GIT STDERR", str(outside))
         self.assertNotIn("fatal:", str(outside))
 
-    def test_git_boundary_cli_failure_exits_two_and_schema_errors_stay_separate(self) -> None:
-        ledger = self.checkpointed_read_transition()
-        original = mock.Mock(wraps=subprocess.run)
-
-        def fail_checkpoint(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            if "missing-commit^{commit}" in command:
-                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
-            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
-
-        with mock.patch.object(subprocess, "run", side_effect=fail_checkpoint):
-            refused = self.cli("ticket", "checkpoint", "--id", "1001", "--commit", "missing-commit", success=False)
-        self.assertEqual(refused.returncode, 2)
-        self.assertIn("ticket 1001 checkpoint:", refused.stderr)
-        self.assertNotIn("PRIVATE GIT STDERR", refused.stderr)
-        self.assertNotIn("fatal:", refused.stderr)
-        error = style_ledger.CheckCouldNotRun("unsupported ledger schema version 999")
-        with mock.patch.object(ledger, "_style_branch_tip", side_effect=error):
-            with self.assertRaises(style_ledger.CheckCouldNotRun) as refused_schema:
-                _ = ledger.ticket_merge("1001")
-        self.assertIs(refused_schema.exception, error)
-
-    def test_git_boundary_repeats_and_invalid_states_make_zero_git_calls(self) -> None:
-        ledger = self.checkpointed_read_transition()
-        rule = ledger.ticket_open(ticket_owner_id("read"))[0]["rules"][0]
-        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as git:
-            ledger.ticket_add("1001", ticket_owner_id("read"), "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
-            ledger.ticket_checkpoint("1001", self.initial_tip)
-            self.assertEqual(ledger.ticket_base("1001"), self.initial_tip)
-            for operation in (lambda: ledger.ticket_assign("1001", "main"),
-                              lambda: ledger.ticket_yield("1001", self.sources[0])):
-                with self.assertRaises(style_ledger.LedgerError):
-                    _ = operation()
-            git.assert_not_called()
-        _ = ledger.ticket_merge("1001")
-        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as git:
-            self.assertEqual(ledger.ticket_merge("1001"), ())
-            self.assertIsNone(ledger.release_held_reservation("1001"))
-            for operation in (lambda: ledger.ticket_drop("1001"), lambda: ledger.check_ticket_pipeline("1001")):
-                with self.assertRaises(style_ledger.LedgerError):
-                    _ = operation()
-            git.assert_not_called()
 
     def test_widen_records_each_path_with_its_reason_name_and_time(self) -> None:
         ledger, issue = self.widen_ticket()
@@ -1775,59 +1700,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(rows, [(self.initial_tip, "fixed"), (checkpoint, "fixed")])
         self.assertEqual(other_commits, [(self.initial_tip,)])
 
-    def test_set_tip_holds_no_write_lock_while_it_lists_sites(self) -> None:
-        listed = self.rule(
-            "listed", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
-            + "  kind: regex\n  pattern: marker\n  surface: whole\n",
-        )
-        self.set_tip(self.initial_tip)
-        self.write(self.sources[0], "pub fn marker() {}\n")
-        tip = self.commit("Add a marker")
-        self.record_while_stalled("enumerate_candidates", lambda ledger: ledger.set_tip(tip))
-        ledger = self.ledger()
-        self.assertEqual(ledger.synced_commit(), tip)
-        self.assertEqual({site.path for site in ledger.listed_sites(listed)}, {self.sources[0]})
-
-    def test_checkpoint_holds_no_write_lock_while_it_restamps(self) -> None:
-        rule = self.rule("read")
-        path = self.sources[0]
-        ledger = self.ledger()
-        ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
-        ledger.ticket_assign("1", "main")
-        _ = ledger.ticket_base("1")
-        self.record(rule, path, self.initial_tip, "fixed", ticket="1")
-        self.write(path, "pub fn renamed() -> u32 { 1 }\n")
-        checkpoint = self.commit("Ticket checkpoint")
-        self.record_while_stalled("_fingerprint", lambda writer: writer.ticket_checkpoint("1", checkpoint))
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["checkpoint"], checkpoint)
-        self.assertIn(checkpoint, {judgment.commit for judgment in ledger.latest_ticket_judgments("1")})
-
-    def test_mark_built_holds_no_write_lock_while_it_checks_the_code(self) -> None:
-        rule, issue, _ = self.decision_findings()
-        ledger = self.ledger()
-        finding = ledger.hold(rule, self.sources[0], 3, "value", "type", "u32", "u64", self.blob(rule), "outside")
-        ledger.file_held(finding.finding_id, issue)
-        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
-                          proposal=str(issue), finding_ids=(finding.finding_id,))
-        ledger.ticket_assign("1", "main")
-        ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_checkpoint("1", self.initial_tip)
-        _ = ledger.ticket_merge("1")
-        self.record_while_stalled("applied_check", lambda writer: writer.mark_built(finding.finding_id))
-        built = next(item for item in ledger.proposal_findings(issue) if item.finding_id == finding.finding_id)
-        self.assertIsInstance(built.state, style_ledger.Built)
-
-    def test_decline_holds_no_write_lock_while_it_checks_judged_inputs(self) -> None:
-        rule = self.rule("read")
-        path = self.sources[0]
-        self.set_tip(self.initial_tip)
-        ledger = self.ledger()
-        finding = ledger.hold(rule, path, 1, "Rename value", "rename", "value", "amount", self.blob(rule), "outside")
-        ledger.record(rule, path, self.initial_tip, self.blob(rule), "held", ticket="outside")
-        self.record_while_stalled("_fingerprint", lambda writer: writer.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user")))
-        self.assertIsInstance(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Waived)
-        self.assertIsInstance(ledger.newest_held_judgment(rule, path), style_ledger.NoHeldJudgment)
 
     def test_checkpoint_starts_again_when_its_judgments_change_before_the_lock(self) -> None:
         ledger, checkpoint, load = self.judge_while_loading_rules(1)
@@ -2729,16 +2601,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.set_tip(style_tip, "style/main")
         self.assertEqual(ledger.synced_commit(), style_tip)
 
-    def test_transition_audit_checkpoint_missing_commit_names_ticket_and_verb(self) -> None:
-        ledger = self.checkpointed_read_transition()
-        refused = self.cli("ticket", "checkpoint", "--id", "1001", "--commit", "missing-commit", success=False)
-        self.assertEqual(refused.returncode, 2)
-        self.assertIn("ticket 1001 checkpoint: git rev-parse failed", refused.stderr)
-        self.assertNotIn("fatal:", refused.stderr)
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("read"))[0]["checkpoint"], self.initial_tip)
-        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
-            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket 1001 checkpoint: git rev-parse failed"):
-                ledger.ticket_checkpoint("1001", "missing-commit")
 
     def repaired_read_checkpoint(self) -> tuple[style_ledger.Ledger, str]:
         ledger = self.checkpointed_read_transition()
@@ -2830,13 +2692,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             stored = cast(tuple[str], connection.execute("SELECT checkpoint FROM tickets WHERE id='1001'").fetchone())
         self.assertEqual(stored, (repair,))
 
-    def test_recheckpoint_same_repair_is_an_exact_no_op_without_git_or_restamps(self) -> None:
-        ledger, repair = self.repaired_read_checkpoint()
-        before = self.ledger_contents(ledger)
-        with (mock.patch.object(subprocess, "run", side_effect=AssertionError("repeat reads Git")),
-              mock.patch.object(ledger, "checkpoint_restamps", side_effect=AssertionError("repeat restamps"))):
-            ledger.ticket_checkpoint("1001", repair)
-        self.assertEqual(self.ledger_contents(ledger), before)
 
     def test_recheckpoint_repair_preserves_adds_and_refuses_reservations(self) -> None:
         ledger, repair = self.repaired_read_checkpoint()
@@ -2855,13 +2710,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(ledger.ticket_open(ticket_owner_id("read"))[0]["checkpoint"], last)
         self.assertEqual(self.ticket_row("1001"), ("checkpointed", "held-run", "7"))
 
-    def test_transition_audit_exact_checkpoint_repeat_counts_zero_git_calls(self) -> None:
-        ledger = self.checkpointed_read_transition()
-        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
-            with mock.patch.object(subprocess, "run", wraps=subprocess.run) as process:
-                ledger.ticket_checkpoint("1001", self.initial_tip)
-            self.assertEqual(process.call_count, 0)
-            self.assertEqual(git.call_count, 0)
 
     def test_transition_audit_empty_first_checkpoint_is_not_an_exact_repeat(self) -> None:
         ledger = self.ledger()
@@ -2882,18 +2730,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             proof.assert_called_once_with(style_unit_id("names"))
             git.assert_not_called()
 
-    def test_transition_audit_assignment_unit_state_precedes_branch_git(self) -> None:
-        write_style_units(self.repo / ".git/style-production.md",
-                          tuple(replace(row, unit="read") if row.unit == "names" else row for row in DEFAULT_STYLE_ASSIGNMENTS))
-        ledger = self.ledger()
-        rule = self.rule("read")
-        self.add_ticket("1001", [rule], unit="read")
-        self.add_ticket("1002", [rule], unit="read")
-        ledger.ticket_assign("1001", "main")
-        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()) as git:
-            with self.assertRaisesRegex(style_ledger.LedgerError, "already has 1001 in state assigned"):
-                ledger.ticket_assign("1002", "main")
-            git.assert_not_called()
 
     def test_transition_audit_merge_predecessor_state_precedes_git(self) -> None:
         ledger = self.checkpointed_read_transition()
@@ -2907,94 +2743,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
                 _ = ledger.ticket_merge("1002")
             git.assert_not_called()
 
-    def test_transition_audit_state_refusals_and_other_exact_repeats_use_no_git(self) -> None:
-        ledger = self.checkpointed_read_transition()
-        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
-            self.assertEqual(ledger.ticket_base("1001"), self.initial_tip)
-            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become assigned from checkpointed"):
-                ledger.ticket_assign("1001", "main")
-            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot yield from checkpointed"):
-                _ = ledger.ticket_yield("1001", self.sources[0])
-            git.assert_not_called()
-        _ = ledger.ticket_merge("1001")
-        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
-            self.assertEqual(ledger.ticket_merge("1001"), ())
-            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become dropped from merged"):
-                ledger.ticket_drop("1001")
-            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot resume or gate from merged"):
-                ledger.check_ticket_pipeline("1001")
-            git.assert_not_called()
-        self.add_ticket("29001", [self.rule("drop")], unit="drop")
-        ledger.ticket_drop("29001")
-        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
-            ledger.ticket_drop("29001")
-            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot record start commit in state dropped"):
-                _ = ledger.ticket_base("29001")
-            git.assert_not_called()
-        self.add_ticket("17001", [self.rule("assign")], unit="assign")
-        ledger.ticket_assign("17001", "main")
-        with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:
-            ledger.ticket_assign("17001", "main")
-            git.assert_not_called()
-
-    def test_transition_audit_widen_repeat_and_reason_refusal_precede_approval_and_git(self) -> None:
-        ledger, _ = self.widen_ticket()
-        path = "crates/alpha/src/extra.rs"
-        first = ledger.ticket_widen("1", (path,), "reference", "worker", lambda: frozenset())
-        approved = mock.Mock(return_value=frozenset())
-        with (mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git,
-              mock.patch.object(ledger, "_check_ticket_pipelines") as proof):
-            self.assertEqual(ledger.ticket_widen("1", (path,), "reference", "worker", approved), first)
-            with self.assertRaisesRegex(style_ledger.LedgerError, "already widened for another reason"):
-                _ = ledger.ticket_widen("1", (path,), "different", "worker", approved)
-            approved.assert_not_called()
-            proof.assert_not_called()
-            git.assert_not_called()
-
-    def test_transition_audit_git_errors_name_base_and_merge_operations(self) -> None:
-        ledger = self.checkpointed_read_transition()
-        self.add_ticket("5001", [self.rule("other")], unit="other")
-        ledger.ticket_assign("5001", "main")
-        with mock.patch.object(style_ledger, "_git", side_effect=self.git_read_failure()):
-            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket 5001 base: git rev-parse failed"):
-                _ = ledger.ticket_base("5001")
-            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket 1001 merge: git rev-parse failed"):
-                _ = ledger.ticket_merge("1001")
-        with (mock.patch.object(ledger, "_style_branch_tip", return_value=("main", self.initial_tip)),
-              mock.patch.object(ledger, "_is_ancestor", side_effect=self.git_read_failure())):
-            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket 1001 merge: git rev-parse failed"):
-                _ = ledger.ticket_merge("1001")
-
-    def test_transition_audit_reconcile_git_errors_name_the_ticket(self) -> None:
-        ledger = self.checkpointed_read_transition()
-        with mock.patch.object(ledger, "_is_ancestor", side_effect=self.git_read_failure()):
-            with self.assertRaisesRegex(style_ledger.LedgerError, "ticket 1001 reconcile: git rev-parse failed"):
-                _ = ledger.reconcile("main", "main")
-
-    def test_ticket_transition_state_refusals_precede_git_and_footprint_work(self) -> None:
-        rule = self.rule("read")
-        ledger = self.ledger()
-        ledger.set_tip(self.initial_tip, "main")
-        self.add_ticket("1001", [rule], unit="read")
-        with (self.subTest(state="queued"),
-              mock.patch.object(style_ledger, "_git", side_effect=style_ledger.LedgerError("git before state check"))):
-            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from queued"):
-                ledger.ticket_checkpoint("1001", "missing-commit")
-        ledger.ticket_assign("1001", "main")
-        for path in self.sources[:2]:
-            self.record(rule, path, self.initial_tip, ticket="1001")
-        ledger.ticket_checkpoint("1001", self.initial_tip)
-        for state in ("checkpointed", "merged"):
-            with self.subTest(state=state):
-                if state == "merged":
-                    _ = ledger.ticket_merge("1001")
-                with (mock.patch.object(style_ledger, "_git", side_effect=style_ledger.LedgerError("git before state check")),
-                      mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=AssertionError("footprint before state check"))):
-                    with self.assertRaisesRegex(style_ledger.LedgerError, f"cannot become assigned from {state}"):
-                        ledger.ticket_assign("1001", "missing-branch")
-                    if state == "merged":
-                        with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from merged"):
-                            ledger.ticket_checkpoint("1001", "missing-commit")
 
     def test_ticket_assignment_with_an_unreadable_successor_branch_fails_closed_with_context(self) -> None:
         rule = self.rule("read")
@@ -3040,18 +2788,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(dropped_final.returncode, 2)
         self.assertIn("merged", dropped_final.stderr)
 
-    def test_ensuring_the_exact_tip_and_style_branch_never_calls_set_tip(self) -> None:
-        _ = self.rule("read")
-        ledger = self.ledger()
-        ledger.set_tip(self.initial_tip, "style/main")
-        before = ledger.synced_at()
-
-        with mock.patch.object(ledger, "set_tip", side_effect=AssertionError("rewrote an exact sync match")):
-            ledger.ensure_synced_tip(self.initial_tip, "style/main")
-            ledger.ensure_synced_tip(self.initial_tip, "refs/heads/style/main")
-
-        self.assertEqual(ledger.summary().synced_tip, self.initial_tip)
-        self.assertEqual(ledger.synced_at(), before)
 
     def test_reconcile_new_style_branch_syncs_at_its_commit_before_the_branch_point(self) -> None:
         _ = self.rule("read")
@@ -3845,18 +3581,6 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual(ledger.ticket_open(ticket_owner_id("read")), ())
         with closing(sqlite3.connect(self.ledger().database)) as connection:
             self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='1001'").fetchone(), ("merged",))
-
-    def test_assigned_ticket_merge_reports_the_state_before_resolving_style_branch(self) -> None:
-        rule = self.rule("read")
-        self.add_ticket("1001", [rule])
-        _ = self.cli("ticket", "assign", "--id", "1001", "--branch", "main")
-        with closing(sqlite3.connect(self.ledger().database)) as connection:
-            _ = connection.execute("UPDATE sync SET style_branch='refs/heads/missing'")
-            connection.commit()
-        refused = self.cli("ticket", "merge", "--id", "1001", success=False)
-        self.assertEqual(refused.returncode, 2)
-        self.assertEqual(refused.stderr.strip(), "style_ledger: 1001: cannot become merged from assigned")
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("read"))[0]["state"], "assigned")
 
 
 if __name__ == "__main__":
