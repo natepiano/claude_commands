@@ -2226,41 +2226,21 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 103 — A build that cannot name its run says so while it waits on a hold  · status: done
 
-**Depends on:** none. Source: builds on 2026-11-11, from a hana request. On 11-11 an fps worker build (`verify.sh`) waited 51 min on fps's own natedev hold. The fps staff row had lost its open-run pointer, so the wait found no owning session, and nothing told anyone. sdlc hierarchies fixes the pointer loss; this phase makes the next loss visible.
+#### As-built
 
-#### Work Order
-
-**Goal:** When `wait-local` waits on a hold and cannot resolve the build's run or session, it says so in one line, once per wait, to the build's caller and to the holder.
-
-**Spec:**
-
-1. **The run resolution, in one place.** `build_hold.owning_session(environment)` (`scripts/build_hold/build_hold.py:360`) reads the run folder from `UNIT_RUN_DIR`, `PLAN_DELEGATE_BOARD_DIR`, `UNIT_SESSION_DIR` or `PLAN_DELEGATE_SESSION_DIR`, finds the staff row whose `OpenRun` path matches, and else falls back to `CLAUDE_CODE_SESSION_ID`. Move the run half into a new `run_resolution(environment) -> RunOwner | NoRunNamed | RunNotInStaff` beside it: `RunOwner(session_id)` for a matched row, `NoRunNamed()` when no run variable is set, `RunNotInStaff(run: Path)` when a run is named and no staff row holds it (an unreadable staff snapshot counts as no row, as now). `owning_session` calls it and keeps its return type and behavior byte for byte. Use frozen dataclasses, like `OwningSession`.
-2. **The unresolved cases.** In `command_wait_local` (`scripts/build_targets/build_targets.py:971`), when `blocking` is a `Holder` (line 1026), the build is unresolved when `run_resolution()` is `RunNotInStaff`, or when the owner is `NoOwningSession`. A resolved owner prints nothing new.
-3. **The line.** Print it once per wait, on stderr, right after the existing `natedev is held by …` announcement:
-   - `RunNotInStaff`: `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.`
-   - `NoOwningSession` with no run named: `<speaker>: build has no session; waits on <holder> hold for <purpose>.`
-   `<speaker>` is `speaker(caller)`. Pass names and the run path through `display_field`, as the announcement does.
-4. **The holder.** Send the same line, once per wait, to the holder: `session_send.send_argv("--to", f"session:{blocking.key}", "--text", <line>)` (the release notice's path, `build_hold.py` `send_release`). The send is best-effort: a failed or refused send prints one stderr line `<speaker>: could not tell <holder>: <reason>` and the wait goes on. A send never ends the wait or changes its exit status.
-5. **Proof.** One test row per case:
-   - `scripts/build_hold/test_build_hold.py`: next to `test_no_matching_staff_run_falls_back_to_shell_session` (:114), assert `run_resolution` for a matched run, no run, and an unmatched run (`RunNotInStaff(run)`). The existing `owning_session` tests stay unchanged and pass.
-   - `scripts/build_targets/test_build_targets.py`: with a hold in force by another session, run `wait-local` (the pattern of `test_holder_session_verify_waits_while_another_hold_is_in_force`, :1274) with `UNIT_RUN_DIR` set to a run that no staff row holds. Assert the stderr line once across two polls, and one send to `session:<holder key>` with the same text (patch the send at its call boundary). A second row: a resolved owner prints no such line and sends nothing. A third row: a failed send prints the `could not tell` line and the wait still returns 0 at the release.
-6. **Docs.** `docs/as-built/build-targets.md`: add the line to the `wait-local` row (:62) and name `run_resolution` beside `owning_session` (:91).
+- `build_hold.run_resolution(environment) -> RunOwner | NoRunNamed | RunNotInStaff` reads the run folder from `UNIT_RUN_DIR`, `PLAN_DELEGATE_BOARD_DIR`, `UNIT_SESSION_DIR` or `PLAN_DELEGATE_SESSION_DIR` and matches it to a staff row's `OpenRun` path. An unreadable staff snapshot counts as no row. `owning_session` calls it and keeps its return type and behavior.
+- `build_targets.command_wait_local`: when a hold blocks and the run is `RunNotInStaff`, or the owner is `NoOwningSession`, the wait prints one line on stderr, once per wait, right after the `natedev is held by …` announcement: `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.` or `<speaker>: build has no session; waits on <holder> hold for <purpose>.` A resolved owner prints nothing new.
+- `tell_wait_holder` sends the same line to `session:<holder key>` through `session_send.send_argv`, with a timeout from `hold_sender_timeout_seconds` (30, range 0.01..300) in `config/build_targets.conf`. A timeout, an `OSError`, an unusable key or a non-zero exit prints `<speaker>: could not tell <holder>: <reason>`; the wait goes on with the same exit status.
 
 **Files:**
-- `scripts/build_hold/build_hold.py`
-- `scripts/build_hold/test_build_hold.py`
-- `scripts/build_targets/build_targets.py`
-- `scripts/build_targets/test_build_targets.py`
-- `docs/as-built/build-targets.md`
+- `scripts/build_hold/build_hold.py` — `run_resolution` and its three frozen outcome types.
+- `scripts/build_targets/build_targets.py` — the wait line and `tell_wait_holder`.
+- `config/build_targets.conf` — `hold_sender_timeout_seconds`.
+- `scripts/direct/verify_hold_wait_test_support.py` — `local_hold_environment` patches `build_targets.tell_wait_holder`.
+- `docs/as-built/build-targets.md` — the `wait-local` line and `run_resolution` beside `owning_session`.
+- `scripts/build_hold/test_build_hold.py`, `scripts/build_targets/test_build_targets.py` — rows for each resolution, each line, a resolved owner, a failed send and a missing timeout key.
 
-**Workers:** `1 writer`
-- `impl` owns all five files.
-
-**State:** none.
-
-**Gate:** the targeted test; `scripts/build_hold/test_build_hold.py` and `scripts/build_targets/test_build_targets.py` pass; and `basedpyright` 0/0/0 on the four Python files and each caller module of `owning_session` (`scripts/mac_test/claim_state.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/mac_test.py`).
-
-**Change-Review:** A build that waits on a natedev hold and cannot name its run says so | In any session on natedev, run a test through verify.sh from a worker whose run has no staff pointer while another session holds natedev | verify.sh prints `build has no run pointer (...); waits on <holder> hold for <purpose>.` once, and the holder gets the same line
+**Gotchas:** the `local_hold_environment` patch reaches only an in-process wait. A wait that `verify.sh` starts as a child process runs the real `tell_wait_holder`, inside the fixture `HOME` and `XDG_STATE_HOME`.
 
 ### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: todo
 
