@@ -2784,7 +2784,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assert_ok(self.rename())
         self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
             row.id, "unit", "gamma", row.parent, current_session=row.id,
-            worktree=staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma"), doc=row.doc))
+            worktree=staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma"), doc=row.doc, unit_type=staff.UnitDetails("direct")))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
 
     def test_uncommitted_work_between_phases_also_keeps_the_tip(self) -> None:

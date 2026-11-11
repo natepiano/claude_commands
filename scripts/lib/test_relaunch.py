@@ -22,6 +22,9 @@ from scripts.lib.process_group import send_process_group
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib import relaunch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff, worker
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.lib.resume_message import AccountMove, ResumeWorkers, resume_message
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
 
@@ -37,6 +40,35 @@ class RelaunchObservation(TypedDict):
 class FinishedChild:
     def wait(self) -> int:
         return 23
+
+
+class UnitResumeCommandTests(StaffTestCase):
+    def test_resume_and_account_move_name_the_recorded_command(self) -> None:
+        runner = fixture_member("showrunner", name="demo")
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type):
+                row = staff.ensure("unit", name=unit_type, parent=staff.ReportsTo(runner.id),
+                    runtime_id=fixture_runtime_id(unit_type), unit_type=unit_type)
+                text = resume_message("maintenance", unit=row, move=AccountMove("claude1", "claude2"))
+                self.assertIn(f"/unit:{unit_type}", text)
+                self.assertIn(f"~/.claude/commands/unit/{unit_type}.md", text)
+                self.assertIn("moved from claude1 to claude2", text)
+                self.assertIn("Background commands that you started before the restart ended with no result. Run them again.", text)
+
+    def test_relaunch_uses_the_retained_unit_after_rename(self) -> None:
+        from scripts.agents import pane_record
+
+        runner = fixture_member("showrunner", name="demo")
+        row = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+            runtime_id=fixture_runtime_id("merges"), unit_type="merge")
+        row = staff.rename(row.id, "renamed")
+        entry = pane_record.launch("w1:p2", str(row.current_session), str(self.root), {}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(worker, "resume_workers", return_value=ResumeWorkers())):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)
+        self.assertIn("/unit:merge", arguments[-1])
+        self.assertNotIn("/unit:direct", arguments[-1])
 
 
 class RelaunchTests(ShutdownTestCase):

@@ -35,6 +35,20 @@ OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
 Kind = Literal["showrunner", "unit", "worker", "producer"]
 _KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer")
+UnitType = Literal["direct", "merge", "style"]
+UNIT_TYPES: tuple[UnitType, ...] = ("direct", "merge", "style")
+
+
+@dataclass(frozen=True)
+class UnitDetails:
+    value: UnitType
+
+
+@dataclass(frozen=True)
+class NotUnit:
+    """The staff member is not a unit."""
+
+
 WorkerRole = Literal["impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 WORKER_ROLES: tuple[WorkerRole, ...] = ("impl", "test", "review", "fix", "astra-designer", "astra-reviewer")
 
@@ -342,6 +356,7 @@ class StaffRow:
     role: KnownWorkerRole | WorkerRoleUnknown = field(default_factory=WorkerRoleUnknown, kw_only=True)
     home: SessionHome | HomeUnknown = field(default_factory=HomeUnknown, kw_only=True)
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
+    unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -349,6 +364,11 @@ class StaffRow:
 
     def to_json(self) -> dict[str, object]:
         value: dict[str, object] = {**self.unknown_fields, "id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent.id if isinstance(self.parent, ReportsTo) else None, "current_session": self.current_session}
+        _ = value.pop("unit_type", None)
+        if self.kind == "unit":
+            if not isinstance(self.unit_type, UnitDetails) or self.unit_type.value not in UNIT_TYPES:
+                raise StaffRefused("unit requires valid unit_type details")
+            value["unit_type"] = self.unit_type.value
         if isinstance(self.role, KnownWorkerRole):
             value["role"] = self.role.value
         if isinstance(self.run, OpenRun):
@@ -379,6 +399,12 @@ class StaffRow:
             raise StaffUnreadable("invalid staff id")
         if not isinstance(kind, str) or kind not in _KINDS:
             raise StaffUnreadable("invalid staff kind")
+        unit_type: UnitDetails | NotUnit = NotUnit()
+        if kind == "unit":
+            raw_type = fields.get("unit_type", "direct")
+            if raw_type not in UNIT_TYPES:
+                raise StaffUnreadable("invalid unit_type")
+            unit_type = UnitDetails(raw_type)
         if not isinstance(name, str):
             raise StaffUnreadable("staff name must be a string")
         if parent is not None and (not isinstance(parent, str) or not _valid_id(parent)):
@@ -393,7 +419,7 @@ class StaffRow:
         parsed_role = (KnownWorkerRole(role)
                        if isinstance(role, str) and role in WORKER_ROLES else WorkerRoleUnknown())
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
-        known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run"}
+        known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
         invalid: list[str] = []
         for key, fact in (("role", parsed_role), ("home", parsed_home)):
             if isinstance(fact, (KnownWorkerRole, SessionHome)):
@@ -405,11 +431,22 @@ class StaffRow:
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
-                   role=parsed_role, home=parsed_home,
+                   role=parsed_role, home=parsed_home, unit_type=unit_type,
                    run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(),
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    unknown_fields=_unknown_fields(fields, known_fields))
+
+
+def unit_command(unit: StaffRow | UnitType) -> str:
+    """Select the command from a row, or its launch type before native admission."""
+    if isinstance(unit, StaffRow):
+        if unit.kind != "unit" or not isinstance(unit.unit_type, UnitDetails):
+            raise StaffRefused(f"{unit.kind} has no unit command")
+        unit = unit.unit_type.value
+    if unit not in UNIT_TYPES:
+        raise StaffRefused("invalid unit_type")
+    return f"/unit:{unit}"
 
 
 def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktree | RemovedWorktree | WorktreeUnfilled, LiveDoc | WrappedDoc | DocUnfilled]:
@@ -1373,7 +1410,9 @@ def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
 def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo | StaffRoot, *,
                 worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
                 doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
-                runtime_id: str = "") -> StaffRow:
+                runtime_id: str = "", unit_type: UnitType | None = None) -> StaffRow:
+    if unit_type is not None and (kind != "unit" or unit_type not in UNIT_TYPES):
+        raise StaffRefused(f"{kind}: invalid unit_type")
     if kind not in ("unit", "producer") and not isinstance(worktree, WorktreeUnfilled):
         raise StaffRefused(f"{kind} cannot hold worktree")
     if kind not in ("showrunner", "producer") and not isinstance(doc, DocUnfilled):
@@ -1381,6 +1420,8 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
     if existing is not None:
+        if unit_type is not None and existing.unit_type != UnitDetails(unit_type):
+            raise StaffRefused(f"{existing.id}: existing unit_type conflicts with admission")
         if not isinstance(worktree, WorktreeUnfilled) and not isinstance(existing.worktree, WorktreeUnfilled) and existing.worktree != worktree:
             raise StaffRefused(f"{existing.id}: existing worktree conflicts with admission")
         if not isinstance(doc, DocUnfilled) and not isinstance(existing.doc, DocUnfilled) and existing.doc != doc:
@@ -1395,7 +1436,8 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
     staff_id = native_id(runtime_id)
     if _row_by_id(rows, staff_id) is not None or any(row.current_session == staff_id for row in rows):
         raise StaffRefused(f"{staff_id}: runtime identity already belongs to another member")
-    row = StaffRow(staff_id, kind, name, parent, worktree, doc, current_session=staff_id)
+    details = UnitDetails(unit_type or "direct") if kind == "unit" else NotUnit()
+    row = StaffRow(staff_id, kind, name, parent, worktree, doc, current_session=staff_id, unit_type=details)
     rows.append(row)
     return row
 
@@ -1403,10 +1445,12 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
 def ensure(kind: Kind, *, name: str, parent: ReportsTo | StaffRoot = STAFF_ROOT,
            worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
            doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
-                runtime_id: str = "") -> StaffRow:
+                runtime_id: str = "", unit_type: UnitType | None = None) -> StaffRow:
     """Admit the identity and its location in the same owner transaction."""
     if not is_owner():
         arguments = ["ensure", kind, f"--name={name}", f"--runtime-id={runtime_id}"]
+        if unit_type is not None:
+            arguments.extend(("--unit-type", unit_type))
         if isinstance(parent, ReportsTo):
             arguments.extend(("--parent", parent.id))
         if not isinstance(worktree, WorktreeUnfilled):
@@ -1416,7 +1460,8 @@ def ensure(kind: Kind, *, name: str, parent: ReportsTo | StaffRoot = STAFF_ROOT,
             arguments.extend(("--doc", doc.machine, str(doc.path), "live" if isinstance(doc, LiveDoc) else "wrapped"))
         return _remote_row(arguments)
 
-    return _transaction(lambda rows: _ensure_row(rows, kind, name, parent, worktree=worktree, doc=doc, runtime_id=runtime_id))
+    return _transaction(lambda rows: _ensure_row(rows, kind, name, parent, worktree=worktree, doc=doc,
+                                               runtime_id=runtime_id, unit_type=unit_type))
 
 
 def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
@@ -1519,6 +1564,7 @@ class UnitRole:
     name: str
     parent: StaffId
     worktree: PresentWorktree
+    unit_type: UnitType = "direct"
 
 
 def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -> StaffRow:
@@ -1526,14 +1572,18 @@ def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -
     promoting = isinstance(destination, ShowrunnerRole)
     location = destination.doc if isinstance(destination, ShowrunnerRole) else destination.worktree
     if not is_owner():
-        return _remote_row(["promote-unit" if promoting else "demote-showrunner", identity,
+        arguments = ["promote-unit" if promoting else "demote-showrunner", identity,
                             "--name", destination.name, "--parent", destination.parent,
-                            "--machine", location.machine, "--path", str(location.path)])
+                            "--machine", location.machine, "--path", str(location.path)]
+        if isinstance(destination, UnitRole):
+            arguments.extend(("--unit-type", destination.unit_type))
+        return _remote_row(arguments)
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
         kind: Kind = "showrunner" if promoting else "unit"
         source = "unit" if promoting else "showrunner"
         changed = replace(row, kind=kind, name=destination.name, parent=ReportsTo(destination.parent),
+                          unit_type=NotUnit() if promoting else UnitDetails(cast(UnitRole, destination).unit_type),
                           worktree=WORKTREE_UNFILLED if promoting else cast(UnitRole, destination).worktree,
                           doc=cast(ShowrunnerRole, destination).doc if promoting else DOC_UNFILLED)
         if row.kind == kind:
@@ -1987,6 +2037,7 @@ class _Arguments:
     value: str = ""
     verb: str = ""
     kind: Kind | None = None
+    unit_type: UnitType | None = None
     under: str | None = None
     target: str = ""
     destination: str | None = None
@@ -2039,6 +2090,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("kind", choices=_KINDS)
     _ = add.add_argument("--name", required=True)
     _ = add.add_argument("--parent")
+    _ = add.add_argument("--unit-type", choices=UNIT_TYPES)
     _ = add.add_argument("--worktree", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--doc", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
@@ -2062,6 +2114,8 @@ def _parser() -> argparse.ArgumentParser:
         _ = director.add_argument("--machine", required=True)
         _ = director.add_argument("--path", required=True)
         _ = director.add_argument("--json", action="store_true")
+        if command == "demote-showrunner":
+            _ = director.add_argument("--unit-type", choices=UNIT_TYPES, default="direct")
     restore_parser = verbs.add_parser("restore-unit", help=argparse.SUPPRESS)
     _ = restore_parser.add_argument("target")
     _ = restore_parser.add_argument("--machine", required=True)
@@ -2152,7 +2206,7 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
                 value[key] = {"machine": machine, "path": path, "state": state}
         worktree, doc = _row_locations(arguments.kind, value)
         return ensure(arguments.kind, name=arguments.name, parent=_parent(arguments.parent),
-                      worktree=worktree, doc=doc, runtime_id=arguments.runtime_id)
+                      worktree=worktree, doc=doc, runtime_id=arguments.runtime_id, unit_type=arguments.unit_type)
     if arguments.verb == "promote-unit":
         assert arguments.parent is not None
         return promote_unit(StaffId(arguments.target), name=arguments.name, parent=StaffId(arguments.parent),
@@ -2160,7 +2214,7 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "demote-showrunner":
         assert arguments.parent is not None
         return change_director(StaffId(arguments.target), UnitRole(arguments.name, StaffId(arguments.parent),
-                               PresentWorktree(arguments.machine, Path(arguments.path))))
+                               PresentWorktree(arguments.machine, Path(arguments.path)), arguments.unit_type or "direct"))
     if arguments.verb == "restore-unit":
         return restore_unit(StaffId(arguments.target), PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "rename":

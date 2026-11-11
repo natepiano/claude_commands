@@ -73,7 +73,8 @@ class ProposalIssueTests(unittest.TestCase):
         rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(name)), kind,
                                     unit_names.name(name) if kind == "unit" else name,
                                     staff.ReportsTo(staff.StaffId(fixture_runtime_id("hana"))) if kind == "unit" else staff.StaffRoot(),
-                                    current_session=staff.StaffId(fixture_runtime_id(name)))
+                                    current_session=staff.StaffId(fixture_runtime_id(name)),
+                                    unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit())
                      for name, kind in members)
         _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(rows)))
         _ = self.enterContext(mock.patch.object(proposal_issue, "calling_showrunner", return_value=fixture_runtime_id("hana")))

@@ -13,6 +13,7 @@ Every unit cuts its staff and lifecycle code to this page. A phase in this work 
 | `id` | the first native session id | never |
 | `name` | the shown name | rename |
 | `kind` | showrunner, unit, worker, or producer | explicit role conversion |
+| `unit_type` | `direct`, `merge`, or `style`, for unit rows only. | Explicit type selection at admission. |
 | `parent` | the `id` of the row it reports to | transfer |
 | `current_session` | the native id that runs now | `/clear`, family switch |
 | `worktree` | Machine and folder for a unit or producer. | Folder move, rename. |
@@ -23,12 +24,20 @@ Every unit cuts its staff and lifecycle code to this page. A phase in this work 
 | `exited` | The session exit state. | Exit or resume. |
 
 A producer has no parent and can start a staff path.
+An old unit row without `unit_type` reads as `direct`.
+An invalid unit type makes the row unreadable.
+Readers discard the field on other staff kinds; the next write removes it.
+Code uses `UnitDetails` for a unit and `NotUnit` for other members.
+Promotion removes the type; demotion selects an explicit type, default `direct`.
+New and changed unit rows write the type explicitly.
+The type selects the unit command for launch, resume, account move, rename, and compaction.
 Morty, brain, and dwight use kind `producer`.
 Each keeps its own command under `commands/producer/` and its own job.
 The [staff contract](../as-built/staff-accessors.md#producer-rows-and-commands) defines the current producer rows.
 
 No other file, table, journal, ledger, roster, record or cache stores any of these facts.
 One exception: a pending producer admission record holds the reserved pane until staff admission and pane publication succeed.
+Pending unit admission and director role records keep the selected type until the operation completes.
 
 ## 2. Found, never stored
 

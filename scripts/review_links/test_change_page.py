@@ -202,7 +202,7 @@ class ChangePageTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.raw_messages = []
-        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""), unit_type=staff.UnitDetails("direct"))
 
     def command(self, module: ModuleType, main: Callable[[list[str]], int],
                 arguments: list[str]) -> subprocess.CompletedProcess[str]:

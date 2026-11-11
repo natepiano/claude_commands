@@ -97,7 +97,8 @@ def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[s
 
 def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
                    workers: ResumeWorkers = NO_WORKERS, context: str = "",
-                   own_pass: BusyPass | NoOwnPass = NO_OWN_PASS) -> str:
+                   own_pass: BusyPass | NoOwnPass = NO_OWN_PASS,
+                   unit: staff.StaffRow | None = None) -> str:
     moved = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
     if isinstance(own_pass, BusyPass):
         opening = context or f"You were stopped and resumed because {why}.{moved}"
@@ -108,6 +109,10 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
                      + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting. "
                      + "Background commands that you started before the restart ended with no result. Run them again.")
+    if unit is not None and unit.kind == "unit":
+        command = staff.unit_command(unit)
+        path = command.removeprefix("/").replace(":", "/")
+        lines.append(f"Read ~/.claude/commands/{path}.md for {command} before continuing.")
     for pane in workers.panes:
         if isinstance(pane.turn, UnsubmittedAssignment):
             lines.append(launcher_prompt(pane.staff_id, pane.turn.dispatch_id, pane.turn.command))

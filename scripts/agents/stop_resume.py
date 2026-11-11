@@ -1078,7 +1078,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             message = launcher_prompt(row.id, own.dispatch_id, own.command) if row is not None else ""
         else:
             message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                     workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
+                                     workers=workers, own_pass=own, unit=row) if (kind != "codex" or row is not None) and (
                                          row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
         completed = entry
         if row is not None and row.kind == "producer":

@@ -623,7 +623,7 @@ def submit_command(argv):
     def prepare_herdr_launch(self, *args: str) -> None:
         parser = argparse.ArgumentParser()
         _ = parser.add_argument("name")
-        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
+        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact", "unit-type"):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
@@ -639,6 +639,7 @@ def submit_command(argv):
             launch = add_unit.UnitLaunch(production=requested.production, branch=requested.branch,
                 worktree=requested.worktree, plan=requested.plan, port=requested.port,
                 session=requested.session, timeout=requested.timeout, responsibilities=requested.responsibilities,
+                unit_type=requested.unit_type,
                 identity=add_unit.UnitIdentity(requested.unit, requested.requested_name))
             self.configure_herdr(launch)
         except (Refusal, OSError, ValueError):

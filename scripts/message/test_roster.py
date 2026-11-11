@@ -565,7 +565,7 @@ class RosterTests(unittest.TestCase):
         record = staff.snapshot()
         row = staff.StaffRow(
             staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.StaffRoot(),
-            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit_type=staff.UnitDetails("direct"),
         )
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
             result, _, errors = self._run_main("--json")
@@ -584,7 +584,7 @@ class RosterTests(unittest.TestCase):
             with self.subTest(parent=parent):
                 row = staff.StaffRow(
                     staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.ReportsTo(parent),
-                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit_type=staff.UnitDetails("direct"),
                 )
                 with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
                     result, lines, errors = self._run_main("--json")

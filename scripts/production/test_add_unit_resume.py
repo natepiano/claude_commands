@@ -178,7 +178,8 @@ class AddUnitResumeTests(AddUnitTestCase):
 
     def test_attach_stops_then_launches_once_with_staff_marks_and_finishes(self) -> None:
         prior, trace = self.prepare_attach()
-        result = self.successful("alpha", "--permanent", "--attach", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
+        result = self.successful("alpha", "--unit-type", "merge", "--permanent", "--attach",
+                                 "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(trace, ["stop", "launch"])
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
         self.assertEqual(len(starts), 1)
@@ -188,6 +189,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn(str(prior), self.opened())
         self.assertIn("attached 62ccbd64-f22e-5647-b20e-7899aa39d766 as alpha: one process, pid 202", result.stdout)
         row = unit_membership("build-followups", "alpha")
+        self.assertEqual(row.unit_type, staff.UnitDetails("merge"))
+        self.assertIn("Load /unit:merge before waiting for orders.", self.opening_prompt())
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
         self.assertNotIn("STAFF_ID", self.pane_environment())
         arguments = self.agent_arguments()
@@ -408,7 +411,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
-                            "--cwd", str(prior), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+                            "--cwd", str(prior), "--unit-type", "style",
+                            "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(self.opened()[7], str(prior))
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(self.agent_arguments(), [
@@ -420,7 +424,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn("You are now alpha in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
-        self.assertIn(f"Run /unit:direct {promoted_plan}", command)
+        self.assertIn(f"Run /unit:style {promoted_plan}", command)
 
     def test_excluded_standing_plan_launches_and_keeps_the_units_copy(self) -> None:
         plan = Path("docs/style-production/units/alpha-unit.md")

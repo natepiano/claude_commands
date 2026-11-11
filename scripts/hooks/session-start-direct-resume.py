@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""SessionStart(compact) hook: restore a /unit:direct run after compaction.
-
-`direct.md` already says to re-read the command file after compaction and
-resume the same control flow. The problem is where that instruction lives: in
-the conversation being summarized. Summarization drops the rules that were not
-firing at the moment it ran, which is exactly the set that matters on the far
-side.
-
-A SessionStart hook with `source == "compact"` runs after the summary is built
-and its `additionalContext` is injected into the fresh context. So this text
-cannot be summarized away -- it is the first thing the resumed agent reads.
-
-Silent unless a /unit:direct run is actually active in this session; an ordinary
-compaction gets nothing.
-"""
+"""Load the recorded unit command after compaction of an active run."""
 
 from __future__ import annotations
 try:
@@ -27,6 +13,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 from scripts.hooks.direct_run import active_run
+from scripts.production import staff
 
 
 class SessionStartInput(TypedDict, total=False):
@@ -40,28 +27,21 @@ class SessionStartInput(TypedDict, total=False):
 
 
 CONTEXT = """\
-A /unit:direct run is active in this session and was just compacted. The \
-summary above is not the whole picture -- compaction is a normal, expected event \
-in a long run, and the run continues.
+An active {command} run continues after compaction.
 
 Before any further workflow action:
 
-1. Re-read ~/.claude/commands/unit/direct.md in full. Do not reconstruct the \
-workflow from the summary; a summarized workflow silently drops rules, and the \
-ones it drops are the ones that were not firing when compaction hit.
+1. Read ~/.claude/commands/{command_file}.md in full.
 2. Read each stub file whose moment is live.
-3. Read back the handoff doc named in the summary and resume the control flow it \
-describes -- re-establish which dispatches are live without blocking on any of \
-them. The authorization state is the one thing the \
-summary has no reason to preserve -- take it from the handoff doc, not from \
-inference, and do not assume a phase is approved.
-4. Delete the handoff doc once the phase it describes is committed.
+3. Read the handoff document named in the summary.
+4. Restore live dispatch state without waiting for completion.
+5. Read the authorization state from the handoff document.
+6. Delete the handoff document after its phase commits and any reservation release succeeds.
 
 Unit session directory: {session_dir}
 Status on demand (single read, never a wait loop): {session_dir}/heartbeat.log
 
-Then continue the run. Do not stop to announce the compaction, do not ask whether \
-to continue, and do not re-run work that the handoff doc reports as done."""
+Continue the run. Do not repeat completed work."""
 
 
 def main() -> None:
@@ -74,12 +54,17 @@ def main() -> None:
     session_dir: Path | None = active_run(session_id)
     if session_dir is None:
         return
+    row = staff.local_by_current_session(session_id)
+    if row is None or row.kind != "unit":
+        return
+    command = staff.unit_command(row)
     print(
         json.dumps(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": CONTEXT.format(session_dir=session_dir),
+                    "additionalContext": CONTEXT.format(session_dir=session_dir, command=command,
+                        command_file=command.removeprefix("/").replace(":", "/")),
                 }
             }
         )

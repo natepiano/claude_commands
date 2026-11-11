@@ -30,6 +30,7 @@ class DemoteShowrunnerTests(StaffTestCase):
     plan_relative: Path = Path("plan.md")
     port: unit_config.AppPort | unit_config.NoAppPort = unit_config.NoAppPort()
     style: bool = True
+    unit_type: staff.UnitType = "direct"
     checkout: Path = Path()
     child_tree: Path = Path()
     doc: Path = Path()
@@ -159,10 +160,12 @@ class DemoteShowrunnerTests(StaffTestCase):
     def start_unit(self, args: list[str]) -> int:
         self.events.append("start")
         self.assertEqual(args, ["--production", self.parent_name, self.child_name, "--plan", str(self.plan_relative),
+                               "--unit-type", self.unit_type,
                                "--resume", self.child.current_session, "--cwd", str(self.child_tree),
                                "--config-dir", str(self.root / "units-account"),
                                *(["--port", str(self.port.number)] if isinstance(self.port, unit_config.AppPort) else [])])
         self.assertEqual(staff.by_id(self.child.id), replace(self.child, kind="unit", parent=staff.ReportsTo(self.parent.id),
+                         unit_type=staff.UnitDetails(self.unit_type),
                          doc=staff.DOC_UNFILLED, worktree=staff.PresentWorktree(remote.local_machine(), self.child_tree)))
         config = unit_config.read(self.child_tree)
         assert isinstance(config, unit_config.UnitConfig)
@@ -347,8 +350,9 @@ class DemoteShowrunnerTests(StaffTestCase):
                 requests: list[demote.Demotion] = []
                 checked = demote.checked
                 def capture(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
-                            record: staff.StaffSnapshot, port: unit_config.AppPort | unit_config.NoAppPort) -> demote.Demotion:
-                    request = checked(parent, name, plan, record, port)
+                            record: staff.StaffSnapshot, port: unit_config.AppPort | unit_config.NoAppPort,
+                            unit_type: staff.UnitType = "direct") -> demote.Demotion:
+                    request = checked(parent, name, plan, record, port, unit_type)
                     requests.append(request)
                     return request
                 with (self.subTest(source=source, flags=flags),
@@ -719,6 +723,21 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertFalse(self.journal().exists())
         self.stop.assert_called_once()
         self.detach.assert_called_once()
+
+    def test_pending_demotion_restores_the_selected_type(self) -> None:
+        self.unit_type = "merge"
+        self.start.side_effect = None
+        self.start.return_value = 2
+        self.assertEqual(self.run_command("--unit-type", "merge")[0], 1)
+        fields = cast(dict[str, object], json.loads(self.journal().read_text()))
+        self.assertEqual(fields["unit_type"], "merge")
+        converted = staff.by_id(self.child.id)
+        assert converted is not None
+        self.assertEqual(converted.to_json()["unit_type"], "merge")
+        self.assertEqual(self.run_command("--unit-type", "style")[0], 2)
+        self.start.side_effect = self.start_unit
+        self.assertEqual(self.run_command()[0], 0)
+        self.stop.assert_called_once()
 
     def test_pane_placement_failure_does_not_repeat_the_restart(self) -> None:
         self.place.side_effect = OSError("fixture placement failed")

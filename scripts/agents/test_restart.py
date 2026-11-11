@@ -505,7 +505,7 @@ class RecordedResumeTests(RestartTestCase):
     def resumed_arguments(self, entry: pane_record.PaneLaunch) -> list[str]:
         row = staff.StaffRow(staff.StaffId("row"), "unit", "current-name", staff.StaffRoot(),
                             current_session=staff.StaffId("current-id"),
-                            worktree=staff.PresentWorktree(remote.local_machine(), self.folder))
+                            worktree=staff.PresentWorktree(remote.local_machine(), self.folder), unit_type=staff.UnitDetails("direct"))
         with (patch.object(pane_record, "launch_for_session", return_value=entry),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
               patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
@@ -1021,7 +1021,7 @@ class RestartTests(RestartTestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
-            worktree=staff.PresentWorktree(remote.local_machine(), self.root)) for n in range(3))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct")) for n in range(3))
         self.running = {str(row.current_session) for row in self.rows}
         self.launches = []
         self.stops = []
@@ -1202,7 +1202,7 @@ class RestartTests(RestartTestCase):
         from scripts.production import worker
 
         owner = self.rows[0]
-        child = replace(self.rows[1], kind="worker", parent=staff.ReportsTo(owner.id))
+        child = replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id))
         record = staff.StaffSnapshot((owner, child))
         with (patch.object(staff, "snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([], [])),
@@ -1324,7 +1324,7 @@ class RestartTests(RestartTestCase):
 
     def test_restart_only_keeps_worker_and_owner_operations_within_selected_rows(self) -> None:
         owner = self.rows[0]
-        children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
+        children = tuple(replace(row, kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
         record = staff.StaffSnapshot((owner, *children))
         for selected in (owner, children[0]):
             with (self.subTest(selected=selected.id),
@@ -1363,7 +1363,7 @@ class RestartTests(RestartTestCase):
     def test_account_filters_partition_an_owner_and_its_workers_by_their_own_accounts(self) -> None:
         self.account_processes()
         owner = self.rows[0]
-        children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
+        children = tuple(replace(row, kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id)) for row in self.rows[1:])
         record = staff.StaffSnapshot((owner, *children))
         states = [worker_panes.OpenWorker(row, f"w1:p{index}", f"terminal-{index}", herdr.AgentStatus.IDLE)
                   for index, row in enumerate(children, 1)]
@@ -1374,7 +1374,7 @@ class RestartTests(RestartTestCase):
                         account=accounts.NamedAccount(label, self.root / ("." + label))), expected)
 
     def test_restart_names_unclassified_claude_and_codex_workers_once_without_acting(self) -> None:
-        row = replace(self.rows[0], kind="worker")
+        row = replace(self.rows[0], kind="worker", unit_type=staff.NotUnit())
         for kind in ("claude", "codex"):
             account = (accounts.NamedAccount("claude3", self.root / ".claude3") if kind == "claude" else
                        accounts.CodexWorkersAccount("codex1", self.root / ".codex1"))
@@ -1635,7 +1635,7 @@ class RestartTests(RestartTestCase):
 
     def test_start_row_selects_the_workers_account_unless_the_target_is_explicit(self) -> None:
         self.running.clear()
-        for row in (self.rows[0], replace(self.rows[0], kind="producer", name="probe-codex")):
+        for row in (self.rows[0], replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="probe-codex")):
             for saved in (False, True):
                 for requested in ("", "codex3"):
                     expected = requested or "codex1"
@@ -1687,7 +1687,7 @@ class RestartTests(RestartTestCase):
 
     def test_start_row_without_a_role_uses_units_unless_the_target_is_explicit(self) -> None:
         self.running.clear()
-        row = replace(self.rows[0], kind="producer")
+        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
         source, target = self.root / ".claude3", self.root / ".claude2"
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(source)}, ["claude", "--resume", str(row.current_session), "--remote-control", "old-name",
@@ -1784,7 +1784,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(target))
 
     def test_dry_run_names_a_morty_producer_with_an_unproved_native_identity(self) -> None:
-        row = replace(self.rows[0], kind="producer", name="morty", worktree=staff.WORKTREE_UNFILLED)
+        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="morty", worktree=staff.WORKTREE_UNFILLED)
         self.rows = (row,)
         record = staff.StaffSnapshot(self.rows)
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
@@ -1802,9 +1802,9 @@ class RestartTests(RestartTestCase):
 
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
         self.rows = (replace(self.rows[0], name="unit"),
-            replace(self.rows[1], kind="worker", name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
+            replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(), name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
                     worktree=staff.WORKTREE_UNFILLED),
-            replace(self.rows[2], kind="producer", name="morty", parent=staff.StaffRoot(),
+            replace(self.rows[2], kind="producer", unit_type=staff.NotUnit(), name="morty", parent=staff.StaffRoot(),
                     worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc(remote.local_machine(), self.root / "morty.md")))
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"name": "old", "seen": 1, "row_id": str(self.rows[1].id)}]}]}
@@ -1838,7 +1838,7 @@ class RestartTests(RestartTestCase):
                 staff.StaffSnapshot(self.rows)), (remote.local_machine(), self.root / "own"))
 
     def test_codex_dry_run_uses_the_newest_pane_record_and_reports_rows_without_a_tab(self) -> None:
-        self.rows = (replace(self.rows[0], kind="producer", name="morty"), *self.rows[1:])
+        self.rows = (replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="morty"), *self.rows[1:])
         row = self.rows[0]
         older: pane_record.PaneLaunch = {"kind": "codex", "pane_id": "w1:p2", "session_id": str(row.id),
             "config_dir": "/account", "cwd": str(self.root), "name": row.name, "model": "",
@@ -1989,7 +1989,7 @@ class RestartTests(RestartTestCase):
             self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
             activity.assert_not_called()
 
-        producer = replace(self.rows[0], kind="producer")
+        producer = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
         self.rows = (producer,)
         self.running.clear()
         record = staff.StaffSnapshot(self.rows)
@@ -2289,7 +2289,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(self.launches, [])
 
     def test_stop_all_keeps_a_producer_for_its_saved_tab(self) -> None:
-        row = replace(self.rows[0], kind="producer", name="TEST-agent", worktree=staff.WORKTREE_UNFILLED)
+        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="TEST-agent", worktree=staff.WORKTREE_UNFILLED)
         self.rows = (row,)
         record = staff.StaffSnapshot(self.rows)
         with patch.object(staff, "initial_snapshot", return_value=record):
@@ -2311,7 +2311,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
-        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
+        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
         self.rows = (row,)
         self.running.clear()
         pane = {"pane_id": "w1:p0", "workspace_id": "w1", "tab_id": "w1:t0",
@@ -2592,7 +2592,7 @@ class RestartTests(RestartTestCase):
         from scripts.production import worker
 
         holder = self.rows[0]
-        child = replace(self.rows[1], kind="worker", parent=staff.ReportsTo(holder.id))
+        child = replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(holder.id))
         record = staff.StaffSnapshot((holder, child))
         self.running.clear()
         shutdown_record.save([str(holder.id), str(child.id)])
@@ -2609,7 +2609,7 @@ class RestartTests(RestartTestCase):
         from scripts.production import worker
 
         holder = self.rows[0]
-        children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(holder.id)) for row in self.rows[1:])
+        children = tuple(replace(row, kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(holder.id)) for row in self.rows[1:])
         record = staff.StaffSnapshot((holder, *children))
         resumed: set[staff.StaffId] = set()
 

@@ -62,14 +62,14 @@ class SendMessageMissTests(unittest.TestCase):
                       expect_contact: bool = True) -> Generator[FakeDaemon, None, None]:
         for identity, name in members.items():
             self.members[identity] = staff.StaffRow(staff.StaffId(identity), "unit", name, staff.StaffRoot(),
-                                                   current_session=staff.StaffId(identity))
+                                                   current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct"))
         with loaded_session_daemon(home, members, expect_contact=expect_contact) as daemon:
             yield daemon
 
     def peer_snapshot(self, *, name: str = "", problems: tuple[str, ...] = ()) -> None:
         if name:
             self.members["peer-thread"] = staff.StaffRow(staff.StaffId("peer-thread"), "unit", name, staff.StaffRoot(),
-                                                       current_session=staff.StaffId("peer-thread"))
+                                                       current_session=staff.StaffId("peer-thread"), unit_type=staff.UnitDetails("direct"))
         with patch.dict(os.environ, self.environment, clear=True):
             from scripts.message import codex_daemon
             from scripts.message import roster
@@ -161,7 +161,7 @@ class SendMessageMissTests(unittest.TestCase):
 
     def test_a_clean_miss_checks_the_peer_before_reporting_no_session(self) -> None:
         self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", staff.StaffRoot(),
-                                                 current_session=staff.StaffId("missing"))
+                                                 current_session=staff.StaffId("missing"), unit_type=staff.UnitDetails("direct"))
         text = self.additional_context(self.run_hook())
         self.assertIn("no session named 'morty' on either machine either", text)
         self.assertTrue((self.root / "peer-read").exists())
@@ -192,7 +192,7 @@ class SendMessageMissTests(unittest.TestCase):
 
     def test_a_roster_error_is_context_and_never_blocks(self) -> None:
         self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", staff.StaffRoot(),
-                                                 current_session=staff.StaffId("missing"))
+                                                 current_session=staff.StaffId("missing"), unit_type=staff.UnitDetails("direct"))
         self.peer_snapshot(problems=("fixture peer failure",))
         text = self.additional_context(self.run_hook())
         self.assertIn("send.py roster error:", text)

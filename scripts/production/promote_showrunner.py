@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 
-from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
+from scripts.production import add_unit, completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.herdr import herdr_types
 from scripts.agents import remote, stop_resume
 from scripts.agents import worker_lifecycle
@@ -61,6 +61,7 @@ class Promotion(NamedTuple):
     marked: unit_lookup.LabeledSession
     claude: unit_lookup.LiveClaude
     worktree: Path
+    unit_type: staff.UnitType = "direct"
 
 
 def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -142,7 +143,7 @@ def checked(name: str, child_name: str, doc: Path, *,
             worktree = location.path
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
         marked = unit_lookup.LabeledSession(name, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
-        return Promotion(name, parent, child, marked, claude, worktree)
+        return Promotion(name, parent, child, marked, claude, worktree, add_unit.saved_unit_type(fields))
     try:
         selected = staff_sources.member(staff_sources.UnitMember(parent.name, name), record)
         if isinstance(selected, staff_sources.NoSuchMember):
@@ -163,7 +164,8 @@ def checked(name: str, child_name: str, doc: Path, *,
     directory = showrunner_account_directory()
     ending = add_showrunner.EndingUnitTab(marked.place.pane)
     _ = add_showrunner.checked(child, parent.name, ending=ending, start_in=worktree, config_dir=directory)
-    return Promotion(name, parent, child, marked, claude, worktree)
+    assert isinstance(selected.row.unit_type, staff.UnitDetails)
+    return Promotion(name, parent, child, marked, claude, worktree, selected.row.unit_type.value)
 
 
 def promotion_record(parent: Production, unit: str) -> Path:
@@ -188,6 +190,7 @@ def save_promotion(promotion: Promotion, target: Path) -> None:
         "session_id": promotion.claude.session_id, "session": promotion.marked.place.session,
         "pane": promotion.marked.place.pane, "socket": promotion.claude.socket, "pid": str(promotion.claude.pid),
         "worktree": str(promotion.worktree),
+        "unit_type": promotion.unit_type,
         "launched_at": datetime.now(UTC).isoformat(),
     }) + "\n")
 
@@ -267,12 +270,13 @@ def account_line() -> str:
 
 
 def restore_line(promotion: Promotion) -> str:
-    """The command that resumes the stopped session as the unit it was, with the plan its .unit.toml names."""
+    """Resume the stopped unit with its saved plan and type."""
     config = unit_config.read(promotion.worktree, cleanup=False)
     if isinstance(config, unit_config.ConfigMissing):
-        return f"add_unit.py with --resume {promotion.claude.session_id}; {config.reason}"
+        return f"add_unit.py with --unit-type {promotion.unit_type} --resume {promotion.claude.session_id}; {config.reason}"
     return "~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py " + shlex.join([
         "--production", promotion.parent.name, promotion.unit,
+        "--unit-type", promotion.unit_type,
         *unit_config.plan_arguments(config.plan),
         "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 

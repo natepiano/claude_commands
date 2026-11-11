@@ -73,7 +73,7 @@ def seed_rebuild_cache(home: Path) -> None:
 
 
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
-UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"))
+UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), unit_type=staff.UnitDetails("direct"))
 WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", staff.ReportsTo(UNIT.id), current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
 
 
@@ -145,7 +145,7 @@ class ColorTests(unittest.TestCase):
         lines = status_lines({**payload, "session_id": UNIT.id, "workspace": {"current_dir": f"{home}/rust/hana_catalyst_cables"}},
                              staff_text=staff_text(
                                  staff.StaffRow(OWNER.id, "showrunner", "hana", staff.StaffRoot(), current_session=OWNER.id),
-                                 staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id)), STAFF_ID=UNIT.id)
+                                 staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id, unit_type=staff.UnitDetails("direct"))), STAFF_ID=UNIT.id)
         self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables")
 
     def test_shipped_role_colors_and_plain_worker_and_unassigned(self) -> None:
@@ -615,7 +615,7 @@ class RoleTests(unittest.TestCase):
 
     def test_jq_and_queue_reader_agree_on_identity_unique_names_and_ambiguity(self) -> None:
         other = staff.StaffRow(staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), "showrunner", "other", staff.StaffRoot(), current_session=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"))
-        duplicate = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "unit", "trunk", staff.ReportsTo(other.id), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
+        duplicate = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "unit", "trunk", staff.ReportsTo(other.id), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), unit_type=staff.UnitDetails("direct"))
         rows = (OWNER, UNIT, WORKER)
         for members in (rows, (*rows, other, duplicate)):
             _ = self.write_staff(*members)
@@ -825,7 +825,9 @@ class CountsRowTests(unittest.TestCase):
                 for kind, enabled in (("showrunner", 0), ("unit", 0)):
                     with self.subTest(kind=kind, enabled=enabled):
                         _ = (instance / "state").write_text(f"ENABLED={enabled}\n", encoding="utf-8")
-                        row = replace(OWNER, kind=kind, doc=staff.LiveDoc(remote.local_machine(),
+                        row = replace(OWNER, kind=kind,
+                                      unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit(),
+                                      doc=staff.LiveDoc(remote.local_machine(),
                                       self.home / "docs/plans/show-production.md"))
                         _ = record.write_text(staff_text(row), encoding="utf-8")
                         # Keep the retained counts newer than the changed staff file.

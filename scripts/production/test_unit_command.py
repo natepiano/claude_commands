@@ -90,7 +90,7 @@ class UnitCommandTests(StaffTestCase):
         unit = staff.StaffRow(
             staff.StaffId(fixture_runtime_id("command")), "unit", "panes", staff.ReportsTo(runner.id),
             worktree=staff.PresentWorktree("natedev", self.folder),
-            current_session=staff.StaffId(fixture_runtime_id("command-unit-current")))
+            current_session=staff.StaffId(fixture_runtime_id("command-unit-current")), unit_type=staff.UnitDetails("direct"))
         worker = staff.StaffRow(
             staff.StaffId(fixture_runtime_id("command-worker")), "worker", "impl", staff.ReportsTo(unit.id),
             current_session=staff.StaffId(fixture_runtime_id("command-worker-current")))
