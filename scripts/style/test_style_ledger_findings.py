@@ -1285,11 +1285,8 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                               for name in ("first_tests", "second_tests", "mixed_tests", "ordinary", "missing_tests", "ambiguous_tests"))
                 root = "crates/alpha/src/lib.rs"
                 self.write(root, (self.repo / root).read_text() + f"\nmod {mode};\n")
-                self.write(parent, "mod first_tests;\nmod mixed_tests;\nmod ambiguous_tests;\nmod owner;\nmod other;\n")
-                owner = f"crates/alpha/src/{mode}/owner.rs"
-                self.write(owner, '#[cfg(test)]\n#[path = "second_tests.rs"]\nmod file_tests;\n')
-                self.write(f"crates/alpha/src/{mode}/other.rs",
-                           '#[path = "ambiguous_tests.rs"]\nmod duplicate;\n')
+                self.write(parent, "#[cfg(test)] mod first_tests;\n#[cfg(test)] mod second_tests;\n"
+                           + "#[cfg(test)] mod mixed_tests;\nmod ambiguous_tests;\nmod ambiguous_tests;\n")
                 for path in paths:
                     self.write(path, "fn item_1() {}\nfn item_2() {}\nfn item_3() {}\n")
                 anchor = self.commit("Declare the sibling test modules")
@@ -1307,7 +1304,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                         _ = connection.executemany("UPDATE held_findings SET anchor_commit=? WHERE finding_id=?",
                                                    [(anchor, finding.finding_id) for finding in originals])
                     self.write(parent, "")
-                    self.write(owner, "")
                     _ = self.commit("Remove the current declarations after judgment")
                     for finding in originals:
                         ledger.file_held(finding.finding_id, issue)
@@ -1327,7 +1323,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     whole, = tuple(finding for finding in live if finding.path == path)
                     self.assertEqual(whole.line, 1)
                     self.assertIn(f"Move the whole file {path}", whole.after)
-                    declaring, module = (owner, "file_tests") if path == paths[1] else (parent, path.rsplit("/", 1)[1][:-3])
+                    declaring, module = parent, path.rsplit("/", 1)[1][:-3]
                     self.assertIn(f"inline {module} module in {declaring}", whole.after)
                     for original in (finding for finding in originals if finding.path == path):
                         history, = ledger.named_held((original.finding_id,))
@@ -1339,46 +1335,44 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 for path in paths[3:]:
                     self.assertEqual(sum(finding.path == path for finding in live), 3)
 
-    def test_test_file_folding_resolves_the_complete_module_path(self) -> None:
-        rule = self.rule("test-move-paths", "tier: D\nfamily: modules\ninput_scope: file\n")
-        paths: list[str] = []
-        for directory, declaration in (
-                ("wrong", '#[path = "widget_tests.rs"] mod file_tests;'),
-                ("plain", "mod widget_tests;"),
-                ("relative", '#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;'),
-                ("duplicate", '#[path = "widget/widget_tests.rs"] #[path = "other.rs"] mod file_tests;'),
-                ("conditional", '#[cfg_attr(all(), path = "other_tests.rs")] mod widget_tests;')):
-            parent = f"crates/alpha/src/{directory}/widget.rs"
-            path = f"crates/alpha/src/{directory}/widget/widget_tests.rs"
-            self.write(f"crates/alpha/src/{directory}/mod.rs", "mod widget;\n")
-            self.write(parent, declaration + "\n")
-            self.write(path, "fn moved_fixture() {}\n")
-            self.write(f"crates/alpha/src/{directory}/widget_tests.rs", "fn different_fixture() {}\n")
-            paths.append(path)
-        root = "crates/alpha/src/lib.rs"
-        self.write(root, (self.repo / root).read_text() +
-                   "\nmod wrong;\nmod plain;\nmod relative;\nmod duplicate;\nmod conditional;\nmod unreadable;\n")
-        self.write("crates/alpha/src/unreadable.rs", "#[path = \nmod;")
-        _ = self.commit("Declare test files with full module paths")
-        ledger = self.ledger()
-        for path in paths:
-            for line in (1, 2):
-                _ = ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
-                                "Inline the whole test file.", self.blob(rule), "outside")
-        folded = ledger.fold_test_files()
-        self.assertEqual({group.path for group in folded}, set(paths[1:3]))
-        live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
-        self.assertEqual(tuple(sum(finding.path == path for finding in live) for path in paths), (2, 1, 1, 2, 2))
-        for finding in live:
-            if finding.path in paths[1:3]:
-                self.assertIn(finding.path.replace("/widget/widget_tests.rs", "/widget.rs"), finding.after)
+    def test_test_file_folding_uses_the_shared_narrow_declaration_rule(self) -> None:
+        for other, eligible in (
+                ("", True),
+                ('#[cfg_attr(all(), path = "widget_tests.rs")] mod alias;', False),
+                ('#[path = "."] mod alias { mod widget_tests; }', False),
+                ("mod alias { mod widget_tests; }", False),
+                ("mod;", False)):
+            with self.subTest(other=other):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    rule = case.rule("test-move-paths", "tier: D\nfamily: modules\ninput_scope: file\n")
+                    path = "crates/alpha/src/widget_tests.rs"
+                    root = "crates/alpha/src/lib.rs"
+                    case.write(root, "#[cfg(test)] mod widget_tests;\n" + ("mod other;\n" if other else ""))
+                    case.write(path, "fn moved_fixture() {}\n")
+                    if other:
+                        case.write("crates/alpha/src/other.rs", other + "\n")
+                    _ = case.commit("Declare the sibling test module")
+                    ledger = case.ledger()
+                    originals = tuple(ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
+                                                  "Inline the whole test file.", case.blob(rule), "outside")
+                                      for line in (1, 2))
+                    folded = ledger.fold_test_files()
+                    live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
+                    self.assertEqual(len(folded), int(eligible))
+                    self.assertEqual(len(live), 1 if eligible else 2)
+                    if not eligible:
+                        self.assertEqual({item.finding_id for item in live}, {item.finding_id for item in originals})
+                finally:
+                    case.doCleanups()
 
     def test_a_new_test_file_anchor_gets_a_new_aggregate_after_the_old_one_is_built(self) -> None:
         rule = self.rule("test-move-anchors", "tier: D\nfamily: modules\ninput_scope: file\n")
         path = "crates/alpha/src/anchor/widget_tests.rs"
         root = "crates/alpha/src/lib.rs"
         self.write(root, (self.repo / root).read_text() + "\nmod anchor;\n")
-        self.write("crates/alpha/src/anchor/mod.rs", "mod widget_tests;\n")
+        self.write("crates/alpha/src/anchor/mod.rs", "#[cfg(test)] mod widget_tests;\n")
         ledger = self.ledger()
         aggregates: list[str] = []
         anchor = ""

@@ -15,7 +15,6 @@ from functools import lru_cache
 import difflib
 import json
 import os
-import posixpath
 import re
 import subprocess
 import sys
@@ -3042,19 +3041,6 @@ def prove_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> 
 
 
 @dataclass(frozen=True)
-class ExternalModuleSource:
-    """The repository path an external module loads and the attributes its inline form keeps."""
-
-    path: str
-    inline_attributes: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class NoExternalModuleSource:
-    """The item has no readable external module source."""
-
-
-@dataclass(frozen=True)
 class VerifiedModuleContext:
     """The Cargo root and source directory proved by the existing plain-module walk."""
 
@@ -3097,63 +3083,64 @@ def verified_module_context(file: str, sources: RevisionTree) -> VerifiedModuleC
         return NoModuleContext()
 
 
-def external_module_source(file: str, words: tuple[str, ...], item: SourceItem,
-                           context: VerifiedModuleContext | NoModuleContext
-                           ) -> ExternalModuleSource | NoExternalModuleSource:
-    """Resolve only known external module forms in a verified module context."""
-    if (isinstance(context, NoModuleContext) or item.kind != "mod"
-            or words[item.keyword + 2:item.end] != (";",)):
-        return NoExternalModuleSource()
-    attributes = words[item.start:item.keyword]
-    parts = tuple(attributes[begin:end] for begin, end in attribute_spans(attributes))
-    if any(part[2:3] in (("cfg_attr",), ("r#cfg_attr",)) for part in parts):
-        return NoExternalModuleSource()
-    path_parts = tuple(part for part in parts if part[2:3] in (("path",), ("r#path",)))
-    if len(path_parts) > 1:
-        return NoExternalModuleSource()
-    if path_parts:
-        part = path_parts[0]
-        literal = re.fullmatch(r'"([^"\\]*)"', part[4]) if len(part) == 6 and part[3] == "=" else None
-        if literal is None:
-            return NoExternalModuleSource()
-        source = PurePosixPath(file).parent / literal[1]
-    else:
-        source = PurePosixPath(context.directory) / (item.name + ".rs")
-    return ExternalModuleSource(posixpath.normpath(str(source)),
-                                tuple(word for part in parts if part not in path_parts for word in part))
-
-
 @dataclass(frozen=True)
-class ExternalModuleDeclaration:
-    """One readable declaration in a verified file of the anchored tree."""
+class EligibleTestFileDeclaration:
+    """One exclusive private test declaration that the crate-root walk reaches."""
 
     file: str
     item: SourceItem
-    source: ExternalModuleSource
+    path: str
 
 
-def external_module_declarations(sources: RevisionTree) -> tuple[ExternalModuleDeclaration, ...]:
-    """Read all supported declarations without letting an unreadable file stop another file."""
-    declarations: list[ExternalModuleDeclaration] = []
+def eligible_test_file_declarations(sources: RevisionTree) -> tuple[EligibleTestFileDeclaration, ...]:
+    """Apply the shared narrow rule for folding findings and proving whole-file moves."""
+    candidates: list[EligibleTestFileDeclaration] = []
+    loaders: Counter[str] = Counter()
+    unresolved: set[str] = set()
     for file in sorted(sources.paths):
         if not file.endswith(".rs"):
             continue
+        crate = sources.crate(file)
         try:
             spans = token_spans(sources.text(file))
             if any(span.token.kind == "unknown" for span in spans):
+                unresolved.add(crate)
                 continue
             words = tuple(span.token.value for span in spans)
             items = source_items(words)
             if items is None:
+                unresolved.add(crate)
+                continue
+            modules = {item.keyword: item for item in items if item.kind == "mod"}
+            owners = attribute_owners(words)
+            if any(words[begin + 2:begin + 3] in (("path",), ("r#path",), ("cfg_attr",), ("r#cfg_attr",))
+                   and words[owners.get(begin, -1):owners.get(begin, -1) + 1] == ("mod",)
+                   for begin, _ in attribute_spans(words)):
+                unresolved.add(crate)
+                continue
+            # A nested external declaration has no supported source directory.
+            if any(word == "mod" and index not in modules and words[index + 2:index + 3] == (";",)
+                   for index, word in enumerate(words)):
+                unresolved.add(crate)
+                continue
+            if not modules:
                 continue
             context = verified_module_context(file, sources)
-            for item in items:
-                source = external_module_source(file, words, item, context)
-                if isinstance(source, ExternalModuleSource):
-                    declarations.append(ExternalModuleDeclaration(file, item, source))
-        except (MoveRefused, FootprintError, UnicodeError, IndexError, ValueError):
-            continue
-    return tuple(declarations)
+            if isinstance(context, NoModuleContext):
+                continue
+            for item in modules.values():
+                if words[item.keyword + 2:item.end] != (";",):
+                    continue
+                path = str(PurePosixPath(context.directory) / (item.name + ".rs"))
+                loaders[path] += 1
+                if (PurePosixPath(file).name in {"mod.rs", "lib.rs"} and not item.visibility
+                        and item.name.endswith("_tests") and path in sources.paths
+                        and words[item.start:item.keyword] == ("#", "[", "cfg", "(", "test", ")", "]")):
+                    candidates.append(EligibleTestFileDeclaration(file, item, path))
+        except (MoveRefused, FootprintError, CheckCouldNotRun, UnicodeError, IndexError, ValueError):
+            unresolved.add(crate)
+    return tuple(candidate for candidate in candidates
+                 if sources.crate(candidate.file) not in unresolved and loaders[candidate.path] == 1)
 
 
 def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:
@@ -3175,16 +3162,15 @@ def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: Revision
     moves: list[ItemMove] = []
     module_lines: list[FileSpan] = []
     parents: set[str] = set()
-    anchored_declarations = external_module_declarations(sources)
+    anchored_declarations = eligible_test_file_declarations(sources)
     for change in changes:
         if change.status != FileStatus.DELETED:
             continue
-        path = PurePosixPath(change.path)
-        declarations = tuple(declaration for declaration in anchored_declarations if declaration.source.path == change.path)
-        if not path.name.endswith("_tests.rs") or len(declarations) != 1:
+        declarations = tuple(declaration for declaration in anchored_declarations if declaration.path == change.path)
+        if len(declarations) != 1:
             raise MoveRefused(f"{change.path}: not one complete sibling test file move")
         declared_at = declarations[0]
-        parent, declared, attributes = declared_at.file, declared_at.item, declared_at.source.inline_attributes
+        parent, declared = declared_at.file, declared_at.item
         if parent not in befores:
             raise MoveRefused(f"{change.path}: its module declaration does not change")
         if parent in parents:
@@ -3197,7 +3183,8 @@ def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: Revision
                for index, word in enumerate(source.words)):
             raise MoveRefused(f"{change.path}: an external child module changes its source directory")
         old, new = befores[parent], afters[parent]
-        candidates = [item for item in new.items if item.kind == "mod" and item.name == declared.name
+        attributes = old.words[declared.start:declared.keyword]
+        candidates = [item for item in new.items if item.kind == "mod" and item.name == declared.name and not item.visibility
                       and new.words[item.start:item.keyword] == attributes
                       and new.words[item.keyword + 2:item.keyword + 3] == ("{",)]
         declaration = word_span(old, declared.start, declared.end)

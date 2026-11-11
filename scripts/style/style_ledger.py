@@ -2443,7 +2443,7 @@ class Ledger:
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
         self._site_rule_families: dict[str, str] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
-        self._test_file_destinations: dict[str, dict[str, tuple[TestFileDestination, ...]]] = {}
+        self._test_file_destinations: dict[str, dict[str, TestFileDestination]] = {}
         self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
         self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
         self._crate_names: dict[tuple[str, str, str], bool] = {}
@@ -4932,22 +4932,17 @@ class Ledger:
 
     def _test_file_destination(self, finding: HeldFinding) -> TestFileDestination | SeparateItemMove:
         """Find the sibling test file's module declaration in its anchored repository tree."""
-        path = PurePosixPath(finding.path)
-        if not path.name.endswith("_tests.rs"):
-            return SeparateItemMove()
         anchor, = cast(tuple[str], self._connection.execute(
             "SELECT anchor_commit FROM held_findings WHERE finding_id=?", (finding.finding_id,),
         ).fetchone())
         tip = self._tip(anchor or "HEAD")
         if tip.commit not in self._test_file_destinations:
-            destinations: dict[str, list[TestFileDestination]] = {}
             tree = style_footprint.RevisionTree(self.repo, tip.commit)
-            for declaration in style_footprint.external_module_declarations(tree):
-                destinations.setdefault(declaration.source.path, []).append(
-                    TestFileDestination(declaration.file, declaration.item.name))
-            self._test_file_destinations[tip.commit] = {file: tuple(owners) for file, owners in destinations.items()}
-        choices = self._test_file_destinations[tip.commit].get(finding.path, ())
-        return choices[0] if len(choices) == 1 else SeparateItemMove()
+            self._test_file_destinations[tip.commit] = {
+                declaration.path: TestFileDestination(declaration.file, declaration.item.name)
+                for declaration in style_footprint.eligible_test_file_declarations(tree)
+            }
+        return self._test_file_destinations[tip.commit].get(finding.path, SeparateItemMove())
 
     def _fold_test_file_group(self, findings: tuple[HeldFinding, ...]) -> tuple[FoldedTestFile, ...]:
         """Fold one rule's unclaimed findings into the repository's whole sibling test file move."""

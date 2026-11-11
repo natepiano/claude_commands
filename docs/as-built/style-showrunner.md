@@ -178,18 +178,18 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 
 Filing folds modules findings from a sibling `*_tests.rs` file under one rule.
 The repository tree supplies the declaring file and module name.
-Both readers use `external_module_source` to compare full repository paths.
-The existing item-move reach check proves the declaring file's context from a Cargo root.
-Cargo discovery supplies each root, including binary roots.
-A target path or disabled target discovery prevents resolution.
-Unsupported attributes, multiple path attributes and nonplain path literals give no source.
-An unreadable file does not stop resolution in other files.
-The anchored tree must contain exactly one readable declaration of the test file.
-A `#[path]` value resolves from the declaring file's directory.
-A plain declaration resolves from that directory in a verified crate root or `mod.rs`.
-In another file `x.rs`, a plain declaration resolves from the `x/` directory.
-The ledger reads the finding’s anchor commit, or HEAD when no anchor exists.
-It reads plain module declarations and declarations with a sibling file in a `#[path]` attribute.
+The fold and the proof share `eligible_test_file_declarations`.
+An eligible file has one private `#[cfg(test)] mod x_tests;` declaration with no other attribute.
+The declaration is a top-level item in a reached `mod.rs` or `lib.rs`.
+The existing crate-root walk proves reach.
+The plain module rule selects the sibling file.
+The scan reads every Rust file in the crate and module declarations at every depth.
+A module with `path` or `cfg_attr` makes the crate unresolved.
+A nested external module or an unreadable file also makes the crate unresolved.
+An unresolved crate gives no source.
+The item findings remain for normal review.
+The proof keeps the same private header, module name, complete body, and other declaring-file content.
+The ledger reads the finding's anchor commit, or HEAD when no anchor exists.
 The finding prose does not select the destination.
 The ledger stores one whole-file move and keeps the item rows as withdrawn duplicates.
 The whole-file move replaces the external declaration with an inline module.

@@ -2002,118 +2002,130 @@ class StyleFootprintTests(unittest.TestCase):
         for name, edit, proven in (("widget_tests", "", True), ("tests", "", False),
                                     ("widget_tests", "body", False), ("widget_tests", "parent", False),
                                     ("widget_tests", "cfg", False), ("tests", "reference", False),
-                                    ("tests", "existing", False), ("file_tests", "path", True),
-                                    ("file_tests", "path-first", True), ("widget_tests", "plain", True),
-                                    ("widget_tests", "attributes", True), ("file_tests", "path-child", False),
+                                    ("tests", "existing", False), ("file_tests", "path", False),
+                                    ("file_tests", "path-first", False), ("widget_tests", "plain", False),
+                                    ("widget_tests", "attributes", False), ("file_tests", "path-child", False),
                                     ("file_tests", "path-nested-child", False)):
             with self.subTest(name=name, edit=edit):
-                declaration = "#[cfg(test)]\nmod widget_tests;\n"
-                parent_path = "src/widget/mod.rs"
-                content = source
-                if edit == "plain":
-                    declaration = "mod widget_tests;\n"
-                if edit == "attributes":
-                    declaration = "#[cfg(test)]\n#[allow(dead_code)]\nmod widget_tests;\n"
-                if edit.startswith("path"):
-                    declaration = ('#[path = "widget_tests.rs"]\n#[cfg(test)]\nmod file_tests;\n'
-                                   if edit == "path-first" else
-                                   '#[cfg(test)]\n#[path = "widget_tests.rs"]\nmod file_tests;\n')
-                    parent_path = "src/widget/owner.rs"
-                    self.write("src/widget/mod.rs", "mod owner;\n")
-                if edit in ("path-child", "path-nested-child"):
-                    nested = edit == "path-nested-child"
-                    content += "mod nested { mod child; }\n" if nested else "mod child;\n"
-                    child = "src/widget/widget_tests/" + ("nested/" if nested else "") + "child.rs"
-                    self.write(child, "pub fn child() {}\n")
-                parent = "pub fn widget() {}\n" + declaration
-                if edit == "reference":
-                    parent += "#[cfg(test)]\nfn caller() { widget_tests::first(); }\n"
-                if edit == "existing":
-                    content = source.replace("use super::*;", "use super::Thing;")
-                    parent += "pub struct Thing;\n#[cfg(test)]\nmod tests {\nuse super::Thing;\nfn previous() {}\n}\n"
-                self.write("src/lib.rs", "mod widget;\n")
-                self.write(parent_path, parent)
-                self.write("src/widget/widget_tests.rs", content)
-                base = self.commit()
-                _ = self.git("rm", "src/widget/widget_tests.rs")
-                body = content.replace("= 3;", "= 4;") if edit == "body" else content
-                attributes = declaration[:declaration.rfind("mod ")].replace('#[path = "widget_tests.rs"]\n', "")
-                inline = attributes + "mod " + name + " {\n" + "".join("    " + line + "\n" for line in body.splitlines()) + "}\n"
-                after = (parent.replace(declaration, "").replace(
-                    "fn previous() {}\n}", "fn previous() {}\n" + content + "}") if edit == "existing" else
-                    parent.replace(declaration, inline))
-                if edit == "parent":
-                    after = after.replace("pub fn widget() {}", "pub fn widget() { panic!(); }")
-                if edit == "cfg":
-                    after = after.replace("#[cfg(test)]", "")
-                self.write(parent_path, after)
-                head = self.commit()
-                changes = style_footprint.changes_between(self.repo, base, head)
-                tree = style_footprint.RevisionTree(self.repo, base)
-                result = style_footprint.prove_item_moves(changes, tree)
-                if proven:
-                    self.assertIsInstance(result, style_footprint.ItemMoves, result)
-                    self.assertEqual(style_footprint.moved_files(changes, tree),
-                                     frozenset({"src/widget/widget_tests.rs", parent_path}))
-                else:
-                    self.assertIsInstance(result, style_footprint.NoItemMoves, result)
-
-    def test_test_file_inlining_resolves_the_complete_module_path(self) -> None:
-        for declaration, name, proven, alias in (
-                ('#[path = "widget_tests.rs"] mod file_tests;', "file_tests", False, False),
-                ("mod widget_tests;", "widget_tests", True, False),
-                ('#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;', "file_tests", True, False),
-                ('#[cfg_attr(all(), path = "other_tests.rs")] mod widget_tests;', "widget_tests", False, False),
-                ('#[path = "widget/widget_tests.rs"] #[path = "other.rs"] mod file_tests;', "file_tests", False, False),
-                ('#[path = 17] mod file_tests;', "file_tests", False, False),
-                ("mod widget_tests;", "widget_tests", False, True)):
-            with self.subTest(declaration=declaration):
                 case = StyleFootprintTests()
                 case.setUp()
                 try:
-                    content = "fn moved_fixture() {}\n"
-                    case.write("src/lib.rs", "mod widget;\n" + ("mod other;\n" if alias else ""))
-                    if alias:
-                        case.write("src/other.rs", '#[path = "widget/widget_tests.rs"] mod alias;\n')
-                    case.write("src/other_tests.rs", "fn other_fixture() {}\n")
-                    case.write("src/widget.rs", declaration + "\n")
-                    case.write("src/widget_tests.rs", "fn different_fixture() {}\n")
+                    declaration = "#[cfg(test)]\nmod widget_tests;\n"
+                    parent_path = "src/widget/mod.rs"
+                    content = source
+                    if edit == "plain":
+                        declaration = "mod widget_tests;\n"
+                    if edit == "attributes":
+                        declaration = "#[cfg(test)]\n#[allow(dead_code)]\nmod widget_tests;\n"
+                    if edit.startswith("path"):
+                        declaration = ('#[path = "widget_tests.rs"]\n#[cfg(test)]\nmod file_tests;\n'
+                                       if edit == "path-first" else
+                                       '#[cfg(test)]\n#[path = "widget_tests.rs"]\nmod file_tests;\n')
+                        parent_path = "src/widget/owner.rs"
+                        case.write("src/widget/mod.rs", "mod owner;\n")
+                    if edit in ("path-child", "path-nested-child"):
+                        nested = edit == "path-nested-child"
+                        content += "mod nested { mod child; }\n" if nested else "mod child;\n"
+                        child = "src/widget/widget_tests/" + ("nested/" if nested else "") + "child.rs"
+                        case.write(child, "pub fn child() {}\n")
+                    parent = "pub fn widget() {}\n" + declaration
+                    if edit == "reference":
+                        parent += "#[cfg(test)]\nfn caller() { widget_tests::first(); }\n"
+                    if edit == "existing":
+                        content = source.replace("use super::*;", "use super::Thing;")
+                        parent += "pub struct Thing;\n#[cfg(test)]\nmod tests {\nuse super::Thing;\nfn previous() {}\n}\n"
+                    case.write("src/lib.rs", "mod widget;\n")
+                    case.write(parent_path, parent)
                     case.write("src/widget/widget_tests.rs", content)
                     base = case.commit()
                     _ = case.git("rm", "src/widget/widget_tests.rs")
-                    case.write("src/widget.rs", "mod " + name + " {\n" + content + "}\n")
+                    body = content.replace("= 3;", "= 4;") if edit == "body" else content
+                    attributes = declaration[:declaration.rfind("mod ")].replace('#[path = "widget_tests.rs"]\n', "")
+                    inline = attributes + "mod " + name + " {\n" + "".join("    " + line + "\n" for line in body.splitlines()) + "}\n"
+                    after = (parent.replace(declaration, "").replace(
+                        "fn previous() {}\n}", "fn previous() {}\n" + content + "}") if edit == "existing" else
+                        parent.replace(declaration, inline))
+                    if edit == "parent":
+                        after = after.replace("pub fn widget() {}", "pub fn widget() { panic!(); }")
+                    if edit == "cfg":
+                        after = after.replace("#[cfg(test)]", "")
+                    case.write(parent_path, after)
                     head = case.commit()
                     changes = style_footprint.changes_between(case.repo, base, head)
                     tree = style_footprint.RevisionTree(case.repo, base)
                     result = style_footprint.prove_item_moves(changes, tree)
                     if proven:
                         self.assertIsInstance(result, style_footprint.ItemMoves, result)
+                        self.assertEqual(style_footprint.moved_files(changes, tree),
+                                         frozenset({"src/widget/widget_tests.rs", parent_path}))
                     else:
                         self.assertIsInstance(result, style_footprint.NoItemMoves, result)
                 finally:
                     case.doCleanups()
 
-    def test_a_binary_module_context_requires_verified_cargo_discovery(self) -> None:
-        for package_setting, proven in (("", True), ("autobins = false\n", False)):
+    def test_test_file_inlining_uses_one_narrow_declaration_rule(self) -> None:
+        header = "#[cfg(test)] "
+        for declaration, parent, other, visibility, proven in (
+                (header + "mod widget_tests;", "src/widget/mod.rs", "", "", True),
+                (header + "mod widget_tests;", "src/lib.rs", "", "", True),
+                (header + "mod widget_tests;", "src/widget.rs", "", "", False),
+                ("mod widget_tests;", "src/lib.rs", "", "", False),
+                (header + "pub mod widget_tests;", "src/lib.rs", "", "", False),
+                (header + "mod widget_tests;", "src/lib.rs", "", "pub ", False),
+                (header + "mod widget_tests;", "src/lib.rs", "", "pub(crate) ", False),
+                (header + "mod widget_tests;", "src/lib.rs",
+                 '#[cfg_attr(all(), path = "widget_tests.rs")] mod alias;', "", False),
+                (header + "mod widget_tests;", "src/lib.rs",
+                 '#[path = "."] mod alias { mod widget_tests; }', "", False),
+                (header + "mod widget_tests;", "src/lib.rs", "mod alias { mod widget_tests; }", "", False),
+                (header + "mod widget_tests;", "src/lib.rs", "mod widget_tests;", "", True),
+                (header + "mod widget_tests;", "src/lib.rs", "mod;", "", False),
+                (header + '#[path = "widget_tests.rs"] mod widget_tests;', "src/lib.rs", "", "", False),
+                ('#[cfg_attr(all(), path = "other_tests.rs")] mod widget_tests;', "src/lib.rs", "", "", False),
+                ('#[path = "widget_tests.rs"] #[path = "other.rs"] mod widget_tests;', "src/lib.rs", "", "", False),
+                ('#[path = 17] mod widget_tests;', "src/lib.rs", "", "", False)):
+            with self.subTest(declaration=declaration, parent=parent, other=other, visibility=visibility):
+                case = StyleFootprintTests()
+                case.setUp()
+                try:
+                    content = "fn moved_fixture() {}\n"
+                    if parent != "src/lib.rs":
+                        case.write("src/lib.rs", "mod widget;\n")
+                    case.write(parent, declaration + "\n" + ("mod other;\n" if other else ""))
+                    if other:
+                        case.write("src/other.rs", other + "\n")
+                    source = "src/widget/widget_tests.rs" if parent != "src/lib.rs" else "src/widget_tests.rs"
+                    case.write(source, content)
+                    base = case.commit()
+                    tree = style_footprint.RevisionTree(case.repo, base)
+                    declarations = style_footprint.eligible_test_file_declarations(tree)
+                    eligible = proven or bool(visibility)
+                    self.assertEqual(any(item.path == source for item in declarations), eligible)
+                    _ = case.git("rm", source)
+                    case.write(parent, header + visibility + "mod widget_tests {\n" + content + "}\n"
+                               + ("mod other;\n" if other else ""))
+                    head = case.commit()
+                    changes = style_footprint.changes_between(case.repo, base, head)
+                    result = style_footprint.prove_item_moves(changes, tree)
+                    self.assertIsInstance(result, style_footprint.ItemMoves if proven else style_footprint.NoItemMoves, result)
+                finally:
+                    case.doCleanups()
+
+    def test_test_file_eligibility_excludes_binary_and_unreached_declarations(self) -> None:
+        for package_setting in ("", "autobins = false\n"):
             with self.subTest(package_setting=package_setting):
                 case = StyleFootprintTests()
                 case.setUp()
                 try:
                     case.write("Cargo.toml", '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n' + package_setting)
                     case.write("src/lib.rs", "")
-                    case.write("src/bin/tool.rs", "mod widget_tests;\n")
+                    case.write("src/bin/tool.rs", "#[cfg(test)] mod widget_tests;\n")
                     case.write("src/bin/widget_tests.rs", "fn binary_fixture() {}\n")
-                    case.write("src/orphan.rs", "mod orphan_tests;\n")
+                    case.write("src/orphan/mod.rs", "#[cfg(test)] mod orphan_tests;\n")
+                    case.write("src/orphan/orphan_tests.rs", "fn orphan_fixture() {}\n")
                     base = case.commit()
                     tree = style_footprint.RevisionTree(case.repo, base)
-                    declarations = style_footprint.external_module_declarations(tree)
-                    self.assertFalse(any(declaration.file == "src/orphan.rs" for declaration in declarations))
-                    selected = tuple(declaration for declaration in declarations if declaration.file == "src/bin/tool.rs")
-                    if proven:
-                        declaration, = selected
-                        self.assertEqual(declaration.source.path, "src/bin/widget_tests.rs")
-                    else:
-                        self.assertEqual(selected, ())
+                    self.assertEqual(style_footprint.eligible_test_file_declarations(tree), ())
                 finally:
                     case.doCleanups()
 
