@@ -21,6 +21,7 @@ from typing import BinaryIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 from scripts.lib import conf
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.usage import context_economy_read as reader
 from scripts.usage import context_economy_cache as cache_module
 
@@ -560,18 +561,21 @@ class ContextEconomyReadTests(unittest.TestCase):
         with closing(cache_module.TranscriptCache()) as cache:
             for path in paths:
                 cache.mark_final(path)
-                _ = path.rename(path.with_suffix(".jsonl.zst"))
+                _ = compressed_copy(path)
         with (patch.object(reader, "_read_transcript", side_effect=AssertionError("compressed Claude parse")),
               patch.object(reader, "_read_codex_file", side_effect=AssertionError("compressed Codex parse"))):
             self.assertEqual(self.cached_families(self.since), cold)
 
-    def test_uncached_compressed_files_count_as_skipped(self) -> None:
-        path = self.projects / "project/unread.jsonl.zst"
-        path.parent.mkdir()
-        _ = path.write_bytes(b"not parsed in this phase")
-        with redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(self.cached_families(self.since), [])
-        self.assertIn("files 1 of 1; skipped 1", errors.getvalue())
+    def test_uncached_compressed_files_read_like_plain_files(self) -> None:
+        paths = [self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl"), self.codex_rollout()]
+        expected = self.cached_families(self.since)
+        self.clear_summary_cache()
+        for path in paths:
+            _ = compressed_copy(path)
+        self.assertEqual(self.cached_families(self.since), expected)
+        with (patch.object(reader, "_read_transcript", side_effect=AssertionError("compressed Claude reparsed")),
+              patch.object(reader, "_read_codex_file", side_effect=AssertionError("compressed Codex reparsed"))):
+            self.assertEqual(self.cached_families(self.since), expected)
 
     def test_cache_bound_evicts_the_least_recently_used_reproducible_summary(self) -> None:
         self.assert_cache_eviction(deleted=False)

@@ -1,11 +1,13 @@
 """The pacer's plan, its measurements, and the rollout reader feeding them."""
 
 import json
+from copy import deepcopy
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import override
 from unittest.mock import patch
 
@@ -205,6 +207,14 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(tokens, {"fast gpt-test": 1000.0, "default gpt-test": 1000.0})
         # The unfinished last line waits for the next pass.
         self.assertEqual(state["files"][str(late)]["offset"], late.stat().st_size - len('{"timestamp": "partial'))
+        archived = [compressed_copy(path) for path in (early, late)]
+        before = deepcopy(state)
+        pacer.ingest(state, iter(archived))
+        self.assertEqual(state, before)
+        fresh = pacer.empty_state()
+        fresh["history"] = state["history"]
+        pacer.ingest(fresh, iter(archived))
+        self.assertEqual(fresh["buckets"], state["buckets"])
 
     def test_spend_ignores_account_switches_and_limit_resets(self) -> None:
         def reading(minutes: int, used: float, window: int) -> str:
