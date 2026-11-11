@@ -32,7 +32,7 @@ from scripts.buildlog import store, parse
 from scripts.lib import conf
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 
 # These indexes support repeated queries over the current schema.
@@ -229,6 +229,7 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("errors", "INTEGER", "test errors"),
     ("skipped", "INTEGER", "skipped tests"),
     ("tests_s", "REAL", "sum of all test times"),
+    ("config_reads", "TEXT", "sorted JSON config stems; [] records no reads, NULL means no record"),
 ]
 
 GATE_TEST_COLUMNS: list[Column] = [
@@ -951,7 +952,9 @@ def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src:
     for suite_row in entries(record, "suites"):
         insert(connection, "gate_suites", pick({**suite_row, **parent}, GATE_SUITE_COLUMNS))
     for module in module_rows:
-        insert(connection, "gate_modules", pick({**module, **parent}, GATE_MODULE_COLUMNS))
+        reads = module.get("config_reads")
+        config_reads = json.dumps(sorted(set(cast(list[str], reads)))) if isinstance(reads, list) else None
+        insert(connection, "gate_modules", pick({**module, **parent, "config_reads": config_reads}, GATE_MODULE_COLUMNS))
         owner: GateTestOwner = {
             **parent,
             "suite": module.get("suite"),

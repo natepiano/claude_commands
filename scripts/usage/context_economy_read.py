@@ -539,6 +539,7 @@ def emit_mac(request: dict[str, object]) -> None:
 def _mac_payload(since: datetime, until: datetime) -> str:
     root = Path(__file__).resolve().parents[2]
     modules = {name: (root / path).read_text(encoding="utf-8") for name, path in (
+        ("scripts.lib.conf_reads", "scripts/lib/conf_reads.py"),
         ("scripts.lib.conf", "scripts/lib/conf.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.context_economy_read", "scripts/usage/context_economy_read.py"),

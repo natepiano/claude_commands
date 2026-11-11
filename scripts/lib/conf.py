@@ -1,6 +1,10 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read live configuration, complete missing default values, and recover invalid values from Git."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
@@ -15,6 +19,8 @@ import socket
 import subprocess
 import sys
 from typing import TYPE_CHECKING, TypeVar
+
+from scripts.lib import conf_reads
 
 
 if TYPE_CHECKING:
@@ -221,6 +227,7 @@ def directory() -> Path:
 
 
 def path(file: str | Path) -> Path:
+    conf_reads.record(file if isinstance(file, str) else file.stem)
     if isinstance(file, Path):
         return file.expanduser()
     if not file or Path(file).name != file or file.endswith(".conf"):
@@ -230,6 +237,7 @@ def path(file: str | Path) -> Path:
 
 def _repository_path(stem: str) -> Path:
     """Return the repository configuration file for a validated stem."""
+    conf_reads.record(stem)
     return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
 
 

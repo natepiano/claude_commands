@@ -68,6 +68,26 @@ class ShellConfTests(unittest.TestCase):
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
+    def test_config_reads_append_with_builtins(self) -> None:
+        self.write("count=4\nmode=fast\n")
+        log = self.root / "reads"
+        self.env["CONF_READ_LOG"] = str(log)
+        for key in ("count", "mode", "count"):
+            result = self.run_reader(key, trace=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(log.is_file(), "The shell reader must record its config reads")
+        self.assertEqual(log.read_text().splitlines(), ["example"] * 3)
+        self.assertFalse((self.root / "python.log").exists())
+        self.assertFalse((self.root / "subshell.log").exists())
+        with self.subTest(read_log="empty"):
+            log.unlink()
+            self.env["CONF_READ_LOG"] = ""
+            result = self.run_reader("count", trace=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "4\n")
+            self.assertEqual(result.stderr, "")
+            self.assertFalse(log.exists())
+
     def test_normal_integer_enum_and_text_reads_use_no_child_process(self) -> None:
         self.write("# whole: -2..4\ncount=4\n# one of: fast, slow\nmode=fast\npath=a=b\n")
         for key, expected in (("count", "4"), ("mode", "fast"), ("path", "a=b")):

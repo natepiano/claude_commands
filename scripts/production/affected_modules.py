@@ -1,4 +1,4 @@
-"""Select tests from direct Python imports, transitive configuration reads and script calls.
+"""Select tests from direct Python imports, recorded config reads and script calls.
 
 No source is imported or evaluated. Callers own certification and execution.
 """
@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 from collections import defaultdict
 from collections.abc import Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions
 from io import BytesIO
@@ -14,12 +15,14 @@ from pathlib import Path
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 from typing import cast
 
 from scripts.lib import conf
+from scripts.test_times.gate_record import NoConfigReadRecord, RecordedConfigReads, config_read_record
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
 
@@ -301,21 +304,30 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     return SourceGraph(graph, tokens, config_reads)
 
 
-def transitive_config_reads(graph: SourceGraph) -> dict[str, set[str]]:
-    importers: dict[str, set[str]] = defaultdict(set)
-    for path, dependencies in graph.imports.items():
-        for dependency in dependencies:
-            importers[dependency].add(path)
-    reads = {path: set(names) for path, names in graph.config_reads.items()}
-    pending = [path for path, names in reads.items() if names]
-    while pending:
-        source = pending.pop()
-        for importer in importers[source]:
-            added = reads[source] - reads[importer]
-            if added:
-                reads[importer].update(added)
-                pending.append(importer)
-    return reads
+def latest_config_reads() -> dict[str, RecordedConfigReads | NoConfigReadRecord]:
+    """Read the newest full gate with config records across all local log hosts."""
+    from scripts.buildlog import index
+
+    _ = index.update()
+    with closing(index.read_only()) as connection:
+        rows = cast(list[tuple[str, str, str | None]], connection.execute(
+            "SELECT suite, module, config_reads FROM gate_modules WHERE run_id = "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded "
+            + "WHERE recorded.run_id = gate_runs.id AND recorded.config_reads IS NOT NULL) "
+            + "ORDER BY started_at DESC, id DESC LIMIT 1) ORDER BY suite, module, attempt"
+        ).fetchall())
+    recorded: dict[str, RecordedConfigReads | NoConfigReadRecord] = {}
+    for suite, module, raw in rows:
+        path = f"scripts/{suite}/{module}"
+        reads = config_read_record(json.loads(raw) if raw is not None else None)
+        previous = recorded.get(path, NoConfigReadRecord())
+        if isinstance(reads, RecordedConfigReads):
+            stems = reads.stems | previous.stems if isinstance(previous, RecordedConfigReads) else reads.stems
+            recorded[path] = RecordedConfigReads(stems)
+        elif path not in recorded:
+            recorded[path] = reads
+    return recorded
 
 
 def retain_facts(cache_path: Path | None, cached: dict[str, SourceFacts],
@@ -442,9 +454,9 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
         before = set(cached)
         graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-        config_reads = transitive_config_reads(graph)
         configs = {Path(path).name.removesuffix(".conf") for path in changed
                    if path.startswith("config/") and path.endswith(".conf")}
+        recorded = latest_config_reads() if configs else {}
         retained = source_blobs(paths | dirty, blobs)
         python = {path for path in changed if path.endswith(".py")}
         removed = {path for path in python if not (repo / path).is_file()}
@@ -464,9 +476,12 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
+            reads = recorded.get(path, NoConfigReadRecord())
+            config_changed = bool(configs) and (isinstance(reads, NoConfigReadRecord)
+                or bool(reads.stems & configs) or bool(graph.config_reads.get(path, frozenset()) & configs))
             if (path in changed or graph.imports.get(path, set()) & python
                     or old_graph.get(path, set()) & removed or names_changed_file(graph, path, named, folder_names)
-                    or config_reads.get(path, set()) & configs):
+                    or config_changed):
                 selected.append(module)
                 continue
             stems = folder_stems.get(str(Path(path).parent), set())
@@ -475,5 +490,5 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
                     selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
-    except (GraphError, OSError, ValueError, SyntaxError) as error:
+    except (GraphError, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
         return FullSuite(f"graph error: {error}")
