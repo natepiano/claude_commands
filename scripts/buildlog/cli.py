@@ -90,30 +90,10 @@ STEP_NAMES = "clippy, mend, doc, fmt, nextest, check (cargo subcommands), sweep 
 
 def cell(value: object) -> str:
     if value is None:
-        return ""
+        return "—"
     if isinstance(value, float):
         return f"{value:g}" if abs(value) < 1e15 else str(value)
     return str(value)
-
-
-def print_table(names: list[str], rows: list[tuple[object, ...]]) -> None:
-    texts = [[cell(value) for value in row] for row in rows]
-    numeric = [
-        all(isinstance(row[column], int | float) or row[column] is None for row in rows) for column in range(len(names))
-    ]
-    widths = [max([len(name), *(len(text[column]) for text in texts)]) for column, name in enumerate(names)]
-
-    def line(values: list[str]) -> str:
-        parts = [
-            value.rjust(width) if is_number else value.ljust(width)
-            for value, width, is_number in zip(values, widths, numeric, strict=True)
-        ]
-        return "  ".join(parts).rstrip()
-
-    print(line(names))
-    print("  ".join("-" * width for width in widths))
-    for text in texts:
-        print(line(text))
 
 
 def query(args: list[str]) -> int:
@@ -142,7 +122,10 @@ def query(args: list[str]) -> int:
     if as_json:
         print(json.dumps([dict(zip(names, row, strict=True)) for row in rows]))
     else:
-        print_table(names, rows)
+        from scripts.lib import terminal_cells
+
+        texts = [[cell(value) for value in row] for row in rows]
+        terminal_cells.print_table(names, texts, empty_message="no rows")
     print(
         f"{len(rows)} rows in {(finished - began) * 1000:.0f} ms"
         + f" (index update {(updated - began) * 1000:.0f} ms)",

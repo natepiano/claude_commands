@@ -645,8 +645,25 @@ The checkout returns to the starting tip before the remaining items retry once.
 Reset aborts an unfinished merge only when no merge was unfinished at batch start.
 An earlier unfinished merge and its staged edits remain unchanged.
 A red test identifies its items through the shared checkpoint test selector.
-An unmatched red command drops every code item.
-If no code item remains, the red stop drops the remaining items and publishes nothing.
+Candidates are the code items that select a red command, or all code items when none selects it.
+When no code item remains, every remaining item is a candidate.
+One candidate drops directly.
+For multiple candidates, a binary search finds the first merge that makes the red commands fail.
+Each probe resets the checkout to a candidate's unpublished merge commit.
+It merges the same main commit that the red test tip holds, without another fetch.
+A conflict stops the search and drops every candidate.
+The probe selects test steps again from the batch paths at that tip.
+It runs only unresolved red steps that the tip still selects.
+A red step absent from that selection counts as green.
+Full tests and probes use the same runner and flake rules.
+The starting tip is treated as green; the last candidate is known red.
+Seven candidates need at most three probes.
+Each probe reports its item, merge commit, and green or red result.
+Each batch invocation clears its shared test log once before the first attempt.
+Full tests, probes, main retests, and the retry append to that log.
+The search restores the starting tip and drops only the causing item.
+A cancelled probe or another non-red stop drops every candidate with that stop.
+A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
 A second stop resets the checkout and lands nothing.
 The remaining directors receive instructions to send their checkpoints again.
 Already-merged items receive `resume it alone with the single command`.
@@ -659,6 +676,9 @@ Each item receives the stop report.
 It also covers unpublished paths after interruption and a wrapper failure after a successful push.
 The interruption rows include a shrink-only retry.
 The held-batch rows preserve an earlier unfinished merge and its staged edits.
+The shared-red row uses two probes to identify the middle item and land the other two.
+The main-integration row keeps new main content at every probe and drops the first item.
+The package-rename row skips the renamed test at the earlier tip and drops the second item.
 
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.
 

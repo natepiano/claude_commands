@@ -60,7 +60,7 @@ No code change. `test_sync_codex_catalog.sh` and `test_models_config.sh` set `HO
 **Files:**
 - `scripts/agents/test_sync_codex_catalog.sh`, `scripts/agents/test_models_config.sh` — temporary `HOME`, publish off.
 
-### Phase 3 — Run records name the model that ran  · status: todo
+### Phase 3 — Run records name the model that ran  · status: done
 
 **Depends on:** Phase 1.
 
