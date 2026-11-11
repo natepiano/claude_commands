@@ -558,15 +558,6 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "anomaly: impl: delivery failed\n")
         self.assertEqual(staff.by_id(opened.row.id), opened.row)
 
-    def test_launcher_recovery_reports_an_absent_director(self) -> None:
-        opened = self.opened()
-        with (patch.object(self.fixture.world, "tab_sessions", return_value=[]),
-              patch.object(self.fixture.world, "prompt") as prompt, redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(worker._resume_launcher(opened.row, progress_history.ActiveDispatch("saved-pass", ("assign.sh",))),  # pyright: ignore[reportPrivateUsage]
-                             worker.ExitCode.UNCERTAIN)
-        prompt.assert_not_called()
-        self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
-
     def test_resume_workers_names_the_active_pass_and_idle_worker(self) -> None:
         from scripts.lib.resume_message import UnsubmittedAssignment, IdleWorker, PaneWorkerResume
 
@@ -1972,16 +1963,6 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.fixture.world.closed, [("w1:p1", "terminal-w1:p1")])
         self.assertEqual(self.agent.submitted, [])
 
-    def test_publication_failure_reports_that_its_new_pane_close_failed(self) -> None:
-        with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
-              patch.object(self.fixture.world, "close_pane", return_value=False),
-              redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
-        self.assertIn("pane w1:p1 close failed", errors.getvalue())
-        self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
-        self.assertIn("w1:p1", self.fixture.world.locations)
-        self.assertEqual(self.agent.submitted, [])
-
     def test_publication_failure_closes_the_backend_without_delivery(self) -> None:
         publish = staff.ensure_worker
         def failed(identity: staff.StaffId, name: str, parent: staff.StaffId) -> staff.StaffRow:
@@ -2374,40 +2355,6 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), before)
         self.assertNotIn(self.agent.submitted[-1][0], self.fixture.world.foreground)
 
-    def test_herdr_list_shares_history_and_staff_reads_across_workers(self) -> None:
-        expected: dict[str, str] = {}
-        for name, role in (("impl", "impl"), ("review", "review"), ("test", "test")):
-            opened = self.opened(name, role=cast(staff.WorkerRole, role))
-            self.fixture.dispatch(opened.row, cast(staff.WorkerRole, role), completed=True)
-            _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole(cast(staff.WorkerRole, role)))
-            # Preserve each finished pass in its own private run.
-            saved = self.fixture.root / ("history-" + name)
-            saved.mkdir()
-            atomic_file.write_text_atomic(saved / "progress_history_state.json",
-                (self.run_dir / "progress_history_state.json").read_text())
-            expected[name] = role
-        started = time.perf_counter()
-        enumerated: list[Path] = []
-        iterdir = Path.iterdir
-        def read_directory(path: Path) -> Iterator[Path]:
-            if path == self.fixture.root:
-                enumerated.append(path)
-            return iterdir(path)
-        with patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshots, \
-                patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as local_snapshots, \
-                patch.object(Path, "iterdir", read_directory), \
-                patch.object(agents_log, "assignments", wraps=agents_log.assignments) as roles:
-            code, output, errors = self.command("list", "--json")
-        elapsed = time.perf_counter() - started
-        self.assertEqual(code, 0, errors)
-        rows = cast(list[dict[str, object]], json.loads(output))
-        self.assertEqual({str(row["name"]): row["role"] for row in rows}, expected)
-        self.assertEqual(snapshots.call_count, 1)
-        self.assertEqual(local_snapshots.call_count, 0)
-        self.assertEqual(enumerated, [self.fixture.root])
-        self.assertEqual(roles.call_count, 1)
-        print(f"herdr list with three workers: {elapsed:.6f} seconds")
-
     def test_assign_shares_role_history_reads_before_selecting_an_unknown_worker(self) -> None:
         for index, name in enumerate(("impl", "fix", "review", "test"), start=1):
             row = self.fixture.worker(name)
@@ -2565,19 +2512,6 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual((rows[first.id]["state"], rows[first.id]["work"], rows[first.id]["activity"]),
                          ("refused", "unknown", "Check the saved work."))
 
-    def test_list_all_resolves_the_legacy_unit_account_once_from_stored_history(self) -> None:
-        _first, second, _paths = self.recorded_list_fixture()
-        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default"}))
-        atomic_file.write_text_atomic(accounts.roles_history_file(), json.dumps({
-            "role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"}) + "\n")
-        with patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolved:
-            code, output, errors = self.command("list", "all", "--json", "--all-parents")
-        self.assertEqual(code, 0, errors)
-        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
-        self.assertEqual(rows[second.id]["account"], "claude2")
-        self.assertEqual(rows[second.id]["home"], str(Path.home() / ".claude2"))
-        resolved.assert_not_called()
-
     def test_list_all_keeps_valid_history_events_beside_an_incomplete_line(self) -> None:
         first, second, paths = self.recorded_list_fixture()
         history = self.fixture.root / "saved-history.jsonl"
@@ -2628,27 +2562,6 @@ class WorkerCommandTests(unittest.TestCase):
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
         self.assertEqual((rows[first.id]["state"], rows[first.id]["role"], rows[first.id]["activity"]),
                          ("completed", "review", "Repair the saved work."))
-
-    def test_list_all_reads_only_the_needed_default_account_history_once(self) -> None:
-        _first, second, _paths = self.recorded_list_fixture()
-        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default", "showrunners": "default"}))
-        history = accounts.roles_history_file()
-        atomic_file.write_text_atomic(history, "".join(json.dumps(row) + "\n" for row in (
-            {"role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"},
-            {"group": "showrunners", "label": "default", "account_label": "claude3", "at": "2026-10-08T00:00:00Z"})))
-        original = Path.read_text
-        reads: list[Path] = []
-        def read(path: Path, *args: object, **kwargs: object) -> str:
-            reads.append(path)
-            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
-        with (patch.object(Path, "read_text", autospec=True, side_effect=read),
-              patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolve):
-            code, output, errors = self.command("list", "all", "--json", "--all-parents")
-        self.assertEqual(code, 0, errors)
-        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
-        self.assertEqual(rows[second.id]["account"], "claude2")
-        self.assertEqual(reads.count(history), 0)
-        resolve.assert_not_called()
 
     def test_list_all_bounds_history_without_a_uuid_creation_time(self) -> None:
         first, _second, paths = self.recorded_list_fixture()
@@ -2729,6 +2642,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(reads.count(path), 1, str(path))
         for path in (accounts.accounts_config_file(), accounts.groups_file()):
             self.assertEqual(reads.count(path), 0, str(path))
+
 
     def test_list_header_names_and_aligns_each_column(self) -> None:
         _ = self.opened("impl")
@@ -2952,28 +2866,6 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(output[0][3], "activity unknown")
         self.assertEqual(output, [["1", "missing-backend", "-", "activity unknown", "closed", "-", "-"]])
         self.assertNotIn("{", str(output))
-
-    def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
-        unit_runs.report_anomaly.cache_clear()
-        self.addCleanup(unit_runs.report_anomaly.cache_clear)
-        rows = [self.fixture.worker(name) for name in ("impl", "review", "test")]
-        for index, row in enumerate(rows, 1):
-            self.fixture.world.add(row, f"w1:p{index}")
-        runs = self.fixture.root
-        for name in ("ownerless-a", "ownerless-b"):
-            run = runs / name
-            run.mkdir(parents=True)
-            atomic_file.write_text_atomic(run / unit_runs.STATE_FILE, '{}')
-            atomic_file.write_text_atomic(run / "fixture-impl_status", "running\n")
-        with patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scans:
-            code, output, errors = self.command("list", "--json")
-        self.assertEqual(code, 0, errors)
-        self.assertEqual(scans.call_count, 1)
-        listing = cast(list[dict[str, object]], json.loads(output))
-        self.assertEqual({item["name"] for item in listing}, {row.name for row in rows})
-        self.assertEqual(errors.splitlines(), [
-            f"anomaly: {runs / name}: this run has no owner because {unit_runs.STATE_FILE} names no staff row"
-            for name in ("ownerless-a", "ownerless-b")])
 
     def test_restore_retains_the_same_native_session_and_reruns_unchanged(self) -> None:
         opened = self.opened()

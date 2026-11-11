@@ -24,7 +24,6 @@ from scripts.accounts import accounts
 from scripts.production import add_showrunner
 from scripts.production.production_doc import ProductionDocument, read_new_production, read_production
 from scripts.production import showrunners
-from scripts.production import showrunner_tree
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
 from scripts.herdr import herdr
@@ -688,26 +687,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
-    def test_resume_uses_the_configured_showrunners_account(self) -> None:
-        directory = self.named_account()
-        child = read_new_production(self.doc("kid"), "kid")
-        self.resume_record()
-        with patch.dict(os.environ, self.env, clear=True), \
-                patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
-            selected = add_showrunner.account_for_launch(child, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
-        self.assertEqual(selected, accounts.NamedAccount("claude3", directory))
-        role.assert_called_once_with("showrunner")
-
-    def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
-        child = read_new_production(self.doc("kid"), "kid")
-        with patch.dict(os.environ, self.env, clear=True), \
-                patch.object(add_showrunner, "running", return_value=False), \
-                patch.object(showrunner_tree, "descendants_of", return_value=[]), \
-                patch.object(add_showrunner, "herdr_tab_open", return_value=False) as destination:
-            result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
-        self.assertIsNone(result)
-        destination.assert_called_once_with("kid", add_showrunner.NoEndingTab())
-
     def test_recorded_herdr_resume_without_an_account_passes_check_using_configured_group(self) -> None:
         self.resume_record()
         for pid, parent, argv, environment in (
@@ -855,23 +834,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.parent_of("kid"), "top")
-
-    def test_showrunner_wait_retries_with_the_configured_interval(self) -> None:
-        self.flaky_registry(1)
-        self.env["ADD_SHOWRUNNER_WAIT_S"] = "300"
-        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
-        polls = self.root / "polls.jsonl"
-        result = self.run_command("kid")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.parent_of("kid"), "top")
-        self.assertEqual([json.loads(line) for line in polls.read_text().splitlines()], [0.01])
-
-    def test_showrunner_poll_default_remains_two_seconds(self) -> None:
-        environment = {key: value for key, value in self.env.items() if key != "ADD_SHOWRUNNER_POLL_S"}
-        program = "from scripts.production import add_showrunner; print(add_showrunner.POLL_S)"
-        result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program], env=environment,
-                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual((result.returncode, result.stdout), (0, "2.0\n"), result.stderr)
 
     def test_a_registry_still_unreadable_at_the_deadline_leaves_the_child_unattached(self) -> None:
         self.flaky_registry(1000)

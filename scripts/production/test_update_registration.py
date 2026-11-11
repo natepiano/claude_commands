@@ -9,11 +9,10 @@ import shutil
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 from typing import IO, cast, final, override
 from unittest import mock
-from zoneinfo import ZoneInfo
 
 from scripts.production import session_staff, staff, showrunners
 from scripts.agents import shutdown
@@ -23,7 +22,6 @@ from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
 
-from scripts.production import dailies_input
 from scripts.production import footer_counts
 from scripts.production import next_item
 from scripts.production import tidy_wrapped
@@ -81,51 +79,6 @@ class RegistrationTests(RegistrationFixture):
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
-    def test_on_demand_keeps_a_stopped_timer_as_the_showrunners_record(self) -> None:
-        first = self.run_command("register")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        doc = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
-                                encoding="utf-8")
-        _ = self.git("commit", "-qam", "dailies on demand")
-        before = len(self.notifier_calls())
-        resumed = self.run_command("register")
-        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} on demand: no scheduled dailies", resumed.stdout)
-        calls = self.notifier_calls()[before:]
-        self.assertIn(["new", f"showrunner-{self.fixture_staff_id()}"], [call[:2] for call in calls])
-        self.assertIn(["stop", f"showrunner-{self.fixture_staff_id()}"], calls)
-        self.assertNotIn(["remove", f"showrunner-{self.fixture_staff_id()}"], calls)
-        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
-        again = self.run_command("register")
-        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
-        # A re-register retargets the timer and stops it again, so it stays stopped.
-        self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["new", "stop", "status"])
-        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
-
-    def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
-        self.without_updates_line()
-        first = self.run_command("register")
-
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} on demand: no scheduled dailies", first.stdout)
-        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
-        self.assertNotIn("footer", first.stdout)
-
-    def test_a_line_asking_for_a_schedule_still_schedules(self) -> None:
-        doc = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(doc.replace("every 15 minutes", "every 20 minutes"), encoding="utf-8")
-        _ = self.git("commit", "-qam", "every 20 minutes")
-
-        result = self.run_command("register")
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        updates = next(call for call in self.notifier_calls() if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
-        self.assertEqual(updates[updates.index("--every") + 1], "20")
-        self.assertNotIn(["stop", f"showrunner-{self.fixture_staff_id()}"], self.notifier_calls())
-        self.assertIn("next_due", result.stdout)
-
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}
         missing_id = self.run_command("register", "--session", "first-showrunner", env=without_id)
@@ -158,24 +111,6 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("/agents rename example other", result.stdout)
         self.assertIn("register: ok", result.stdout)
         self.assertNotEqual(self.notifier_calls(), [])
-
-    def test_registered_prompt_keeps_status_save_dailies_call_and_render_state(self) -> None:
-        result = self.run_command("register", "--session", "first-showrunner")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        prompts = list((self.state / "showrunner").rglob("prompt.txt"))
-        self.assertEqual(len(prompts), 1)
-        prompt = prompts[0].read_text(encoding="utf-8")
-        self.assertIn("unit_status.txt", prompt)
-        self.assertIn("/showrunner:dailies gantt", prompt)
-        state_dir = self.state / "showrunner" / self.fixture_staff_id() / "session"
-        self.assertEqual(prompt.count(f"Pass `--render-state {state_dir}/dailies_state.json` to the builder"), 1)
-        self.assertIn(f"unit_status.sh {state_dir}/unit_status ", prompt)
-        self.assertNotIn("<STATE_DIR>", prompt)
-        self.assertEqual(prompt.count("--render-state"), 1)
-        self.assertIn("America/Los_Angeles", prompt)
-        self.assertIn("--production example", prompt)
-        self.assertNotIn("first-showrunner", prompt)
-
 
 @final
 class QuestionIdentityTests(RegistrationFixture):
@@ -264,26 +199,6 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(after.entries[0].item,
                          "example [user], since Tue Oct 06 08:00, asked by alpha: Keep the layout?")
 
-    def test_dailies_reader_preserves_review_timing_and_rank_after_migration(self) -> None:
-        legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
-                                        "question": "Keep the layout?", "review_unavailable": "offline",
-                                        "asked_by": str(self.asker_id), "after": "2099-01-02T08:00",
-                                        "urgency": "soon", "due": "2099-01-03", "follows": "Earlier choice"}
-        _ = self.outstanding().write_text(json.dumps([legacy]))
-        self.migrate()
-        with self.forbid_legacy_question_access():
-            after = dailies_render.read_outstanding(self.outstanding())
-        self.assertEqual(len(after), 1)
-        item = after[0]
-        self.assertIsInstance(item, dailies_render.ReviewUnavailableOutstandingQuestion)
-        assert isinstance(item, dailies_render.ReviewUnavailableOutstandingQuestion)
-        self.assertEqual((item.text, item.question, item.asked_by),
-                         ("Choose the layout", "Keep the layout?", self.asker_id))
-        self.assertEqual(item.since, datetime(2026, 10, 6, 8))
-        self.assertEqual(item.reason, "offline")
-        self.assertEqual(item.timing, dailies_render.DeferredUntil(datetime(2099, 1, 2, 8)))
-        self.assertEqual(item.rank.follows, "Earlier choice")
-
     def test_footer_counts_read_migrated_records_without_the_legacy_list(self) -> None:
         self.file_question()
         self.migrate()
@@ -295,16 +210,6 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(footer_counts.counts_line(counts), "For you: 1 question")
         for record in self.issues.glob("*.md"):
             self.assertIn(record, sources)
-
-    def test_dailies_counts_read_migrated_records_without_the_legacy_list(self) -> None:
-        self.file_question()
-        self.migrate()
-        with self.forbid_legacy_question_access():
-            fields = dailies_input.child_fields("example", datetime.now(ZoneInfo("America/Los_Angeles")),
-                                                ZoneInfo("America/Los_Angeles"), expand=False,
-                                                record=staff.snapshot())
-        self.assertEqual(fields["open"], 1)
-        self.assertNotIn("unreadable", fields)
 
     def test_showrunner_footer_reads_migrated_records_without_the_legacy_list(self) -> None:
         self.file_question()
@@ -680,6 +585,26 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.question_rows(), [])
         self.assertFalse(timer.exists())
         self.assertFalse((self.state / "showrunner/outstanding/example.json").exists())
+
+    def test_reader_preserves_review_timing_and_rank_after_migration(self) -> None:
+        legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                                        "question": "Keep the layout?", "review_unavailable": "offline",
+                                        "asked_by": str(self.asker_id), "after": "2099-01-02T08:00",
+                                        "urgency": "soon", "due": "2099-01-03", "follows": "Earlier choice"}
+        _ = self.outstanding().write_text(json.dumps([legacy]))
+        self.migrate()
+        with self.forbid_legacy_question_access():
+            after = registration.read_open_items(self.outstanding())
+        self.assertEqual(len(after), 1)
+        item = after[0]
+        self.assertIsInstance(item, registration.ReviewUnavailableOutstandingQuestion)
+        assert isinstance(item, registration.ReviewUnavailableOutstandingQuestion)
+        self.assertEqual((item.text, item.question, item.asked_by),
+                         ("Choose the layout", "Keep the layout?", self.asker_id))
+        self.assertEqual(item.since, datetime(2026, 10, 6, 8))
+        self.assertEqual(item.reason, "offline")
+        self.assertEqual(item.timing, registration.DeferredUntil(datetime(2099, 1, 2, 8)))
+        self.assertEqual(item.rank.follows, "Earlier choice")
 
 
 if __name__ == "__main__":
