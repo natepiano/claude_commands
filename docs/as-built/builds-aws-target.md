@@ -159,16 +159,15 @@ An interruption marker reports the instance generation.
 
 - `targets.read_aws_status` and `build_targets.format_aws_status` show state, spending decision, month dollars against the cap, slots per repository, cleanup state and recovery action. Status makes no AWS call, probe or write.
 - `report.py` renders `### AWS` from the AWS state folder without an SSH target registration.
-  The section shows uptime, steps, estimated queue wait saved, costs, the account bill, and daily gate spend.
+  The section shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+  Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+  The daily spend table shows bill days and estimate days after the newest bill day.
+  Historical reports omit estimate days after the report date.
   `aws_report.estimate_wait_saved` compares natedev steps from the same day, kind, and repository.
   The report shows one AWS section before the Mac copies section.
   The worker records `mode` in each launch, refusal, and finish event in `cloud-gate-launches.jsonl`.
   After result validation, the worker records `gate_s` in the finish event.
-  The cost matrix separates machine types, merge gates, targeted tests, and totals over `gate_type_window_days` UTC days (default: 14).
-  Daily cost splits by box seconds; costs per run use billed days only.
-  Counts include all finished runs in the window.
-  A daily table shows median test time, median box time, and cost per run, newest day first.
-  Runs use their UTC completion day; the source line counts old rows without a run kind.
+  `gate_type_window_days` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 

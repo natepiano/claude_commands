@@ -692,6 +692,7 @@ class DailySpend:
     runs: int
     query_usd: Decimal = Decimal(0)
     intervals: tuple[ChargedInterval, ...] = ()
+    provisional_bill: bool = False
 
     @property
     def usd(self) -> Decimal:
@@ -861,7 +862,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                     include(ChargedInterval(reservation.at, reservation.at, reservation.allowance_usd,
                                              'gate storage and transfer:' + reservation.attempt, 'fixed'))
         days.append(DailySpend(key, source, tuple(SpendGroupCost(group, usd) for group, usd in groups.items()),
-                              runs, query_usd, tuple(intervals)))
+                              runs, query_usd, tuple(intervals), provisional_bill=bill is not None and bill.provisional))
     return tuple(days)
 
 
