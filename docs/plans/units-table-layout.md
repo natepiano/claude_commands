@@ -40,47 +40,24 @@ The user's words, from the sdlc showrunner on 2026-11-11:
 
 ### Phase 1 — Sorted rows, a colored bar, and a Notes column  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** Rows sort by unit name; Progress is a colored bar only; Phase shows `<done>/<total>`; a new Notes column holds every other phase text.
-
-**Spec:**
-
-1. **Sort.** Both tables (phase and style) list rows by unit name, case-insensitive. Sort once where `main` gets the unit list, before either table is built, so the Machine column index stays aligned.
-2. **Progress.** Only the bar, with no text after it.
-   - `🟩` done, `🟨` running (open), `⬜` not started (todo).
-   - Keep the scaling rule: at most 20 cells; cell `i` covers phases `[⌊i·n/20⌋, ⌊(i+1)·n/20⌋)` and shows running, else not started, else done.
-   - No phases gives `—`.
-   - All three characters have East Asian Width `W`, so each takes two columns and the Markdown table stays aligned. Do not mix in a narrow character.
-3. **Phase.** `<done>/<total>` when the plan has phases. Otherwise `—`.
-4. **Notes.** A new column directly after Phase. Parts join with ` · `, cut to 80 characters with `…`:
-   - An open phase: `phase <id> — <step>: <task>`, or `phase <id> — <title>` with no open step (the old Phase text without `of <total>`).
-   - No open phase: `between phases`, `not started`, `plan done`, `no phases`, or `no plan`, as Phase showed them before. `between phases` drops `, <done> of <total> done`, which Phase now shows.
-   - Fix rounds: `fix rounds <n>`, plus ` + 1 running` when one runs. This moves out of Progress.
-   - Nothing to say gives `—`.
-5. The header becomes `| Unit | Status | [Machine |] Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |`.
-6. Update `commands/showrunner/units.md` and the two as-built docs to state the new columns, in the same commit.
+- `main` sorts the unit list by unit name, case-insensitive, before it builds the phase and style tables. The Machine column index stays aligned.
+- `progress_cell` shows only a bar: `🟩` done, `🟨` running, `⬜` not started. It has at most 20 cells; cell `i` covers phases `[⌊i·n/20⌋, ⌊(i+1)·n/20⌋)`. No phases gives `—`.
+- `phase_cell` shows `<done>/<total>` from the same phase rows as Progress, else `—`.
+- `notes_cell` holds the open phase (`phase <id> — <step>: <task>` or `phase <id> — <title>`), else `between phases`, `not started`, `plan done`, `no phases` or `no plan`, plus `fix rounds <n>[ + 1 running]`. Parts join with ` · ` and cut at 80 characters.
+- Progress, Phase and Notes read `progress_record`: the open-run record from `phase_table.build_run` when the plan record has no phases. Notes reads the plan record when that run record has no phases either, so an unreadable plan still shows `no plan`.
+- The header is `| Unit | Status | [Machine |] Progress | Phase | Notes | ETA | Workers | Non-Phase Work | Queued |`.
 
 **Files:**
-- `scripts/production/unit_phases.py` — sort, `progress_cell`, `phase_cell`, a new `notes_cell`, `table` header and cells.
-- `scripts/production/test_unit_phases.py` — rows for each rule above.
-- `commands/showrunner/units.md` — column text.
-- `docs/as-built/showrunner-automation.md`, `docs/as-built/phase-tables.md` — column text.
+- `scripts/production/unit_phases.py` — the sort, `progress_cell`, `phase_cell`, `notes_cell`, and the `table` header and cells.
+- `scripts/production/test_unit_phases.py` — layout, sort, bar, Phase and Notes rows.
+- `scripts/agents/test_shutdown_cli.py` — pins the units table header.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/phase-tables.md` — column text.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `unit_phases.py`, `units.md`, both as-built docs.
-- `test` — `test_unit_phases.py`: change the existing table rows to the new layout, and add rows for sorting, the three bar characters, the Phase count, and each Notes form.
+**Binds later work:** ETA columns follow Notes and read `progress_record`, as Progress, Phase and Notes do.
 
-**State:** none
-
-**Constraints from prior phases:** none
-
-**Acceptance gate:**
-1. `basedpyright scripts/production/unit_phases.py scripts/production/test_unit_phases.py`: 0 errors, 0 warnings, 0 notes.
-2. `env HERDR_BIN=/nonexistent/herdr PYTHONPATH="$PWD" scripts/lib/py -m unittest scripts.production.test_unit_phases scripts.production.test_roles_audit` passes.
-3. Live: `PYTHONPATH="$PWD" scripts/lib/py scripts/production/unit_phases.py --production sdlc` prints sorted rows and colored bars.
+**Gotchas:** `scripts/agents/test_shutdown_cli.py` pins the units header; each header change updates it. The three bar characters have East Asian Width `W`; a narrow character breaks the Markdown alignment.
 
 ### Phase 2 — ETA Next and ETA Plan  · status: todo
 
@@ -104,6 +81,7 @@ The user's words, from the sdlc showrunner on 2026-11-11:
    - The column shows only when at least one row has a plan with phases that are not all done. Otherwise the table has no ETA Plan column.
    - A row with no running plan shows `—`.
 3. **Plan finish never earlier than a promise.** Fix this in `phase_table._plan_finish`, where the defect lives: add the latest stated promise (`eta_trail[-1][0]`) of every open and not-started phase to the projections before taking the maximum. Seen live: the phases unit showed `ends 15:42` while its phase 5 had a promise of 11-15 18:00. Every reader of `plan_finish` (the unit report too) gets the corrected time.
+   - A not-started phase has no phase instance, so `_phase_history` gives it an empty `eta_trail` today. A checkpoint ETA (`eta_stated` with `eta_phase_id` naming that phase) is then lost. Seen live: unit-board phase 2 had a 15:30 checkpoint promise, an empty trail, and `ends 13:56`. Attach each `eta_stated` event whose `eta_phase_id` names a plan phase with no instance to that phase's `eta_trail`. Item 1.3 and item 3 both read this trail.
 4. The `ends <time>` part leaves ETA Next.
 5. Update `commands/showrunner/units.md` and the two as-built docs in the same commit.
 
@@ -111,17 +89,21 @@ The user's words, from the sdlc showrunner on 2026-11-11:
 - `scripts/production/unit_phases.py` — `eta_cell` becomes the ETA Next cell, a new plan-finish cell, the optional column in `table`.
 - `scripts/direct/phase_table.py` — `_plan_finish`.
 - `scripts/production/test_unit_phases.py`, `scripts/direct/test_phase_table.py` — rows for each rule.
+- `scripts/agents/test_shutdown_cli.py` — its expected units header (about line 233).
 - `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/phase-tables.md` — column text.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `unit_phases.py`, `phase_table.py`, `units.md`, both as-built docs.
-- `test` — `test_unit_phases.py` rows for each ETA Next source, the hidden and shown ETA Plan column; a `test_phase_table.py` row where a not-started phase's promise is later than the predicted finish.
+- `test` — `test_unit_phases.py` rows for each ETA Next source, the hidden and shown ETA Plan column; a `test_phase_table.py` row where a not-started phase's promise is later than the predicted finish; the header in `test_shutdown_cli.py`.
 
 **State:** none
 
-**Constraints from prior phases:** Phase 1 sets the column order up to Notes. ETA Next and ETA Plan follow Notes.
+**Constraints from prior phases:**
+- Phase 1 sets the column order up to Notes. ETA Next and ETA Plan follow Notes.
+- Progress, Phase and Notes read `progress_record` (the open-run record when the plan record has no phases). ETA Next and ETA Plan read the same record.
+- `scripts/agents/test_shutdown_cli.py` pins the units header. Each header change updates it.
 
 **Acceptance gate:**
 1. `basedpyright scripts/production/unit_phases.py scripts/production/test_unit_phases.py scripts/direct/phase_table.py scripts/direct/test_phase_table.py`: 0 errors, 0 warnings, 0 notes.
-2. `env HERDR_BIN=/nonexistent/herdr PYTHONPATH="$PWD" scripts/lib/py -m unittest scripts.production.test_unit_phases scripts.direct.test_phase_table scripts.production.test_roles_audit` passes.
+2. `env HERDR_BIN=/nonexistent/herdr PYTHONPATH="$PWD" scripts/lib/py -m unittest scripts.production.test_unit_phases scripts.direct.test_phase_table scripts.production.test_roles_audit scripts.agents.test_shutdown_cli` passes.
 3. Live: the phases row shows an ETA Plan no earlier than its phase 5 promise.
