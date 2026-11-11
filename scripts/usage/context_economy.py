@@ -29,7 +29,7 @@ from scripts.usage import collect, weights
 from scripts.usage.agents_log import state_dir
 from scripts.usage.context_economy_read import (
     CompactionEvent, MacReadFailed, MacSessions, Request, Session, SettingsSet, Start,
-    SettingsUnknown, configured_checkout, label, read_claude, role_of,
+    SettingsUnknown, ReportSettingsTimeline, configured_checkout, label, read_claude, role_of,
     read_codex, read_mac, settings_for, settings_timeline, timeline_start,
 )
 
@@ -256,10 +256,11 @@ def build_report(sessions: Sequence[Session], timelines: Mapping[str, Sequence[S
     role_samples: dict[str, dict[str, list[float]]] = {}
     unweighted_models: dict[str, int] = defaultdict(int)
     left_out = 0
+    report_timelines = {machine: ReportSettingsTimeline(entries) for machine, entries in timelines.items()}
     for session in sessions:
         if family != "all" and session.family != family:
             continue
-        timeline = timelines.get(session.machine, ())
+        timeline = report_timelines.get(session.machine, ())
         session_role = role_of(store, session.machine, session.family, session.session_id, session.agent_id)
         if role and role != session_role:
             continue

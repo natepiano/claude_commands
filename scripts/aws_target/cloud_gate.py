@@ -558,9 +558,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
 def service_command(module: str, arguments: Sequence[str], unit: str, *, paired: bool = False) -> list[str]:
     """Use the installed scaler environment for each gate controller."""
     credential = str(Path(settings().text('credential_file')).expanduser())
+    configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
     return ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=' + unit,
             '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
-            '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
+            *configuration,
             '--property=KillMode=' + ('mixed' if paired else 'control-group'), '--property=UMask=0077',
             '--property=TimeoutStopSec=' + str(settings().number('termination_timeout_s')
                 + 2 * settings().number('api_timeout_s')),
