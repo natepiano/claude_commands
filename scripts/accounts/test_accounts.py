@@ -7474,6 +7474,22 @@ class PaneWorkerMoveTests(unittest.TestCase):
             "pass": {row.name: {"worker_name": row.name, "team_slot": row.name, "kind": role,
                                  "status": status, "started_at": time.time(), "instance_id": "dispatch-" + row.name,
                                  "launcher_command": ["assign.sh", "--to", row.name]}}}))
+        if status == "active":
+            from scripts.direct import progress_history
+            from scripts.production import worker_admission
+
+            instance = "dispatch-" + row.name
+            line = (f'Read the unchanged prompt file "{self.root / "prompt.md"}". '
+                    f"End your final reply with this line alone: DONE {instance}\n"
+                    "A reply that waits on a detached run is not final.")
+            progress_history.save_dispatch_delivery(self.run_dir, instance,
+                progress_history.DispatchDelivery(line, instance, str(self.root / "reply.md")))
+            backend = staff.backend(row)
+            assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+            entry = ({"type": "event_msg", "payload": {"type": "user_message", "message": line}}
+                     if isinstance(backend, staff.CodexBackend) else
+                     {"type": "user", "message": {"role": "user", "content": line}})
+            atomic_file.write_text_atomic(worker_admission.transcript_source(row, backend), json.dumps(entry) + "\n")
         if status == "completed":
             from scripts.production import worker_admission
 
@@ -7806,9 +7822,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         from scripts.direct import progress_history
 
         row = self.worker()
-        _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
-        with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
-              patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatch("saved-pass", ("assign.sh",)))):
+        self.dispatch(row)
+        with patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()):
             result = self.move("claude2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.world.requests[-1][2]["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))

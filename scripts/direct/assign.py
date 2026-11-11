@@ -580,14 +580,18 @@ def launch(target: worker_panes.ConsultationPane, policy: worker_panes.LaunchPol
 
 @overload
 def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
-           policy: worker_panes.LaunchPolicy) -> worker_panes.WorkerStart: ...
+           policy: worker_panes.LaunchPolicy, *,
+           lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           ) -> worker_panes.WorkerStart: ...
 
 
-def launch(target: worker_panes.PaneTarget, policy: worker_panes.LaunchPolicy) -> side_pane.SidePane | worker_panes.WorkerStart:
+def launch(target: worker_panes.PaneTarget, policy: worker_panes.LaunchPolicy, *,
+           lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           ) -> side_pane.SidePane | worker_panes.WorkerStart:
     """Start the named target with the supplied policy."""
     if isinstance(target, worker_panes.ConsultationPane):
         return side_pane.open(target.label, policy, question=target.question, cwd=target.cwd, delivery=target.delivery)
-    return staff_worker.launch(target, policy)
+    return staff_worker.launch(target, policy, lock=lock)
 
 
 def execute_consultation(args: Arguments, cwd: Path) -> int:
@@ -696,8 +700,11 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
     target = worker_panes.StaffWorker(parent.id, staff.WorkerName.parse(args.new_worker), "astra-reviewer")
     policy = pane_policy(args.policy or "astra-reviewer", model=args.model, effort=args.effort)
     before = staff_worker.rows_before_launch()
-    with ExitStack() as cleanup:
-        current = launch(target, policy)
+    with worker_panes.worker_lock(target.parent, target.name) as hold, ExitStack() as cleanup:
+        if isinstance(hold, worker_panes.Kept):
+            print(hold.blocker, file=sys.stderr)
+            return staff_worker.ExitCode.BUSY
+        current = launch(target, policy, lock=hold)
         staff_worker.arm_launch_cleanup(cleanup, before, current)
         if not isinstance(current, worker_panes.OpenWorker):
             return staff_worker.startup_result(target.name, current)
@@ -712,7 +719,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                 reply=Path(args.summary), policy=policy, started=current,
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
                     finish_phase="astra-review", finish_run=True),
-                launcher_command=launcher_command(), on_submission=cleanup.pop_all)
+                launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold)
             if result is staff_worker.DispatchSubmission.SUBMITTED:
                 _ = cleanup.pop_all()
             return result

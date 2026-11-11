@@ -216,8 +216,10 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     real_hold = astra_roles.hold
                     real_launch = assign.launch
                     def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
-                               policy: worker_panes.LaunchPolicy) -> worker_panes.WorkerStart:
-                        result = real_launch(target, policy)
+                               policy: worker_panes.LaunchPolicy, *,
+                               lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+                               ) -> worker_panes.WorkerStart:
+                        result = real_launch(target, policy, lock=lock)
                         if failure == "incomplete":
                             assert isinstance(result, worker_panes.OpenWorker)
                             rows.append(result.row)
