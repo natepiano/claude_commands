@@ -1107,10 +1107,15 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertEqual(trend_tables(output)["aws full"][1][-3:], ["$0.220", "$0.220", "$0.220"])
 
         self.write_run([module_run("test_alpha.py", 8)], host="ip-10-1-1-2", epoch=EPOCH - 86400)
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET run_id='gate-history-2' WHERE run_id='history-2'").close()
+            writer.execute("UPDATE gate_runs SET id='gate-history-2' WHERE id='history-2'").close()
+            writer.commit()
         _ = self.report("trend", "--days", "2")
         with closing(sqlite3.connect(index_path_in(self.log))) as writer:
             writer.execute("UPDATE gate_modules SET cpu_s=999 WHERE run_id=?",
-                           (f"history-{self.next_id}",)).close()
+                           (f"gate-history-{self.next_id}",)).close()
             writer.commit()
         queries: list[str] = []
         with closing(show.open_report_index()) as reader:
@@ -1123,6 +1128,49 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                          ["2026-11-02", "1", "4", "4", "30", "30", "—", "—", "—"])
         self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
         self.assertIn("1 of 2 runs have no cost record.", output)
+
+        for attempt in ("settled-pending", "settled-priced"):
+            self.write_run([module_run("test_alpha.py", 8)], host="ip-10-1-1-3", epoch=EPOCH - 2 * 86400)
+            _ = show.index.update()
+            with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("UPDATE gate_modules SET run_id=? WHERE run_id=?",
+                               ("gate-" + attempt, f"history-{self.next_id}")).close()
+                writer.execute("UPDATE gate_runs SET id=? WHERE id=?",
+                               ("gate-" + attempt, f"history-{self.next_id}")).close()
+                writer.commit()
+        reservations = list(ledger.CostLedger(state).read_snapshot().gate_reservations)
+        reservations.append(ledger.GateReservation(
+            "settled-priced", int(EPOCH - 2 * 86400), int(EPOCH), Decimal("0.4"), Decimal("0.02"),
+            ledger.GateTerminated(int(EPOCH - 2 * 86400 + 3600), "i-priced"),
+            rate=ledger.BoxRate(Decimal("0.1"), "bill A")))
+        write_trend_ledger(state, reservations)
+        status, output, errors = report_without_update("trend", "--days", "3")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(trend_tables(output)["aws full"][1][-3:], ["$0.120", "$0.120", "$0.120"])
+        self.assertIn("2 of 4 runs have no cost record.", output)
+
+        reservations = reservations[:1]
+        for attempt in ("settled-pending", "settled-priced", "history-2"):
+            reservations.append(ledger.GateReservation(
+                attempt, int(EPOCH - 2 * 86400), int(EPOCH), Decimal("0.4"), Decimal("0.02"),
+                ledger.GateTerminated(int(EPOCH - 2 * 86400 + 3600), "i-" + attempt),
+                rate=ledger.BoxRate(Decimal("0.4"), "bill B")))
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET cpu_s=999 WHERE run_id LIKE 'gate-settled-%'").close()
+            writer.commit()
+        write_trend_ledger(state, reservations)
+        queries.clear()
+        with closing(show.open_report_index()) as reader:
+            reader.set_trace_callback(queries.append)
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                show.trend(reader, 3)
+        output = output_buffer.getvalue()
+        self.assertEqual(trend_tables(output)["aws full"][1],
+                         ["2026-11-01", "2", "4", "4", "30", "30", "$0.420", "$0.420", "$0.840"])
+        self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
+        self.assertNotIn("2026-11-01", "".join(queries))
+        self.assertNotIn("runs have no cost record.", output)
 
     def test_trend_computes_only_open_days_and_rebuilds_an_unreadable_or_old_cache(self) -> None:
         self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
@@ -1146,7 +1194,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertNotEqual(output.getvalue(), first)
         path = self.log / show.TREND_CACHE_NAME
         document = cast(dict[str, object], json.loads(path.read_text()))
-        for damaged in ("not JSON", json.dumps({**document, "version": 0})):
+        for damaged in ("not JSON", json.dumps({**document, "version": 2})):
             with self.subTest(cache=damaged):
                 _ = path.write_text(damaged)
                 status, output, errors = report_without_update("trend", "--days", "2")
@@ -1223,7 +1271,7 @@ else:
                 cache = show.read_trend_cache()
                 previous = cache.days["2026-11-02"][0]
                 cache.days["2026-11-02"] = [show.TrendDay(previous.place, previous.selection,
-                    (*previous.cells[:2], "4", "4", *previous.cells[4:]))]
+                    (*previous.cells[:2], "4", "4", *previous.cells[4:]), previous.run_ids)]
                 cache.completed_refresh_started_at = 0 if action == "initialize" else EPOCH + 300
                 show.write_trend_cache(cache)
                 event, child_event = socket.socketpair()
@@ -1238,7 +1286,7 @@ else:
                         self.assertIn(event.recv(1), (b'L', b'R'))
                         current = show.read_trend_cache()
                         current.days["2026-11-02"] = [show.TrendDay(previous.place, previous.selection,
-                            (*previous.cells[:2], "77", "77", *previous.cells[4:]))]
+                            (*previous.cells[:2], "77", "77", *previous.cells[4:]), previous.run_ids)]
                         newer = EPOCH + 1200
                         current.completed_refresh_started_at = newer
                         show.write_trend_cache(current)

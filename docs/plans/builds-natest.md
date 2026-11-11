@@ -2759,7 +2759,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:** The cost ledger re-prices every stored reservation with its newest AWS bill at each reserve and resolve, so a cost cached with a day goes stale.
 
-### Phase 136 — Trend costs always match the cost ledger  · status: todo
+### Phase 136 — Trend costs always match the cost ledger  · status: done
 **Depends on:** Phase 135
 
 #### Work Order
