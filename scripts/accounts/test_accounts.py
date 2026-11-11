@@ -6907,7 +6907,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 _, target = self.workers_fixture()
                 failed = self.workers_member("project-review")
                 pending = self.workers_member("project-test")
-                machine = remote.local_machine()
+                machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
                 producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(self.home / ".codex2"),
                     doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
                     worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))

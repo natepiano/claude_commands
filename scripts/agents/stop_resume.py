@@ -928,13 +928,15 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 destination_path = pane_record.record_path(client.session)
                 attempt = pane_launch.resume_attempt(destination_path, tab.pane_id)
                 proof = names.resume_proof(original.entry, completed)
-                source_client = client if original.path == destination_path else herdr.Herdr(original.path.stem)
-                retained = next((pane for pane in source_client.panes() if pane["pane_id"] == original.entry["pane_id"]), None)
-                if ((original.path == destination_path and tab.pane_id == original.entry["pane_id"])
-                        or retained is None or (retained["session_id"] in (None, "", identity)
-                            and isinstance(source_client.pane_activity(retained["pane_id"]), herdr.PaneAtShell))):
-                    pane_launch.finish_restore(original.path, original.entry, attempt, proof, close=client.close_tab_confirmed,
-                                               destination=destination_path, close_source=source_client.close_tab_confirmed)
+                if (original.path, original.entry["pane_id"]) == (destination_path, tab.pane_id):
+                    pane_launch.finish_restore(original.path, original.entry, attempt, proof, close=client.close_tab_confirmed)
+                else:
+                    source_client = client if original.path == destination_path else herdr.Herdr(original.path.stem)
+                    retained = next((pane for pane in source_client.panes() if pane["pane_id"] == original.entry["pane_id"]), None)
+                    if retained is None or (retained["session_id"] in (None, "", identity)
+                            and isinstance(source_client.pane_activity(retained["pane_id"]), herdr.PaneAtShell)):
+                        pane_launch.finish_restore(original.path, original.entry, attempt, proof, close=client.close_tab_confirmed,
+                                                   destination=destination_path, close_source=source_client.close_tab_confirmed)
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: launch record anomaly: {error}", file=sys.stderr)
         attempt_pane = ""

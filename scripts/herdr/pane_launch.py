@@ -150,6 +150,8 @@ def record_directory() -> Path:
 
 
 def read_entries(path: Path) -> dict[str, object]:
+    if not path.parent.exists():
+        return {}
     with _publication_lock(path.parent):
         return _read_entries(path)
 

@@ -56,7 +56,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
         self.assertEqual(entry["environment"], {})
 
     def test_producer_publication_replaces_only_its_proved_binding(self) -> None:
-        cases = ("control same pane", "move", "native reference", "different records", "interrupted records",
+        cases = ("control same pane", "move", "native reference", "different records", "interrupted records", "interrupted then unit write",
                  "wrong identity", "wrong backend", "wrong folder", "unread flags", "ended", "stale process",
                  "stale publication", "repeated publication")
         for kind in ("claude", "codex"):
@@ -73,7 +73,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
                     model = "opus" if kind == "claude" else "gpt-test"
                     registry = write_registry(root / "models.conf", {"producers": {owner.name: f"{kind}:{model}:high"}})
                     source = root / "source.json"
-                    destination = root / "destination.json" if case in ("different records", "interrupted records") else source
+                    destination = root / "destination.json" if case in ("different records", "interrupted records", "interrupted then unit write") else source
                     old = pane_launch.launch("old", owner.id, str(root), {}, [kind], kind=kind)
                     old["written_at"] = "2026-01-01T00:00:00+00:00"
                     if case == "native reference":
@@ -109,7 +109,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
                             self.assertEqual(pane_launch.read_strict(destination),
                                              {"old": old, **unrelated} if destination == source else {})
                             continue
-                        if case == "interrupted records":
+                        if case in ("interrupted records", "interrupted then unit write"):
                             publish = atomic_file.write_text_atomic
                             def interrupt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
                                 if path == source:
@@ -118,6 +118,12 @@ class LaunchEnvironmentTests(unittest.TestCase):
                             with patch.object(atomic_file, "write_text_atomic", side_effect=interrupt):
                                 with self.assertRaises(OSError):
                                     pane_launch.write(destination, launch, sources=(source, destination))
+                            if case == "interrupted then unit write":
+                                update = unrelated["unit"].copy()
+                                update["model"] = "updated-unit-model"
+                                pane_launch.write(source, update)
+                                _ = update.pop("config_dir", None)
+                                unrelated["unit"] = update
                         else:
                             pane_launch.write(destination, launch, sources=(source, destination))
                         committed = pane_launch.read_strict(destination)[target]
