@@ -2443,6 +2443,7 @@ class Ledger:
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
         self._site_rule_families: dict[str, str] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
+        self._test_file_destinations: dict[str, dict[str, tuple[TestFileDestination, ...]]] = {}
         self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
         self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
         self._crate_names: dict[tuple[str, str, str], bool] = {}
@@ -4938,28 +4939,22 @@ class Ledger:
             "SELECT anchor_commit FROM held_findings WHERE finding_id=?", (finding.finding_id,),
         ).fetchone())
         tip = self._tip(anchor or "HEAD")
-        destinations: list[TestFileDestination] = []
-        module_files = {path.parent / name for name in ("mod.rs", "lib.rs", "main.rs")}
-        module_files.add(path.parent.with_suffix(".rs"))
-        for file, blob in tip.blobs.items():
-            candidate = PurePosixPath(file)
-            if candidate not in module_files and (candidate.parent != path.parent or candidate.suffix != ".rs"):
-                continue
-            code = self._rust_code(blob)
-            if not isinstance(code, RustCode):
-                continue
-            words = tuple(token.value for token in code.tokens)
-            for item in style_footprint.source_items(words) or ():
-                if item.kind != "mod" or words[item.keyword + 2:item.end] != (";",):
+        if tip.commit not in self._test_file_destinations:
+            destinations: dict[str, list[TestFileDestination]] = {}
+            for file, blob in tip.blobs.items():
+                if not file.endswith(".rs"):
                     continue
-                attributes = words[item.start:item.keyword]
-                path_attribute = ("#", "[", "path", "=", f'"{path.name}"', "]")
-                mounted = any(attributes[index:index + len(path_attribute)] == path_attribute
-                              for index in range(len(attributes)))
-                plain = candidate in module_files and item.name == path.stem and "path" not in attributes
-                if mounted or plain:
-                    destinations.append(TestFileDestination(file, item.name))
-        return destinations[0] if len(destinations) == 1 else SeparateItemMove()
+                code = self._rust_code(blob)
+                if not isinstance(code, RustCode):
+                    continue
+                words = tuple(token.value for token in code.tokens)
+                for item in style_footprint.source_items(words) or ():
+                    source = style_footprint.external_module_source(file, words, item)
+                    if isinstance(source, style_footprint.ExternalModuleSource):
+                        destinations.setdefault(source.path, []).append(TestFileDestination(file, item.name))
+            self._test_file_destinations[tip.commit] = {file: tuple(owners) for file, owners in destinations.items()}
+        choices = self._test_file_destinations[tip.commit].get(finding.path, ())
+        return choices[0] if len(choices) == 1 else SeparateItemMove()
 
     def _fold_test_file_group(self, findings: tuple[HeldFinding, ...]) -> tuple[FoldedTestFile, ...]:
         """Fold one rule's unclaimed findings into the repository's whole sibling test file move."""

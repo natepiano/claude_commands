@@ -2058,6 +2058,34 @@ class StyleFootprintTests(unittest.TestCase):
                 else:
                     self.assertIsInstance(result, style_footprint.NoItemMoves, result)
 
+    def test_test_file_inlining_resolves_the_complete_module_path(self) -> None:
+        for declaration, name, proven in (
+                ('#[path = "widget_tests.rs"] mod file_tests;', "file_tests", False),
+                ("mod widget_tests;", "widget_tests", True),
+                ('#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;', "file_tests", True)):
+            with self.subTest(declaration=declaration):
+                case = StyleFootprintTests()
+                case.setUp()
+                try:
+                    content = "fn moved_fixture() {}\n"
+                    case.write("src/lib.rs", "mod widget;\n")
+                    case.write("src/widget.rs", declaration + "\n")
+                    case.write("src/widget_tests.rs", "fn different_fixture() {}\n")
+                    case.write("src/widget/widget_tests.rs", content)
+                    base = case.commit()
+                    _ = case.git("rm", "src/widget/widget_tests.rs")
+                    case.write("src/widget.rs", "mod " + name + " {\n" + content + "}\n")
+                    head = case.commit()
+                    changes = style_footprint.changes_between(case.repo, base, head)
+                    tree = style_footprint.RevisionTree(case.repo, base)
+                    result = style_footprint.prove_item_moves(changes, tree)
+                    if proven:
+                        self.assertIsInstance(result, style_footprint.ItemMoves, result)
+                    else:
+                        self.assertIsInstance(result, style_footprint.NoItemMoves, result)
+                finally:
+                    case.doCleanups()
+
     def test_a_const_moved_to_an_existing_constants_module_is_proven(self) -> None:
         result = self.prove_move(self.LIMIT_FILES, self.LIMIT_MOVED)
         assert isinstance(result, style_footprint.ItemMoves), result

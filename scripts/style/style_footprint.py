@@ -15,6 +15,7 @@ from functools import lru_cache
 import difflib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -3036,6 +3037,41 @@ def prove_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> 
         return NoItemMoves(str(refusal))
 
 
+@dataclass(frozen=True)
+class ExternalModuleSource:
+    """The repository path an external module loads and the attributes its inline form keeps."""
+
+    path: str
+    inline_attributes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoExternalModuleSource:
+    """The item has no readable external module source."""
+
+
+def external_module_source(file: str, words: tuple[str, ...], item: SourceItem
+                           ) -> ExternalModuleSource | NoExternalModuleSource:
+    """Resolve a file-level external module declaration to its full repository path."""
+    if item.kind != "mod" or words[item.keyword + 2:item.end] != (";",):
+        return NoExternalModuleSource()
+    attributes = words[item.start:item.keyword]
+    parts = tuple(attributes[begin:end] for begin, end in attribute_spans(attributes))
+    path_parts = tuple(part for part in parts if part[2:3] == ("path",))
+    declaring = PurePosixPath(file)
+    if path_parts:
+        part, = path_parts
+        literal = re.fullmatch(r'"([^"\\]*)"', part[4]) if len(part) == 6 and part[3] == "=" else None
+        if literal is None:
+            return NoExternalModuleSource()
+        source = declaring.parent / literal[1]
+    else:
+        directory = declaring.parent if declaring.name in {"mod.rs", "lib.rs", "main.rs"} else declaring.with_suffix("")
+        source = directory / (item.name + ".rs")
+    return ExternalModuleSource(posixpath.normpath(str(source)),
+                                tuple(word for part in parts if part not in path_parts for word in part))
+
+
 def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:
     """Prove that complete sibling test files replace their private test module declarations."""
     crates = {sources.crate(change.path) for change in changes}
@@ -3059,22 +3095,12 @@ def proven_test_file_inlining(changes: tuple[FileChange, ...], sources: Revision
         if change.status != FileStatus.DELETED:
             continue
         path = PurePosixPath(change.path)
-        path_attribute = ("#", "[", "path", "=", f'"{path.name}"', "]")
-        module_files = {path.parent / name for name in ("mod.rs", "lib.rs", "main.rs")}
-        module_files.add(path.parent.with_suffix(".rs"))
         declarations: list[tuple[str, SourceItem, tuple[str, ...]]] = []
         for file, old in befores.items():
-            if PurePosixPath(file).parent != path.parent and PurePosixPath(file) not in module_files:
-                continue
             for item in old.items:
-                if item.kind != "mod" or item.visibility or old.words[item.keyword + 2:item.end] != (";",):
-                    continue
-                attributes = old.words[item.start:item.keyword]
-                parts = tuple(attributes[begin:end] for begin, end in attribute_spans(attributes))
-                mounted = path_attribute in parts
-                plain = PurePosixPath(file) in module_files and item.name == path.stem and "path" not in attributes
-                if mounted or plain:
-                    declarations.append((file, item, tuple(word for part in parts if part != path_attribute for word in part)))
+                module_source = external_module_source(file, old.words, item)
+                if not item.visibility and isinstance(module_source, ExternalModuleSource) and module_source.path == change.path:
+                    declarations.append((file, item, module_source.inline_attributes))
         if not path.name.endswith("_tests.rs") or len(declarations) != 1:
             raise MoveRefused(f"{change.path}: not one complete sibling test file move")
         parent, declared, attributes = declarations[0]

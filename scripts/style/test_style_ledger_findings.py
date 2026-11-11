@@ -1337,6 +1337,33 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 for path in paths[3:]:
                     self.assertEqual(sum(finding.path == path for finding in live), 3)
 
+    def test_test_file_folding_resolves_the_complete_module_path(self) -> None:
+        rule = self.rule("test-move-paths", "tier: D\nfamily: modules\ninput_scope: file\n")
+        paths: list[str] = []
+        for directory, declaration in (
+                ("wrong", '#[path = "widget_tests.rs"] mod file_tests;'),
+                ("plain", "mod widget_tests;"),
+                ("relative", '#[path = "./widget/../widget/widget_tests.rs"] mod file_tests;')):
+            parent = f"crates/alpha/src/{directory}/widget.rs"
+            path = f"crates/alpha/src/{directory}/widget/widget_tests.rs"
+            self.write(parent, declaration + "\n")
+            self.write(path, "fn moved_fixture() {}\n")
+            self.write(f"crates/alpha/src/{directory}/widget_tests.rs", "fn different_fixture() {}\n")
+            paths.append(path)
+        _ = self.commit("Declare test files with full module paths")
+        ledger = self.ledger()
+        for path in paths:
+            for line in (1, 2):
+                _ = ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
+                                "Inline the whole test file.", self.blob(rule), "outside")
+        folded = ledger.fold_test_files()
+        self.assertEqual({group.path for group in folded}, set(paths[1:]))
+        live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
+        self.assertEqual(tuple(sum(finding.path == path for finding in live) for path in paths), (2, 1, 1))
+        for finding in live:
+            if finding.path != paths[0]:
+                self.assertIn(finding.path.replace("/widget/widget_tests.rs", "/widget.rs"), finding.after)
+
     def test_a_new_test_file_anchor_gets_a_new_aggregate_after_the_old_one_is_built(self) -> None:
         rule = self.rule("test-move-anchors", "tier: D\nfamily: modules\ninput_scope: file\n")
         path = "crates/alpha/src/anchor/widget_tests.rs"

@@ -178,6 +178,10 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 
 Filing folds modules findings from a sibling `*_tests.rs` file under one rule.
 The repository tree supplies the declaring file and module name.
+Both readers use `external_module_source` to compare full repository paths.
+A `#[path]` value resolves from the declaring file's directory.
+A plain declaration resolves from that directory in `mod.rs`, `lib.rs` or `main.rs`.
+In another file `x.rs`, a plain declaration resolves from the `x/` directory.
 The ledger reads the finding’s anchor commit, or HEAD when no anchor exists.
 It reads plain module declarations and declarations with a sibling file in a `#[path]` attribute.
 The finding prose does not select the destination.
@@ -188,6 +192,8 @@ A later anchor creates a new aggregate.
 A fold never withdraws findings into a closed aggregate.
 Files without one declaring file keep their item findings.
 Other sibling files remain separate.
+The order-waste report separates `folded test file duplicate` from `bare rename duplicate`.
+It reads the retained finding's kind to select the duplicate kind.
 
 ### Tickets, hand-offs, processed tips, reconcile
 
