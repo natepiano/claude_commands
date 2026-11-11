@@ -7,6 +7,9 @@ Its instance, Tailscale device, and data volumes are gone.
 Build jobs use `mac` and `natedev` only, in that order.
 Cloud gates still run merge gates and targeted tests on temporary AWS instances.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
+Cloud gates boot the official NixOS image and fetch their tools at boot.
+A saved gate image was taken out of use. Five gates with it had a 32 s median; gates without it had 29 s.
+`deploy.py remove-images --approve-destroy` switches the gates to the official image. It deletes the saved gate image, the former builder image, and their snapshots.
 
 The former builder used host `aws-build` and one persistent Spot `m7a.4xlarge` instance.
 It used NixOS and a retained, encrypted 500 GiB gp3 data volume at `/home`.

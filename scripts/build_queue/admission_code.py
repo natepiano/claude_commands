@@ -11,7 +11,7 @@ ADMISSION_CODE_PATHS = (
     "production/merge_gate.py", "production/targeted_test.py", "lint/memory_gate.sh", "lint/memory_admit.py",
     "build_queue/admission_code.py", "build_queue/admission_client.py", "build_queue/admission_protocol.py", "build_queue/admission_wire.py",
     "build_queue/system_clock.py", "build_queue/admission_records.py", "build_queue/step_estimator.py",
-    "build_queue/admission_service.py", "build_queue/queue_place.py",
+    "build_queue/admission_service.py", "build_queue/queue_place.py", "build_queue/placement.py",
     "build_queue/scope_activity.py", "build_queue/queue_snapshot.py", "build_queue/progress_profile.py", "build_queue/snapshot_codec.py",
     "lib/suite_runners.py", "lib/build_steps.py", "lib/boot_identity.py", "lib/inotify.py", "lib/conf.py", "lib/atomic_file.py", "lib/test_phase.py",
     "lint/build_shape.py", "buildlog/store.py", "buildlog/record.py", "buildlog/repository.py", "buildlog/parse.py",

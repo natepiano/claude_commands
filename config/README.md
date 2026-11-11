@@ -433,25 +433,17 @@ The guard runs before each resource request. `deployment_timeout_s` bounds each 
 `scaler_key_check_delay_s=5` allows IAM time to publish the key between checks.
 The scaler stage keeps other credential profiles and writes the private file with mode `0600`.
 It verifies the new key before deleting old keys. It deletes a new key that fails verification.
-Run `scripts/lib/py scripts/aws_target/deploy.py gate-image --approve-resources` at the terminal to prepare a cloud gate image.
+Cloud gates boot the official NixOS image that `ami_id` names, and fetch their tools at boot.
+A saved gate image was measured and taken out of use: gates were no faster with it, and its snapshot cost 1.60 USD each month.
+To inspect the saved image removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-images`.
 Without the flag, the command prints its plan and needs no credentials.
-The command uses one temporary box and terminates it after success, failure, interruption, or the time limit.
-`gate_image_timeout_s=1200` limits preparation and image availability to 1200 seconds.
-The box also has an expiry timer and the existing gate expiry tags.
-The image key contains only the configured cloud gate packages and the host nixpkgs revision.
-Gate source changes still arrive through the source bundle and never require an image build.
-Changed packages or a changed revision create a new image on the next approved command.
-After the image becomes available, the command removes older gate images and their snapshots.
-It retains the builder image independently.
-The command updates only the live stack GateImage parameter and retains every other parameter and template definition.
-The launch template and its image permission then use the saved image.
-The next gate launch uses the saved image without other launch changes.
-A gate without matching saved tools uses the existing tool fetch.
-The boot stages remain `boot`, `tools ready`, `source ready`, and `tests start`.
-The expected saving is the measured tool fetch: median 24 seconds, range 18 to 119 seconds.
-`gate_image_snapshot_usd_per_gib_month=0.05` supplies the monthly snapshot estimate per GiB.
-The command prints the logical image size and the estimate; AWS bills stored snapshot blocks.
-The ledger includes this estimate until `down` removes the gate image and its snapshot.
+To remove the saved images, run `scripts/lib/py scripts/aws_target/deploy.py remove-images --approve-destroy`.
+The command switches the live stack GateImage parameter to `ami_id` and keeps every other parameter and template definition.
+The old image stays launchable until `gate-deployment.json` names the official image.
+A second stack update then removes the old image permission.
+Then the command deletes the saved gate image, its snapshot, and its cost row.
+Last, it deletes the former builder image, its snapshot, and `image.json`. A later builder `up` would make a new image.
+A repeat after a partial removal continues from the live state. A repeat after a full removal changes nothing.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
 `scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
 The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.

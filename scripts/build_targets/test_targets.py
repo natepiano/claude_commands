@@ -18,9 +18,10 @@ from unittest import mock
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
-from scripts.build_targets import targets
+from scripts.build_targets import build_targets, targets
 from scripts.build_hold import build_hold
 from scripts.mac_test import mac_test
+from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
 from scripts.mac_test import offload
@@ -44,6 +45,10 @@ HoldRecord = TypedDict(
 
 
 class ClaimRecord(TypedDict):
+    claim_id: str
+    episode: str
+    attempt: str
+    submitting_session: str
     pid: int
     proc_start: str
     what: str
@@ -144,6 +149,8 @@ class IsolatedTargetTest(unittest.TestCase):
 
     def write_claim(self, file_name: str = "run.json", what: str = "nextest hana", since: datetime = SINCE) -> None:
         record: ClaimRecord = {
+            "claim_id": file_name, "episode": "fixture-episode", "attempt": "fixture-attempt",
+            "submitting_session": "",
             "pid": 12345,
             "proc_start": "test-run-start",
             "what": what,
@@ -435,6 +442,8 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_ended_repository_claim_leaves_only_live_jobs(self) -> None:
         record: ClaimRecord = {
+            "claim_id": "ended-claim", "episode": "fixture-episode", "attempt": "fixture-attempt",
+            "submitting_session": "",
             "pid": 12345,
             "proc_start": "ended-run-start",
             "what": "nextest cargo-liner",
@@ -567,6 +576,8 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_claim_with_invalid_timestamp_is_a_state_read_failure(self) -> None:
         record: ClaimRecord = {
+            "claim_id": "invalid-time-claim", "episode": "fixture-episode", "attempt": "fixture-attempt",
+            "submitting_session": "",
             "pid": 12345,
             "proc_start": "test-run-start",
             "what": "nextest hana",
@@ -587,6 +598,66 @@ class TargetStateTests(IsolatedTargetTest):
         self.write_block()
         self.assertEqual(targets.target_state(self.mac()),
                          targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END), targets.HolderSession("hana-session")))
+
+
+class ReservationTests(IsolatedTargetTest):
+    def test_takeover_retry_publishes_its_session_after_an_interrupted_publication(self) -> None:
+        _ = self.write_config(
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", template="mac_test")
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.package = "mac", "test", "sample"
+        args.repo_root, args.pid = str(self.root), os.getpid()
+        reservation = self.root / "reservation.tsv"
+        identity_file = self.root / "reservation.identity"
+        args.reservation_file, args.claim_identity_file = str(reservation), str(identity_file)
+        paths = mac_test.StatePaths(self.mac_state)
+        session = build_hold.OwningSession("cleanup-session")
+        write_atomic = atomic_file.write_text_atomic
+
+        def process_start(pid: int) -> process_identity.ProcessStart:
+            return process_identity.Gone() if pid == 12345 else process_identity.Started("cleanup-start")
+
+        for failed_path in (reservation, identity_file):
+            with self.subTest(publication_failure=failed_path.name):
+                reservation.unlink(missing_ok=True)
+                identity_file.unlink(missing_ok=True)
+                retained: mac_test.RemoteJobClaim = {
+                    "claim_id": "kept-claim", "episode": "kept-episode", "attempt": "kept-attempt",
+                    "submitting_session": "original-session", "holder_session": "original-holder",
+                    "pid": 12345, "proc_start": "ended-start", "what": "older tests",
+                    "worktree": str(self.root), "since": SINCE.isoformat(), "remote_host": "test-mac",
+                }
+                mac_test.write_json(paths.run, retained)
+
+                def interrupted_write(path: Path, text: str) -> None:
+                    if path == failed_path:
+                        raise OSError("publication interrupted")
+                    write_atomic(path, text)
+
+                with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}), \
+                        mock.patch.object(build_hold, "owning_session", return_value=session), \
+                        mock.patch.object(process_identity, "process_start", side_effect=process_start), \
+                        mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
+                        mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+                        mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
+                    with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
+                        with self.assertRaisesRegex(OSError, "publication interrupted"):
+                            _ = build_targets.command_reserve(args)
+                    self.assertEqual(reservation.exists(), failed_path == identity_file)
+                    self.assertFalse(identity_file.exists())
+                    self.assertEqual(build_targets.command_reserve(args), 0)
+                self.assertEqual(reservation.read_text(), f"mac\t{self.settings}\n")
+                self.assertEqual(identity_file.read_text(),
+                                 "kept-claim\tkept-episode\tkept-attempt\tcleanup-session\n")
+                saved = mac_test.read_run(paths.run)
+                self.assertNotIsInstance(saved, mac_test.NoRun)
+                assert not isinstance(saved, mac_test.NoRun)
+                self.assertEqual(saved["submitting_session"], "cleanup-session")
+                self.assertEqual({key: value for key, value in saved.items()
+                                  if key not in ("pid", "proc_start", "submitting_session", "cleanup_pending")},
+                                 {key: value for key, value in retained.items()
+                                  if key not in ("pid", "proc_start", "submitting_session", "cleanup_pending")})
 
 
 class ValueTests(unittest.TestCase):
