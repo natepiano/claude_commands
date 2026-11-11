@@ -30,9 +30,9 @@ from urllib.parse import quote
 from scripts.buildlog import store, parse
 
 from scripts.lib import conf
-from scripts.test_times.gate_record import TYPE_CHECK_JOB
+from scripts.test_times.gate_record import TYPE_CHECK_JOB, RecordedConfigReads, RecordedFolderScans, module_read_record
 
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 
 
 # These indexes support repeated queries over the current schema.
@@ -230,6 +230,7 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("skipped", "INTEGER", "skipped tests"),
     ("tests_s", "REAL", "sum of all test times"),
     ("config_reads", "TEXT", "sorted JSON config stems; [] records no reads, NULL means no record"),
+    ("folder_scans", "TEXT", "sorted JSON repository folders; [] records no scans, NULL means no record"),
 ]
 
 GATE_TEST_COLUMNS: list[Column] = [
@@ -952,9 +953,11 @@ def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src:
     for suite_row in entries(record, "suites"):
         insert(connection, "gate_suites", pick({**suite_row, **parent}, GATE_SUITE_COLUMNS))
     for module in module_rows:
-        reads = module.get("config_reads")
-        config_reads = json.dumps(sorted(set(cast(list[str], reads)))) if isinstance(reads, list) else None
-        insert(connection, "gate_modules", pick({**module, **parent, "config_reads": config_reads}, GATE_MODULE_COLUMNS))
+        reads = module_read_record(module.get("config_reads"), module.get("folder_scans"))
+        config_reads = json.dumps(sorted(reads.config_reads.stems)) if isinstance(reads.config_reads, RecordedConfigReads) else None
+        folder_scans = json.dumps(sorted(reads.folder_scans.folders)) if isinstance(reads.folder_scans, RecordedFolderScans) else None
+        insert(connection, "gate_modules", pick({**module, **parent, "config_reads": config_reads,
+                                                "folder_scans": folder_scans}, GATE_MODULE_COLUMNS))
         owner: GateTestOwner = {
             **parent,
             "suite": module.get("suite"),
