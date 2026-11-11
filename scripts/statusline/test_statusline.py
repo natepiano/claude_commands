@@ -819,6 +819,22 @@ class CountsRowTests(unittest.TestCase):
                 self.assertEqual(lines[-1], "For you: 1 question, 1 proposal")
                 self.assertNotIn("project", lines[-1])
                 self.assertNotIn("For you: 1 question, 1 proposal", self.lines("bbbb-2222", shell=shell))
+                instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+                record = self.home / ".local/state/staff/staff.json"
+                saved_record = record.read_text(encoding="utf-8")
+                for kind, enabled in (("showrunner", 0), ("unit", 0)):
+                    with self.subTest(kind=kind, enabled=enabled):
+                        _ = (instance / "state").write_text(f"ENABLED={enabled}\n", encoding="utf-8")
+                        row = replace(OWNER, kind=kind, doc=staff.LiveDoc(remote.local_machine(),
+                                      self.home / "docs/plans/show-production.md"))
+                        _ = record.write_text(staff_text(row), encoding="utf-8")
+                        # Keep the retained counts newer than the changed staff file.
+                        os.utime(self.cache)
+                        if kind == "showrunner":
+                            self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question, 1 proposal")
+                        else:
+                            self.assertFalse(any(line.startswith("For you:") for line in self.lines(shell=shell)))
+                _ = record.write_text(saved_record, encoding="utf-8")
 
     def test_each_count_in_the_row_is_bold_inside_its_shipped_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")

@@ -2244,18 +2244,47 @@ always=natedev
         return {"type": "assistant", "message": {"content": list(blocks)}}
 
     def test_a_compacted_pane_reads_a_blocked_turn_end_from_the_transcript(self) -> None:
-        self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
-                       self.said({"type": "thinking", "thinking": ""}),
-                       self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}))
-        self.assertEqual(self.tick(START).returncode, 0)
-        self.assertEqual(self.tick(START + 3600).returncode, 0)
-        self.assertEqual(self.sent(), [])
+        peer_prompt: dict[str, object] = {
+            "type": "user", "message": {"content": "Peer update: the Ghostty check remains blocked."}}
+        peer_result: dict[str, object] = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "peer-call", "content": "Peer update sent."}]}}
+        for peer_entries in ([],
+                             [peer_prompt, self.said({"type": "text", "text": "—"})],
+                             [peer_prompt,
+                              self.said({"type": "tool_use", "name": "Bash", "id": "peer-call"}),
+                              peer_result,
+                              self.said({"type": "text", "text": " \n—\n "})]):
+            with self.subTest(peer_entries=peer_entries):
+                self.send_log.unlink(missing_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
+                               self.said({"type": "thinking", "thinking": ""}),
+                               self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}),
+                               *peer_entries)
+                if peer_entries:
+                    self.panes["unit-one"]["pane"] = "— holding: waiting on the tests\n"
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 3600).returncode, 0)
+                self.assertEqual(self.sent(), [])
 
     def test_a_compacted_pane_bumps_when_the_transcript_names_own_work_or_went_on(self) -> None:
+        peer_prompt: dict[str, object] = {"type": "user", "message": {"content": [
+            {"type": "text", "text": "Peer update: the Ghostty check remains blocked."}]}}
         for last, status in (([self.said({"type": "text", "text": "— holding: waiting on the tests"})],
                               "— holding: waiting on the tests"),
                              ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
-                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen")):
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "text", "text": "I continue the tests."}),
+                               self.said({"type": "text", "text": "—"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "text", "text": "—"}),
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "tool_use", "name": "Bash"}),
+                               peer_prompt,
+                               self.said({"type": "text", "text": "—"})], "none on screen")):
             with self.subTest(status=status):
                 self.compacted(*last)
                 self.assertEqual(self.tick(START).returncode, 0)

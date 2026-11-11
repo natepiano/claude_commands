@@ -410,10 +410,12 @@ class RowTimerJoinTests(StaffTestCase):
     def test_name_keyed_timer_is_not_a_staff_id_registration(self) -> None:
         row, folder = self.timer("hana")
         folder = folder.rename(folder.with_name(f"showrunner-{row.name}"))
-        with mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", folder.parent):
-            with self.assertRaisesRegex(ValueError, "no showrunner staff row"):
-                _ = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.STRICT,
-                                            record=staff.snapshot())
+        errors = io.StringIO()
+        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", folder.parent),
+              redirect_stderr(errors)):
+            self.assertEqual(showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.STRICT,
+                                                     record=staff.snapshot()), [])
+        self.assertEqual(errors.getvalue(), "")
 
     def test_timer_lookup_does_not_scan_name_keyed_targets(self) -> None:
         row, folder = self.timer("hana")
@@ -655,13 +657,42 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertIn("TARGET=session:" + row.id, configuration.read_text())
 
     def test_a_stopped_timer_still_names_its_showrunner(self) -> None:
-        # A production on demand keeps its timer stopped, and the timer is still the showrunner's record.
         self.instance("showrunner-show", doc=self.doc)
-        _ = (self.notifier / f"showrunner-{showrunners.owner_for("show").id}" / "state").write_text(
+        owner = showrunners.owner_for("show")
+        _ = (self.notifier / f"showrunner-{owner.id}" / "state").write_text(
             "ENABLED=0\nNEXT_DUE=0\nLAST_SENT=0\nLAST_RESTART=0\nLAST_TARGET=\n", encoding="utf-8")
         _ = self.record("on-demand", "live-id")
         self.assertEqual(self.successful("name", "show"), "on-demand\n")
         self.assertIn("show\ton-demand\t", self.successful("list"))
+        self.assertEqual([source.timer.name for source in showrunners.read_sources(
+            self.notifier, unreadable=showrunners.UnreadableTimerPolicy.STRICT)], ["show"])
+        self.assertEqual(showrunners.timer_docs(self.notifier), {"show": self.doc})
+        self.assertEqual(showrunners.timer_names(self.notifier), {"show"})
+        parent = fixture_member("showrunner", name="parent")
+        _ = staff.change_director(owner.id, staff.UnitRole(owner.name, parent.id,
+                                 staff.PresentWorktree("natedev", self.root)))
+        for staff_state, readers in (("unit", ("registry", "sources")),
+                                     ("absent", ("sources", "docs", "names"))):
+            if staff_state == "absent":
+                self.staff_file.unlink()
+            for reader in readers:
+                with self.subTest(staff_state=staff_state, reader=reader):
+                    errors = io.StringIO()
+                    with redirect_stderr(errors):
+                        if reader == "registry":
+                            result = self.cli("list")
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stdout, "")
+                            self.assertEqual(result.stderr, "")
+                        elif reader == "sources":
+                            for policy in showrunners.UnreadableTimerPolicy:
+                                with self.subTest(policy=policy):
+                                    self.assertEqual(showrunners.read_sources(self.notifier, unreadable=policy), [])
+                        elif reader == "docs":
+                            self.assertEqual(showrunners.timer_docs(self.notifier), {})
+                        else:
+                            self.assertEqual(showrunners.timer_names(self.notifier), set())
+                    self.assertEqual(errors.getvalue(), "")
 
 
 
@@ -724,9 +755,9 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual(result.stdout.splitlines(), [
             f"lost-doc\tdirector\t{LOS_ANGELES}\t{self.root / 'lost-production.md'}",
             f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
-        self.assertIn("skipping showrunner-no-target", result.stderr)
-        self.assertIn("skipping showrunner-no-doc:", result.stderr)
-        self.assertIn("no showrunner staff row", result.stderr)
+        self.assertNotIn("skipping showrunner-no-target", result.stderr)
+        self.assertNotIn("skipping showrunner-no-doc:", result.stderr)
+        self.assertNotIn("no showrunner staff row", result.stderr)
         self.assertNotIn("skipping showrunner-lost-doc", result.stderr)
         self.assertIn(f"skipping showrunner-unnamed: session {fixture_runtime_id('unnamed-id')} has no live named process", result.stderr)
 
