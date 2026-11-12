@@ -7606,6 +7606,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
             (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
         _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                                                + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
+                                               + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
                                                + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         _ = (config / "shutdown.conf").write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=10\n")
         registry = write_registry(config / "models.conf")
