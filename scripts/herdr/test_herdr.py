@@ -221,18 +221,19 @@ class NativePaneSessionTests(StaffTestCase):
         proc = self.root / "unheld-proc"
         process = proc / "998079"
         (process / "fd").mkdir(parents=True)
-        for arguments, refusal in ((["codex"], herdr.CodexPaneStarting),
-                          (["codex", "app-server", "--managed-daemon"], ValueError),
-                          (["codex", "exec", "resume", identity], ValueError),
-                          (["codex", "-c", "resume", identity], ValueError)):
+        for arguments, refusal, cause in ((["codex"], herdr.CodexPaneStarting, "pane is starting"),
+                          (["codex", "app-server", "--managed-daemon"], ValueError, "subcommand app-server"),
+                          (["codex", "exec", "resume", identity], ValueError, "subcommand exec"),
+                          (["codex", "-c", "resume", identity], ValueError, "option -c has no =")):
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             with (self.subTest(arguments=arguments),
                   patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
                   patch.object(herdr, "_PLATFORM", "linux"),
                   patch.object(sessions, "process_start", return_value="same-process"),
                   patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": identity})):
-                with self.assertRaisesRegex(refusal, "Codex launch identity is unavailable"):
+                with self.assertRaisesRegex(refusal, "Codex launch identity is unavailable") as failure:
                     _ = herdr.native_process(998079, "codex")
+                self.assertIn(cause, str(failure.exception))
 
     def test_codex_native_process_accepts_only_the_thread_in_its_resume_arguments(self) -> None:
         identity = fixture_runtime_id("argv-thread")
@@ -289,6 +290,7 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(entry.get("pid"), 998070)
 
         for source, report, failure in (("fresh", True, ""), ("fresh", False, ""),
+                                        ("fresh-worker", False, ""),
                                         ("wrapper", False, ""), ("wrapper-without-identity", False, ""),
                                         ("two-fresh", False, "Codex launch has no unique foreground process"),
                                         ("invalid-resume", False, "Codex launch identity is unavailable"),
@@ -296,6 +298,10 @@ class NativePaneSessionTests(StaffTestCase):
                                         ("write-failure", True, "Is a directory")):
             with self.subTest(source=source, report=report), tempfile.TemporaryDirectory(dir=self.root) as folder:
                 arguments = ["resume", "invalid"] if source == "invalid-resume" else []
+                if source == "fresh-worker":
+                    arguments = ["--no-daemon", "--model", "gpt-6.1-sol", "--sandbox", "danger-full-access",
+                                 "--ask-for-approval", "never", "-c", 'model_reasoning_effort="high"',
+                                 "-c", "notice.hide_rate_limit_model_nudge=true"]
                 with (codex_launch_evidence(Path(folder), ["codex", *arguments]) as process_info,
                       patch.object(client, "start_command", return_value=subprocess.CompletedProcess[str]([], 0, "", "")),
                       redirect_stderr(io.StringIO()) as errors):
@@ -332,7 +338,7 @@ class NativePaneSessionTests(StaffTestCase):
                     self.assertIn("legacy launch publication is unavailable:", errors.getvalue())
                     self.assertIn(failure, errors.getvalue())
                     self.assertIn("; launch continues\n", errors.getvalue())
-                elif source == "fresh" and not report:
+                elif source in {"fresh", "fresh-worker"} and not report:
                     self.assertEqual(errors.getvalue(), "herdr codex-worker:w1:p1: pane is starting; pane retained\n")
                     self.assertNotIn("anomaly", errors.getvalue())
                 else:
@@ -473,33 +479,40 @@ class NativePaneSessionTests(StaffTestCase):
                 self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
 
         pending_launches = (
-            (["codex"], True),
-            (["codex", "Explain this repository"], True),
-            (["codex", "--", "Explain this repository"], True),
-            (["codex", "--model", "test-model", "--no-alt-screen"], True),
-            (["codex", "--config=resume"], False),
-            (["codex", "-cresume"], False),
-            (["codex", '-cmodel="test-model"'], True),
-            (["node", "/opt/@openai/codex/bin/codex.js"], True),
-            (["codex", "resume", "--last"], False),
-            (["codex", "exec"], False),
-            (["codex", "--future-option"], False),
-            (["codex", "--model"], False),
-            (["codex", "--model", "--no-alt-screen"], False),
+            (["codex"], True, ""),
+            (["codex", "--no-daemon", "--model", "gpt-6.1-sol", "--sandbox", "danger-full-access",
+              "--ask-for-approval", "never", "-c", 'model_reasoning_effort="high"',
+              "-c", "notice.hide_rate_limit_model_nudge=true"], True, ""),
+            (["codex", "Explain this repository"], True, ""),
+            (["codex", "--", "Explain this repository"], True, ""),
+            (["codex", "--model", "test-model", "--no-alt-screen"], True, ""),
+            (["codex", "--config=resume"], False, "option --config has no ="),
+            (["codex", "-cresume"], False, "option -c has no ="),
+            (["codex", '-cmodel="test-model"'], True, ""),
+            (["node", "/opt/@openai/codex/bin/codex.js"], True, ""),
+            (["codex", "resume", "--last"], False, "bad resume id"),
+            (["codex", "exec"], False, "subcommand exec"),
+            (["codex", "--future-option"], False, "unknown option --future-option"),
+            (["codex", "--future-option=private-value"], False, "unknown option --future-option"),
+            (["codex", "--model"], False, "option --model has a missing or dash value"),
+            (["codex", "--model", "--no-alt-screen"], False, "option --model has a missing or dash value"),
         )
-        for arguments, starting in pending_launches:
+        for arguments, starting, cause in pending_launches:
             with self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence:
                 pane = herdr.json_object(evidence["pane"], "fixture pane")
                 pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
                 info = herdr.json_object(evidence["process_info"], "fixture process info")
                 info.update(shell_pid=998069, foreground_process_group_id=998070)
-                with self.assertRaises(herdr.CodexSessionPending if starting else ValueError):
+                with self.assertRaises(herdr.CodexSessionPending if starting else ValueError) as failure:
                     _ = herdr.codex_resume_thread(998070)
                 identity = herdr.codex_launch_identity(998070, "")
                 if starting:
                     self.assertIsInstance(identity, herdr.StartingCodexPane)
                 else:
                     self.assertIsInstance(identity, herdr.CodexLaunchIdentityUnknown)
+                    assert isinstance(identity, herdr.CodexLaunchIdentityUnknown)
+                    self.assertEqual(identity.reason, f"pid 998070: Codex launch identity is unavailable: {cause}")
+                    self.assertEqual(str(failure.exception), identity.reason)
                 client = herdr.Herdr("agents")
                 with redirect_stderr(io.StringIO()) as notes:
                     scan = client.scan_row_panes(staff.initial_snapshot(), [pane])
