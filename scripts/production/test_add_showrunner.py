@@ -27,6 +27,7 @@ from scripts.production import showrunners
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
 from scripts.herdr import herdr
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr.fake_herdr import CommandResponse
 
 from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT
@@ -425,6 +426,32 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             retry = self.run_command("kid")
         self.assertEqual(retry.returncode, 2, retry.stdout + retry.stderr)
         self.assertIn(f"pending backend {native} differs from {other_native}", retry.stderr)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_args.args[0], receipt_path)
+        self.assertEqual(staff.by_id(child.id), renamed)
+        self.assertEqual((self.staff.staff_file.read_bytes(), receipt_path.read_bytes(), self.herdr_calls()), before)
+
+    def test_pending_retry_refuses_a_pane_reused_after_the_first_native_read(self) -> None:
+        native = "cfc4564d-fed3-5803-9a4c-e3119733bb53"
+        self.starts(native, registers="kid")
+        first = self.run_command("kid")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        child = staff.by_path("kid")
+        assert child is not None
+        renamed = staff.rename(child.id, "renamed-kid")
+        receipt_path = self.root / "showrunner" / child.id / "add_showrunner.json"
+        receipt = completion_receipt.read_launch_receipt(receipt_path, staff.snapshot())
+        self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)
+        before = self.staff.staff_file.read_bytes(), receipt_path.read_bytes(), self.herdr_calls()
+        other_native = fixture_runtime_id("another-showrunner-backend")
+        with (patch.object(completion_receipt, "read_launch_receipt",
+                           wraps=completion_receipt.read_launch_receipt) as read,
+              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr.Herdr, "native_session", side_effect=[native, other_native])):
+            with patch.object(add_showrunner, "running", return_value=False):
+                retry = self.run_command("kid")
+        self.assertEqual(retry.returncode, 2, retry.stdout + retry.stderr)
+        self.assertIn(f"session {native} does not own kid's tab", retry.stderr)
         self.assertEqual(read.call_count, 1)
         self.assertEqual(read.call_args.args[0], receipt_path)
         self.assertEqual(staff.by_id(child.id), renamed)
@@ -920,6 +947,24 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
     def test_launch_check_with_no_ending_tab_refuses_a_same_named_shared_tab(self) -> None:
+        for shown in (None, "old-showrunner-title"):
+            with self.subTest(native_title=shown):
+                case = StaffTestCase()
+                case.setUp()
+                try:
+                    world = PaneWorld()
+                    world.setup(case)
+                    owner = fixture_member("showrunner", name="native-child")
+                    other = fixture_member("showrunner", name="other-child")
+                    world.add(owner, "w1:p1")
+                    world.locations["w1:p1"]["label"] = shown
+                    world.add(other, "w1:p2", label="native-child")
+                    with patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]):
+                        self.assertTrue(add_showrunner.herdr_tab_open("native-child", add_showrunner.EndingUnitTab("w1:p2")))
+                        self.assertFalse(add_showrunner.herdr_tab_open("old-showrunner-title", add_showrunner.NO_ENDING_TAB))
+                finally:
+                    case.doCleanups()
+
         (self.state / "live-agents").touch()
         self.refused(self.run_command("kid", "--check"), "a tab named kid is already open in herdr session agents")
         self.assertIn(["--session", "agents", "pane", "list"], self.herdr_calls())

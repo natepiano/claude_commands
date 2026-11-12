@@ -15,6 +15,9 @@ from scripts.message.sessions import SessionRecord, running_sessions
 from scripts.lib.user_zone import user_zone_name
 
 
+OWNER_NOT_RECORDED = "owner not recorded"
+
+
 @dataclass(frozen=True)
 class UnderShowrunner:
     production: str
@@ -76,6 +79,11 @@ class UnitLabels:
     showrunner: str = "—"
     unit: str = "—"
 
+    @property
+    def owner_text(self) -> str:
+        """Show the session name when the owner has no production or unit."""
+        return self.session if self.showrunner == "—" and self.unit == "—" else self.showrunner
+
     def folder_name(self) -> str:
         """Name a copies folder from the owning director's labels.
 
@@ -96,7 +104,8 @@ def make_labels(name: str, showrunner: ShowrunnerRelationship,
                  director: DirectorRelationship) -> UnitLabels:
     production = " ".join(production_of(showrunner).split())
     unit = " ".join(unit_of(director).split())
-    return UnitLabels(" ".join(name.split()), production or "—", unit or "—")
+    session = " ".join(name.split())
+    return UnitLabels(session, production or "—", unit or "—")
 
 
 def production_of(showrunner: ShowrunnerRelationship) -> str:
@@ -363,9 +372,32 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                             if owner in names else UnitWithoutRunningDirector(unit))
             labels[session_id] = make_labels(names[session_id], showrunner, director)
         labels.update(codex_unit_labels(wanted - labels.keys(), records, places, membership=record))
+        labels.update(recorded_owner_labels(wanted - labels.keys(), record))
         return labels
     except Exception:
         return {}
+
+
+def recorded_owner_labels(wanted: set[str], record: staff.StaffSnapshot) -> dict[str, UnitLabels]:
+    """Keep recorded ownership when the session registry has no live entry."""
+    labels: dict[str, UnitLabels] = {}
+    for session_id in wanted:
+        member = record.by_current_session(session_id) if session_id else None
+        if member is None:
+            continue
+        showrunner: ShowrunnerRelationship = NoShowrunner()
+        director: DirectorRelationship = NoDirector()
+        if member.kind == "showrunner":
+            showrunner = RunsProduction(member.name)
+        elif member.kind == "unit":
+            director = DirectsUnit(member.name)
+            parent = record.parent_of(member)
+            if parent is not None and parent.kind == "showrunner":
+                showrunner = ProductionWithoutRunningShowrunner(parent.name)
+        elif member.kind == "worker":
+            director, showrunner = staff_relationships(record, member, {}, {})
+        labels[session_id] = make_labels(member.name, showrunner, director)
+    return labels
 
 
 def live_runs(

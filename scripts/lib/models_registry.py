@@ -135,11 +135,16 @@ class LaunchSettings(NamedTuple):
 def claude_model(model: str, environment: Mapping[str, str]) -> str:
     """Resolve a model with the selected launch account's catalog."""
     try:
+        home = Path(environment.get("HOME", str(Path.home())))
+        path = Path(environment.get("MODELS_CONFIG_FILE") or home / ".claude/config/models.conf")
+        configuration = LaunchModelConfiguration(*_snapshot(environment, OPERATION_ENVIRONMENT[0], path))
         result = subprocess.run(
-            ["bash", "-c", 'source "$1" && _agents_model_slug claude "$2"', "claude-model",
+            ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
+             + '_agents_model_slug claude "$2"', "claude-model",
              str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), model],
+            input=configuration_shell(configuration),
             env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return model
     return result.stdout.strip()
 

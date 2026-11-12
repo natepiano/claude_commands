@@ -104,8 +104,9 @@ def _helper_process(client: herdr.Herdr, pane: herdr.PaneIdentity) -> bool:
             continue
         try:
             native = herdr.pane_native_process(info, kind, pane)
-        except herdr.CodexPaneStarting:
-            return entry is None
+        except (herdr.CodexPaneStarting, herdr.CodexSessionPending):
+            # A pending consultation restart can replace its previous native launch.
+            return entry is None or "staff_id" not in entry and bool(entry.get("name"))
         if entry is not None and "staff_id" not in entry and (
                 entry.get("session_id") == native.current_identity
                 or entry.get("pid") == process.get("pid") and entry.get("proc_start") == native.started):
@@ -114,7 +115,7 @@ def _helper_process(client: herdr.Herdr, pane: herdr.PaneIdentity) -> bool:
         if record.by_member_reference(native.current_identity) is not None:
             return False
         if entry is None:
-            return True
+            return False
         return pane_launch.matching_launch({identity: entry}, herdr.HerdrPlace(client.session, identity),
                                           native.current_identity) is not None
     return entry is None
@@ -123,15 +124,22 @@ def _helper_process(client: herdr.Herdr, pane: herdr.PaneIdentity) -> bool:
 def _find(client: herdr.Herdr, panes: list[herdr.PaneIdentity], caller: CallerPane, label: str) -> SidePane:
     candidates: list[herdr.PaneIdentity] = []
     activities: dict[str, herdr.PaneAtShell | herdr.PaneRunning] = {}
+    entries = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json")
     for pane in panes:
-        if pane.get("pane_id") == caller.pane or pane.get("tab_id") != caller.tab or pane.get("label") != label:
+        if pane["pane_id"] == caller.pane or pane.get("tab_id") != caller.tab:
             continue
         identity = pane["pane_id"]
+        entry = entries.get(identity)
+        if entry is not None:
+            if "staff_id" in entry or entry.get("name") != label:
+                continue
+        # Consultation starts use names only before a native identity and launch record exist.
+        elif pane.get("label") != label:
+            continue
         try:
             activity = client.pane_activity(identity)
             if isinstance(activity, herdr.PaneAtShell):
-                entry = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json").get(identity)
-                eligible = entry is None or "staff_id" not in entry
+                eligible = True
             else:
                 eligible = _helper_process(client, pane)
             if eligible:
@@ -140,7 +148,7 @@ def _find(client: herdr.Herdr, panes: list[herdr.PaneIdentity], caller: CallerPa
         except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             return _note(client, identity, str(error))
     try:
-        pane = worker_panes.labelled_pane(candidates, caller.tab, label, exclude=caller.pane)
+        pane = worker_panes.selected_pane(panes, candidates, label)
     except ValueError as error:
         raise SidePaneRefused(str(error)) from error
     if isinstance(pane, herdr.NoPane):
@@ -176,8 +184,11 @@ def open(label: str, policy: worker_panes.LaunchPolicy, *, question: str = "", c
     else:
         ratio = config.number("WORKER_SPLIT_RATIO")
         destination = herdr.SplitPane(caller.pane, "right", ratio, label)
+    arguments = worker_panes.launch_arguments(policy, "", cwd)
+    if policy.settings.kind == "claude":
+        arguments.extend(["-n", label])
     launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-        worker_panes.launch_arguments(policy, "", cwd), herdr.NoOpeningPrompt(),
+        arguments, herdr.NoOpeningPrompt(),
         int(config.number("PANE_AGENT_START_SECONDS") * 1000), agent=label)
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return _note(client, launched.pane, launched.outcome.reason)
@@ -187,6 +198,21 @@ def open(label: str, policy: worker_panes.LaunchPolicy, *, question: str = "", c
         # The agent just launched in this call, so it holds no draft and needs no composer check.
         text = f"{question}\n{caller.reply_command}" if isinstance(delivery, worker_panes.ReplyToCaller) else question
         client.prompt_terminal(result.pane, result.terminal, text)
+        if policy.settings.kind == "codex":
+            deadline = monotonic() + config.number("PANE_AGENT_START_SECONDS")
+            while True:
+                try:
+                    _ = client.native_pane_process(result.pane, "codex", max(0, deadline - monotonic()))
+                    entry = client.codex_launch(result.pane)
+                except (herdr.CodexPaneStarting, herdr.CodexSessionPending) as error:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        return _note(client, result.pane, str(error))
+                    _ = Event().wait(min(0.1, remaining))
+                else:
+                    entry["name"] = label
+                    pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
+                    break
     return result
 
 

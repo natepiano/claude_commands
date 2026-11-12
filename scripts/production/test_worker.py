@@ -1861,16 +1861,16 @@ class WorkerCommandTests(unittest.TestCase):
                     def fail(*_arguments: object, **_options: object) -> str:
                         row, = staff.find(kind="worker", parent=case.fixture.parent.id)
                         rows.append(row)
-                        if family == "claude":
-                            path = case.fixture.root / "pane-records/agents.json"
-                            entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
-                            case.assertEqual(entries, {})
                         raise ValueError("TEST recorder failed")
                     with (patch.object(progress_history, "begin_dispatch", side_effect=fail),
                           patch.object(case.fixture.world, "close_tab_confirmed", side_effect=refuse_empty_target),
                           redirect_stderr(io.StringIO()) as errors):
                         with case.assertRaisesRegex(ValueError, "TEST recorder failed"):
                             _ = case.dispatch()
+                    if family == "claude":
+                        path = case.fixture.root / "pane-records/agents.json"
+                        entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
+                        case.assertEqual(entries, {})
                     row, = rows
                     case.assertEqual(targets, [str(row.current_session)])
                     case.assertIsNone(staff.by_id(row.id))

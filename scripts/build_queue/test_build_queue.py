@@ -64,6 +64,11 @@ class QueueTests(NotificationGuardedTestCase):
         super().setUp()
         self.fixture = self.enterContext(QueueFixture(captured=False))
         self.root = self.fixture.root
+        mac_cache = self.root / "mac-builds.json"
+        _ = mac_cache.write_text(json.dumps({"read_at": NOW, "builds": [], "error": ""}))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=mac_cache))
+        _ = self.enterContext(mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.read_mac_builds()))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_activity_refresh_seconds", return_value=30))
         _ = cast(object, self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=self.fixture.read)))
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
         config = self.root / "build_admission.conf"
@@ -410,6 +415,12 @@ class QueueTests(NotificationGuardedTestCase):
         with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unitless priority write")):
             self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
 
+    def test_unowned_row_refuses_a_bump_without_writing_priority(self) -> None:
+        _ = self.fixture.waiter(100, "", "")
+        self.labels_read.return_value = {}
+        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unowned priority write")):
+            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
+
     def test_admit_head_and_clear_from_any_session_send_the_actor(self) -> None:
         for arguments in (("admit-head", "urgent"), ("clear",)):
             for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
@@ -500,7 +511,7 @@ class QueueTests(NotificationGuardedTestCase):
             rows = waiting_rows(queue_view.render_view(model, 140))
         self.assertEqual(len(rows), 32)
         self.assertEqual([row[:3] for row in rows[:10]], [f"{n:>3}" for n in range(1, 11)])
-        self.assertEqual([row.index("nextest") for row in rows[:2]], [40, 40])
+        self.assertEqual([row.index("nextest") for row in rows[:2]], [47, 47])
         self.assertTrue(all("| ---" not in row for row in rows))
 
     def test_head_line_short_forms_share_the_recorded_head_and_bump_facts(self) -> None:
@@ -701,12 +712,12 @@ class QueueTests(NotificationGuardedTestCase):
             if line.startswith("#") or line.startswith("Selected running step:"))
             for session, _ in identities)
         for label in ("hana · organon · organon-ci88", "hana · merge · merge-gate", "hana · hana-showrunner",
-                      "standalone", "offline · orphan", "recorded", "tree-7"):
+                      "standalone", "offline · orphan", "owner not recorded · recorded", "owner not recorded · tree-7"):
             cards = [row for row in text.splitlines() if row.startswith("#")]
             running_rows = [row for row in text.splitlines() if row.startswith("Selected running step:")]
-            self.assertEqual(sum(label in row for row in cards), 1)
+            self.assertEqual(sum(f" · {label} · " in row for row in cards), 1)
             session_label = label.split(" · ")[-1]
-            self.assertEqual(sum(session_label in row for row in running_rows), 1)
+            self.assertEqual(sum(f" / {session_label}, " in row for row in running_rows), 1)
         self.assertNotIn("clone88ci", text)
         self.assertNotIn("Roster:", text)
 

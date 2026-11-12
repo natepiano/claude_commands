@@ -19,7 +19,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
+from scripts.message import sessions as native_sessions
 from scripts.herdr import herdr_types
 
 from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
@@ -91,8 +92,17 @@ class LaunchOptions(argparse.Namespace):
 
 
 def _tab_pane(name: str) -> str:
-    """The pane of the shared session's tab named `name`; empty when no such tab is open."""
-    return next((pane["pane_id"] for pane in herdr.Herdr(herdr.shared_session()).panes() if pane.get("label") == name), "")
+    """Find a member or native launch by its name, then prove its pane."""
+    shared = herdr.shared_session()
+    client = herdr.Herdr(shared)
+    panes = client.panes()
+    record = staff.initial_snapshot()
+    entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
+    references = pane_launch.named_references(name, record, entries)
+    scan = client.scan_row_panes(record, [dict(pane) for pane in panes]) if record.rows else herdr.RowPaneScan({}, [])
+    evidence = pane_launch.NativePaneEvidence(panes, scan)
+    return next((str(pane["pane_id"]) for reference in references
+                 for pane in pane_launch.reference_panes(reference, record, client, entries, evidence=evidence)), "")
 
 
 def _attach(pane: str) -> None:
@@ -147,7 +157,13 @@ def _launch(verb: str, arguments: list[str]) -> int:
     shared = herdr.shared_session()
     _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
     panes = herdr.Herdr(shared).panes()
-    taken = {pane.get("label") for pane in panes}
+    record = staff.initial_snapshot()
+    entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
+    opened = {pane["pane_id"] for pane in panes}
+    taken = {row.name for row in record.rows}
+    taken.update(entry["name"] for pane, entry in entries.items() if pane in opened and "staff_id" not in entry)
+    taken.update(session["name"] for session in native_sessions.running_sessions()
+                 if record.by_member_reference(session["sessionId"]) is None)
     name = options.name or next(candidate for candidate in (
         herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
         if candidate not in taken)
