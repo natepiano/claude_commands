@@ -2271,13 +2271,20 @@ def disk_section() -> list[str]:
         rows.append([free_label, gib(snapshot["free"])])
     rows.extend([f"Cargo outputs unavailable: {reason}", "unavailable"]
                 for reason in snapshot.get("output_unavailable", []))
-    measured = sync.sync_time(snapshot["measured_at"], datetime.now())
+    now = datetime.now()
+    measured = sync.sync_time(snapshot["measured_at"], now)
+    capacity_measured_at = snapshot.get("capacity_measured_at", snapshot["measured_at"])
+    if capacity_measured_at != snapshot["measured_at"]:
+        capacity = sync.sync_time(capacity_measured_at, now)
+        measurement = f"Folder sizes measured by the buildlog disk job at {measured}; free and used space at {capacity}"
+    else:
+        measurement = f"Measured by the buildlog disk job at {measured}"
     return [
         f"### Disk: {snapshot['host']}",
         "",
         *table(["Where", "Size"], rows),
         "",
-        f"Measured by the buildlog disk job at {measured}: allocated blocks, each hard-linked file once.",
+        f"{measurement}: allocated blocks, each hard-linked file once.",
         "",
     ]
 

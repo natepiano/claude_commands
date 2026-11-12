@@ -3037,6 +3037,17 @@ class ReportTests(unittest.TestCase):
         disk.write_snapshot(expanded)
         self.assertEqual(report.disk_section(), old_lines)
         self.assertIn("| /tmp | 1.0 GiB |", old_lines)
+        for capacity_at in (base["measured_at"], "2026-10-04T16:24:00+00:00"):
+            with self.subTest(capacity_measured_at=capacity_at):
+                disk.write_snapshot({**expanded, "capacity_measured_at": capacity_at})
+                with mock.patch.object(sync, "sync_time", side_effect=[base["measured_at"], capacity_at]):
+                    lines = report.disk_section()
+                if capacity_at == base["measured_at"]:
+                    expected = f"Measured by the buildlog disk job at {base['measured_at']}"
+                else:
+                    expected = (f"Folder sizes measured by the buildlog disk job at {base['measured_at']}; "
+                                f"free and used space at {capacity_at}")
+                self.assertIn(f"{expected}: allocated blocks, each hard-linked file once.", lines)
 
     def test_no_disk_section_without_snapshot(self) -> None:
         with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=None):
