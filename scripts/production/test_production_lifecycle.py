@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +37,7 @@ from scripts.production.production_doc import read_production, Refusal
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 
 def setUpModule() -> None:
@@ -647,6 +649,17 @@ class LifecycleTests(LifecycleFixture):
         second = self.run_lifecycle("promote-main", "--no-ci")
         self.assert_step(second, "ok")
         self.assertIn(f"{destination}: already at {tip}", second.stdout)
+
+        with self.subTest(holder="another process"):
+            reject.unlink()
+            self.write(self.checkout / "second.txt", "another promotion\n")
+            _ = self.git("add", "second.txt")
+            _ = self.git("commit", "-m", "another promotion")
+            _ = self.git("push", "origin", "production")
+            command = [sys.executable, str(Path(production_lifecycle.__file__)), "promote-main",
+                       "--production", "example", "--no-ci"]
+            _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
+            self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
 
     def test_promote_main_holds_foreign_local_main_commit_without_push(self) -> None:
         self.running()

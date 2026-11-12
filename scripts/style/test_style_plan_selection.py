@@ -291,6 +291,7 @@ class StylePlanTests(StylePlanFixture):
         finding, = self.ledger().proposal_findings(issue)
         _ = self.git("rm", finding.path)
         self.commit_to_every_checkout()
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.root / "modules")
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
         # A declaration reading cannot make a missing file available.
@@ -563,6 +564,7 @@ class StylePlanTests(StylePlanFixture):
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
 
@@ -579,6 +581,7 @@ class StylePlanTests(StylePlanFixture):
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         for path in self.sources[1:]:
             self.record(structure, path, self.tip)
             self.record(read, path, self.tip)

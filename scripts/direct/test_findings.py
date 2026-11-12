@@ -278,18 +278,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["lens"] for event in opened], expected)
 
-    def test_an_unknown_lens_is_refused_and_records_nothing(self) -> None:
-        self.write_progress_state("instance-a")
-        for lens in ("style", "adversary,style", "both,craft", "craft,"):
-            result = self.run_failing_command(
-                "open", "--severity", "minor", "--title", "misspelt lens",
-                "--caught-by", "worker", "--lens", lens,
-            )
-            self.assertEqual(result.returncode, 2, lens)
-            self.assertIn("argument --lens: unknown lens", result.stderr)
-        self.assertEqual(self.status()["findings"], [])
-        self.assertEqual(self.events(), [])
-
     def test_first_round_gates_blocker_and_minor_but_never_nits(self) -> None:
         _ = self.open_finding("blocker", "null deref")
         _ = self.open_finding("minor", "unused import")
@@ -329,12 +317,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must repair every gating open finding together", result.stderr)
         self.assertIn("F002", result.stderr)
-
-    def test_dispatch_refuses_unknown_ids(self) -> None:
-        _ = self.open_finding("blocker", "null deref")
-        result = self.run_failing_command("dispatch", "--covers", "F001,F099")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Unknown finding ids", result.stderr)
 
     def test_dispatch_refuses_when_the_gate_says_converged(self) -> None:
         _ = self.open_finding("nit", "comment typo")
@@ -575,12 +557,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         ]
         self.assertEqual(abandoned[0]["reason"], "the user stopped the launcher")
 
-    def test_abandon_refuses_when_no_repair_is_in_flight(self) -> None:
-        _ = self.open_finding("blocker", "null deref")
-        result = self.run_failing_command("abandon", "--reason", "nothing to abandon")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No repair round is in flight", result.stderr)
-
     def test_landed_is_quiet_when_no_repair_is_in_flight(self) -> None:
         """Implementation dispatches call it too, and must not fail because of it."""
         _ = self.open_finding("blocker", "null deref")
@@ -663,32 +639,6 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         payload = self.gate()
         self.assertEqual(payload["verdict"], "dispatch")
         self.assertIsNone(payload["advisory"])
-
-    # Keep process configuration coverage.
-    @process_boundary
-    def test_an_unusable_config_value_stops_the_run(self) -> None:
-        """A bad value is an error, not a fall back to some compiled limit."""
-        self.write_config("MIN_REPAIR_BUDGET=zero\n")
-        result = self.run_failing_command("gate")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("MIN_REPAIR_BUDGET=zero is not a whole number", result.stderr)
-        self.assertEqual(result.stdout, "")
-
-    def test_a_missing_config_key_stops_the_run(self) -> None:
-        """Every limit must be set, and one run names all of the missing ones."""
-        self.write_partial_config("# whole: 1..\nMIN_REPAIR_BUDGET=3\n")
-        result = self.run_failing_command("gate")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("RUNAWAY_ROUNDS is not set", result.stderr)
-        self.assertIn("MAX_REVIEW_CANCELLATIONS is not set", result.stderr)
-        self.assertNotIn("MIN_REPAIR_BUDGET", result.stderr)
-
-    def test_a_missing_config_file_stops_the_run(self) -> None:
-        """No config at all is the same error, not a run on defaults."""
-        self.config_file.unlink()
-        result = self.run_failing_command("gate")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("cannot be read", result.stderr)
 
     def test_repair_budget_scales_with_the_original_finding_count(self) -> None:
         """Eight findings buy four rounds; two buy the floor of three."""

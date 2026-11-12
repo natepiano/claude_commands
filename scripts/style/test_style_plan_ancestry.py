@@ -46,6 +46,34 @@ class StylePlanTests(StylePlanFixture):
         self.record(read, self.sources[0], merged, ticket="1")
         self.assertEqual(self.cell_state(read, self.sources[0]), "current")
 
+    def test_refill_issues_no_ticket_when_the_unit_tip_is_one_commit_behind_the_synced_tip(self) -> None:
+        _ = self.rule("read")
+        unit_tip = self.git("rev-parse", "HEAD", cwd=self.unit)
+        path = "crates/alpha/src/new_at_synced_tip.rs"
+        self.write(path, "pub fn new_at_synced_tip() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.assertEqual(self.git("rev-parse", self.tip + "^"), unit_tip)
+        self.assertFalse((self.unit / path).exists())
+        _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
+
+        self.assertEqual(self.run_next(),
+                         (6, f"merge the style branch first: unit tip {unit_tip[:7]} is behind the synced tip {self.tip[:7]}\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_refill_waits_for_sync_when_the_style_branch_lacks_the_synced_tip(self) -> None:
+        _ = self.rule("read")
+        unit_tip = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.write("crates/alpha/src/new_at_synced_tip.rs", "pub fn new_at_synced_tip() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.style), unit_tip)
+
+        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], [ticket_owner_id("names")])
+
     def test_refill_issues_a_stale_cell_whose_inputs_at_the_unit_tip_changed_since_its_judgment(self) -> None:
         read, _ = self.judged_at_unit_tip_then_style_moves()
         _ = (self.unit / "crates/alpha/README.md").write_text("Unit notes.\n")
@@ -70,7 +98,7 @@ class StylePlanTests(StylePlanFixture):
 
         _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
         self.assertEqual(self.run_next(),
-                         (6, f"merge the style branch first: 2 cells judged at {unit_tip[:7]} wait for style/main\n", ""))
+                         (6, f"merge the style branch first: unit tip {unit_tip[:7]} is behind the synced tip {self.tip[:7]}\n", ""))
         self.assertEqual(self.sync_wait_rows(), [])
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
@@ -104,7 +132,7 @@ class StylePlanTests(StylePlanFixture):
 
         self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
 
-    def test_refill_waits_for_sync_when_the_unit_tip_is_not_in_the_style_tip(self) -> None:
+    def test_refill_requires_the_synced_tip_when_the_unit_and_style_tips_diverge(self) -> None:
         read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()
         for path in self.sources:
@@ -118,7 +146,9 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
         self.assertEqual(self.candidates(), ())
 
-        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        unit_tip = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.assertEqual(self.run_next(),
+                         (6, f"merge the style branch first: unit tip {unit_tip[:7]} is behind the synced tip {self.tip[:7]}\n", ""))
 
     def test_refill_issues_a_cell_whose_newest_judgment_is_not_in_the_unit_tip(self) -> None:
         read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
@@ -172,6 +202,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.cell_state(read, self.sources[0]), "open")
 
         self.assertEqual(self.candidates(), ())
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
         code, output, errors = self.run_next()
         self.assertEqual((code, errors), (3, ""))
         self.assertEqual(output, "waiting for structure: crates/alpha\n")
@@ -192,7 +223,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.candidates("modules"), ())
 
         self.assertEqual(style_plan.next_phase("modules", plan, self.repo),
-                         style_plan.MergeStyleBranchFirst(2, unit_tip, "refs/heads/style/main"))
+                         style_plan.UnitNeedsSyncedTip(unit_tip, self.tip))
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.root / "modules")
         self.assertEqual(style_plan.next_phase("modules", plan, self.repo), style_plan.PhaseWritten("1"))
         ticket = self.ledger().ticket_open(ticket_owner_id("modules"))[0]

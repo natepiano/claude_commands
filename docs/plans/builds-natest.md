@@ -2768,7 +2768,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 #### Work Order
 
-**Goal:** A recorder start costs less CPU, and the gate modules that start the recorder save at least 30 CPU s in sum, with the same tests.
+**Goal:** A recorder start costs less CPU, and the gate modules that start the recorder use less CPU in sum, with the same tests. User, 2026-11-11: any measured saving ships.
 
 **Decision:** Director, 2026-11-11, from the Phase 137 research: deferred imports saved 16.4 CPU s in `direct/test_verify_wait_holder.py` alone. Savings may join across modules.
 
@@ -2797,7 +2797,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - basedpyright reports zero errors and zero warnings on the three files and their callers.
 - The direct and production suites pass.
-- An aws paired trial, 3 rounds, over the named modules with the most recorder starts gives a summed paired median saving of at least 30 CPU s, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
+- An aws paired trial, 3 rounds, over the five modules with the most `progress_history.py` starts gives a summed paired median saving greater than zero, with the same test counts. Both trial revisions contain Phase 134 and the three owner lands.
+  1. Find the five modules: `python3 scripts/test_times/module_cost.py --tree . --commands 15 <module> ...` over `direct/test_verify_wait_holder.py` and the direct and production modules that start the recorder. Count `progress_history.py` rows.
+  2. Run `python3 -m scripts.aws_target.gate_trial --base <base full sha> --changed <changed full sha> --modules <the five modules> --rounds 3`.
 
 ### Phase 139 — Find where the fast-track test module spends its CPU  · status: done
 **Depends on:** none
@@ -2805,40 +2807,195 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - Research only; no repository file changed. `production/test_fast_track.py` measures 45.7 CPU s, 8,618 processes and 52 tests at `bcda46a2e`. Git commands use 13.9 CPU s in 7,703 starts; repeated setup uses 1.0 CPU s.
-- The module is at its Git floor. devtools-unit owns the Git read path.
+- No absolute CPU floor is established. Git and required children dominate. devtools-unit owns the Git read path. Phase 143 asks which of these Git calls the tests need.
 
 **Gotchas:** One local pair on natedev can vary by more than 10 CPU s. Check process and exec counts before trusting a local saving.
 
 **Ruled out:** direct fixture calls (-2.6 CPU s alone); retained immutable Git reads (-4.9 CPU s alone); both together remove only 16 of 8,618 processes.
 
-### Phase 140 — Find where the style sync test module spends its CPU  · status: todo
+### Phase 140 — Find where the style sync test module spends its CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed. `style/test_style_sync.py` measures 46.3 CPU s, 4,218 processes and 70 tests. Git uses 3.6 CPU s in 3,263 starts.
+- Three test-only candidates, one pair each: private sender CLIs in process (11.6 CPU s), the scratch `cargo-save` CLI in process (7.6 CPU s), and a seeded initial Git repository (7.5 CPU s). Together they save 19.5 CPU s. Phase 142 implements them.
+
+**Gotchas:** A harness that patches the unqualified test module counts nothing; the runner loads the qualified module. Check each candidate counter before trusting a pair.
+
+**Kept:** signal, lock, verifier, lint driver and workspace integration processes stay real.
+
+### Phase 141 — Find where the crate run test module spends its CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed. `style/test_crate_run.py` measures 61.7 CPU s, 27,662 processes and 97 tests. Git uses about 30.8 CPU s in 26,573 starts; `rev-parse` runs 8,182 times and `fetch` 764 times.
+- No candidate gave a stable saving. Phase 143 asks which of these Git calls the tests need.
+
+**Ruled out:** batched checkout metadata (+8.7 CPU s in one pair, queue-unit); batched ledger location (-2.7 CPU s); both together (-3.7 CPU s).
+
+### Phase 142 — The wait holder and style sync test modules use less CPU  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A measured report names where `style/test_style_sync.py` (median 47.7 CPU s, 70 tests) spends its CPU, and which changes save CPU with the same tests.
+**Goal:** `direct/test_verify_wait_holder.py` and `style/test_style_sync.py` use less CPU per gate, with the same tests and assertions.
 
-**Decision:** Director, 2026-11-11: the next module in the descending sort, beside the Phase 139 research. Research first, as in Phases 137 and 139.
+**Decision:** User, 2026-11-11: "there is no minimum speed change required - anything is helpful - but i want you to always work on the worst case scenarios". Any measured saving ships. This phase takes the measured test-only candidates of Phases 137 and 140 for the first and third slowest modules.
 
 **Spec:**
-1. Run `scripts/test_times/module_cost.py` on the module with `--tests 10 --commands 15`.
-2. Name each fixed cost: interpreter starts, imports, real sleeps or wait intervals, subprocess trees, repeated setup.
-3. Measure one local pair for each candidate change in a scratch copy, and one pair for the candidates together. A test that proves a process boundary keeps its process.
-4. For each candidate in shared code, count the other test modules it reaches.
-5. Name the owning unit of each file a change would touch.
-6. Edit no repository file.
+1. `scripts/direct/verify_hold_wait_test_support.py` (Phase 137 candidate B, 2.2 CPU s in one pair): the fixture environment at line 281 stops setting `CLAUDE_PYTHON` to `sys.executable`, so the real launcher uses the seeded interpreter cache. The two observer cases near line 543 keep their explicit overrides.
+2. `scripts/style/test_style_sync.py` (Phase 140, 19.5 CPU s together in one pair):
+   1. Run the fixture's private `address.py`, `send.py` and `roster.py` sources in process through `invoke_cli` (`scripts/production/cli_fixture.py:91`). Keep their file writes, argument reads, output and exit result. Return `CompletedProcess` results with the same check behavior. Keep the observer mocks.
+   2. Route the supported style commands through `run_style_command` (`scripts/style/style_plan_test_support.py:73`). Unknown commands and Python probes keep their subprocesses.
+   3. Run the fixture's synchronous scratch `cargo-save` command in process through `invoke_cli` with `scratch.main`. Keep `CARGO_BUILD_BUILD_DIR`. Driver-process scratch calls stay real.
+   4. Build the initial Git repository (init, two identity settings, add, first commit) once in a class fixture seed, and copy only its `.git` into each case. Every later Git call stays real.
+3. Keep every test and assertion. Signal, lock, verifier, lint driver and workspace integration processes stay real.
 
 **Files:**
-- `scripts/style/test_style_sync.py` — read only.
+- `scripts/direct/verify_hold_wait_test_support.py`
+- `scripts/style/test_style_sync.py`
 
-**Workers:** 1 writer; research only.
-- impl: the report.
+**Workers:** 1 writer; the two files are small, separate changes.
+- impl: both files.
 
 **Constraints from prior phases:**
-- Phase 137: Phase 138 defers recorder and staff imports. Do not count that saving again here.
-- Phase 134: `run_style_command` in `scripts/style/style_plan_test_support.py` runs style plan commands in process; reuse it where it fits.
+- Phase 134: `run_style_command` runs style plan commands in process; reuse it without change.
+- Phase 137: the recorder and staff import change belongs to Phase 138. Do not change `progress_history.py`, `plan_history.py` or `session_staff.py` here.
+- Phase 140: the research harness used a frame check to limit the Git seed to `setUp`. Use an explicit class fixture seed instead.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report at `phases/140/research_report.md` in the unit session gives the measures, each candidate with its saving and reach, and the owners.
+- basedpyright reports 0 errors and 0 warnings on both files.
+- Both modules pass all tests.
+- An aws paired trial (3 rounds, both modules) shows a summed CPU saving greater than zero.
+
+### Phase 143 — Find which Git calls the slowest test modules do not need  · status: done
+**Depends on:** none
+
+#### As-built
+
+- User, 2026-11-11: "why do we need all of those git calls in our tests - maybe they're not necessary". Research only; no repository file changed.
+- Git starts by module: crate_run 26,573 (20.7 CPU s), bulk_run 13,019 (10.0), fast_track 7,703 (16.7), merge_checkpoint 4,789 (5.5), standing_checkpoint 3,219 (2.7). Most calls test real Git behavior: commits, refs, index state, ancestry, recovery and publication. Those keep real Git.
+- Two candidates remain: a shared `CargoProjectTests` repository seed (550 calls, natest-unit, reaches `test_bulk_rename.py`, `test_bulk_run.py`, `test_crate_run.py`) and batched manifest reads in `coverage_report.workspace` (377 calls, style owner, 42 modules). Isolated local pairs save 27.9 and 7.1 CPU s; together only 1.3 CPU s. Host noise is larger than the saving. Both wait in the next-items review; an aws pair decides.
+- Report: `phases/143/research_report.md` in the unit session.
+
+**Gotchas:** isolated local savings do not add. Measure candidates together, on aws, before naming a gain.
+
+### Phase 144 — /test_times trend says targeted tests and merge gates, and every table right-aligns its numbers  · status: done
+**Depends on:** none
+
+#### As-built
+
+- User, 2026-11-11, through builds: `/test_times trend` names its tables `<place> merge gates` (selection `full`) and `<place> targeted tests` (selection `affected`), merge gates first. The database keeps `full` and `affected`.
+- `scripts/lib/terminal_cells.py` `is_number_cell` decides number cells (sign, `$`, `%` or `s` suffix, or `—`). `print_table` right-aligns each column whose cells are all number cells, header included; only test_times tools call it.
+
+### Phase 145 — The dailies tests are gone and the stall-watch tests keep only the tests that pay their way  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** The retired dailies have no tests left, and the stall-watch test module loses every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+
+**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". The user approved the Rule 2 sweep with no CPU or money bar: fewer tests is the goal. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Work order: the folders with the most tests first (production 2,805, style 2,356, direct 1,597), the largest modules first. `test_staff.py` is out: Phase 87 swept it.
+
+**Spec:**
+1. For each test in the listed modules, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
+2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
+3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
+4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. Do not change production code.
+5. Do not merge tests into table rows in this phase. Remove no test that a held speed phase changes.
+6. Write `phases/145/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case and the reason no user harm follows. Give the counts before and after for each module.
+
+7. User, 2026-11-11, through natedev and builds: the dailies retire; `/showrunner:units` replaces them. Delete `scripts/production/test_dailies_counts.py`, `test_dailies_input.py`, `test_dailies_render.py`, `test_dailies_render_agents.py`, `test_dailies_render_holds.py`, `test_unit_status_dailies.py` and `dailies_input_test_support.py`, and the dailies-only cases in other test files. Keep a case that also covers code `/showrunner:units` uses, and name it in the report. The accounts unit retires the dailies code, config, timers, commands and docs.
+8. Restore `test_bad_unheld_history_header_and_tail_do_not_affect_units` and `test_a_failed_session_scan_ends_the_tick_and_the_next_tick_scans_again` in `test_stall_watch.py` (review: damaged history isolation and scan-failure recovery guard saved state).
+
+**Files:**
+- `scripts/production/test_stall_watch.py` — 130 tests.
+- `scripts/production/test_dailies_counts.py` — delete.
+- `scripts/production/test_dailies_input.py` — delete.
+- `scripts/production/test_dailies_render.py` — delete.
+- `scripts/production/test_dailies_render_agents.py` — delete.
+- `scripts/production/test_dailies_render_holds.py` — delete.
+- `scripts/production/test_unit_status_dailies.py` — delete.
+- `scripts/production/test_review_pause.py` — delete.
+- `scripts/production/dailies_input_test_support.py` — delete.
+- `scripts/production/test_update_registration.py` — remove dailies-only cases.
+- `scripts/production/test_update_registration_answers.py` — remove dailies-only cases.
+- `scripts/production/test_ci_points.py` — remove dailies-only cases.
+- `scripts/production/test_waiting.py` — remove dailies-only cases.
+- `scripts/production/test_unit_status_decisions.py` — remove dailies-only cases.
+- `scripts/hooks/test_conversation_pause.py` — remove dailies-only cases.
+- `scripts/build_hold/test_override_guard.py` — remove dailies-only cases.
+- `scripts/whoami/test_run_out.py` — remove dailies-only cases.
+
+**Held (sdlc, 2026-11-11):** `test_change_review.py`, `test_worker.py` and `test_production_lifecycle.py` wait for owner branches to reach main. A later phase sweeps them when sdlc clears them. The hold on `test_dailies_input.py` does not apply to its deletion.
+
+**Workers:** 1 writer; one reader keeps one standard across the files.
+- impl: every file above and the removal table.
+
+**Constraints from prior phases:**
+- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
+- Phase 87: Rule 2 removal saved no CPU in Git-heavy modules. CPU is not this phase's measure.
+
+**State:** none.
+
+**Acceptance gate:**
+- Each edited module passes; basedpyright reports 0 errors and 0 warnings on each.
+- No import names a deleted module.
+- `phases/145/removed_tests.md` lists every removed test with its reason, and the counts.
+- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+
+### Phase 146 — Four style test modules keep only the tests that pay their way  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** The style ledger tickets, style proposals, style ledger sites and bulk rename test modules lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+
+**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". The user approved the Rule 2 sweep with no CPU or money bar: fewer tests is the goal. Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Work order: the folders with the most tests first (production 2,805, style 2,356, direct 1,597), the largest modules first. `test_staff.py` is out: Phase 87 swept it.
+
+**Spec:**
+1. For each test in the listed modules, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
+2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
+3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
+4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. Do not change production code.
+5. Do not merge tests into table rows in this phase. Remove no test that a held speed phase changes.
+6. Write `phases/146/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case and the reason no user harm follows. Give the counts before and after for each module.
+
+**Files:**
+- `scripts/style/test_style_ledger_tickets.py` — 196 tests.
+- `scripts/style/test_style_proposals.py` — 187 tests.
+- `scripts/style/test_style_ledger_sites.py` — 169 tests.
+- `scripts/style/test_bulk_rename.py` — 118 tests.
+
+**Held (sdlc, 2026-11-11):** `test_style_footprint.py` and `test_style_ledger_findings.py` wait for owner branches to reach main. `test_style_sync.py` stays with Phase 142.
+
+**Workers:** 1 writer; one reader keeps one standard across the four modules.
+- impl: the four modules and the removal table.
+
+**Constraints from prior phases:**
+- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
+- Phase 87: Rule 2 removal saved no CPU in Git-heavy modules. CPU is not this phase's measure.
+
+**State:** none.
+
+**Acceptance gate:**
+- Each of the four modules passes; basedpyright reports 0 errors and 0 warnings on each.
+- `phases/146/removed_tests.md` lists every removed test with its reason, and the counts.
+- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+
+### Phase 147 — Four direct test modules keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### As-built
+
+- User, 2026-11-11: the Rule 2 sweep has no CPU or money bar; fewer tests is the goal. Rule 2 keeps a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work.
+- Removed 14 rare-case tests: `test_findings.py` 82 → 76, `test_assign_launcher.py` 65 → 60, `test_phase_reservation.py` 59 → 56. `test_phase_process.py` keeps all 73: each test guards a main path or saved state.
+- Removals were parser refusals, configuration errors that already fail visibly, cleanup of unused panes or backends, and diagnostics that change no state.
+- `findings_test_support.py` lost `write_partial_config`, which had no user after the removals.
+- Held (sdlc): `test_progress_history.py` and `test_phase_table.py` wait for owner branches to reach main.
+
+**Gotchas:** a removal can leave a helper in a shared `*_test_support.py` file with no user. List each module's support files under Files in a sweep phase.

@@ -20,7 +20,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.agents import stop_resume
-from scripts.lib import main_publish
+from scripts.lib import main_publish, main_push_lock
 from scripts.herdr import worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
@@ -342,30 +342,31 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
     tip = checked(production.checkout, "promote", "rev-parse", "HEAD")
     if not verdict_checked:
         ci_steps(production, tip, no_ci, ci_green, smoke_passed)
-    _ = checked(production.checkout, "main", "fetch", "origin", "main")
-    if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
-        raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
-    report("main", "ok", f"origin/main is behind {tip}")
-    promotion = production_doc.promotion_from_doc(lines)
-    if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
-        remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
-        if remote != tip:
-            _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
-            report("promote", "ok", f"main pushed to {tip}")
-        else:
-            report("promote", "ok", f"already at {tip}")
-    else:
-        for destination in promotion.checkouts:
-            result = promote_local_checkout(destination, production.merge_branch, tip)
-            if isinstance(result, PromotionNotPushed):
-                raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
-            if isinstance(result, PromotionAlreadyAtTip):
-                detail = f"{destination}: already at {tip}"
-            elif isinstance(result, PromotionOriginPushed):
-                detail = f"{destination}: pushed {tip}"
+    with main_push_lock.main_push_lock(production.checkout):
+        _ = checked(production.checkout, "main", "fetch", "origin", "main")
+        if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
+            raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
+        report("main", "ok", f"origin/main is behind {tip}")
+        promotion = production_doc.promotion_from_doc(lines)
+        if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
+            remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
+            if remote != tip:
+                _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
+                report("promote", "ok", f"main pushed to {tip}")
             else:
-                detail = f"{destination}: advanced to {tip}"
-            report("promote", "ok", detail)
+                report("promote", "ok", f"already at {tip}")
+        else:
+            for destination in promotion.checkouts:
+                result = promote_local_checkout(destination, production.merge_branch, tip)
+                if isinstance(result, PromotionNotPushed):
+                    raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
+                if isinstance(result, PromotionAlreadyAtTip):
+                    detail = f"{destination}: already at {tip}"
+                elif isinstance(result, PromotionOriginPushed):
+                    detail = f"{destination}: pushed {tip}"
+                else:
+                    detail = f"{destination}: advanced to {tip}"
+                report("promote", "ok", detail)
     if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
         outcome = pull_mac_checkout(promotion.mac.path, source)

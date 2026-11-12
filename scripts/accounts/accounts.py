@@ -2854,6 +2854,9 @@ class WorkerResumePreview(Protocol):
     @property
     def kept_open_reason(self) -> str: ...
 
+    @property
+    def detached_context(self) -> str: ...
+
 
 class PaneMoves(Protocol):
     def move_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
@@ -3050,6 +3053,8 @@ def _preview_worker_moves(target: str, why: str) -> GroupMoveDryRun:
         else:
             preview = (f"not moved: {decision.reason}" if isinstance(decision, SessionMoveRefused) else
                        f"would stop and resume the same conversation on {target} in its worker pane")
+            if not isinstance(decision, SessionMoveRefused) and decision.detached_context:
+                preview += "; " + decision.detached_context.replace("\n", " ")
             if not isinstance(decision, SessionMoveRefused) and decision.kept_open_reason:
                 preview = f"kept open: {decision.kept_open_reason}; {preview}"
         lines.append(f"{row.name} ({row.id}): {preview}")
@@ -3179,8 +3184,33 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
     return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
 
 
+def detached_move_context(identity: str) -> str:
+    """Find a worker's live runs by staff id, session id, or name."""
+    from scripts.production import staff
+
+    try:
+        record = staff.local_snapshot()
+    except staff.StaffAbsent:
+        return ""
+    row = record.by_member_reference(identity)
+    if row is None:
+        matches = [member for member in record.find() if member.name == identity]
+        if len(matches) != 1:
+            return ""
+        row = matches[0]
+    if row.kind != "worker":
+        return ""
+    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
+    context = cast(Callable[[Path, str], str], import_module("scripts.agents.detached_runs").resume_context)
+    run = pane_moves.run_for_worker(row, record)
+    return context(run / "detached_runs", row.name)
+
+
 def move_preview_line(member: ListedSession | LiveGroupMember, target: str) -> str:
-    return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
+    line = f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
+    context = (detached_move_context(member.session_id)
+               if not isinstance(member, LiveGroupMember) and member.kind == "worker" else "")
+    return line + ("; " + context.replace("\n", " ") if context else "")
 
 
 def _move_output(results: tuple[SessionMoveOutcome, ...],
@@ -3286,7 +3316,9 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
             return checked
         if not matches:
             if dry_run:
-                return MoveDryRun(session, (f"{session}: would resume on {target} if its saved tab is local",))
+                context = detached_move_context(session)
+                line = f"{session}: would resume on {target} if its saved tab is local"
+                return MoveDryRun(session, (line + ("; " + context.replace("\n", " ") if context else ""),))
             results = move_sessions((session,), target, why=why or "finish account move", live=live, account_config=account_config)
             stdout, stderr, code = _move_output(results, ())
             outcome = MoveStartFailed if code else MoveStarted

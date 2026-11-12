@@ -63,7 +63,7 @@ from typing import Literal, Protocol, TextIO, cast
 
 from scripts.lib import process_group
 from scripts.copies import copies
-from scripts.lib import build_folders, conf
+from scripts.lib import build_folders, conf, main_push_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review  # noqa: E402
@@ -1540,28 +1540,29 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
-    fetch_branches(main_repo, "main", args.merge_branch)
-    head = checked_git(main_repo, "rev-parse", "HEAD")
-    origin = checked_git(main_repo, "rev-parse", "origin/main")
-    path = push_record_path(main_repo, "promotion", args.merge_branch)
-    target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
-    if head != origin:
-        record = read_push_record(path)
-        if (not isinstance(record, RecordedPush) or head != record.commit
-                or record.source_commit != record.commit
-                or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
-                or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
-            raise GateRefused("main HEAD differs from origin/main")
-        target = record.commit
-    if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
-        raise GateRefused("main is not an ancestor of the merge branch")
     hold.wait_until_free()
-    if conflict := promotion_edit_conflict(main_repo, target):
-        raise GateRefused(conflict)
-    write_push_record(path, RecordedPush(origin, target, target))
-    _ = checked_git(main_repo, "merge", "--ff-only", target)
-    _ = checked_git(main_repo, "push", "origin", "main")
-    promoted = checked_git(main_repo, "rev-parse", "HEAD")
+    with main_push_lock.main_push_lock(main_repo):
+        fetch_branches(main_repo, "main", args.merge_branch)
+        head = checked_git(main_repo, "rev-parse", "HEAD")
+        origin = checked_git(main_repo, "rev-parse", "origin/main")
+        path = push_record_path(main_repo, "promotion", args.merge_branch)
+        target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
+        if head != origin:
+            record = read_push_record(path)
+            if (not isinstance(record, RecordedPush) or head != record.commit
+                    or record.source_commit != record.commit
+                    or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
+                    or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
+                raise GateRefused("main HEAD differs from origin/main")
+            target = record.commit
+        if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
+            raise GateRefused("main is not an ancestor of the merge branch")
+        if conflict := promotion_edit_conflict(main_repo, target):
+            raise GateRefused(conflict)
+        write_push_record(path, RecordedPush(origin, target, target))
+        _ = checked_git(main_repo, "merge", "--ff-only", target)
+        _ = checked_git(main_repo, "push", "origin", "main")
+        promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)

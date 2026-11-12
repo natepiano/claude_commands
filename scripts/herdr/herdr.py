@@ -1060,6 +1060,7 @@ class SavedName(TypedDict):
     seen: float
     row_id: NotRequired[str]
     terminal_id: NotRequired[str]
+    sort_after_rename: NotRequired[bool]
 
 
 class SavedSpace(TypedDict):
@@ -1123,6 +1124,8 @@ def _saved_name(value: object) -> SavedName:
         result["row_id"] = json_text(item["row_id"], "herdr layout staff row")
     if isinstance(item.get("terminal_id"), str):
         result["terminal_id"] = json_text(item["terminal_id"], "herdr layout terminal")
+    if item.get("sort_after_rename") is True:
+        result["sort_after_rename"] = True
     return result
 
 
@@ -1666,15 +1669,56 @@ class Herdr:
                 changed = True
         return changed
 
+    def mark_tab_rename(self, identity: staff.StaffId) -> None:
+        """Retain a rename request before the staff name or display labels change."""
+        with _LayoutLock(self.session):
+            saved = saved_layout(self.session)
+            record = _tab_staff()
+            changed = False
+            for space in saved["workspaces"]:
+                for entry in space["tabs"]:
+                    member = record.by_member_reference(entry["name"])
+                    if member is not None and member.id == identity and not entry.get("sort_after_rename"):
+                        entry["sort_after_rename"] = True
+                        changed = True
+            if changed:
+                _write_layout(self.session, saved)
+
     def retitle(self, pane: str, title: str, *, tab: bool = True) -> bool:
         """Set the pane title and, when requested, its tab title."""
         with _LayoutLock(self.session):
             row = next((row for row in self.listed("pane") if row.get("pane_id") == pane), None)
-            if row is None or not self._retitle(row, title, tab=tab):
+            if row is None:
+                return False
+            saved = saved_layout(self.session)
+            reorder = False
+            record = _tab_staff()
+            space_name: object = ""
+            if tab and saved["workspaces"]:
+                workspace = json_text(row.get("workspace_id"), "workspace id")
+                space_name = next((space.get("label") for space in self.listed("workspace")
+                                   if space.get("workspace_id") == workspace), "")
+                reorder = any(entry.get("sort_after_rename")
+                    and (member := record.by_member_reference(entry["name"])) is not None
+                    and member.name == title
+                    for space in saved["workspaces"] if space["name"] == space_name for entry in space["tabs"])
+            changed = self._retitle(row, title, tab=tab)
+            if not changed and not reorder:
                 return False
             if tab:
-                _ = self.order_tabs(json_text(row.get("workspace_id"), "workspace id"), saved_layout(self.session))
-            self.save_layout()
+                _ = self.order_tabs(json_text(row.get("workspace_id"), "workspace id"), saved)
+            if reorder:
+                self.record_layout()
+                saved = saved_layout(self.session)
+                for space in saved["workspaces"]:
+                    if space["name"] == space_name:
+                        for entry in space["tabs"]:
+                            member = record.by_member_reference(entry["name"])
+                            if member is not None and member.name == title:
+                                _ = entry.pop("sort_after_rename", False)
+                _write_layout(self.session, saved)
+            else:
+                self.save_layout()
             return True
 
     def scan_row_panes(self, record: staff.StaffSnapshot,
@@ -1869,7 +1913,8 @@ class Herdr:
         titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
         stored = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), list[SavedName]())
         kept = [SavedName(name=row.name, seen=item["seen"]) for item in stored
-                if (row := membership.by_member_reference(item["name"])) is not None]
+                if not item.get("sort_after_rename")
+                and (row := membership.by_member_reference(item["name"])) is not None]
         order = tab_order(name if isinstance(name, str) else "", titles, kept, unit_director_titles)
         current = list(range(len(tabs)))
         moved: dict[str, str] = {}
@@ -2026,27 +2071,27 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
-        matches: list[pane_launch.PaneLaunch] = []
+        matches: list[dict[str, object]] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
             argv = _foreground_arguments(process)
-            if not is_codex_process(argv):
-                continue
-            pid = process.get("pid")
-            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-                raise ValueError("Codex launch has no process id")
-            observed = native_process(pid, "codex")
-            session_id, started, environment = observed.identity.id, observed.started, observed.environment
-            cwd = json_text(process.get("cwd"), "Codex launch cwd")
-            if not Path(cwd).is_absolute():
-                raise ValueError("Codex launch working folder is unavailable")
-            entry = pane_launch.launch(pane, session_id, cwd, legacy_identity.without_legacy_identity(environment),
-                                       ["codex", *arguments], kind="codex")
-            entry["pid"], entry["proc_start"] = pid, started
-            matches.append(entry)
+            if is_codex_process(argv):
+                matches.append(process)
         if len(matches) != 1:
             raise ValueError("Codex launch has no unique foreground process")
-        return matches[0]
+        process = matches[0]
+        pid = process.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError("Codex launch has no process id")
+        observed = native_process(pid, "codex")
+        session_id, started, environment = observed.identity.id, observed.started, observed.environment
+        cwd = json_text(process.get("cwd"), "Codex launch cwd")
+        if not Path(cwd).is_absolute():
+            raise ValueError("Codex launch working folder is unavailable")
+        entry = pane_launch.launch(pane, session_id, cwd, legacy_identity.without_legacy_identity(environment),
+                                   ["codex", *arguments], kind="codex")
+        entry["pid"], entry["proc_start"] = pid, started
+        return entry
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
@@ -2091,7 +2136,7 @@ class Herdr:
                 entry["name"] = name
                 directory = pane_launch.record_directory()
                 pane_launch.write(directory / f"{self.session}.json", entry, sources=tuple(directory.glob("*.json")))
-            except CodexPaneStarting:
+            except (CodexPaneStarting, CodexSessionPending):
                 print(f"herdr {name}:{pane}: pane is starting; pane retained", file=sys.stderr)
                 return (PromptNotSubmitted("pane is starting; prompt retained", never_typed=True)
                         if isinstance(opening, OpeningPrompt) else PromptSubmissionNotRequired())
@@ -3541,11 +3586,17 @@ def _process_birth(pid: int) -> str:
     return started
 
 
+class CodexSessionPending(ValueError):
+    """A fresh Codex process has no session report yet."""
+
+
 def codex_resume_thread(pid: int) -> str:
     """Read the Codex thread from its resume arguments."""
     launch = _codex_launch_argument(pid)
     if isinstance(launch, LaunchArgument):
         return launch.id
+    if isinstance(launch, StartingCodexPane):
+        raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
     raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
 
 
@@ -3624,6 +3675,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
             except CodexPaneStarting:
                 raise
             except HerdrFailure as error:
+                if isinstance(error.__cause__, CodexSessionPending):
+                    raise error.__cause__
                 raise ValueError(str(error)) from error
     return native_process(pid, "codex", "")
 

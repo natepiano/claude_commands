@@ -83,7 +83,11 @@ def bump(selector: str, actor: str) -> int:
     first = next((WaitingPosition(place) for place, step in enumerate(reading.view.waiting, 1)
                   if step_labels(step, labels).unit == unit), NoWaitingStep())
     detail = f"first step now #{first.place}" if isinstance(first, WaitingPosition) else "no waiting step now"
-    print(f"queue priority set for {unit} (step #{selected_place}): {detail}")
+    priority = reading.explanation.priority
+    units = ([entry["unit"] for entry in priority.entries]
+             if isinstance(priority, admission_records.QueuePriority) else [])
+    place = f"; priority #{units.index(unit) + 1}" if unit in units else ""
+    print(f"queue priority set for {unit} (step #{selected_place}): {detail}{place}")
     return 0
 
 
@@ -109,14 +113,18 @@ def main() -> int:
             actor = admission_records.queue_command_actor()
             if sys.argv[1] == "bump" and len(sys.argv) == 3:
                 return bump(sys.argv[2], actor)
-            elif sys.argv[1] == "clear" and len(sys.argv) == 2:
-                result = admission_client.priority_clear(actor)
+            elif sys.argv[1] == "clear" and len(sys.argv) in (2, 3):
+                result = (admission_client.priority_clear(actor, sys.argv[2]) if len(sys.argv) == 3
+                          else admission_client.priority_clear(actor))
             elif sys.argv[1] == "admit-head" and len(sys.argv) > 2:
                 result = admission_client.admit_head(" ".join(sys.argv[2:]), actor)
             else:
-                print("build queue: use bump <position|session|folder>, clear, or admit-head <why>", file=sys.stderr)
+                print("build queue: use bump <position|session|folder>, clear [unit], or admit-head <why>", file=sys.stderr)
                 return 3
             if isinstance(result, admission_protocol.Refused):
+                if command == "clear" and len(sys.argv) == 3:
+                    print(f"build queue: {result.reason}")
+                    return 3
                 print(f"build queue: {result.reason}", file=sys.stderr)
                 return 2
             if command == "clear":

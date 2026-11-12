@@ -7,7 +7,6 @@ except FileNotFoundError:
     pass
 
 import argparse
-import hashlib
 import json
 import os
 import signal
@@ -31,7 +30,7 @@ from scripts.direct import progress_history
 from scripts.herdr import herdr, worker_panes
 from scripts.lib import process_group, process_start, conf, berth_board, unit_runs
 from scripts.lib.conf import UseConfiguredValue
-from scripts.message import sessions
+from scripts.message import sessions, session_send, send_budget, send_result
 from scripts.production import (
     staff,
     staff_sources,
@@ -44,7 +43,7 @@ from scripts.production import (
     unit_names,
 )
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.production.rename_state import RenameRefused, production_journal, read_json, write_json
+from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.agents import (
     restart,
@@ -665,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--why", default="")
     command = commands.add_parser("restart")
+    _ = command.add_argument("--why", default=restart.DEFAULT_RESTART_CAUSE)
     _ = command.add_argument("--all", action="store_true")
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--only", default="")
@@ -711,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
                     selected_account = accounts.NamedAccount(named.label, accounts.account_dir(named.label))
             return restart.restart(stop_all=options.all, dry_run=options.dry_run,
                                    only=tuple(item for item in options.only.split(",") if item),
-                                   account=selected_account)
+                                   account=selected_account, why=options.why)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0
@@ -1794,7 +1794,7 @@ class StagedDocumentBlob:
 
 @dataclass(frozen=True)
 class NoStagedDocumentBlob:
-    """The journal has no staged document content to restore."""
+    """The Git index has no staged document content to restore."""
 
 
 @dataclass(frozen=True)
@@ -1804,7 +1804,6 @@ class DocBranchMove:
     checkout: Path
     old_branch: str
     branch: str
-    digest: str
     tracked: bool
     staged_blob: StagedDocumentBlob | NoStagedDocumentBlob
 
@@ -1845,29 +1844,6 @@ def rename_member(old: str, new: str, record: staff.StaffSnapshot) -> staff.Staf
     raise staff.StaffRefused(f"{old}: no showrunner, unit, or worker staff row")
 
 
-def rename_saved_move(fields: dict[str, object]) -> DocBranchMove:
-    keys = ("source", "destination", "checkout", "old_branch", "branch", "digest")
-    if not all(isinstance(fields.get(key), str) and fields[key] for key in keys):
-        raise RenameRefused("the document move journal is incomplete")
-    if not isinstance(fields.get("tracked"), bool):
-        raise RenameRefused("the document move journal has no index evidence")
-    blob = fields.get("staged_blob")
-    staged_blob: StagedDocumentBlob | NoStagedDocumentBlob = NoStagedDocumentBlob()
-    if isinstance(blob, dict):
-        blob_fields = cast(dict[str, object], blob)
-        mode = blob_fields.get("mode")
-        object_id = blob_fields.get("object_id")
-        if not isinstance(mode, str) or not mode or not isinstance(object_id, str) or not object_id:
-            raise RenameRefused("the document move journal has an incomplete staged blob")
-        staged_blob = StagedDocumentBlob(mode, object_id)
-    elif "staged_blob" in fields:
-        raise RenameRefused("the document move journal has an incomplete staged blob")
-    return DocBranchMove(Path(cast(str, fields["source"])), Path(cast(str, fields["destination"])),
-                         Path(cast(str, fields["checkout"])), cast(str, fields["old_branch"]),
-                         cast(str, fields["branch"]), cast(str, fields["digest"]), cast(bool, fields["tracked"]),
-                         staged_blob)
-
-
 def rename_check_branch(checkout: Path, target: str) -> str:
     _ = unit_move.git(checkout, "check-ref-format", "--branch", target)
     branch = unit_move.git(checkout, "branch", "--show-current")
@@ -1898,15 +1874,13 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
         if ((row.name != name or to_branch) and not isinstance(row.worktree, staff.WorktreeUnfilled)
                 and row.worktree.machine != remote.local_machine()):
             raise ValueError(f"{old}: run rename on {row.worktree.machine}")
+        pending = unit_move.pending_rename(row.id)
+        if pending is not None and (pending.name != name or to_branch and pending.branch != to_branch):
+            raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
         if to_branch:
             if isinstance(row.worktree, staff.WorktreeUnfilled):
                 raise RenameRefused(f"{old}: no unit worktree")
-            checkout = row.worktree.path.expanduser().resolve()
-            if not checkout.exists():
-                target = unit_names.swap_stem(checkout.name, row.name, name)
-                destination = checkout.with_name(target) if target is not None else checkout
-                unit_move.require_move_destination(record, row, destination)
-                checkout = destination
+            checkout = unit_move.move_checkout(record, row)
             return RenamePlan(row, name, UnitBranchMove(rename_check_branch(checkout, to_branch), to_branch))
         return RenamePlan(row, name, KeepDocBranch())
     if bool(to_doc) != bool(to_branch):
@@ -1923,48 +1897,34 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
     if doc.machine != remote.local_machine():
         raise RenameRefused(f"{row.name}: run the document move on {doc.machine}")
     destination = Path(to_doc).expanduser().resolve()
-    journal = production_journal(row.id)
-    if journal.exists():
-        value = read_json(journal)
-        if not isinstance(value, dict):
-            raise RenameRefused(f"{journal}: expected a journal object")
-        fields = cast(dict[str, object], value)
-        if (fields.get("staff_id") == row.id and fields.get("name") == new
-                and fields.get("destination") == str(destination) and fields.get("branch") == to_branch):
-            move = rename_saved_move(fields)
-            if (fields.get("done") is True and doc.path == destination
-                    and unit_move.git(move.checkout, "branch", "--show-current") == to_branch):
-                return RenamePlan(row, new, KeepDocBranch())
-            return RenamePlan(row, new, move)
-        if fields.get("done") is not True:
-            raise RenameRefused(f"{journal}: another document move is incomplete")
     checkout = Path(unit_move.git(doc.path.parent, "rev-parse", "--show-toplevel"))
     _ = destination.relative_to(checkout)
     branch = rename_check_branch(checkout, to_branch)
-    if doc.path != destination and unit_move.exists(destination):
+    if doc.path != destination and doc.path.exists() and unit_move.exists(destination):
         raise RenameRefused(f"destination already exists: {destination}")
     if doc.path == destination and branch == to_branch:
         return RenamePlan(row, new, KeepDocBranch())
-    entry = unit_move.git(checkout, "ls-files", "-s", "--", str(doc.path.relative_to(checkout)))
+    source = str(doc.path.relative_to(checkout))
+    target = str(destination.relative_to(checkout))
+    entry = unit_move.git(checkout, "ls-files", "-s", "--", source)
+    if doc.path != destination and not doc.path.exists() and unit_move.exists(destination):
+        target_entry = unit_move.git(checkout, "ls-files", "-s", "--", target)
+        if unit_move.git(checkout, "ls-tree", "HEAD", "--", target):
+            raise RenameRefused(f"destination already exists: {destination}")
+        if entry and target_entry:
+            if entry.split(maxsplit=3)[:3] != target_entry.split(maxsplit=3)[:3]:
+                raise RenameRefused(f"destination already exists: {destination}")
+        elif not entry:
+            changes = unit_move.git(checkout, "diff", "--cached", "--name-status", "-z", "--find-renames",
+                                    "--", source, target).split("\0")
+            if len(changes) != 4 or not changes[0].startswith("R") or changes[1:3] != [source, target]:
+                raise RenameRefused(f"destination already exists: {destination}")
+        entry = entry or target_entry
     staged_blob: StagedDocumentBlob | NoStagedDocumentBlob = NoStagedDocumentBlob()
     parts = entry.split(maxsplit=3)
     if len(entry.splitlines()) == 1 and len(parts) == 4 and parts[2] == "0":
         staged_blob = StagedDocumentBlob(parts[0], parts[1])
-    return RenamePlan(row, new, DocBranchMove(doc.path, destination, checkout, branch, to_branch,
-                                            hashlib.sha256(doc.path.read_bytes()).hexdigest(),
-                                            bool(entry), staged_blob))
-
-
-def rename_journal_fields(request: RenamePlan, move: DocBranchMove, *, done: bool) -> dict[str, object]:
-    fields: dict[str, object] = {
-        "staff_id": request.member.id, "name": request.name, "source": str(move.source),
-        "destination": str(move.destination), "checkout": str(move.checkout),
-        "old_branch": move.old_branch, "branch": move.branch, "digest": move.digest,
-        "tracked": move.tracked, "done": done,
-    }
-    if isinstance(move.staged_blob, StagedDocumentBlob):
-        fields["staged_blob"] = {"mode": move.staged_blob.mode, "object_id": move.staged_blob.object_id}
-    return fields
+    return RenamePlan(row, new, DocBranchMove(doc.path, destination, checkout, branch, to_branch, bool(entry), staged_blob))
 
 
 def rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
@@ -1974,8 +1934,6 @@ def rename_move_doc(request: RenamePlan, move: DocBranchMove) -> bool:
     document = move.source if move.source.exists() else move.destination
     if not document.is_file():
         raise RenameRefused(f"{document}: the document is unavailable")
-    if hashlib.sha256(document.read_bytes()).hexdigest() != move.digest:
-        print(f"anomaly: document_move: {document}: the document changed after the move request", file=sys.stderr)
     if move.source != move.destination and move.source.exists():
         if unit_move.exists(move.destination):
             raise RenameRefused(f"destination already exists: {move.destination}")
@@ -2021,7 +1979,10 @@ def rename_move_branch(move: DocBranchMove) -> bool:
 
 def rename_owner(row: staff.StaffRow, name: str) -> staff.StaffRow:
     """Keep the old owner name until every worker pane has its new name."""
-    worker_panes.rename_workers(replace(row, name=name), herdr.Herdr(herdr.shared_session()))
+    client = herdr.Herdr(herdr.shared_session())
+    if row.name != name:
+        client.mark_tab_rename(row.id)
+    worker_panes.rename_workers(replace(row, name=name), client)
     return staff.rename(row.id, name) if row.name != name else row
 
 
@@ -2081,13 +2042,6 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
             print("done" if request.member.name != request.name else "unchanged")
             return request
         move = request.move
-        journal = production_journal(request.member.id)
-        if isinstance(move, DocBranchMove) and not journal.exists():
-            write_json(journal, rename_journal_fields(request, move, done=False))
-        elif isinstance(move, DocBranchMove):
-            saved = read_json(journal)
-            if saved != rename_journal_fields(request, move, done=False) and saved != rename_journal_fields(request, move, done=True):
-                write_json(journal, rename_journal_fields(request, move, done=False))
         row = request.member
         changed = row.name != request.name
         row = rename_owner(row, request.name)
@@ -2095,9 +2049,6 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
             try:
                 changed = rename_move_doc(request, move) or changed
                 changed = rename_move_branch(move) or changed
-                completed = rename_journal_fields(request, move, done=True)
-                if read_json(journal) != completed:
-                    write_json(journal, completed)
             except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound) as error:
                 print(f"anomaly: document_move: {error}", file=sys.stderr)
                 changed = True
@@ -2110,71 +2061,128 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
         return request
 
 
-@dataclass(frozen=True)
-class RequestedUnitFolderMove:
-    destination: Path
-    branch: str | unit_move.KeepBranch
-
-
-@dataclass(frozen=True)
-class NoRequestedUnitFolderMove:
-    """The rename request has no folder operation."""
-
-
 def rename_apply_unit(request: RenamePlan) -> RenamePlan:
     with staff.row_operation(str(request.member.id)):
         record = staff.snapshot()
         if (row := record.by_id(request.member.id)) is None:
             raise ValueError(f"{request.member.id}: no unit staff row")
         changed = row.name != request.name
-        branch_move = isinstance(request.move, UnitBranchMove) and request.move.old_branch != request.move.branch
-        movement: RequestedUnitFolderMove | NoRequestedUnitFolderMove = NoRequestedUnitFolderMove()
-        if isinstance(row.worktree, staff.WorktreeUnfilled):
-            if changed or branch_move:
+        pending = unit_move.pending_rename(row.id)
+        if pending is not None:
+            if (pending.name != request.name or isinstance(request.move, UnitBranchMove)
+                    and request.move.branch != pending.branch):
+                raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
+            _ = unit_move.rename_observation(record, row, pending)
+        elif changed or (isinstance(request.move, UnitBranchMove) and request.move.old_branch != request.move.branch):
+            if isinstance(row.worktree, staff.WorktreeUnfilled):
                 print(f"anomaly: {request.name}: the staff worktree is unfilled", file=sys.stderr)
-        else:
-            if row.worktree.machine != remote.local_machine():
-                raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
-            folder = row.worktree.path.expanduser().resolve()
-            target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
-            if target is None:
-                target = unit_names.swap_stem(folder.name, request.name, request.name)
-            destination = folder.with_name(target) if target is not None else folder
-            unit_move.require_move_destination(record, row, destination)
-            checkout = folder if folder.exists() else destination
-            branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
-            renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
-                              unit_names.swap_stem(branch, row.name, request.name))
-            if renamed_branch is None:
-                renamed_branch = unit_names.swap_stem(branch, request.name, request.name)
-            if changed and target is None:
-                print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
-            if changed and renamed_branch is None:
-                print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
-            target_branch = renamed_branch if renamed_branch is not None else unit_move.KeepBranch.CURRENT
-            if (changed or branch_move or isinstance(request.move, UnitBranchMove)
-                    or (checkout.exists() and unit_move.move_locked(row.id, checkout))):
-                movement = RequestedUnitFolderMove(destination, target_branch)
-        display_row = replace(row, name=request.name)
+            else:
+                if row.worktree.machine != remote.local_machine():
+                    raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
+                folder = row.worktree.path.expanduser().resolve()
+                target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
+                destination = folder.with_name(target) if target is not None else folder
+                unit_move.require_move_destination(record, row, destination)
+                checkout = unit_move.move_checkout(record, row)
+                branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
+                renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
+                                  unit_names.swap_stem(branch, row.name, request.name))
+                if changed and target is None:
+                    print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
+                if changed and renamed_branch is None:
+                    print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
+                target_branch = renamed_branch if renamed_branch is not None else unit_move.KeepBranch.CURRENT
+                if (destination != folder or renamed_branch is not None and renamed_branch != branch
+                        or checkout.exists() and unit_move.move_locked(row.id, checkout)):
+                    pending = unit_move.prepare_rename(row, destination, target_branch, request.name)
+        rename_prepare_notice(row, request.name)
+        row = rename_owner(row, request.name)
         try:
-            changed = rename_repair_displays(display_row) or changed
+            changed = rename_repair_displays(row) or changed
         except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: display: {error}", file=sys.stderr)
             changed = True
-        if isinstance(movement, RequestedUnitFolderMove):
-            moved = unit_move.move_folder(row.id, movement.destination, branch=movement.branch)
-            if not moved:
-                current = staff.by_id(row.id)
-                if (current is None or isinstance(current.worktree, staff.WorktreeUnfilled)
-                        or current.worktree.path.expanduser().resolve() != movement.destination
-                        or (movement.destination.exists() and isinstance(movement.branch, str)
-                            and unit_move.git(movement.destination, "branch", "--show-current") != movement.branch)):
-                    print("unchanged")
-                    return request
-            changed = moved or changed
-        row = rename_owner(row, request.name)
+        changed = rename_notify_unit(row) or changed
+        if pending is None and isinstance(request.move, UnitBranchMove):
+            if not isinstance(row.worktree, staff.WorktreeUnfilled):
+                changed = unit_move.move_idle_folder(row.id, row.worktree.path, branch=request.move.branch) or changed
+        if pending is not None:
+            if not unit_move.rename_complete(staff.snapshot(), row, pending):
+                changed = unit_move.move_idle_folder(row.id, pending.destination, branch=pending.branch) or changed
+                record = staff.snapshot()
+                if (current := record.by_id(row.id)) is None:
+                    raise RenameRefused(f"{row.id}: the staff row is unavailable after the rename")
+                row = current
+            if unit_move.finish_rename(row, pending):
+                pending = None
+                changed = True
+        notice = rename_notice_path(row.id)
+        if notice.exists() and pending is None:
+            fields = unit_move.json_object(read_json(notice))
+            if not fields.get("pending"):
+                notice.unlink()
         print("done" if changed else "unchanged")
         return request
+
+
+def rename_notice_path(identity: staff.StaffId) -> Path:
+    """Select the delivery state for one unit."""
+    root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+    return root / identity / "rename-notices.json"
+
+
+def rename_prepare_notice(row: staff.StaffRow, name: str) -> None:
+    """Retain the recipients before the staff name changes."""
+    if row.name == name:
+        return
+    path = rename_notice_path(row.id)
+    record = staff.snapshot()
+    members = [row, *record.find(kind="worker", parent=row.id)]
+    write_json(path, {"key": f"rename:{row.id}:{time.time_ns()}",
+                      "pending": [str(member.id) for member in members]})
+
+
+def rename_notify_unit(row: staff.StaffRow) -> bool:
+    """Send one rename notice to each retained recipient through the shared send path."""
+    path = rename_notice_path(row.id)
+    if not path.exists():
+        return False
+    saved = unit_move.json_object(read_json(path))
+    fields = {key: saved[key] for key in ("key", "pending") if key in saved}
+    changed = fields != saved
+    if changed:
+        write_json(path, fields)
+    pending = fields.get("pending")
+    if not isinstance(pending, list):
+        return False
+    recipients = [recipient for recipient in cast(list[object], pending) if isinstance(recipient, str)]
+    text = f"The unit director is now named {row.name}. Continue the current work."
+    for recipient in recipients.copy():
+        try:
+            rename_send_notice(recipient, str(fields["key"]), text)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+            detail = " ".join(str(error).splitlines())
+            print(f"anomaly: {row.name}: rename message to {recipient}: {detail}", file=sys.stderr)
+            changed = True
+            continue
+        recipients.remove(recipient)
+        fields["pending"] = recipients
+        write_json(path, fields)
+        changed = True
+    return changed
+
+
+def rename_send_notice(recipient: str, key: str, text: str) -> None:
+    """Use the shared transport with a sender that does not request shutdown."""
+    result = subprocess.run(session_send.send_argv("--to", recipient, "--from", "agents rename",
+        "--summary", "Unit director renamed", "--key", key,
+        "--repeat-minutes", str(100 * 365 * 24 * 60)),
+        input=text, capture_output=True, text=True, check=False, timeout=send_budget.seconds())
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if (not isinstance(outcome, send_result.ConfirmedSendOutcome)
+            or outcome.header.outcome not in {"sent", "queued", "skipped", "kept", "replaced"}):
+        lines = (result.stderr or result.stdout).splitlines()
+        raise RuntimeError(lines[0] if lines else "rename message has no confirmed send result")
 
 
 def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> int:

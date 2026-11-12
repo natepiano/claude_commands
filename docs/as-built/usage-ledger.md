@@ -195,7 +195,19 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 `scripts/usage/context_economy.py` reads context measurements on demand.
 `scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_mac`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
 `/context_economy` (`commands/context_economy.md`) defaults to `report`, also when its first argument starts with `--`.
-The CLI has `report`, `save`, `compare`, `trend` and `hourly`; `report` takes `--role` and `--by settings|week`.
+The CLI has `report`, `save`, `compare`, `trend`, `hourly` and `changes`; `report` takes `--role` and `--by settings|week`.
+`report` shows the `--where` value in the settings column and omits rows with no samples.
+`changes [--since TIME] [--files] [--detail]` lists tracked settings changes, newest first, after one summary line of verdict counts.
+It compares `changes_window_hours` before and after each change, per machine, family and role.
+A Claude setting is judged only for Claude roles, and a Codex setting only for Codex roles; a tracked file counts for both.
+Each request is split by time and by the settings it ran with. A session counts only on the side with more matching requests.
+Each measure needs `changes_min_sessions` sessions on each side; a role is judged when at least one measure qualifies, and its line names the measures with too few samples.
+Lower is better for all four measures. A change under `changes_min_percent` is noise.
+The verdicts are better, worse, mixed (named measures moved both ways), no clear change, and too few sessions.
+Roles with too few sessions share one `not judged` line. Other settings, model and CLI changes in the window, and file edits grouped per file, share one `also changed` line.
+By default only settings changes are listed; `--files` adds tracked file edits. `--detail` prints every measure with its sample counts.
+The `/context_economy` command does not print this report by default. It writes a short summary: one table per settings change, the other changes, a trust line and a next step. `--raw` prints the report unchanged.
+The verdicts describe observed movement, not proven cause.
 `hourly` reads only the ledger, so it lags by up to one collection. It shows active unit directors and weighted cost for the last `hourly_recent_hours` complete hours. Its normal and busy rows are the median and p75 of the `hourly_baseline_days` before those hours.
 The default window covers the last seven days.
 Bounds use `scripts.lib.user_zone.user_zone`.
@@ -479,13 +491,27 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
 
 `scripts/usage/transcript_retention.py` acts only on this machine.
 `config/transcript_retention.conf` sets `compress_after_days` to 14 and `delete_after_days` to 60.
-The command uses file mtime and skips every session that the local staff record names.
-It also skips subagents under those sessions.
+The command uses file mtime for the age rules.
+Only main transcripts of local staff rows of kind `showrunner`, `producer`, or `unit` have a keep rule.
+Live and retired rows keep their main transcript, regardless of its age.
+The staff record has no retirement timestamp.
+A retired row's main transcript stays plain while the row stays in the record.
+A cut for rows retired more than four weeks waits for a retirement time in the staff record.
+When the staff record no longer holds the row, its transcripts follow the age rule.
+A main transcript is `<current_session>.jsonl`, its `.zst` form, or a Codex rollout whose name ends with that session id.
+Subagent files under a session folder and worker transcripts follow the age rule.
 Compression writes a neighboring `.jsonl.zst`, preserves mtime and permissions, then removes the plain file.
 Deletion removes either form after the second age limit.
-`--dry-run` measures compression in temporary storage and prints each action without changing the source tree or summary cache.
-Each root gets counts, the staff skip count, and the bytes freed or planned.
-No timer starts this command.
+A real run prints a flushed start line for each root with its compression and deletion counts.
+Each run prints one summary per transcript root and one total line.
+Each summary gives compression, deletion, and staff skip counts, plus freed GB with two decimals.
+Dry runs and real runs also print `kept plain` counts by staff kind.
+`--files` also prints each file action.
+`--dry-run` reports "would compress", "would delete", and "would free about" without changing transcripts or the summary cache.
+The dry run estimates compression savings from bounded samples instead of compressing every candidate.
+`sample_files` and `sample_bytes` in `config/transcript_retention.conf` limit each root to 20 samples of at most 1 MiB each.
+Deletion sizes remain exact, and a real run measures compression savings exactly.
+The shared `modules/common/transcript-retention.nix` in the nixos repo schedules the command daily at 04:30 local time on both machines.
 
 `scripts/lib/transcripts.py` owns the seekable binary reader for both forms.
 Decompression uses zstd and temporary disk storage rather than holding the transcript in memory.
@@ -495,7 +521,8 @@ The screenshot report sends the same reader source to the Mac.
 The hana_shot report reads timing records rather than transcripts and needs no change.
 `usage/rollouts.py` already parses supplied streams and needs no reader change.
 Model-study reports, usage outcomes, and screenshot episode reports read saved measurements and need no transcript change.
-Active hooks, `production/worker_admission.py`, and worker lifecycle readers retain plain reads because the staff skip protects their resumable sessions.
+Active hooks, `production/worker_admission.py`, and worker lifecycle readers retain plain reads.
+Recent worker transcripts stay plain through the age rule.
 `message/sessions.py` and `message/rca.py` locate active sessions and do not parse historical transcripts.
 `shot_report/transcripts.py` retains `rg` only for plain-file candidate selection; its archive selection and parsing use the shared reader.
 `nightly_review` sends selected paths to the reply review subprocess, which uses the shared reader.

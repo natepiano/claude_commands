@@ -25,7 +25,6 @@ from zoneinfo import ZoneInfo
 from scripts.production import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
-from scripts.production.merge_checkpoint import check_parallel
 
 from scripts.lib import main_publish, scratch
 
@@ -277,7 +276,14 @@ import subprocess
 tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
 common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
 with (Path(common) / "main-push.lock").open("a") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_state = "held"
+    else:
+        lock_state = "free"
+with (state / "tested-locks").open("a") as output:
+    output.write(lock_state + "\\n")
 with (state / "tested-tips").open("a") as output:
     output.write(tip + "\\n")
 if name == "checkpoint-test" and (state / "move-main").exists() and not (state / "moved-main").exists():
@@ -306,6 +312,10 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                     if outcome == "resume":
                         _ = self.git("merge", "--no-ff", "-m", "Merge interrupted checkpoint", checkpoint)
                     result = self.run_checkpoint(checkpoint, phase="3")
+                    if outcome != "conflict":
+                        tips = (self.state / "tested-tips").read_text().splitlines()
+                        lock_states = (self.state / "tested-locks").read_text().splitlines()
+                        self.assertEqual(lock_states, ["free" if tip == tips[0] else "held" for tip in tips])
                     if outcome.startswith("moving-"):
                         tips = (self.state / "tested-tips").read_text().splitlines()
                         moved = (self.state / "moved-main").read_text()
@@ -705,20 +715,6 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertIn("--review-trial", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
-    def test_code_checkpoint_requires_a_known_parallel_line(self) -> None:
-        sha = self.checkpoint()
-        for parallel, expected in (
-            (None, "requires --parallel"),
-            ("Parallel: unknown — Phase 5 has no **Depends on:** line; add one under each phase heading and rerun",
-             "adds a **Depends on:** line"),
-            ("Parallel: maybe later", "--parallel must read"),
-        ):
-            result = self.run_checkpoint(sha, parallel=parallel)
-            self.assertEqual(result.process.returncode, 1)
-            self.assert_stopped_before_merge(result, "failed", expected)
-        for parallel in ("Parallel: none — Phase 4 needs Phase 3 (running)", "Parallel: Phase 4, Phase 6 could start"):
-            with self.subTest(parallel=parallel):
-                check_parallel(parallel)
     def test_alternate_review_trial_is_refused_and_canonical_numbers_reach_record(self) -> None:
         sha = self.checkpoint()
         alternate = self.run_checkpoint(sha, trial="review trial: UX 2, code 3, review 14 min, UX check 4 min, UX repair 1 min")

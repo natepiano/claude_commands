@@ -1432,6 +1432,8 @@ def main(arguments: list[str] | None = None) -> int:
             return ExitCode.OK
         name = WorkerName.parse(args.name)
         if args.command == "close":
+            if worker_admission.find_worker(record, owner.id, name.value) is None:
+                return _result(AdmissionRefused(f"no worker named {name.value}"))
             return _result(close(owner.id, name))
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))
