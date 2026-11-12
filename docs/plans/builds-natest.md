@@ -3219,46 +3219,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 186 — The verify test fixtures answer fixed Cargo calls from a shell script, not a Python start  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The full `verify.sh` entries in the verify tests cost less CPU, because a fixed Cargo reply comes from a shell script and not a new Python process, with every test, assertion and full entry kept.
-
-**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check; no test removal. Architect after Phase 183: one shared fixed-reply installer is the next verify step. verify-unit go, 2026-11-12, for the four support files, with conditions 1-5 in Spec 3.
-
-**Spec:**
-1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_wait_holder.py direct/test_verify_mac_only.py direct/test_verify_ssh_targets_routing.py direct/test_verify_token_renew.py`. Count the Cargo stub starts and their CPU, and which reply each call needs.
-2. Add one shared installer in `verify_mac_offload_test_support.py` that writes a POSIX shell `cargo` for fixed replies, and use it from the other three support files where they now start Python only for a fixed reply. `CARGO_STUB` (line 306) and the Python path stay for `TEST_CARGO_HOLD`, signals, PID files, edits, custom observers and dynamic event records.
-3. Keep (verify-unit conditions):
-   1. Same event line. Each shell reply writes the same `TEST_CARGO_EVENTS` line as `CARGO_STUB`: the same JSON for `args` and `token_held`, in one write per line. Add one row that runs both paths with arguments that hold a space, a double quote, a backslash, a non-ASCII character and an empty string, and compares the lines byte for byte. An argument the shell path cannot quote goes to the Python path.
-   2. Same order. The `--version` replies (`mend`, `+nightly fmt`, `clippy`) exit before the event write. The metadata reply prints `TEST_METADATA` exactly, with one newline.
-   3. `token_held` is true when the `TEST_TOKEN_RECORD` file exists at the moment of the call.
-   4. The leak marker. Shell replies inherit `TEST_RUNNER_STATE`, so `assert_nothing_outlives` still finds them. Do not exec a binary that clears the environment.
-   5. Python stays for `TEST_CARGO_HOLD`, signals, PID files and the observers.
-4. Keep every test, assertion and full `verify.sh` entry. Keep `RUSTC_STUB` and the token metadata path. Change no production code. Use Bash 3.2-compatible POSIX shell.
-5. Run every importer of the four support files after the change. Measure after with the Spec 1 command. The director runs three aws pairs on the four modules and a sample of importers; only aws pairs decide.
-
-**Files:**
-- `scripts/direct/verify_mac_offload_test_support.py` — `CARGO_STUB` and the new shared installer; 42 test importers.
-- `scripts/direct/verify_token_wait_test_support.py` — its Cargo stubs.
-- `scripts/direct/verify_hold_wait_test_support.py` — its `CARGO_STUB` variant.
-- `scripts/direct/verify_ssh_targets_test_support.py` — its Cargo stubs.
-- `scripts/direct/test_verify_mac_only.py` — the byte-for-byte event row, or another verify test module the writer names.
-
-**Workers:** 1 writer; the four support files share one installer and cannot split.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 177: 1,141 Python Cargo tasks cost 25.261 local CPU s across 47 modules (gross ceiling).
-- Phases 181 and 183: aws pairs saved 1.37 s and 0.71 s; the full entries verify named hold most of the cost.
-- Phase 185: the recorder imports less; use matching production code on both sides of each pair.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest` passes for every importer of the four support files, with unchanged test counts.
-- The byte-for-byte event row passes and fails when the shell quoting is broken.
-- basedpyright on each changed Python file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+- Checkpoint `a8054dadf`. `install_fixed_cargo` in `verify_mac_offload_test_support.py` writes a POSIX shell `cargo` that answers the fixed replies (`--version`, metadata, `nextest run` status) and appends the same `TEST_CARGO_EVENTS` line as the Python stub; it exits 1 when the append fails. Other calls (`TEST_CARGO_HOLD`, signals, PID files, observers) still go to Python. `verify_hold_wait_test_support.py` and `verify_ssh_targets_test_support.py` use it; `verify_token_wait_test_support.py` is unchanged. `test_fixed_cargo_replies_match_python_events` in `test_verify_mac_only.py` compares both stubs byte for byte, including a `/dev/full` row. 145 importers, 2,355 tests pass. Three aws pairs saved about 1.2 CPU s per run: `ssh_targets_routing` 0.63, `wait_holder` 0.39, `token_renew` 0.22, `hold_events` 0.06, `mac_only` −0.01 (one new test), `result_environment` −0.06. The local 25 s figure was load noise: Python stub starts are not the main cost of these modules.
 
 ### Phase 187 — The task CPU measure reads a task whose name holds bytes that are not UTF-8  · status: done
 **Depends on:** none
@@ -3310,31 +3273,117 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright reports 0 errors and 0 warnings on the changed files.
 - The replay keeps containment for all 55 runs and shows the added median before and after.
 
-### Phase 190 — Measure the repeated target-command work in three verify test modules  · status: todo
+### Phase 190 — Measure the repeated target-command work in three verify test modules  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research; no commit. Target commands cost 28.462 CPU s in `test_verify_wait_holder.py` (7.420), `test_verify_mac_only.py` (11.064) and `test_verify_ssh_targets_routing.py` (9.978), all required eligibility, probe, reserve and release work. Repeats that read unchanged data: `target_platform` (`verify.sh:2628`), `target_for_settings` (`verify.sh:2639`), and the reserve command that `route_test` builds twice per attempt (`verify.sh:2848,2865`). Estimate, not measured: 0–0.22 CPU s for 446 excess reads. Owner proposal sent to verify-unit via builds: build `ssh_reserve_hook` once per `route_test` attempt; natest recommends no action at this gain. Report: `phases/190/target_command_report.md` in the session folder. Architect after Phase 190: the tested verify harness changes are at a practical floor; the next verify step is a startup-reuse owner trial (next items).
+
+### Phase 191 — Profile the three slowest test modules outside verify and name their removable work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research; no commit. Local profiles (161 tests pass): `test_fast_track.py` 46.1 CPU s (Git 21.3 s in 7,596 starts, `fast_track.py` CLI 11.0 s), `test_crate_run.py` 55.5 s (26,619 processes), `test_standing_checkpoint.py` 6.9 s (the 39.9 s rolling median is not a paired baseline). All three already use class fixtures; most Git work supplies race and recovery proofs. Bounded estimates, not measured: zone handler called directly in function cases (`test_fast_track.py:316`, natest) 0–2.06 s; skip frozen checkout preparation for terminal resumes (`style/crate_run.py:979`, style-unit with copies-unit review) 0–2.86 s; single-file frozen seed (`test_crate_run.py:135`) 0–1.09 s; command adapter for direct publication helpers (`test_standing_checkpoint.py:237`) 0–0.78 s; extended frozen seed (`test_crate_run.py:102`) 0–0.57 s; fixed seed Git metadata (`test_fast_track.py:275,298`) 0–0.26 s. First aws trial: the zone handler change, after the test owner's go. Report: `phases/191/module_profile_report.md` in the session folder.
+
+### Phase 192 — The fast-track tests run the zone drain through its real handler in process  · status: done
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A report names the target-command work that repeats inside `test_verify_wait_holder.py`, `test_verify_mac_only.py` and `test_verify_ssh_targets_routing.py`, with the removable part kept apart from the required part.
+**Goal:** `production/test_fast_track.py` uses less CPU, with all 50 tests, every assertion, the full CLI case and every interruption case kept.
 
-**Decision:** architect after Phase 187 (next items order step 2). natest measures; verify-unit owns any production design. Keep every check, full entry, reservation, live probe, lock and release.
+**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R2 and R6): direct zone handler calls; keep the CLI and interruption cases. Tell devtools before the edit. Paired aws trials decide; ship any measured gain.
 
 **Spec:**
-1. For each module, run `module_cost.py --tests 10 --commands 10`. Count the `build_targets.py` and `verify.sh` target-metadata calls per test, with their arguments.
-2. Trace the calls through `verify.sh:783,2395` and the `build_targets.py` eligibility and reservation handlers. Mark each repeated call as an immutable read (same input, same output in one test) or required work.
-3. Estimate removable CPU from the immutable repeats only. Keep estimates apart from measurements. Phase 177 measured 8.019, 8.658 and 8.156 target-command CPU s; 0–24.833 s is a gross ceiling.
-4. Name the smallest owner change (a file and function in verify's code) that removes the repeats, and the test-side change, if any, that natest can make alone.
+1. R2. In `FastTrackTests.command` (`test_fast_track.py:316`), intercept only the known `zone.py drain --pulled ...` command in synchronous function cases. Run `zone.main` through the shared `invoke_cli` fixture with the real queue and Git work. Restore the environment, `user_zone.CONF`, cwd, stdout, stderr and the exit status. Do not replace the drain with a fixed reply.
+2. Keep the full fast-track CLI case (`test_fast_track.py:1000`) and every interruption, concurrent-process and deadline case as real processes.
+3. R6. Store the class seed's common Git directory and initial main commit as class fixture values (`test_fast_track.py:238,275,298`). Copy them into the instance after the private tree is restored. Read mutable refs again in every production operation and assertion.
+4. Change no production code. Keep every test and assertion.
+5. Run `test_fast_track`, the zone tests and the promotion tests that cover queued-zone delivery. The director runs three aws pairs.
 
 **Files:**
-- `phases/190/target_command_report.md` — in the session folder.
+- `scripts/production/test_fast_track.py` — the command helper and the class seed.
 
-**Workers:** 1 researcher; one report.
-- impl: the measurement and the report.
+**Workers:** 1 writer; one test file.
+- impl: all files.
 
 **Constraints from prior phases:**
-- Phases 181, 183 and 185 saved 1.37, 0.71 and about 2.7 CPU s in aws pairs. Phase 186 (fixed-reply Cargo installer) is open on the shared verify fixtures; local CPU can be high while its runs go. Report counts first; CPU is a guide only, and aws pairs decide.
+- Phase 191: zone drain parent calls 2.06 CPU s (36 calls); seed Git metadata 0.27 s. Estimates bound the saving; they are not measured.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report has per-module call counts, the immutable-repeat list with file and line, the CPU estimate range and the owner proposal.
+- `python3 -m unittest` passes `test_fast_track` (50 tests) and the zone and promotion tests that cover queued-zone delivery.
+- basedpyright on the changed file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain with all 50 tests passing; with no gain, the phase lands nothing.
+
+### Phase 193 — The crate-run and standing-checkpoint tests reuse class seeds and the command adapter  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `style/test_crate_run.py` and `style/test_standing_checkpoint.py` use less CPU, with every test, assertion, path and proof kept.
+
+**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R3, R4 and R5): frozen seeds and the command adapter. Tell style before the edit. Paired aws trials decide; ship any measured gain.
+
+**Spec:**
+1. R3. Add one single-file frozen class seed (`paths=("src/lib.rs",)`) for the thirteen first-statement setup calls the Phase 191 report lists (`test_crate_run.py:135,161,242`). The real fixture writers run once per class. Keep all fixture paths, private ledgers, refs, workspaces, cached properties and per-test cleanup.
+2. R5. Use the existing default `frozen_tests` seed for the seven setup-only cases the report lists (`test_crate_run.py:102,161`). Keep `test_manifest_pins_exact_selection_rule_and_result_paths` (line 1401) and the custom source, changed manifest, shared proposal, dry-run, loader and pre-freeze edit cases on their current paths.
+3. R4. Route the direct `publish` helper (`test_standing_checkpoint.py:237`) and the direct gate call (`:305`) through `run_style_command`, as the CLI helper at `:176` does. Keep one original publication-to-footprint child path and both notification CLI calls at `:539`. Keep real Git, publication locks, candidate checkouts, index bytes, crash journals and verification callbacks.
+4. Change no production code. Keep every test and assertion.
+5. Run both modules and the importers of `style_plan_test_support.py` that the change touches. The director runs three aws pairs per module.
+
+**Files:**
+- `scripts/style/test_crate_run.py` — the R3 seed and the R5 cases.
+- `scripts/style/test_standing_checkpoint.py` — the R4 adapter calls.
+
+**Workers:** 1 writer; the two files are small changes in one fixture family.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 191 bounds: R3 0–1.09 s, R5 0–0.57 s, R4 0–0.78 s. Not measured. `test_standing_checkpoint.py` measured 6.9 CPU s locally.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest` passes both modules with unchanged test counts.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- Three aws pairs per module show a CPU gain with unchanged test counts; a module with no gain lands nothing.
+
+### Phase 194 — A terminal crate-run resume skips frozen checkout preparation  · status: todo
+**Depends on:** Phase 193
+
+#### Work Order
+
+**Goal:** A crate run that resumes in a terminal stage returns without building the frozen checkout, with every cleanup, lock and evidence check kept.
+
+**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R1): only if a terminal resume never reads that checkout; show that proof in the checkpoint. Tell style and queue (owner of `scripts/copies`) before the edit. Paired aws trials decide.
+
+**Spec:**
+1. Prove first: trace every read of the frozen checkout on the terminal path from `style/crate_run.py:974` through `complete_run` (`:1159`) and `copies.end_workspaces`. Write the proof to `phases/194/terminal_proof.md` in the session folder. If any terminal read exists, stop and report; land nothing.
+2. Move only the package lookup and the terminal-stage check before frozen checkout acquisition (`crate_run.py:979,986`). Keep the serial run lock and the `complete_run` context around that return.
+3. Keep every owner, unsaved-file, busy-lock, pending-removal and result-evidence check. Do not skip the checkout for selected, pending, claimed, tested or imported work.
+4. Add one row to an existing terminal test in `test_crate_run.py` that fails if a terminal resume builds the frozen checkout.
+5. Run `test_crate_run` and every importer of `crate_run.py`. The director runs three aws pairs.
+
+**Files:**
+- `scripts/style/crate_run.py` — the terminal return before checkout acquisition.
+- `scripts/style/test_crate_run.py` — the new row.
+- `phases/194/terminal_proof.md` — in the session folder.
+
+**Workers:** 1 writer; the proof and the change are one unit.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 191: twenty terminal-entry frozen scopes cost 2.86 CPU s inclusive, in seven tests. Not measured as a saving.
+- Phase 193 changes `test_crate_run.py` fixtures; this phase starts after it lands so the aws pairs measure one change.
+
+**State:** none.
+
+**Acceptance gate:**
+- The proof shows no read of the frozen checkout on the terminal path.
+- `python3 -m unittest` passes `test_crate_run` and every importer of `crate_run.py`.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain; with no gain, the phase lands nothing.
