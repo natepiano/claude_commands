@@ -1348,7 +1348,7 @@ class ResumeUnitTests(unittest.TestCase):
                 code, output = self.resume(*flags)
                 self.assertEqual(code, 1, output)
                 self.assertEqual(output, f"alpha: no .unit.toml in {self.worktree} or "
-                                 + f"~/.local/state/staff/units/{row.id}.toml; ask the showrunner\n")
+                                 + f"{unit_config.parked_path(row.id)}; ask the showrunner\n")
                 self.assertFalse(self.worktree.exists())
                 self.assertEqual(unit_config.place(row.id, self.worktree), unit_config.Nowhere())
                 self.assertEqual(self.calls, [])
