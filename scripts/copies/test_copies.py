@@ -1221,6 +1221,21 @@ class StandingTests(unittest.TestCase):
         self.assertTrue(scratch.end_copy(tree, record.task, time.time()))
         self.assertFalse(tree.exists())
 
+        with self.subTest(ended_workspace="unlinked native copy with unsaved work"):
+            with copies.workspace(self.owner_id, self.source, self.published,
+                                  name="unsaved-sweep-package", branch="worker", task="gate:unlinked-run") as unsaved:
+                _ = (unsaved / "pending.txt").write_text("keep unsaved work\n")
+            record = scratch.task_of(unsaved)
+            assert isinstance(record, copy_record.Registered)
+            self.assertNotIn("crate_run", record.fields)
+            copies.end_workspaces(record.task, [unsaved])
+            self.assertTrue(unsaved.exists())
+            ended = scratch.task_of(unsaved)
+            assert isinstance(ended, copy_record.Registered)
+            self.assertEqual(ended.fields["ended_task"], record.task)
+            self.assertIsInstance(scratch.lifetime(unsaved), scratch.Ended)
+            self.assertEqual((unsaved / "pending.txt").read_text(), "keep unsaved work\n")
+
     def test_workspace_refuses_another_base_or_branch_without_resetting(self) -> None:
         with copies.workspace(self.owner_id, self.source, self.head, name="reserved", branch="worker") as tree:
             _ = (tree / "tracked.txt").write_text("keep these edits\n")
@@ -1739,6 +1754,31 @@ class StandingTests(unittest.TestCase):
             pass
         copies.remove_trees(self.owner_id)
         self.assertFalse(tree.exists())
+        for stage in ("integrated", "abandoned"):
+            with self.subTest(crate_stage=stage):
+                name = "crate-" + stage
+                terminal = copies.workspace_path(self.owner_id, self.source, name)
+                active = copies.workspace_path(self.owner_id, self.source, name + "-active")
+                manifest_path = self.base / (name + ".json")
+                crates = {"terminal": {"checkout": str(terminal), "stage": stage},
+                          "active": {"checkout": str(active), "stage": "selected"}}
+                manifest = {"version": 2, "canonical": str(self.source), "base": self.head, "crates": crates}
+                _ = manifest_path.write_text(json.dumps(manifest))
+                with copies.workspace(self.owner_id, self.source, self.head, name=name,
+                                      branch="worker", run_manifest=manifest_path):
+                    pass
+                with copies.workspace(self.owner_id, self.source, self.head, name=name + "-active",
+                                      branch="worker", run_manifest=manifest_path):
+                    pass
+                with self.assertRaisesRegex(copies.CopyError, "not terminal") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(active), str(refused.exception))
+                self.assertFalse(terminal.exists())
+                self.assertTrue(active.exists())
+                crates["active"]["stage"] = "abandoned"
+                _ = manifest_path.write_text(json.dumps(manifest))
+                copies.remove_trees(self.owner_id)
+                self.assertFalse(active.exists())
 
     def test_owner_removal_preserves_a_source_with_an_adopted_borrower(self) -> None:
         with copies.workspace(self.owner_id, self.source, self.head, name="parent", branch="worker") as parent:
