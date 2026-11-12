@@ -382,6 +382,43 @@ try {
               unit.dispatchEvent(new Event('change'));
             })()`);
 
+            for(const [name,detail] of [
+              ['cloud_stage','tools ready'],
+              ['cloud_region','tests start · eu-south-2, zone a'],
+              ['cloud_zone','eu-south-2, zone us-east-1b'],
+              ['cloud_empty','']]) {
+              await show(readings[name]);
+              const detailProof=await evaluate(`(() => {
+                const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
+                const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
+                const amounts=chart.querySelector('.amounts');
+                return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
+                  ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
+                  rootFont:getComputedStyle(document.documentElement).fontSize,
+                  beside:document.querySelector('#walk').classList.contains('beside'),
+                  detailRight:amounts.getBoundingClientRect().right,
+                  tableLeft:document.querySelector('.walk-table').getBoundingClientRect().left,
+                  chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
+              assert.equal(detailProof.text,expected,'The AWS detail text differs.');
+              assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
+              assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
+              if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
+                'The AWS detail text crosses into the table.');
+              assert.ok(Math.abs(detailProof.chartHeight-detailProof.rowHeight)<1,'The AWS row heights differ.');
+              assert.ok(detailProof.scroll<=detailProof.client,'The AWS detail text overflows the page.');
+              if(name==='cloud_region') {
+                const clip=await evaluate(`(() => {
+                  const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                  return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,`${theme}-${width}-aws.png`),Buffer.from(shot.data,'base64'));
+              }
+            }
+
             for(const [name,lateAge,modules,failed] of [
               ['cloud','2 min','7 of 12 modules','1 failed module'],
               ['cloud_zero','2 d','123456 of 999999 modules','123456 failed modules']]) {

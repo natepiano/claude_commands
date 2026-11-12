@@ -610,6 +610,29 @@ class MemoryFeedTests(unittest.TestCase):
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 self.assertEqual(payload["mac_idle_alert"], expected)
 
+    def test_cloud_rows_show_stage_and_location(self) -> None:
+        reading = cloud_reading(reservation_reading())
+        first = reading.cloud[0]
+        assert isinstance(first.progress, cloud_progress.CloudProgress)
+        for stage, region, zone, detail in (
+            ("tools ready", "", "", "tools ready"),
+            ("tests start", "eu-south-2", "eu-south-2a", "tests start · eu-south-2, zone a"),
+            ("", "eu-south-2", "us-east-1b", "eu-south-2, zone us-east-1b"),
+            ("", "", "eu-south-2a", "zone eu-south-2a"),
+            ("", "eu-south-2", "", "eu-south-2"),
+            ("", "", "", ""),
+        ):
+            with self.subTest(stage=stage, region=region, zone=zone):
+                current = replace(first, progress=replace(first.progress, stage=stage, region=region, zone=zone))
+                with mock.patch.object(admission_client, "view", return_value=replace(
+                        reading, cloud=(current, *reading.cloud[1:]))):
+                    page = memory_feed.reading()
+                payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                rows = cast(list[dict[str, object]], payload["walk"])
+                remote, = [row for row in rows if row.get("kind") == "cloud"]
+                expected = " · ".join(filter(None, (detail, "7 of 12 modules", "1 failed module")))
+                self.assertEqual(remote["status"], expected)
+
     def test_cloud_rows_share_the_feed_without_memory_reservations(self) -> None:
         _ = (self.root / "cloud_gate.conf").write_text(
             "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
@@ -939,6 +962,14 @@ def write_browser_fixture(folder: Path) -> None:
         readings["cloud"] = cloud
         first = cloud.cloud[0]
         assert isinstance(first.progress, cloud_progress.CloudProgress)
+        for name, stage, region, zone in (
+            ("cloud_stage", "tools ready", "", ""),
+            ("cloud_region", "tests start", "eu-south-2", "eu-south-2a"),
+            ("cloud_zone", "", "eu-south-2", "us-east-1b"),
+            ("cloud_empty", "", "", ""),
+        ):
+            readings[name] = replace(cloud, cloud=(replace(first, progress=replace(
+                first.progress, stage=stage, region=region, zone=zone)), *cloud.cloud[1:]))
         readings["cloud_zero"] = replace(cloud, cloud=(replace(first,
             progress=replace(first.progress, updated_at=0.0, failed_modules=123456),
             counter=progress_profile.ProgressCounter("modules", 123456, 999999)), *cloud.cloud[1:]))
