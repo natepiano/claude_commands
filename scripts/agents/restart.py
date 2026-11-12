@@ -295,13 +295,16 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         return False
 
 
-def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
-    projected = entry.copy()
-    projected["session_id"] = identity
-    projected["name"] = name
+def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str, *,
+                  record: staff.StaffSnapshot | pane_launch.StaffSnapshotRead = pane_launch.StaffSnapshotRead.CURRENT) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+    record = staff.initial_snapshot() if isinstance(record, pane_launch.StaffSnapshotRead) else record
+    projected = pane_launch.current_launch(entry, record)
+    if "staff_id" not in projected:
+        projected["session_id"] = identity
+        projected["name"] = name
     arguments = pane_record.resume_arguments(projected)
-    kind = pane_launch.agent_kind(entry)
-    home = pane_launch.config_home(entry)
+    kind = pane_launch.saved_kind(projected)
+    home = pane_launch.config_home(projected, record=record)
     if isinstance(home, staff.HomeUnknown):
         print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
         return kind, {}, arguments
@@ -451,7 +454,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if row.kind == "producer":
             kind, environment, arguments = producer_resume(row, original) if original is not None else producer_launch(row)
         else:
-            kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name)
+            kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name, record=record)
                 if original is not None else session_launch(str(row.current_session), row.name))
         selected = member_account.resume_account(kind, row, to=target_account)
         if isinstance(selected, accounts.NamedAccount):
@@ -463,6 +466,10 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
                        client.saved_row_tab(str(row.id), row.name, workspace))
+        selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
+        expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(folder), selected_home)
+        if row.kind == "producer":
+            environment = expectation.environment(environment)
         prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
         if isinstance(prepared, nix_env.Refused):
@@ -499,7 +506,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         settings = conf.read("shutdown")
         start_seconds = settings.number("START_SECONDS")
         operation_deadline.check()
-        selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
         check: DirectorResumeCheck | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT
         if isinstance(opening, herdr.OpeningPrompt):
             transcript = herdr.SessionTranscript(selected_home, str(row.current_session))
@@ -524,8 +530,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                         return before_prompt(actual)
 
                     opening = replace(opening, before_prompt=native_transcript)
-        expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(folder), selected_home)
-        scope = (pane_launch.producer_start(pane_record.record_directory(), expectation)
+        scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,

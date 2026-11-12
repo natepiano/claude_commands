@@ -233,7 +233,7 @@ class RelaunchTests(ShutdownTestCase):
 
     def test_director_resume_without_a_pane_marker_names_its_workers(self) -> None:
         from scripts.production import staff
-        from scripts.production.staff_test_support import fixture_member, fixture_worker
+        from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_session
         from scripts.agents import pane_record
 
         with patch.dict(os.environ, {"HOME": str(self.root), "ROSTER_RUN_ROOT": str(self.root / "runs"),
@@ -241,6 +241,7 @@ class RelaunchTests(ShutdownTestCase):
             runner = fixture_member("showrunner", name="TEST-showrunner")
             director = fixture_member("unit", name="TEST-director", parent=runner.id,
                                       worktree=staff.PresentWorktree("natedev", self.root))
+            fixture_session(director.current_session, staff.ClaudeBackend())
             workers = [fixture_worker(name, director.id) for name in ("impl", "review")]
             entry = pane_record.launch("w1:p2", director.current_session, str(self.root), {}, ["claude"])
             with patch.object(pane_record, "RECORD_DIR", self.root / "panes"):
