@@ -3294,7 +3294,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `46b4a770b`. In synchronous function cases, `FastTrackTests.command` runs the known `zone.py drain` through the real `zone.main` with `invoke_cli` and restores the environment, `user_zone.CONF`, cwd, stdout, stderr and exit status on success, nonzero exit and exception. The class seed keeps its common Git directory and first main commit. The full CLI case and every interruption, concurrent-process and deadline case stay real processes. 50 tests and 308 assertions kept. aws pairs: 53.77 to 51.19 CPU s (2.63 s per run); `lib/test_zone.py` unchanged. Local unpaired runs showed no gain.
 
-### Phase 193 — The crate-run and standing-checkpoint tests reuse class seeds and the command adapter  · status: todo
+### Phase 193 — The crate-run and standing-checkpoint tests reuse class seeds and the command adapter  · status: done
 **Depends on:** none
 
 #### Work Order
