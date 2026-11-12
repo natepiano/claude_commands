@@ -117,6 +117,8 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         owner = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
         owner = staff.update_current_session(owner.id, staff.native_id(SESSION))
         _ = staff.set_run(owner.id, staff.OpenRun(run))
+        state["owner_staff_id"] = owner.id
+        _ = (run / "progress_history_state.json").write_text(json.dumps(state))
         sessions = root / "sessions"
         sessions.mkdir()
         for index, name in enumerate(("expected-showrunner", "claude-build-followups-other", "claude-one", "claude-two", "postmaster")):
@@ -163,7 +165,7 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
 
 
 class DirectorTurnWaitHookTests(unittest.TestCase):
-    def test_historical_worker_address_alias_matches_its_thread_and_not_its_name(self) -> None:
+    def test_fixed_worker_address_matches_its_current_session(self) -> None:
         with director_wait_fixture() as fixture:
             runs = fixture.root / "unit-runs"
             worker_run = runs / "supplier-run"
@@ -172,8 +174,9 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             worker = fixture_worker("supplier-fix", parent.id,
                                     backend=staff.CodexBackend(fixture.root / "codex"))
             write_text_atomic(worker_run / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": parent.id}))
+            _ = staff.rename(worker.id, "renamed-supplier")
             fixture.environment["UNIT_RUN_ROOT"] = str(runs)
-            supplier = "worker:supplier-run/supplier-fix"
+            supplier = f"worker:supplier-run/{worker.id}"
             fixture.call(STOP, {"last_assistant_message": "blocked: waiting on " + supplier}, 1010)
             fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:another-thread", name=supplier)}, 1020)
             self.assertEqual(len(fixture.wait_events()), 1)

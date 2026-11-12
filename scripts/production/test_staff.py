@@ -26,7 +26,7 @@ from scripts.production import staff
 from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
-from scripts.lib import unit_runs
+from scripts.lib import transcripts, unit_runs
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -203,8 +203,13 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         (numbered / "sessions").symlink_to(shared, target_is_directory=True)
         absent = Path.home() / ".codex2"
         absent.mkdir()
+        sibling = Path.home() / ".codex3"
+        sibling.mkdir()
+        (sibling / "sessions").symlink_to(shared, target_is_directory=True)
+        expected_backends: dict[staff.StaffId, staff.CodexBackend] = {}
         for label, home, expected in (
             ("recorded", staff.SessionHome(numbered), staff.CodexBackend(numbered)),
+            ("shared", staff.SessionHome(sibling), staff.CodexBackend(sibling)),
             ("unknown", staff.HomeUnknown(), staff.BACKEND_UNAVAILABLE),
             ("absent", staff.SessionHome(absent), staff.BACKEND_UNAVAILABLE),
         ):
@@ -215,13 +220,22 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                 transcript.touch()
                 if isinstance(home, staff.SessionHome):
                     row = staff.set_home(row.id, home)
+                if isinstance(expected, staff.CodexBackend):
+                    expected_backends[row.id] = expected
                 with mock.patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}):
                     for compressed in (False, True):
                         with self.subTest(compressed=compressed):
                             if compressed:
                                 _ = compressed_copy(transcript)
-                            self.assertEqual(staff.backend(row), expected)
-                            self.assertEqual(staff.local_snapshot().backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
+                            with mock.patch.object(transcripts, "transcript_paths", wraps=transcripts.transcript_paths) as listed:
+                                self.assertEqual(staff.backend(row), expected)
+                                backends = staff.local_snapshot().backends
+                                self.assertEqual(backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
+                            self.assertEqual(dict(backends), expected_backends)
+                            self.assertEqual(
+                                [cast(Path, call.args[0]).resolve() for call in listed.call_args_list].count(shared),
+                                2,
+                            )
 
     def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
         environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",

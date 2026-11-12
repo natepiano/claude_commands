@@ -138,7 +138,7 @@ class PaneWorld(herdr.Herdr):
             "HERDR_PROC": str(test.root / "proc"), "HERDR_PLATFORM": "linux",
             "HERDR_PANE_RECORD_DIR": str(test.root / "pane-records"),
             "CLAUDE_CONFIG_DIR": str(test.root / "claude"), "CODEX_HOME": str(test.root / "codex"),
-            "AGENTS_CALLER_FAMILY": "", "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
+            "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
             "UNIT_RUN_DIR": str(test.root / "run"), "ROSTER_RUN_ROOT": str(test.root),
         })))
         _ = test.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
@@ -555,6 +555,7 @@ class WorkerPaneTests(StaffTestCase):
                                         worktree=staff.PresentWorktree("natedev", self.root)).id
         self.world = PaneWorld()
         self.world.setup(self)
+        _ = self.enterContext(patch.object(staff, "local_snapshot", side_effect=staff.snapshot))
         self.world.add(self.parent, "w1:p0")
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit-runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
@@ -906,7 +907,7 @@ class WorkerPaneTests(StaffTestCase):
         run = self.root / "run"
         run.mkdir(exist_ok=True)
         write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": str(self.parent.id), "pass": {
-            row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
+            row.name: {"instance_id": "dispatch-" + row.name, "worker_id": row.id,
                        "team_slot": row.name, "kind": role, "status": "completed" if completed else "active"}}}))
 
     def completed_dispatch(self, row: staff.StaffRow, role: staff.WorkerRole) -> None:
@@ -1026,6 +1027,25 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.requests[-1][2]["UNIT_RUN_DIR"], str(first))
         self.assertEqual(self.start("new-worker"), result)
         self.assertEqual(len(self.world.launches), 1)
+        assert isinstance(result, worker_panes.OpenWorker)
+        foreign = self.root / "foreign-run"
+        foreign.mkdir()
+        self.write_json(foreign / unit_runs.STATE_FILE, {"owner_staff_id": self.parent.id})
+        link = staff.record_path().parent / "dispatches" / result.row.id
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(foreign / unit_runs.STATE_FILE)
+        self.assertEqual(worker_panes.worker_run(result.row), first)
+
+    def test_worker_run_checks_the_recorded_dispatch_with_the_supplied_staff(self) -> None:
+        row = self.worker("before-rename")
+        _ = self.recorded_dispatch(row, "completed", at=20)
+        linked = self.root / "run"
+        _ = self.worker_run("older-run", "unit", self.parent.current_session, director_run=True,
+            passes=({"worker_id": row.id, "instance_id": "older-dispatch", "started_at": 10},))
+        _ = staff.rename(row.id, "after-rename")
+        record = staff.snapshot()
+        with patch.object(staff, "local_snapshot", side_effect=AssertionError("use the supplied staff")):
+            self.assertEqual(worker_panes.worker_run(row, record=record), linked)
 
     def test_close_uses_the_newest_pass_when_an_older_short_slot_is_last(self) -> None:
         cases = ((10, 20, False), (None, -1, False), ("later", -1, False), (10, 20, True))
@@ -1042,12 +1062,12 @@ class WorkerPaneTests(StaffTestCase):
                 newest = passes[row.name]
                 newest["started_at"] = newest_start
                 own_pass = dict(newest)
-                older: dict[str, object] = {"instance_id": "older-dispatch", "worker_name": row.name,
+                older: dict[str, object] = {"instance_id": "older-dispatch", "worker_id": row.id,
                     "team_slot": "test", "kind": "impl", "status": "completed"}
                 if older_start is not None:
                     older["started_at"] = older_start
                 if foreign_worker:
-                    newest.update(worker_name="test2", team_slot="test", instance_id="foreign-dispatch",
+                    newest.update(worker_id=fixture_runtime_id("foreign-pass-worker"), team_slot="test", instance_id="foreign-dispatch",
                                   status="active", started_at=30)
                 else:
                     passes["test"] = older
@@ -1424,6 +1444,8 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
 
     def test_run_handoff_keeps_the_pane_with_the_current_run_environment_once(self) -> None:
+        run_a = self.run_state()
+        _ = staff.set_run(self.parent.id, staff.OpenRun(run_a))
         row = self.worker("retained", family="codex")
         self.world.add(row, "w1:p1", live=False, family="codex")
         first = self.start(row.name)

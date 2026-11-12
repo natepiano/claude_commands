@@ -545,3 +545,21 @@ The saved baseline reports inserted phases as about 2% of gaps.
 - `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/checkpoint.md`, `docs/direct/phase_end.md`, `commands/plan/to_phased_plan.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md` — notice format and phase-start rules
 
 **Ruled out:** a replacement check for independent phases (user order).
+
+### Phase 23 — Transcript lookups do not resolve each file  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `transcript_paths(root, pattern)` calls no `resolve()` on each file. It keys each match by `uncompressed_path(path)`, so a plain file and its `.zst` copy give one entry, with the plain file preferred.
+- `distinct_files(paths)` in `scripts/lib/transcripts.py` merges symlink aliases in a small list of matches. A caller that counts or picks among the matches of one session uses it: `read_director_transcripts` in `phase_process.py`.
+- `showrunner_transcripts` in `nightly_review.py` resolves each path as it enters its result set, so a recorded path and a discovered path give one entry.
+- `_found_backends` in `staff.py` lists each real session folder once and reuses the list for each home that links to it. A row gets `CodexBackend(home)` only for its recorded home.
+- Paired CPU per call on natedev, 662 rows: `_found_backends` 0.08–0.10 s against 0.45–0.52 s before; `transcript_paths` over three homes 0.16 s against 0.42 s.
+
+**Files:**
+- `scripts/lib/transcripts.py` — transcript discovery and `distinct_files`
+- `scripts/production/staff.py` — Codex backend lookup, one scan for each real folder
+- `scripts/direct/phase_process.py`, `scripts/nightly_review/nightly_review.py` — callers that merge aliases
+- `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`, `scripts/direct/test_phase_process.py` — alias, shared-folder and plain-preferred rows

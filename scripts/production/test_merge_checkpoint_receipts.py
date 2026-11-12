@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.production import staff
 from scripts.production.cli_fixture import process_boundary
 
 import json
@@ -105,13 +106,14 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((report["covered_n"], report["missing_n"], report["missing"]),
                          (0, 1, [{"state": "ReceiptMissing", "merge_commit": merge}]))
     def test_gate_wait_uses_the_units_named_phase_and_closes_on_red(self) -> None:
+        director = next(row for row in staff.local_snapshot().find(kind="unit") if row.name == "alpha")
         checkpoint = self.checkpoint()
         session = self.root / "unit-runs" / "alpha-run"
         recorder = SCRIPT.parent.parent / "direct" / "progress_history.py"
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.unit),
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
-             "--main-session-id", "unit-director"],
+             "--main-session-id", str(director.current_session)],
             ["start-phase", "--session-dir", str(session), "--phase-id", "2", "--phase-title", "Gate"],
             ["checkpoint", "--session-dir", str(session), "--phase", "2", "--commit", checkpoint],
             ["start-phase", "--session-dir", str(session), "--phase-id", "3", "--phase-title", "Parallel"],
@@ -130,7 +132,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         finished, = [row for row in rows if row["event_type"] == "wait_finished"]
         phase, = [row for row in rows if row["event_type"] == "phase_started" and row["phase_id"] == "2"]
         self.assertEqual((started["wait_kind"], started["phase_instance_id"], started["unit"], started["owner_session"]),
-                         ("WaitingForMergeGate", phase["phase_instance_id"], "alpha", "unit-director"))
+                         ("WaitingForMergeGate", phase["phase_instance_id"], "alpha", director.current_session))
         self.assertEqual(started["wait_id"], finished["wait_id"])
         self.assertEqual(cast(dict[str, object], finished["wait_end"])["state"], "Finished")
     def test_merge_after_phase_finish_records_the_checkpoint_instances_gate_wait(self) -> None:
