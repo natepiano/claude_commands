@@ -1032,7 +1032,7 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py`, `scripts/production/test_merge_gate_holds.py` — the tests.
 - `docs/as-built/merge-gate-and-test-speed.md` — module start and end times.
 
-### Phase 51 — Gate module times use named recorded and not-recorded states · status: todo
+### Phase 51 — Gate module times use named recorded and not-recorded states · status: done
 **Depends on:** Phase 50, and the owners' go: sdlc for `scripts/production/merge_gate.py`, natest for `scripts/test_times/gate_record.py`, and aws for `scripts/aws_target/gate_box.py`.
 
 Director decision, 2026-11-11 (Phase 50 phase review): Phase 50 put two bare `float | None` fields on `GateJobResult` and `gate_record.Execution`. The Type Design Contract treats a bare optional in a domain type as a design defect. The two optionals also allow a start with no end. `gate_record` already names its absent states (`NoModuleTimes`, `TimingNotApplicable`), so this phase follows that form.
@@ -1055,6 +1055,7 @@ From the aws unit (not the user), 2026-11-11: go on `gate_box.py` and `test_gate
 - `scripts/production/merge_gate.py`: `GateJobResult` replaces its two fields with the same `wall_clock` field, default `WallClockNotRecorded("job did not run")`. `finish_gate_job` sets `WallClockSpan(job.started_at, time.time())`. `RunningGateJob.started_at` stays a `float`. `record_gate_run` passes `wall_clock=job.wall_clock`.
 - `scripts/aws_target/gate_box.py`: the wire format stays the same. `encode_job` writes top-level `started_at` and `ended_at` for a `WallClockSpan` and leaves both out for `WallClockNotRecorded`; it writes no `wall_clock` key. The decoder makes a `WallClockSpan` when both keys are present (finite, nonnegative), `WallClockNotRecorded("box result has no module times")` when both are absent, and `WallClockNotRecorded("box result has only one module time")` when only one is present. A half-timed row never fails the decode or the gate verdict. A present time that is negative or not finite is still refused, as in Phase 50. `execution_records` passes `wall_clock`.
 - No other module reads the two old fields. `scripts/buildlog/index.py` reads the JSON keys and does not change.
+- `docs/as-built/merge-gate-and-test-speed.md` ("Module start and end times") adds: a cloud row with only one of the two times records neither.
 - Tests change rows in existing tests only:
   - `scripts/test_times/test_gate_record.py`: the table builds `WallClockSpan` values; the `test_legacy.py` row uses `WallClockNotRecorded` and has no time keys.
   - `scripts/aws_target/test_gate_box.py`: the round trip keeps the span; the `recorded_times=False` subtest decodes to `WallClockNotRecorded`; a row with only `started_at` and a row with only `ended_at` decode to `WallClockNotRecorded` and keep the job status.
@@ -1067,6 +1068,7 @@ From the aws unit (not the user), 2026-11-11: go on `gate_box.py` and `test_gate
 - `scripts/test_times/test_gate_record.py`
 - `scripts/aws_target/test_gate_box.py`
 - `scripts/production/test_merge_gate_suites_tripwires.py`
+- `docs/as-built/merge-gate-and-test-speed.md`
 
 **Workers:** `1 writer`
 - writer — all files and the tests. `merge_gate.py` and `gate_record.py` change together, so one slot holds both.

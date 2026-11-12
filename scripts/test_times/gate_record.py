@@ -113,6 +113,19 @@ class NoModuleTimes:
 
 
 @dataclass(frozen=True)
+class WallClockSpan:
+    """The wall-clock epoch seconds for one module attempt."""
+    started_at: float
+    ended_at: float
+
+
+@dataclass(frozen=True)
+class WallClockNotRecorded:
+    """The attempt has no recorded wall-clock span."""
+    reason: str
+
+
+@dataclass(frozen=True)
 class RecordedConfigReads:
     """The module recorded its reads, including a known empty set."""
 
@@ -226,8 +239,7 @@ class Execution:
     restart: Literal["", "hold"]
     times: ModuleTimes | NoModuleTimes | TimingNotApplicable
     output: str
-    started_at: float | None = field(default=None, kw_only=True)
-    ended_at: float | None = field(default=None, kw_only=True)
+    wall_clock: WallClockSpan | WallClockNotRecorded = field(default=WallClockNotRecorded("not recorded"), kw_only=True)
 
 
 def _fields(value: object) -> dict[str, object]:
@@ -322,10 +334,9 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
             "times_missing": job.times.reason if isinstance(job.times, NoModuleTimes) else "",
             "log": "",
         }
-        if job.started_at is not None:
-            module["started_at"] = store.utc_iso(job.started_at)
-        if job.ended_at is not None:
-            module["ended_at"] = store.utc_iso(job.ended_at)
+        if isinstance(job.wall_clock, WallClockSpan):
+            module["started_at"] = store.utc_iso(job.wall_clock.started_at)
+            module["ended_at"] = store.utc_iso(job.wall_clock.ended_at)
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
             times = job.times
             reads = module_read_record(times.get("config_reads"), times.get("folder_scans"), times.get("content_reads"))
