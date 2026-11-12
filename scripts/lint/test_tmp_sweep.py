@@ -168,6 +168,23 @@ class TmpSweepCase(unittest.TestCase):
     def sweep(self, dry_run: bool = False) -> tmp_sweep.Sweep:
         return tmp_sweep.sweep(dry_run, self.roots(), self.now, str(self.proc))
 
+    def assert_run_tmp_entries(self, run: Path, reason: tmp_sweep.RunKeepReason) -> None:
+        idle = write(run / "tmp" / "idle" / "file").parent
+        fresh = write(run / "tmp" / "fresh" / "file").parent
+        self.recent(fresh / "file")
+        used = write(run / "tmp" / "used" / "file").parent
+        pid = 100 + len(list(self.proc.iterdir()))
+        fake_process(self.proc, pid, fds=(str(used / "file"),))
+        result = self.sweep()
+        self.assertFalse(idle.exists())
+        self.assertTrue(fresh.is_dir())
+        self.assertTrue(used.is_dir())
+        self.assertTrue((run / "tmp").is_dir())
+        self.assertTrue(run.is_dir())
+        self.assertIn(str(run), result.kept[reason.value])
+        self.assertIn(str(fresh), result.kept[tmp_sweep.RECENT])
+        self.assertIn(f"{used}: pid {pid} holds a file open in it", result.kept[tmp_sweep.IN_USE])
+
     def run_once(self, dry_run: bool = False) -> tuple[int, str]:
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(io.StringIO()):
@@ -953,6 +970,7 @@ class OwnerTests(TmpSweepCase):
         self.assertFalse(ended.exists())
         self.assertFalse(unowned.exists())
         self.assertEqual(result.kept[tmp_sweep.DIRECTOR_RUNS], [str(live)])
+        self.assert_run_tmp_entries(live, tmp_sweep.RunKeepReason.DIRECTOR)
 
     def test_a_staff_run_stays_without_a_director_file(self) -> None:
         """The staff row keeps a run before a worker starts."""
@@ -1125,10 +1143,10 @@ class RunFolderTests(TmpSweepCase):
     def test_a_staff_run_pointer_keeps_a_run_after_its_session_stops(self) -> None:
         for root in (self.unit, self.delegate):
             with self.subTest(root=root.name):
-                payload = write(root / "marked" / "tmp" / "old" / "file")
-                _ = self.open_run(payload.parents[2], ENDED_SESSION)
-                _ = self.sweep()
-                self.assertTrue(payload.is_file())
+                run = write(root / "marked" / "board.log").parent
+                _ = self.open_run(run, ENDED_SESSION)
+                self.assert_run_tmp_entries(run, tmp_sweep.RunKeepReason.OPEN_RUN)
+                self.assertTrue((run / "board.log").is_file())
 
 
     def test_stale_pause_does_not_keep_a_dead_units_worktree(self) -> None:
@@ -1168,6 +1186,7 @@ class RunFolderTests(TmpSweepCase):
         }))
         _ = self.sweep()
         self.assertTrue(payload.is_file())
+        self.assert_run_tmp_entries(payload.parent, tmp_sweep.RunKeepReason.SESSION_WORKTREE)
 
     def test_unreadable_ownership_records_keep_the_run(self) -> None:
         for name in ("progress_history_state.json", "history", "session"):
