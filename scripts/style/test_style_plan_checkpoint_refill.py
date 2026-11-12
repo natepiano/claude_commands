@@ -45,6 +45,27 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual([ticket["id"] for ticket in ledger.ticket_open(ticket_owner_id("names"))], ["1", "2", "3"])
         self.assertEqual([match.group("id") for match in style_plan.PHASE.finditer(self.plan.read_text())], ["1", "2", "3"])
         self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names"))], ["4"])
+        _ = self.doCleanups()
+        with self.subTest(kind="proposal"):
+            case = StylePlanTests()
+            case.setUp()
+            try:
+                ticket_id = case.approved_reference_ticket()
+                with case.ledger() as proposal_ledger:
+                    ticket = proposal_ledger.ticket_get(ticket_id)
+                    prompt = style_plan.phase_text(
+                        ticket, proposal_ledger.pinned_rule_texts(ticket_id), case.plan, case.plan_header())
+                need = ("Record each reserved, unmerged or dirty file that the finding needs outside this ticket. Use "
+                        + "`style_ledger.py held need --repo . --finding <finding id> --path <file>`.")
+                yielded = ("When a finding's file, or a file its change edits, is reserved, unmerged or dirty, "
+                           + "yield the finding's file with "
+                           + f"`style_ledger.py ticket yield --repo . --id {ticket_id} --path <finding file>`: "
+                           + "its findings stay filed for a later ticket, and the gate skips them.")
+                self.assertIn(need, prompt)
+                self.assertIn(yielded, prompt)
+                self.assertLess(prompt.index(need), prompt.index(yielded))
+            finally:
+                case.doCleanups()
 
     def test_restart_restores_every_assigned_phase_before_refill(self) -> None:
         ledger = self.queued_parallel_work(3)
@@ -281,8 +302,8 @@ class TicketWorkerTests(AssignLauncherFixture):
             "Type Design Contract: ~/.claude/docs/type_design.md applies to the code you change.",
             "Edit only the listed paths.",
             "Run no git add, commit, stash, reset or checkout.",
-            "Start no detached run you will not wait on.",
-            "Finish your summary before you end your turn.",
+            "After you start a detached run, end your turn. Its result arrives as your next message.",
+            "Write your summary after the last result arrives.",
         ):
             self.assertIn(sentence, prompt.read_text())
 

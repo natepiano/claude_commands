@@ -526,7 +526,6 @@ class GuardCallSiteTests(unittest.TestCase):
             ("mac_test/mac_test.py", "main"),
             ("mac_test/offload.py", "main"),
             ("mac_test/audit.py", "main"),
-            ("production/dailies_input.py", "main"),
             ("buildlog/rust_release.py", "build_hold_active"),
         ):
             with self.subTest(file=relative, function=function_name):

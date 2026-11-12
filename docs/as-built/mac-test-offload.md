@@ -57,10 +57,10 @@ Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-c
   A failed target probe blocks every repository.
   A version decline blocks only its repository.
   `verify.sh` passes its repository root with `--repo-root`.
-- `block --holder NAME --for TEXT [--hours N] [--showrunner NAME]` records the session from `build_hold.owning_session()`. A pending or active block admits that session's own claims; a block with no recorded session refuses every caller. A block lasts `block_hours`, at most `block_max_hours`; the holder is warned `block_warn_minutes` before it lifts by itself. A repeat block by the same holder keeps `since`. `unblock --holder NAME` lifts only the holder's own block.
+- `block --holder KEY --for TEXT [--hours N] [--showrunner NAME]` stores the holder key and the native session from `build_hold.owning_session()`. The build-hold command supplies the fixed staff ID. A block admits its recorded session’s claims; a block without a session refuses every caller. The block uses `block_hours`, with a limit of `block_max_hours`. It warns the holder `block_warn_minutes` before expiry. A repeat block keeps `since`. `unblock --holder KEY` matches only the stored key. Status lines show the current staff name when the key resolves.
 - **CI switch.** `block` turns the repository variable `ci_variable` (hana's `MACOS_CI`) off through `gh` and records a `ci` word: `off_by_this_block`, `off_before`, `not_configured`, `still_on`, `off_unconfirmed`. Unblock and expiry turn it back on only for `off_by_this_block` and `off_unconfirmed`, and list per branch the CI runs that skipped macOS meanwhile, with the `gh workflow run` line to rerun them. The report uses one paged REST list and one GraphQL request for the newest 200 runs; missing or partial job data produces a report error. A lift that cannot turn the switch back on keeps the block, messages the holder hourly and keeps trying. Expiry records that failure as `ExpiredBlockLiftFailed(gh_error_line)` on `SettleOutcome.expired_block_lift_failure` (otherwise `NO_EXPIRED_BLOCK_LIFT_FAILURE`), apart from `ci_problem`; while it lasts `status` prints `The block is past its time limit but could not lift: CI's Mac switch could not be turned back on (<gh line>). Run github-warmup, then unblock.`, and `block` names the same `gh` line. A new `ci` word goes into `CiSwitch`, `decoded_ci`, `ci_needs_restore` and `ci_may_still_be_on`.
 - **Pending until idle.** A block is pending while any claim is live (it waits on the oldest one's `what`), or while `ci_activity` reads busy: a queued or in-progress run of `ci_workflow` is busy until it lists a job named `ci_job` with status `completed`. A pending block says `a CI run may still use the Mac`; the stored `waiting_on` kind is `ci_job`.
-- **The message.** Sent once per block, keyed `mac-free-<since>`, through `send.py` to the session's socket (from `sessions.py socket session:<id>`) or the holder's name: `Message from mac-test: the Mac is free. <what> ended at <HH:MM zone>; your block (<for>) is active, and nothing is built or tested there until you run unblock.` For CI the ended work reads `CI's hold on the Mac`. send.py exit 0 or 1 counts as delivered.
+- **The message.** The block sends one free message with key `mac-free-<since>`. A staff holder receives it through the fixed staff ID. A holder outside staff uses the recorded session socket or given key. The message states which work ended and that the block remains active. A send.py exit status of 0 or 1 counts as delivery.
 - Every `gh` call is bounded by `gh_timeout_s`; the send and the session lookup by 30 s (`MAC_TEST_MESSAGE_TIMEOUT_S`). An empty `ci_repo` turns every `gh` call off.
 - `commands/build/mac.md` is `/build:mac block <why>`, `unblock`, `status`, and `audit`; `/build:hold hold <why> target mac` runs the same block command with its default duration. `/build:status [--probe]` only reads coordination state, with a reach check when requested. `mac_test.py status` calls `full_settle`, which can lift expiry, restore CI and send pending messages.
 
@@ -191,9 +191,8 @@ Failed repair messages remain pending.
 The recorded action is `message_showrunner`.
 `MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` select private test roots.
 
-### Footer and dailies — `scripts/production/dailies_render.py`
-
-A pending or active block is one footer item after the build-hold lines: `Mac block: <holder> since HH:MM ZZZ, for <reason> - lifts Ddd HH:MM ZZZ` (or `Mac block pending: …`), ending ` - CI can still use the Mac` while `ci_may_still_be_on`. The renderer reads `block.json` through `read_block(state_paths().block)` alone: no lock, no `gh`, no message. An unreadable file shows as `Mac block: its state file cannot be read (<path>)`.
+2026-11-11: Dailies and their Mac block footer were retired.
+Use `/build:mac status` to read the Mac block state.
 
 ### The offload runner — `scripts/mac_test/offload.py`
 

@@ -79,14 +79,6 @@ class NoPhaseOnLog(NamedTuple):
     pass
 
 
-class EtaOnLog(NamedTuple):
-    moment: datetime
-
-
-class NoEtaOnLog(NamedTuple):
-    pass
-
-
 class PhaseStart(NamedTuple):
     moment: datetime
 
@@ -462,41 +454,6 @@ def phase_start(unit: Unit, phase: str, events: list[dict[str, object]]) -> Phas
             if starts else NoPhaseStart())
 
 
-def eta_moment(text: str, line_moment: datetime) -> EtaOnLog | NoEtaOnLog:
-    weekday = re.match(r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (\d\d):(\d\d) [A-Z]{3}(?:,|$)", text)
-    if weekday is not None:
-        target = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun").index(weekday.group(1))
-        days = (target - line_moment.weekday()) % 7
-        if days > 3:
-            days -= 7
-        moment = line_moment.replace(hour=int(weekday.group(2)), minute=int(weekday.group(3)),
-                                     second=0, microsecond=0) + timedelta(days=days)
-        return EtaOnLog(moment)
-    clock = re.match(r"(\d\d):(\d\d) [A-Z]{3}( tomorrow)?(?:,|$)", text)
-    if clock is None:
-        return NoEtaOnLog()
-    moment = line_moment.replace(hour=int(clock.group(1)), minute=int(clock.group(2)),
-                                 second=0, microsecond=0)
-    if clock.group(3):
-        moment += timedelta(days=1)
-    return EtaOnLog(moment)
-
-
-def phase_eta(events: tuple[LogEvent, ...], unit: Unit, phase: str,
-              start: PhaseStart) -> EtaOnLog | NoEtaOnLog:
-    labels = tuple(label for label in dict.fromkeys((unit.session, unit.name)) if label)
-    for event in reversed(events):
-        if event.moment < start.moment or "dailies ETAs:" not in event.line:
-            continue
-        segments = event.line.split("dailies ETAs:", 1)[1].strip().split("; ")
-        for segment in segments:
-            for label in labels:
-                prefix = f"{label} {phase} "
-                if segment.startswith(prefix):
-                    return eta_moment(segment.removeprefix(prefix), event.moment)
-    return NoEtaOnLog()
-
-
 def agenda_state(seen: JsonMap, item: AgendaOpen) -> AgendaOpen | AgendaNotDue:
     if f"{item.unit}|{item.phase}" in seen:
         return AgendaNotDue()
@@ -516,10 +473,7 @@ def agenda(production: Production, state_dir: Path) -> None:
         start = phase_start(unit, re.sub(r"^Phase (\S+).*", r"\1", phase.phase), starts)
         if isinstance(start, NoPhaseStart):
             continue
-        eta = phase_eta(events, unit, phase.phase, start)
         due = now - start.moment > timedelta(hours=8)
-        if isinstance(eta, EtaOnLog):
-            due = due or eta.moment - start.moment > timedelta(hours=8)
         if due:
             due_items.append(AgendaOpen(unit.name, phase.phase))
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from functools import cached_property
 from collections import Counter
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
@@ -27,7 +28,7 @@ from scripts.production import codex_winddown
 from scripts.production import fake_unit_host
 from scripts.production import fake_showrunner
 from scripts.production import showrunners, staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, worker_panes
 from scripts.message import process_table, roster
@@ -48,21 +49,39 @@ with open(os.environ["LOG"], "a") as log:
 class NoticeRetryTests(unittest.TestCase):
     state: Path = Path()
 
+    @cached_property
+    def runner(self) -> staff.StaffRow:
+        return fixture_member("showrunner", name="runner", doc=staff.LiveDoc(remote.local_machine(), self.state / "doc.md"))
+
+    @cached_property
+    def unit(self) -> staff.StaffRow:
+        return fixture_member("unit", name="unit", parent=self.runner.id)
+
+    @cached_property
+    def first(self) -> staff.StaffRow:
+        return fixture_member("unit", name="first", parent=self.runner.id)
+
+    @cached_property
+    def second(self) -> staff.StaffRow:
+        return fixture_member("unit", name="second", parent=self.runner.id)
+
     @override
     def setUp(self) -> None:
         self.state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(self.state / "staff.json", {}))
         _ = self.enterContext(mock.patch.object(codex_winddown, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(codex_winddown, "instances", return_value=["production"]))
         _ = self.enterContext(mock.patch.object(broadcast, "SEND", self.state / "fake-send.py"))
 
     def test_status_reports_partial_discovery_after_rendering_healthy_work(self) -> None:
+        healthy = fixture_member("showrunner", name="healthy")
         runner = Showrunner(session="healthy", socket="/fixture.sock", name="healthy", zone="UTC", doc="fixture.md")
         partial = showrunners.ShowrunnerDiscovery([runner], (
             showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
         output = io.StringIO()
         with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
               mock.patch.object(codex_winddown, "current_counts", return_value={"healthy": 1}),
-              mock.patch.object(codex_winddown, "live_unit_names", return_value=["healthy"]) as units,
+              mock.patch.object(codex_winddown, "live_unit_ids", return_value=[healthy.id]) as units,
               mock.patch.object(codex_winddown, "read_projections", return_value={}),
               redirect_stdout(output)):
             self.assertEqual(codex_winddown.main(["status"]), 1)
@@ -128,14 +147,14 @@ class NoticeRetryTests(unittest.TestCase):
             codex_winddown.announce_quiet(1)
             return {}
 
-        runner = Showrunner(session="runner", socket="/fixture", name="show", zone="UTC", doc="doc.md")
+        runner = Showrunner(session=self.runner.id, socket="/fixture", name="show", zone="UTC", doc=str(self.state / "doc.md"))
         with (mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([runner])),
-              mock.patch.object(codex_winddown, "live_unit_names", return_value=["unit"]),
+              mock.patch.object(codex_winddown, "live_unit_ids", return_value=[self.unit.id]),
               mock.patch.object(codex_winddown, "current_counts", return_value=Counter[str]()),
               mock.patch.object(codex_winddown, "refresh", side_effect=refresh),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", "")),
               redirect_stdout(io.StringIO())):
-            self.assertEqual(codex_winddown.count("runner"), 0)
+            self.assertEqual(codex_winddown.count(self.runner.id), 0)
         self.assertFalse((self.state / codex_winddown.QUIET).exists())
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", "")) as send:
             codex_winddown.announce_quiet(0)
@@ -171,26 +190,31 @@ class NoticeRetryTests(unittest.TestCase):
             pass
 
         with codex_winddown.projections() as saved:
-            saved["unit"] = codex_winddown.ProjectionAnswerOwed()
+            saved[self.unit.id] = codex_winddown.ProjectionAnswerOwed()
         with mock.patch.object(broadcast, "send", side_effect=Killed):
             with self.assertRaises(Killed):
-                _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
+                _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+        _ = staff.rename(self.unit.id, "renamed-unit")
+        current = staff.native_id(fixture_runtime_id("winddown-after-clear"))
+        _ = staff.update_current_session(self.unit.current_session, current)
+        from scripts.message import sessions
+        self.assertEqual(sessions.member_target("session:" + self.unit.id), "session:" + current)
         with mock.patch.object(broadcast, "send", return_value="") as send:
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-        send.assert_called_once_with("unit", "runner", codex_winddown.AT_ZERO.format(showrunner="runner"))
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+        send.assert_called_once_with(self.unit.id, "runner", codex_winddown.AT_ZERO.format(showrunner="runner"))
         self.assertEqual(codex_winddown.read_projections(), {})
 
     def test_zero_notice_is_kept_until_a_failed_delivery_succeeds(self) -> None:
         with codex_winddown.projections() as saved:
-            saved["unit"] = codex_winddown.CompletionUnmeasured()
+            saved[self.unit.id] = codex_winddown.CompletionUnmeasured()
         with mock.patch.object(broadcast, "send", side_effect=["FAILED: unavailable", ""]) as send:
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-            self.assertIn("unit", codex_winddown.read_projections())
-            self.assertIsInstance(codex_winddown.read_projections()["unit"], codex_winddown.ZeroNoticeOwed)
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-        self.assertEqual(send.call_args_list, [mock.call("unit", "runner", codex_winddown.AT_ZERO.format(showrunner="runner"))] * 2)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+            self.assertIn(self.unit.id, codex_winddown.read_projections())
+            self.assertIsInstance(codex_winddown.read_projections()[self.unit.id], codex_winddown.ZeroNoticeOwed)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+        self.assertEqual(send.call_args_list, [mock.call(self.unit.id, "runner", codex_winddown.AT_ZERO.format(showrunner="runner"))] * 2)
         self.assertEqual(codex_winddown.read_projections(), {})
 
     def test_a_later_stop_does_not_repeat_an_earlier_units_zero_notice(self) -> None:
@@ -198,27 +222,27 @@ class NoticeRetryTests(unittest.TestCase):
             pass
 
         with codex_winddown.projections() as saved:
-            saved.update({"first": codex_winddown.ProjectionAnswerOwed(),
-                          "second": codex_winddown.CompletionExpectedAt(900)})
+            saved.update({self.first.id: codex_winddown.ProjectionAnswerOwed(),
+                          self.second.id: codex_winddown.CompletionExpectedAt(900)})
         with mock.patch.object(broadcast, "send", side_effect=["", Killed]):
             with self.assertRaises(Killed):
-                _ = codex_winddown.refresh("runner", ["first", "second"], {"first": 0, "second": 0}, 1000)
+                _ = codex_winddown.refresh(self.runner.id, [self.first.id, self.second.id], {self.first.id: 0, self.second.id: 0}, 1000)
         with mock.patch.object(broadcast, "send", return_value="") as send:
-            _ = codex_winddown.refresh("runner", ["first", "second"], {"first": 0, "second": 0}, 1000)
-        send.assert_called_once_with("second", "runner", codex_winddown.AT_ZERO.format(showrunner="runner"))
+            _ = codex_winddown.refresh(self.runner.id, [self.first.id, self.second.id], {self.first.id: 0, self.second.id: 0}, 1000)
+        send.assert_called_once_with(self.second.id, "runner", codex_winddown.AT_ZERO.format(showrunner="runner"))
 
     def test_an_owed_zero_notice_is_sent_even_after_an_agent_starts(self) -> None:
         with codex_winddown.projections() as saved:
-            saved["unit"] = codex_winddown.CompletionUnmeasured()
+            saved[self.unit.id] = codex_winddown.CompletionUnmeasured()
         zero_notice = codex_winddown.AT_ZERO.format(showrunner="runner")
         with mock.patch.object(broadcast, "send", return_value="FAILED: unavailable"):
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
         with mock.patch.object(broadcast, "send", return_value="") as send:
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1001)
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1002)
-        self.assertIn(mock.call("unit", "runner", zero_notice), send.call_args_list)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1001)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1002)
+        self.assertIn(mock.call(self.unit.id, "runner", zero_notice), send.call_args_list)
         self.assertEqual(send.call_count, 2)
-        self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ProjectionAnswerOwed()})
+        self.assertEqual(codex_winddown.read_projections(), {self.unit.id: codex_winddown.ProjectionAnswerOwed()})
 
     def test_zero_debt_survives_repeated_failure_and_a_new_eta(self) -> None:
         zero_notice = codex_winddown.AT_ZERO.format(showrunner="runner")
@@ -230,20 +254,20 @@ class NoticeRetryTests(unittest.TestCase):
                                  ("unmeasured", codex_winddown.CompletionUnmeasured())):
             with self.subTest(answer=answer):
                 with codex_winddown.projections() as saved:
-                    saved["unit"] = codex_winddown.ProjectionAnswerOwed()
+                    saved[self.unit.id] = codex_winddown.ProjectionAnswerOwed()
                 with mock.patch.object(broadcast, "send", side_effect=deliver):
-                    _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-                    _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1000)
+                    _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+                    _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1000)
                 self.assertEqual(codex_winddown.read_projections(), {
-                    "unit": codex_winddown.ZeroNoticeOwed(codex_winddown.ProjectionAnswerOwed()),
+                    self.unit.id: codex_winddown.ZeroNoticeOwed(codex_winddown.ProjectionAnswerOwed()),
                 })
                 with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
-                    self.assertEqual(codex_winddown.record_eta("unit", answer), 0)
-                self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ZeroNoticeOwed(expected)})
+                    self.assertEqual(codex_winddown.record_eta(self.unit.id, answer), 0)
+                self.assertEqual(codex_winddown.read_projections(), {self.unit.id: codex_winddown.ZeroNoticeOwed(expected)})
                 with mock.patch.object(broadcast, "send", return_value="") as send:
-                    current = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1000)
-                send.assert_called_once_with("unit", "runner", zero_notice)
-                self.assertEqual(current, {"unit": expected})
+                    current = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1000)
+                send.assert_called_once_with(self.unit.id, "runner", zero_notice)
+                self.assertEqual(current, {self.unit.id: expected})
                 self.assertEqual(codex_winddown.read_projections(), current)
 
     def test_a_finished_resumed_group_is_asked_again_when_an_agent_starts(self) -> None:
@@ -252,37 +276,37 @@ class NoticeRetryTests(unittest.TestCase):
                            codex_winddown.ProjectionAnswerOwed()):
             with self.subTest(projection=projection):
                 with codex_winddown.projections() as saved:
-                    saved["unit"] = codex_winddown.ZeroNoticeOwed(projection)
+                    saved[self.unit.id] = codex_winddown.ZeroNoticeOwed(projection)
                 with mock.patch.object(broadcast, "send", return_value="") as send:
-                    _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
+                    _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
                     self.assertEqual(codex_winddown.read_projections(), {})
-                    _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1001)
-                    _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1002)
+                    _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1001)
+                    _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1002)
                 self.assertEqual(send.call_args_list, [
-                    mock.call("unit", "runner", zero_notice),
-                    mock.call("unit", "runner", codex_winddown.ASK.format(
-                        showrunner="runner", agents=1, script=SCRIPT.resolve(), unit="unit")),
+                    mock.call(self.unit.id, "runner", zero_notice),
+                    mock.call(self.unit.id, "runner", codex_winddown.ASK.format(
+                        showrunner="runner", agents=1, script=SCRIPT.resolve(), unit=self.unit.id)),
                 ])
-                self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ProjectionAnswerOwed()})
+                self.assertEqual(codex_winddown.read_projections(), {self.unit.id: codex_winddown.ProjectionAnswerOwed()})
 
     def test_a_failed_zero_delivery_keeps_debt_but_finishes_the_resumed_group(self) -> None:
         with codex_winddown.projections() as saved:
-            saved["unit"] = codex_winddown.ZeroNoticeOwed(codex_winddown.CompletionUnmeasured())
+            saved[self.unit.id] = codex_winddown.ZeroNoticeOwed(codex_winddown.CompletionUnmeasured())
         with mock.patch.object(broadcast, "send", return_value="FAILED: unavailable"):
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-        self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ZeroNoticeOwed()})
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+        self.assertEqual(codex_winddown.read_projections(), {self.unit.id: codex_winddown.ZeroNoticeOwed()})
         with mock.patch.object(broadcast, "send", return_value="") as send:
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1001)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1001)
         self.assertEqual(send.call_args_list, [
-            mock.call("unit", "runner", codex_winddown.ASK.format(
-                showrunner="runner", agents=1, script=SCRIPT.resolve(), unit="unit")),
-            mock.call("unit", "runner", codex_winddown.AT_ZERO.format(showrunner="runner")),
+            mock.call(self.unit.id, "runner", codex_winddown.ASK.format(
+                showrunner="runner", agents=1, script=SCRIPT.resolve(), unit=self.unit.id)),
+            mock.call(self.unit.id, "runner", codex_winddown.AT_ZERO.format(showrunner="runner")),
         ])
-        self.assertEqual(codex_winddown.read_projections(), {"unit": codex_winddown.ProjectionAnswerOwed()})
+        self.assertEqual(codex_winddown.read_projections(), {self.unit.id: codex_winddown.ProjectionAnswerOwed()})
 
     def test_an_older_zero_count_cannot_discard_a_newer_running_groups_eta(self) -> None:
         with codex_winddown.projections() as saved:
-            saved["unit"] = codex_winddown.ZeroNoticeOwed()
+            saved[self.unit.id] = codex_winddown.ZeroNoticeOwed()
         original_read = codex_winddown.read_projections
         newer_pass_ran = False
         expected_eta = codex_winddown.CompletionExpectedAt(1300)
@@ -294,39 +318,39 @@ class NoticeRetryTests(unittest.TestCase):
             if not newer_pass_ran:
                 newer_pass_ran = True
                 with mock.patch.object(broadcast, "send", side_effect=["", "FAILED: unavailable"]) as newer_send:
-                    _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1001)
+                    _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1001)
                 self.assertEqual(newer_send.call_args_list, [
-                    mock.call("unit", "runner", codex_winddown.ASK.format(
-                        showrunner="runner", agents=1, script=SCRIPT.resolve(), unit="unit")),
-                    mock.call("unit", "runner", zero_notice),
+                    mock.call(self.unit.id, "runner", codex_winddown.ASK.format(
+                        showrunner="runner", agents=1, script=SCRIPT.resolve(), unit=self.unit.id)),
+                    mock.call(self.unit.id, "runner", zero_notice),
                 ])
                 with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
-                    self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
+                    self.assertEqual(codex_winddown.record_eta(self.unit.id, "5"), 0)
             return observed
 
         with (mock.patch.object(codex_winddown, "read_projections", side_effect=read_then_run_newer_pass),
               mock.patch.object(broadcast, "send", return_value="") as stale_send):
-            current = codex_winddown.refresh("runner", ["unit"], {"unit": 0}, 1000)
-        self.assertEqual(current, {"unit": codex_winddown.ZeroNoticeOwed(expected_eta)})
+            current = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
+        self.assertEqual(current, {self.unit.id: codex_winddown.ZeroNoticeOwed(expected_eta)})
         self.assertEqual(codex_winddown.read_projections(), current)
         stale_send.assert_not_called()
         with mock.patch.object(broadcast, "send", return_value="") as retry:
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1002)
-            _ = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1003)
-        retry.assert_called_once_with("unit", "runner", zero_notice)
-        self.assertEqual(codex_winddown.read_projections(), {"unit": expected_eta})
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1002)
+            _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1003)
+        retry.assert_called_once_with(self.unit.id, "runner", zero_notice)
+        self.assertEqual(codex_winddown.read_projections(), {self.unit.id: expected_eta})
 
     def test_an_eta_recorded_during_ask_is_not_replaced_with_answer_owed(self) -> None:
         def answer_during_send(_unit: str, _sender: str, _message: str) -> str:
             with mock.patch("scripts.production.codex_winddown.time.time", return_value=1000), redirect_stdout(io.StringIO()):
-                self.assertEqual(codex_winddown.record_eta("unit", "5"), 0)
+                self.assertEqual(codex_winddown.record_eta(self.unit.id, "5"), 0)
             return ""
 
         with mock.patch.object(broadcast, "send", side_effect=answer_during_send) as send:
-            current = codex_winddown.refresh("runner", ["unit"], {"unit": 1}, 1000)
-        send.assert_called_once_with("unit", "runner", codex_winddown.ASK.format(
-            showrunner="runner", agents=1, script=SCRIPT.resolve(), unit="unit"))
-        self.assertEqual(current, {"unit": codex_winddown.CompletionExpectedAt(1300)})
+            current = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 1}, 1000)
+        send.assert_called_once_with(self.unit.id, "runner", codex_winddown.ASK.format(
+            showrunner="runner", agents=1, script=SCRIPT.resolve(), unit=self.unit.id))
+        self.assertEqual(current, {self.unit.id: codex_winddown.CompletionExpectedAt(1300)})
         self.assertEqual(codex_winddown.read_projections(), current)
 
 
@@ -412,6 +436,10 @@ class CountTests(unittest.TestCase):
 
     def test_start_counts_the_newest_named_session_without_broadcast_session_lookup(self) -> None:
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(state / "staff.json", {}))
+        owner = fixture_member("showrunner", name="staff-runner", doc=staff.LiveDoc(remote.local_machine(), state / "doc.md"))
+        current = staff.native_id(fixture_runtime_id("newest-count-session"))
+        owner = staff.update_current_session(owner.current_session, current)
         older = SessionRecord(
             pid=10,
             sessionId="older",
@@ -423,7 +451,7 @@ class CountTests(unittest.TestCase):
         )
         newer = SessionRecord(
             pid=11,
-            sessionId="newer",
+            sessionId=current,
             name="hana",
             messagingSocketPath="/tmp/newer.sock",
             updatedAt=2,
@@ -439,7 +467,7 @@ class CountTests(unittest.TestCase):
             tmux="",
             formerNames=[],
         )
-        runner = Showrunner(session="hana", socket="/tmp/newer.sock", name="show", zone="UTC", doc="doc.md")
+        runner = Showrunner(session="hana", socket="/tmp/newer.sock", name="show", zone="UTC", doc=str(state / "doc.md"))
 
         with (
             mock.patch.object(codex_winddown, "STATE", state),
@@ -457,7 +485,20 @@ class CountTests(unittest.TestCase):
             result = codex_winddown.start("natedev")
 
         self.assertEqual(result, 0)
-        start_count.assert_called_once_with(newer)
+        start_count.assert_called_once_with(owner)
+
+        for session_name in ("hana", "runner with spaces"):
+            owner = staff.rename(owner.id, session_name)
+            with (self.subTest(notifier="real parser", session=session_name),
+                  mock.patch.object(codex_winddown, "NOTIFIER", SCRIPT.parents[1] / "message/notifier.sh"),
+                  mock.patch.object(codex_winddown, "STATE", state),
+                  mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(state / "notifier"),
+                                               "__ETC_ZSHENV_SOURCED": "1"})):
+                self.assertTrue(codex_winddown.start_count(owner))
+                instance = state / "notifier" / codex_winddown.instance_name(owner.id)
+                conf = dict(line.split("=", 1) for line in (instance / "conf").read_text().splitlines())
+                self.assertEqual(conf["TARGET"], f"session:{owner.id}")
+                self.assertIn(f"count {owner.id}`", conf["COMMAND"])
 
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
@@ -601,7 +642,7 @@ class MessageTests(unittest.TestCase):
         done = self.run_script("start", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
-        self.assertEqual(lines[-1], "hana: counting every 2 minutes")
+        self.assertEqual(lines[-1], "show: counting every 2 minutes")
         self.assertCountEqual(lines[:-1], [
             "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
             "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
@@ -614,16 +655,17 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(log.count('a "Codex count" message arrives'), 1)
         self.assertEqual(log.count("You are encouraged to continue work on your own"), 1)
         self.assertEqual(log.count("Sent directly to showrunners and unit directors on fixture and mac; do not pass it on."), 2)
-        self.assertIn("notifier new codex-count-hana --every 2 --to session:b861068b-66ee-573d-b3be-ec6d4a321e71", log)
-        prompt = (self.root / "prompts/codex-count-hana.txt").read_text(encoding="utf-8")
-        self.assertIn(f"{SCRIPT} count hana`", prompt)
+        self.assertIn("notifier new codex-count-b861068b-66ee-573d-b3be-ec6d4a321e71 --every 2 --to session:b861068b-66ee-573d-b3be-ec6d4a321e71", log)
+        prompt = next(line for line in log.splitlines()
+                      if line.startswith("notifier new codex-count-b861068b-66ee-573d-b3be-ec6d4a321e71 ")).split(" --command ", 1)[1]
+        self.assertIn(f"{SCRIPT} count b861068b-66ee-573d-b3be-ec6d4a321e71`", prompt)
 
     def test_clear_stops_every_count_and_sends_the_all_clear(self) -> None:
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("clear", "--from", "natedev")
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
-        self.assertEqual(lines[0], "hana: count stopped")
+        self.assertEqual(lines[0], "b861068b-66ee-573d-b3be-ec6d4a321e71: count stopped")
         self.assertCountEqual(lines[1:], [
             "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
             "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
@@ -647,46 +689,71 @@ class MessageTests(unittest.TestCase):
                       (self.root / "log").read_text(encoding="utf-8"))
 
     def test_a_unit_records_its_answer_and_start_forgets_it(self) -> None:
-        self.assertEqual(self.run_script("eta", "trunk", "5").stdout, "trunk: recorded\n")
-        self.assertEqual(self.run_script("eta", "organon", "unmeasured").returncode, 0)
-        self.assertEqual(self.run_script("eta", "trunk", "soon").returncode, 2)
-        saved = (self.root / "prompts/projections.json").read_text(encoding="utf-8")
-        self.assertIn('"organon": "unmeasured"', saved)
-        self.assertIn('"trunk": ', saved)
+        owner = staff.snapshot().by_id(staff.StaffId(fixture_runtime_id("showrunner::show")))
+        assert owner is not None
+        trunk = staff.snapshot().by_id(staff.StaffId(fixture_runtime_id("unit:" + owner.id + ":trunk")))
+        assert trunk is not None
+        organon = fixture_member("unit", name="organon", parent=owner.id)
+        self.assertEqual(self.run_script("eta", trunk.id, "5").stdout, "trunk: recorded\n")
+        self.assertEqual(self.run_script("eta", organon.id, "unmeasured").returncode, 0)
+        self.assertEqual(self.run_script("eta", trunk.id, "soon").returncode, 2)
+        saved = cast(dict[str, float | str], json.loads((self.root / "prompts/projections.json").read_text(encoding="utf-8")))
+        self.assertEqual(set(saved), {trunk.id, organon.id})
+        self.assertIsInstance(saved[trunk.id], float)
+        self.assertEqual(saved[organon.id], "unmeasured")
         _ = self.run_script("start", "--from", "natedev")
         self.assertFalse((self.root / "prompts/projections.json").exists())
 
     def test_a_unit_that_reaches_no_agents_is_told_at_once_and_only_once(self) -> None:
         (self.root / "prompts").mkdir()
-        _ = (self.root / "prompts/projections.json").write_text('{"trunk": null}', encoding="utf-8")
+        _ = (self.root / "prompts/projections.json").write_text(json.dumps({fixture_runtime_id("unit:" + fixture_runtime_id("showrunner::show") + ":trunk"): None}), encoding="utf-8")
         for _ in range(2):
-            self.assertIn("trunk - 0\n", self.run_script("count", "hana").stdout)
+            self.assertIn("trunk - 0\n", self.run_script("count", fixture_runtime_id("showrunner::show")).stdout)
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertEqual(log.count("send --to trunk --from hana --text Codex wind-down, from hana: your Codex agents"), 1)
+        self.assertEqual(log.count("send --to 379d7b65-4078-589d-aa5b-b7df1d7a2d37 --from show --text Codex wind-down, from show: your Codex agents"), 1)
         self.assertIn("launch Claude agents for short time frames", log)
+
+        owner = staff.snapshot().by_id(staff.StaffId(fixture_runtime_id("showrunner::show")))
+        assert owner is not None
+        unit = staff.snapshot().by_id(staff.StaffId(fixture_runtime_id("unit:" + owner.id + ":trunk")))
+        assert unit is not None
+        renamed = staff.rename(unit.id, "renamed-trunk")
+        decoy = fixture_member("unit", name="trunk", parent=owner.id, runtime_id=fixture_runtime_id("replacement-trunk"))
+        self.set_processes(f"{os.getppid()} 1 claude claude", f"40 {os.getppid()} codex codex exec task")
+        with mock.patch.dict(os.environ, self.environment):
+            runner = showrunners.require_complete(showrunners.registered_showrunners())[0]
+            self.assertEqual(codex_winddown.live_unit_ids(runner), [renamed.id])
+        counted = self.run_script("count", owner.id)
+        self.assertEqual(counted.returncode, 0, counted.stderr)
+        self.assertIn("renamed-trunk - 1", counted.stdout)
+        self.assertNotIn("\ntrunk -", counted.stdout)
+        self.assertIn("renamed-trunk - 1", self.run_script("status").stdout)
+        saved = cast(dict[str, object], json.loads((self.root / "prompts/projections.json").read_text()))
+        self.assertIn(renamed.id, saved)
+        self.assertNotIn(decoy.id, saved)
 
     def test_the_user_is_told_once_when_a_wind_down_reaches_no_agents(self) -> None:
         agent = (f"{os.getpid()} 1 claude claude", f"40 {os.getpid()} codex codex exec task")
         self.set_processes(*agent)
         _ = self.run_script("start", "--from", "natedev")
-        self.assertIn("hana - 1 - ETA Unmeasured", self.run_script("count", "hana").stdout)
+        self.assertIn("show - 1 - ETA Unmeasured", self.run_script("count", fixture_runtime_id("showrunner::show")).stdout)
         self.assertNotIn("--to user", (self.root / "log").read_text(encoding="utf-8"))
         self.set_processes()
         for _ in range(2):
-            _ = self.run_script("count", "hana")
+            _ = self.run_script("count", fixture_runtime_id("showrunner::show"))
         log = (self.root / "log").read_text(encoding="utf-8")
         self.assertEqual(log.count("send --to user --from codex-winddown --need decision --text-id codex.reset_ready"), 1)
         self.assertIn("--value machine=", log)
         self.set_processes(*agent)
-        _ = self.run_script("count", "hana")
+        _ = self.run_script("count", fixture_runtime_id("showrunner::show"))
         self.set_processes()
-        _ = self.run_script("count", "hana")
+        _ = self.run_script("count", fixture_runtime_id("showrunner::show"))
         self.assertEqual((self.root / "log").read_text(encoding="utf-8").count("--to user"), 2)
 
     def test_status_says_whether_a_wind_down_is_on(self) -> None:
         self.assertIn("Wind-down: off", self.run_script("status").stdout)
         _ = self.run_script("start", "--from", "natedev")
-        self.assertIn("Wind-down: on for hana", self.run_script("status").stdout)
+        self.assertIn("Wind-down: on for show", self.run_script("status").stdout)
 
 
 class PaneCountTests(StaffTestCase):
@@ -709,7 +776,7 @@ class PaneCountTests(StaffTestCase):
                     process_table, "snapshot", return_value={}), mock.patch.object(
                     staff, "snapshot", wraps=staff.snapshot) as snapshot, redirect_stderr(error):
                 counts = codex_winddown.current_counts()
-            self.assertEqual(counts[parent.name], expected)
+            self.assertEqual(counts[parent.id], expected)
             self.assertEqual(snapshot.call_count, 1)
             if reason:
                 self.assertIn("reader", error.getvalue())

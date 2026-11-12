@@ -27,6 +27,7 @@ from scripts.message import top_level
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.message import unit_labels
 from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
@@ -341,6 +342,8 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             "ROSTER_CODEX_SOCKET": str(self.folder / "no-daemon.sock"),
         }, clear=True))
         _ = self.enterContext(environment)
+        _ = self.enterContext(isolated_staff_file(self.folder / "staff.json", {}))
+        _ = fixture_member("producer", name="shared", runtime_id="019b3a40-4250-7000-8000-000000000202")
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
         _ = self.enterContext(mock.patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]))

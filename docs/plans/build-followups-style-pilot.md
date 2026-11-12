@@ -303,10 +303,11 @@ Pass. All 8 hand-offs went through `--from-child`. The trace of hand-off
 
 ## Dailies
 
-Not run. Both productions registered `on demand: no scheduled dailies`, and no
-dailies run happened during the pilot. The parent's last saved dailies are from
-2026-10-16 and carry no style entry. This criterion needs one dailies run on
-demand.
+Neither production ran dailies during the pilot.
+Both registered `on demand: no scheduled dailies`.
+The parent's last saved dailies were from 2026-10-16 and carried no style entry.
+The pilot did not verify this criterion.
+Dailies were retired on 2026-11-11, so no later run is required.
 
 ## Fixes
 

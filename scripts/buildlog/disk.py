@@ -8,11 +8,13 @@ import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+from scripts.lib.user_zone import user_zone
 
 from scripts.buildlog import store
 from scripts.buildlog import filesystem
@@ -48,6 +50,7 @@ class FilesystemCapacity(TypedDict):
 
 class DiskSnapshot(TypedDict):
     measured_at: str
+    capacity_measured_at: NotRequired[str]
     host: str
     rows: list[DiskRow]
     used: int
@@ -62,6 +65,7 @@ class DiskSnapshot(TypedDict):
 
 class MeasuredDiskSnapshot(TypedDict):
     measured_at: str
+    capacity_measured_at: str
     host: str
     rows: list[DiskRow]
     used: int
@@ -225,6 +229,7 @@ def measure(
     measured_at = store.utc_iso(time.time())
     return {
         "measured_at": measured_at,
+        "capacity_measured_at": measured_at,
         "host": store.host_name(),
         "rows": rows,
         "used": current_usage.used,
@@ -280,8 +285,34 @@ def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], lis
 
 
 def snapshot() -> MeasuredDiskSnapshot:
+    previous_snapshot = read_snapshot()
     floor = read_floor()
-    previous = previous_outside_measurement(read_snapshot())
+    settings = conf.read("buildlog")
+    walk_minutes = settings.whole("DISK_WALK_MINUTES")
+    walk_hour = settings.whole("DISK_WALK_HOUR")
+    if (previous_snapshot is not None and "filesystems" in previous_snapshot
+            and "outside_build_caches" in previous_snapshot and "outside_build_cache_totals" in previous_snapshot
+            and "previous_measured_at" in previous_snapshot):
+        now = datetime.now(user_zone())
+        if (now.timestamp() - datetime.fromisoformat(previous_snapshot["measured_at"]).timestamp() < walk_minutes * 60
+                or now.hour != walk_hour):
+            usage = filesystem.filesystem_usage("/")
+            capacities: list[FilesystemCapacity] = []
+            for row in previous_snapshot["filesystems"]:
+                try:
+                    current = filesystem.filesystem_usage(row["path"])
+                except OSError:
+                    capacities.append(row)
+                else:
+                    capacities.append({**row, "used": current.used, "free": current.free})
+            return {
+                **previous_snapshot, "used": usage.used, "free": usage.free, "floor": floor,
+                "filesystems": capacities, "capacity_measured_at": store.utc_iso(now.timestamp()),
+                "outside_build_caches": previous_snapshot["outside_build_caches"],
+                "outside_build_cache_totals": previous_snapshot["outside_build_cache_totals"],
+                "previous_measured_at": previous_snapshot["previous_measured_at"],
+            }
+    previous = previous_outside_measurement(previous_snapshot)
     folders = list(FOLDERS)
     outputs, unavailable = mapped_output_paths(folders)
     for output in outputs:

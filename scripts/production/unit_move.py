@@ -1,7 +1,7 @@
-"""Move a unit folder, or share stopped-unit move steps with rename commands.
+"""Move unit folders with exact rename recovery records.
 
-Folder moves stop, move, publish the location, and resume the unit.
-Rename callers control their own step order and progress records.
+Explicit folder moves stop and resume live sessions.
+Renames move folders only when the worktree is idle.
 """
 from __future__ import annotations
 try:
@@ -314,7 +314,7 @@ def unit_conversation(found: unit_lookup.LabeledSession | None, *, session_id: s
     if not session_id:
         return NoUnitConversation()
     entry = pane_record.read(found.place.session).get(found.place.pane) if found is not None else None
-    if entry is None or entry["session_id"] != session_id:
+    if entry is None or pane_launch.reference_id(entry) != session_id:
         try:
             entry = pane_record.launch_for_session(session_id)
         except ValueError as error:
@@ -380,6 +380,130 @@ class KeepBranch(Enum):
     CURRENT = "keep current branch"
 
 
+class PendingRename(NamedTuple):
+    source: Path
+    destination: Path
+    source_branch: str
+    branch: str
+    name: str
+    branch_change: bool = False
+
+
+def rename_move_path(unit: staff.StaffId) -> Path:
+    """Use the existing pending move directory beside the staff record."""
+    return staff.record_path().parent / "folder_moves" / f"{staff.native_id(unit)}.json"
+
+
+def pending_rename(unit: staff.StaffId) -> PendingRename | None:
+    path = rename_move_path(unit)
+    if not path.exists():
+        return None
+    fields = json_object(read_json(path))
+    values = [fields.get(key) for key in ("source", "destination", "source_branch", "branch", "name")]
+    if (fields.get("kind") != "rename" or any(not isinstance(value, str) for value in values)
+            or not fields.get("name")):
+        raise RenameRefused(f"{path}: the pending rename record is invalid")
+    source, destination, source_branch, branch, name = cast(list[str], values)
+    if not Path(source).is_absolute() or not Path(destination).is_absolute():
+        raise RenameRefused(f"{path}: the pending rename paths must be absolute")
+    # Older records keep exact branch names but have no intent field.
+    branch_change = fields.get("branch_change", source_branch != branch)
+    if (not isinstance(branch_change, bool) or branch_change != (source_branch != branch)
+            or branch_change and not branch):
+        raise RenameRefused(f"{path}: the pending rename branch intent is invalid")
+    return PendingRename(Path(source), Path(destination), source_branch, branch, name, branch_change)
+
+
+def prepare_rename(row: staff.StaffRow, destination: Path, branch: str | KeepBranch, name: str) -> PendingRename:
+    """Record exact source and destination values before the staff rename."""
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise RenameRefused(f"{row.id}: no unit worktree")
+    if (pending := pending_rename(row.id)) is not None:
+        raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
+    source = row.worktree.path.expanduser().resolve()
+    destination = destination.expanduser().resolve()
+    checkout = move_checkout(staff.snapshot(), row)
+    source_branch = git(checkout, "branch", "--show-current") if checkout.exists() else ""
+    target_branch = branch if isinstance(branch, str) else source_branch
+    branch_change = isinstance(branch, str) and branch != source_branch
+    pending = PendingRename(source, destination, source_branch, target_branch, name, branch_change)
+    write_json(rename_move_path(row.id), {
+        "kind": "rename", "name": name, "source": str(source), "destination": str(destination),
+        "source_branch": source_branch, "branch": target_branch, "branch_change": branch_change})
+    return pending
+
+
+def rename_observation(record: staff.StaffSnapshot, row: staff.StaffRow,
+                       pending: PendingRename) -> tuple[Path, str]:
+    """Accept only the recorded folder paths and branch names."""
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise RenameRefused(f"{row.name}: the pending rename has no staff worktree")
+    location = row.worktree.path.expanduser().resolve()
+    if location not in (pending.source, pending.destination):
+        raise RenameRefused(f"{row.name}: pending rename to {pending.name} found staff path {location}")
+    checkout = move_checkout(record, row)
+    if checkout not in (pending.source, pending.destination):
+        raise RenameRefused(f"{row.name}: pending rename to {pending.name} found folder {checkout}")
+    branch = git(checkout, "branch", "--show-current") if checkout.exists() else ""
+    # Records made without a checkout leave both branch values empty.
+    if (not checkout.exists() and isinstance(row.worktree, staff.RemovedWorktree)
+            and isinstance(row.worktree.branch, staff.ParkedBranch) and (pending.source_branch or pending.branch)):
+        branch = row.worktree.branch.value
+    if branch not in (pending.source_branch, pending.branch):
+        raise RenameRefused(f"{row.name}: pending rename to {pending.name} found branch {branch!r} at {checkout}")
+    if not checkout.exists() and not isinstance(row.worktree, staff.RemovedWorktree):
+        raise RenameRefused(f"{row.name}: pending rename to {pending.name} found no folder at {checkout}")
+    return checkout, branch
+
+
+def rename_complete(record: staff.StaffSnapshot, row: staff.StaffRow, pending: PendingRename) -> bool:
+    checkout, branch = rename_observation(record, row, pending)
+    if (isinstance(row.worktree, staff.WorktreeUnfilled)
+            or row.worktree.path.expanduser().resolve() != pending.destination
+            or checkout != pending.destination or branch != pending.branch):
+        return False
+    if not checkout.exists():
+        return isinstance(row.worktree, staff.RemovedWorktree)
+    return not move_locked(row.id, checkout)
+
+
+def finish_rename(row: staff.StaffRow, pending: PendingRename) -> bool:
+    """Clear recovery after the recorded move and any required push."""
+    record = staff.snapshot()
+    if not rename_complete(record, row, pending):
+        return False
+    _finish_rename_push(record, row, pending, pending.destination)
+    if (isinstance(row.worktree, staff.RemovedWorktree) and pending.branch
+            and row.worktree.branch != staff.ParkedBranch(pending.branch)):
+        _ = staff.set_worktree(row.id, replace(row.worktree, branch=staff.ParkedBranch(pending.branch)),
+                              expected=row.worktree)
+    rename_move_path(row.id).unlink()
+    return True
+
+
+def _finish_rename_push(record: staff.StaffSnapshot, row: staff.StaffRow,
+                        pending: PendingRename, checkout: Path) -> None:
+    """Push only when the recorded request changes the branch name."""
+    if not pending.branch_change:
+        return
+    try:
+        if not checkout.exists():
+            owner = record.parent_of(row)
+            if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                    or owner.doc.machine != remote.local_machine()):
+                raise RenameRefused("the owner's repository is unavailable")
+            checkout = owner.doc.path.parent
+        tip = branch_tip(checkout, pending.branch)
+        if not tip:
+            raise RenameRefused("the local destination branch is unavailable")
+        _push_moved_branch(checkout, pending.branch)
+        if remote_tip(checkout, pending.branch) != tip or branch_tip(checkout, pending.branch) != tip:
+            raise RenameRefused("origin does not have the destination tip")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        detail = " ".join(str(error).splitlines())
+        raise RenameRefused(f"branch {pending.branch}: push is unfinished: {detail}") from error
+
+
 def _check_move_deadline() -> None:
     """Start no operation after the shared deadline."""
     if time.monotonic() >= worker_lifecycle.effective_deadline():
@@ -421,91 +545,81 @@ def _wait_folder_rows(observe: Callable[[], set[staff.StaffId]], wanted: set[sta
             time.sleep(min(poll, remaining))
 
 
-class NoPendingMove(Enum):
-    CURRENT = "no pending folder move"
+def _worktree_lock(folder: Path) -> Path:
+    """Locate the native Git lock without copying a worktree path."""
+    admin = Path(git(folder, "rev-parse", "--absolute-git-dir"))
+    return admin / "locked"
 
 
-class FolderMove(NamedTuple):
-    destination: Path
-    branch: str | KeepBranch
-
-
-class PendingRename(NamedTuple):
-    destination: Path
-    branch: str | KeepBranch
-    name: str
-
-
-def pending_move(unit: staff.StaffId) -> FolderMove | PendingRename | NoPendingMove:
-    path = staff.folder_move_path(unit)
-    if not path.exists():
-        return NoPendingMove.CURRENT
-    progress = json_object(read_json(path))
-    branch = str(progress.get("branch", ""))
-    destination = Path(str(progress["destination"]))
-    name = str(progress.get("name", ""))
-    if progress.get("kind") == "rename" or ("kind" not in progress and name):
-        return PendingRename(destination, branch or KeepBranch.CURRENT, name)
-    return FolderMove(destination, branch or KeepBranch.CURRENT)
-
-
-def prepare_move(row: staff.StaffRow, destination: Path, branch: str | KeepBranch,
-                 name: str = "") -> None:
-    """Save the move before the first staff write or session stop."""
-    if isinstance(row.worktree, staff.WorktreeUnfilled):
-        raise ValueError(f"{row.id}: no unit worktree")
-    source = row.worktree.path.expanduser().resolve()
-    folder = source if source.exists() else destination
-    admin_path = ""
-    if (folder / ".git").is_file():
-        admin = Path((folder / ".git").read_text().strip().removeprefix("gitdir: "))
-        admin_path = str((admin if admin.is_absolute() else folder / admin).resolve())
-    write_json(staff.folder_move_path(row.id), {
-        "source": str(source), "destination": str(destination), "admin": admin_path,
-        "branch": branch if isinstance(branch, str) else "",
-        "kind": "rename" if name else "folder", **({"name": name} if name else {})})
-
-
-def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, old: Path,
-                        destination: Path, branch: str | KeepBranch) -> bool:
-    """Require the journal identity and the unit's registered branch."""
+def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, destination: Path) -> bool:
+    """Require the owner's repository and the fixed staff identity in Git."""
     owner = record.parent_of(row)
     if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
         return False
     try:
         repository = Path(git(owner.doc.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        target_repository = Path(git(destination, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        if (target_repository != repository
-                or Path(git(destination, "rev-parse", "--show-toplevel")).resolve() != destination):
-            return False
-        allowed = {"refs/heads/" + branch} if isinstance(branch, str) else set[str]()
-        # Git keeps the admin path when it moves a worktree.
-        admin = Path((destination / ".git").read_text().strip().removeprefix("gitdir: "))
-        if not admin.is_absolute():
-            admin = destination / admin
-        admin = admin.resolve()
-        if admin.parent != repository / "worktrees":
-            return False
-        progress_path = staff.folder_move_path(row.id)
-        raw: object = read_json(progress_path) if progress_path.exists() else dict[str, object]()
-        progress = cast(dict[str, object], raw) if isinstance(raw, dict) else dict[str, object]()
-        if (progress.get("source") != str(old) or progress.get("destination") != str(destination)
-                or progress.get("admin") != str(admin)):
-            return False
-        _check_move_deadline()
-        head = (admin / "HEAD").read_text().strip()
-        if head.startswith("ref: refs/heads/"):
-            allowed.add(head.removeprefix("ref: "))
-        registered = git(destination, "worktree", "list", "--porcelain", "-z")
-        for entry in registered.split("\0\0"):
-            fields = entry.split("\0")
-            if (f"worktree {destination}" in fields
-                    and any(f"branch {name}" in fields for name in allowed)):
-                return True
-    except RenameRefused:
+        target = Path(git(destination, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        identity = _worktree_lock(destination)
+        return (repository == target and identity.parent.parent == repository / "worktrees"
+                and identity.read_text().strip() == f"staff:{row.id}"
+                and Path(git(destination, "rev-parse", "--show-toplevel")).resolve() == destination)
+    except (RenameRefused, OSError):
         return False
-    return False
+
+
+def move_checkout(record: staff.StaffSnapshot, row: staff.StaffRow) -> Path:
+    """Find an interrupted move through its native Git lock."""
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise ValueError(f"{row.id}: no unit worktree")
+    folder = row.worktree.path.expanduser().resolve()
+    if folder.exists():
+        return folder
+    owner = record.parent_of(row)
+    if (owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+            and owner.doc.machine == remote.local_machine()):
+        found = [Path(line.removeprefix("worktree ")).resolve()
+                 for line in git(owner.doc.path.parent, "worktree", "list", "--porcelain").splitlines()
+                 if line.startswith("worktree ")]
+        matching = [path for path in found if _recoverable_folder(record, row, path)]
+        if len(matching) == 1:
+            return matching[0]
+    return folder
+
+
+def require_move_destination(record: staff.StaffSnapshot, row: staff.StaffRow, destination: Path) -> None:
+    """Refuse an occupied destination before a caller changes displays or sessions."""
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        raise ValueError(f"{row.id}: no unit worktree")
+    old = row.worktree.path.expanduser().resolve()
+    if old != destination and exists(destination):
+        if exists(old) or not _recoverable_folder(record, row, destination):
+            raise RenameRefused(f"destination already exists: {destination}")
+
+
+def move_locked(unit: staff.StaffId, folder: Path) -> bool:
+    """Read the fixed unit identity from the native Git worktree lock."""
+    lock = _worktree_lock(folder)
+    return lock.exists() and lock.read_text().strip() == f"staff:{unit}"
+
+
+def _lock_move(folder: Path, unit: staff.StaffId) -> None:
+    """Keep only the fixed unit identity in Git during a folder move."""
+    lock = _worktree_lock(folder)
+    if lock.exists():
+        if lock.read_text().strip() != f"staff:{unit}":
+            raise RenameRefused(f"worktree is locked: {folder}")
+    else:
+        _ = git(folder, "worktree", "lock", "--reason", f"staff:{unit}", str(folder))
+
+
+def _unlock_move(folder: Path, unit: staff.StaffId) -> bool:
+    """Release only this unit's native lock after staff records the destination."""
+    lock = _worktree_lock(folder)
+    if not lock.exists() or lock.read_text().strip() != f"staff:{unit}":
+        return False
+    _ = git(folder, "worktree", "unlock", str(folder))
+    return True
 
 
 def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
@@ -549,24 +663,39 @@ def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | Ke
         location = row.worktree
         if location.machine != remote.local_machine():
             raise ValueError(f"{unit}: run rename on {location.machine}")
+        pending = pending_rename(unit)
+        if pending is not None:
+            if destination != pending.destination or branch != pending.branch or row.name != pending.name:
+                raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
         old = location.path.expanduser().resolve()
-        if old != destination and exists(old) and exists(destination):
-            raise RenameRefused(f"destination already exists: {destination}")
-        folder = old if old.exists() else destination
-        pending = pending_move(unit)
+        folder = rename_observation(record, row, pending)[0] if pending is not None else old if old.exists() else destination
+        require_move_destination(record, row, destination)
         if worktree_busy(row, record, folder):
             print(f"{row.name}: folder and branch kept while work runs in the worktree; rerun rename when idle")
             return False
         if not folder.exists():
-            changed = isinstance(location, staff.RemovedWorktree) and location.path != destination
+            updated = location
+            if isinstance(location, staff.RemovedWorktree):
+                updated = replace(location, path=destination)
+                if pending is not None and pending.branch:
+                    _finish_rename_push(record, row, pending, folder)
+                    updated = replace(updated, branch=staff.ParkedBranch(pending.branch))
+            changed = updated != location
             if changed:
-                _ = staff.set_worktree(unit, replace(location, path=destination), expected=location)
+                _ = staff.set_worktree(unit, updated, expected=location)
+            if pending is not None and pending.branch and old == destination:
+                return changed
             missing = destination if isinstance(location, staff.RemovedWorktree) else old
             print(f"anomaly: folder is absent: {missing}", file=sys.stderr)
-            staff.folder_move_path(unit).unlink(missing_ok=True)
-            return changed or not isinstance(pending, NoPendingMove)
-        if folder == destination and old != destination and not _recoverable_folder(record, row, old, destination, branch):
-            raise RenameRefused(f"destination already exists: {destination}")
+            return changed
+        current_branch = git(folder, "branch", "--show-current")
+        complete = old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
+        if complete and not move_locked(unit, folder):
+            if pending is not None:
+                _finish_rename_push(record, row, pending, folder)
+            elif isinstance(branch, str):
+                _push_moved_branch(folder, branch)
+            return False
         restart = import_module("scripts.agents.restart")
         live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
         members = [row, *record.find(kind="worker", parent=row.id)]
@@ -575,27 +704,44 @@ def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | Ke
             if member.id not in live:
                 print(f"info: {member.name}: stopped; agents restart --only {member.id}")
         changed = False
+        push_finished = False
+        _lock_move(folder, unit)
         try:
             if folder != destination:
-                _ = git(folder, "worktree", "move", str(folder), str(destination))
+                _check_move_deadline()
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _ = git(folder, "worktree", "move", "--force", "--force", str(folder), str(destination))
                 folder = destination
                 changed = True
-            if isinstance(branch, str) and git(folder, "branch", "--show-current") != branch:
+            current_branch = git(folder, "branch", "--show-current")
+            if pending is not None and current_branch not in (pending.source_branch, pending.branch):
+                raise RenameRefused(f"{row.name}: pending rename to {pending.name} found branch {current_branch!r} at {folder}")
+            if isinstance(branch, str) and current_branch != branch:
                 _ = git(folder, "branch", "-m", branch)
                 changed = True
-            if isinstance(branch, str):
+            if pending is not None:
+                _finish_rename_push(record, row, pending, folder)
+            elif isinstance(branch, str):
                 _push_moved_branch(folder, branch)
+            push_finished = True
         finally:
             if not old.exists() and destination.exists():
-                if location.path != destination:
-                    _ = staff.set_worktree(unit, replace(location, path=destination), expected=location)
+                folder = destination
+            if folder == destination:
+                updated = replace(location, path=destination)
+                if isinstance(updated, staff.RemovedWorktree) and isinstance(branch, str) and branch and push_finished:
+                    updated = replace(updated, branch=staff.ParkedBranch(git(folder, "branch", "--show-current")))
+                if updated != location:
+                    _check_move_deadline()
+                    _ = staff.set_worktree(unit, updated, expected=location)
                     changed = True
-        staff.folder_move_path(unit).unlink(missing_ok=True)
-        return changed or not isinstance(pending, NoPendingMove)
+        return _unlock_move(folder, unit) or changed
 
 
 def _push_moved_branch(checkout: Path, branch: str) -> None:
-    _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
+    upstream = git(checkout, "for-each-ref", "--format=%(upstream:short)", f"refs/heads/{branch}")
+    if upstream != f"origin/{branch}" or remote_tip(checkout, branch) != branch_tip(checkout, branch):
+        _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
 
 
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
@@ -608,13 +754,13 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         row = record.by_id(unit)
         if row is None or row.kind != "unit" or isinstance(row.worktree, staff.WorktreeUnfilled):
             raise ValueError(f"{unit}: move-folder requires a unit with a worktree")
+        if (pending := pending_rename(unit)) is not None:
+            raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
         location = row.worktree
-        pending = pending_move(unit)
         if location.machine != remote.local_machine():
             raise ValueError(f"{unit}: run move-folder on {location.machine}")
         old = location.path.expanduser().resolve()
-        if old != destination and exists(old) and exists(destination):
-            raise RenameRefused(f"destination already exists: {destination}")
+        require_move_destination(record, row, destination)
         folder = old if old.exists() else destination
         if not folder.exists():
             changed = isinstance(location, staff.RemovedWorktree) and location.path != destination
@@ -624,15 +770,14 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 _check_move_deadline()
             missing = destination if isinstance(location, staff.RemovedWorktree) else old
             print(f"anomaly: folder is absent: {missing}", file=sys.stderr)
-            staff.folder_move_path(unit).unlink(missing_ok=True)
-            return changed or not isinstance(pending, NoPendingMove)
-        recovering = folder == destination
-        if recovering and old != destination and not _recoverable_folder(record, row, old, destination, branch):
-            raise RenameRefused(f"destination already exists: {destination}")
+            return changed
         current_branch = git(folder, "branch", "--show-current")
         move_complete = old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
-        if move_complete and isinstance(pending, NoPendingMove):
-            return False
+        if move_complete:
+            if not move_locked(unit, folder):
+                if isinstance(branch, str):
+                    _push_moved_branch(folder, branch)
+                return False
         members = [row, *record.find(kind="worker", parent=row.id)]
         for member in members[1:]:
             _check_move_deadline()
@@ -660,10 +805,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         if move_complete:
             if isinstance(branch, str):
                 _push_moved_branch(folder, branch)
-            staff.folder_move_path(unit).unlink(missing_ok=True)
+            _ = _unlock_move(folder, unit)
             return True
-        if isinstance(pending, NoPendingMove):
-            prepare_move(row, destination, branch)
         changed = False
         reported = set[staff.StaffId]()
 
@@ -679,6 +822,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                     for member in members if member.id in live
                     for pane in panes if pane["session_id"] == member.current_session}
         try:
+            if folder != destination:
+                _lock_move(folder, unit)
             stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
             with worker_lifecycle.operation_deadline(deadline=stop_deadline):
                 for member in members:
@@ -696,7 +841,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             if folder != destination:
                 _check_move_deadline()
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                _ = git(folder, "worktree", "move", str(folder), str(destination))
+                _ = git(folder, "worktree", "move", "--force", "--force", str(folder), str(destination))
                 folder = destination
                 changed = True
             if isinstance(branch, str) and git(folder, "branch", "--show-current") != branch:
@@ -713,8 +858,10 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 current = staff.snapshot()
                 _check_move_deadline()
                 latest_unit = current.by_id(unit)
-                if folder == destination and latest_unit is not None and latest_unit.worktree != replace(location, path=destination):
-                    updated = replace(location, path=destination)
+                updated = replace(location, path=destination)
+                if folder == destination and isinstance(updated, staff.RemovedWorktree) and isinstance(branch, str):
+                    updated = replace(updated, branch=staff.ParkedBranch(git(folder, "branch", "--show-current")))
+                if folder == destination and latest_unit is not None and latest_unit.worktree != updated:
                     latest_unit = replace(latest_unit, worktree=updated)
                     current = staff.StaffSnapshot(tuple(latest_unit if item.id == unit else item for item in current.rows))
                     try:
@@ -724,6 +871,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                         _check_move_deadline()
                     except (OSError, ValueError, staff.StaffRefused) as error:
                         raise OSError(f"staff worktree write failed for {row.name}: {error}") from error
+                if folder == destination:
+                    _ = _unlock_move(folder, unit)
             finally:
                 try:
                     start_deadline = time.monotonic() + _move_timeout("RENAME_LIVE_WAIT_SECONDS")
@@ -756,8 +905,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                         if member.id in live - observed_live:
                             restart_notice(member, error)
         _check_move_deadline()
-        staff.folder_move_path(unit).unlink(missing_ok=True)
-        return changed or not isinstance(pending, NoPendingMove)
+        return changed
 
 
 def main(argv: Sequence[str] | None = None) -> int:

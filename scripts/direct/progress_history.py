@@ -14,7 +14,6 @@ import itertools
 import json
 import os
 import re
-import statistics
 import subprocess
 import sys
 import time
@@ -31,9 +30,8 @@ from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, cast
 
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
@@ -253,6 +251,8 @@ def _contract_file(path: Path) -> ContractFileHash | ContractFileUnavailable:
 
 def _contract_revision() -> ContractRevision:
     """Read the deployed main checkout afresh at each phase boundary."""
+    from scripts.direct.tag_inventory import contract_table_paths
+
     root = Path.home() / ".claude"
     head: ContractMainHead | ContractHeadUnavailable
     try:
@@ -1129,6 +1129,8 @@ def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generat
 
 def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
     """Read the newest open or finished dispatch across the staff parent's runs."""
+    from scripts.direct import phase_reservation
+
     reads = _dispatch_reads.get()
     if isinstance(reads, ReadDispatches):
         try:
@@ -1605,6 +1607,8 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 
 
 def _start_phase(args: argparse.Namespace) -> None:
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     record = staff.initial_snapshot()
     state = _read_state(session_dir, record=record)
@@ -2278,6 +2282,8 @@ def _arm_review(args: argparse.Namespace) -> None:
     only earns the reviewer a row in the stage table while the writer it
     overlaps is still going.
     """
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _arg_string(args, "phase_id")
@@ -2514,6 +2520,8 @@ def _round_metric(value: float) -> float:
 
 
 def _sample_metrics(samples: list[CalibrationSample], current_hold: int) -> dict[str, object]:
+    import statistics
+
     if not samples:
         return {
             "sample_count": 0,
@@ -6544,6 +6552,8 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     workers. When the current phase closes, the most recently started older open
     phase becomes current again.
     """
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _optional_arg(args, "phase_id")

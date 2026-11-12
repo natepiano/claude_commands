@@ -1,7 +1,8 @@
-"""hana_shot run as a subprocess against a stdlib fake BRP server: one still camera, a few entities and tools."""
+"""Test screenshot commands with a local BRP server and isolated CLI calls."""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -34,6 +35,7 @@ from scripts.lib import scratch as scratch_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
 
@@ -418,11 +420,20 @@ class HanaShotTest(BuildLogIsolatedTest):
     def run_python(
         self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
-            cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
-            timeout=TEST_HANG_GUARD_SECS, check=False,
-        )
+        if program != SCRIPT or process_boundary_for_case(self):
+            return subprocess.run(
+                [str(SCRIPT.parents[1] / "lib/py"), str(program), *args],
+                cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS, check=False,
+            )
+        arguments = list(args)
+        with (
+            ThreadPoolExecutor(max_workers=conf.read("hana_shot").whole("workers")) as pool,
+            mock.patch.object(hana_shot, "worker_pool", return_value=pool),
+            mock.patch.object(hana_shot, "EXIT_SIGNAL_LATCH", hana_shot.ExitSignalLatch()),
+        ):
+            return invoke_cli(hana_shot, lambda: hana_shot.main(arguments), arguments,
+                              self.script_environment(session_variables), self.scratch)
 
     def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return self.run_python(SCRIPT, *args, session_variables=session_variables)
@@ -1884,6 +1895,7 @@ class ShotTests(HanaShotTest):
                 self.assertRegex(result.stderr, r"0\.1\s*=\s*10%")
         self.assertEqual(self.fake.calls, [])
 
+    @process_boundary
     def test_unhandled_filesystem_failure_records_its_exception_type_and_diagnostic(self) -> None:
         result = self.shot("--view", "front", "--views-file", str(self.scratch))
 
@@ -1962,6 +1974,7 @@ class ShotTests(HanaShotTest):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.timing_lines()[-1]["session"], expected)
 
+    @process_boundary
     def test_timed_out_screenshot_is_never_resent(self) -> None:
         self.fake.screenshot = "hang"
         result = self.shot("--mode", "home")
@@ -1983,6 +1996,7 @@ class ShotTests(HanaShotTest):
         self.assertEqual(len(sent), 2)
         self.assertTrue((self.scratch / "shot.png").exists())
 
+    @process_boundary
     def test_screenshot_busy_past_the_resend_limit_fails(self) -> None:
         self.fake.screenshot = "busy-always"
         result = self.shot("--mode", "home")
@@ -2180,6 +2194,7 @@ class RemoteTests(HanaShotTest):
         _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return cast(int, process.returncode), stderr
 
+    @process_boundary
     def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:
         remote = self.fake_remote(copies=True)
         result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
@@ -2214,6 +2229,7 @@ class RemoteTests(HanaShotTest):
         self.assertFalse((self.scratch / "shot.png").exists())
         self.assertEqual(self.timing_lines()[0]["failure_reason"], "copy_failed")
 
+    @process_boundary
     def test_remote_mac_shot_raises_the_window_and_holds_the_display_awake_for_the_run(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
@@ -2231,6 +2247,7 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(copy[0], "scp", "the display is awake before the shot")
         self.assertIn(["ended"], calls, "the keep-awake ends before the run exits")
 
+    @process_boundary
     def test_remote_mac_shot_restores_an_always_on_bottom_window(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
@@ -2244,6 +2261,7 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
         self.assertIn(["ended"], self.ssh_calls())
 
+    @process_boundary
     def test_remote_mac_shot_repairs_an_already_always_on_top_window_to_normal(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnTop"
@@ -2257,6 +2275,7 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(self.fake.window_level, "Normal")
         self.assertIn(["ended"], self.ssh_calls())
 
+    @process_boundary
     def test_failed_remote_mac_shot_restores_the_window_and_ends_keep_awake(self) -> None:
         _ = self.fake_remote(copies=False, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
@@ -2348,6 +2367,7 @@ hana_shot.Session.close = signal_before_close
         self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGHUP))
         self.assertIn("SIGHUP", cast(str, line["error"]))
 
+    @process_boundary
     def test_views_check_retries_window_preparation_after_a_refused_raise(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
@@ -2380,6 +2400,7 @@ hana_shot.Session.close = signal_before_close
         self.assertLess(awake, copy, "the second shot starts only after keep-awake is running")
         self.assertIn(["ended"], calls)
 
+    @process_boundary
     def test_refused_window_restore_reports_once_without_changing_a_success_exit(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.refuse_window_level_restore = True

@@ -12,6 +12,7 @@ from unittest import mock
 from scripts.style.ledger_test_support import ticket_owner_id
 
 from scripts.style import style_plan
+from scripts.style import style_ledger
 
 from scripts.style import mechanical_classes
 from scripts.style import rules
@@ -137,15 +138,37 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn("Apply the approved findings. " + sentence, self.plan.read_text())
 
     def test_a_proposal_phase_lists_each_widened_path_under_its_files(self) -> None:
-        ticket = self.approved_reference_ticket()
-        extra = "crates/alpha/src/extra.rs"
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", extra,
-                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
-        self.write_approved_phase()
-        at = self.ledger().ticket_open(ticket_owner_id("names"))[0]["widened"][0]["widened_at"]
-        self.assertIn(f"**Files:**\n- `{self.sources[0]}`\n"
-                      + f"- widened: {extra} — the move needs a new file (showrunner, {at})\n", self.plan.read_text())
+        _ = self.doCleanups()
+        for needs in ((), ("crates/tui_pane/src/lib.rs",)):
+            with self.subTest(needs=needs):
+                case = StylePlanTests()
+                case.setUp()
+                try:
+                    ticket = case.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"),
+                                                              ("Outcome::SignalFailed", "Outcome::Failed")))
+                    extra = "crates/alpha/src/extra.rs"
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(style_plan.main(["widen", "--repo", str(case.repo), "--ticket", ticket, "--files", extra,
+                                                          "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
+                    ledger = case.ledger()
+                    identities = ledger.ticket_get(ticket)["finding_ids"]
+                    for identity in identities:
+                        for path in needs:
+                            ledger.finding_need(identity, path)
+                        ledger.finding_need(identity, case.sources[0])
+                    case.write_approved_phase()
+                    at = ledger.ticket_open(ticket_owner_id("names"))[0]["widened"][0]["widened_at"]
+                    prefix = (f"**Files:**\n- `{case.sources[0]}`\n"
+                              + f"- widened: {extra} — the move needs a new file (showrunner, {at})\n")
+                    self.assertIn(prefix, case.plan.read_text())
+                    files = case.plan.read_text().split("**Files:**\n", 1)[1].split("\n\n", 1)[0]
+                    self.assertEqual(files.count(f"- `{case.sources[0]}`"), 1)
+                    for path in needs:
+                        line = f"- `{path}` — needed by finding {', '.join(identities)}"
+                        self.assertIn(prefix + line + "\n", case.plan.read_text())
+                        self.assertEqual(files.count(f"- `{path}`"), 1)
+                finally:
+                    case.doCleanups()
 
     def test_a_proposal_phase_names_each_qualified_pair_and_keeps_a_bare_rename_in_its_own_file(self) -> None:
         _ = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"), ("helper", "assistant")))
@@ -392,26 +415,41 @@ class StylePlanTests(StylePlanFixture):
             self.assertEqual(self.reference_gate(ticket), (2, "error: class pure-move names the unknown proof copy\n"))
 
     def test_approved_proposal_gate_allows_a_widened_file_and_only_it(self) -> None:
-        ticket = self.approved_reference_ticket()
-        outside, other = self.sources[3], self.sources[2]
-        self.write(outside, "pub fn moved() -> usize { 1 }\n")
-        result, output = self.reference_gate(ticket)
-        self.assertEqual(result, 1, output)
-        refusal = "files outside approved findings: {} (change is not an approved rename reference)"
-        self.assertIn(refusal.format(outside), output)
-        widened = io.StringIO()
-        with redirect_stdout(widened):
-            self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", outside,
-                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
-        line = widened.getvalue()
-        self.assertTrue(line.startswith(f"widened: {outside} — the move needs a new file (showrunner, ")
-                        and line.endswith(")\n") and line.count("\n") == 1, line)
-        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
-        self.write(other, "pub fn other() -> usize { 2 }\n")
-        result, output = self.reference_gate(ticket)
-        self.assertEqual(result, 1, output)
-        self.assertIn(refusal.format(other) + "\n", output)
-        self.assertNotIn(outside, output)
+        _ = self.doCleanups()
+        for authorization in ("widen", "need"):
+            with self.subTest(authorization=authorization):
+                case = StylePlanTests()
+                case.setUp()
+                try:
+                    ticket = case.approved_reference_ticket()
+                    outside, other = case.sources[3], case.sources[2]
+                    case.write(outside, "pub fn moved() -> usize { 1 }\n")
+                    result, output = case.reference_gate(ticket)
+                    self.assertEqual(result, 1, output)
+                    refusal = "files outside approved findings: {} (change is not an approved rename reference)"
+                    self.assertIn(refusal.format(outside), output)
+                    if authorization == "need":
+                        ledger = case.ledger()
+                        identity, = ledger.ticket_get(ticket)["finding_ids"]
+                        ledger.finding_need(identity, outside)
+                        with self.assertRaisesRegex(style_ledger.LedgerError, "already allowed by the approved findings"):
+                            style_plan.widen(case.repo, ticket, (outside,), "the move needs a new file", "showrunner")
+                    else:
+                        widened = io.StringIO()
+                        with redirect_stdout(widened):
+                            self.assertEqual(style_plan.main(["widen", "--repo", str(case.repo), "--ticket", ticket, "--files", outside,
+                                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
+                        line = widened.getvalue()
+                        self.assertTrue(line.startswith(f"widened: {outside} — the move needs a new file (showrunner, ")
+                                        and line.endswith(")\n") and line.count("\n") == 1, line)
+                    self.assertEqual(case.reference_gate(ticket), (0, "approved proposal\n"))
+                    case.write(other, "pub fn other() -> usize { 2 }\n")
+                    result, output = case.reference_gate(ticket)
+                    self.assertEqual(result, 1, output)
+                    self.assertIn(refusal.format(other) + "\n", output)
+                    self.assertNotIn(outside, output)
+                finally:
+                    case.doCleanups()
 
 if __name__ == "__main__":
     _ = unittest.main()

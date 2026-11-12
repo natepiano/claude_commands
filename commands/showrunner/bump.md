@@ -15,8 +15,7 @@ it changes, and say so in one line.
 
 1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py bump <position|session|folder>` for a waiting step of the bumped unit. It gives that unit the queue priority until step 5 clears it; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
-   one line: the bumped unit's merge goes first, and a build hold may come. Do
-   not wait for the next update tick.
+   one line: the bumped unit's merge goes first, and a build hold may come.
 2. **Checkpoint now.** Tell the owning unit director: "Bump: checkpoint and
    push this work now. Run lint and the tests directly related to the change
    only, not the full suite. The full suite runs on the pushed tip after the

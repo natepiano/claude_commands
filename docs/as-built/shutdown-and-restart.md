@@ -437,6 +437,12 @@ An unknown ACCOUNT prints one error and returns status 2 before any stop.
 Without ACCOUNT, the existing selection and role accounts apply.
 
 `--only ID[,ID...]` also limits `--all`; ACCOUNT and `--only` must both match.
+An `--only` run observes only the requested rows as restart candidates.
+It judges workers only for selected worker rows and their parents.
+It retains incomplete evidence and anomaly lines for a selected worker.
+It skips the scan for live sessions without staff rows.
+The shared pane read still supplies complete identity evidence.
+A run without `--only` keeps the existing observations.
 If a stop includes the caller, restart continues in a detached process before the first stop.
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.
@@ -452,6 +458,28 @@ The restart option `--why TEXT` replaces that cause.
 The message asks the session to continue its work.
 If Codex message delivery fails after launch, restart reports one anomaly line with the director's name and the first error line.
 The director counts as started and leaves the restart record.
+Restart checks each unit director and showrunner that it starts with a continuation message.
+The check uses the launched account home and native session identity.
+It reads only turns after that director's start.
+The reader leaves a final record without a newline unread until the writer completes it.
+The launch boundary follows the last complete newline.
+A malformed Codex record with a newline makes the transcript unreadable.
+A Claude transcript missing from the current read also makes the transcript unreadable.
+A matching user turn followed by an assistant turn or tool call confirms resumed work.
+All checked directors share one deadline.
+The check ends as soon as every director resumes.
+At the deadline, each failed check prints one of these lines:
+
+- `<name>: restart check: no continuation message`
+- `<name>: restart check: no work after the continuation message`
+- `<name>: restart check: transcript unreadable`
+
+The check then prints `restart check: <passed> of <checked> directors resumed`.
+The check prints nothing when it checks no director.
+It skips held directors, unchanged rows, failed starts, workers, producers, dry runs, and stop-only commands.
+It does not change the exit code, restart record, or staff.
+config/shutdown.conf sets RESUME_CHECK_SECONDS=180 and RESUME_CHECK_INTERVAL_SECONDS=5.
+
 A paused or exited director stays stopped and keeps its hold record and restart entry.
 A running row gets no continuation message.
 Producers keep their existing start behavior.
@@ -508,6 +536,8 @@ A detached run continues across a session stop or restart.
 `detached_runs.py start` starts its supervisor in a new process session.
 The command runs in a `builds-detached.slice` scope when systemd is available.
 The record, the log and the exit code stay in the run folder's `detached_runs` directory.
+After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
+The supervisor waits for delivery before it marks the run finished.
 The result goes to the worker's fixed staff row and its current conversation.
 A stopped worker's result goes to its parent. A stopped parent's result waits in its queue.
 

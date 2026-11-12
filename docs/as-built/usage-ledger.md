@@ -109,7 +109,18 @@ Every stored time is UTC ISO-8601 text ending `+00:00`.
 - `finding_opened`, `finding_verdict` → `findings`, key (`machine`, `phase_instance_id`, `finding_id`); `state` is `open` until a verdict, then its `resulting_state`.
 - `finding_batch_dispatched`, `_landed`, and `_abandoned` enter the `repair_rounds` audit table. Its key is (`machine`, `phase_instance_id`, `round`). These rows preserve dispatch records. Repair counts require started fix passes. Relaunches of one ledger batch add no round. Refunded batches add no round unless they later land.
 
-In `runs`, `phases` and `passes`, `state` is `open` until the finish event and `finished_at` is NULL only while `open`. `source_event` is the creating event's `event_id`, from which a finding's title and detail can be found in the history file.
+The `runs` columns are `machine`, `run_id`, `started_at`, `plan_doc`, `worktree`, `finished_at`, and `source_event`.
+The table stores no `state` or `branch`.
+`HISTORY_FIELDS` gives `run_started` only the `plan_doc` and `worktree` fields.
+Its insert names all six supplied columns explicitly.
+`run_finished` carries no event-specific fields and updates only `finished_at`.
+A run without an imported finish event keeps `finished_at` NULL.
+
+In `phases` and `passes`, `state` is `open` until the finish event.
+The finish event sets both `state` and `finished_at`.
+`validate_history_fields` rejects an `open` finish status only for `phase_finished` and `pass_finished`.
+`source_event` is the creating event's `event_id`.
+It identifies the source event in the history file, including a finding's title and detail.
 
 **Checkpoints** (`scripts/usage/outcomes.py`, natedev only). `git log --all --format=%H%x00%ct%x00%s` in every repository `outcomes.repositories(...)` returns. `checkpoint_subject` parses `checkpoint(<plan-slug>): phase <id> — <title>`; the phase id is everything between `phase ` and the first ` — ` and may contain spaces. Any other `checkpoint(` subject is stored with NULL slug and phase. `checkpoint_mapping` is recomputed for every checkpoint on every pass: among `phases` whose run's `plan_doc` stem equals the slug, with the same phase id, started at or before the commit, and still `open` or finished at or after it, the latest-started one makes `mapping = 'mapped'`; otherwise `unmapped` with NULL `machine`, `run_id`, `phase_instance_id`.
 
@@ -192,8 +203,8 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 
 ### Context economy
 
-`scripts/usage/context_economy.py` reads context measurements on demand.
-`scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_mac`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
+`scripts/usage/context_economy.py` reads natedev context measurements on demand.
+`scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
 `/context_economy` (`commands/context_economy.md`) defaults to `report`, also when its first argument starts with `--`.
 The CLI has `report`, `save`, `compare`, `trend`, `hourly` and `changes`; `report` takes `--role` and `--by settings|week`.
 `report` shows the `--where` value in the settings column and omits rows with no samples.
@@ -208,7 +219,10 @@ Roles with too few sessions share one `not judged` line. Other settings, model a
 By default only settings changes are listed; `--files` adds tracked file edits. `--detail` prints every measure with its sample counts.
 The `/context_economy` command does not print this report by default. It writes a short summary: one table per settings change, the other changes, a trust line and a next step. `--raw` prints the report unchanged.
 The verdicts describe observed movement, not proven cause.
-`hourly` reads only the ledger, so it lags by up to one collection. It shows active unit directors and weighted cost for the last `hourly_recent_hours` complete hours. Its normal and busy rows are the median and p75 of the `hourly_baseline_days` before those hours.
+`hourly` reads natedev ledger rows, so it lags by up to one collection.
+It uses the latest natedev row to set the report time.
+It shows active unit directors and weighted cost for the last `hourly_recent_hours` complete hours.
+Its normal and busy rows show the median and p75 of the `hourly_baseline_days` before those hours.
 The default window covers the last seven days.
 Bounds use `scripts.lib.user_zone.user_zone`.
 
@@ -218,7 +232,7 @@ The inputs are read at run time:
    Requests are deduplicated by (`message.id`, `requestId`); records with model `<synthetic>` are not requests.
    A Claude Code restart does not always write a `SessionStart:resume` hook record, so a change of the record `version` also counts as a resume start.
 2. Codex rollouts supply requests, thread openings, models from `turn_context`, and versions from `session_meta`.
-3. Each machine's checkout HEAD reflog supplies settings times and tracked file values.
+3. Natedev's checkout HEAD reflog supplies settings times and tracked file values.
    `main` moves by fast-forward, so commit times are late; only the reflog gives the time the live files changed.
    `CONTEXT_ECONOMY_CHECKOUT` sets the checkout; its default is `~/.claude`.
 4. The local usage ledger supplies roles; `weights.weighted` supplies dated request costs.
@@ -254,9 +268,9 @@ Those requests remain in context quantities and contribute no cost samples.
 `left out:` counts whole sessions below `min_requests`, which defaults to 20 requests in the window.
 Resumes do not split this count or discard compaction pairs.
 
-The Mac reader uses one SSH call.
-It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac returns summary JSON lines.
-Both machines keep parsed events and complete-line checkpoints under `~/.cache/context_economy/`.
+All context-economy subcommands use natedev data and make no Mac request.
+On other hosts, the CLI forwards the same arguments to `role_map.ROLE_MAP_HOST` over SSH and streams its output.
+Natedev keeps parsed events and complete-line checkpoints under `~/.cache/context_economy/`.
 A warm read reuses unchanged files; an appended file resumes with its saved parser state.
 Before resuming a grown file, the cache checks its device, inode, saved size, and complete-line offset.
 It compares BLAKE2b hashes of the first 4 KiB and the last 4 KiB before that offset.
@@ -275,36 +289,29 @@ A compressed file uses its saved entry; a compressed file without an entry uses 
 `TranscriptCache.mark_final(path)` lets the compressor mark a saved summary as final.
 `cache_max_megabytes` in `config/context_economy.conf` bounds reproducible summaries, using least recent access first.
 Entries whose plain source files are compressed or deleted remain protected, even when the cache exceeds that bound.
-Long reads show file progress on stderr, including skipped files and progress from the Mac.
+Long reads show file progress on stderr, including skipped files.
 `progress_seconds` in the same config sets the progress update interval.
-Natedev sends both values in the Mac request.
-The Mac uses these request values without reading the new keys from its checkout config.
 Transcript files remain unchanged.
-`CONTEXT_ECONOMY_MAC_COMMAND` (a JSON list) replaces the SSH command, for tests and a forced failure.
-`mac_timeout_seconds` in `config/context_economy.conf` limits it to 300 seconds by default.
-A failed read prints `mac: <reason>` on `report` and `save`; local measurements remain available.
-An empty Mac result is a successful read.
-Saved results hold `"mac": {"state": "read"}` or `"mac": {"state": "failed", "reason": "<reason>"}`.
-`trend` marks failures with `mac failed`.
-An older result without the field reads as Mac unknown and has no mark.
+Saved results omit the `mac` field.
+The reader ignores that field in older results.
 
 Only named results are written, under `<state_dir()>/context_economy/<name>.json`.
 `USAGE_STATE_DIR` overrides `state_dir()`; its default is `~/.local/state/usage-model`.
 `save NAME` publishes a complete temporary file and refuses an existing name.
-Results retain settings, bounds, machine and family, roles, models, versions, request counts, quantities, and the Mac outcome.
-`compare NAME` pools by role and quantity, prints both sample sizes, and names changed settings, CLI versions, models, machines, and families under `confounds:`.
+Results retain settings, bounds, machine and family, roles, models, versions, request counts, and quantities.
+`compare NAME` uses only natedev groups from saved results and derives each role's mean and sample count from those groups.
+`trend` uses the same groups and sums only their request counts.
+Results without a machine split show their stored totals unchanged, with a note that they may include Mac data.
+`compare NAME` prints both sample sizes and names changed settings, CLI versions, models, machines, and families under `confounds:`.
 A side with fewer than ten samples prints `too few` instead of a percentage change.
 `trend` reads saved results in time order, also after transcripts disappear.
-Without `--role`, it includes empty results with zero requests, blank quantities, and their Mac mark.
+Without `--role`, it includes empty results with zero requests and blank quantities.
 With `--role`, it omits results without that role.
 
 `save --last-week` names the previous complete ISO week `week-<ISO year>-W<week>`.
 Its bounds are Monday 00:00 through the next Monday 00:00 in the user zone.
 It takes no name, explicit time bounds, `--where`, or `--family` other than `all`.
-An existing week with a successful or unknown Mac state prints its path and exits 0 before any reader runs.
-A week with a failed Mac state retries its reads.
-A successful Mac retry replaces the complete result atomically.
-Another failed Mac read keeps the file unchanged, prints the path and `mac: <reason>`, and exits 0.
+An existing week prints its path and exits 0 before any reader runs.
 The Linux `context-economy.nix` module declares `nate.jobs.context-economy` for natedev's user.
 It runs at login and every 86400 seconds with `save --last-week`.
 The job writes only `week-*` results and sends no message.
@@ -317,8 +324,6 @@ Commit `46471082e` added the key at 2026-11-08 12:36.
 `--where` cannot select an absent key.
 The OFF save selects `--where precomputeCompactionEnabled=false` after role `director` has at least 30 `requests_per_cycle` samples.
 Until that threshold, no OFF result is saved; on 2026-11-09 the director n was 8.
-
-The default `report` (seven days, both families, natedev and the Mac) measured 202.8 seconds on 2026-11-09.
 
 ### Worker readout: `scripts/whoami/worker_usage.py`
 
