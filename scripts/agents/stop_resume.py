@@ -673,7 +673,7 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
         if member is not None:
             return member.current_session
         registered = {row["sessionId"] for row in sessions.running_sessions()
-                      if session in (row["sessionId"], row["name"])}
+                      if session == row["sessionId"]}
         if len(registered) > 1:
             return StopFailed(session, f"{session}: several live sessions match")
         if registered:
@@ -1051,22 +1051,13 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
 
 
 def _codex_name_ids(name: str) -> list[str]:
-    """Keep a UUID or read exact names from the shared Codex index."""
+    """Accept an explicit native ID without reading Codex display names."""
     from scripts.production import staff
 
     try:
         _ = staff.native_id(name)
         return [name]
     except staff.StaffRefused:
-        pass
-    try:
-        entries = [cast(dict[str, str], json.loads(line))
-                   for line in (agent_accounts.codex_home() / "session_index.jsonl").read_text().splitlines() if line.strip()]
-        return sorted({entry["id"] for entry in entries if entry.get("thread_name") == name})
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as error:
-        print(f"{name}: index anomaly: {error}", file=sys.stderr)
         return []
 
 
