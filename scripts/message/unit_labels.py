@@ -339,8 +339,10 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
             if (parent := record.parent_of(row)) is not None}
         places = production_places(records, set(directors), diagnostics,
                                    record=record, resolver=resolver)
-        # Label readers stay silent and retain each session's recorded name.
-        names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
+        # Read names from staff for the native sessions in this registry.
+        names: dict[str, str] = {
+            item["sessionId"]: member.name if (member := record.by_current_session(item["sessionId"])) is not None else ""
+            for item in records}
         labels: dict[str, UnitLabels] = {}
         for session_id in wanted & names.keys():
             showrunner: ShowrunnerRelationship = NoShowrunner()

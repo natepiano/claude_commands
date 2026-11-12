@@ -460,7 +460,7 @@ print(observed.row.id)
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
             labels = unit_labels.unit_labels_for([owner.id], self.environment)
-        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("organon", "show", "alpha"))
+        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("alpha", "show", "alpha"))
 
         with mock.patch.object(pane_record, "PROC", self.root / "proc"):
             changes = session_staff.repair_marks()

@@ -2274,8 +2274,13 @@ def _staff_recipient_match(
     if len(matches) == 1 and not foreign_workers_only:
         return next(iter(matches.values()))
     if matches:
-        details = ", ".join(f"{paths[row.id]} (staff:{row.id}, session:{row.current_session})" for row in matches.values())
-        return RecipientLookupFailed(f"ambiguous staff row for {target!r}: {details}")
+        details: list[str] = []
+        for row in matches.values():
+            addresses = ", ".join(dict.fromkeys(
+                entry.reach.address for entry in _staff_transport_matches(row, list(observed))
+                if isinstance(entry.reach, roster.Messageable))) or f"session:{row.current_session}"
+            details.append(f"{paths[row.id]} (staff:{row.id}, {addresses})")
+        return RecipientLookupFailed(f"ambiguous staff row for {target!r}: {', '.join(details)}")
     return NoStaffRecipient()
 
 
@@ -3577,6 +3582,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                             forget_sent(key, identity.to, started)
                         delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
                                                       delivered_text(message, entry_id), live,
+                                                      reply_identity=sender_native_id(message.stamp), membership=membership,
                                                       deadline=claude_started + options.timeout,
                                                       publish=partial(publish_postmaster_entry, postmaster_identity, entry_id),
                                                       resolve=partial(record_postmaster_result, postmaster_identity, entry_id))

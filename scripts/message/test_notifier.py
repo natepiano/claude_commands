@@ -15,7 +15,7 @@ from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
@@ -372,6 +372,8 @@ finally:
         self.assertRegex(self.lines()[-1], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d .+ / \d\d:\d\d:\d\d UTC \| exit 0 \| to session:sid-1 uds:.+ \| fake send result$")
 
     def test_prompt_file_fire_ignores_schedule_and_hold(self) -> None:
+        owner = fixture_member("showrunner", name="showrunner")
+        self.record(owner.current_session)
         prompt = self.root / "prompt.txt"
         _ = prompt.write_text("prompt contents")
         _ = self.successful("new", "example", "--to", "showrunner", "--every", "2", "--prompt-file", str(prompt), "--hold")

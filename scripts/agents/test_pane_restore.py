@@ -36,7 +36,7 @@ from scripts.agents import pane_restore
 from scripts.herdr import herdr, worker_panes  # noqa: E402
 from scripts.agents import pane_record  # noqa: E402
 from scripts.herdr import pane_launch
-from scripts.message import sessions  # noqa: E402
+from scripts.message import session_records, sessions  # noqa: E402
 
 END_HOOK = Path(__file__).resolve().parent.parent / "hooks/session-end-pane-record.py"
 SETTINGS = '{"disableAgentView": true}'
@@ -955,6 +955,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
               mock.patch.object(staff, "runtime_id", side_effect=EXACT_RUNTIME_ID),
               mock.patch.object(os, "kill", side_effect=alive),
               mock.patch.object(runtime_sessions, "process_start", return_value="retirement-start"),
+              mock.patch.object(session_records, "process_start", return_value="retirement-start"),
               mock.patch.dict(os.environ, {"HERDR_PROC": str(proc)})):
             yield
 

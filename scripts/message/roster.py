@@ -1050,7 +1050,7 @@ def _claude_entries(
                     unit = ""
                 director = UnderDirector(
                     unit,
-                    director_entry["name"],
+                    owner.name if (owner := membership.by_current_session(run_director.session_id)) is not None else "",
                     f"session:{run_director.session_id}",
                 )
         else:
@@ -1060,7 +1060,7 @@ def _claude_entries(
             machine=machine,
             kind="claude",
             role=role,
-            name=record["name"],
+            name=member.name if (member := membership.by_current_session(session_id)) is not None else "",
             status=detail.status,
             reach=(
                 Messageable(f"session:{session_id}")
@@ -1128,6 +1128,7 @@ def _review_workers(
     machine: str, run: _LiveRun, place: _RunPlace,
     table: Mapping[int, process_table.Process], problems: list[str], *,
     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
+    names_by_pid: Mapping[int, str],
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
@@ -1159,13 +1160,12 @@ def _review_workers(
         process = _reviewer_process(launcher_pid, table)
         if isinstance(process, _ReviewerProcessNotFound):
             continue
-        name = f"{lens} reviewer" if lens else "blind reviewer"
         slot_role = f"review ({lens})" if lens else "review"
         entries.append(RosterEntry(
             machine=machine,
             kind=process.kind,
             role="worker",
-            name=name,
+            name=names_by_pid.get(process.pid, ""),
             status="running",
             reach=CannotReceiveMessages("blind reviewer"),
             cwd=_reviewer_cwd(process, place.cwd),
@@ -1182,6 +1182,7 @@ def _unit_workers(
     production_places: Mapping[str, _ProductionPlace],
     problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
     membership: staff.StaffSnapshot,
+    records: list[SessionRecord],
 ) -> tuple[list[RosterEntry], set[str]]:
     try:
         table = process_table.snapshot()
@@ -1232,13 +1233,16 @@ def _unit_workers(
                         else AccountUnread("worker account not read")))
     except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused) as error:
         _problem(problems, "pane workers", error)
+    names_by_pid = {record["pid"]: member.name for record in records
+                    if (member := membership.by_current_session(record["sessionId"])) is not None}
     for run in runs:
         try:
             place = _run_place(run, claude_entries, production_places, membership)
         except staff.StaffUnreadable as error:
             _problem(problems, str(run.path), error)
             continue
-        entries.extend(_review_workers(machine, run, place, table, problems, home_state=home_state))
+        entries.extend(_review_workers(machine, run, place, table, problems,
+                                       home_state=home_state, names_by_pid=names_by_pid))
     return entries, worker_threads
 
 
@@ -1258,7 +1262,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                 evidence = session_staff.worker_backend(membership, member.id) if member is not None else session_staff.WorkerBackendUnavailable("worker is absent")
                 thread = (member.current_session if member is not None and isinstance(evidence, session_staff.RecordedWorker)
                           and isinstance(evidence.backend, staff.CodexBackend) else "")
-                if not thread:
+                if member is None or not thread:
                     print(f"anomaly: {instance.name}: held role has no Codex backend", file=sys.stderr)
                     continue
                 if thread in threads:
@@ -1267,7 +1271,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                 status = type(instance.lifecycle).__name__
                 entries.append(RosterEntry(machine=machine, kind='codex',
                     role='astra-designer' if instance.role == 'designer' else 'astra-reviewer',
-                    name=instance.name, status=status, reach=CannotReceiveMessages(
+                    name=member.name, status=status, reach=CannotReceiveMessages(
                         'held role; add pending messages through design_roles.py'),
                     cwd=design.repository, showrunner=showrunner, director=director,
                     assignment=HeldDesignRole(instance.role, str(path.parent)), thread=CodexThread(thread),
@@ -1278,10 +1282,11 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 
 
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
-                       worker_threads: Iterable[str] = ()) -> Roster:
+                       worker_threads: Iterable[str] = (), membership: staff.StaffSnapshot | None = None) -> Roster:
     """Use the reported session or the pane process to address Codex."""
     from scripts.herdr import herdr
 
+    membership = staff.initial_snapshot() if membership is None else membership
     entries: list[RosterEntry] = []
     problems: list[str] = []
     try:
@@ -1326,7 +1331,9 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                 continue
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
-                name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
+                name=(member.name if isinstance(thread, CodexThread)
+                      and (member := membership.by_current_session(thread.thread_id)) is not None else ""),
+                status=str(agent["agent_status"]),
                 reach=(Messageable(f"codex:{thread.thread_id}") if isinstance(thread, CodexThread)
                        else CannotReceiveMessages("interactive Codex in a herdr pane")),
                 thread=thread, pane=HerdrPlace(name, pane),
@@ -1378,7 +1385,8 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
         home_state=home_state, problems=problems, membership=membership,
     )
     unit_workers, worker_threads = _unit_workers(
-        machine, runs, claude, production_places, problems, home_state=home_state, membership=membership
+        machine, runs, claude, production_places, problems,
+        home_state=home_state, membership=membership, records=records
     )
     durable_roles, durable_threads = _durable_roles(machine, claude, warnings, membership=membership)
     unit_workers = [entry for entry in unit_workers
@@ -1396,7 +1404,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
                 machine=machine,
                 kind="codex",
                 role="freestanding",
-                name=session.name,
+                name=member.name if (member := membership.by_current_session(session.thread_id)) is not None else "",
                 status=session.status,
                 reach=Messageable(f"codex:{session.thread_id}"),
                 cwd=session.cwd,
@@ -1410,7 +1418,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
             for session in daemon
             if session.thread_id not in worker_threads
         )
-    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered), worker_threads=worker_threads)
+    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered), worker_threads=worker_threads, membership=membership)
     problems.extend(interactive.problems)
     excluded = diagnostics.excluded_sessions
     claude = {key: entry for key, entry in claude.items() if key not in worker_threads}

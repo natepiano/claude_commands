@@ -19,7 +19,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.agents.test_support import ShutdownTestCase
-from scripts.message import sessions
+from scripts.message import sessions, session_records
 from scripts.message import process_identity
 from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
 from scripts.message.relay_test_support import write_relay_record
@@ -318,7 +318,7 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertFalse(sessions.running_session(record))
         self.assertFalse(sessions.messaging_socket_exists(record))
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), \
-                mock.patch.object(sessions, "live_session", return_value=True) as accepts:
+                mock.patch.object(session_records, "live_session", return_value=True) as accepts:
             live = sessions.live_sessions()
         self.assertEqual(live, [record])
         accepts.assert_called_once_with(record)
@@ -331,7 +331,7 @@ class SessionLookupTests(ShutdownTestCase):
         with (
             mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
             mock.patch.object(os, "kill"),
-            mock.patch.object(sessions, "process_start", return_value="new process start") as start,
+            mock.patch.object(session_records, "process_start", return_value="new process start") as start,
         ):
             self.assertFalse(sessions.running_session(registered))
             self.assertFalse(sessions.live_session(registered))
@@ -347,7 +347,7 @@ class SessionLookupTests(ShutdownTestCase):
         assert not isinstance(registered, sessions.UnreadableSessionRecord)
         with (
             mock.patch.object(os, "kill"),
-            mock.patch.object(sessions, "process_start", return_value="recorded start"),
+            mock.patch.object(session_records, "process_start", return_value="recorded start"),
         ):
             self.assertTrue(sessions.running_session(registered))
             self.assertTrue(sessions.live_session(registered))
@@ -358,7 +358,7 @@ class SessionLookupTests(ShutdownTestCase):
         assert not isinstance(registered, sessions.UnreadableSessionRecord)
         with (
             mock.patch.object(os, "kill"),
-            mock.patch.object(sessions, "process_start", return_value=None),
+            mock.patch.object(session_records, "process_start", return_value=None),
         ):
             self.assertFalse(sessions.running_session(registered))
             self.assertFalse(sessions.live_session(registered))
@@ -419,7 +419,7 @@ class SessionLookupTests(ShutdownTestCase):
         assert not isinstance(record, sessions.UnreadableSessionRecord)
         self.assertEqual(record.get("procStart"), "")
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), \
-                mock.patch.object(sessions, "process_start", side_effect=AssertionError("unexpected start read")):
+                mock.patch.object(session_records, "process_start", side_effect=AssertionError("unexpected start read")):
             self.assertEqual(sessions.live_sessions(), [record])
 
     def test_empty_readable_registry_returns_absent(self) -> None:

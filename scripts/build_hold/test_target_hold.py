@@ -11,6 +11,7 @@ from unittest import mock
 import unittest
 
 from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 ORIGINAL_RUN = subprocess.run
 ORIGINAL_POPEN = subprocess.Popen
@@ -20,6 +21,9 @@ class TargetHoldTests(IsolatedTargetState):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        for name in ("alice", "bob"):
+            _ = fixture_member("producer", name=name)
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.target_command))
 
     def target_command(self, arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:

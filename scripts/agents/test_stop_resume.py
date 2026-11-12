@@ -43,7 +43,7 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member,
 from scripts.usage import agents_log
 from scripts.herdr import herdr, pane_launch
 from scripts.agents import pane_record, shutdown
-from scripts.message import sessions
+from scripts.message import codex_daemon, session_records, sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history
@@ -332,6 +332,19 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(world.arguments, [])
                 self.assertEqual(case.client.opened, [])
                 self.assertEqual(list((case.root / "panes").glob(".producer-admission-*")), [])
+
+        for reference, owned in (("dwight", True), ("old producer title", True), ("dwight", False)):
+            with self.subTest(daemon_name=reference, owned=owned), producer_first_fixture("codex") as world:
+                if owned:
+                    member = fixture_member("producer", name="dwight", runtime_id=fixture_runtime_id("fixed-producer"))
+                    member = staff.update_current_session(member.current_session, staff.native_id(world.identity))
+                    self.assertNotEqual(member.id, member.current_session)
+                read = codex_daemon.DaemonRead(
+                    codex_daemon.CodexDaemon(world.home, world.home / "daemon.sock"),
+                    [codex_daemon.DaemonSession(world.identity, str(world.folder), "idle")])
+                with patch.object(codex_daemon, "read_daemons", return_value=[read]):
+                    self.assertEqual(stop_resume.producer_conflicts(reference, world.case.client),
+                                     [(world.identity, "outside herdr")] if owned and reference == "dwight" else [])
 
     def test_interrupted_producer_admission_reuses_its_live_native_conversation(self) -> None:
         lost_stages = {"lost", "replaced", "unpublished", "foreign-recovery", "native-recovery"}
@@ -1984,6 +1997,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.observe))
         _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
+        _ = self.enterContext(patch.object(session_records, "process_start", return_value="generation-1"))
         _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
             herdr.PaneSessionReport("019b3a40-4250-7000-8000-000000000102"), "generation-1", {})))
         _ = self.enterContext(patch.object(sessions, "process_liveness", self.process))

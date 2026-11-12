@@ -60,7 +60,7 @@ from scripts.message.test_postmaster import FakeClock
 from scripts.message import codex_daemon
 from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
 from scripts.message import roster
-from scripts.message import sessions
+from scripts.message import sessions, session_records
 from scripts.accounts import accounts
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib.user_zone import user_zone
@@ -1100,7 +1100,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 membership = staff.StaffSnapshot(tuple(self.staff_rows.values()))
                 live = sessions.live_sessions()
                 if target == "postmaster reply":
-                    reply = postmaster.reply_destination("transport label", live)
+                    reply = postmaster.reply_destination(f"session:{current}", live)
                     assert isinstance(reply, postmaster.ReplyToSession)
                     address = f"session:{reply.session_id}"
                 else:
@@ -2065,7 +2065,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                                  "--text", "The local key needs attention."])
         started = send.now()
         with (mock.patch.object(send, "now", return_value=started),
-              mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as discovery):
+              mock.patch.object(session_records, "read_registry", wraps=session_records.read_registry) as discovery,
+              mock.patch.object(sessions, "read_registry", new=discovery)):
             self.assertEqual(send.send(options).outcome, "sent")
         self.assertGreater(discovery.call_count, 1)
         caller_record = self.root / "caller-completion.json"
@@ -2075,7 +2076,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         (self.root / "sessions/before.json").unlink()
         (self.root / "before.sock").unlink()
         with (mock.patch.object(send, "now", return_value=started + timedelta(minutes=1)),
-              mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as discovery):
+              mock.patch.object(session_records, "read_registry", wraps=session_records.read_registry) as discovery,
+              mock.patch.object(sessions, "read_registry", new=discovery)):
             self.assertEqual(send.send(options).outcome, "skipped")
         discovery.assert_called_once_with()
         self.assertEqual(len(self.relayed), 1)
