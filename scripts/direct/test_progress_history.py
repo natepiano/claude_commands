@@ -8876,6 +8876,18 @@ class StaffProgressHistoryTests(StaffTestCase):
                 collect.director_evidence([json.dumps({**resolved, "timestamp": "2026-11-11T10:00:00Z"}).encode()],
                                           "fixture", evidence)
                 self.assertEqual(len(evidence), 1)
+        from scripts.whoami import agent_accounts
+        from scripts.whoami.account_test_support import write_codex_auth
+
+        default = Path.home() / ".codex"
+        default.mkdir(parents=True, exist_ok=True)
+        notes = self.root / "account-notes"
+        notes.mkdir()
+        _ = (notes / "codex2.md").write_text("---\nlogin: director@example.invalid\n---\n")
+        write_codex_auth(default, "director@example.invalid")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)})))
+        self.assertEqual(agent_accounts.codex_account(default),
+                         agent_accounts.KnownCodexAccount(default, "director@example.invalid", "codex2"))
         for folder in ("sessions", "archived_sessions"):
             with self.subTest(numbered_account=folder):
                 numbered = fixture_member("unit", name="numbered-" + folder, parent=owner.id)
@@ -8883,6 +8895,8 @@ class StaffProgressHistoryTests(StaffTestCase):
                 transcript = Path.home() / ".codex2" / folder / f"{numbered.current_session}.jsonl"
                 transcript.parent.mkdir(parents=True, exist_ok=True)
                 transcript.touch()
+                self.assertFalse((transcript.parent.parent / "auth.json").exists())
+                self.assertNotIn(transcript.parent.parent, agent_accounts.codex_homes(default))
                 with patch.dict(os.environ, {"CODEX_HOME": ""}):
                     resolved = plan_history.staff_directory({"owner_staff_id": numbered.id}, staff.snapshot())
                 agent = cast(dict[str, object], resolved["main_agent"])

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import time
@@ -153,14 +152,9 @@ def _text(value: object) -> str:
 def _director_family(row: staff.StaffRow) -> str:
     """Read the current director's native transcript evidence."""
     from scripts.message import sessions
-    from scripts.whoami import agent_accounts
 
-    homes = set(agent_accounts.codex_homes(Path.home() / ".codex"))
-    if isinstance(row.home, staff.SessionHome):
-        homes.add(row.home.path)
-    if configured := os.environ.get("CODEX_HOME"):
-        homes.add(Path(configured).expanduser())
-    for home in homes:
+    extra_homes = (row.home.path,) if isinstance(row.home, staff.SessionHome) else ()
+    for home in transcripts.codex_transcript_homes(extra_homes):
         for folder in ("sessions", "archived_sessions"):
             if transcripts.transcript_paths(home / folder, f"**/*{row.current_session}.jsonl"):
                 return "codex"
