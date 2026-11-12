@@ -545,3 +545,28 @@ The saved baseline reports inserted phases as about 2% of gaps.
 - `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/checkpoint.md`, `docs/direct/phase_end.md`, `commands/plan/to_phased_plan.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md` — notice format and phase-start rules
 
 **Ruled out:** a replacement check for independent phases (user order).
+
+### Phase 23 — Transcript lookups do not resolve each file  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `transcript_paths` and the staff backend lookup cost a small part of their present CPU, for every caller.
+
+**Spec:**
+- `scripts/lib/transcripts.py` `transcript_paths(root, pattern)`: do not call `resolve()` on each file. Key each match by `uncompressed_path(path)` as the glob gives it, so a plain file and its `.zst` copy still give one entry, with the plain file preferred. Keep the signature, the sorted order and the return type.
+- `scripts/production/staff.py` `_found_backends`: Codex homes share session folders through symlinks (`~/.codex1/sessions` and `~/.codex2/sessions` point to `~/.codex/sessions`). Resolve each `home / folder` once, list each real folder once, and use that list for each home that shares it. Keep the rule that a row gets `CodexBackend(home)` only for its recorded home, and the `anomaly:` line on `OSError`.
+- Add no new public API. Change no other caller.
+- Tests: add rows to existing tests (`scripts/lib/test_transcripts.py`, and `test_codex_backend_requires_the_recorded_home_to_hold_the_transcript` in `scripts/production/test_staff.py`). Cover: a plain file and its `.zst` give one entry, plain preferred; two homes whose folder is a symlink to one real folder each get the right `CodexBackend` for their recorded rows, with the folder listed once.
+- Timing: the director measures paired CPU per call before and after with the same harness (`time.process_time`, five calls, no profiler). Before, at 12:25 EST on natedev: `_found_backends` over 657 rows took 0.55–0.61 s per call; `transcript_paths` over 14,025 files took 0.32 s, of which the glob is 0.04 s.
+
+**Files:**
+- `scripts/lib/transcripts.py`
+- `scripts/production/staff.py`
+- `scripts/lib/test_transcripts.py`
+- `scripts/production/test_staff.py`
+
+**Workers:** `1 writer + 1 tester`
+- impl: `scripts/lib/transcripts.py`, `scripts/production/staff.py`
+- test: `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`
