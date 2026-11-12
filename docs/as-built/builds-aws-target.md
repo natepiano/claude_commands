@@ -494,9 +494,17 @@ The same administrator session reads failure details without another passphrase 
 
 Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
 Both refs can name local commits in `~/.claude`.
-The trial pushes each commit to a fresh `gate-trial-<id>-base|changed` branch with a plain push.
+The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed` branch with a plain push.
+The expires field records the trial's fixed expiry epoch in seconds.
 The trial folder's UUID supplies the id; `trial_branch_prefix` configures the prefix.
-At trial end, it lists the trial's remote branch namespace and deletes each branch, including after failures and signals.
+At trial end, cleanup lists the trial's remote branch namespace and deletes each branch, including after errors and Ctrl-C.
+`paired_main` installs no signal handler.
+SIGTERM or SIGHUP can skip this cleanup.
+Before new pushes, a start sweep deletes parsed trial branches whose expiry is earlier than the current time.
+The sweep reads no current lifetime setting.
+A lower lifetime setting leaves existing trials' fixed expiries unchanged.
+The sweep preserves unexpired branches, malformed names, and unrelated branches.
+A sweep failure prints one stderr line and the trial continues.
 This cleanup covers a push accepted remotely before the client reports an error.
 Each network Git call uses `git_network_timeout_s`, which defaults to 60 seconds.
 A timeout or cancellation kills the Git process group, including SSH children.

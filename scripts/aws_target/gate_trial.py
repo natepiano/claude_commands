@@ -13,6 +13,7 @@ from decimal import Decimal
 from datetime import UTC, datetime
 import json
 import multiprocessing
+import re
 import sys
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -130,9 +131,9 @@ def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], r
     return PairedTrialRequest(revisions[0], revisions[1], tuple(modules), rounds, url)
 
 
-def delete_trial_branches(repo: Path, clone_url: str, prefix: str, trial_id: str) -> None:
+def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int, trial_id: str) -> None:
     """Find and delete remote branches in this trial's unique namespace."""
-    namespace = f'refs/heads/{prefix}-{trial_id}-'
+    namespace = f'refs/heads/{prefix}-{expires}-{trial_id}-'
     try:
         remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -147,6 +148,23 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, trial_id: str
             _ = checked_git(repo, 'push', clone_url, '--delete', branch)
         except (OSError, ValueError, subprocess.SubprocessError):
             print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
+
+
+def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> None:
+    """Delete expired trial branches without blocking a new trial on failure."""
+    namespace = f'refs/heads/{prefix}-'
+    try:
+        remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
+        for line in remote.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or not fields[1].startswith(namespace):
+                continue
+            name = fields[1].removeprefix(namespace)
+            match = re.fullmatch(r'([0-9]{1,12})-([0-9a-f]{32})-(base|changed)', name)
+            if match and int(match[1]) < now:
+                _ = checked_git(repo, 'push', clone_url, '--delete', fields[1])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(f'paired trial: could not sweep old branches for {prefix}', file=sys.stderr)
 
 
 def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires: int) -> dict[str, object]:
@@ -419,7 +437,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
     trial_id = ''
     prefix = ''
     clone_url = ''
-    previous = {number: signal.signal(number, stop_paired) for number in TRIAL_SIGNALS}
+    expires = 0
     try:
         modules = args.modules
         if len(modules) > cloud_gate.settings().whole('slots'):
@@ -430,14 +448,15 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         deployment = gate_deployment(directory / 'gate-deployment.json', home)
         clone_url = trial.clone_url
         prefix = cloud_gate.settings().text('trial_branch_prefix')
+        sweep_trial_branches(args.repo, clone_url, prefix, int(time.time()))
+        expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
         folder = directory / 'paired-trials' / uuid4().hex
         folder.mkdir(parents=True)
         trial_id = folder.name
         for variant, revision in (('base', trial.base), ('changed', trial.changed)):
-            branch = f'{prefix}-{folder.name}-{variant}'
+            branch = f'{prefix}-{expires}-{folder.name}-{variant}'
             _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
             _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
-        expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
         for module in trial.modules:
             path = folder / uuid4().hex
             path.mkdir()
@@ -453,9 +472,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
     finally:
         with defer_cleanup_signals():
             if trial_id:
-                delete_trial_branches(args.repo, clone_url, prefix, trial_id)
-            for number, handler in previous.items():
-                _ = signal.signal(number, handler)
+                delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
 
 
 if __name__ == '__main__':

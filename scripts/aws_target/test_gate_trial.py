@@ -375,14 +375,18 @@ class Sample(unittest.TestCase):
 
         def service(_command: Sequence[str], _unit: str) -> int:
             folder = next((self.state / 'paired-trials').iterdir())
+            expires = 1700000000 + cloud_gate.settings().whole('lifetime_minutes') * 60
+            request_path = next(folder.glob('*/request.json'))
+            self.assertEqual(cloud_gate.read(request_path)['expires'], expires)
             self.assertEqual(self.remote_branches(), {**branches,
-                f'refs/heads/gate-trial-{folder.name}-base': self.base,
-                f'refs/heads/gate-trial-{folder.name}-changed': self.changed})
+                f'refs/heads/gate-trial-{expires}-{folder.name}-base': self.base,
+                f'refs/heads/gate-trial-{expires}-{folder.name}-changed': self.changed})
             self.assertEqual(trial.checked_git(self.repo, 'show-ref'), before)
             self.assertEqual(trial.checked_git(self.repo, 'status', '--porcelain'), status)
             return 0
 
-        with mock.patch.object(trial, 'paired_service', side_effect=service):
+        with (mock.patch.object(trial, 'paired_service', side_effect=service),
+              mock.patch.object(time, 'time', return_value=1700000000)):
             self.assertEqual(self.invoke_trial(), 0)
         self.assertEqual(self.remote_branches(), branches)
         self.assertEqual(trial.checked_git(self.repo, 'show-ref'), before)
@@ -418,8 +422,126 @@ class Sample(unittest.TestCase):
             self.assertNotIn('--force', arguments)
             self.assertFalse(cast(str, arguments[2]).startswith('+'))
         listings = [call.args for call in git.call_args_list if call.args[1] == 'ls-remote']
-        self.assertEqual(len(listings), 2)
+        self.assertEqual(len(listings), 4)
         self.assertTrue(all(cast(str, arguments[-1]).startswith('refs/heads/fixture-trial-') for arguments in listings))
+
+    def test_paired_main_never_installs_a_signal_handler(self) -> None:
+        handlers = {number: signal.getsignal(number) for number in trial.TRIAL_SIGNALS}
+        git = trial.checked_git
+        observations: list[str] = []
+
+        def check_handlers(label: str) -> None:
+            self.assertEqual({number: signal.getsignal(number) for number in trial.TRIAL_SIGNALS}, handlers)
+            observations.append(label)
+
+        def inspect_git(repo: Path, *arguments: str) -> str:
+            check_handlers(arguments[0])
+            return git(repo, *arguments)
+
+        def service(_command: Sequence[str], _unit: str) -> int:
+            check_handlers('service')
+            return 0
+
+        with (mock.patch.object(trial, 'checked_git', side_effect=inspect_git),
+              mock.patch.object(trial, 'paired_service', side_effect=service),
+              mock.patch.object(signal, 'signal', side_effect=AssertionError('signal handler installation'))):
+            self.assertEqual(self.invoke_trial(), 0)
+        check_handlers('finished')
+        self.assertIn('push', observations)
+        self.assertIn('service', observations)
+
+    def test_start_sweep_deletes_only_expired_trial_branches(self) -> None:
+        now = 1700000000
+        old = now - 1
+        expired = {f'gate-trial-{old}-' + 'a' * 32 + '-' + variant for variant in ('base', 'changed')}
+        preserved = {
+            f'gate-trial-{now + 1}-' + 'b' * 32 + '-base',
+            f'gate-trial-{now}-' + 'c' * 32 + '-changed',
+            f'gate-trial-{now + 60}-' + 'd' * 32 + '-base',
+            'gate-trial-not-an-epoch-' + 'e' * 32 + '-base',
+            f'gate-trial-{old}-invalid-base',
+            f'gate-trial-{old}-' + 'f' * 32 + '-other',
+            f'gate-trial-{old}-' + 'f' * 32 + '-base-extra',
+            f'other-trial-{old}-' + 'a' * 32 + '-base',
+            'unrelated-work',
+        }
+        for name in expired | preserved:
+            _ = trial.checked_git(self.repo, 'push', str(self.origin), self.base + ':refs/heads/' + name)
+        before = self.remote_branches()
+        expected = {ref: commit for ref, commit in before.items() if ref.removeprefix('refs/heads/') not in expired}
+
+        def service(_command: Sequence[str], _unit: str) -> int:
+            remote = self.remote_branches()
+            self.assertEqual({ref: commit for ref, commit in remote.items() if ref in before}, expected)
+            self.assertEqual(len(set(remote) - set(before)), 2)
+            return 0
+
+        with (mock.patch.object(trial, 'paired_service', side_effect=service),
+              mock.patch.object(time, 'time', return_value=now),
+              mock.patch.object(trial, 'checked_git', wraps=trial.checked_git) as git):
+            self.assertEqual(self.invoke_trial(), 0)
+        self.assertEqual(self.remote_branches(), expected)
+        listings = [call.args for call in git.call_args_list if call.args[1] == 'ls-remote']
+        self.assertEqual(len(listings), 2)
+        self.assertEqual(listings[0][-1], 'refs/heads/gate-trial-*')
+
+    def test_lower_lifetime_keeps_live_trial_branches(self) -> None:
+        now = 1700000000
+        before = self.remote_branches()
+        config = self.root / 'cloud_gate.conf'
+        lifetime = cloud_gate.settings().whole('lifetime_minutes')
+        self.assertGreater(lifetime, 2)
+
+        def first_service(_command: Sequence[str], _unit: str) -> int:
+            live = self.remote_branches()
+            self.assertEqual(len(set(live) - set(before)), 2)
+            folder = next((self.state / 'paired-trials').iterdir())
+            request = cloud_gate.read(next(folder.glob('*/request.json')))
+            self.assertEqual(request['expires'], now + lifetime * 60)
+            _ = config.write_text(config.read_text().replace(f'lifetime_minutes={lifetime}', 'lifetime_minutes=1'))
+
+            def second_service(_command: Sequence[str], _unit: str) -> int:
+                remote = self.remote_branches()
+                self.assertEqual({ref: commit for ref, commit in remote.items() if ref in live}, live)
+                self.assertEqual(len(set(remote) - set(live)), 2)
+                return 0
+
+            with (mock.patch.object(time, 'time', return_value=now + 120),
+                  mock.patch.object(trial, 'paired_service', side_effect=second_service)):
+                self.assertEqual(self.invoke_trial(), 0)
+            self.assertEqual(self.remote_branches(), live)
+            return 0
+
+        with (mock.patch.object(time, 'time', return_value=now),
+              mock.patch.object(trial, 'paired_service', side_effect=first_service)):
+            self.assertEqual(self.invoke_trial(), 0)
+        self.assertEqual(self.remote_branches(), before)
+
+    def test_start_sweep_failure_reports_once_and_continues(self) -> None:
+        now = 1700000000
+        old = now - 1
+        branch = f'refs/heads/gate-trial-{old}-' + 'a' * 32 + '-base'
+        _ = trial.checked_git(self.repo, 'push', str(self.origin), self.base + ':' + branch)
+        before = self.remote_branches()
+        git = trial.checked_git
+        for failure in ('list', 'delete'):
+            with self.subTest(failure=failure):
+                def refuse_sweep(repo: Path, *arguments: str) -> str:
+                    listing = arguments[0] == 'ls-remote' and arguments[-1] == 'refs/heads/gate-trial-*'
+                    deleting = arguments[0] == 'push' and '--delete' in arguments and arguments[-1] == branch
+                    if (failure == 'list' and listing) or (failure == 'delete' and deleting):
+                        raise subprocess.CalledProcessError(1, ['git', *arguments])
+                    return git(repo, *arguments)
+
+                errors = StringIO()
+                with (mock.patch.object(trial, 'checked_git', side_effect=refuse_sweep),
+                      mock.patch.object(time, 'time', return_value=now),
+                      mock.patch.object(trial, 'paired_service', return_value=0) as service,
+                      redirect_stderr(errors)):
+                    self.assertEqual(self.invoke_trial(), 0)
+                service.assert_called_once()
+                self.assertEqual(errors.getvalue().splitlines(), ['paired trial: could not sweep old branches for gate-trial'])
+                self.assertEqual(self.remote_branches(), before)
 
     def test_signal_stopped_service_deletes_both_trial_branches(self) -> None:
         service = trial.paired_service
@@ -494,7 +616,7 @@ class Sample(unittest.TestCase):
                 listings: list[str] = []
 
                 def refuse_listing(repo: Path, *arguments: str) -> str:
-                    if arguments[0] == 'ls-remote':
+                    if arguments[0] == 'ls-remote' and arguments[-1] != 'refs/heads/gate-trial-*':
                         listings.append(arguments[-1])
                         raise subprocess.CalledProcessError(1, ['git', *arguments])
                     return git(repo, *arguments)
@@ -504,11 +626,12 @@ class Sample(unittest.TestCase):
                       mock.patch.object(trial, 'paired_service', return_value=status), redirect_stderr(errors)):
                     self.assertEqual(self.invoke_trial(), status)
                 self.assertEqual(len(listings), 1)
-                trial_id = listings[0].removeprefix('refs/heads/gate-trial-').removesuffix('-*')
+                name = listings[0].removeprefix('refs/heads/gate-trial-').removesuffix('-*')
+                _epoch, _separator, trial_id = name.partition('-')
                 self.assertEqual(errors.getvalue().splitlines(), [
                     'paired trial: could not list branches for trial ' + trial_id])
-                self.assertEqual(self.remote_branches()['refs/heads/gate-trial-' + trial_id + '-base'], self.base)
-                self.assertEqual(self.remote_branches()['refs/heads/gate-trial-' + trial_id + '-changed'], self.changed)
+                self.assertEqual(self.remote_branches()['refs/heads/gate-trial-' + name + '-base'], self.base)
+                self.assertEqual(self.remote_branches()['refs/heads/gate-trial-' + name + '-changed'], self.changed)
 
     def stalled_network_trial(self, *, interrupt: bool) -> None:
         git = shutil.which('git')
@@ -579,10 +702,10 @@ else:
         self.stalled_network_trial(interrupt=False)
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'The test requires a Linux child subreaper')
-    def test_signal_during_push_kills_its_process_group_and_cleans_remote_branch(self) -> None:
+    def test_keyboard_interrupt_during_push_kills_its_process_group_and_cleans_remote_branch(self) -> None:
         self.stalled_network_trial(interrupt=True)
 
-    def test_signal_after_first_push_deletes_the_pushed_branch(self) -> None:
+    def test_keyboard_interrupt_after_first_push_deletes_the_pushed_branch(self) -> None:
         git = trial.checked_git
         branches = self.remote_branches()
         pushed: list[str] = []
@@ -591,7 +714,7 @@ else:
             reply = git(repo, *arguments)
             if arguments[0] == 'push' and '--delete' not in arguments:
                 pushed.append(arguments[-1])
-                signal.raise_signal(signal.SIGTERM)
+                raise KeyboardInterrupt
             return reply
 
         with (mock.patch.object(trial, 'checked_git', side_effect=interrupt_push),
