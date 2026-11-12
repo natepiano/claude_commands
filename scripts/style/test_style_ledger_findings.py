@@ -1359,6 +1359,14 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     self.assertEqual(sum(finding.path == path for finding in live), 3)
 
     def test_test_file_folding_resolves_the_supported_live_forms(self) -> None:
+        scan_lints = '''#[cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "tests should panic on unexpected values"
+    )
+)]'''
         for parent, declaration, source in (
                 ("census/herdr.rs", '#[cfg(test)] #[path = "herdr_tests.rs"] mod tests;', "census/herdr_tests.rs"),
                 ("census/hierarchy.rs", '#[cfg(test)] #[path = "hierarchy_file_tests.rs"] mod file_tests;',
@@ -1372,6 +1380,8 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                  "census/worker_dispatch/prompt_opening_tests.rs"),
                 ("census/scan/census.rs", '#[cfg(test)] #[path = "census_tests.rs"] mod tests;',
                  "census/scan/census_tests.rs"),
+                ("census/scan/conditional.rs", '#[cfg(test)] #[path = "conditional_tests.rs"] mod tests;',
+                 "census/scan/conditional_tests.rs"),
                 ("owner.rs", "#[cfg(test)] mod plain_tests;", "owner/plain_tests.rs"),
                 ("lib.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs"),
                 ("main.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs")):
@@ -1382,9 +1392,13 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     rule = case.rule("test-move-forms", "tier: D\nfamily: modules\ninput_scope: file\n")
                     root = "crates/alpha/src/"
                     case.write(root + "lib.rs", "mod census;\nmod render;\nmod owner;\n")
+                    scan_attribute = scan_lints if parent == "census/scan/conditional.rs" else '#[cfg(\n    feature = "scan"\n)]'
+                    inner_attribute = ('#![cfg_attr(test, cfg_attr(feature = "scan", allow(dead_code)), doc = "Scan")]'
+                                       if parent == "census/scan/conditional.rs" else '#![cfg(\n    feature = "scan"\n)]')
                     case.write(root + "census/mod.rs", "mod herdr;\nmod hierarchy;\nmod worker_dispatch;\n"
-                               + '#[cfg(\n    feature = "scan"\n)]\npub(crate) mod scan;\n')
-                    case.write(root + "census/scan/mod.rs", '#![cfg(\n    feature = "scan"\n)]\npub(crate) mod census;\n')
+                               + scan_attribute + "\npub(crate) mod scan;\n")
+                    case.write(root + "census/scan/mod.rs",
+                               inner_attribute + "\npub(crate) mod census;\npub(crate) mod conditional;\n")
                     if parent == "main.rs":
                         _ = (case.repo / root / "lib.rs").unlink()
                     case.write(root + parent, declaration + "\n")
@@ -1405,24 +1419,31 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     case.doCleanups()
 
     def test_test_file_folding_keeps_unsupported_and_ambiguous_findings(self) -> None:
-        for declaration, other in (
-                ("mod widget_tests;", ""),
-                ("#[cfg(test)] pub mod widget_tests;", ""),
-                ('#[cfg(test)] #[path = "../widget_tests.rs"] mod tests;', ""),
-                ('#[cfg(test)] #[path = r"widget_tests.rs"] mod tests;', ""),
-                ('#[cfg(test)] #[path = 17] mod tests;', ""),
-                ('#[cfg(test)] #[path = "widget_tests.rs"] #[path = "other.rs"] mod tests;', ""),
-                ("#[cfg(test)] #[allow(dead_code)] mod widget_tests;", ""),
-                ('#[cfg_attr(all(), path = "widget_tests.rs")] mod tests;', ""),
+        for declaration, other, module_attribute in (
+                ("mod widget_tests;", "", ""),
+                ("#[cfg(test)] pub mod widget_tests;", "", ""),
+                ('#[cfg(test)] #[path = "../widget_tests.rs"] mod tests;', "", ""),
+                ('#[cfg(test)] #[path = r"widget_tests.rs"] mod tests;', "", ""),
+                ('#[cfg(test)] #[path = 17] mod tests;', "", ""),
+                ('#[cfg(test)] #[path = "widget_tests.rs"] #[path = "other.rs"] mod tests;', "", ""),
+                ("#[cfg(test)] #[allow(dead_code)] mod widget_tests;", "", ""),
+                ('#[cfg_attr(all(), path = "widget_tests.rs")] mod tests;', "", ""),
+                ("#[cfg(test)] mod widget_tests;", "", '#[cfg_attr(test, path = "owner.rs")]'),
+                ("#[cfg(test)] mod widget_tests;", "", '#[cfg_attr(test, cfg_attr(all(), path = "owner.rs"))]'),
+                ("#[cfg(test)] mod widget_tests;", "", '#[cfg_attr(test, custom_macro)]'),
                 ("#[cfg(test)] mod widget_tests;",
-                 '#[cfg(test)] #[path = "widget_tests.rs"] mod shared_tests;')):
-            with self.subTest(declaration=declaration, other=other):
+                 '#[cfg(test)] #[path = "widget_tests.rs"] mod shared_tests;', "")):
+            with self.subTest(declaration=declaration, other=other, module_attribute=module_attribute):
                 case = StyleLedgerFindingsTests()
                 case.setUp()
                 try:
                     rule = case.rule("test-move-unsupported", "tier: D\nfamily: modules\ninput_scope: file\n")
-                    path = "crates/alpha/src/widget_tests.rs"
-                    case.write("crates/alpha/src/lib.rs", declaration + "\n" + ("mod other;\n" if other else ""))
+                    path = "crates/alpha/src/" + ("owner/" if module_attribute else "") + "widget_tests.rs"
+                    if module_attribute:
+                        case.write("crates/alpha/src/lib.rs", module_attribute + "\npub(crate) mod owner;\n")
+                        case.write("crates/alpha/src/owner.rs", declaration + "\n")
+                    else:
+                        case.write("crates/alpha/src/lib.rs", declaration + "\n" + ("mod other;\n" if other else ""))
                     if other:
                         case.write("crates/alpha/src/other.rs", other + "\n")
                     case.write(path, "fn moved_fixture() {}\n")
