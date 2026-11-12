@@ -217,7 +217,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/change_routing.py` | read | staff.json path |
 | `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
-| `scripts/production/dailies_input.py` | read | snapshot |
 | `scripts/production/delivery_state.py` | read | staff.json path |
 | `scripts/production/demote_showrunner.py` | write | by_id, change_director, cli_result, move, operation, snapshot |
 | `scripts/production/fake_showrunner.py` | write | native_id, update_current_session |
@@ -312,7 +311,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-184 accessor rows: 40 write, 143 read, 1 owner.
+183 accessor rows: 39 write, 143 read, 1 owner.
 
 ## Approved copies
 

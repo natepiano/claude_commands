@@ -15,7 +15,8 @@ from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_runtime_id, recorded_showrunner
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
@@ -94,27 +95,43 @@ finally:
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
 
-    def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
-        from scripts.production import staff
-        from scripts.production.staff_test_support import fixture_runtime_id
+    def scheduled_owner(self) -> tuple[staff.StaffRow, Path]:
+        doc = self.root / "production.md"
+        _ = doc.write_text(f"# Production — demo\n\n## Production Context\n\n"
+                           + f"- **Merge branch:** main\n- **Showrunner checkout:** `{self.root}`\n"
+                           + "- **Log:** production.log\n- **Updates:** every 2 minutes\n")
+        owner = recorded_showrunner("demo", doc)
+        self.record(owner.current_session)
+        return owner, doc
 
-        with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")}):
-            owner = staff.ensure("showrunner", name="demo", runtime_id=fixture_runtime_id("timer-first"))
-            current = staff.native_id(fixture_runtime_id("timer-after-clear"))
-            _ = staff.update_current_session(owner.current_session, current)
-            self.record(current)
-            _ = self.successful("new", "example", "--to", "session:" + owner.id,
-                                "--every", "2", "--command", "the scheduled prompt")
-            configuration = self.state_dir / "example" / "conf"
-            before = configuration.read_bytes(), configuration.stat().st_mtime_ns
-            _ = self.successful("fire", "example")
-            arguments = self.send_args.read_text().splitlines()
-            self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
-            self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
-            self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
-            retained = staff.by_id(owner.id)
-            assert retained is not None
-            self.assertEqual(retained.current_session, current)
+    def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
+        owner = self.scheduled_owner()[0]
+        current = staff.native_id(fixture_runtime_id("timer-after-clear"))
+        _ = self.successful("new", "example", "--to", "session:" + owner.id,
+                            "--every", "2", "--prompt", "scheduled")
+        configuration = self.state_dir / "example" / "conf"
+        before = configuration.read_bytes(), configuration.stat().st_mtime_ns
+        for index, change in enumerate(("session", "name"), start=1):
+            with self.subTest(change=change):
+                if change == "session":
+                    owner = staff.update_current_session(owner.current_session, current)
+                    self.record(current)
+                else:
+                    owner = staff.rename(owner.id, "renamed-demo")
+                _ = self.successful("tick", now=MINUTE + 120 * index)
+                arguments = self.send_args.read_text().splitlines()
+                self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
+                prompt = arguments[arguments.index("--text") + 1:]
+                delivered = "\n".join(prompt)
+                self.assertIn("--production " + owner.name, delivered)
+                self.assertIn("every 2 minutes", delivered)
+                self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
+                self.assertEqual(self.conf()["PROMPT"], "scheduled")
+                self.assertNotIn("PROMPT_FILE", self.conf())
+                self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
+        retained = staff.by_id(owner.id)
+        assert retained is not None
+        self.assertEqual(retained.current_session, current)
 
     def test_tick_drains_repeat_notices_only_from_the_configured_local_state(self) -> None:
         pending = self.root / "repeat-outbox"
@@ -371,17 +388,28 @@ finally:
         self.assertEqual(self.state()["NEXT_DUE"], str(MINUTE + 240))
         self.assertRegex(self.lines()[-1], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d .+ / \d\d:\d\d:\d\d UTC \| exit 0 \| to session:sid-1 uds:.+ \| fake send result$")
 
-    def test_prompt_file_fire_ignores_schedule_and_hold(self) -> None:
-        owner = fixture_member("showrunner", name="showrunner")
-        self.record(owner.current_session)
-        prompt = self.root / "prompt.txt"
-        _ = prompt.write_text("prompt contents")
-        _ = self.successful("new", "example", "--to", "showrunner", "--every", "2", "--prompt-file", str(prompt), "--hold")
+    def test_scheduled_prompt_fire_ignores_schedule_and_hold(self) -> None:
+        owner = self.scheduled_owner()[0]
+        _ = self.successful("new", "example", "--to", "session:" + owner.id, "--every", "2",
+                            "--prompt", "scheduled", "--hold")
         _ = self.successful("fire", "example")
-        self.assertEqual(self.send_args.read_text().splitlines()[-2:], ["--file", str(prompt)])
+        arguments = self.send_args.read_text().splitlines()
+        self.assertIn("--text", arguments)
+        self.assertIn("--production " + owner.name, "\n".join(arguments[arguments.index("--text") + 1:]))
         self.assertEqual(self.state()["NEXT_DUE"], str(MINUTE + 120))
         _ = self.successful("fire", "example", now=NOW + 1)
         self.assertEqual(len([line for line in self.lines() if " | exit 0 | " in line]), 2)
+
+    def test_failed_scheduled_prompt_skips_delivery_with_one_error_line(self) -> None:
+        owner, doc = self.scheduled_owner()
+        _ = self.successful("new", "example", "--to", "session:" + owner.id, "--every", "2",
+                            "--prompt", "scheduled")
+        doc.unlink()
+        result = self.run_cli("tick", now=MINUTE + 120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("prompt", result.stderr)
+        self.assertFalse(self.send_args.exists())
 
     def test_check_exit_one_skips_and_exit_two_removes(self) -> None:
         _ = self.new("--check", "/bin/sh -c 'exit 1'")
@@ -406,7 +434,7 @@ finally:
         self.assertFalse(self.send_args.exists())
 
     def test_empty_prompt_sources_do_not_create_an_instance(self) -> None:
-        for source in ("--command", "--prompt-file"):
+        for source in ("--command", "--prompt"):
             with self.subTest(source=source):
                 result = self.run_cli(
                     "new", "example", "--to", "session:sid-1", "--every", "2", source, "",

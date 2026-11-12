@@ -815,13 +815,16 @@ class RosterTests(unittest.TestCase):
 
     def test_durable_role_keeps_its_fixed_worker_after_a_rename_and_name_reuse(self) -> None:
         parent = unit_membership("alpha", "unit-one")
+        checkout = self.root / "checkout"
+        parent = staff.set_worktree(parent.id, staff.PresentWorktree("fixture-host", checkout), expected=parent.worktree)
         original = designer_fixture(parent.id, "held-designer", self.root / "codex-home")
         design = design_roles.HeldDesign(
             design_roles.DesignPlacement("00000000-0000-4000-8000-000000000047", "fixture-host", 1),
             "fixture-repo", str(self.root / "checkout"), str(self.root / "checkout/design.md"), "design",
             "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", original.name, design_roles.RoleOpen(original.id)),
-             design_roles.RoleInstance("reviewer", "held-reviewer", design_roles.RoleNotOpened())))
+             design_roles.RoleInstance("reviewer", "held-reviewer", design_roles.RoleNotOpened())),
+            checkout=design_roles.UnitCheckout(parent.id))
         save = cast(Callable[[design_roles.HeldDesign], None], getattr(design_roles, "_save"))
         save(design)
         with mock.patch.object(herdr.Herdr, "retitle_row", return_value=True):
@@ -829,12 +832,15 @@ class RosterTests(unittest.TestCase):
         replacement = fixture_worker(original.name, parent.id,
                                      runtime_id=fixture_runtime_id("replacement-held-designer"),
                                      backend=staff.CodexBackend(self.root / "codex-home"))
+        destination = self.root / "moved-checkout"
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("fixture-host", destination), expected=parent.worktree)
         found = roster.roster(os.environ, roster.ThisMachine())
         entries = [entry for entry in found.entries if entry.role == "astra-designer" and entry.name == renamed.name]
         self.assertEqual(found.warnings, [])
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].name, renamed.name)
         self.assertEqual(entries[0].thread, roster.CodexThread(renamed.current_session))
+        self.assertEqual(entries[0].cwd, str(destination))
         self.assertNotEqual(entries[0].thread, roster.CodexThread(replacement.current_session))
         self.assertEqual(sum(entry.thread == roster.CodexThread(renamed.current_session) for entry in found.entries), 1)
 
@@ -1358,17 +1364,28 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(forwarded.text, 'owner update')
 
     def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:
+        runner = fixture_member("showrunner", name="alpha")
+        _ = staff.rename(runner.id, "runner")
         bad = write_empty_binding_record(self.root)
-        code, output, errors = self._run_main('--json')
-        self.assertEqual(code, 0, errors)
-        report = cast(dict[str, object], json.loads('\n'.join(output)))
-        self.assertEqual(report['problems'], [])
-        self.assertEqual(report['warnings'], [f'durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
-        self.assertEqual(errors, [f'could not read: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
-        result = roster.roster(os.environ, roster.ThisMachine())
-        decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(result).encode()).result
-        self.assertEqual(decoded.warnings, result.warnings)
-        self.assertEqual(decoded.problems, [])
+        for row, reason in (("invalid-repository", "missing or invalid repository"),
+                            ("missing-owner", "checkout owner is absent: missing-owner")):
+            with self.subTest(row=row):
+                if row == "missing-owner":
+                    fields = cast(dict[str, object], json.loads(bad.read_text()))
+                    del fields["repository"]
+                    fields["repository_owner"] = "missing-owner"
+                    _ = bad.write_text(json.dumps(fields))
+                code, output, errors = self._run_main('--json')
+                self.assertEqual(code, 0, errors)
+                report = cast(dict[str, object], json.loads('\n'.join(output)))
+                self.assertEqual(report['problems'], [])
+                self.assertEqual(report['warnings'], [f'durable role {bad}: {bad}: worker state unreadable: {reason}'])
+                self.assertEqual(errors, [f'could not read: warning: durable role {bad}: {bad}: worker state unreadable: {reason}'])
+                result = roster.roster(os.environ, roster.ThisMachine())
+                self.assertIn("runner", {entry.name for entry in result.entries})
+                decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(result).encode()).result
+                self.assertEqual(decoded.warnings, result.warnings)
+                self.assertEqual(decoded.problems, [])
 
     def test_worker_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
@@ -1381,8 +1398,8 @@ class RosterTests(unittest.TestCase):
             design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
                 "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
                 "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
-                (design_roles.RoleInstance("designer", "design-address", design_roles.RoleOpen(designer.current_session)),
-                 design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleOpen(reviewer.current_session))))
+                (design_roles.RoleInstance("designer", "design-address", design_roles.RoleOpen(designer.id)),
+                 design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleOpen(reviewer.id))))
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             for held_role, name, job in (("designer", "design-address", "designer"),
                                          ("reviewer", "review-address", "design reviewer")):

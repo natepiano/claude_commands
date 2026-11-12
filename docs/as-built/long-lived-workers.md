@@ -423,26 +423,44 @@ A rename never selects a replacement through the worker's former name.
 
 `design_roles.py` stores each design under `DESIGN_ROLES_STATE`.
 The default is `~/.local/state/astra/design-roles/<design id>/`.
-`design.json` stores placement, repository, document, area, binding, role slots and assignment claims.
+`design.json` stores placement, checkout ownership, document, area, binding, role slots and assignment claims.
+The record has no `holder` field.
 `prompts/`, `replies/` and `pending/<role>/` retain work and queued messages.
 `transition.json` retains an incomplete lifecycle operation.
 The binding is `DesignUnbound` or `DesignBoundToPhase(run_directory, phase, repository, output_paths)`.
+`HeldDesign` and `DesignBoundToPhase` have a keyword-only `checkout` field.
+Its value is `UnitCheckout(owner)` or `IndependentCheckout()`, with the independent checkout as the default.
+When an opened checkout matches the caller unit's staff worktree, the design and binding store `repository_owner: <unit staff id>`.
+An owned record stores no `repository` path.
+Its `document` is relative to the checkout.
+`design_repository` and `binding_repository` resolve the owner's current staff worktree.
+`read_design` returns the current absolute repository and document paths.
+A worktree move therefore changes the resolved document path without rewriting the record.
+An independent checkout stores its absolute `repository` and `document` paths.
+
 The lifecycle is `RoleNotOpened`, `RoleOpen`, `RolePausedForMove`, `RoleNeedsRecovery` or `RoleEnded`.
 Open, paused and recovery states retain the fixed staff id.
 Ending an opened role retains its staff id.
 Ending an uncertain creation can record an empty id when no worker exists.
 `HeldWorker.thread_id` derives the current thread from staff.
+A role with a worker staff id stores no `name`.
+`instance_name` reads the current worker name for prompts, dispatch, recovery, end, and role lists.
+A role without a worker id stores its `name` as the creation claim.
+The roster's `_durable_roles` and `worker_shown_name` use `instance_name` and `design_repository` for display.
+An absent checkout owner raises `RoleRefused`.
+The roster reports that record as a warning and continues with other records.
 `ReadOnlyReviewer` and `PhaseBoundDesigner` define the access policy.
 `_read_designs` reports each skipped damaged record once per operation.
 It refuses a matching active design that needs recovery.
 `list` returns damaged record problems alongside readable roles.
 
 `DamagedDesignRecord` identifies the record path and damaged field.
-Holder-aware scans decide whether matching damage prevents the requested operation.
+Record scans decide whether matching damage prevents the requested operation.
+`held_document` resolves owned document paths before it matches damaged records.
 Writes validate the complete design before publication.
 An omitted binding repository uses the authority checkout; an empty repository refuses.
 `rebind --unbind` or a complete replacement binding can repair an empty repository under the generation lock.
-Unrelated damaged records produce one warning per operation and do not stop other holders.
+Unrelated damaged records produce one warning per operation and do not stop other designs.
 `unbind-run` refuses matching damage, including damage without a live role.
 Plain `list` keeps diagnostics on stderr; JSON retains `problems`.
 An identical `rebind` retry completes only after launch context and census publication agree.
@@ -456,6 +474,8 @@ It saves the headed prompt, checks the current lifecycle and generation, then re
 `recover` proves the recorded worker idle and clears its uncertain claim without creating a replacement.
 `rebind` requires a reason and the expected generation.
 It records a transition and advances the authority generation before it publishes a new binding, checkout or document.
+Rebinding to the current checkout preserves the recorded checkout ownership for any caller.
+It also preserves the binding's checkout reference.
 It then refreshes the census and clears the transition.
 `end` confirms release before it records `RoleEnded`.
 A failed end retains its transition record for retry.
@@ -500,7 +520,8 @@ Repeated registration must keep the same mappings.
 Placement uses a hash of the repository id and relative document path.
 The authority supports registration, reservation, lookup, generation advance, checkout changes, and aliases.
 An authority error stops the local lifecycle operation without changing placement.
-Renames and transfers retain worker staff ids without rewriting holder records.
+Renames and transfers retain worker staff ids.
+Readers resolve the worker's current parent from staff.
 
 ### Dispatch and messages
 

@@ -72,8 +72,9 @@ Codex rows:
   `session_staff.worker_directory` supplies the working directory.
   Staff parents supply the director and showrunner relationships.
 - **Held Astra role.** `_durable_roles` lists opened roles that have not ended.
-  Staff supplies the current name, thread, and parent.
-  The role store supplies the design repository and lifecycle.
+  Staff supplies the current thread, worker name, role parent, and owned checkout path.
+  The role store supplies lifecycle and checkout ownership.
+  Independent checkouts retain their stored paths.
   A missing backend prints an anomaly and skips that role.
   The row uses `astra-designer` or `astra-reviewer` and cannot receive direct messages.
   The holder adds pending messages through `design_roles.py`.

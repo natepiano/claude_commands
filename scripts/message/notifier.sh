@@ -22,7 +22,7 @@ else
 fi
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
-usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|pause|unpause|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
+usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt scheduled)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|pause|unpause|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
 
 [[ $NOW == <0-> ]] || die "invalid clock: $NOW"
 
@@ -55,7 +55,7 @@ write_conf() {
     print -r -- "TARGET=${conf[TARGET]}"
     print -r -- "EVERY=${conf[EVERY]}"
     [[ -n ${conf[COMMAND]:-} ]] && print -r -- "COMMAND=${conf[COMMAND]}"
-    [[ -n ${conf[PROMPT_FILE]:-} ]] && print -r -- "PROMPT_FILE=${conf[PROMPT_FILE]}"
+    [[ -n ${conf[PROMPT]:-} ]] && print -r -- "PROMPT=${conf[PROMPT]}"
     [[ -n ${conf[RUN]:-} ]] && print -r -- "RUN=${conf[RUN]}"
     print -r -- "FROM=${conf[FROM]}"
     print -r -- "CHECK=${conf[CHECK]:-}"
@@ -126,19 +126,19 @@ log_error() { print -r -- "$fired | $1" >> "$STATE_DIR/notifier.log" }
 
 cmd_new() {
   (( $# >= 2 )) || usage
-  local name=$1 dir lock_fd target='' every='' command='' prompt_file='' run='' sender='' check='' hold=0 align=0 timeout=120
+  local name=$1 dir lock_fd target='' every='' command='' prompt='' run='' sender='' check='' hold=0 align=0 timeout=120
   local command_given=0 prompt_given=0 run_given=0 state_created=0
   shift
   valid_name "$name"
   while (( $# )); do
     case $1 in
-      --to|--every|--command|--prompt-file|--run|--from|--check|--timeout)
+      --to|--every|--command|--prompt|--run|--from|--check|--timeout)
         (( $# >= 2 )) || usage
         case $1 in
           --to) target=$2 ;;
           --every) every=$2 ;;
           --command) command=$2; command_given=1 ;;
-          --prompt-file) prompt_file=$2; prompt_given=1 ;;
+          --prompt) prompt=$2; prompt_given=1 ;;
           --run) run=$2; run_given=1 ;;
           --from) sender=$2 ;;
           --check) check=$2 ;;
@@ -159,9 +159,8 @@ cmd_new() {
     (( command_given + prompt_given == 1 )) || usage
   fi
   (( command_given )) && [[ -z $command ]] && usage
-  (( prompt_given )) && [[ -z $prompt_file ]] && usage
+  (( prompt_given )) && [[ $prompt != scheduled ]] && usage
   [[ $timeout == <1-> ]] || die "timeout must be whole seconds above 0: $timeout"
-  [[ -z $prompt_file || $prompt_file == /* ]] || die 'prompt file must be absolute'
   [[ -n $sender ]] || sender=$name
   dir=$(instance_dir "$name")
   mkdir -p -- "$dir" || die "cannot create $dir"
@@ -170,7 +169,7 @@ cmd_new() {
   typeset -A conf state
   conf=(TARGET "$target" EVERY "$every" FROM "$sender" CHECK "$check" HOLD "$hold" ALIGN "$align" TIMEOUT "$timeout")
   (( command_given )) && conf[COMMAND]=$command
-  (( prompt_given )) && conf[PROMPT_FILE]=$prompt_file
+  (( prompt_given )) && conf[PROMPT]=$prompt
   (( run_given )) && conf[RUN]=$run
   if [[ ! -e $dir/state ]]; then
     state=(ENABLED 1 NEXT_DUE 0 LAST_SENT 0 LAST_RESTART 0 LAST_TARGET '')
@@ -223,7 +222,7 @@ cmd_state() {
 # Claim before checking or sending. A concurrent tick or manual fire cannot
 # claim the same scheduled slot twice.
 instance_tick() {
-  local name=$1 forced=$2 show_next=$3 dir lock_fd fired result rc socket
+  local name=$1 forced=$2 show_next=$3 dir lock_fd fired result rc socket prompt
   local check_pid watchdog_pid timeout_marker
   local -a check_words run_words send_args
   typeset -A conf state
@@ -319,6 +318,15 @@ instance_tick() {
     fi
   fi
 
+  if [[ ${conf[PROMPT]:-} == scheduled ]]; then
+    prompt=$("$PY" "${SCRIPT:h:h}/production/update_registration.py" prompt --owner "${conf[TARGET]#session:}" 2>&1)
+    rc=$?
+    if (( rc != 0 )); then
+      print -u2 -r -- "notifier.sh: scheduled prompt failed for $name: ${(j: :)${(f)prompt}}"
+      return 0
+    fi
+  fi
+
   zsystem flock -f lock_fd "$dir/lock" || { log_error "lock failed: $name"; return 1; }
   read_state
   state[LAST_SENT]=$NOW
@@ -330,7 +338,7 @@ instance_tick() {
   if [[ -n ${conf[COMMAND]:-} ]]; then
     send_args+=(--text "${conf[COMMAND]}")
   else
-    send_args+=(--file "${conf[PROMPT_FILE]}")
+    send_args+=(--text "$prompt")
   fi
   if [[ -n ${NOTIFIER_SEND:-} ]]; then
     result=$("$NOTIFIER_SEND" "${send_args[@]}" 2>&1)

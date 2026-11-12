@@ -776,12 +776,19 @@ Temporary checkouts use their own fetches and refs.
   - Inside the call it swaps `os.environ` (cleared, then set to `environment`), `sys.argv`, `sys.path` and cwd, and captures stdout and stderr.
   - Afterwards it restores those, the SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers, and the module's global bindings (`vars(module)`).
   - `SystemExit` becomes the return code; a string code is printed to stderr.
-  - With `production_state=True` it first imports `dailies_render` and `showrunners` in the caller's environment, then patches their import-time paths under the fixture HOME: `CHART_CONF`, `AGENTS_DIR`, `READINGS_LOG`; `CONFIG`, `NOTIFIER_STATE_DIR`, `SESSIONS_DIR`, `SHOWRUNNER_STATE_DIR`, `SESSIONS`, `SEND`.
+  - With `production_state=True`, it first imports `scripts.production.showrunners` in the caller's environment.
+    It then binds production registry paths and `note_file.AGENTS_DIR` to the fixture environment.
+    The registry paths are `CONFIG`, `NOTIFIER_STATE_DIR`, `SHOWRUNNER_STATE_DIR`, `SESSIONS`, and `SEND`.
 - `ImmutableGitSeed.create(root, branch, author, email, files)` builds one checkout plus a bare origin per test class, with `GIT_CONFIG_GLOBAL=/dev/null`. `copy_to(checkout, origin)` copies both trees and repoints the remote, so each case has private refs, config, index and origin without re-running git setup.
 - Converted modules retain a `subprocess_cli=True` case for parsing, exit status, and executable behavior.
   `scripts.mac_test.test_offload` imports `scripts.production.cli_fixture` by package name.
 
-**Session host fakes.** Production, message and shutdown tests reach herdr only through `scripts/herdr/fake_herdr.py` (`HERDR_BIN`) and `scripts/production/fake_unit_host.py`, which publishes panes with session labels, pane reads and a fake `/proc` (see [herdr-adoption.md](herdr-adoption.md), Test doubles). Most production suites use them, `test_waiting.py` among them. The `ci_points` fake `gh` is a shell + jq stub (`GH_STUB` in `test_ci_points.py`).
+**Session host fakes.** Production, message, and shutdown tests use `scripts/herdr/fake_herdr.py` through `HERDR_BIN`.
+They also use `scripts/production/fake_unit_host.py`.
+It supplies session labels, pane reads, and a fake `/proc`.
+See [herdr-adoption.md](herdr-adoption.md), Test doubles.
+Production suites such as `test_waiting.py` use these fixtures.
+The `ci_points` fake `gh` uses the `GH_STUB` shell and jq fixture in `test_ci_points.py`.
 
 **`scripts/production/test_add_showrunner.py`** keeps its launch, account, trust and registry cases in one module, sharing `add_showrunner_test_support.py`. Each class builds an account/tool seed once and restores private files and symlinks at the same paths before each case. Synchronous commands run the real parser and handlers through `invoke_cli`; the fixture's herdr/systemd, registry and message scripts run in process with their recorded arguments and file effects intact. Git and the fake herdr agent-start command remain subprocesses. One complete launch case and the unset poll-default check retain their Python subprocess boundaries. Registry retries use a controlled clock, recording the requested interval; dummy session processes block on a pipe until cleanup, instead of expiring after 60 seconds.
 
@@ -944,7 +951,15 @@ Lint scope runs in `test_verify_lint_scope.py` (workspace and package fix/judgme
 
 Step routing runs in `test_verify_step_routes.py` (admission and refusals), `test_verify_step_routes_lint.py` (formatting and Mac judgment), `test_verify_step_routes_helpers.py` (helpers after a local mend), `test_verify_step_routes_results.py` (declined, lost and invalid Mac replies), and `test_verify_step_routes_restart.py` (stopped local steps). They share `verify_step_routes_test_support.py`, which reuses the committed Mac fixture contract and builds the route tools once per class, restoring a private copy at the same path for each test. All original assertions, fake-tool observations and the final child-leak check remain. Real Bash routing, admission, record transitions and tool processes remain because the tests prove their process boundaries. Holds change at fake-tool events rather than elapsed intervals; private memory and interpreter state avoid unrelated admission and discovery waits. The 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs. The original module still exports the route stubs for token-wait tests.
 
-Unit status runs in `test_unit_status.py` (registered units, Claude liveness and tick health), `test_unit_status_decisions.py` (new and repeated user gates), and `test_unit_status_routing.py` (showrunner and peer gate routing). They share `unit_status_test_support.py`, which builds the copied script tree once per class and restores a private copy at the same paths for each scenario. Static fake-herdr responses are generated as shell dispatch tables with exact output bytes and argv logs; the real status shell, production lookup, session registry and pane readers still run as processes. Unique live registry processes wait for pipe EOF instead of a fixed sleep. Dailies parsing remains in-process. All original assertions remain; the 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs.
+Unit status tests cover registered units, Claude liveness, tick health, user gates, and routing.
+The modules are `test_unit_status.py`, `test_unit_status_decisions.py`, and `test_unit_status_routing.py`.
+They share `unit_status_test_support.py`.
+It builds one script tree per class and restores private copies at the same paths for each case.
+Shell dispatch tables supply exact fake-herdr replies and argument logs.
+The real status shell, production lookup, session registry, and pane readers remain subprocesses.
+Registry processes wait for pipe EOF during cleanup.
+The 600-second limit in `scripts/lib/test_hang_guard.py` detects hangs.
+Dailies parsing and its separate test module were retired on 2026-11-11.
 
 Example verification runs in `test_verify_untested_examples.py` (clean package) and `test_verify_example_acceptance.py` (accepted examples), `test_verify_example_markers.py` (test attributes and module files), `test_verify_example_manifest.py` (manifest refusal and diagnostic ordering), `test_verify_example_cache.py` (new tests invalidate passes) and `test_verify_example_edits.py` (edits during tests and session writes), `test_verify_example_dependencies.py` (dependency-scoped invalidation), and `test_verify_example_commands.py` (targeted tests and the removed verb), and `test_verify_example_final.py` (final command ordering). They share `verify_examples_test_support.py`, which seeds the private tools once per class and restores a copy at the original paths for every test. The seed pins the interpreter cache, marks its complete toolchain ready and matches its memory budget to its 64 GiB reading. Real Bash verification, Cargo metadata calls, command ordering and pass-cache writes remain exercised. Existing users of the unseeded workspace fixture keep their original lifecycle and environment through compatibility exports; the 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs.
 
@@ -960,7 +975,9 @@ Example verification runs in `test_verify_untested_examples.py` (clean package) 
 
 - **pidfds stay readable** after the process exits; `wait_until` observes each one once and drops it.
 
-- **Import-time paths.** A module first imported under a fixture HOME computes its import-time paths from it, and restoring bindings then restores the fixture paths. Preload such modules before swapping the environment; `invoke_cli(production_state=True)` and `recorder_fixture.py` do this.
+- **Import-time paths.** A module computes its default paths when it is imported.
+  Import it before changing HOME to a fixture path.
+  `invoke_cli(production_state=True)` and `recorder_fixture.py` preserve caller paths this way.
 
 - **Bindings, not containers.** `invoke_cli` restores module bindings, not mutable containers in module globals.
 
@@ -1017,6 +1034,9 @@ the token ownership fixture's process metadata observer.
 Lint repair ordering runs in `test_verify_lint_fixes.py` (successive fixes before judgment, with cache off and on) and `test_verify_lint_fix_failures.py` (formatting after failed repair and preservation of the final judgment status). Both reuse the committed lint-scope fixture, which builds once per class and restores private copies at the same paths. The convergence test inherits `VerifyLintCacheFixture`, enabling pass records through `UNIT_RUN_DIR` without an unrelated director token or progress window. Real Bash verification, source hashing, fake Cargo/Taplo/Git processes and every original assertion remain. There are no fixture sleeps or polling intervals; the existing 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs.
 
 Tree watcher scope coverage remains in `scripts/direct/test_tree_watch.py`, with `tree_watch_test_support.py` owning one Git fixture seed per class, including the two nested Cargo workspace layouts, and private copies restored at the same paths per test. Key CLI calls run in-process; scope tests run the real watcher loop with an event-controlled sleep, completing explicit snapshot iterations instead of waiting through fixed intervals. All Git snapshots and file publication stay real, and the parent-exit test keeps a real watcher process. Negative checks require two completed observations and a live watcher, followed by the original positive-change proof; the original 2.5-second change and parent-exit bounds remain. Only non-speed setup and cleanup waits use the named 600-second hang guard in `scripts/lib/test_hang_guard.py`.
+
+2026-11-11: Dailies input, rendering, and their dedicated test fixtures were retired.
+Use [/showrunner:units](../../commands/showrunner/units.md) to read current unit status.
 
 ## Cloud gate resource names
 

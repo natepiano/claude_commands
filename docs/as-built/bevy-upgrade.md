@@ -2,7 +2,11 @@
 
 ## What it is
 
-`/showrunner:bevy_upgrade` keeps one record per production of every crate that ties the project to its Bevy version: the project's pin, what crates.io and GitHub offer for the target version, and the user's answer on a git pin, stored in the user's own words. A job in [the notifier](session-notifier.md) runs a check every four hours, which keeps the record current and writes to the showrunner only what changed since the showrunner last saw it. [The dailies builder](showrunner-automation.md) adds one `Bevy upgrade` topic read from the same record, so every statement about the upgrade in a report has one source. The user asked for it so that a report "doesn't have bad information", and so that what is known about each dependency is saved "so we can limit the work we do" (user, 2026-10-12).
+`/showrunner:bevy_upgrade` keeps one dependency record per production.
+The record holds the project pin, available target versions, and the user's answer about each git pin.
+A job in [the notifier](session-notifier.md) checks it every four hours.
+The job sends only changes since the showrunner last read the record.
+The user requested one saved source for dependency facts on 2026-10-12.
 
 `/bevy_migration_plan`'s dependency check belongs to the same feature. It lists the direct dependencies of every workspace member, sees a crate that depends on Bevy only through Bevy's own sub-crates, such as `bevy_app` or `bevy_ecs`, and looks each crate up on crates.io once, under its whole version. The watch and the check send crates.io at most one request a second, through one shared pacer. The watch lives in `scripts/bevy_upgrade/`, behind `commands/showrunner/bevy_upgrade.md`; the dependency check is `scripts/bevy_migration_plan/bevy_migration_dependency_check.py`.
 
@@ -22,8 +26,6 @@
 | `scripts/bevy_upgrade/bevy_upgrade.py` | The CLI: the verbs, the one lock block and its save, the baseline, job upkeep, closing and exit codes. |
 | `scripts/bevy_upgrade/test_*.py` | One test file per module, `test_crates_io_pacer.py` among them, and `test_cli.py`, which runs the CLI as a subprocess. |
 | `commands/showrunner/bevy_upgrade.md` | The command: runs the CLI and gives the showrunner its rules. |
-| `scripts/production/dailies_input.py` | `bevy_upgrade_watch` and `bounded_bevy_update`: the `Bevy upgrade` dailies topic. |
-| `commands/showrunner/dailies.md` | Gather item 7 and the meaning of `bevy upgrade: unavailable`. |
 | `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` | The dependency check behind `/bevy_migration_plan`. |
 | `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` | Dependency-check tests, runnable from the repository root or their own directory. |
 | `scripts/bevy_migration_plan/bevy_migration_count_pattern.sh` | Regex match counts excluding `vendor/` and `target/`; single, multiple and verify modes. |
@@ -311,25 +313,8 @@ main(argv: list[str] | None = None) -> int
 - On a row reading `ask the user: git pin?`, the showrunner asks once and records the answer with `approve` or `decline`. A pin to an unmerged pull request's branch needs the same answer.
 - A scheduled check writes to the session only when something changed. Its message is this command's output and the one exception to the same-turn rule: its lines are shown to the user in the next reply as received, and anything beyond them needs `status` first.
 
-### The dailies topic
-
-While a watch is open, every dailies carries a `Bevy upgrade` topic whose text is the `line` sentence, marked as needing the user while a git pin has no answer. The builder reads it from the upgrade command, never from the record file.
-
-```python
-# scripts/production/dailies_input.py
-OpenBevyUpgradeWatch(update: str, needs_user: bool)
-NoOpenBevyUpgradeWatch()
-BevyUpgradeUnavailable(reason: str)
-BevyUpgradeWatch = OpenBevyUpgradeWatch | NoOpenBevyUpgradeWatch | BevyUpgradeUnavailable
-bevy_upgrade_watch(production: Production) -> BevyUpgradeWatch
-bounded_bevy_update(text: str) -> str
-```
-
-- **Lookup.** `bevy_upgrade_watch` runs `<sys.executable> <script> --production <showrunner name> line --json` with a 30-second timeout. Empty or whitespace-only output is `NoOpenBevyUpgradeWatch`. An object with a non-blank single-line `update` string and a boolean `needs_user` is `OpenBevyUpgradeWatch`; extra keys are ignored. Everything else is `BevyUpgradeUnavailable`: a non-zero exit, a timeout, an `OSError`, invalid JSON, or an object of another form. Its reason is the first stderr line when there is one, else `command exited <code>`, `timed out after 30 seconds`, or the error text of the parser or the operating system.
-- **Topic.** `run()` adds the topic after the review watch topic, with the title `Bevy upgrade`, the ETA `no ETA stated yet` and the lookup's `needs_user`. For an unavailable lookup the text is `the record could not be read: <reason>` and `needs_user` is false. With no open watch there is no topic.
-- **Cut.** `bounded_bevy_update` cuts the text to the smallest finite value in `dailies_render.LENGTHS`, ending in `…`.
-- **Step line.** `bevy upgrade: ok — <text>`, `bevy upgrade: ok — no open watch`, or `bevy upgrade: unavailable — <text>`. A failed lookup never fails the builder.
-- **`dailies.md`.** Gather item 7 says the builder adds the topic from the record while a watch is open and that nothing else in the report states the upgrade's status. Output says that on `bevy upgrade: unavailable — <reason>` the report continues and carries the topic with that reason.
+2026-11-11: Dailies and their Bevy upgrade topic were retired.
+Use `/showrunner:bevy_upgrade` to read the dependency record.
 
 ### The migration plan's dependency check
 
@@ -381,7 +366,6 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - `BEVY_UPGRADE_FIXTURES`: a JSON file of URL to body that stands in for the network in the CLI. Unset by default, which means `http_fetch`.
 - `BEVY_UPGRADE_NOTIFIER`: the notifier script, default `scripts/message/notifier.sh`.
 - `BEVY_UPGRADE_SEND`: the sender script, default `scripts/message/send.py`.
-- `DAILIES_BEVY_UPGRADE`: the upgrade script the dailies builder calls, default `scripts/bevy_upgrade/bevy_upgrade.py`.
 - `CLAUDE_CODE_SESSION_ID`: the session whose production is used when `--production` is absent. The default is `""`, which matches no production.
 - `NOTIFIER_STATE_DIR`, `NOTIFIER_SESSIONS_DIR`, `SHOWRUNNER_STATE_DIR`, `SHOWRUNNERS_CONFIG`, `SHOWRUNNERS_SESSIONS`: where `scripts/production/showrunners.py` finds a showrunner and its production, defaults `~/.local/state/notifier`, `~/.claude/sessions`, `~/.local/state/showrunner`, `config/showrunners.json` and `scripts/message/sessions.py`. `showrunners.py` reads them once, at import.
 - The migration plan's dependency check reads no environment variable: the Bevy checkout is `rust/bevy-<version>` under `Path.home()`.
@@ -402,12 +386,12 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - A name outside `bevy_names` is never read as Bevy.
 - `Entry.crates_io`, `Entry.branch` and `Record.target_bevy` are tagged cases. `load` validates every field, so a field added to `Record`, `Entry` or a pin needs a starting value and a check in `_validate`, and a required `Record` field also needs the record fixture in `test_upgrade_check.py`.
 - Stored `branch` and `items` belong to one repository, and an item number names an item only with it.
-- `ask the user: git pin?` is the one Next cell that asks the user for an answer. `waiting` counts exactly those rows, and `needs_user` in the dailies comes from it.
+- `ask the user: git pin?` is the only Next cell that requests an answer.
+  `waiting` counts those rows.
 - `announced` moves only when the showrunner has seen the change: a table printed by a hand verb, or a scheduled send that returned `True`.
 - A watch closes only on a check whose pins re-read succeeded in the same run, and a scheduled check closes it only once its message was sent.
 - The job is created and removed, and the queued message retired, inside the record lock, after the one save.
 - `line` takes no lock, saves nothing, never changes `announced` and sends nothing. A scheduled check prints nothing on stdout and never calls `retire_message`.
-- The dailies builder reads the watch through the command, never from the record file. A failed lookup reads `unavailable`, never `failed`, because `dailies.md` treats a `<step>: failed` line as a failed report. The dailies length limit has one copy, `dailies_render.LENGTHS`.
 - In the migration plan's dependency check, a failed crates.io request is never read as "no Bevy dependency", and the Bevy checkout is read once per run. A crate is looked up under its whole version, and once however many workspace members list it.
 - Within one process, crates.io requests start at least one second apart: every function that reaches crates.io, in the watch and in the migration check, waits for `crates_io_pacer.CRATES_IO_PACER` immediately before it opens the request. A GitHub request never waits on it.
 - One pacer: `CRATES_IO_MIN_INTERVAL_SECONDS`, `RequestPacer` and `CRATES_IO_PACER` are defined in `crates_io_pacer.py` only, and nothing copies or re-exports them.
@@ -420,9 +404,12 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - **GitHub's limit.** GitHub allows 60 API requests an hour without a token, and `port_items` reads one page of 100 per check, newest update first. A repository's first read makes 4 requests plus one per pull request. A following check makes 2, plus one for each kept open pull request and for each returned pull request whose `updated` moved, plus the manifest reads when the head moved or the requirement is still empty. One check of hana's ten dependencies makes 16 GitHub requests on a first read and 8 afterwards, counted without a member search or a kept pull request.
 - **crates.io.** Requests start at least one second apart, which the pacer module's docstring gives as crates.io's published crawler limit. Measured at 22:01 EDT on 2026-10-12 through the real `http_fetch`: three crates.io lookups in a row answered at 0.22, 1.18 and 2.17 s, and a GitHub lookup after them took 0.27 s with no wait.
 - **The limit is per process.** `CRATES_IO_PACER` is one object in each Python process. A watch check and a migration check running at the same moment each keep to one request a second and are not paced against each other.
-- **A paced check and the record lock.** A check that makes N crates.io requests takes at least N − 1 seconds and holds the record lock that long, about 40 s for hana_catalyst's first read. A verb that takes the lock waits behind it. `line` takes no lock, so the dailies topic never waits.
+- **A paced check and the record lock.** A check with N crates.io requests takes at least N − 1 seconds.
+  It holds the record lock during those requests.
+  The first hana_catalyst check took about 40 seconds.
+  A verb that needs the lock waits.
+  `line` does not take the lock.
 - **The pacer's clock reading.** The pacer records the reading taken after its sleep, never the planned wake time. With the planned time, one sleep that runs 0.6 s long gives request starts at 0.0, 1.6 and 2.0 s, a gap of 0.4 s. A stand-in sleep that advances the clock by exactly the amount asked for cannot show this; the regression test's stand-in runs long.
-- **Dailies cut.** 240 characters today. A change that lengthens the `line` sentence shows in the dailies cut at that limit.
 - **Fetcher exceptions.** `http.client.IncompleteRead` and `BadStatusLine` are `http.client.HTTPException`, which is neither `OSError` nor `ValueError`. A fetcher that catches only those two lets a truncated or malformed response escape as a traceback.
 - **`newest`.** It is crates.io's first version not yanked, which is publication order. A yanked version of the target Bevy still reads as `released`.
 - **Spent budget.** About 180 crates.io requests is the most one check makes before `CHECK_BUDGET` cuts it short. The next check continues from there, and the only outward sign is that `Record.checked` does not advance.
@@ -479,7 +466,7 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - **`1 change` for a single line.** `<N> changes` reads wrongly for one.
 - **A scheduled close waits for its message.** The watch stays open, and its job keeps running, until the showrunner has been sent the closing sentence.
 - **The builder takes the length limit from the renderer.** A second copy of the 240 limit in the builder could differ from the renderer's.
-- **The `line` sentence stays whole.** The dailies cut happens in the builder; the showrunner's own report and the scheduled message get the full sentence.
+- **The `line` sentence stays whole.** The showrunner report and the scheduled message receive the full sentence.
 - **The migration check keeps its own requirement rule.** It prints its own warnings, so it does not import `scripts/bevy_upgrade/upstream.release_requirement`. The pacer is the one module it takes from the watch's directory.
 - **The tree lookup, not `[workspace] members` globs.** The tree lists the manifests that exist and needs no glob rules.
 - **A truncated tree is not followed.** The search is bounded and answers unknown instead of making further requests.

@@ -197,15 +197,9 @@ def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity], *,
 
     classifier = herdr.UnitTabClassifier(
         client.session, herdr.herdr_processes(membership=StaffLabels.for_record(record)), record)
-    spaces: dict[str, str] = {}
-    if any(classifier.has_unit_title(pane.get("label") or "") for pane in panes):
-        for item in herdr.json_items(client.result("workspace", "list").get("workspaces"), "herdr workspace list"):
-            space = herdr.json_object(item, "herdr workspace")
-            spaces[herdr.json_text(space.get("workspace_id"), "herdr workspace id")] = (
-                herdr.json_text(space.get("label"), "herdr workspace label"))
     roles: dict[str, str] = {}
     for pane in panes:
-        unit = classifier.classify(spaces.get(pane["workspace_id"], ""), pane.get("label") or "", [pane["pane_id"]])
+        unit = classifier.classify([pane["pane_id"]])
         if isinstance(unit, herdr.UnitTab):
             roles[pane["pane_id"]] = f"unit {unit.parent.name}/{unit.row.name}"
     return roles

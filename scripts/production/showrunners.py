@@ -381,8 +381,7 @@ def session_state_dir(staff_id: str) -> Path:
 
 
 # The showrunner state a scratchpad held before session_state_dir.
-SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", "dailies_judgment.json",
-                 "dailies_state.json")
+SESSION_STATE = ("unit_status", "showrunner_state.json", "waiting_state")
 
 
 def copy_session_state(staff_id: str, scratch: Path) -> list[str]:
