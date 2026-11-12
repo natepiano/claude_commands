@@ -3447,3 +3447,36 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - `scripts/production/test_unit_lookup.py` went from 67 to 60 tests under Rule 2. The removed tests checked a constructor type, timer and process-scan call counts, and a retired history tail reader. The `live_hosts` helper and unused `renamed_production` rows went with them. All 60 retained tests and 205 assertions are unchanged. Both blind reviews approved each removal. Checkpoint `76007751d`.
 
+### Phase 219 — Gates and targeted runs stop at a time limit  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a merge gate or a targeted test run that runs longer than a configured factor times its normal wall time on the same vCPU count stops, ends its AWS box, and reports red to the owner with the modules still running and the failed modules with their tracebacks.
+
+**Decision:** the user, via builds, 2026-11-12: "we need to not wait that long - if it is not done within 50% more than our normal speed for that vcpu, then we should pre-emptively kill it and send it back to the owner to fix" and "this needs to be a configurable value". builds: top priority, ahead of test speed work. sdlc gives its go for `merge_gate.py`. aws owns the box-end call.
+
+**Spec:**
+1. Find each place a gate runs: the local gate on natedev (`scripts/production/merge_gate.py`) and the cloud gate (`scripts/aws_target/cloud_gate.py`, `gate_box.py`). Find the gate index that `/test_times suites` reads (`scripts/test_times/gate_record.py`, `show.py`). If a gate record does not hold the vCPU count, add it.
+2. Add one config key, `GATE_TIME_LIMIT_FACTOR=1.5`, in `config/merge_gate.conf`, with a comment and a range line that does not repeat the value. Read it through the existing config reader. Tests set their own factor and never read the live value.
+3. One function computes the normal wall time: the median wall time of recent passing full gates on the same vCPU count, from the gate index. Use the existing `TOP_RUNS` count of runs. With no passing record for that vCPU count, set no limit and print one line that says so.
+4. Full gate limit = factor × that median.
+5. Targeted run limit = factor × the larger of (a) the longest selected module's median wall time and (b) the sum of the selected modules' median wall times divided by the run's job count. Use only records on the same vCPU count. A module with no record adds nothing. With no record for any selected module, set no limit and print one line.
+6. Enforce the limit in the gate's existing wait loop with a monotonic deadline. Add no signal handler. Past the deadline, stop all running module groups through the existing stop path (`merge_gate.py:720`), and mark the gate red with the reason `time limit`.
+7. The red result names the limit, the elapsed time, the modules still running when the gate stopped, and each failed module with its saved traceback (the `GATE_FAILURE_LOG_KIB` tail). Send it to the owner through the same path a failed gate uses now.
+8. Cloud gate: past the deadline, also end the AWS box through the existing teardown call. If no call ends one box, stop and report; the director asks aws.
+9. Tests: direct calls with a fake clock and fake history; no real long runs, no whole gate runs for a limit check. Rows: same vCPU count only; passing gates only; the factor comes from config; no history gives no limit; the deadline stops the running modules and names them; failed modules carry tracebacks; the cloud path calls box end; the targeted limit rule.
+
+**Files:**
+- `scripts/production/merge_gate.py`, `scripts/production/targeted_test.py`
+- `config/merge_gate.conf`
+- `scripts/test_times/gate_record.py` (vCPU count, history read)
+- `scripts/aws_target/cloud_gate.py` or `gate_box.py` (box end)
+- their test modules
+
+**Workers:** 1 writer; the limit function is shared by every file.
+- impl: all files.
+
+**Acceptance gate:**
+- All merge-gate, targeted-test, test_times and aws_target modules pass; basedpyright clean on each changed file.
+- A fake-clock test shows a gate past its limit stops, names its running modules, and reports red.
