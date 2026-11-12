@@ -42,6 +42,7 @@ Each executed module attempt records its wall-clock start and end in UTC ISO for
 `gate_modules.started_at` remains the gate run's start for existing keys and window queries.
 Older records have NULL module times because they did not record them.
 Results from older cloud boxes can omit these times.
+A cloud row with only one of the two times records neither.
 Jobs that never start also omit them.
 Index schema 40 rebuilds from the JSON lines without changing them.
 

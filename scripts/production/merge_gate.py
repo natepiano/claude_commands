@@ -222,8 +222,8 @@ class GateJobResult:
     peak_mib: float = 0.0
     restart: Literal["", "hold"] = ""
     memory_stopped: bool = False
-    started_at: float | None = field(default=None, kw_only=True)
-    ended_at: float | None = field(default=None, kw_only=True)
+    wall_clock: gate_record.WallClockSpan | gate_record.WallClockNotRecorded = field(
+        default=gate_record.WallClockNotRecorded("job did not run"), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -833,7 +833,8 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,
                          tripwire_tripped, job.kind, job.cpu_seconds, times, job.peak_memory_mib,
-                         memory_stopped=job.memory_stopped, started_at=job.started_at, ended_at=time.time())
+                         memory_stopped=job.memory_stopped,
+                         wall_clock=gate_record.WallClockSpan(job.started_at, time.time()))
 
 
 @dataclass(frozen=True)
@@ -1011,7 +1012,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
         recorded_executions = [
             gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds,
                                   job.peak_mib, job.returncode, job.restart, job.times, job.output,
-                                  started_at=job.started_at, ended_at=job.ended_at)
+                                  wall_clock=job.wall_clock)
             for job in executions
         ]
         modules = gate_record.module_runs(recorded_executions, slow_test_s)

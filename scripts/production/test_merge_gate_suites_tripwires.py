@@ -17,6 +17,7 @@ from scripts.production import merge_gate
 from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.test_times import gate_record
 
 
 @final
@@ -56,13 +57,13 @@ class MergeGateTripwiresTests(GateSuitesFixture):
             self.checkout, self.environment, root / "output.log")
         status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
         result = merge_gate.finish_gate_job(job, status)
-        started_at, ended_at = result.started_at, result.ended_at
-        if started_at is None or ended_at is None:
-            self.fail("the finished job has no recorded start and end time")
-        self.assertLessEqual(began, started_at)
-        self.assertEqual(started_at, job.started_at)
-        self.assertLessEqual(started_at, ended_at)
-        self.assertLessEqual(ended_at, time.time())
+        wall_clock = result.wall_clock
+        if not isinstance(wall_clock, gate_record.WallClockSpan):
+            self.fail("The executed job has no wall-clock span")
+        self.assertLessEqual(began, wall_clock.started_at)
+        self.assertEqual(wall_clock.started_at, job.started_at)
+        self.assertLessEqual(wall_clock.started_at, wall_clock.ended_at)
+        self.assertLessEqual(wall_clock.ended_at, time.time())
         self.assertEqual(status, 0)
         self.assertEqual(result.returncode, 1)
         self.assertTrue(result.tripwire_tripped)
