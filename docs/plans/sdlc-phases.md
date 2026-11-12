@@ -550,23 +550,16 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `transcript_paths` and the staff backend lookup cost a small part of their present CPU, for every caller.
-
-**Spec:**
-- `scripts/lib/transcripts.py` `transcript_paths(root, pattern)`: do not call `resolve()` on each file. Key each match by `uncompressed_path(path)` as the glob gives it, so a plain file and its `.zst` copy still give one entry, with the plain file preferred. Keep the signature, the sorted order and the return type.
-- `scripts/production/staff.py` `_found_backends`: Codex homes share session folders through symlinks (`~/.codex1/sessions` and `~/.codex2/sessions` point to `~/.codex/sessions`). Resolve each `home / folder` once, list each real folder once, and use that list for each home that shares it. Keep the rule that a row gets `CodexBackend(home)` only for its recorded home, and the `anomaly:` line on `OSError`.
-- Add no new public API. Change no other caller.
-- Tests: add rows to existing tests (`scripts/lib/test_transcripts.py`, and `test_codex_backend_requires_the_recorded_home_to_hold_the_transcript` in `scripts/production/test_staff.py`). Cover: a plain file and its `.zst` give one entry, plain preferred; two homes whose folder is a symlink to one real folder each get the right `CodexBackend` for their recorded rows, with the folder listed once.
-- Timing: the director measures paired CPU per call before and after with the same harness (`time.process_time`, five calls, no profiler). Before, at 12:25 EST on natedev: `_found_backends` over 657 rows took 0.55–0.61 s per call; `transcript_paths` over 14,025 files took 0.32 s, of which the glob is 0.04 s.
+- `transcript_paths(root, pattern)` calls no `resolve()` on each file. It keys each match by `uncompressed_path(path)`, so a plain file and its `.zst` copy give one entry, with the plain file preferred.
+- `distinct_files(paths)` in `scripts/lib/transcripts.py` merges symlink aliases in a small list of matches. A caller that counts or picks among the matches of one session uses it: `read_director_transcripts` in `phase_process.py`.
+- `showrunner_transcripts` in `nightly_review.py` resolves each path as it enters its result set, so a recorded path and a discovered path give one entry.
+- `_found_backends` in `staff.py` lists each real session folder once and reuses the list for each home that links to it. A row gets `CodexBackend(home)` only for its recorded home.
+- Paired CPU per call on natedev, 662 rows: `_found_backends` 0.08–0.10 s against 0.45–0.52 s before; `transcript_paths` over three homes 0.16 s against 0.42 s.
 
 **Files:**
-- `scripts/lib/transcripts.py`
-- `scripts/production/staff.py`
-- `scripts/lib/test_transcripts.py`
-- `scripts/production/test_staff.py`
-
-**Workers:** `1 writer + 1 tester`
-- impl: `scripts/lib/transcripts.py`, `scripts/production/staff.py`
-- test: `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`
+- `scripts/lib/transcripts.py` — transcript discovery and `distinct_files`
+- `scripts/production/staff.py` — Codex backend lookup, one scan for each real folder
+- `scripts/direct/phase_process.py`, `scripts/nightly_review/nightly_review.py` — callers that merge aliases
+- `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`, `scripts/direct/test_phase_process.py` — alias, shared-folder and plain-preferred rows
