@@ -744,32 +744,32 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
-  const columns = duration => `<th scope="col" class="place">#</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th><th scope="col" class="stage">Stage</th>` +
+  const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th>`;
-  const cells = (place, name, duration, stage, unit, pid, machine, vcpus, tip, className = "") => {
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="stage">${esc(stage)}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       `<td class="machine">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
   };
   const running = d.walk.map((row, index) => ({row, index}));
-  const ordered = [...running.filter(({row}) => row.kind === "cloud" || row.queued && !row.ci), ...running.filter(({row}) => row.ci)];
+  const ordered = [...running.filter(({row}) => row.kind === "cloud" || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.ci_runners?.some(runner => runner.state === "busy"))];
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    cells("run", r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
-      r.progress?.kind === "RowProgress" ? r.progress.phase : "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`);
+    cells(r.progress?.kind === "RowProgress" ? r.progress.phase : "—",
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
-  cells("", "Next step room", "", "", "", null, "", null, "room", "room");
+  cells("", "Next step room", "", "", null, "", null, "room", "room");
   rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
   if (d.waiters.length) {
-    tableRows.push(`<tr class="queue-head">${columns("Waiting")}</tr>`);
+    tableRows.push(`<tr class="queue-head">${columns("#", "Waiting")}</tr>`);
     rows.push(`<div class="walk-chart-head queue-head" aria-hidden="true"></div>`);
   }
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, "", w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
@@ -779,7 +779,7 @@ function renderWalk(d) {
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
     `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
-    `${columns("Duration")}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
+    `${columns("Stage", "Duration")}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
@@ -879,7 +879,7 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   if (!beside) {
-    const fixedWidth = ["place", "duration", "stage", "machine", "vcpus", "pid"].reduce((width, name) =>
+    const fixedWidth = ["place", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
       width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
     const padding = ["step", "unit"].reduce((width, name) =>
       width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
