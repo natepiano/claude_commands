@@ -3146,7 +3146,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `8f30bce69`. Read-only replay of the affected-test selection on 62 failed cloud merge gates (42 trees) since 11-08. Of 35 trees with a commit, the selection includes every failing module on 25, some on 4 and none on 6; 7 trees have no commit object. Most misses are whole-repository audits and fixtures that read a config file (Phase 176).
 
-### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: todo
+### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: done
 **Depends on:** Phase 175
 
 #### Work Order
