@@ -495,6 +495,22 @@ The report renderer, report schedule, child report rows, and report interval com
 `update_registration.py` owns question types, reading, and due filtering.
 Registration retains a stopped timer for discovery and session ownership.
 
+Timer folders and targets retain the showrunner's fixed staff ID.
+Discovery uses the staff row's current session and current name.
+Registry names do not affect registration or discovery.
+The herdr session list classifies showrunner panes through native session identity and the owning staff ID.
+Quota notices retain staff IDs for named recipients.
+Current staff names resolve at notice creation; former names do not resolve.
+Explicit `session:` and `uds:` recipients retain their native addresses.
+Wind-down projection keys and count timer commands use staff IDs.
+Count timers resolve the current session through staff when they fire.
+Wind-down starts clear projection state; this change adds no conversion.
+Worker completion notices resolve the director's staff ID after the worker lock releases.
+Friend waits use the native process and the last transcript prompt's reply address.
+Consultations need no staff row.
+Unrelated panes with another agent kind do not stop the hook.
+Pane labels do not identify a friend.
+
 - **User zone.** `scripts.lib.user_zone` supplies `user_zone`, `user_zone_name`, and `zone_label`.
   `config/user_zone.conf` supplies the configured zone.
   `USER_ZONE` overrides that value, and `USER_ZONE_CONF` selects another file.
