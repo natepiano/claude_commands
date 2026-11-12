@@ -105,7 +105,7 @@ The existing price rows still support the gate ranking fallback.
 After this change reaches the installed scripts:
 
 1. Run `python3 scripts/aws_target/aws_target.py snapshot` to create the first snapshot.
-2. Run `python3 scripts/aws_target/deploy.py spot-table` to inspect the snapshot.
+2. Run `python3 scripts/aws_target/deploy.py spot-table`, or `/aws_prices` in a session, to inspect the snapshot.
 
 Later reads run through the existing timer.
 `GateGpuTrialScalerPolicy` already allows `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota` in every candidate region.

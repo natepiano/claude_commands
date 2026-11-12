@@ -260,6 +260,7 @@ It prints machine types as rows and candidate regions as columns.
 Each cell shows the lowest zone price in USD/h, or `-` when the snapshot has no offer.
 It splits wide tables into groups of region columns to fit the terminal.
 Each region shows its snapshot age and a stale mark after `price_max_age_seconds`.
+The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
 Below the prices, it shows both quotas in vCPUs and the number of boxes each type fits.
 Standard types use the Standard quota; GPU types use the G and VT quota.
 The box counts divide the quota by the existing type-size vCPU calculation and round downward.
